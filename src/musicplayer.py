@@ -1234,12 +1234,17 @@ class MusicPlayer:
         ]
 
     async def queue_shuffle(self) -> str:
-        # Cancel before shuffle()'s too-few guard: a prefetch holding a dequeued
-        # item must be accounted for even when the shuffle is a no-op.
-        await self._cancel_prefetch()
+        # Neutralize rather than cancel, and before shuffle()'s too-few guard:
+        # cancel_task() no-ops on a COMPLETED prefetch, whose claim would then pin
+        # its song to the front of the reorder the user just asked for.
+        await self._neutralize_prefetch()
         outcome = await self.queue.shuffle()
         if outcome is ShuffleOutcome.TOO_FEW_SONGS:
-            return "There must be at least 3 songs to shuffle the queue"
+            return "There must be at least 4 songs to shuffle the queue"
+        # The neutralized prefetch took the resolve of the next song with it;
+        # a song is playing, so re-hide it behind the remainder of this one.
+        if self.current_song is not None and self._prefetch_task is None:
+            self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
         return "Shuffled!"
 
     async def queue_remove(self, needle: str) -> RemoveOutcome:
@@ -1781,6 +1786,10 @@ class MusicPlayer:
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
+                    # The tail is the same play, so a song that was itself a
+                    # -playnow comes back saying so — the span attribute below
+                    # reads it at every level of a stack.
+                    interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
                     # The tail is the same play, so it keeps the interrupted song's
                     # stamps — played_at included, which files the whole play under

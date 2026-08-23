@@ -273,7 +273,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
 | `-resume` | `r` | — | Resume paused playback; re-hosts the Now Playing block so the pause confirmation becomes plain history. |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
-| `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 3+ songs). |
+| `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
 | `-remove` | `rm` | `<link or search text>` | Remove **all** queued songs matching, by the resolved yt-dlp URL **or** by what the user originally typed — a search term or a source link, so one playlist link takes back out every track it added. Reports the removed positions and names which of the two matched. Consume-rest, so a multi-word search works. Without an argument, prints usage. |
 | `-now` | `np`, `rn`, `nowplaying` | — | Display the now-playing embed, rebuilt live for the current song. |
@@ -640,9 +640,9 @@ Every mutation that touches the Redis mirror (put, clear, shuffle, remove, `fini
 
 `put`/`put_front` return the list they enqueued, which the caller uses to spawn per-item prefetch. They no longer patch what passes through: queue objects arrive complete. `queue_position` is depth **at ask** — `MusicPlayer.enqueue_depth()` read once at command dispatch, alongside the `queued_at` taken from the command message — rather than depth at insert computed under this mutex. It is approximate against the insert by design: the playback loop dequeues continuously, so the two differ routinely with no user involvement, and the quantity the field proxies for is stored exactly beside it as `played_at − queued_at`. `enqueue_depth()` reads `display_size()`, never `qsize()`: a claimed song is gone from the pending count and still ahead of a new arrival, so `qsize()` would undercount by one exactly when a `-play` lands during another song's resolve. The two are now `len(_items)` and `len(_items) - _cursor` — one term apart over the same fields, which is why five tests pin them apart and each half of the swap fails a different subset.
 
-`MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) call `_cancel_prefetch()` **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else.
+`MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) settle the prefetch **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else. `queue_clear`/`queue_remove` call `_cancel_prefetch()`; `queue_shuffle` calls `_neutralize_prefetch()`, because `cancel_task()` no-ops on a *completed* prefetch, whose claim would otherwise pin its song to the front of the reorder and leave `shuffle()`'s too-few guard counting one below what `-queue` renders.
 
-- **Shuffle**: islices the pending tail under the mutex, `random.shuffle`, re-enqueues, rebuilds the mirror. Returns a `ShuffleOutcome` enum.
+- **Shuffle**: islices the pending tail under the mutex, `random.shuffle`, re-enqueues, rebuilds the mirror. Returns a `ShuffleOutcome` enum. The too-few guard counts `display_size()`, the number `-queue` and `-debug` render, so a refusal quoting 4 cannot land on a queue the user sees four songs in — only the pending tail is reordered, but a claimed head still counts toward the threshold.
 - **Clear**: empties the deque, resets the cursor, sets the cleared-flag the loop consumes (`consume_cleared_flag()`), returns the removed titles for the report embed.
 - **Remove**: takes a **predicate** (`RemoveMatcher`), not a URL, and returns a `RemoveOutcome` — the removed items, their 1-based positions, and the `RemoveMode` that matched. The items are in it because a removed entry can be the last record of a song that already played (`MusicPlayer._flush_played`). The policy lives in `remove_matcher()` beside the class rather than inside it, so it is testable without a queue.
 
@@ -1492,9 +1492,6 @@ prefetch's claim is still open there. `put_front` must then rebuild the Redis mi
 rather than LPUSH, because the in-flight item's entry is still at the list head
 awaiting a commit-time LPOP. Delete the branch as "unreachable" and that path silently
 eats the new head.
-
-Note that `-shuffle` requires **4** queued songs while `MusicPlayer.queue_shuffle()`
-and `-help` both say 3 (tracked by an in-code FIXME).
 
 ### Now Playing host invariants
 

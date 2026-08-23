@@ -1225,6 +1225,20 @@ class TestShuffle:
         assert gq.display_items() == items
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == before
 
+    async def test_a_claimed_head_counts_toward_the_threshold(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """-queue and -debug both render display_size(), so counting pending alone
+        refuses "at least 4" to a user looking at exactly four songs — which is
+        every mid-song -shuffle, since the loop or a prefetch holds one claim."""
+        items = [_qobj(n, mock_author) for n in range(1, 5)]
+        await gq.put(items)
+        await gq.get()
+
+        assert gq.display_size() == 4
+        assert gq.qsize() == 3
+        assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
+
     async def test_shuffle_preserves_item_set(
         self,
         gq: GuildQueue,

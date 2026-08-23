@@ -1668,7 +1668,7 @@ class MusicBot(commands.Cog):
         name="shuffle",
         brief="randomly reorder the queue",
         help=(
-            "Randomly reorders the songs waiting in the queue. Needs at least 3 "
+            "Randomly reorders the songs waiting in the queue. Needs at least 4 "
             "queued songs to have any effect. The song currently playing is left "
             "alone — shuffling only touches what comes after it."
         ),

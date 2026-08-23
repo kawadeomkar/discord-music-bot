@@ -373,17 +373,15 @@ class GuildQueue:
     async def shuffle(self) -> ShuffleOutcome:
         """Shuffle the pending items in place: drain → shuffle → refill under one
         continuous mutex hold, so the loop never sees a mid-shuffle empty queue.
-        Requires 4+ pending items. A claimed item keeps its position — only what
-        is still pending is reordered."""
-        # FIXME: -shuffle requires 4 queued songs but tells the user it needs 3.
-        # MusicPlayer.queue_shuffle() refuses with "at least 3 songs" and -help says
-        # "(3+ songs)", so a user with exactly 3 queued is refused by a message
-        # stating a requirement they have met. Fix: drop this to < 3, or correct
-        # both user-facing strings to 4.
+        A claimed item keeps its position — only what is still pending is
+        reordered."""
+        # display_size(), the number -queue and -debug show: a claim held by the
+        # loop or a prefetch is displayed but not pending, and the refusal below
+        # quotes the number the user is looking at.
         async with self._mutex:
             # Counted inside the lock: acquiring suspends, and a clear() or
             # remove() completing in that gap leaves nothing to shuffle.
-            if self.qsize() < 4:
+            if self.display_size() < 4:
                 return ShuffleOutcome.TOO_FEW_SONGS
             # A list round-trip because deque has no slicing.
             head = list(islice(self._items, 0, self._cursor))

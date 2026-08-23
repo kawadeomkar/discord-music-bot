@@ -839,13 +839,81 @@ class TestQueueShuffle:
             await music_player.queue_put(qobj)
 
         result = await music_player.queue_shuffle()
-        assert result == "There must be at least 3 songs to shuffle the queue"
+        assert result == "There must be at least 4 songs to shuffle the queue"
+
+    async def test_a_completed_prefetchs_claim_is_returned_before_the_guard(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        """cancel_task() no-ops on a task that already finished, so a completed
+        prefetch keeps its claim through -shuffle: the song it holds stays pinned
+        to the front of the very reorder the user asked for, its FFmpeg process
+        is never reaped, and the guard counts one short."""
+        live_song.np_message_id = None
+        live_song.np_channel_id = None
+        live_song.np_dedicated = False
+        live_song.np_host_ref = None
+        for i in range(4):
+            await music_player.queue_put(
+                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            )
+        # A prefetch that finished: it claimed the head and its task is done.
+        music_player.queue.get_nowait()
+        finished: asyncio.Future[MagicMock] = asyncio.get_running_loop().create_future()
+        finished.set_result(live_song)
+        music_player._prefetch_task = cast(Any, finished)
+
+        assert await music_player.queue_shuffle() == "Shuffled!"
+        assert music_player.queue._cursor == 0
+        assert music_player.queue.qsize() == 4
+        live_song.cleanup.assert_called_once()
+
+    async def test_a_shuffle_during_a_song_prefetches_the_new_head(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        """Neutralizing the prefetch gave its resolve back to the queue; with a
+        song still playing there is time to hide the new head's resolve behind
+        it, so the reorder does not cost the next transition a gap."""
+        for i in range(4):
+            await music_player.queue_put(
+                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            )
+        music_player.current_song = live_song
+        spawned: list[str] = []
+
+        async def _prefetch(_self: Any) -> None:
+            spawned.append("prefetch")
+
+        with patch.object(MusicPlayer, "_prefetch_next_song", new=_prefetch):
+            assert await music_player.queue_shuffle() == "Shuffled!"
+            assert music_player._prefetch_task is not None
+            await music_player._prefetch_task
+        assert spawned == ["prefetch"]
+
+    async def test_a_shuffle_with_nothing_playing_spawns_no_prefetch(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Only loop() prefetches for an idle queue: the next start claims the
+        head itself, and a prefetch claim with no song to hide behind would pin
+        the head of a queue the user may still be editing."""
+        for i in range(4):
+            await music_player.queue_put(
+                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            )
+        music_player.current_song = None
+        assert await music_player.queue_shuffle() == "Shuffled!"
+        assert music_player._prefetch_task is None
 
     async def test_shuffle_empty_queue_returns_error(
         self, music_player: MusicPlayer
     ) -> None:
         result = await music_player.queue_shuffle()
-        assert result == "There must be at least 3 songs to shuffle the queue"
+        assert result == "There must be at least 4 songs to shuffle the queue"
 
     async def test_shuffle_sufficient_songs_returns_shuffled(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -8395,6 +8463,26 @@ class TestInterject:
 
         assert attrs["interject.depth"] == 1
         assert attrs["interject.over_interjection"] is True
+
+    async def test_the_resume_tail_keeps_the_interjected_marker(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The tail is the same play, so a song that was itself a -playnow comes
+        back saying so. Attribution-only today: the span above reads it at the
+        second and later levels of a stack."""
+        live_song.elapsed_secs = 30.0
+        live_song.interjected = True
+        music_player.current_song = live_song
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        tail = queue_object(music_player.queue.display_items()[-1])
+        assert tail.is_resume is True
+        assert tail.interjected is True
 
     async def test_interject_marks_the_stop_as_deliberate_before_stopping(
         self,

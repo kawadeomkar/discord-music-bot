@@ -26,7 +26,8 @@ from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
 from src.musicbot import MusicBot as MusicBotCog
 from src.util import spawn_background
-from tests.helpers import command_callback
+from src.guild_queue import QueueObject
+from tests.helpers import command_callback, seed_queue
 from src.musicplayer import MusicPlayer
 from src.debug import (
     DebugAction,
@@ -376,6 +377,31 @@ class TestGuildBlock:
         assert "player       yes" in lines
         assert "queue        0 queued" in lines
         assert "volume       50%" in lines
+
+    async def test_a_claimed_song_still_counts_as_queued(
+        self,
+        mock_guild: MagicMock,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+    ) -> None:
+        """The row renders display_size(), the number -queue shows. On qsize() it
+        drops a song the loop has claimed but not yet started — which is most of
+        every song — and an operator reading two depths from two commands cannot
+        tell which one is lying."""
+        mock_guild.voice_client = None
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/watch?v=claimed", "Claimed", mock_author),
+        )
+        await music_player.queue.get()
+        assert music_player.queue.qsize() == 0
+
+        lines = "\n".join(
+            guild_lines(
+                mock_guild, self._inputs(player=music_player), source="saved here"
+            )
+        )
+        assert "queue        1 queued" in lines
 
     @pytest.mark.parametrize(
         "name",

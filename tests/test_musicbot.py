@@ -4,6 +4,8 @@ from src.musicplayer import MusicPlayer
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
+import inspect
+import re
 import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
@@ -2465,6 +2467,20 @@ class TestHistoryCommand:
         assert guard.number == 1
         assert guard.per is commands.BucketType.guild
         assert guard.wait is False
+
+    def test_the_shuffle_copy_and_the_refusal_quote_the_same_number(self) -> None:
+        """The FIXME this closed was exactly this drift: the code refused at one
+        number while -help promised another, so a user meeting the stated
+        requirement was turned away. Nothing else reads both strings."""
+        help_text = MusicBot.shuffle.help
+        assert help_text is not None
+        promised = re.search(r"at least (\d+) ", help_text)
+        refused = re.search(
+            r"There must be at least (\d+) songs",
+            inspect.getsource(MusicPlayer.queue_shuffle),
+        )
+        assert promised is not None and refused is not None
+        assert promised.group(1) == refused.group(1)
 
     def test_help_copy_states_the_real_retention_window(self) -> None:
         """The user-facing copy must name the window the command actually keeps: 50
