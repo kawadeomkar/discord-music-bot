@@ -2,11 +2,75 @@ import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final, Optional, Union
+from urllib.parse import parse_qs, urlsplit
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
-from src.util import get_logger
+from src.util import get_logger, safe_label
 
 log = get_logger(__name__)
+
+# YouTube's older share format: ?t=1m30s, ?t=90s, ?t=1h2m3s. Still widely
+# present in the wild — every "copy link at current time" from an older client
+# emits it, and old messages are re-pasted for years.
+_HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+
+# Quoted back to the user when their timestamp does not parse. Lives beside the
+# regex so the accepted shapes have one definition.
+TIMESTAMP_FORMATS: Final = "`90`, `90s`, `1m30s`, `2h30m15s`"
+
+
+def parse_timestamp(raw: str) -> Optional[int]:
+    """Seconds from a YouTube `t`/`ts` value, or None if it isn't one.
+
+    Accepts both shapes YouTube has shipped: bare seconds ("90") and the
+    colon-free HMS form ("1m30s", "90s", "1h2m3s"). Returns None rather than
+    raising, because a timestamp is an optional refinement of a URL — an
+    unparseable one must degrade to "play from the start", never to "this
+    wasn't a URL at all" (which is what `int(v)` raising used to cause: the
+    ValueError escaped parse_url and parse_input converted the whole link into
+    a YouTube *search* for the URL text).
+    """
+    raw = raw.strip().lower()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    match = _HMS_RE.fullmatch(raw)
+    # `fullmatch` on an all-optional pattern also matches the empty string and
+    # any leftover garbage matches nothing, so require at least one group.
+    if match is None or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
+
+# The unparseable `t=` echoed back to the user. Short: it is quoted inside a
+# sentence, and a pasted URL fragment can be arbitrarily long.
+_TIMESTAMP_ECHO_MAX = 40
+
+
+def timestamp_warning(
+    source: Union["SpotifySource", "YTSource", "SoundcloudSource"],
+) -> Optional[str]:
+    """One line naming a `t=` value that did not parse, or None.
+
+    Lives beside the parser so the accepted shapes have one definition and the
+    sentence quoting them cannot drift from what parse_timestamp takes. Returns
+    text rather than an embed: this module stays free of discord, and the cog
+    owns how a notice is rendered.
+
+    Stated rather than silent, for the reason the playlist branch reports its
+    skipped count: something the user wrote in their own URL changed where the
+    song starts, and nothing else in the response accounts for it."""
+    if not isinstance(source, YTSource) or source.bad_timestamp is None:
+        return None
+    # safe_label, not the raw value: it is rendered inside a code span below and
+    # a backtick in it would close that span.
+    shown = safe_label(source.bad_timestamp, _TIMESTAMP_ECHO_MAX)
+    return (
+        f"⚠️ Couldn't read the timestamp `{shown}` in that link — starting from "
+        f"the beginning. YouTube's `t=` takes {TIMESTAMP_FORMATS}."
+    )
 
 
 class URLSource(Enum):
@@ -58,7 +122,6 @@ class YTType(Enum):
 class SpotifySource:
     type: SpotifyType
     id: str
-    si: Optional[str] = None
     process: bool = True
     stype: URLSource = URLSource.SPOTIFY
 
@@ -85,6 +148,11 @@ class YTSource:
     list_id: Optional[str] = None
     index: Optional[int] = None
     video_id: Optional[str] = None
+    # The raw `t`/`ts` value that failed to parse, set only when no usable
+    # timestamp was found. Read once at the command layer to warn the requester
+    # and never persisted, so it carries none of the propagation contracts the
+    # fields below do.
+    bad_timestamp: Optional[str] = None
     # Ask-time analytics (guild_state.Analytics), carried onto the QueueObject
     # this resolves into. Parse-layer minting leaves the zero value — the real
     # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
@@ -144,7 +212,7 @@ def spotify_playlist_to_ytsearch(
     ask-time analytics and `origin` are set here because it is the last point that
     knows where these came from — each resolves to a YouTube URL at dequeue.
     `analytics` is the head's; per-track positions are derived from it, as in
-    yt_playlist. `origin` is the album/playlist link the user pasted."""
+    yt_playlist. `origin` is the collection link the user pasted."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
@@ -170,34 +238,61 @@ def _playlist_index(raw: str) -> Optional[int]:
     return value if value >= 1 else None
 
 
+def _last(args: dict[str, list[str]], key: str) -> Optional[str]:
+    """Last value of a repeated query key. Matches a left-to-right scan in which
+    each assignment overwrites the one before."""
+    values = args.get(key)
+    return values[-1] if values else None
+
+
 def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
     domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path."""
-    domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
-    args_re = r"(\?|\&)([^=]+)\=([^&]+)"
+    # Inside a character class `+` and `|` are literals, so a wider spelling
+    # accepts "you+tube|com" as a hostname. `-` is included because hostnames
+    # carry it: without it re.search starts matching after the hyphen and
+    # "my-site.com" is read as the host "site.com", which is what lands in the
+    # archive's query_source.
+    domain_re = r"(https:\/\/)?(www\.)?([\w.-]+)\/([^?]*)"
 
     domain_match = re.search(domain_re, url)
-    args_match = re.findall(args_re, url)
 
     if not domain_match:
         raise ValueError(f"Not a recognised URL: {url!r}")
 
     domain = domain_match.group(3)
+    # Query parsing via urllib rather than a hand-rolled regex: it handles
+    # percent-encoding and repeated keys correctly, and it works on scheme-less
+    # input ("youtu.be/x?t=90") because urlsplit only needs the "?" to find the
+    # query — which is exactly the shape users paste.
+    args = parse_qs(urlsplit(url).query)
 
     if domain in ("youtube.com", "youtu.be"):
         ts: Optional[int] = None
         list_id: Optional[str] = None
-        index: Optional[int] = None
-        video_id: Optional[str] = None
-        for _, k, v in args_match:
-            if k == "ts" or k == "t":
-                ts = int(v)
-            elif k == "list":
-                list_id = v
-            elif k == "index":
-                index = _playlist_index(v)
-            elif k == "v":
-                video_id = v
+        # `t` and `ts` are the same parameter under two names; `ts` wins if a URL
+        # somehow carries both.
+        unparsed: list[str] = []
+        for key in ("t", "ts"):
+            for raw in args.get(key, []):
+                parsed = parse_timestamp(raw)
+                if parsed is None:
+                    # Keep the URL and start at 0:00. An unparseable timestamp
+                    # must not raise: parse_url's ValueError means "not a URL",
+                    # which sends parse_input to search for the link's own text.
+                    log.info(f"Ignoring unparseable timestamp {raw!r} in {url!r}")
+                    unparsed.append(raw)
+                else:
+                    ts = parsed
+        # Only worth reporting when nothing usable was found: a URL carrying both
+        # a bad `t` and a good `ts` does start where the user asked.
+        bad_timestamp = unparsed[-1] if ts is None and unparsed else None
+        list_id = _last(args, "list")
+        raw_index = _last(args, "index")
+        index: Optional[int] = (
+            _playlist_index(raw_index) if raw_index is not None else None
+        )
+        video_id = _last(args, "v")
         if list_id is not None:
             return YTSource(
                 url,
@@ -207,9 +302,16 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
                 list_id=list_id,
                 index=index,
                 video_id=video_id,
+                bad_timestamp=bad_timestamp,
                 query_source=QUERY_SOURCE_YOUTUBE,
             )
-        return YTSource(url, ts=ts, process=False, query_source=QUERY_SOURCE_YOUTUBE)
+        return YTSource(
+            url,
+            ts=ts,
+            process=False,
+            bad_timestamp=bad_timestamp,
+            query_source=QUERY_SOURCE_YOUTUBE,
+        )
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
         try:
@@ -238,6 +340,23 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
+def unquote_argument(text: str) -> str:
+    """Drop one matched pair of surrounding quotes.
+
+    `-play` takes a consume-rest argument, which discord.py's `read_rest()` hands
+    through with the quotes: parse_url then drags the trailing one into the path and
+    yt-dlp rejects it, and a quoted search stores `"some song"` as the origin, which
+    `-remove some song` cannot match.
+
+    Only a whole argument wrapped at both ends, and never down to nothing — a lone
+    quote or an empty pair is text the user typed. Runs here and at the command,
+    which unquotes the value it stamps `origin` from, so it must be safe twice."""
+    for quote in ('"', "'"):
+        if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
+            return text[1:-1]
+    return text
+
+
 def parse_input(user_input: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """Top-level entry point for command input: tries parse_url, falls back to ytsearch.
     parse_url is attempted only for single-word input, since URLs never contain spaces; a
@@ -254,10 +373,10 @@ def parse_input(user_input: str) -> Union[SpotifySource, YTSource, SoundcloudSou
         try:
             # args[0], not user_input: the token without whatever whitespace
             # surrounded it, since parse_url hands this straight to YTSource.url.
-            return parse_url(args[0])
+            return parse_url(unquote_argument(args[0]))
         except ValueError:
             pass
-    ytsearch = " ".join(args)
+    ytsearch = unquote_argument(" ".join(args))
     return YTSource(
         ytsearch=f"ytsearch:{ytsearch}",
         process=True,

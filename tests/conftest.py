@@ -8,6 +8,7 @@ from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import fakeredis
 import pytest
@@ -15,12 +16,15 @@ import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
+import src.spotify as spotify_mod
+import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.musicbot import MusicBot
 from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
+from src.youtube import close_probe_session
 from tests.helpers import noop_ffmpeg_init, tier_enabled
 
 
@@ -63,6 +67,63 @@ def pytest_collection_modifyitems(
         file=sys.stderr,
     )
     raise pytest.UsageError(f"{tier} tier selected but not enabled")
+
+
+@pytest.fixture(autouse=True)
+def reset_probe_streak() -> Iterator[None]:
+    """Zero the process-wide unconfirmed-probe streak between tests.
+
+    The streak is deliberately module-global (the condition it detects is
+    process-wide), so without this one test's unconfirmed probes change how the NEXT
+    test's cached URL is handled — order-dependent and silent.
+    """
+    import src.youtube as youtube
+
+    youtube._unconfirmed_streak = 0
+    yield
+    youtube._unconfirmed_streak = 0
+
+
+@pytest.fixture(autouse=True)
+async def close_shared_http_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[None]:
+    """Close the process-lifetime HTTP sessions after every test.
+
+    Production closes them in MusicBotApp.close() and the cog's unload; nothing
+    calls those here, and a surviving ClientSession fails an unrelated later test
+    through aiohttp's __del__ ResourceWarning. Wrapping _session_or_create covers
+    a Spotify instance built inside a test body.
+    """
+    # close_probe_session() latches the module closed for good, which is right for
+    # a process that exits after it and wrong for a suite that keeps going.
+    monkeypatch.setattr(youtube_mod, "_probe_session_closed", False)
+
+    created: list[tuple[Any, Any]] = []
+    original = spotify_mod.Spotify._session_or_create
+
+    def tracked(self: Any) -> Any:
+        session = original(self)
+        if not any(s is session for _, s in created):
+            created.append((self, session))
+        return session
+
+    monkeypatch.setattr(spotify_mod.Spotify, "_session_or_create", tracked)
+
+    yield
+
+    try:
+        for owner, session in created:
+            # Only real sessions: a test-injected factory usually returns a mock,
+            # whose close() is not awaitable.
+            if isinstance(session, aiohttp.ClientSession) and not session.closed:
+                await session.close()
+            # Clear the handle too. _session_or_create refuses to rebuild after
+            # aclose() and hands back whatever is stored otherwise, so an instance
+            # outliving its test would otherwise be holding a closed session.
+            owner._session = None
+    finally:
+        await close_probe_session()
 
 
 @pytest.fixture(autouse=True)
@@ -386,7 +447,14 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog._play_inflight = set()
-    cog.spotify = MagicMock()
+    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
+    # rejects an attribute Spotify does not have, which is how a renamed method
+    # gets caught here rather than passing against a mock that invents it. spec
+    # covers the class, so the credentials __init__ assigns are set by hand —
+    # -ping reads them to tell "unconfigured" from "configured and rejected".
+    cog.spotify = MagicMock(spec=Spotify)
+    cog.spotify.client_id = "cid"
+    cog.spotify.client_secret = "secret"
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     # None, not a mock: this fixture builds the cog without __init__, so an unset
@@ -428,7 +496,14 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.bot = mock_bot
     cog.mps = {}
     cog._play_inflight = set()
-    cog.spotify = MagicMock()
+    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
+    # rejects an attribute Spotify does not have, which is how a renamed method
+    # gets caught here rather than passing against a mock that invents it. spec
+    # covers the class, so the credentials __init__ assigns are set by hand —
+    # -ping reads them to tell "unconfigured" from "configured and rejected".
+    cog.spotify = MagicMock(spec=Spotify)
+    cog.spotify.client_id = "cid"
+    cog.spotify.client_secret = "secret"
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
     # None, not a mock, and set explicitly: this fixture builds the cog without

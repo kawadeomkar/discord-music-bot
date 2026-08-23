@@ -40,9 +40,9 @@ from src.dashboard import run_live_dashboard
 # TICK is a CEILING on how long it waits before re-rendering, not a cadence: the
 # loop wakes on the first probe to finish. Defined in config.py so there is one
 # answer to "what does this bot read from the environment?".
+from src import config
 from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
-    ENVIRONMENT,
     PING_DEADLINE_SECS,
     PING_TICK_SECS,
     SpotifyStatus,
@@ -410,7 +410,7 @@ def render_ping_embed(
     embed.add_field(
         name="Versions", value="```\n" + "\n".join(ver_lines) + "\n```", inline=False
     )
-    footer = f"environment: {ENVIRONMENT}"
+    footer = f"environment: {config.ENVIRONMENT}"
     if any(r.state is ProbeState.PENDING for r in rows):
         footer += " · probing…"
     if (tf := trace_footer(span)) is not None:

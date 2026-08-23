@@ -35,7 +35,6 @@ from src import config
 from src.config import (
     DEBUG_DEADLINE_SECS,
     DEBUG_TICK_SECS,
-    ENVIRONMENT,
     debug_mode_default,
 )
 from src.dashboard import run_live_dashboard
@@ -322,10 +321,18 @@ class _ConfigVar:
     # What the bot uses when the variable is unset, as text. Read from config's own
     # resolved constants where there is one, so this can't drift from the real default.
     fallback: Optional[str] = None
+    # For a default main() can still replace. src.main imports this module, so that
+    # assignment lands after this tuple is built and a stored string would freeze
+    # the pre-inference value.
+    fallback_factory: Optional[Callable[[], str]] = None
 
 
 _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
-    _ConfigVar(name="ENVIRONMENT", kind=_ConfigKind.VALUE, fallback=ENVIRONMENT),
+    _ConfigVar(
+        name="ENVIRONMENT",
+        kind=_ConfigKind.VALUE,
+        fallback_factory=lambda: config.ENVIRONMENT,
+    ),
     _ConfigVar(name="DEBUG_MODE", kind=_ConfigKind.VALUE, fallback="false"),
     _ConfigVar(
         name="HISTORY_ARCHIVE_ENABLED", kind=_ConfigKind.VALUE, fallback="false"
@@ -345,6 +352,11 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
         fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
+    ),
+    _ConfigVar(
+        name="HEARTBEAT_INTERVAL_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.HEARTBEAT_INTERVAL_SECS),
     ),
     _ConfigVar(
         name="PING_TICK_SECS",
@@ -470,7 +482,8 @@ def render_config_value(var: _ConfigVar) -> str:
         # issue; a value here is one paste away from a leaked credential.
         return "set" if (raw or "").strip() else "unset"
     if raw is None or not raw.strip():
-        return "unset" if var.fallback is None else f"{var.fallback} (default)"
+        fallback = var.fallback_factory() if var.fallback_factory else var.fallback
+        return "unset" if fallback is None else f"{fallback} (default)"
     if var.kind is _ConfigKind.URL:
         return redact_url(raw.strip(), hide_host=True)
     return raw.strip()
@@ -611,7 +624,7 @@ def build_lines(sha: Optional[str]) -> list[str]:
     return [
         f"version      {bot_version()}",
         f"commit       {sha if sha is not None else 'unknown'}",
-        f"environment  {ENVIRONMENT}",
+        f"environment  {config.ENVIRONMENT}",
         f"container    {'yes' if _in_container() else 'no'}",
     ]
 
@@ -1206,7 +1219,7 @@ _PROMETHEUS_MAX_BYTES = 1 << 20
 _prometheus_session_cache: Optional[aiohttp.ClientSession] = None
 
 
-async def _prometheus_session() -> aiohttp.ClientSession:
+def _prometheus_session() -> aiohttp.ClientSession:
     """The process's Prometheus session, created on first use.
 
     One per query cost an extra connect every time — 0.92 ms against 0.37 ms on
@@ -1252,7 +1265,7 @@ async def read_container_metrics(
         f'{{__name__=~"{"|".join(_CONTAINER_METRICS)}",container_name="{container}"}}'
     )
     try:
-        session = await _prometheus_session()
+        session = _prometheus_session()
         async with session.get(
             f"{base_url.rstrip('/')}/api/v1/query", params={"query": selector}
         ) as response:
@@ -1740,7 +1753,7 @@ def render_snapshot_embed(
     # and Build — and on a `just run` deployment it is the git branch name. Known and
     # inherited rather than decided here: -ping prints this identical footer to every
     # caller, so gating it would hide nothing the sibling command does not disclose.
-    footer = f"environment: {ENVIRONMENT}"
+    footer = f"environment: {config.ENVIRONMENT}"
     if (tf := trace_footer(trace.get_current_span())) is not None:
         footer += f" \u00b7 {tf}"
     if inputs.debug_suffix:
@@ -1883,7 +1896,7 @@ class DebugSettings:
         # the durable copy agrees.
         self._unpersisted: set[int] = set()
         self._sampler = RuntimeSampler()
-        if self._default and ENVIRONMENT == "production":
+        if self._default and config.ENVIRONMENT == "production":
             # Debug modes announce themselves in production; the convention is
             # Flask's and Django's. Observation-only, so this is an advisory, not
             # a refusal — but a production deployment should have chosen it.

@@ -13,7 +13,7 @@ from typing import (
     assert_never,
     cast,
 )
-from collections.abc import AsyncGenerator, Coroutine, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 
 import discord
 from discord.ext import commands
@@ -46,6 +46,8 @@ from src.redis_client import (
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, item_label
 from src.sources import (
     QUERY_SOURCE_SEARCH,
+    timestamp_warning,
+    unquote_argument,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -73,16 +75,19 @@ from src.ping import run_health_dashboard, send_latency_line
 from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
+    EMBED_FIELD_LIMIT,
     background_typing,
     cancel_task,
     fmt_duration,
     notice_embed,
     pluralize,
     queue_message,
+    safe_label,
     record_span_error,
     send_embed,
     spawn_background,
     trace_footer,
+    truncate,
     truncate_embed_title,
     get_logger,
 )
@@ -301,37 +306,47 @@ def split_play_args(argument: str) -> PlayArgs:
     return PlayArgs(mode=PlayMode.NORMAL, query=stripped)
 
 
-# What a user typed, echoed back into an embed. Discord renders markdown in embed
-# descriptions and field values, so an unescaped needle lets any member make the
-# bot post a styled masked link under its own name. 200 leaves room for the
-# surrounding sentence inside the 1024-char field cap even after escaping doubles
-# the length.
+# Bound on one echoed needle, which owns a field to itself. Discord renders
+# markdown in field values, so what a user typed goes through safe_label first.
 _ECHO_MAX = 200
 
+# One row of a multi-row field — ten of these share the budget one needle gets.
+_ECHO_ROW_MAX = 70
 
-def _echo(needle: str) -> str:
-    """A needle safe to put in an embed: escaped, then bounded."""
-    shown = needle if len(needle) <= _ECHO_MAX else needle[:_ECHO_MAX] + "\u2026"
-    return discord.utils.escape_markdown(shown)
+
+# The most dropped positions worth spelling out; past this the list says nothing
+# the count above it did not.
+_MAX_SHOWN_POSITIONS = 60
+
+
+def _echo(text: str, limit: int = _ECHO_MAX) -> str:
+    """A needle safe to put in an embed — see util.safe_label."""
+    return safe_label(text, limit)
+
+
+def _field(value: str) -> str:
+    """An embed field value that cannot 400 the send. The callers below build from
+    lists whose length is the user's to choose, and the send happens AFTER the
+    queue has been mutated."""
+    return truncate(value, EMBED_FIELD_LIMIT)
 
 
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
-    """How the removal matched, for the reply's "Matched" field.
-
-    An origin match is the one that needs explaining: one argument can take out a
-    whole album, so the reply names which of the user's own inputs did it. The
-    resolved-URL case reads as it always has.
-    """
+    """How the removal matched, for the reply's "Matched" field. An origin match
+    names which of the user's own inputs did it, since one argument can take out a
+    whole playlist."""
+    # Not wrapped in a code span: inside one Discord renders safe_label's
+    # backslashes literally, so `-remove foo_bar` comes back as `foo\_bar`.
     shown = _echo(needle)
     if outcome.mode is not RemoveMode.ORIGIN:
-        return f"`{shown}`"
+        return shown
     kinds = {item.query_source for item in outcome.removed if item.query_source}
     # Only when every removed item agrees — a mixed set has no one kind to name.
     kind = kinds.pop() if len(kinds) == 1 else ""
     them = "them" if len(outcome.removed) > 1 else "it"
     if kind == QUERY_SOURCE_SEARCH:
-        return f"`{shown}` — the search you queued {them} with"
-    return f"`{shown}` — the {kind + ' ' if kind else ''}link you queued {them} with"
+        return f"{shown} — the search you queued {them} with"
+    return f"{shown} — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -647,15 +662,36 @@ class MusicBot(commands.Cog):
     async def cog_unload(self) -> None:
         """Stop the runtime sampler unconditionally. A reload that left it running
         would drip /proc reads for the life of the process. The shared Prometheus
-        session goes with it, or a reload leaks a connector per load.
+        and Spotify sessions go with it, or a reload leaks a connector per load.
 
         The background tasks go FIRST: the hydration ends in sync_sampler, so one
         still in flight would restart the sampler straight after aclose() and leak
         it, holding a dead cog alive.
+
+        Every step is guarded individually, like MusicBotApp.close(): Cog._eject
+        only logs what this raises and BotBase.close swallows it, so an early
+        failure would silently skip the rest and nothing would say so.
         """
-        await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
-        await self.debug_settings.aclose()
-        await debug_mode.close_prometheus_session()
+        spotify = self.spotify
+
+        async def _cancel_background() -> None:
+            await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
+
+        # Callables, not coroutines: building them up front would schedule the
+        # gather before its turn and leave the rest un-awaited on any early exit,
+        # which pytest's filterwarnings=error turns into a failure.
+        steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("background tasks", _cancel_background),
+            ("runtime sampler", self.debug_settings.aclose),
+            ("prometheus session", debug_mode.close_prometheus_session),
+        ]
+        if spotify is not None:
+            steps.append(("spotify session", spotify.aclose))
+        for name, step in steps:
+            try:
+                await step()
+            except Exception as e:
+                log.warning(f"cog unload step failed ({name}): {e}")
 
     async def _validate_spotify_credentials(self) -> None:
         """Background credential probe (spawned by cog_load, never awaited). Only
@@ -734,6 +770,7 @@ class MusicBot(commands.Cog):
             teardown = [
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
+                cancel_task(mp._heartbeat_task),
                 cancel_task(mp._pause_debounce_task),
                 cancel_task(mp._player),
                 cancel_task(mp._restore_task),
@@ -1074,6 +1111,8 @@ class MusicBot(commands.Cog):
             Placement.COLD_FRONT: mp.queue_put_front,
             Placement.NEXT: mp.queue_put_next,
         }[placement]
+        warning = timestamp_warning(source)
+        warning_line = f"\n\n{warning}" if warning else ""
         # Said, not implied: "Queued playlist" reads as "at the back" to anyone who
         # has used the command without a flag. Appended rather than woven in, so
         # both branches' titles keep the shape they already had.
@@ -1084,11 +1123,13 @@ class MusicBot(commands.Cog):
                 titles, analytics=analytics, origin=origin
             )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
+            shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
             await asyncio.gather(
                 send_embed(
                     ctx,
                     "Queued playlist" + next_suffix,
-                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
+                    f"{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
@@ -1117,12 +1158,16 @@ class MusicBot(commands.Cog):
                 if qobj.skipped
                 else ""
             )
+            shown_titles = queue_message(
+                [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+            )
             await asyncio.gather(
                 send_embed(
                     ctx,
                     f"Queued playlist — {count} "
                     f"{pluralize(count, 'song')}{next_suffix}",
-                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n{skipped_line}\n{queue_message([q.title for q in islice(tracks, 10)])}",
+                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
+                    f"{skipped_line}\n{shown_titles}{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
@@ -1166,7 +1211,13 @@ class MusicBot(commands.Cog):
         *,
         placement: Placement = Placement.TAIL,
         note: str = "",
+        warning: Optional[str] = None,
     ) -> None:
+        """`warning` rides the confirmation embed when there is one. Every exit
+        below sends it either way: the embed is conditional (a song that starts
+        immediately gets none) and the warning is about what the user typed, so
+        losing it on the quietest path would hide it in the common case of
+        queueing the first song."""
         vc = ctx.voice_client
         if placement is Placement.COLD_FRONT:
             # The "Est. playing at" embed below would be wrong: a restored queue is
@@ -1181,6 +1232,10 @@ class MusicBot(commands.Cog):
             ]
             if resume_notice is not None:
                 coros.append(ctx.send(embed=resume_notice))
+            if warning is not None:
+                coros.append(
+                    ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                )
             await asyncio.gather(*coros)
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
@@ -1193,10 +1248,15 @@ class MusicBot(commands.Cog):
             # different clock from the progress bar, -queue and the presence line,
             # which is a bug this repo has had once already. Naming the song it
             # waits behind is exact and needs no new arithmetic.
-            await asyncio.gather(
+            coros: list[Coroutine[Any, Any, Any]] = [
                 mp.queue_put_next(qobj),
                 self._send_playing_next(ctx, qobj, note=_plays_after_note(mp, vc)),
-            )
+            ]
+            if warning is not None:
+                coros.append(
+                    ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                )
+            await asyncio.gather(*coros)
             log.info(f"play (next) qsize: {mp.queue.qsize()}")
             return
 
@@ -1213,6 +1273,7 @@ class MusicBot(commands.Cog):
             ctx.message.add_reaction("👍"),
         ]
         if should_show_queued:
+            warning_line = f"\n\n{warning}" if warning else ""
             coros.append(
                 send_embed(
                     ctx,
@@ -1221,11 +1282,16 @@ class MusicBot(commands.Cog):
                         f"Requested by: [{ctx.author.mention}]\n"
                         f"{qobj.title} - ({qobj.webpage_url})\n"
                         f"Est. playing at {mp.estimated_playing_at()}{note}"
+                        f"{warning_line}"
                     ),
                     discord.Color.blue(),
                     thumbnail=qobj.thumbnail,
                 )
             )
+        elif warning is not None:
+            # Nothing else is being sent on this path — the song starts now and
+            # the NP card speaks for it — so the warning needs its own message.
+            coros.append(ctx.send(embed=notice_embed(warning, discord.Color.orange())))
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
@@ -1331,7 +1397,9 @@ class MusicBot(commands.Cog):
         # the flag off it. Threading args.query per call site instead would leave a
         # fourth to miss, and a leaked flag persists a user_input -remove cannot
         # match — silently, since nothing else reads that field.
-        url = args.query
+        # read_rest hands the quotes through, and a quoted origin is one
+        # -remove would have to match literally.
+        url = unquote_argument(args.query)
         # The error title names the branch, not the flag: `-p --now x` on an idle
         # bot queues like any other -play, and "failed to play song now" would
         # describe an interjection that never happened.
@@ -1527,7 +1595,13 @@ class MusicBot(commands.Cog):
                             return
 
                     if isinstance(qobj, QueueObject):
-                        await self._enqueue_single(ctx, qobj, mp, placement=placement)
+                        await self._enqueue_single(
+                            ctx,
+                            qobj,
+                            mp,
+                            placement=placement,
+                            warning=timestamp_warning(source),
+                        )
                     else:
                         await self._enqueue_playlist(
                             ctx,
@@ -1692,7 +1766,9 @@ class MusicBot(commands.Cog):
                 ]
                 await mp.queue_put(follow_on, prefetch=False)
                 note = _collection_note(url, len(follow_on) + 1, head_playing=False)
-            await self._enqueue_single(ctx, qobj, mp, note=note)
+            await self._enqueue_single(
+                ctx, qobj, mp, note=note, warning=timestamp_warning(source)
+            )
             return
 
         outcome = await mp.interject(
@@ -1814,13 +1890,22 @@ class MusicBot(commands.Cog):
             # Primitives, not the object — the player thread calls cleanup() on it.
             skipped_title: Optional[str] = None
             skipped_position = ""
-            if vc.is_paused():
-                song = self.get_mp(ctx).current_song
+            assert ctx.guild is not None  # validate_commands rejects DMs before this
+            # mps, not get_mp(): this must not build a player, and one lookup keeps
+            # the mark and the paused read on the same object — cog_before_invoke can
+            # rebuild a player mid-command.
+            mp_for_stop = self.mps.get(ctx.guild.id)
+            if vc.is_paused() and mp_for_stop is not None:
+                song = mp_for_stop.current_song
                 if song is not None:
                     skipped_title = song.title
                     # position_secs is frozen while paused: the exact leave point.
                     skipped_position = fmt_duration(int(song.position_secs))
 
+            # Before vc.stop(): a skip inside ffmpeg's startup window otherwise looks
+            # exactly like a stream that never opened.
+            if mp_for_stop is not None:
+                mp_for_stop.note_deliberate_stop()
             vc.stop()
 
             coros: list[Coroutine[Any, Any, Any]] = []
@@ -2058,6 +2143,18 @@ class MusicBot(commands.Cog):
     async def shuffle(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
+            # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
+            # so running it before restore_entries() has replayed the saved queue
+            # writes an unrestored deque over it and deletes the persisted entries.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
             async with background_typing(ctx):
                 await ctx.send(
                     embed=notice_embed("Please wait... shuffling", discord.Color.blue())
@@ -2156,7 +2253,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            description = queue_message(cleared)
+            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
@@ -2235,29 +2332,42 @@ class MusicBot(commands.Cog):
                 await send_embed(
                     ctx,
                     "",
-                    f"No queued songs found matching: `{_echo(needle)}`",
+                    f"No queued songs found matching: {_echo(needle)}",
                     discord.Color.red(),
                 )
                 return
             count = len(positions)
             noun = pluralize(count, "song")
             pos_label = pluralize(count, "Position")
-            pos_str = ", ".join(str(p) for p in positions)
+            # Capped by count: one -remove of a collection link drops as many
+            # positions as the collection had, and a raw join passes the 1024-char
+            # field limit at 227 of them — a 400 for a removal that already
+            # happened.
+            shown = positions[:_MAX_SHOWN_POSITIONS]
+            pos_str = ", ".join(str(p) for p in shown)
+            if len(positions) > len(shown):
+                pos_str += f", …and {len(positions) - len(shown)} more"
             await send_embed(
                 ctx,
                 f"Removed {count} {noun} from the queue",
                 "",
                 discord.Color.orange(),
                 fields=[
-                    ("Matched", _matched_label(outcome, needle), False),
-                    (f"{pos_label} removed", pos_str, False),
-                    # Titles, like -clear reports: one argument can now take out a
-                    # whole playlist, and a bare count leaves the user unable to
-                    # tell whether it took what they meant. There is no undo.
+                    ("Matched", _field(_matched_label(outcome, needle)), False),
+                    (f"{pos_label} removed", _field(pos_str), False),
+                    # Titles, like -clear reports: one argument can take out a whole
+                    # playlist, and there is no undo, so a bare count is not enough
+                    # to tell whether it took what the user meant.
                     (
                         "Songs",
-                        queue_message(
-                            [_echo(item_label(i) or "?") for i in outcome.removed]
+                        _field(
+                            queue_message(
+                                [
+                                    _echo(item_label(i), _ECHO_ROW_MAX)
+                                    # Sliced before the echo: queue_message keeps 10.
+                                    for i in outcome.removed[:10]
+                                ]
+                            )
                         ),
                         False,
                     ),

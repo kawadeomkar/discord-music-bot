@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
@@ -11,7 +12,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src import config
-from src.config import ENVIRONMENT, spotify_enabled
+from src.config import spotify_enabled
 
 # Reaches yt_dlp transitively (src.debug -> src.ping -> yt_dlp.version), and the
 # console script imports THIS module at module scope — so the yt-dlp pool's
@@ -41,8 +42,36 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-intents = discord.Intents.all()
-intents.message_content = True
+
+def _build_intents() -> discord.Intents:
+    """The gateway events this bot subscribes to.
+
+    `presences` is deliberately absent: it is privileged — which blocks bot
+    verification past 100 guilds — and nothing here reads a presence update.
+    `change_presence()` SENDS our own and needs no intent for it.
+    """
+    intents = discord.Intents.none()
+    # Guild/channel/voice-client cache. Everything else assumes it.
+    intents.guilds = True
+    # on_voice_state_update, plus the VoiceChannel.members behind the
+    # alone-in-channel disconnect timer.
+    intents.voice_states = True
+    # Prefix commands dispatch from on_message, so the events have to arrive at
+    # all — message_content alone does not deliver them.
+    intents.guild_messages = True
+    # -help renders in a DM and -debug answers one; both are pinned by tests.
+    intents.dm_messages = True
+    # Privileged. Without it every message arrives with empty content and no
+    # command ever matches.
+    intents.message_content = True
+    # Privileged. guild.get_member() rehydrates a queue entry's requester and
+    # backs VoiceChannel.members; the event-driven cache alone goes patchy
+    # across a restart.
+    intents.members = True
+    return intents
+
+
+intents = _build_intents()
 EXTENSIONS = ("src.musicbot",)
 
 
@@ -161,6 +190,7 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
+        self._liveness_task: Optional[asyncio.Task] = None
         # Postgres play-history archive + its outbox drainer, built in setup_hook while
         # HISTORY_ARCHIVE_ENABLED (the opt-in consent gate for long-term storage). None
         # is the disabled shape — the default — and every consumer handles it:
@@ -171,12 +201,34 @@ class MusicBotApp(commands.AutoShardedBot):
         # discord.py or a signal handler calls close().
         self._teardown_started = False
 
+    async def _liveness_heartbeat(self) -> None:
+        """Touch LIVENESS_FILE on a fixed cadence for the container HEALTHCHECK.
+
+        Answers one question: is the event loop still turning. A wedged loop
+        stops touching the file and the healthcheck fails on the stale mtime.
+        Probing Redis or Discord here would report the bot dead over a
+        dependency blip, so this stays dependency-free.
+        """
+        path = Path(config.LIVENESS_FILE)
+        while True:
+            try:
+                path.touch()
+            except OSError as e:
+                # An unwritable path degrades to no liveness signal; the
+                # healthcheck then fails on its own rather than the bot dying here.
+                log.warning(f"Liveness touch failed for {path}: {e}")
+            await asyncio.sleep(config.LIVENESS_INTERVAL_SECS)
+
     async def setup_hook(self) -> None:
         # The archive flag is read first, before anything else can consume it: the
         # parser raises on garbage and the next reader would be push_history, which is
         # @_guild_op-wrapped and would swallow that ValueError into one warning per
         # song. Startup is the only place the signal can be loud.
         archive_enabled = config.history_archive_enabled()
+        # Ahead of the pool and the extensions so the file exists early in the
+        # HEALTHCHECK's start-period, and after the flag read, which stays first.
+        if config.LIVENESS_FILE:
+            self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
         if archive_enabled:
@@ -387,7 +439,7 @@ class MusicBotApp(commands.AutoShardedBot):
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
             log.info(f"Bot: {self.user.name} # {self.user.id}")
-        log.info(f"Environment: {ENVIRONMENT}")
+        log.info(f"Environment: {config.ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
         # FIXME: this line is labelled "Bot commands:" but logs the `voice_states`
@@ -405,6 +457,13 @@ class MusicBotApp(commands.AutoShardedBot):
             await super().close()
             return
         self._teardown_started = True
+        # getattr for the same reason as the rest: a close() from run()'s finally
+        # can land before __init__ finished. First in the sequence so a slow
+        # teardown stops reporting itself alive.
+        liveness = getattr(self, "_liveness_task", None)
+        if liveness is not None:
+            liveness.cancel()
+            self._liveness_task = None
         # Two ordering constraints, on different pairs, so they compose:
         #   drainer before archive and Redis — its final drain reads the outbox and
         #     writes Postgres, so both have to still be alive for it.
@@ -451,7 +510,7 @@ class MusicBotApp(commands.AutoShardedBot):
         loop = asyncio.get_running_loop()
         # Awaited directly rather than via the executor below — only aclose() knows
         # which half blocks; it owns its off-loop join and bounds the wait.
-        from src.youtube import ytdlp_pool
+        from src.youtube import close_probe_session, ytdlp_pool
 
         try:
             await ytdlp_pool.aclose()
@@ -460,6 +519,13 @@ class MusicBotApp(commands.AutoShardedBot):
             # timeout, so this arm is for the unexpected — which would otherwise cost
             # the span flush below, the record of the failed shutdown.
             log.warning(f"yt-dlp pool shutdown failed: {e}")
+        try:
+            await close_probe_session()
+        except Exception as e:
+            log.warning(f"stream-probe session shutdown failed: {e}")
+        # Exception, not BaseException, in every guard above: a second Ctrl-C
+        # raises KeyboardInterrupt through them and abandons the rest of this
+        # sequence, which is what a second Ctrl-C is asking for.
         # shutdown_telemetry has no async form and blocks up to 30s flushing spans,
         # so it needs the executor hop.
         from src.telemetry import shutdown_telemetry
@@ -468,6 +534,14 @@ class MusicBotApp(commands.AutoShardedBot):
 
 
 def main() -> None:
+    # Dev convenience: with ENVIRONMENT unset, name it after the current git
+    # branch. An entrypoint is where running a subprocess belongs. Must precede
+    # setup_telemetry(), which stamps the value onto the OTel resource.
+    if not os.environ.get("ENVIRONMENT"):
+        inferred = config.infer_environment_from_git()
+        if inferred is not None:
+            config.ENVIRONMENT = inferred
+
     from src.telemetry import setup_telemetry
 
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves

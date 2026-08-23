@@ -16,13 +16,14 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
+import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, item_label
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
-    _echo,
     DEPTH_RESTORE_WAIT_SECS,
+    _echo,
     HISTORY_MAX_LIMIT,
     EmptyPlaylistError,
     HistoryFlags,
@@ -41,7 +42,16 @@ from src.musicbot import (
     split_play_args,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
+from src.util import EMBED_FIELD_LIMIT
+from src.sources import (
+    SpotifySource,
+    SpotifyType,
+    YTSource,
+    YTType,
+    parse_input,
+    parse_url,
+    timestamp_warning,
+)
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
@@ -1218,6 +1228,7 @@ class TestCleanup:
         mp.store = None
         mp._progress_task = None
         mp._pause_debounce_task = None
+        mp._heartbeat_task = None
         mp.retire_np_host_on_stop = AsyncMock()
         mp.update_activity = AsyncMock()
         # None = nothing was playing, the shape most of these tests mean. A bare
@@ -1295,6 +1306,19 @@ class TestCleanup:
         task.done.return_value = False
         task.cancel = MagicMock()
         self._make_minimal_mp(music_bot, mock_guild, _pause_debounce_task=task)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        task.cancel.assert_called_once()
+
+    async def test_cancels_in_flight_heartbeat_task(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Left running it keeps writing last_position_secs — and refreshing the
+        state key's TTL — over fields clear_connection() is about to delete."""
+        task = AsyncMock(spec=asyncio.Task)
+        task.done.return_value = False
+        task.cancel = MagicMock()
+        self._make_minimal_mp(music_bot, mock_guild, _heartbeat_task=task)
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)
         task.cancel.assert_called_once()
@@ -1707,6 +1731,51 @@ class TestSkipCommand:
         await command_callback(MusicBot.skip)(music_bot, mock_ctx)
         vc.stop.assert_called_once()
 
+    async def test_marks_the_stop_as_deliberate_before_stopping(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A skip inside ffmpeg's startup window is byte for byte what a stream whose
+        host never answered looks like; without the marker the player drops the cached
+        URL of a perfectly good song. Marked BEFORE vc.stop(), which fires `after`
+        immediately."""
+        order: list[str] = []
+        # spec'd: a bare MagicMock invents note_deliberate_stop, so renaming the real
+        # method would leave this green while -skip silently stopped marking.
+        mp = MagicMock(spec=MusicPlayer)
+        mp.note_deliberate_stop = MagicMock(side_effect=lambda: order.append("mark"))
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        vc.stop = MagicMock(side_effect=lambda: order.append("stop"))
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        assert order == ["mark", "stop"]
+
+    async def test_skip_without_a_player_still_stops(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Read from mps, never get_mp(): constructing a player here would start a
+        playback loop as a side effect of stopping a song."""
+        music_bot.mps.pop(mock_ctx.guild.id, None)
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        vc.stop = MagicMock()
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        vc.stop.assert_called_once()
+        assert mock_ctx.guild.id not in music_bot.mps
+
     async def test_playing_skip_sends_no_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -1769,9 +1838,11 @@ class TestSkipCommand:
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
 
-        mp = MagicMock()
+        mp = MagicMock(spec=MusicPlayer)
         mp.current_song = MagicMock(title="Paused Song", position_secs=83.4)
-        music_bot.get_mp = MagicMock(return_value=mp)
+        # Registered, not patched onto get_mp: skip reads the player it already has
+        # and must never construct one.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.skip)(music_bot, mock_ctx)
 
@@ -1855,9 +1926,9 @@ class TestSkipCommand:
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
 
-        mp = MagicMock()
+        mp = MagicMock(spec=MusicPlayer)
         mp.current_song = MagicMock(title="Paused Song", position_secs=83.4)
-        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
         # Simulate the playback loop racing ahead the instant we stop.
         vc.stop = MagicMock(side_effect=lambda: setattr(mp, "current_song", None))
 
@@ -2639,6 +2710,49 @@ def _running(cog: MusicBot, coro_name: str) -> bool:
     keeps the assertion about the thing under test.
     """
     return any(coro_name in repr(t.get_coro()) for t in cog._restore_tasks)
+
+
+class TestCogUnloadReleasesSpotify:
+    """The Spotify client's session lives for the life of the process, so the
+    cog's unload is the only thing that releases it."""
+
+    async def test_cog_unload_closes_the_spotify_session(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Nothing else asserts this: the conftest fixture closes stray sessions
+        after every test, so dropping the call from cog_unload leaves the whole
+        suite green."""
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_a_failing_step_does_not_skip_the_ones_after_it(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Cog._eject only logs what this raises and BotBase.close swallows that,
+        so an unguarded early failure would silently skip every later step and
+        nothing would say so — the same shape that once made a hung Postgres
+        permanently skip the rest of MusicBotApp.close()."""
+        music_bot._restore_tasks = set()
+        music_bot.debug_settings = MagicMock()
+        music_bot.debug_settings.aclose = AsyncMock(side_effect=OSError("boom"))
+
+        with patch.object(
+            debug_mode, "close_prometheus_session", new=AsyncMock()
+        ) as prom:
+            await music_bot.cog_unload()  # must not raise
+
+        prom.assert_awaited_once()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_cog_unload_skips_a_disabled_spotify(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The shipping default: no credentials means `spotify` is None, and the
+        unload must not raise on the guard that exists for exactly that case."""
+        music_bot.spotify = None
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()  # must not raise
 
 
 class TestCogLoadSpotifyValidation:
@@ -4782,34 +4896,172 @@ class TestEchoIsSafeInAnEmbed:
     under its own name, with no queue state required."""
 
     def test_a_masked_link_cannot_form(self) -> None:
-        """The opening bracket is escaped, so Discord renders the text literally
-        rather than as a link. escape_markdown backslashes rather than strips, so
-        the assertion is on the escape, not on the substring being gone."""
+        """Asserted on the OUTCOME, not on the escape: what matters is that no
+        `](` pair survives to pick a link's label and destination. Escaping alone
+        does not cover it — brackets are not in escape_markdown's set."""
         attack = "[Free Discord Nitro](https://evil.example/phish)"
-        assert _echo(attack).startswith("\\[")
+        out = _echo(attack)
+        assert "[" not in out and "]" not in out
 
-    def test_backticks_and_emphasis_are_escaped(self) -> None:
-        """A backtick would otherwise break out of the code span the reply wraps
-        the needle in, and take the rest of the sentence with it."""
-        escaped = _echo("foo` **bold** `bar")
-        assert "\\`" in escaped
-        assert "\\*\\*" in escaped
+    def test_markdown_riding_behind_a_url_is_neutralized(self) -> None:
+        """escape_markdown defaults to ignore_links=True, which passes any http(s)
+        URL through UNTOUCHED — so an attack prefixed with a bare link reaches the
+        embed verbatim unless safe_label overrides that default."""
+        attack = "https://x.com/`[FREE NITRO](https://evil.example/phish)"
+        out = _echo(attack)
+        assert "[" not in out and "]" not in out
+        assert "`" not in out
+
+    def test_emphasis_behind_a_url_is_escaped(self) -> None:
+        """What `ignore_links=False` still buys, now that the brackets are
+        neutralized outright: escape_markdown's URL exemption covers the WHOLE
+        token, so emphasis after a scheme renders styled unless the flag is off.
+        Pinned separately because the masked-link tests above pass either way."""
+        out = _echo("https://x.com/**bold**_em_")
+        assert "\\*\\*" in out
+        assert "\\_" in out
+
+    def test_a_backtick_cannot_close_the_code_span(self) -> None:
+        """Two call sites wrap this in a code span, and Discord gives a backslash
+        NO meaning inside one — so an ESCAPED backtick still closes the span and
+        renders everything after it. The backtick has to go, not be escaped."""
+        out = _echo("foo` **bold** `bar")
+        assert "`" not in out
+        assert "\\*\\*" in out
+
+    def test_control_characters_cannot_end_the_line_early(self) -> None:
+        """A control character truncates the rendered line, hiding whatever the
+        needle put after it."""
+        assert _echo("a\x00b\x1fc\x7fd") == "a b c d"
 
     def test_the_echo_is_bounded_well_inside_the_field_cap(self) -> None:
         """Discord 400s the whole send past 1024 chars in a field value, and
         escaping can double the length. The removal has already committed by then,
-        so the user sees "Command failed" for a removal that happened."""
-        # A LITERAL bound, not one derived from _ECHO_MAX, and tight: the old 1024
-        # passed at five times the real value, so raising _ECHO_MAX kept this green
-        # while pushing the composed field — ten of these in ONE 1024-char value —
-        # past the cap. 410 is the true worst case: escape_markdown adds a
-        # backslash per character, so 200 raw chars become 400 plus the ellipsis.
-        # Markdown-heavy input, or the doubling this docstring argues about is
-        # never actually exercised.
+        so the user sees "Command failed" for a removal that happened. `*`, not
+        `x`: escaping leaves `x` alone and would not exercise the doubling."""
+        # A LITERAL bound, and tight: the old 1024 passed at five times the real
+        # value, so raising _ECHO_MAX kept this green while pushing the composed
+        # field — ten of these in ONE 1024-char value — past the cap. safe_label
+        # caps BEFORE escaping, so 200 raw chars become at most 400 plus the
+        # ellipsis.
         assert len(_echo("*" * 5000)) <= 410
 
     def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
         assert _echo("never gonna give you up") == "never gonna give you up"
+
+
+class TestItemLabelNamesEveryItemType:
+    """The Songs field exists because one argument can now take out a whole
+    playlist and there is no undo. `YTSource` has no `.title` at all, so reaching
+    for it rendered every unresolved Spotify-playlist track as `?` — the exact
+    case the field was added for, and the one the -remove help now advertises."""
+
+    def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
+        item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
+        assert item_label(item) == "Real Title"
+
+    def test_an_unresolved_search_uses_its_search_text(self) -> None:
+        item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
+        assert item_label(item) == "Artist - Song"
+
+    def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
+        item = YTSource(url="https://yt.com/v=2", process=True)
+        assert item_label(item) == "https://yt.com/v=2"
+
+
+class TestRemoveReplyStaysInsideDiscordsCaps:
+    """Every field of the `-remove` reply is built from a list the USER sizes —
+    the removed songs and their positions — and the send happens AFTER
+    queue_remove() has already mutated memory and Redis. So an over-length field
+    is not cosmetic: Discord 400s the whole send, `_command_error` reports
+    "Command failed", and the user is told nothing happened to a queue that has
+    already been irreversibly changed. Asserted on the ASSEMBLED embed, since ten
+    individually-capped echoes still share one field."""
+
+    @staticmethod
+    def _fields(mock_ctx: MagicMock) -> list[discord.embeds.EmbedProxy]:
+        return list(mock_ctx.send.await_args_list[0][1]["embed"].fields)
+
+    async def _run(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        *,
+        removed: list[QueueItem],
+        positions: list[int],
+    ) -> None:
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=removed, positions=positions, mode=RemoveMode.RESOLVED
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://yt.com/v=0"
+        )
+
+    async def test_ten_long_titles_fit_the_songs_field(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """99 characters is INSIDE YouTube's own 100-char title limit, so ten
+        ordinary songs overflow the 1024-char field with no crafted content."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "A" * 99, MagicMock())
+            for i in range(10)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        for field in self._fields(mock_ctx):
+            assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    async def test_a_markdown_heavy_title_cannot_blow_the_field(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Escaping roughly doubles a title of pure markdown characters, which is
+        the shape a hostile uploader picks."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            for i in range(10)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        for field in self._fields(mock_ctx):
+            assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    async def test_a_playlists_worth_of_positions_fits(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """One `-remove <playlist link>` drops every track the link added. A raw
+        join passes 1024 characters at 227 positions — well inside what a real
+        playlist holds."""
+        songs: list[QueueItem] = [_removed_song(i) for i in range(240)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
+        )
+        fields = {f.name: f.value or "" for f in self._fields(mock_ctx)}
+        positions_field = next(v for k, v in fields.items() if k and "removed" in k)
+        assert len(positions_field) <= EMBED_FIELD_LIMIT
+        # The count is still honest about what went, even though the list is cut.
+        assert "180 more" in positions_field
+
+    async def test_the_whole_embed_stays_under_the_total_cap(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Discord caps an embed at 6000 characters across every part, so three
+        fields each legal on their own can still fail together."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            for i in range(240)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
+        )
+        assert len(mock_ctx.send.await_args_list[0][1]["embed"]) <= 6000
 
 
 class TestCommandArgumentBinding:
@@ -5053,8 +5305,7 @@ class TestRemoveCommand:
             f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
         }
         assert (
-            fields["Matched"]
-            == f"`{album}` — the spotify.com link you queued them with"
+            fields["Matched"] == f"{album} — the spotify.com link you queued them with"
         )
 
     async def test_a_search_match_is_quoted_not_linked(
@@ -5081,7 +5332,7 @@ class TestRemoveCommand:
             f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
         }
         assert fields["Matched"] == (
-            "`never gonna give you up` — the search you queued it with"
+            "never gonna give you up — the search you queued it with"
         )
 
     async def test_removal_embed_names_what_it_matched(
@@ -5104,9 +5355,10 @@ class TestRemoveCommand:
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         fields = {f.name: f.value for f in removal_embed.fields}
-        # Escaped and code-spanned, not angle-bracketed: the needle is user text
-        # echoed into an embed, and markdown renders there.
-        assert fields["Matched"] == f"`{url}`"
+        # Escaped, and deliberately NOT wrapped in a code span: escaping inside
+        # one renders the backslashes literally, and a bare URL auto-links —
+        # which the angle-bracket form this replaced also did.
+        assert fields["Matched"] == url
 
     async def test_removal_embed_shows_positions(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -5877,3 +6129,81 @@ class TestDebugObservesWithoutCreating:
         inputs = await music_bot._debug_inputs(mock_ctx)
         assert inputs.player is None
         assert inputs.players == 0
+
+
+class TestShuffleWaitsForTheRestore:
+    """-shuffle waits for the restore like every other queue-mutating command:
+    shuffle() REBUILDS the mirror from memory, so running it before
+    restore_entries() has replayed the saved queue writes an unrestored deque over
+    it and deletes the persisted entries outright."""
+
+    async def test_it_refuses_until_the_restore_lands(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=False)
+        mp.queue_shuffle = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing():
+            await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_not_awaited()
+        assert "Still loading" in mock_ctx.send.await_args.kwargs["embed"].description
+
+    async def test_it_shuffles_once_the_restore_has_landed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock(return_value="Shuffled!")
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing():
+            await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_awaited_once()
+
+
+class TestTimestampWarningReachesTheUser:
+    @staticmethod
+    def _bad_ts_source() -> Any:
+        return parse_url("https://youtu.be/a?t=bogus")
+
+    async def test_it_rides_the_queued_song_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=3)  # something already queued
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        assert send.await_args is not None
+        description = send.await_args[0][2]
+        assert "bogus" in description
+        assert "Est. playing at" in description  # folded in, not replacing it
+
+    async def test_it_gets_its_own_message_when_no_embed_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An idle bot plays the first song immediately and sends no "Queued
+        song" embed at all. Riding that embed alone would drop the warning in
+        the most ordinary case there is."""
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=0)
+        mock_ctx.voice_client = _connected_vc()
+        mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        send.assert_not_awaited()
+        sent = [c.kwargs["embed"] for c in mock_ctx.send.await_args_list]
+        assert any("bogus" in (e.description or "") for e in sent)

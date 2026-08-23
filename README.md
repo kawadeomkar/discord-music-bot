@@ -41,7 +41,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
 - **Rich `-help`** — a custom man-page-style help command with aliases, examples,
   and per-command notes
-- **Resilient YouTube extraction** — PO-token sidecar support makes `web_safari` a
+- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback client a
   working fallback client when the primary client is throttled or blocked
 - **Observability** — OpenTelemetry tracing and structured logging (structlog), with a
   bundled Grafana LGTM stack in Docker Compose
@@ -387,7 +387,7 @@ The Compose stack runs the bot plus its supporting services:
 | `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: on the `archive` profile, which the deploy tooling activates when `HISTORY_ARCHIVE_ENABLED=true` |
 | `db-migrate` | One-shot schema migration for the archive — same `archive` profile. Every deploy runs it before recreating the bot, and `docker compose up` runs it too; re-running applies nothing |
 | `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `just db-backfill-docker` |
-| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works; optional — the bot degrades gracefully without it |
+| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so yt-dlp's fallback client works; optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
 ```bash
@@ -468,6 +468,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
+| `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
 | `PING_DEADLINE_SECS` | | `3.0` | `-ping` health dashboard: how long a probe may run before the row is marked failed |
 | `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-debug --enable`/`--disable` persists to Redis and wins over this value from then on, across restarts. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |

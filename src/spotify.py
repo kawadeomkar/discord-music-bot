@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 from collections.abc import Awaitable, Callable
 
 import aiohttp
@@ -30,7 +30,8 @@ _ALBUM_TTL = 86400  # 24h
 
 # aiohttp's default is ClientTimeout(total=300) — a hung Spotify request held a
 # command for five minutes, with the user's only signal being a typing indicator
-# that eventually stopped.
+# that eventually stopped. Carried by the session, so it bounds the token grant
+# as well as every API call.
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 _MAX_429_RETRIES = 3
@@ -143,9 +144,47 @@ class Spotify:
         self._auth_lock = asyncio.Lock()
         self._redis = redis
         self._session_factory = session_factory or aiohttp.ClientSession
+        # Built on first use, so a deployment with Spotify configured but never
+        # used never opens a connector.
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._closed = False
 
     def __str__(self) -> str:
-        return self.auth_token
+        # Never the bearer token: one f-string would put a live credential into
+        # logs that ship to Loki, where they are indexed and retained. __repr__
+        # is aliased below so an exception repr cannot leak it either.
+        client = self.client_id or "unset"
+        return (
+            f"Spotify(client_id={client[:6]}…, "
+            f"token={'set' if self.auth_token else 'unset'})"
+        )
+
+    __repr__ = __str__
+
+    def _session_or_create(self) -> aiohttp.ClientSession:
+        """The client's session, created on first use. One session keeps the
+        connection pool and DNS cache warm across every call to the API, which
+        the read-to-EOF response handling in http_call makes reachable. Rebuilt
+        when closed from outside, but never after aclose(): a caller arriving
+        then would strand a session nothing closes."""
+        if self._closed:
+            raise RuntimeError("Spotify client is closed")
+        if self._session is None or self._session.closed:
+            self._session = cast(
+                aiohttp.ClientSession,
+                self._session_factory(
+                    json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
+                ),
+            )
+        return self._session
+
+    async def aclose(self) -> None:
+        """Release the session for good. Called from the cog's unload; safe to
+        call twice. A reload builds a fresh Spotify, so nothing reuses this one."""
+        self._closed = True
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            await session.close()
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -171,8 +210,8 @@ class Spotify:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         }
-        async with self._session_factory(json_serialize=ujson.dumps) as session:
-            resp = await session.post(self.auth_endpoint, data=data)
+        session = self._session_or_create()
+        async with session.post(self.auth_endpoint, data=data) as resp:
             if strict and resp.status not in (200, 201):
                 raise SpotifyAuthError(resp.status, "client-credentials grant failed")
             resp_data = await resp.json(content_type=None)
@@ -204,17 +243,19 @@ class Spotify:
         headers["Authorization"] = f"Bearer {self.auth_token}"
 
         retry_after: Optional[float] = None
+        session = self._session_or_create()
         for attempt in range(_MAX_429_RETRIES + 1):
-            async with self._session_factory(
-                json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
-            ) as session:
-                resp = await session.request(
-                    http_method,
-                    endpoint_route,
-                    headers=headers,
-                    data=data,
-                    params=params,
-                )
+            # `async with`, not a bare await: the session outlives this call, so an
+            # unread body holds its pooled connection until the response is
+            # collected. __aexit__ releases on every path, including the raises
+            # below — which a hand-rolled release has twice been written without.
+            async with session.request(
+                http_method,
+                endpoint_route,
+                headers=headers,
+                data=data,
+                params=params,
+            ) as resp:
                 if resp.status in (200, 201):
                     return await resp.json(content_type=None)
                 if resp.status in (401, 403):
@@ -225,8 +266,8 @@ class Spotify:
                 if resp.status != 429:
                     raise SpotifyRequestError(resp.status, endpoint_route, params)
                 retry_after = _retry_after_secs(resp)
-            # Session closed before sleeping: holding one open across the wait
-            # keeps a connection parked for nothing.
+            # Outside the block on purpose: the connection is back in the pool
+            # before the wait, rather than parked for the length of it.
             if attempt == _MAX_429_RETRIES:
                 break
             delay = min(

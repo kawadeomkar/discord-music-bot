@@ -4,7 +4,9 @@ import pytest
 
 from src.guild_state import Analytics
 from src.sources import (
+    unquote_argument,
     QUERY_SOURCE_SEARCH,
+    TIMESTAMP_FORMATS,
     QUERY_SOURCE_SOUNDCLOUD,
     QUERY_SOURCE_SPOTIFY,
     QUERY_SOURCE_YOUTUBE,
@@ -16,9 +18,11 @@ from src.sources import (
     YTType,
     normalize_query_host,
     parse_input,
+    parse_timestamp,
     parse_url,
     query_source_of,
     spotify_playlist_to_ytsearch,
+    timestamp_warning,
 )
 
 
@@ -56,6 +60,54 @@ class TestParseUrlYouTube:
         result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.ts == 60
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("90", 90),
+            ("90s", 90),
+            ("1m30s", 90),
+            ("2m", 120),
+            ("1h", 3600),
+            ("1h2m3s", 3723),
+            ("0", 0),
+            ("1H2M3S", 3723),  # YouTube has emitted uppercase
+        ],
+    )
+    def test_hms_timestamp_forms_are_parsed(self, raw: str, expected: int) -> None:
+        """YouTube's older share format. These used to raise ValueError out of
+        parse_url, which parse_input read as "not a URL" — so the link became a
+        SEARCH for its own text and the seek was silently dropped."""
+        url = f"https://youtu.be/dQw4w9WgXcQ?t={raw}"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.ts == expected
+
+    @pytest.mark.parametrize("raw", ["abc", "1m2x", "", "m", "s", "-30", "1.5"])
+    def test_unparseable_timestamp_keeps_the_url(self, raw: str) -> None:
+        """Degrade to "play from the start", never to "this wasn't a URL"."""
+        url = f"https://youtu.be/dQw4w9WgXcQ?t={raw}"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.url == url  # still a URL, not a ytsearch
+        assert result.ts is None
+
+    def test_unparseable_timestamp_does_not_fall_back_to_search(self) -> None:
+        """The end-to-end shape of the bug: through parse_input, a bad
+        timestamp must not turn the link into `ytsearch:<the url>`."""
+        url = "https://youtu.be/dQw4w9WgXcQ?t=notatime"
+        result = parse_input(url)
+        assert isinstance(result, YTSource)
+        assert result.ytsearch is None
+        assert result.url == url
+
+    def test_timestamp_and_playlist_together(self) -> None:
+        url = "https://www.youtube.com/watch?v=abc&list=PLtest&t=1m30s"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.ts == 90
+        assert result.list_id == "PLtest"
+        assert result.type == YTType.PLAYLIST
 
     def test_youtube_without_www(self) -> None:
         url = "https://youtube.com/watch?v=dQw4w9WgXcQ"
@@ -422,6 +474,67 @@ class TestYTSourcePlaylistUrl:
         assert reparsed.list_id == "PLround"
 
 
+class TestParseTimestamp:
+    """Direct coverage of the helper, independent of URL shape."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("45", 45),
+            ("45s", 45),
+            ("3m", 180),
+            ("3m20s", 200),
+            ("2h", 7200),
+            ("2h30m", 9000),
+            ("2h30m15s", 9015),
+            ("  90  ", 90),
+            ("100000", 100000),
+        ],
+    )
+    def test_valid_forms(self, raw: str, expected: int) -> None:
+        assert parse_timestamp(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "abc",
+            "1x",
+            "h",
+            "hms",
+            "1:30",  # colon form is not something YouTube emits in ?t=
+            "1m 30s",
+            "-5",
+            "1.5s",
+            "s30",
+        ],
+    )
+    def test_invalid_forms_return_none(self, raw: str) -> None:
+        assert parse_timestamp(raw) is None
+
+    def test_all_optional_pattern_rejects_empty_match(self) -> None:
+        """The HMS regex is entirely optional groups, so it also matches ""
+        — the "at least one group" guard is what stops that being 0 seconds."""
+        assert parse_timestamp("") is None
+
+
+class TestDomainRegex:
+    def test_plus_and_pipe_are_not_hostname_characters(self) -> None:
+        """The old character class `[\\w+|\\.]+` treated `+` and `|` as literals,
+        so this parsed as a real host instead of falling back to search."""
+        result = parse_input("you+tube|com/watch")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:you+tube|com/watch"
+
+    def test_hyphenated_hosts_are_not_truncated(self) -> None:
+        """`-` has to be in the class: re.search otherwise starts matching after
+        the hyphen, so "my-site.com" parses as the host "site.com" and the
+        archive records a query_source for a domain nobody linked."""
+        result = parse_url("https://my-site.com/watch?v=x")
+        assert query_source_of(result) == "my-site.com"
+
+
 class TestNormalizeQueryHost:
     @pytest.mark.parametrize(
         "raw,expected",
@@ -433,8 +546,10 @@ class TestNormalizeQueryHost:
             ("music.example.co.uk", "music.example.co.uk"),
             ("xn--80ak6aa92e.com", "xn--80ak6aa92e.com"),
             ("192.168.1.10", "192.168.1.10"),
-            # parse_url's domain group is `[\w+|\.]+`, so these three really can
-            # reach the normalizer — it filters, it does not merely format.
+            # `_` is in `\w`, so bad_host.com really does reach the normalizer —
+            # it filters, it does not merely format. `|` and `+` no longer can:
+            # parse_url's domain group is `[\w.]+` and they fall through to
+            # search (TestDomainRegex). Kept as direct coverage of the filter.
             ("bad_host.com", ""),
             ("bad|host.com", ""),
             ("bad+host.com", ""),
@@ -521,3 +636,69 @@ class TestQuerySource:
         """A hand-built source (crash recovery, tests, a future call site) reports
         the unknown sentinel rather than guessing."""
         assert query_source_of(YTSource(ytsearch="ytsearch:x")) == ""
+
+
+class TestQuotedArgumentsSurviveConsumeRest:
+    """`-play` takes a consume-rest argument, and discord.py's read_rest
+    does no quote handling where the positional parser's get_quoted_word did. So
+    the quotes started arriving as part of the value."""
+
+    def test_a_quoted_url_still_parses_as_that_url(self) -> None:
+        """parse_url uses re.search, so a quoted URL still matched the domain while
+        dragging the trailing quote into the path — yt-dlp then rejects it."""
+        source = parse_input('"https://www.youtube.com/watch?v=dQw4w9WgXcQ"')
+        assert isinstance(source, YTSource)
+        assert source.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_a_quoted_search_does_not_keep_its_quotes(self) -> None:
+        """The origin is what -remove matches on, so a quoted search meant the
+        obvious retype (`-remove some song`) matched nothing."""
+        source = parse_input('"some song"')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == "ytsearch:some song"
+
+    def test_an_unmatched_quote_is_left_alone(self) -> None:
+        """Only a whole argument wrapped at BOTH ends is a wrapper; anything else
+        is text the user typed."""
+        source = parse_input('say "hello')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == 'ytsearch:say "hello'
+
+    def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
+        assert unquote_argument('""') == '""'
+        assert unquote_argument('"') == '"'
+
+
+class TestTimestampWarning:
+    """A `t=` that does not parse changes where the song starts, so the response
+    has to say so — the seek is otherwise dropped with nothing on screen."""
+
+    def test_none_when_the_timestamp_parsed(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=1m30s")) is None
+
+    def test_none_for_a_link_with_no_timestamp(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a")) is None
+
+    def test_none_for_a_source_that_cannot_carry_one(self) -> None:
+        """Spotify and SoundCloud have no `t=`; the helper takes the union type,
+        so the isinstance narrowing is what keeps this from raising."""
+        assert timestamp_warning(parse_url("https://soundcloud.com/a/b")) is None
+
+    def test_names_the_value_and_the_accepted_forms(self) -> None:
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=1h30"))
+        assert warning is not None
+        assert "1h30" in warning
+        assert TIMESTAMP_FORMATS in warning
+
+    def test_a_good_second_timestamp_suppresses_it(self) -> None:
+        """`?t=bad&ts=90` does start where the user asked, so warning about it
+        would be wrong."""
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=bad&ts=90")) is None
+
+    def test_the_echoed_value_cannot_break_out_of_its_code_span(self) -> None:
+        """The raw value is attacker-influenceable and is rendered inside
+        backticks, so safe_label's backtick neutralization is load-bearing."""
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=`x`[y](z)"))
+        assert warning is not None
+        assert "`x`" not in warning
+        assert "[y](z)" not in warning
