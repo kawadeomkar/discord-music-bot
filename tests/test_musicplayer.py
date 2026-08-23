@@ -3,6 +3,7 @@
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
+import logging
 import dataclasses
 import re
 from zoneinfo import ZoneInfo
@@ -28,6 +29,7 @@ from src.guild_state import (
     SongQueueEntry,
     parse_queue_entry,
 )
+from src.redis_client import GuildRedisStore
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -3774,32 +3776,57 @@ class TestRestoreCrashedSong:
         assert first.ts is not None
         assert 50 <= first.ts <= 70
 
-    async def test_crashed_song_position_capped_by_cached_stream_duration(
+    async def test_crashed_song_position_capped_by_the_parked_duration(
         self,
         music_player: MusicPlayer,
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """The recovery position is capped at cached stream duration − 10s so
-        FFmpeg never seeks past EOF."""
+        """Capped at duration − 10s so FFmpeg never seeks past EOF, read from the
+        state hash rather than the stream cache: that key expires in 30 minutes, so
+        sourcing it there capped or did not depending on how long the restart took.
+        """
         assert music_player.store is not None
-        import time
-
-        start = time.time() - 90  # computed position ≈ 90s
         await fake_redis.hset(
             music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
+            mapping={
+                b"current_song_url": b"https://yt.com/v=crash",
+                b"current_song_title": b"Crashed",
+                b"current_song_duration": b"60",
+                b"last_position_secs": b"90",
+                b"last_heartbeat_epoch": b"2000",
+                b"play_start_epoch": b"1000",
+            },
         )
+        # Deliberately absent: the cache this used to read is gone half an hour in,
+        # and the cap must not depend on it.
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.ts == 50  # min(90, 60 − 10)
+
+    async def test_a_livestream_duration_of_zero_does_not_cap_to_zero(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """max(0, 0 - 10) is 0, so treating an unknown duration as a real one would
+        restart every livestream from the beginning."""
+        assert music_player.store is not None
         await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"play_start_epoch", str(start).encode()
-        )
-        # Cached stream metadata says the song is only 60s long.
-        await fake_redis.set(
-            "ytdl:stream:https://yt.com/v=crash", orjson.dumps({"duration": 60})
+            music_player.store.state_key(),
+            mapping={
+                b"current_song_url": b"https://yt.com/v=live",
+                b"current_song_title": b"Live",
+                b"current_song_duration": b"0",
+                b"last_position_secs": b"140",
+                b"last_heartbeat_epoch": b"2000",
+                b"play_start_epoch": b"1000",
+            },
         )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player.bot.wait_until_ready = AsyncMock()
@@ -3807,7 +3834,7 @@ class TestRestoreCrashedSong:
         await music_player._restore_state()
 
         first = await music_player.queue.get()
-        assert first.ts == 50  # min(≈90, 60 − 10)
+        assert first.ts == 140
 
     async def test_crashed_song_position_uncapped_when_cached_duration_malformed(
         self,
@@ -9919,7 +9946,7 @@ class TestHeartbeatUpdater:
         # mirroring the real YTDL property — set the inputs, not the result.
         mock_song.start_offset = 10
         mock_song.elapsed_secs = 32.5
-        store = AsyncMock()
+        store = AsyncMock(spec=GuildRedisStore)
         music_player.store = store
 
         with patch("asyncio.sleep", new=self._make_sleep(1)):
@@ -9938,7 +9965,7 @@ class TestHeartbeatUpdater:
         vc.source = mock_song
         vc.is_paused.return_value = True
         mocked(music_player._guild).voice_client = vc
-        store = AsyncMock()
+        store = AsyncMock(spec=GuildRedisStore)
         music_player.store = store
 
         with patch("asyncio.sleep", new=self._make_sleep(2)):
@@ -9954,7 +9981,7 @@ class TestHeartbeatUpdater:
         vc.source = MagicMock()  # a different song is playing now
         vc.is_paused.return_value = False
         mocked(music_player._guild).voice_client = vc
-        store = AsyncMock()
+        store = AsyncMock(spec=GuildRedisStore)
         music_player.store = store
 
         with patch("asyncio.sleep", new=self._make_sleep(3)):
@@ -9973,7 +10000,7 @@ class TestHeartbeatUpdater:
         vc.is_paused.return_value = False
         mocked(music_player._guild).voice_client = vc
         music_player._np_host_message = None
-        store = AsyncMock()
+        store = AsyncMock(spec=GuildRedisStore)
         music_player.store = store
 
         with patch("asyncio.sleep", new=self._make_sleep(1)):
@@ -9981,6 +10008,29 @@ class TestHeartbeatUpdater:
                 await music_player._heartbeat_updater(mock_song)
 
         store.heartbeat.assert_awaited_once()
+
+    async def test_an_unexpected_error_stops_the_ticker_at_error_level(
+        self, music_player: MusicPlayer, mock_song: MagicMock, caplog: Any
+    ) -> None:
+        """@_guild_op already swallows Redis failures, so anything reaching here is a
+        defect that recurs every tick. It must not die silently: cancel_task never
+        awaits a task that ended on its own, so the traceback would surface at GC with
+        no guild attached while recovery quietly fell back to the seeded position."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        store = AsyncMock(spec=GuildRedisStore)
+        store.heartbeat.side_effect = AttributeError("boom")
+        music_player.store = store
+
+        with patch("asyncio.sleep", new=self._make_sleep(5)):
+            with caplog.at_level(logging.ERROR):
+                await music_player._heartbeat_updater(mock_song)
+
+        # Returned rather than raising, and wrote exactly once before giving up.
+        assert store.heartbeat.await_count == 1
+        assert any("playback heartbeat stopped" in r.message for r in caplog.records)
 
     async def test_tolerates_no_store(
         self, music_player: MusicPlayer, mock_song: MagicMock
