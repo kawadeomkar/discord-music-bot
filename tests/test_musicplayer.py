@@ -1922,9 +1922,9 @@ class TestReparkCrashedHead:
     async def test_position_survives_the_round_trip(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """The state hash carries no `ts` field — a resume point exists there only
-        as a backdated play_start_epoch, which is what recovery reads it back out
-        of."""
+        """The state hash carries no `ts` field, so the offset a re-parked head had
+        already reached survives only as the seeded position — which is what
+        recovery reads back out."""
         seed_queue(music_player.queue, _crashed(mock_author, ts=45))
 
         await music_player.repark_crashed_head()
@@ -1932,7 +1932,24 @@ class TestReparkCrashedHead:
         assert music_player.store is not None
         state = await music_player.store.get_guild_state()
         assert state is not None
-        assert state.crashed_position_at(time.time()) == pytest.approx(45, abs=2)
+        assert state.last_position_secs == pytest.approx(45)
+        assert state.crashed_position_at(time.time()) == 45
+
+    async def test_the_backdated_epoch_carries_the_position_for_a_rollback(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The same offset, down the legacy path an older build takes. That build
+        cannot read last_position_secs, so dropping the backdate here would strand
+        a re-parked head at 0:00 on any `just up <older-sha>`."""
+        seed_queue(music_player.queue, _crashed(mock_author, ts=45))
+
+        await music_player.repark_crashed_head()
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        rolled_back = dataclasses.replace(state, last_position_secs=None)
+        assert rolled_back.crashed_position_at(time.time()) == pytest.approx(45, abs=2)
 
     async def test_played_at_survives_the_round_trip(
         self, music_player: MusicPlayer, mock_author: MagicMock

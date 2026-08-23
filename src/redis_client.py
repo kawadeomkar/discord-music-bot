@@ -1110,7 +1110,13 @@ class GuildRedisStore:
 
     @_guild_op(default=None)
     async def on_pause(self, epoch: float) -> None:
-        """Record the epoch when the voice client was paused."""
+        """Record the epoch when the voice client was paused.
+
+        LEGACY. Feeds only _legacy_wall_clock_position_at now — MusicPlayer.pause
+        records the exact position through heartbeat(). Drop this, on_resume, and
+        the three wall-clock StateFields together one release after the heartbeat
+        ships.
+        """
         pipe = self.redis.pipeline()
         pipe.hset(self.state_key(), StateField.PAUSE_START_EPOCH, str(epoch))
         await self._exec_with_state_ttl(pipe)
@@ -1119,6 +1125,10 @@ class GuildRedisStore:
     async def on_resume(self, resume_epoch: float) -> None:
         """Accumulate elapsed pause time into total_pause_seconds, clear
         pause_start_epoch.
+
+        LEGACY, like on_pause: the accumulated total feeds only
+        _legacy_wall_clock_position_at, and goes with it one release after the
+        heartbeat ships.
 
         Non-atomic read-modify-write, so it assumes one writer per guild (true
         today). Under multi-process sharding this must become a Lua script or a

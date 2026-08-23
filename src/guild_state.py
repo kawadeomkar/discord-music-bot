@@ -102,6 +102,9 @@ class StateField:
     # -ss offset, and not derivable from this run's clock at all — a resume tail
     # inherits its value from an earlier fragment.
     CURRENT_SONG_PLAYED_AT: Final[str] = "current_song_played_at"
+    # LEGACY, all three: superseded by LAST_POSITION_SECS below and read only by
+    # _legacy_wall_clock_position_at. Still written so a rollback recovers; drop them
+    # with that method and on_pause/on_resume one release after the heartbeat ships.
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
@@ -379,20 +382,40 @@ class GuildStateData:
         (vc.is_paused()): this is persisted crash-time state only."""
         return self.pause_start_epoch is not None
 
-    # FIXME: Crash recovery counts bot downtime as playback position.
-    # `now` is read at RESTART time while play_start_epoch dates from when the song
-    # started, so 10 minutes
-    # of downtime lands straight on the computed position: a song that crashed 30s in
-    # comes back near its end, on the caller's duration−10s EOF cap. Only a pause already
-    # active at crash time is subtracted; the crash gap is never tracked.
-    # Fix: a periodic playback heartbeat in Redis, so recovery reads the last known
-    # position instead of extrapolating.
     def crashed_position_at(self, now: float) -> int | None:
-        """Approximate playback position (seconds) at crash time, or None when no
-        play_start_epoch was recorded. Pure function of the snapshot plus a
-        caller-supplied clock. play_start_epoch is already backdated by the FFmpeg
-        -ss offset at write time; callers still cap the result at the song duration
-        to stop FFmpeg seeking past EOF.
+        """Playback position (seconds) at the last recorded heartbeat, or None
+        when nothing was recorded.
+
+        No clock is read, so neither downtime nor skew between restarts can be
+        credited as playback. Resumes at last_position_secs exactly, so the worst
+        case replays one heartbeat interval — the deliberate bias, since replaying
+        3s is imperceptible and skipping 3s is not. `now` feeds only the legacy
+        fallback. Callers still cap at the song's duration to stop an EOF seek.
+        """
+        if self.last_position_secs is not None and not self._heartbeat_predates_song():
+            return max(0, int(self.last_position_secs))
+        return self._legacy_wall_clock_position_at(now)
+
+    def _heartbeat_predates_song(self) -> bool:
+        """True when the recorded position belongs to an EARLIER song.
+
+        A build without these fields cannot clear them, so `just up <older-sha>`
+        and back leaves one song's position parked on a later song's hash — which
+        would resume it minutes in. Every legitimate write puts the heartbeat at or
+        after the start it belongs to: the seed writes play_start_epoch +
+        start_offset, and ticks read a clock the backdated epoch precedes. Judged
+        only when both values are present, so a corrupt one costs nothing.
+        """
+        if self.last_heartbeat_epoch is None or self.play_start_epoch is None:
+            return False
+        return self.last_heartbeat_epoch < self.play_start_epoch
+
+    def _legacy_wall_clock_position_at(self, now: float) -> int | None:
+        """Pre-heartbeat position math: extrapolate from the start epoch.
+
+        Reads a state hash written before last_position_secs existed. `now` is read
+        at RESTART, so downtime lands straight on the position — the bug the
+        heartbeat replaces. Kept one release: resuming badly beats not resuming.
         """
         if self.play_start_epoch is None:
             return None
