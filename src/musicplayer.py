@@ -1655,13 +1655,16 @@ class MusicPlayer:
         entry point, so a future call site can't forget either side effect."""
         vc.pause()
         if self.store is not None:
+            # One instant for both writes, so the legacy wall-clock math cannot
+            # count the gap between them as playback the heartbeat never saw.
+            paused_at = time.time()
             # The exact pause point: the ticking task skips paused songs, so
             # without this the position sits an interval behind for the whole pause.
             if self.current_song is not None:
-                await self.store.heartbeat(self.current_song.position_secs, time.time())
+                await self.store.heartbeat(self.current_song.position_secs, paused_at)
             # Still written this release: a rollback to the previous build
             # reads the wall-clock fields; they go one release after this.
-            await self.store.on_pause(time.time())
+            await self.store.on_pause(paused_at)
         self.mark_paused()
 
     async def resume(self, vc: discord.VoiceClient) -> None:
@@ -2543,12 +2546,13 @@ class MusicPlayer:
                                 now_playing=now_playing,
                                 start_offset=song.start_offset,
                             )
-
-                    # Not beside the progress bar: that lives in _send_now_playing,
-                    # which is display-gated, and a song with no bar must recover.
-                    self._heartbeat_task = asyncio.create_task(
-                        self._heartbeat_updater(song)
-                    )
+                        # In this block because the store is the ticker's only
+                        # writer: a Redis-less guild would otherwise tick for the
+                        # whole song to reach a no-op. After the seed above, so the
+                        # first tick cannot race it.
+                        self._heartbeat_task = asyncio.create_task(
+                            self._heartbeat_updater(song)
+                        )
 
                     if song.start_paused:
                         # Returns parked where -playnow interrupted it (the player

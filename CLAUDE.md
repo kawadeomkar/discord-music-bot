@@ -662,7 +662,10 @@ could not be read"; only the first may be reported to a guild as an empty queue.
 Recovery reads a position the loop **recorded**, never one it infers from a clock:
 `_heartbeat_updater` writes `last_position_secs` every `HEARTBEAT_INTERVAL_SECS` while a
 song plays, the start transaction seeds it from the `-ss` offset, and `MusicPlayer.pause`
-writes one final exact value (the ticker skips paused songs). Downtime is therefore never
+writes one final exact value (the ticker skips paused songs). The task is created inside
+that transaction's `store is not None` block — the store is its only writer, so a
+Redis-less guild would otherwise tick for the whole song to reach a no-op. Downtime is
+therefore never
 credited and clock skew between restarts stops mattering; the worst case is replaying one
 interval, which is the deliberate bias — replaying 3s is imperceptible, skipping 3s is not.
 The legacy wall-clock fields are still written so a rollback still recovers, and

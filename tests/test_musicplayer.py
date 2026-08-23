@@ -1924,9 +1924,9 @@ class TestReparkCrashedHead:
     async def test_position_survives_the_round_trip(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """The state hash carries no `ts` field — a resume point exists there only
-        as a backdated play_start_epoch, which is what recovery reads it back out
-        of."""
+        """The state hash carries no `ts` field, so the offset a re-parked head had
+        already reached survives only as the seeded position — which is what
+        recovery reads back out."""
         seed_queue(music_player.queue, _crashed(mock_author, ts=45))
 
         await music_player.repark_crashed_head()
@@ -1934,7 +1934,24 @@ class TestReparkCrashedHead:
         assert music_player.store is not None
         state = await music_player.store.get_guild_state()
         assert state is not None
-        assert state.crashed_position_at(time.time()) == pytest.approx(45, abs=2)
+        assert state.last_position_secs == pytest.approx(45)
+        assert state.crashed_position_at(time.time()) == 45
+
+    async def test_the_backdated_epoch_carries_the_position_for_a_rollback(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The same offset, down the legacy path an older build takes. That build
+        cannot read last_position_secs, so dropping the backdate here would strand
+        a re-parked head at 0:00 on any `just up <older-sha>`."""
+        seed_queue(music_player.queue, _crashed(mock_author, ts=45))
+
+        await music_player.repark_crashed_head()
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        rolled_back = dataclasses.replace(state, last_position_secs=None)
+        assert rolled_back.crashed_position_at(time.time()) == pytest.approx(45, abs=2)
 
     async def test_played_at_survives_the_round_trip(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -5728,6 +5745,42 @@ class TestPlayerPauseResume:
         state = await fake_redis.hgetall(music_player.store.state_key())
         assert float(state[b"last_position_secs"]) == 42.5
 
+    async def test_pause_with_no_song_records_no_position(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """-pause is reachable with nothing playing. position_secs would raise on
+        None, and a position written here would name whatever song ran last."""
+        assert music_player.store is not None
+        music_player.current_song = None
+        vc = MagicMock(spec=discord.VoiceClient)
+
+        await music_player.pause(vc)
+
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert b"last_position_secs" not in state
+        assert b"pause_start_epoch" in state  # the legacy leg still runs
+
+    async def test_pause_stamps_both_writes_with_one_instant(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """Two clock reads would leave the sliver between them as elapsed the
+        legacy wall-clock math counts as playback and the heartbeat never saw."""
+        assert music_player.store is not None
+        music_player.current_song = mock_song
+        vc = MagicMock(spec=discord.VoiceClient)
+
+        await music_player.pause(vc)
+
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert float(state[b"last_heartbeat_epoch"]) == float(
+            state[b"pause_start_epoch"]
+        )
+
     async def test_pause_schedules_debounced_update(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -7109,6 +7162,44 @@ class TestLoop:
         # updater's own guard cannot fire — this cancel is what stops it writing
         # over the fields clear_song_end_state() just deleted.
         assert music_player._heartbeat_task is None
+
+    async def test_a_redis_less_loop_starts_no_heartbeat_task(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The store is the task's only writer, so without the guard a degraded
+        guild ticks for every song of its life to reach a no-op."""
+        observed: list[Any] = []
+        music_player.store = None
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+
+        async def _capture_mid_song() -> None:
+            observed.append(music_player._heartbeat_task)
+
+        music_player.play_next.wait = AsyncMock(side_effect=_capture_mid_song)
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        assert observed == [None], "a store-less loop started a heartbeat task"
 
     async def test_played_at_is_stamped_before_the_start_transaction(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock

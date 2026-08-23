@@ -707,11 +707,13 @@ is opt-in per guild and off by default.
 `-pause` / `-resume` funnel through single entry points on `MusicPlayer` so no call site can forget a side effect:
 
 ```
-pause(vc):  vc.pause()  → store.on_pause(now)        → mark_paused()
+pause(vc):  vc.pause()  → store.heartbeat(pos, t)
+                        → store.on_pause(t)          → mark_paused()
 resume(vc): vc.resume() → store.on_resume(now)       → mark_resumed()
 ```
 
-- **Redis epoch accounting** (crash-recovery correctness): `on_pause` writes `pause_start_epoch`; `on_resume` folds the pause interval into `total_pause_seconds` and clears `pause_start_epoch`. Recovery position is read from `last_position_secs`, recorded by the heartbeat while the song played — no clock is consulted, so downtime is never credited. The epoch accounting above feeds only `_legacy_wall_clock_position_at`, the fallback for a hash written before the heartbeat existed.
+- **The exact pause point**: `pause()` records the position itself because the ticker skips paused songs (frames are frozen, so it would rewrite one value for the whole pause). Both writes take the same `t`, so the legacy math below cannot count the gap between them as playback. Skipped when nothing is playing — `-pause` is reachable with no song.
+- **Redis epoch accounting** (crash-recovery correctness): `on_pause` writes `pause_start_epoch`; `on_resume` folds the pause interval into `total_pause_seconds` and clears `pause_start_epoch`. Recovery position is read from `last_position_secs`, recorded by the heartbeat while the song played — no clock is consulted, so downtime is never credited. The epoch accounting above feeds only `_legacy_wall_clock_position_at`, the fallback for a hash written before the heartbeat existed, and goes with it one release after this ships.
 - **`mark_paused`/`mark_resumed`** both fire `_fire_pause_state_updates()` — a debounced one-off NP-embed edit + presence refresh, so the bar and tooltip freeze/unfreeze promptly rather than waiting for the next 3 s tick.
 - `-pause` replies with a **confirmation embed** (`build_pause_confirmation_embed`) showing the frozen position; `-resume` calls `rehost_np_after_resume()` so a pause confirmation hosting the block becomes plain history rather than sitting beneath a live, advancing bar.
 
@@ -817,7 +819,7 @@ sequenceDiagram
 | `_prefetch_task` | `Optional[asyncio.Task]` | Active `_prefetch_next_song()` task |
 | `_restore_task` / `_restore_complete` | `Optional[asyncio.Task]` / `asyncio.Event` | One-shot `_restore_state()`; the event gates `loop()`'s first dequeue |
 | `_progress_task` | `Optional[asyncio.Task]` | Per-song progress-bar updater |
-| `_heartbeat_task` | `Optional[asyncio.Task]` | Per-song position recorder for crash recovery |
+| `_heartbeat_task` | `Optional[asyncio.Task]` | Per-song position recorder for crash recovery; started only when a store exists |
 | `_pause_debounce_task` | `Optional[asyncio.Task]` | Debounced pause/resume embed+presence refresh |
 | `_skip_history_for` | `Optional[YTDL]` | Set by `interject()` to the parked song whose history add is deferred to its resume tail (holds identity, not a flag — the song can end during interject's awaits) |
 | `_np_host_message` / `_np_host_own_embeds` / `_np_host_dedicated` | host pointer + its own embeds + kind | The one message currently carrying the NP block |

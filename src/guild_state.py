@@ -112,7 +112,8 @@ class StateField:
     # three fields above are its predecessors, still written for rollback safety;
     # they go one release after this ships.
     LAST_POSITION_SECS: Final[str] = "last_position_secs"
-    # Observability only — how stale the snapshot is. Never position math.
+    # When that position was recorded. Never an addend — it dates the field above,
+    # so _heartbeat_predates_song can refuse one belonging to an earlier song.
     LAST_HEARTBEAT_EPOCH: Final[str] = "last_heartbeat_epoch"
 
 
