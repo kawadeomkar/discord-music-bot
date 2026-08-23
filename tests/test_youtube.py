@@ -826,6 +826,42 @@ class TestYTSource:
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
 
+    async def test_yt_source_ignores_a_cached_search_wrapper(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        """A build without the empty-search guard cached the wrapper itself, and those
+        entries live an hour — so honouring one keeps failing every play of that term
+        long after the fix ships. Ignored, and the search runs again."""
+        import orjson as _orjson
+
+        poisoned = {
+            "webpage_url": "ytsearch:cached search",
+            "title": "cached search",
+            "duration": None,
+            "uploader": None,
+            "thumbnail": None,
+        }
+        await fake_redis.set(
+            "ytdl:source:cached search", _orjson.dumps(poisoned), ex=3600
+        )
+        fresh = {
+            "webpage_url": "https://www.youtube.com/watch?v=real",
+            "title": "The Real Song",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fresh
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "cached search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert result.webpage_url == "https://www.youtube.com/watch?v=real"
+        assert result.title == "The Real Song"
+
     async def test_yt_source_caches_thumbnail_for_next_lookup(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:

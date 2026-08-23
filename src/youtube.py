@@ -455,6 +455,18 @@ def _stream_cache_key(webpage_url: str) -> str:
     return f"ytdl:stream:{webpage_url}"
 
 
+def _cached_source_is_usable(cached: dict[str, Any]) -> bool:
+    """False for a cached source whose URL is a search term rather than a video page.
+
+    Builds before the empty-search guard cached the ytsearch wrapper itself when a
+    search matched nothing, and those entries live an hour. Ignored on read so the
+    guard runs now instead of after the TTL lapses. Every real extraction answers an
+    http(s) webpage_url, so the scheme is the whole test.
+    """
+    url = cached.get("webpage_url")
+    return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
     """How long a stream URL may be cached, or None when it isn't worth caching.
     `expire` advertises a 6-hour window but YouTube revokes long before it, so
@@ -1126,6 +1138,9 @@ class YTDL(discord.FFmpegOpusAudio):
 
         if redis is not None:
             cached = await cache_get(redis, cache_key)
+            if cached is not None and not _cached_source_is_usable(cached):
+                trace.get_current_span().set_attribute("ytdl.source_cache_stale", True)
+                cached = None
             if cached is not None:
                 trace.get_current_span().set_attribute("ytdl.source_cache_hit", True)
                 trace.get_current_span().set_attribute(
