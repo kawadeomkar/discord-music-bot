@@ -6,6 +6,7 @@ from src.guild_state import Analytics
 from src.sources import (
     unquote_argument,
     QUERY_SOURCE_SEARCH,
+    TIMESTAMP_FORMATS,
     QUERY_SOURCE_SOUNDCLOUD,
     QUERY_SOURCE_SPOTIFY,
     QUERY_SOURCE_YOUTUBE,
@@ -17,18 +18,17 @@ from src.sources import (
     YTType,
     normalize_query_host,
     parse_input,
+    parse_timestamp,
     parse_url,
     query_source_of,
     spotify_playlist_to_ytsearch,
+    timestamp_warning,
 )
 
 
 class TestParseUrlYouTube:
     def test_youtube_watch_url(self) -> None:
-        result = parse_url(
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-            "-play https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        )
+        result = parse_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.YOUTUBE
         assert result.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -37,19 +37,19 @@ class TestParseUrlYouTube:
 
     def test_youtube_watch_url_with_t_param(self) -> None:
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.ts == 42
 
     def test_youtube_watch_url_with_ts_param(self) -> None:
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&ts=120"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.ts == 120
 
     def test_youtu_be_short_url(self) -> None:
         url = "https://youtu.be/dQw4w9WgXcQ"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.YOUTUBE
         assert result.url == url
@@ -57,26 +57,74 @@ class TestParseUrlYouTube:
 
     def test_youtu_be_with_timestamp(self) -> None:
         url = "https://youtu.be/dQw4w9WgXcQ?t=60"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.ts == 60
 
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("90", 90),
+            ("90s", 90),
+            ("1m30s", 90),
+            ("2m", 120),
+            ("1h", 3600),
+            ("1h2m3s", 3723),
+            ("0", 0),
+            ("1H2M3S", 3723),  # YouTube has emitted uppercase
+        ],
+    )
+    def test_hms_timestamp_forms_are_parsed(self, raw: str, expected: int) -> None:
+        """YouTube's older share format. These used to raise ValueError out of
+        parse_url, which parse_input read as "not a URL" — so the link became a
+        SEARCH for its own text and the seek was silently dropped."""
+        url = f"https://youtu.be/dQw4w9WgXcQ?t={raw}"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.ts == expected
+
+    @pytest.mark.parametrize("raw", ["abc", "1m2x", "", "m", "s", "-30", "1.5"])
+    def test_unparseable_timestamp_keeps_the_url(self, raw: str) -> None:
+        """Degrade to "play from the start", never to "this wasn't a URL"."""
+        url = f"https://youtu.be/dQw4w9WgXcQ?t={raw}"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.url == url  # still a URL, not a ytsearch
+        assert result.ts is None
+
+    def test_unparseable_timestamp_does_not_fall_back_to_search(self) -> None:
+        """The end-to-end shape of the bug: through parse_input, a bad
+        timestamp must not turn the link into `ytsearch:<the url>`."""
+        url = "https://youtu.be/dQw4w9WgXcQ?t=notatime"
+        result = parse_input(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch is None
+        assert result.url == url
+
+    def test_timestamp_and_playlist_together(self) -> None:
+        url = "https://www.youtube.com/watch?v=abc&list=PLtest&t=1m30s"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.ts == 90
+        assert result.list_id == "PLtest"
+        assert result.type == YTType.PLAYLIST
+
     def test_youtube_without_www(self) -> None:
         url = "https://youtube.com/watch?v=dQw4w9WgXcQ"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.YOUTUBE
 
     def test_youtube_watch_url_is_track_by_default(self) -> None:
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.TRACK
         assert result.list_id is None
 
     def test_youtube_url_with_list_param_is_playlist(self) -> None:
         url = "https://www.youtube.com/watch?v=jOLT6ukrQSg&list=RDEMfxur2p8gn1zGJ2gwGBdjQg"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.PLAYLIST
         assert result.list_id == "RDEMfxur2p8gn1zGJ2gwGBdjQg"
@@ -84,14 +132,14 @@ class TestParseUrlYouTube:
 
     def test_youtube_playlist_url_is_playlist(self) -> None:
         url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.PLAYLIST
         assert result.list_id == "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
 
     def test_youtube_playlist_preserves_timestamp(self) -> None:
         url = "https://www.youtube.com/watch?v=abc&list=PLtest&t=30"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.PLAYLIST
         assert result.list_id == "PLtest"
@@ -106,7 +154,7 @@ class TestParseUrlPlaylistIndex:
 
     def test_index_is_parsed_from_a_watch_url(self) -> None:
         url = "https://www.youtube.com/watch?v=abc&list=PLtest&index=4"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.PLAYLIST
         assert result.index == 4
@@ -114,7 +162,7 @@ class TestParseUrlPlaylistIndex:
 
     def test_index_is_none_when_absent(self) -> None:
         url = "https://www.youtube.com/playlist?list=PLtest"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.index is None
         assert result.video_id is None
@@ -122,7 +170,7 @@ class TestParseUrlPlaylistIndex:
     def test_index_is_not_carried_by_a_bare_track(self) -> None:
         """No list, no playlist — the index has nothing to index into."""
         url = "https://www.youtube.com/watch?v=abc&index=4"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.TRACK
         assert result.index is None
@@ -132,7 +180,7 @@ class TestParseUrlPlaylistIndex:
         """A malformed index degrades to "no index" instead of raising: the
         alternative sends the whole link to ytsearch as plain text."""
         url = f"https://www.youtube.com/watch?v=abc&list=PLtest&index={raw}"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.type == YTType.PLAYLIST
         assert result.list_id == "PLtest"
@@ -142,7 +190,7 @@ class TestParseUrlPlaylistIndex:
 class TestParseUrlSpotify:
     def test_spotify_track(self) -> None:
         url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SpotifySource)
         assert result.type == SpotifyType.TRACK
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
@@ -151,7 +199,7 @@ class TestParseUrlSpotify:
 
     def test_spotify_playlist(self) -> None:
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SpotifySource)
         assert result.type == SpotifyType.PLAYLIST
         assert result.id == "37i9dQZF1DXcBWIGoYBM5M"
@@ -159,7 +207,7 @@ class TestParseUrlSpotify:
 
     def test_spotify_track_with_si_param(self) -> None:
         url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT?si=abc123"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SpotifySource)
         assert result.type == SpotifyType.TRACK
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
@@ -167,13 +215,13 @@ class TestParseUrlSpotify:
     def test_unknown_spotify_type_raises(self) -> None:
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
         with pytest.raises(Exception, match="Unknown Spotify track type"):
-            parse_url(url, f"-play {url}")
+            parse_url(url)
 
 
 class TestParseUrlSoundcloud:
     def test_soundcloud_url(self) -> None:
         url = "https://soundcloud.com/artist/track-name"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SoundcloudSource)
         assert result.stype == URLSource.SOUNDCLOUD
         assert result.url == url
@@ -181,7 +229,7 @@ class TestParseUrlSoundcloud:
 
     def test_soundcloud_ts_defaults_to_none(self) -> None:
         url = "https://soundcloud.com/artist/track"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SoundcloudSource)
         assert result.ts is None
 
@@ -189,14 +237,14 @@ class TestParseUrlSoundcloud:
 class TestParseUrlErrors:
     def test_plain_text_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="Not a recognised URL"):
-            parse_url("never gonna give you up", "-play never gonna give you up")
+            parse_url("never gonna give you up")
 
     def test_dotless_host_raises_value_error(self) -> None:
         """A search term like "98/99" matches the domain regex with a dotless
         "host" of "98" — not a real URL, so it raises ValueError and parse_input
         falls back to search rather than shipping it to yt-dlp."""
         with pytest.raises(ValueError, match="Not a recognised URL"):
-            parse_url("98/99", "-play 98/99")
+            parse_url("98/99")
 
 
 class TestParseUrlOther:
@@ -204,21 +252,21 @@ class TestParseUrlOther:
 
     def test_unknown_domain_becomes_generic_ytdlp_source(self) -> None:
         url = "https://example.com/video/123"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.OTHER
         assert result.url == url
 
     def test_vimeo_becomes_generic_ytdlp_source(self) -> None:
         url = "https://vimeo.com/12345678"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.OTHER
         assert result.url == url
 
     def test_tiktok_becomes_generic_ytdlp_source(self) -> None:
         url = "https://www.tiktok.com/@user/video/1234567890"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.OTHER
         assert result.url == url
@@ -378,7 +426,7 @@ class TestYTSourcePlaylistUrl:
     def test_parse_url_output_yields_a_usable_playlist_url(self) -> None:
         """End-to-end with the real parser, not a hand-built dataclass."""
         url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.playlist_url == url
 
@@ -386,10 +434,71 @@ class TestYTSourcePlaylistUrl:
         """Round-trip: the rebuilt form must itself parse back to the same
         playlist, so a rebuilt URL is safe to hand to any download path."""
         src = YTSource(url=None, list_id="PLround", type=YTType.PLAYLIST)
-        reparsed = parse_url(src.playlist_url, f"-play {src.playlist_url}")
+        reparsed = parse_url(src.playlist_url)
         assert isinstance(reparsed, YTSource)
         assert reparsed.type == YTType.PLAYLIST
         assert reparsed.list_id == "PLround"
+
+
+class TestParseTimestamp:
+    """Direct coverage of the helper, independent of URL shape."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("45", 45),
+            ("45s", 45),
+            ("3m", 180),
+            ("3m20s", 200),
+            ("2h", 7200),
+            ("2h30m", 9000),
+            ("2h30m15s", 9015),
+            ("  90  ", 90),
+            ("100000", 100000),
+        ],
+    )
+    def test_valid_forms(self, raw: str, expected: int) -> None:
+        assert parse_timestamp(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "abc",
+            "1x",
+            "h",
+            "hms",
+            "1:30",  # colon form is not something YouTube emits in ?t=
+            "1m 30s",
+            "-5",
+            "1.5s",
+            "s30",
+        ],
+    )
+    def test_invalid_forms_return_none(self, raw: str) -> None:
+        assert parse_timestamp(raw) is None
+
+    def test_all_optional_pattern_rejects_empty_match(self) -> None:
+        """The HMS regex is entirely optional groups, so it also matches ""
+        — the "at least one group" guard is what stops that being 0 seconds."""
+        assert parse_timestamp("") is None
+
+
+class TestDomainRegex:
+    def test_plus_and_pipe_are_not_hostname_characters(self) -> None:
+        """The old character class `[\\w+|\\.]+` treated `+` and `|` as literals,
+        so this parsed as a real host instead of falling back to search."""
+        result = parse_input("you+tube|com/watch", "-play you+tube|com/watch")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:you+tube|com/watch"
+
+    def test_hyphenated_hosts_are_not_truncated(self) -> None:
+        """`-` has to be in the class: re.search otherwise starts matching after
+        the hyphen, so "my-site.com" parses as the host "site.com" and the
+        archive records a query_source for a domain nobody linked."""
+        result = parse_url("https://my-site.com/watch?v=x")
+        assert query_source_of(result) == "my-site.com"
 
 
 class TestNormalizeQueryHost:
@@ -403,8 +512,10 @@ class TestNormalizeQueryHost:
             ("music.example.co.uk", "music.example.co.uk"),
             ("xn--80ak6aa92e.com", "xn--80ak6aa92e.com"),
             ("192.168.1.10", "192.168.1.10"),
-            # parse_url's domain group is `[\w+|\.]+`, so these three really can
-            # reach the normalizer — it filters, it does not merely format.
+            # `_` is in `\w`, so bad_host.com really does reach the normalizer —
+            # it filters, it does not merely format. `|` and `+` no longer can:
+            # parse_url's domain group is `[\w.]+` and they fall through to
+            # search (TestDomainRegex). Kept as direct coverage of the filter.
             ("bad_host.com", ""),
             ("bad|host.com", ""),
             ("bad+host.com", ""),
@@ -430,26 +541,26 @@ class TestQuerySource:
 
     def test_youtube_watch_url(self) -> None:
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        assert query_source_of(parse_url(url, f"-play {url}")) == QUERY_SOURCE_YOUTUBE
+        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
 
     def test_youtu_be_collapses_onto_the_service(self) -> None:
         """A shortener is not a different service."""
         url = "https://youtu.be/dQw4w9WgXcQ"
-        assert query_source_of(parse_url(url, f"-play {url}")) == QUERY_SOURCE_YOUTUBE
+        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
 
     def test_youtube_playlist(self) -> None:
         url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp"
-        assert query_source_of(parse_url(url, f"-play {url}")) == QUERY_SOURCE_YOUTUBE
+        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
 
     def test_spotify_track_link(self) -> None:
         url = "https://open.spotify.com/track/5WZD6jHtgSSAGK97diNG7y"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SpotifySource)
         assert query_source_of(result) == QUERY_SOURCE_SPOTIFY
 
     def test_soundcloud_link(self) -> None:
         url = "https://soundcloud.com/artist/track"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, SoundcloudSource)
         assert query_source_of(result) == QUERY_SOURCE_SOUNDCLOUD
 
@@ -464,7 +575,7 @@ class TestQuerySource:
     def test_generic_hosts_keep_their_own_host(self, url: str, expected: str) -> None:
         """The point of the open tail: tiktok and vimeo are distinguishable
         without a dataclass apiece."""
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.OTHER
         assert query_source_of(result) == expected
@@ -482,7 +593,7 @@ class TestQuerySource:
         YouTube branch and lands on the generic one — the normalizer still names
         the service correctly."""
         url = "https://WWW.youtube.com/watch?v=dQw4w9WgXcQ"
-        result = parse_url(url, f"-play {url}")
+        result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.OTHER
         assert query_source_of(result) == QUERY_SOURCE_YOUTUBE
@@ -525,3 +636,38 @@ class TestQuotedArgumentsSurviveConsumeRest:
     def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
         assert unquote_argument('""') == '""'
         assert unquote_argument('"') == '"'
+
+
+class TestTimestampWarning:
+    """A `t=` that does not parse changes where the song starts, so the response
+    has to say so — the seek is otherwise dropped with nothing on screen."""
+
+    def test_none_when_the_timestamp_parsed(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=1m30s")) is None
+
+    def test_none_for_a_link_with_no_timestamp(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a")) is None
+
+    def test_none_for_a_source_that_cannot_carry_one(self) -> None:
+        """Spotify and SoundCloud have no `t=`; the helper takes the union type,
+        so the isinstance narrowing is what keeps this from raising."""
+        assert timestamp_warning(parse_url("https://soundcloud.com/a/b")) is None
+
+    def test_names_the_value_and_the_accepted_forms(self) -> None:
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=1h30"))
+        assert warning is not None
+        assert "1h30" in warning
+        assert TIMESTAMP_FORMATS in warning
+
+    def test_a_good_second_timestamp_suppresses_it(self) -> None:
+        """`?t=bad&ts=90` does start where the user asked, so warning about it
+        would be wrong."""
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=bad&ts=90")) is None
+
+    def test_the_echoed_value_cannot_break_out_of_its_code_span(self) -> None:
+        """The raw value is attacker-influenceable and is rendered inside
+        backticks, so safe_label's backtick neutralization is load-bearing."""
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=`x`[y](z)"))
+        assert warning is not None
+        assert "`x`" not in warning
+        assert "[y](z)" not in warning

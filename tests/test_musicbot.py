@@ -18,6 +18,7 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
+import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
@@ -39,7 +40,15 @@ from src.musicbot import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.util import EMBED_FIELD_LIMIT
-from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
+from src.sources import (
+    SpotifySource,
+    SpotifyType,
+    YTSource,
+    YTType,
+    parse_input,
+    parse_url,
+    timestamp_warning,
+)
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
@@ -1074,6 +1083,7 @@ class TestCleanup:
         mp.store = None
         mp._progress_task = None
         mp._pause_debounce_task = None
+        mp._heartbeat_task = None
         mp.retire_np_host_on_stop = AsyncMock()
         mp.update_activity = AsyncMock()
         # None = nothing was playing, the shape most of these tests mean. A bare
@@ -1151,6 +1161,19 @@ class TestCleanup:
         task.done.return_value = False
         task.cancel = MagicMock()
         self._make_minimal_mp(music_bot, mock_guild, _pause_debounce_task=task)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        task.cancel.assert_called_once()
+
+    async def test_cancels_in_flight_heartbeat_task(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Left running it keeps writing last_position_secs — and refreshing the
+        state key's TTL — over fields clear_connection() is about to delete."""
+        task = AsyncMock(spec=asyncio.Task)
+        task.done.return_value = False
+        task.cancel = MagicMock()
+        self._make_minimal_mp(music_bot, mock_guild, _heartbeat_task=task)
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)
         task.cancel.assert_called_once()
@@ -1563,6 +1586,51 @@ class TestSkipCommand:
         await command_callback(MusicBot.skip)(music_bot, mock_ctx)
         vc.stop.assert_called_once()
 
+    async def test_marks_the_stop_as_deliberate_before_stopping(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A skip inside ffmpeg's startup window is byte for byte what a stream whose
+        host never answered looks like; without the marker the player drops the cached
+        URL of a perfectly good song. Marked BEFORE vc.stop(), which fires `after`
+        immediately."""
+        order: list[str] = []
+        # spec'd: a bare MagicMock invents note_deliberate_stop, so renaming the real
+        # method would leave this green while -skip silently stopped marking.
+        mp = MagicMock(spec=MusicPlayer)
+        mp.note_deliberate_stop = MagicMock(side_effect=lambda: order.append("mark"))
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        vc.stop = MagicMock(side_effect=lambda: order.append("stop"))
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        assert order == ["mark", "stop"]
+
+    async def test_skip_without_a_player_still_stops(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Read from mps, never get_mp(): constructing a player here would start a
+        playback loop as a side effect of stopping a song."""
+        music_bot.mps.pop(mock_ctx.guild.id, None)
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        vc.stop = MagicMock()
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        vc.stop.assert_called_once()
+        assert mock_ctx.guild.id not in music_bot.mps
+
     async def test_playing_skip_sends_no_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -1625,9 +1693,11 @@ class TestSkipCommand:
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
 
-        mp = MagicMock()
+        mp = MagicMock(spec=MusicPlayer)
         mp.current_song = MagicMock(title="Paused Song", position_secs=83.4)
-        music_bot.get_mp = MagicMock(return_value=mp)
+        # Registered, not patched onto get_mp: skip reads the player it already has
+        # and must never construct one.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.skip)(music_bot, mock_ctx)
 
@@ -1711,9 +1781,9 @@ class TestSkipCommand:
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
 
-        mp = MagicMock()
+        mp = MagicMock(spec=MusicPlayer)
         mp.current_song = MagicMock(title="Paused Song", position_secs=83.4)
-        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
         # Simulate the playback loop racing ahead the instant we stop.
         vc.stop = MagicMock(side_effect=lambda: setattr(mp, "current_song", None))
 
@@ -2520,6 +2590,49 @@ def _running(cog: MusicBot, coro_name: str) -> bool:
     keeps the assertion about the thing under test.
     """
     return any(coro_name in repr(t.get_coro()) for t in cog._restore_tasks)
+
+
+class TestCogUnloadReleasesSpotify:
+    """The Spotify client's session lives for the life of the process, so the
+    cog's unload is the only thing that releases it."""
+
+    async def test_cog_unload_closes_the_spotify_session(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Nothing else asserts this: the conftest fixture closes stray sessions
+        after every test, so dropping the call from cog_unload leaves the whole
+        suite green."""
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_a_failing_step_does_not_skip_the_ones_after_it(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Cog._eject only logs what this raises and BotBase.close swallows that,
+        so an unguarded early failure would silently skip every later step and
+        nothing would say so — the same shape that once made a hung Postgres
+        permanently skip the rest of MusicBotApp.close()."""
+        music_bot._restore_tasks = set()
+        music_bot.debug_settings = MagicMock()
+        music_bot.debug_settings.aclose = AsyncMock(side_effect=OSError("boom"))
+
+        with patch.object(
+            debug_mode, "close_prometheus_session", new=AsyncMock()
+        ) as prom:
+            await music_bot.cog_unload()  # must not raise
+
+        prom.assert_awaited_once()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_cog_unload_skips_a_disabled_spotify(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The shipping default: no credentials means `spotify` is None, and the
+        unload must not raise on the guard that exists for exactly that case."""
+        music_bot.spotify = None
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()  # must not raise
 
 
 class TestCogLoadSpotifyValidation:
@@ -4895,3 +5008,47 @@ class TestShuffleWaitsForTheRestore:
             await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
 
         mp.queue_shuffle.assert_awaited_once()
+
+
+class TestTimestampWarningReachesTheUser:
+    @staticmethod
+    def _bad_ts_source() -> Any:
+        return parse_url("https://youtu.be/a?t=bogus")
+
+    async def test_it_rides_the_queued_song_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=3)  # something already queued
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        assert send.await_args is not None
+        description = send.await_args[0][2]
+        assert "bogus" in description
+        assert "Est. playing at" in description  # folded in, not replacing it
+
+    async def test_it_gets_its_own_message_when_no_embed_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An idle bot plays the first song immediately and sends no "Queued
+        song" embed at all. Riding that embed alone would drop the warning in
+        the most ordinary case there is."""
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=0)
+        mock_ctx.voice_client = _connected_vc()
+        mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        send.assert_not_awaited()
+        sent = [c.kwargs["embed"] for c in mock_ctx.send.await_args_list]
+        assert any("bogus" in (e.description or "") for e in sent)

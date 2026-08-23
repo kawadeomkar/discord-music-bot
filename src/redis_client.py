@@ -116,6 +116,8 @@ _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
     StateField.TOTAL_PAUSE_SECONDS,
     StateField.PAUSE_START_EPOCH,
+    StateField.LAST_POSITION_SECS,
+    StateField.LAST_HEARTBEAT_EPOCH,
 )
 
 
@@ -126,6 +128,17 @@ def _hset_mapping(mapping: dict[str, str]) -> Mapping[FieldT, EncodableT]:
     Mapping[FieldT, EncodableT] even though str is a member of FieldT. A variance
     workaround only — it widens nothing at runtime."""
     return cast(Mapping[FieldT, EncodableT], mapping)
+
+
+def _fmt_position(secs: float) -> str:
+    """Encode a playback position for LAST_POSITION_SECS. The one definition, so
+    the seed and the heartbeat cannot drift.
+
+    position_secs accumulates 20ms frames, so repr renders 13.5% of values with a
+    float-error tail ('153.42000000000002'). Milliseconds are already far finer
+    than the reader, which truncates to whole seconds.
+    """
+    return f"{max(0.0, secs):.3f}"
 
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -203,14 +216,18 @@ async def cache_set(
         log.warning(f"cache_set failed [{key}]: {e}")
 
 
-async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
-    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> bool:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors.
+
+    Returns whether an entry was actually removed, so a caller can report what happened
+    rather than announce a deletion that did not occur. False on a no-op or an error."""
     if redis is None:
-        return
+        return False
     try:
-        await redis.delete(key)
+        return bool(await redis.delete(key))
     except Exception as e:
         log.warning(f"cache_del failed [{key}]: {e}")
+        return False
 
 
 # ── Spotify auth token cache ──────────────────────────────────────────────────
@@ -772,7 +789,10 @@ class GuildRedisStore:
         await self.redis.lpop(self.queue_key())
 
     def _now_playing_state_mapping(
-        self, current: SongQueueEntry, play_start_epoch: float
+        self,
+        current: SongQueueEntry,
+        play_start_epoch: float,
+        start_offset: float = 0.0,
     ) -> dict[str, str]:
         """The current_song_* state fields ARE a parked queue entry — one signature
         enforcing the identity SongQueueEntry.from_song()/from_crashed_state()
@@ -797,6 +817,11 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
+            # Seeded so a position always exists before the first tick: without
+            # it a crash inside that interval, or a re-crashed recovered song,
+            # resumes at 0:00 rather than at its -ss offset.
+            StateField.LAST_POSITION_SECS: _fmt_position(start_offset),
+            StateField.LAST_HEARTBEAT_EPOCH: str(play_start_epoch + start_offset),
         }
 
     @_guild_op(default=False)
@@ -805,6 +830,7 @@ class GuildRedisStore:
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
+        start_offset: float = 0.0,
     ) -> bool:
         """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
@@ -818,7 +844,9 @@ class GuildRedisStore:
         settle already happened, so a swallowed failure leaves the list holding an
         entry memory does not, and the next start retires the wrong one.
         """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
+        mapping = self._now_playing_state_mapping(
+            current, play_start_epoch, start_offset
+        )
         pipe = self.redis.pipeline(transaction=True)
         pipe.lpop(self.queue_key())
         pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
@@ -839,12 +867,15 @@ class GuildRedisStore:
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
+        start_offset: float = 0.0,
     ) -> None:
         """pop_queue_and_start_song without the LPOP, in one transaction — for
         restarting a crash-recovered "current song" that was never RPUSHed to the
         queue list.
         """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
+        mapping = self._now_playing_state_mapping(
+            current, play_start_epoch, start_offset
+        )
         pipe = self.redis.pipeline(transaction=True)
         pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
         pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
@@ -1090,7 +1121,13 @@ class GuildRedisStore:
 
     @_guild_op(default=None)
     async def on_pause(self, epoch: float) -> None:
-        """Record the epoch when the voice client was paused."""
+        """Record the epoch when the voice client was paused.
+
+        LEGACY. Feeds only _legacy_wall_clock_position_at now — MusicPlayer.pause
+        records the exact position through heartbeat(). Drop this, on_resume, and
+        the three wall-clock StateFields together one release after the heartbeat
+        ships.
+        """
         pipe = self.redis.pipeline()
         pipe.hset(self.state_key(), StateField.PAUSE_START_EPOCH, str(epoch))
         await self._exec_with_state_ttl(pipe)
@@ -1099,6 +1136,10 @@ class GuildRedisStore:
     async def on_resume(self, resume_epoch: float) -> None:
         """Accumulate elapsed pause time into total_pause_seconds, clear
         pause_start_epoch.
+
+        LEGACY, like on_pause: the accumulated total feeds only
+        _legacy_wall_clock_position_at, and goes with it one release after the
+        heartbeat ships.
 
         Non-atomic read-modify-write, so it assumes one writer per guild (true
         today). Under multi-process sharding this must become a Lua script or a
@@ -1374,6 +1415,33 @@ class GuildRedisStore:
         )
         pipe.delete(self.now_playing_key())
         await pipe.execute()
+
+    @_guild_op(default=None)
+    async def heartbeat(self, position_secs: float, epoch: float) -> None:
+        """Record where the audio is, so recovery never has to infer it.
+
+        Two commands in one round trip, once per HEARTBEAT_INTERVAL_SECS per
+        PLAYING guild — 0.33/s at the default. Small in absolute terms but ~40x the
+        per-song transactions, and every one is an AOF append: ~230 B each, so a
+        thousand simultaneous listeners is ~0.3 GiB/day. Writes the legacy fields'
+        successor without removing them (see StateField) — a rollback must still
+        read this.
+
+        transaction=False unlike the other state writers: HSET then EXPIRE on one
+        key needs no atomicity, and at this frequency the MULTI/EXEC pair is a
+        measured 12% of the latency and 14% of the bytes for nothing.
+        """
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.hset(
+            self.state_key(),
+            mapping=_hset_mapping(
+                {
+                    StateField.LAST_POSITION_SECS: _fmt_position(position_secs),
+                    StateField.LAST_HEARTBEAT_EPOCH: str(epoch),
+                }
+            ),
+        )
+        await self._exec_with_state_ttl(pipe)
 
     # Recovery lock — one restore_guild per guild at a time
 

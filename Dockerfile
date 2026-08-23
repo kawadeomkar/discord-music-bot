@@ -106,6 +106,18 @@ COPY pyproject.toml ./
 # never be different versions.
 COPY migrations/ ./migrations/
 
+# Non-root: ffmpeg and the venv need no privilege. The uid/gid are fixed rather
+# than distro-assigned so volume ownership survives rebuilds and base-image bumps.
+# HOME is set below because yt-dlp derives its cache directory from it, and
+# docker-compose.yml mounts ytdlp-cache at that path.
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
+ && mkdir -p /home/app/.cache/yt-dlp \
+ && chown -R app:app /home/app
+# Numeric, not `app`: kubelet checks runAsNonRoot against the image's USER and
+# cannot resolve a name, failing the pod with "image has non-numeric user".
+USER 10001:10001
+
 ARG ENVIRONMENT=production
 # The commit this image was built from. GIT_SHA existed only as an image TAG, so a
 # running bot could not report its own commit — `just up <sha>` deploys by tag and
@@ -117,7 +129,23 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
+    HOME="/home/app" \
     ENVIRONMENT="${ENVIRONMENT}" \
-    GIT_SHA="${GIT_SHA}"
+    GIT_SHA="${GIT_SHA}" \
+    LIVENESS_FILE="/tmp/bot-alive"
+
+# `restart: always` only covers the process exiting; a wedged event loop leaves
+# the container up while it answers nothing. The bot touches LIVENESS_FILE from a
+# loop-resident task, so a stale mtime means the loop stopped turning. Not a
+# dependency probe: a Redis blip must not mark the bot dead.
+#
+# This REPORTS, it does not act. The engine takes no action on an unhealthy
+# container — only Swarm, Kubernetes or an autoheal sidecar restarts one — so
+# under plain compose the effect is a status `docker ps` and monitoring can see.
+#
+# start-period covers login and extension load. interval x retries marks it
+# unhealthy after ~90s, above the 15s touch cadence.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 
 CMD ["python", "-m", "src.main"]

@@ -280,6 +280,18 @@ class TestConfigAllowlist:
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "YTDLP_POOL_WORKERS")
         assert render_config_value(var) == "4 (default)"
 
+    def test_the_environment_default_is_read_at_render_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() infers ENVIRONMENT from the git branch when the var is unset, and
+        src.main imports this module — so a fallback stored at import freezes the
+        pre-inference value and this row contradicts the host block on the same card.
+        """
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.setattr(config, "ENVIRONMENT", "task/some-branch")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "ENVIRONMENT")
+        assert render_config_value(var) == "task/some-branch (default)"
+
     def test_unlisted_variable_never_renders(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2034,8 +2046,8 @@ class TestContainerMetrics:
 
     def _patch_session(
         self, monkeypatch: pytest.MonkeyPatch, session: MagicMock
-    ) -> AsyncMock:
-        factory = AsyncMock(return_value=session)
+    ) -> MagicMock:
+        factory = MagicMock(return_value=session)
         monkeypatch.setattr(debug, "_prometheus_session", factory)
         return factory
 
@@ -2084,7 +2096,7 @@ class TestContainerMetrics:
         factory = self._patch_session(monkeypatch, self._session(self._payload()))
         assert await debug.read_container_metrics(None, "discord-postgres") is None
         assert await debug.read_container_metrics("", "discord-postgres") is None
-        factory.assert_not_awaited()
+        factory.assert_not_called()
 
     async def test_absent_series_is_not_an_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2196,33 +2208,33 @@ class TestPrometheusSession:
         """aiohttp's default total timeout is FIVE MINUTES. Without this kwarg a
         black-holed metrics endpoint holds the Postgres probe far past -debug's own
         8s deadline, and the compose comment calls that port unauthenticated."""
-        session = await debug._prometheus_session()
+        session = debug._prometheus_session()
         assert session.timeout.total == debug._PROMETHEUS_TIMEOUT_SECS
 
     async def test_one_session_serves_the_process(self) -> None:
         """A session per query paid an extra connect every time — a full TCP (plus
         TLS) handshake against anything not on loopback."""
-        first = await debug._prometheus_session()
-        assert await debug._prometheus_session() is first
+        first = debug._prometheus_session()
+        assert debug._prometheus_session() is first
 
     async def test_a_closed_session_is_replaced(self) -> None:
         """cog_unload closes it; the next -debug must not be handed the corpse."""
-        first = await debug._prometheus_session()
+        first = debug._prometheus_session()
         await first.close()
-        second = await debug._prometheus_session()
+        second = debug._prometheus_session()
         assert second is not first and not second.closed
 
     async def test_close_really_closes_and_clears_the_cache(self) -> None:
         """The one test that drove cog_unload had a None cache, so a no-op body was
         green while leaking a connector per reload."""
-        session = await debug._prometheus_session()
+        session = debug._prometheus_session()
         await debug.close_prometheus_session()
         assert session.closed
         assert debug._prometheus_session_cache is None
 
     async def test_closing_twice_is_safe(self) -> None:
         """cog_unload can run after a teardown that already closed it."""
-        await debug._prometheus_session()
+        debug._prometheus_session()
         await debug.close_prometheus_session()
         await debug.close_prometheus_session()
         assert debug._prometheus_session_cache is None

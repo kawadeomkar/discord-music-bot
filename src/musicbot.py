@@ -10,7 +10,7 @@ from typing import (
     assert_never,
     cast,
 )
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 
 import discord
 from discord.ext import commands
@@ -43,6 +43,7 @@ from src.redis_client import (
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
     QUERY_SOURCE_SEARCH,
+    timestamp_warning,
     unquote_argument,
     SoundcloudSource,
     SpotifySource,
@@ -192,6 +193,7 @@ _ECHO_MAX = 200
 
 # One row of a multi-row field — ten of these share the budget one needle gets.
 _ECHO_ROW_MAX = 70
+
 
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
@@ -431,15 +433,36 @@ class MusicBot(commands.Cog):
     async def cog_unload(self) -> None:
         """Stop the runtime sampler unconditionally. A reload that left it running
         would drip /proc reads for the life of the process. The shared Prometheus
-        session goes with it, or a reload leaks a connector per load.
+        and Spotify sessions go with it, or a reload leaks a connector per load.
 
         The background tasks go FIRST: the hydration ends in sync_sampler, so one
         still in flight would restart the sampler straight after aclose() and leak
         it, holding a dead cog alive.
+
+        Every step is guarded individually, like MusicBotApp.close(): Cog._eject
+        only logs what this raises and BotBase.close swallows it, so an early
+        failure would silently skip the rest and nothing would say so.
         """
-        await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
-        await self.debug_settings.aclose()
-        await debug_mode.close_prometheus_session()
+        spotify = self.spotify
+
+        async def _cancel_background() -> None:
+            await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
+
+        # Callables, not coroutines: building them up front would schedule the
+        # gather before its turn and leave the rest un-awaited on any early exit,
+        # which pytest's filterwarnings=error turns into a failure.
+        steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("background tasks", _cancel_background),
+            ("runtime sampler", self.debug_settings.aclose),
+            ("prometheus session", debug_mode.close_prometheus_session),
+        ]
+        if spotify is not None:
+            steps.append(("spotify session", spotify.aclose))
+        for name, step in steps:
+            try:
+                await step()
+            except Exception as e:
+                log.warning(f"cog unload step failed ({name}): {e}")
 
     async def _validate_spotify_credentials(self) -> None:
         """Background credential probe (spawned by cog_load, never awaited). Only
@@ -518,6 +541,7 @@ class MusicBot(commands.Cog):
             teardown = [
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
+                cancel_task(mp._heartbeat_task),
                 cancel_task(mp._pause_debounce_task),
                 cancel_task(mp._player),
                 cancel_task(mp._restore_task),
@@ -821,6 +845,8 @@ class MusicBot(commands.Cog):
         # collapses it to the first track to bound how long an interrupted song
         # waits. Nothing is playing to interrupt on this path.
         enqueue = mp.queue_put_front if front else mp.queue_put
+        warning = timestamp_warning(source)
+        warning_line = f"\n\n{warning}" if warning else ""
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(
@@ -832,7 +858,8 @@ class MusicBot(commands.Cog):
                 send_embed(
                     ctx,
                     "Queued playlist",
-                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}",
+                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
+                    f"{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
@@ -868,7 +895,7 @@ class MusicBot(commands.Cog):
                     ctx,
                     f"Queued playlist — {count} {pluralize(count, 'song')}",
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
-                    f"{skipped_line}\n{shown_titles}",
+                    f"{skipped_line}\n{shown_titles}{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
@@ -883,7 +910,13 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         front: bool = False,
+        warning: Optional[str] = None,
     ) -> None:
+        """`warning` rides the confirmation embed when there is one. Every exit
+        below sends it either way: the embed is conditional (a song that starts
+        immediately gets none) and the warning is about what the user typed, so
+        losing it on the quietest path would hide it in the common case of
+        queueing the first song."""
         vc = ctx.voice_client
         if front:
             # The "Est. playing at" embed below would be wrong: a restored queue is
@@ -898,6 +931,10 @@ class MusicBot(commands.Cog):
             ]
             if resume_notice is not None:
                 coros.append(ctx.send(embed=resume_notice))
+            if warning is not None:
+                coros.append(
+                    ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                )
             await asyncio.gather(*coros)
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
@@ -910,6 +947,7 @@ class MusicBot(commands.Cog):
             ctx.message.add_reaction("👍"),
         ]
         if should_show_queued:
+            warning_line = f"\n\n{warning}" if warning else ""
             coros.append(
                 send_embed(
                     ctx,
@@ -918,11 +956,16 @@ class MusicBot(commands.Cog):
                         f"Requested by: [{ctx.author.mention}]\n"
                         f"{qobj.title} - ({qobj.webpage_url})\n"
                         f"Est. playing at {mp.estimated_playing_at()}"
+                        f"{warning_line}"
                     ),
                     discord.Color.blue(),
                     thumbnail=qobj.thumbnail,
                 )
             )
+        elif warning is not None:
+            # Nothing else is being sent on this path — the song starts now and
+            # the NP card speaks for it — so the warning needs its own message.
+            coros.append(ctx.send(embed=notice_embed(warning, discord.Color.orange())))
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
@@ -1091,7 +1134,13 @@ class MusicBot(commands.Cog):
                             return
 
                     if isinstance(qobj, QueueObject):
-                        await self._enqueue_single(ctx, qobj, mp, front=front)
+                        await self._enqueue_single(
+                            ctx,
+                            qobj,
+                            mp,
+                            front=front,
+                            warning=timestamp_warning(source),
+                        )
                     else:
                         await self._enqueue_playlist(
                             ctx,
@@ -1276,7 +1325,7 @@ class MusicBot(commands.Cog):
             # minted for the interjection. Read here: the queue moved during the
             # resolve.
             qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
-            await self._enqueue_single(ctx, qobj, mp)
+            await self._enqueue_single(ctx, qobj, mp, warning=timestamp_warning(source))
             return
 
         outcome = await mp.interject(qobj, vc, resume_paused=resume_paused)
@@ -1377,13 +1426,22 @@ class MusicBot(commands.Cog):
             # Primitives, not the object — the player thread calls cleanup() on it.
             skipped_title: Optional[str] = None
             skipped_position = ""
-            if vc.is_paused():
-                song = self.get_mp(ctx).current_song
+            assert ctx.guild is not None  # validate_commands rejects DMs before this
+            # mps, not get_mp(): this must not build a player, and one lookup keeps
+            # the mark and the paused read on the same object — cog_before_invoke can
+            # rebuild a player mid-command.
+            mp_for_stop = self.mps.get(ctx.guild.id)
+            if vc.is_paused() and mp_for_stop is not None:
+                song = mp_for_stop.current_song
                 if song is not None:
                     skipped_title = song.title
                     # position_secs is frozen while paused: the exact leave point.
                     skipped_position = fmt_duration(int(song.position_secs))
 
+            # Before vc.stop(): a skip inside ffmpeg's startup window otherwise looks
+            # exactly like a stream that never opened.
+            if mp_for_stop is not None:
+                mp_for_stop.note_deliberate_stop()
             vc.stop()
 
             coros: list[Coroutine[Any, Any, Any]] = []

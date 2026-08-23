@@ -14,6 +14,8 @@ services:
         GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
+    # Linux only. On Docker Desktop the daemon runs in a VM, where this is a
+    # no-op and the bot cannot reach Redis or the OTLP endpoint on localhost.
     network_mode: host
     env_file:
     - .env
@@ -81,7 +83,15 @@ services:
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
-      - ytdlp-cache:/root/.cache/yt-dlp
+      # Path follows HOME for the non-root `app` user in the Dockerfile; the two
+      # move together.
+      #
+      # Docker seeds ownership only into an EMPTY volume, so a ytdlp-cache
+      # carried over from the root-owned path stays root:root and uid 10001
+      # cannot write it: yt-dlp logs `PermissionError: [Errno 13]` per store and
+      # nothing persists. Discard it once —
+      #   docker compose down && docker volume rm discord-music-bot_ytdlp-cache
+      - ytdlp-cache:/home/app/.cache/yt-dlp
     depends_on:
       redis:
         condition: service_healthy
@@ -101,7 +111,7 @@ services:
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
       # bgutil-pot-provider is intentionally NOT in depends_on either: the bot is
-      # fully functional without it (web_safari degrades to token-less, android_vr
+      # fully functional without it (the fallback client degrades to token-less, the primary
       # is untouched).
 
   redis:
@@ -317,7 +327,7 @@ services:
         condition: service_started
 
   bgutil-pot-provider:
-    # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
+    # Mints GVS Proof-of-Origin tokens so yt-dlp's fallback client can serve audio
     # client. Version must match the
     # bgutil-ytdlp-pot-provider pin in pyproject.toml — plugin and server are
     # released in lockstep; bump both together.
@@ -385,6 +395,8 @@ services:
       - ./grafana/dashboards/discord-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/discord-provider.yaml:ro
       - ./grafana/dashboards/json:/var/lib/grafana/dashboards/discord:ro
     environment:
+      # Dev credentials, safe only while this service is unpublished beyond the
+      # host. Replace them anywhere it is reachable.
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:
