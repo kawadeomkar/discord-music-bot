@@ -2843,8 +2843,19 @@ class TestHeartbeat:
     ) -> None:
         await store.heartbeat(42.5, 1700000000.0)
         raw = await fake_redis.hgetall(store.state_key())
-        assert raw[b"last_position_secs"] == b"42.5"
+        assert raw[b"last_position_secs"] == b"42.500"
         assert raw[b"last_heartbeat_epoch"] == b"1700000000.0"
+
+    async def test_the_position_is_written_without_a_float_error_tail(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """position_secs accumulates 20ms frames, so repr renders 13.5% of values
+        as '153.42000000000002'. The reader truncates to whole seconds, so the tail
+        is noise on every write."""
+        await store.heartbeat(7671 * 0.02, 1700000000.0)  # 153.42000000000002
+
+        raw = await fake_redis.hgetall(store.state_key())
+        assert raw[b"last_position_secs"] == b"153.420"
 
     async def test_refreshes_the_state_ttl(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

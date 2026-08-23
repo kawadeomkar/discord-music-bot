@@ -127,6 +127,17 @@ def _hset_mapping(mapping: dict[str, str]) -> Mapping[FieldT, EncodableT]:
     return cast(Mapping[FieldT, EncodableT], mapping)
 
 
+def _fmt_position(secs: float) -> str:
+    """Encode a playback position for LAST_POSITION_SECS. The one definition, so
+    the seed and the heartbeat cannot drift.
+
+    position_secs accumulates 20ms frames, so repr renders 13.5% of values with a
+    float-error tail ('153.42000000000002'). Milliseconds are already far finer
+    than the reader, which truncates to whole seconds.
+    """
+    return f"{max(0.0, secs):.3f}"
+
+
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
 
@@ -806,7 +817,7 @@ class GuildRedisStore:
             # Seeded so a position always exists before the first tick: without
             # it a crash inside that interval, or a re-crashed recovered song,
             # resumes at 0:00 rather than at its -ss offset.
-            StateField.LAST_POSITION_SECS: str(max(0.0, start_offset)),
+            StateField.LAST_POSITION_SECS: _fmt_position(start_offset),
             StateField.LAST_HEARTBEAT_EPOCH: str(play_start_epoch + start_offset),
         }
 
@@ -1414,7 +1425,7 @@ class GuildRedisStore:
             self.state_key(),
             mapping=_hset_mapping(
                 {
-                    StateField.LAST_POSITION_SECS: str(max(0.0, position_secs)),
+                    StateField.LAST_POSITION_SECS: _fmt_position(position_secs),
                     StateField.LAST_HEARTBEAT_EPOCH: str(epoch),
                 }
             ),
