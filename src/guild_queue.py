@@ -13,9 +13,9 @@ The cursor is the boundary, not a per-item flag, because Redis retires entries
 by LPOP — so in-flight items are necessarily a PREFIX. Both legs are private:
 no caller can move one without the other, and every mirror-touching mutation
 (put, put_front, clear, shuffle, remove, finish_failed_dequeue) holds one
-bulk-mutation mutex across its memory AND mirror writes. One residual window
-remains — see the ISSUE below. Invalidation is carried by the generation
-counter and the cursor (see clear()).
+bulk-mutation mutex across its memory AND mirror writes. The dequeue commit
+extends that hold over the caller's Redis write (see commit_dequeue).
+Invalidation is carried by the generation counter and the cursor (see clear()).
 
 Two counters, adjacent names, different sets: qsize() is PENDING (len - cursor),
 display_size() is pending PLUS in-flight (len).
@@ -30,18 +30,12 @@ Not known here:
 See docs/ARCHITECTURE.md#queue-invariant.
 """
 
-# ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
-# try_commit_dequeue() releases the bulk mutex before pop_queue_and_start_song()'s
-# atomic LPOP+HSET dispatches, so a -clear landing in that tick pops an entry the clear
-# already deleted: memory and Redis drift by one until the next rebuild, and a crash
-# inside the drift restores the queue one song out of alignment. Accepted. Cheapest fix:
-# hold the mutex across the store dispatch, costing one ~1ms round-trip.
-
 import asyncio
+import contextlib
 import random
 import re
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass
 from itertools import islice
 from enum import Enum, StrEnum, auto
@@ -178,6 +172,7 @@ class GuildQueue:
         "_wake",
         "_mutex",
         "_generation",
+        "_mirror_dirty",
     )
 
     def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
@@ -191,6 +186,10 @@ class GuildQueue:
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
         self._generation = 0
+        # True while the list holds an entry memory already retired: the start
+        # transaction's LPOP did not land. Cleared by the next write that replaces
+        # the list outright — a rebuild, a DELETE, or the next song start.
+        self._mirror_dirty = False
 
     # ── Wake discipline ───────────────────────────────────────────────────────
 
@@ -263,9 +262,10 @@ class GuildQueue:
 
     @property
     def generation(self) -> int:
-        """Bumped by clear(). A dequeue captures this when it takes its item and
-        hands it back to try_commit_dequeue(), which refuses to commit across a
-        bump — see that method for why emptiness alone cannot answer this."""
+        """Monotonic counter of queue invalidations, bumped by clear(). A dequeue
+        captures it when it takes its item and hands it back to commit_dequeue(),
+        which refuses across a bump — see there for why emptiness alone cannot
+        answer this."""
         return self._generation
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
@@ -347,7 +347,7 @@ class GuildQueue:
 
         Bumps the generation under the mutex before draining, and resets the
         cursor: a claim the loop took before this clear() captured the old value
-        and is refused by try_commit_dequeue(); a claim a prefetch took commits under
+        and is refused by commit_dequeue(); a claim a prefetch took commits under
         the current value and is refused because nothing is claimed at cursor 0.
 
         The DEL is inside the mutex too: released early, a concurrent put()'s
@@ -358,8 +358,8 @@ class GuildQueue:
             self._items.clear()
             self._cursor = 0
             self._sync_wake()
-            if self._store is not None:
-                await self._store.delete_queue()
+            if self._store is not None and await self._store.delete_queue():
+                self._mirror_dirty = False
         return cleared_items
 
     async def shuffle(self) -> ShuffleOutcome:
@@ -518,7 +518,7 @@ class GuildQueue:
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
-    # Settle through try_commit_dequeue() or finish_failed_dequeue(), never
+    # Settle through commit_dequeue() or finish_failed_dequeue(), never
     # try_release() alone: those two carry the mirror leg with them.
 
     def try_release(self) -> bool:
@@ -527,10 +527,13 @@ class GuildQueue:
         stays pending.
 
         False means there was nothing claimed to settle, which is what a clear()
-        during the resolve leaves behind. Guarded rather than raising: a negative
-        _cursor eats a PENDING item on the next release and breaks I1. Use
-        try_commit_dequeue() unless already holding the bulk-mutation lock — the
-        check must not race a clear()/shuffle()."""
+        during the resolve leaves behind. Guarded rather than raising, because
+        driving _cursor negative would eat a PENDING item on the next release and
+        break I1. Both callers make the no-op correct: commit_dequeue() refuses a
+        commit taken before a clear(), and finish_failed_dequeue() gates its LPOP
+        on this return value, since nothing claimed means the mirror holds only
+        what was queued after that clear. Use one of them unless already holding
+        the bulk-mutation lock — the check must not race a clear()/shuffle()."""
         if self._cursor == 0:
             return False
         self._items.popleft()
@@ -549,7 +552,10 @@ class GuildQueue:
         every loop failure path shares. `context` labels the nothing-claimed
         warning. The mutex spans the settle and the LPOP so a bulk mutation cannot
         rebuild the mirror between them and have the LPOP hit the new head.
-        `persisted` overrides what `item` says about itself — see redis_pop_for.
+
+        `persisted` overrides what `item` says about itself, and exists for the one
+        caller holding a claim it cannot describe with a QueueItem — see
+        redis_pop_for.
 
         The LPOP is GATED on the settle: nothing claimed means a clear() already
         retired this item and reset the cursor, so the mirror holds only what was
@@ -563,23 +569,48 @@ class GuildQueue:
                 return
             await self.redis_pop_for(item, persisted=persisted)
 
-    async def try_commit_dequeue(self, generation: int) -> bool:
-        """Settle the claim for a song about to play, under the bulk-mutation lock
-        so the check cannot race a clear()/shuffle(). False means the queue was
-        cleared during the resolve and the caller discards the song; its FFmpeg
-        cleanup stays caller-side.
+    @contextlib.asynccontextmanager
+    async def commit_dequeue(self, generation: int) -> AsyncGenerator[bool]:
+        """Settle the claim for a song about to play, with the bulk mutex held
+        across the caller's own Redis write. Yields False when the queue was
+        cleared since the claim, which means discard the song (its FFmpeg
+        cleanup stays caller-side, outside the hold).
 
-        `generation` is what the queue read when this claim took its item, and
-        neither emptiness nor identity can stand in for it. A put() landing before
-        the commit refills the queue, so the head belongs to the NEW song and
-        committing settles that instead — playing, and re-recording, the cleared
-        one. And _resolve_source() replaces a YTSource with the QueueObject it
-        resolved to, so head and item are legitimately different objects for one
-        slot."""
+        `generation` is the value the caller captured beside its claim. A
+        put() refilling the head before the commit, or a YTSource resolved to
+        the QueueObject it became, cannot stand in for it; a prefetched claim
+        passes the current value and is refused by the cursor reset instead.
+
+        Keep the body to ONE bounded Redis write and never touch Discord in it:
+        the pool sets no socket_timeout. vc.play() belongs inside or after the
+        commit, never before it. See docs/ARCHITECTURE.md#queue-operations."""
         async with self._mutex:
             if generation != self._generation:
-                return False
-            return self.try_release()
+                yield False
+                return
+            yield self.try_release()
+
+    @property
+    def mirror_dirty(self) -> bool:
+        """True while the Redis list holds an entry memory already retired. The
+        next song start must rebuild the list rather than LPOP it, or it retires
+        the wrong entry; a -clear/-shuffle/-remove rebuild clears it in passing."""
+        return self._mirror_dirty
+
+    def note_mirror_write(self, *, landed: bool, retired: bool) -> None:
+        """Record the start transaction's outcome, from inside commit_dequeue's
+        hold. A write that landed leaves the list correct whatever leg it carried;
+        one that did not, while `retired` says memory dropped an entry, leaves
+        the list one ahead."""
+        if landed:
+            self._mirror_dirty = False
+        elif retired:
+            self._mirror_dirty = True
+
+    def mirror_entries(self) -> list[QueueEntry]:
+        """The list as the mirror should hold it: the persisted subset of the
+        deque, claimed prefix included, in order — what a rebuild writes."""
+        return [_to_entry(s) for s in self._items if is_persisted(s)]
 
     async def redis_pop_for(
         self, item: Optional[QueueItem], *, persisted: Optional[bool] = None
@@ -617,7 +648,8 @@ class GuildQueue:
 
         `removed` is the LREM shortcut, and only a removal may pass it: LREM assumes
         the survivors kept their order, which is false for shuffle and for any
-        insert. It is capped by COUNT (see _LREM_MAX_ENTRIES) and guarded twice more,
+        insert — and a stale list (mirror_dirty) has no order to keep. It is capped
+        by COUNT (see _LREM_MAX_ENTRIES) and guarded twice more,
         because LREM matches on exact bytes: skipped outright when a removed blob is
         byte-identical to a claimed item's, since LREM takes the head-most copy —
         the entry awaiting a commit-time LPOP — and falling through to the rebuild
@@ -628,7 +660,8 @@ class GuildQueue:
             return
         survivors = sum(1 for s in items if is_persisted(s))
         if not survivors:
-            await self._store.delete_queue()
+            if await self._store.delete_queue():
+                self._mirror_dirty = False
             return
         # The gate needs only a count, and one -remove of a collection link
         # routinely drops hundreds: serializing 500 entries measured 2.5ms on the
@@ -636,6 +669,7 @@ class GuildQueue:
         dropped_count = sum(1 for s in removed if is_persisted(s))
         if (
             dropped_count
+            and not self._mirror_dirty
             and dropped_count <= _LREM_MAX_ENTRIES
             and dropped_count * _LREM_MAX_SHARE <= survivors
         ):
@@ -651,9 +685,10 @@ class GuildQueue:
                     f"queue mirror diverged from memory in guild {self._guild.id}; "
                     "rebuilding instead of removing"
                 )
-        await self._store.rebuild_queue(
+        if await self._store.rebuild_queue(
             [_to_entry(s) for s in items if is_persisted(s)]
-        )
+        ):
+            self._mirror_dirty = False
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a CLAIMED

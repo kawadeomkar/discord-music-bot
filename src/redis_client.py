@@ -821,78 +821,116 @@ class GuildRedisStore:
             StateField.LAST_HEARTBEAT_EPOCH: str(play_start_epoch + start_offset),
         }
 
-    @_guild_op(default=None)
+    def _start_song_pipeline(
+        self,
+        current: SongQueueEntry,
+        play_start_epoch: float,
+        now_playing: Optional[NowPlayingData],
+        start_offset: float,
+    ) -> Pipeline:
+        """The state and snapshot legs every song start writes, in one
+        MULTI; the caller adds its queue leg and executes. `now_playing` rides
+        the same transaction, so a crash can never leave state pointing at song
+        B while the snapshot still shows song A."""
+        mapping = self._now_playing_state_mapping(
+            current, play_start_epoch, start_offset
+        )
+        pipe = self.redis.pipeline(transaction=True)
+        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
+        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
+        pipe.expire(self.state_key(), GUILD_TTL)
+        if now_playing is not None:
+            pipe.hset(
+                self.now_playing_key(),
+                mapping=_hset_mapping(now_playing.to_redis_mapping()),
+            )
+            pipe.expire(self.now_playing_key(), GUILD_TTL)
+        return pipe
+
+    @_guild_op(default=False)
     async def pop_queue_and_start_song(
         self,
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
         start_offset: float = 0.0,
-    ) -> None:
+    ) -> bool:
         """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
         MULTI/EXEC leaves the song in one of two consistent states — still queued
         with current_song_url empty, or dequeued with all now-playing fields set —
-        closing the crash window where it was absent from both. `now_playing` rides
-        the same transaction, so a crash can never leave state pointing at song B
-        while the snapshot still shows song A.
-        """
-        mapping = self._now_playing_state_mapping(
-            current, play_start_epoch, start_offset
-        )
-        pipe = self.redis.pipeline(transaction=True)
-        pipe.lpop(self.queue_key())
-        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
-        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
-        pipe.expire(self.state_key(), GUILD_TTL)
-        if now_playing is not None:
-            pipe.hset(
-                self.now_playing_key(),
-                mapping=_hset_mapping(now_playing.to_redis_mapping()),
-            )
-            pipe.expire(self.now_playing_key(), GUILD_TTL)
-        await pipe.execute()
+        closing the crash window where it was absent from both.
 
-    @_guild_op(default=None)
+        Returns whether the transaction landed, and THE CALLER MUST CHECK: the
+        in-memory settle already happened, so a swallowed failure leaves the list
+        holding an entry memory does not (GuildQueue.note_mirror_write).
+        """
+        pipe = self._start_song_pipeline(
+            current, play_start_epoch, now_playing, start_offset
+        )
+        pipe.lpop(self.queue_key())
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def rebuild_queue_and_start_song(
+        self,
+        current: SongQueueEntry,
+        entries: Sequence[QueueEntry],
+        play_start_epoch: float,
+        now_playing: Optional[NowPlayingData] = None,
+        start_offset: float = 0.0,
+    ) -> bool:
+        """pop_queue_and_start_song with the list REPLACED by `entries` instead of
+        LPOPed — for a mirror the caller knows is stale, where an LPOP would
+        retire the wrong entry. DELETE + RPUSH ride the same MULTI as the state
+        fields, so either the song is parked over a correct list or nothing
+        changed. Returns whether it landed.
+        """
+        pipe = self._start_song_pipeline(
+            current, play_start_epoch, now_playing, start_offset
+        )
+        pipe.delete(self.queue_key())
+        if entries:
+            pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
+            pipe.expire(self.queue_key(), GUILD_TTL)
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
     async def set_current_song_state(
         self,
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
         start_offset: float = 0.0,
-    ) -> None:
+    ) -> bool:
         """pop_queue_and_start_song without the LPOP, in one transaction — for
         restarting a crash-recovered "current song" that was never RPUSHed to the
-        queue list.
+        queue list. Returns whether it landed.
         """
-        mapping = self._now_playing_state_mapping(
-            current, play_start_epoch, start_offset
+        pipe = self._start_song_pipeline(
+            current, play_start_epoch, now_playing, start_offset
         )
-        pipe = self.redis.pipeline(transaction=True)
-        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
-        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
-        pipe.expire(self.state_key(), GUILD_TTL)
-        if now_playing is not None:
-            pipe.hset(
-                self.now_playing_key(),
-                mapping=_hset_mapping(now_playing.to_redis_mapping()),
-            )
-            pipe.expire(self.now_playing_key(), GUILD_TTL)
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def delete_queue(self) -> None:
-        """DELETE the queue key."""
+    @_guild_op(default=False)
+    async def delete_queue(self) -> bool:
+        """DELETE the queue key. Returns whether it landed."""
         await self.redis.delete(self.queue_key())
+        return True
 
-    @_guild_op(default=None)
-    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> None:
-        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window race."""
+    @_guild_op(default=False)
+    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> bool:
+        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window
+        race. Returns whether it landed."""
         pipe = self.redis.pipeline(transaction=True)
         pipe.delete(self.queue_key())
         pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
         pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
+        return True
 
     @_guild_op(default=0)
     async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:

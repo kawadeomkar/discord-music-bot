@@ -579,8 +579,8 @@ flowchart TD
     Stream["_stream_source() → YTDL"]
     Failed{"YTDL is None?"}
     FailPop["queue.finish_failed_dequeue()\nsend 'Failed…' via send_with_np"]
-    Commit{"queue.try_commit_dequeue()?"}
-    Discard["cleared mid-resolve:\ncommit refused + song.cleanup()"]
+    Commit{"queue.commit_dequeue()?"}
+    Discard["cleared (mid-resolve, or mid-prefetch):\ncommit refused + song.cleanup()"]
     Play["vc.play(song, after=play_next.set\nvia call_soon_threadsafe)"]
     Persist["Redis MULTI/EXEC:\npop_queue_and_start_song(entry,\nbackdated play_start, now_playing)\n(or set_current_song_state for\ncrash-recovered song)"]
     NP["update_activity(song)\n_send_now_playing(song)\n→ progress task starts"]
@@ -608,7 +608,7 @@ Key details:
 - **Atomic start transaction**: for a real queue item, `pop_queue_and_start_song` LPOPs the Redis queue and writes all current-song state fields plus the `now_playing` display snapshot in one `MULTI/EXEC` — there is no window where the song is neither on the queue list nor in the state hash. A crash-recovered song (`persisted=False`) was never on the Redis list, so only the state fields are written (an LPOP would drop an unrelated queued song).
 - **Backdated epoch**: `play_start_epoch` is stored as `play_start − song.start_offset`. The same offset is passed again as `start_offset`, seeding `last_position_secs` so a crash inside the first heartbeat interval still resumes a `?t=` song at its offset. The backdated epoch now feeds only the legacy fallback.
 - **`_prefetch_next_song`** dequeues via `queue.get_nowait()`, resolves + streams the next item while the current song plays. If cancelled (clear/shuffle/remove), it returns the item to the front via `queue.requeue_front()` — the claim goes back with it. If resolve/stream fails, it settles the claim and mirrors it via `queue.finish_failed_dequeue()`.
-- **Every claim is settled exactly once** — by `try_commit_dequeue()` (the song starts), `finish_failed_dequeue()` (failure), or `requeue_front()` (cancellation, which returns the claim with the item). The loop's exception handler releases a claim no other path settled, tracked by `claim_outstanding`; a claim left standing would keep its item counted as in flight forever and the next release would settle a different song.
+- **Every claim is settled exactly once** — by `commit_dequeue()` (the song starts), `finish_failed_dequeue()` (failure), or `requeue_front()` (cancellation, which returns the claim with the item). The loop's exception handler releases a claim no other path settled, tracked by `claim_outstanding`; a claim left standing would keep its item counted as in flight forever and the next release would settle a different song.
 - **Resume entries**: an `is_resume` `SongQueueEntry` (from `-playnow`) replays through the same FFmpeg `-ss ts` seek path as a `?t=` song and honours `start_paused`. The parked song's history add is deferred via `_skip_history_for` so it is recorded once, at its resume tail — see [-playnow Interjection](#-playnow-interjection).
 
 ---
@@ -656,7 +656,11 @@ The shortcut is guarded twice more, because LREM matches on **exact serialized b
 
 Counted per distinct serialization, never `LREM … 0`: two enqueues of one song usually differ on the wire (`queue_position`, `queued_at`), but when they do not, removing "all matching" would take out a copy still queued.
 
-**Known residual window (by design)**: the loop's `try_commit_dequeue()` → `pop_queue_and_start_song()` handoff releases the mutex before the store's atomic transaction dispatches; a bulk mutation scheduled in that single event-loop tick can race the LPOP server-side. The start transaction is a store-level atomicity boundary — see the `guild_queue.py` module docstring.
+**No residual window against a concurrent mutation**: the loop settles its claim through `commit_dequeue()`, the async context manager that holds the bulk mutex across the caller's own store dispatch, so the in-memory settle and the start transaction's server-side LPOP land under one hold. This closed the window a separate commit-then-dispatch used to leave open, where a bulk mutation scheduled in that event-loop tick raced the LPOP server-side. A caller with no Redis write to make passes an empty body.
+
+The hold is bounded by `_START_WRITE_TIMEOUT` (5s, musicplayer.py). The pool sets no `socket_timeout`, so an unbounded write would park `-play`/`-clear`/`-shuffle`/`-remove` for that guild for as long as Redis stalls — measured past 20s against one that accepts and then stops answering. A `socket_timeout` on the pool would be the wrong lever: redis-py runs the whole `MULTI/EXEC` through `call_with_retry` and `retry_on_error` already lists `RedisTimeoutError`, so a read timeout would re-execute the transaction and LPOP twice. Cancellation is not retried, and redis-py disconnects the connection on `BaseException`, so nothing poisoned returns to the pool. The start transaction is the ONLY write under the hold: a second one through the same stalled pool would park the guild for the rest of the stall, which is what the bound exists to prevent.
+
+**A start transaction that does not land leaves the list one entry ahead of memory, and the queue records that rather than repairing it in place.** `pop_queue_and_start_song` is `@_guild_op`-wrapped, so a Redis failure is swallowed and returns `False`; the timeout reaches the same conclusion, and so does a `vc.play()` that raises after the settle (the report is in a `finally`). In every case the in-memory settle already happened, so an LPOP at the next start would retire the wrong entry — replaying a song after a crash and recording it twice in `play_history`, forever. The loop tells the queue through `GuildQueue.note_mirror_write(landed, retired)`, and while `mirror_dirty` is set the next song start calls `rebuild_queue_and_start_song` — DEL + RPUSH from memory plus the state and snapshot HSETs in one MULTI — instead of the LPOP, so the song is parked over a correct list or nothing changed. Any `-clear`/`-shuffle`/`-remove` rebuild clears the flag in passing (the LREM shortcut is refused over a stale list, since LREM keeps whatever it does not name), and a further failure leaves it set. Cost under a persistently slow Redis is one bounded attempt per song start. A crash inside the window restores the song from its stale entry and replays it: a duplicate, never a loss — the state the list holds then is exactly what it held before the start, and restore already replays from it.
 
 ---
 
@@ -921,7 +925,7 @@ flowchart TD
 |---|---|---|
 | `play_next: asyncio.Event` | `MusicPlayer` | Song-completion signal from discord.py's audio thread (`call_soon_threadsafe`) |
 | `_restore_complete: asyncio.Event` | `MusicPlayer` | `loop()` must not dequeue before restore populates the queue |
-| `GuildQueue._mutex: asyncio.Lock` | `GuildQueue` (private) | Bulk queue mutations + the loop's `try_commit_dequeue()` |
+| `GuildQueue._mutex: asyncio.Lock` | `GuildQueue` (private) | Bulk queue mutations + the loop's dequeue commit (`commit_dequeue()` holds it across the start transaction's dispatch) |
 | `GuildQueue._wake: asyncio.Event` | `GuildQueue` (private) | The pending-item signal a parked `get()` waits on. Set iff `_cursor < len(_items)`; `_sync_wake()` is its ONLY writer, because a stale set leaves the wait loop with no suspension point and stalls the whole event loop (I3) |
 | `_np_edit_lock: asyncio.Lock` | `MusicPlayer` | Old-host edits vs retire (strip/delete is always the final write) |
 | `Spotify._auth_lock: asyncio.Lock` | `Spotify` | Double-checked locking for token refresh |
@@ -1009,7 +1013,7 @@ stateDiagram-v2
 
     ResolvingSource --> Streaming : _resolve_source() complete\n(YTSource → QueueObject)
 
-    Streaming --> Playing : try_commit_dequeue() ok\nvc.play(YTDL)
+    Streaming --> Playing : commit_dequeue() ok\nvc.play(YTDL)
 
     Playing --> Prefetching : after= callback wired\nprogress task ticking
 
@@ -1477,7 +1481,7 @@ no log line.
 **`clear()` resets `_cursor` as well as the deque, and that is not bookkeeping.** A cursor
 outliving the items it indexed makes `qsize()` return negative, `empty()` lie, and the next
 `try_release()` pop an empty deque. The loop's own path there is safe twice over: the bumped
-`_generation` makes `try_commit_dequeue()` refuse first, and the guard on `try_release()` makes
+`_generation` makes `commit_dequeue()` refuse first, and the guard on `try_release()` makes
 the failure path a no-op second. See [Queue Operations](#queue-operations) for the structure.
 
 **Why `put_front`'s in-flight branch is not dead code.** `MusicPlayer.interject()`

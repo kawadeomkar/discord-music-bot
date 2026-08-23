@@ -399,7 +399,7 @@ code in the repo. Its bookkeeping invariants:
 
 - `claim_outstanding` tracks an unsettled `queue.get()` so the outer exception handler can
   settle the claim, so `_cursor` never drifts.
-- `try_commit_dequeue()` (under the queue mutex) detects "queue cleared while this song
+- `commit_dequeue()` (under the queue mutex) detects "queue cleared while this song
   resolved" — the song is discarded and its FFmpeg subprocess `cleanup()`ed (leak
   otherwise).
 - The Redis start write is `pop_queue_and_start_song` (MULTI/EXEC: LPOP + state HSET +
@@ -480,7 +480,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
 - Every multi-leg mutation (`put`, `put_front`, `clear`, `shuffle`, `remove`,
   `finish_failed_dequeue`) runs under one bulk-mutation mutex.
 - A dequeue is **two-phase**: `get()` advances `_cursor`; the item and the Redis LPOP
-  settle later via `try_commit_dequeue()` / `redis_pop_for()` (or are undone via
+  settle later via `commit_dequeue()` / `redis_pop_for()` (or are undone via
   `requeue_front()` / retired via `finish_failed_dequeue()`). `put_front` inserts at
   `_cursor`, which IS inserting behind the in-flight head.
 - **`_sync_wake()` is the only writer of `_wake`.** A stale set
@@ -865,11 +865,28 @@ Per-guild synchronization primitives and what they protect:
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
 | claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject) |
 
-One known, documented, accepted race remains open (ISSUE header in guild_queue.py): a
-bulk mutation can land between `try_commit_dequeue()` releasing the mutex and the start
-transaction's server-side LPOP, drifting memory and Redis by one entry. The sketched fix
-(hold the mutex across the store dispatch) is described there — if you touch this code,
-read that header first.
+The dequeue commit and the start transaction's server-side LPOP share ONE mutex hold,
+via `GuildQueue.commit_dequeue()` — the async context manager the playback loop wraps
+around `vc.play()` and the store dispatch. This closes the race guild_queue.py used to
+carry as an accepted ISSUE: with the lock released between them, a `put_front` scheduled
+in that tick read a cursor of 0, LPUSHed ahead of the entry the pending LPOP was about to
+retire, and the LPOP ate the new song. Cost is one Redis round trip under the mutex per
+song start (p50 ~2.4ms, p99 ~5.4ms, measured against `redis:7-alpine` through Docker
+Desktop's published port), **bounded by `_START_WRITE_TIMEOUT` (5s)** — the pool sets no
+`socket_timeout`, so an unbounded write parks `-play`/`-clear`/`-shuffle`/`-remove` for
+that guild for as long as Redis stalls, measured past 20s against one that accepts and
+then stops answering. **It is the only write under the hold.** A start transaction that
+does not land — timed out, swallowed by `@_guild_op`, or never dispatched because
+`vc.play()` raised after the settle — leaves the list one entry ahead of memory, and the
+loop reports that through `GuildQueue.note_mirror_write()` rather than repairing it in
+place: a repair under the same mutex through the same stalled pool would park the guild
+exactly as the bound exists to prevent. While `mirror_dirty` is set, the next song start
+REPLACES the list (`rebuild_queue_and_start_song`: DEL + RPUSH + the state HSETs in one
+MULTI) instead of LPOPing it, and any `-clear`/`-shuffle`/`-remove` rebuild clears the
+flag in passing; the LREM shortcut is refused over a stale list. A crash inside the
+window restores the song from its stale entry and replays it — the cost is a duplicate
+play, never a lost one. The body of that `async with` must stay short and must never
+touch Discord; a caller with no Redis write to make passes an empty body.
 
 ## Code conventions
 
@@ -1039,7 +1056,6 @@ duplicated.
 
 | Where | Marker | Summary |
 |---|---|---|
-| guild_queue.py (module header) | ISSUE | dequeue-commit ↔ Redis-LPOP race window; accepted, fix sketched |
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
 | spotify.py `playlist` | FIXME | playlists >100 tracks silently truncated (first page only, `next` cursor never followed) |
 | sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
