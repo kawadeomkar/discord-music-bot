@@ -37,7 +37,7 @@ from src.guild_state import (
     NowPlayingData,
     SongQueueEntry,
 )
-from src.redis_client import GuildRedisStore, cache_get
+from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
@@ -351,6 +351,7 @@ class MusicPlayer:
         "_playback_holds",
         "_background_tasks",
         "_progress_task",
+        "_heartbeat_task",
         "_np_last_rendered",
         "_np_last_id",
         "_np_host_message",
@@ -389,6 +390,7 @@ class MusicPlayer:
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
+    _heartbeat_task: Optional[asyncio.Task]
     # Last payload pushed and the host it went to, for the no-op-edit guard in
     # _push_np_edit. Compared only for equality; Embed.to_dict() is a TypedDict
     # and list is invariant, so the element type stays Any.
@@ -477,6 +479,7 @@ class MusicPlayer:
         self._playback_holds = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._np_last_rendered: Optional[list[Any]] = None
         self._np_last_id: Optional[int] = None
         # NP host state: the message carrying the block, its own cached embeds that
@@ -951,29 +954,19 @@ class MusicPlayer:
                     # bot died after that transaction committed but before the song
                     # finished (at-most-once delivery).
                     if guild_state.has_crashed_song:
-                        # Approximate position at crash time — pure math on the
-                        # snapshot, no IO. crashed_position_at documents why it is
-                        # only approximate (downtime counts as playback).
+                        # The recorded position, read straight off the snapshot —
+                        # no clock, no IO, so downtime is never credited.
                         position = guild_state.crashed_position_at(time.time())
                         if position is not None:
-                            # Cap at duration − 10s so FFmpeg can't seek past EOF.
-                            # Narrow try/except: a malformed cached duration must
-                            # degrade to "no cap", not abort the whole restore.
-                            try:
-                                stream_data = await cache_get(
-                                    self.store.redis,
-                                    f"ytdl:stream:{guild_state.current_song_url}",
-                                )
-                                if stream_data is not None:
-                                    raw_duration = stream_data.get("duration")
-                                    if raw_duration is not None:
-                                        position = min(
-                                            position, max(0, int(raw_duration) - 10)
-                                        )
-                            except Exception as pos_err:
-                                log.warning(
-                                    f"Failed to cap recovery position: {pos_err}"
-                                )
+                            # Cap at duration − 10s so FFmpeg cannot seek past EOF,
+                            # read from the snapshot this restore already holds. The
+                            # stream cache expires in 30 minutes, so sourcing it there
+                            # capped or did not depending on how long the restart took.
+                            # Falsy covers both unknown and a livestream's 0, either of
+                            # which means no cap rather than a cap at 0.
+                            duration = guild_state.current_song_duration
+                            if duration:
+                                position = min(position, max(0, duration - 10))
                             log.info(
                                 f"Computed recovery position {position}s for "
                                 f"'{guild_state.current_song_title}'"
@@ -1048,10 +1041,13 @@ class MusicPlayer:
         if is_persisted(head):
             # Already on the Redis list: parking it would re-queue a second copy.
             return False
-        # Backdated by the resume offset as the loop does at vc.play — the hash has no
-        # `ts`, and recovery reads position as now - play_start_epoch - pauses.
+        # Backdated by the resume offset as the loop does at vc.play, and seeded as
+        # the recorded position: the hash carries no `ts`, so the offset is the only
+        # record of how far this song had reached.
         await self.store.set_current_song_state(
-            SongQueueEntry.from_queue_object(head), time.time() - (head.ts or 0)
+            SongQueueEntry.from_queue_object(head),
+            time.time() - (head.ts or 0),
+            start_offset=head.ts or 0,
         )
         return True
 
@@ -1659,7 +1655,16 @@ class MusicPlayer:
         entry point, so a future call site can't forget either side effect."""
         vc.pause()
         if self.store is not None:
-            await self.store.on_pause(time.time())
+            # One instant for both writes, so the legacy wall-clock math cannot
+            # count the gap between them as playback the heartbeat never saw.
+            paused_at = time.time()
+            # The exact pause point: the ticking task skips paused songs, so
+            # without this the position sits an interval behind for the whole pause.
+            if self.current_song is not None:
+                await self.store.heartbeat(self.current_song.position_secs, paused_at)
+            # Still written this release: a rollback to the previous build
+            # reads the wall-clock fields; they go one release after this.
+            await self.store.on_pause(paused_at)
         self.mark_paused()
 
     async def resume(self, vc: discord.VoiceClient) -> None:
@@ -2230,6 +2235,42 @@ class MusicPlayer:
         except asyncio.CancelledError:
             raise
 
+    async def _heartbeat_updater(self, song: YTDL) -> None:
+        """Record the playback position to Redis on a fixed cadence.
+
+        Separate from _progress_updater because that task is display-gated: it
+        skips songs too short for a bar and goes dormant when the host message is
+        gone. A song with no visible bar must still be recoverable.
+        """
+        while True:
+            await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
+            vc = self._guild.voice_client
+            if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
+                return  # song changed under us; loop() owns cancellation
+            if vc.is_paused():
+                # Frames are frozen, so the position is not moving and pause()
+                # already recorded the exact point. Writing here would only
+                # rewrite the same value once per interval, forever.
+                continue
+            if self.store is not None:
+                try:
+                    await self.store.heartbeat(song.position_secs, time.time())
+                except Exception as e:
+                    # Redis failures are already swallowed by @_guild_op, so anything
+                    # here is a defect that will recur every tick. Stop, but say so:
+                    # cancel_task never awaits a task that ended on its own, so the
+                    # exception would otherwise surface at GC with no guild attached,
+                    # and recovery would quietly fall back to the seeded position.
+                    log.error(
+                        f"playback heartbeat stopped: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    return
+
+    async def _cancel_heartbeat_task(self) -> None:
+        await cancel_task(self._heartbeat_task)
+        self._heartbeat_task = None
+
     async def _cancel_progress_task(self) -> None:
         """Await before the next song's _send_now_playing(), so no concurrent edit
         for the old song races the new message send."""
@@ -2484,21 +2525,34 @@ class MusicPlayer:
                     # window. A crash-recovered "current song" was never on the Redis
                     # list, so only state is written — an LPOP would drop a queued one.
                     if self.store is not None:
-                        # Backdated by the FFmpeg -ss offset so recovery math (now -
-                        # play_start_epoch - pauses) yields true audio position, not
-                        # time-since-vc.play(). Without it, ?t= songs and
-                        # double-crash recoveries resume start_offset seconds early.
+                        # The -ss offset twice: backdated into the epoch the legacy
+                        # fallback extrapolates from, and passed as the seed the
+                        # heartbeat has not written yet. Without it a `?t=` song
+                        # crashing inside the first interval resumes at 0:00.
                         backdated_start = play_start - song.start_offset
                         current = SongQueueEntry.from_song(song)
                         now_playing = NowPlayingData.from_song(song)
                         if should_pop_queue:
                             await self.store.pop_queue_and_start_song(
-                                current, backdated_start, now_playing=now_playing
+                                current,
+                                backdated_start,
+                                now_playing=now_playing,
+                                start_offset=song.start_offset,
                             )
                         else:
                             await self.store.set_current_song_state(
-                                current, backdated_start, now_playing=now_playing
+                                current,
+                                backdated_start,
+                                now_playing=now_playing,
+                                start_offset=song.start_offset,
                             )
+                        # In this block because the store is the ticker's only
+                        # writer: a Redis-less guild would otherwise tick for the
+                        # whole song to reach a no-op. After the seed above, so the
+                        # first tick cannot race it.
+                        self._heartbeat_task = asyncio.create_task(
+                            self._heartbeat_updater(song)
+                        )
 
                     if song.start_paused:
                         # Returns parked where -playnow interrupted it (the player
@@ -2603,6 +2657,10 @@ class MusicPlayer:
                     # and the prefetch await below is long enough for a teardown to
                     # land in between. Cleared once this iteration settles it.
                     self._ended_song = song
+                    # Below current_song = None, unlike the other task cancels: this
+                    # task always exists, so awaiting it yields, and the block above
+                    # must stay synchronous for the reason stated there.
+                    await self._cancel_heartbeat_task()
 
                     # Claim-then-await: interject() may have neutralized (and nulled)
                     # the task while this iteration sat in play_next.wait(). Both
@@ -2706,6 +2764,7 @@ class MusicPlayer:
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
                     await self.update_activity(None)
                     raise
@@ -2734,6 +2793,7 @@ class MusicPlayer:
                     await cancel_task(self._prefetch_task)
                     self._prefetch_task = None
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
                     # No finalize for a song that errored — just release the host so
                     # the next song starts clean.

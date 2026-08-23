@@ -1626,6 +1626,116 @@ class TestQueueEntryImmutability:
             setattr(entry, "url", "x")
 
 
+class TestCrashedPositionUsesTheHeartbeat:
+    """The headline crash-recovery fix: downtime must not count as playback."""
+
+    def test_downtime_is_not_credited_as_playback(self) -> None:
+        """A bot down 10 minutes used to add those 10 minutes to the position,
+        landing the caller's EOF cap and resuming near the END of the song
+        instead of where it stopped."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1",
+            play_start_epoch=1000.0,
+            last_position_secs=30.0,
+        )
+        # Restart 10 minutes after the song started.
+        assert state.crashed_position_at(1600.0) == 30
+
+    def test_position_is_independent_of_the_clock(self) -> None:
+        """No clock is read on this path, so clock skew between restarts — and
+        any downtime at all — cannot move the answer."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1", last_position_secs=77.0
+        )
+        assert state.crashed_position_at(0.0) == state.crashed_position_at(1e9) == 77
+
+    def test_zero_position_is_preserved(self) -> None:
+        """0.0 is a real position (song just started), not a missing value."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1",
+            play_start_epoch=1000.0,
+            last_position_secs=0.0,
+        )
+        assert state.crashed_position_at(9999.0) == 0
+
+    def test_negative_position_floors_at_zero(self) -> None:
+        state = GuildStateData(last_position_secs=-5.0)
+        assert state.crashed_position_at(0.0) == 0
+
+    def test_a_heartbeat_predating_the_song_is_refused(self) -> None:
+        """`just up <older-sha>` and back: the older build cannot clear these fields,
+        so one song's position is left parked on a later song's hash. Taking it would
+        resume the new song minutes in."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=2",
+            play_start_epoch=5000.0,
+            last_position_secs=200.0,
+            last_heartbeat_epoch=1200.0,
+            total_pause_seconds=0.0,
+        )
+        # Falls through to the legacy math, which describes THIS song.
+        assert state.crashed_position_at(5005.0) == 5
+
+    def test_a_heartbeat_from_this_song_is_kept(self) -> None:
+        """The seed writes play_start_epoch + start_offset, so a legitimate heartbeat
+        is never older than the start it belongs to."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1",
+            play_start_epoch=1000.0,
+            last_position_secs=30.0,
+            last_heartbeat_epoch=1030.0,
+        )
+        assert state.crashed_position_at(9999.0) == 30
+
+    def test_an_unjudgeable_heartbeat_is_kept(self) -> None:
+        """Only positive evidence of staleness rejects the position — a corrupt epoch
+        parses to None, and dropping the position for it would cost a real recovery."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1", last_position_secs=42.0
+        )
+        assert state.crashed_position_at(9999.0) == 42
+
+    def test_a_fractional_position_truncates_rather_than_rounds(self) -> None:
+        """The documented bias: replaying is imperceptible, skipping is not. Rounding
+        59.7 up to 60 skips 0.3s of audio."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1", last_position_secs=59.7
+        )
+        assert state.crashed_position_at(0.0) == 59
+
+    def test_falls_back_to_wall_clock_for_a_pre_heartbeat_state_hash(self) -> None:
+        """Release 1 of 2: a hash written by the previous build has no
+        last_position_secs. Recovering it badly beats not recovering it."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=1",
+            play_start_epoch=1000.0,
+            total_pause_seconds=5.0,
+        )
+        assert state.crashed_position_at(1100.0) == 95
+
+    def test_returns_none_when_nothing_was_recorded(self) -> None:
+        assert GuildStateData().crashed_position_at(1000.0) is None
+
+    def test_heartbeat_fields_round_trip_through_redis(self) -> None:
+        state = GuildStateData.from_redis(
+            {
+                b"last_position_secs": b"12.5",
+                b"last_heartbeat_epoch": b"1700000000.0",
+            }
+        )
+        assert state.last_position_secs == 12.5
+        assert state.last_heartbeat_epoch == 1700000000.0
+
+    def test_corrupt_heartbeat_degrades_to_the_fallback(self) -> None:
+        """A malformed float parses to None, which must route to the legacy
+        path rather than resuming at 0:00."""
+        state = GuildStateData.from_redis(
+            {b"last_position_secs": b"not-a-float", b"play_start_epoch": b"1000.0"}
+        )
+        assert state.last_position_secs is None
+        assert state.crashed_position_at(1050.0) == 50
+
+
 class TestGuildConfig:
     """Durable per-guild preferences. The tri-state is the whole design: "never
     chose" has to stay distinguishable from "chose off", or a guild that opted out

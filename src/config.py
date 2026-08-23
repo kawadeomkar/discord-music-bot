@@ -96,6 +96,19 @@ DEBUG_DEADLINE_SECS: float = _float_env(
 )
 
 
+# Floor for the playback heartbeat. Higher than the dashboard floor because each
+# tick is a Redis write per PLAYING guild rather than a local timer: at 0.05 that
+# is 20 HSET+EXPIRE round trips a second per guild, all of it AOF-appended.
+_MIN_HEARTBEAT_SECS: Final[float] = 0.5
+
+# How often a playing guild records its playback position. Bounds the worst-case
+# recovery error: a crash resumes at the last heartbeat, so at most this many
+# seconds replay. Separate knob from the progress bar — that cadence is display.
+HEARTBEAT_INTERVAL_SECS: float = _float_env(
+    "HEARTBEAT_INTERVAL_SECS", 3.0, minimum=_MIN_HEARTBEAT_SECS
+)
+
+
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     """Parse an integer knob from the environment, or raise a named error.
 

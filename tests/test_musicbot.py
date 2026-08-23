@@ -1081,6 +1081,7 @@ class TestCleanup:
         mp.store = None
         mp._progress_task = None
         mp._pause_debounce_task = None
+        mp._heartbeat_task = None
         mp.retire_np_host_on_stop = AsyncMock()
         mp.update_activity = AsyncMock()
         # None = nothing was playing, the shape most of these tests mean. A bare
@@ -1158,6 +1159,19 @@ class TestCleanup:
         task.done.return_value = False
         task.cancel = MagicMock()
         self._make_minimal_mp(music_bot, mock_guild, _pause_debounce_task=task)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        task.cancel.assert_called_once()
+
+    async def test_cancels_in_flight_heartbeat_task(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Left running it keeps writing last_position_secs — and refreshing the
+        state key's TTL — over fields clear_connection() is about to delete."""
+        task = AsyncMock(spec=asyncio.Task)
+        task.done.return_value = False
+        task.cancel = MagicMock()
+        self._make_minimal_mp(music_bot, mock_guild, _heartbeat_task=task)
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)
         task.cancel.assert_called_once()
