@@ -351,6 +351,7 @@ class MusicPlayer:
         "_playback_holds",
         "_background_tasks",
         "_progress_task",
+        "_heartbeat_task",
         "_np_last_rendered",
         "_np_last_id",
         "_np_host_message",
@@ -389,6 +390,7 @@ class MusicPlayer:
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
+    _heartbeat_task: Optional[asyncio.Task]
     # Last payload pushed and the host it went to, for the no-op-edit guard in
     # _push_np_edit. Compared only for equality; Embed.to_dict() is a TypedDict
     # and list is invariant, so the element type stays Any.
@@ -477,6 +479,7 @@ class MusicPlayer:
         self._playback_holds = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         self._np_last_rendered: Optional[list[Any]] = None
         self._np_last_id: Optional[int] = None
         # NP host state: the message carrying the block, its own cached embeds that
@@ -2233,6 +2236,42 @@ class MusicPlayer:
         except asyncio.CancelledError:
             raise
 
+    async def _heartbeat_updater(self, song: YTDL) -> None:
+        """Record the playback position to Redis on a fixed cadence.
+
+        Separate from _progress_updater because that task is display-gated: it
+        skips songs too short for a bar and goes dormant when the host message is
+        gone. A song with no visible bar must still be recoverable.
+        """
+        while True:
+            await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
+            vc = self._guild.voice_client
+            if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
+                return  # song changed under us; loop() owns cancellation
+            if vc.is_paused():
+                # Frames are frozen, so the position is not moving and pause()
+                # already recorded the exact point. Writing here would only
+                # rewrite the same value once per interval, forever.
+                continue
+            if self.store is not None:
+                try:
+                    await self.store.heartbeat(song.position_secs, time.time())
+                except Exception as e:
+                    # Redis failures are already swallowed by @_guild_op, so anything
+                    # here is a defect that will recur every tick. Stop, but say so:
+                    # cancel_task never awaits a task that ended on its own, so the
+                    # exception would otherwise surface at GC with no guild attached,
+                    # and recovery would quietly fall back to the seeded position.
+                    log.error(
+                        f"playback heartbeat stopped: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    return
+
+    async def _cancel_heartbeat_task(self) -> None:
+        await cancel_task(self._heartbeat_task)
+        self._heartbeat_task = None
+
     async def _cancel_progress_task(self) -> None:
         """Await before the next song's _send_now_playing(), so no concurrent edit
         for the old song races the new message send."""
@@ -2508,6 +2547,13 @@ class MusicPlayer:
                                 now_playing=now_playing,
                                 start_offset=song.start_offset,
                             )
+                        # In this block because the store is the ticker's only
+                        # writer: a Redis-less guild would otherwise tick for the
+                        # whole song to reach a no-op. After the seed above, so the
+                        # first tick cannot race it.
+                        self._heartbeat_task = asyncio.create_task(
+                            self._heartbeat_updater(song)
+                        )
 
                     if song.start_paused:
                         # Returns parked where -playnow interrupted it (the player
@@ -2612,6 +2658,10 @@ class MusicPlayer:
                     # and the prefetch await below is long enough for a teardown to
                     # land in between. Cleared once this iteration settles it.
                     self._ended_song = song
+                    # Below current_song = None, unlike the other task cancels: this
+                    # task always exists, so awaiting it yields, and the block above
+                    # must stay synchronous for the reason stated there.
+                    await self._cancel_heartbeat_task()
 
                     # Claim-then-await: interject() may have neutralized (and nulled)
                     # the task while this iteration sat in play_next.wait(). Both
@@ -2715,6 +2765,7 @@ class MusicPlayer:
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
                     await self.update_activity(None)
                     raise
@@ -2743,6 +2794,7 @@ class MusicPlayer:
                     await cancel_task(self._prefetch_task)
                     self._prefetch_task = None
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
                     # No finalize for a song that errored — just release the host so
                     # the next song starts clean.
