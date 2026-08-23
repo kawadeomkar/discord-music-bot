@@ -116,6 +116,26 @@ def notice_embed(
     return discord.Embed(title=title, description=message, color=color)
 
 
+def build_embed(
+    title: str,
+    description: str,
+    color: Optional[discord.Color] = None,
+    footer: Optional[str] = None,
+    thumbnail: Optional[str] = None,
+    fields: Optional[list[tuple[str, str, bool]]] = None,
+) -> discord.Embed:
+    """The embed send_embed sends, for a caller that builds its reply in one place
+    and sends it from another."""
+    embed = discord.Embed(title=title, description=description, color=color)
+    if footer:
+        embed.set_footer(text=footer)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    for name, value, inline in fields or []:
+        embed.add_field(name=name, value=value, inline=inline)
+    return embed
+
+
 async def send_embed(
     destination: discord.abc.Messageable,
     title: str,
@@ -125,14 +145,9 @@ async def send_embed(
     thumbnail: Optional[str] = None,
     fields: Optional[list[tuple[str, str, bool]]] = None,
 ) -> discord.Message:
-    embed = discord.Embed(title=title, description=description, color=color)
-    if footer:
-        embed.set_footer(text=footer)
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-    for name, value, inline in fields or []:
-        embed.add_field(name=name, value=value, inline=inline)
-    return await destination.send(embed=embed)
+    return await destination.send(
+        embed=build_embed(title, description, color, footer, thumbnail, fields)
+    )
 
 
 def first_sendable_channel(

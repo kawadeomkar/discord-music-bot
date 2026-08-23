@@ -155,6 +155,11 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 # backend, so a cached handle refers to something that backend has never seen.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
+# Per-guild ceiling on -play requests resolving at once. Each costs one coroutine
+# awaiting a pool future and one open span; the bound is fairness against the
+# shared yt-dlp pool, not latency. 0 would decline every request, hence the floor.
+PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=1)
+
 
 def _parse_bool_env(name: str) -> bool:
     """Parse a boolean knob, or raise naming it. Unset and empty read as False.

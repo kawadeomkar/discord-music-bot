@@ -347,6 +347,7 @@ class MusicPlayer:
         "_restore_task",
         "_restore_complete",
         "_restore_read_failed",
+        "_retired",
         "_stopped_deliberately",
         "_playback_gate",
         "_playback_holds",
@@ -386,6 +387,7 @@ class MusicPlayer:
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
     _restore_read_failed: bool
+    _retired: bool
     _stopped_deliberately: bool
     _playback_gate: asyncio.Event
     _playback_holds: int
@@ -465,6 +467,7 @@ class MusicPlayer:
         # ambiguous — nothing saved vs nothing readable — and a command reporting the
         # first when it means the second tells a guild its queue is gone.
         self._restore_read_failed = False
+        self._retired = False
         # Set by whoever calls vc.stop() on the live song, cleared at each vc.play().
         # Zero frames alone cannot tell a stream that never opened from one we stopped
         # before its first frame; this is the half that says which.
@@ -574,6 +577,16 @@ class MusicPlayer:
         the player outlived its voice client (an eject on_voice_state_update never
         saw), so its legs and gate are untrustworthy: rebuild, don't reuse."""
         return self.current_song is None and not self._playback_gate.is_set()
+
+    @property
+    def retired(self) -> bool:
+        """True once the cog tore this player down. A -play that bound it before
+        the teardown reads this at its insert: a put into a retired player lands
+        in the Redis mirror alone, to be resurrected by the next restore."""
+        return self._retired
+
+    def mark_retired(self) -> None:
+        self._retired = True
 
     @property
     def restore_read_failed(self) -> bool:
