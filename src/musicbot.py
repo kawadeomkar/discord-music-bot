@@ -1424,10 +1424,11 @@ class MusicBot(commands.Cog):
             ],
             "note": (
                 "Spotify links are matched to YouTube audio one title at a time, so a "
-                "long playlist takes a few seconds to finish queueing — and one plain "
-                "`-play` runs at a time per server, so a second one sent meanwhile is "
-                "declined rather than queued. `--now` and `--next` have their own "
-                "limit, so an urgent request still goes through."
+                "long playlist takes a few seconds to finish queueing. Requests sent "
+                "meanwhile are looked up alongside it and land as each one is ready — "
+                "a `--now` sent behind a long playlist interrupts as soon as its own "
+                "song resolves. `-clear` and `-stop` also drop requests still being "
+                "looked up."
             ),
         },
     )
@@ -2425,8 +2426,9 @@ class MusicBot(commands.Cog):
         aliases=["c"],
         brief="empty the queue",
         help=(
-            "Removes every song waiting in the queue and lists what was dropped. "
-            "The song currently playing keeps going — use `-skip` to move past it "
+            "Removes every song waiting in the queue and lists what was dropped, "
+            "along with any play requests still being looked up. The song "
+            "currently playing keeps going — use `-skip` to move past it "
             "or `-stop` to end the session entirely."
         ),
         extras={"category": "Queue", "examples": ["-clear", "-c"]},

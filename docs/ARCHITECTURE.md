@@ -641,7 +641,7 @@ Every mutation that touches the Redis mirror (put, clear, shuffle, remove, `fini
 
 **Settling a claim asks the claim, not the item.** `redis_pop_for(item, *, persisted=None)` defaults to deriving the answer from `item`, and `item=None` defaults to popping — right for every ordinary dequeue and wrong for exactly one caller. The playback loop's prefetched branch holds a claim whose item is a `YTDL`, which is not a `QueueItem` and cannot be passed; a prefetch really can hold an *unpersisted* claim (a cold-start `-play` front-inserts at cursor 0, ahead of the crash-recovered head, so the prefetch behind it takes that head). So the loop carries `claim_persisted` from the moment it takes the claim through to its outer error handler, and both settle paths — the start transaction's LPOP and `finish_failed_dequeue`'s — read that one flag rather than re-deriving it. Re-deriving is what LPOPed a real entry for a head that never had one, deleting the next queued song with no error and no log line.
 
-`put`/`put_front` return the list they enqueued, which the caller uses to spawn per-item prefetch. They no longer patch what passes through: queue objects arrive complete. `queue_position` is depth **at ask** — `MusicPlayer.enqueue_depth()` read once at command dispatch, alongside the `queued_at` taken from the command message — rather than depth at insert computed under this mutex. It is approximate against the insert by design: the playback loop dequeues continuously, so the two differ routinely with no user involvement, and the quantity the field proxies for is stored exactly beside it as `played_at − queued_at`. `enqueue_depth()` reads `display_size()`, never `qsize()`: a claimed song is gone from the pending count and still ahead of a new arrival, so `qsize()` would undercount by one exactly when a `-play` lands during another song's resolve. The two are now `len(_items)` and `len(_items) - _cursor` — one term apart over the same fields, which is why five tests pin them apart and each half of the swap fails a different subset.
+`put`/`put_front` return the list they enqueued, which the caller uses to spawn per-item prefetch. They no longer patch what passes through: queue objects arrive complete. `queue_position` is depth **at the insert** — `MusicPlayer.enqueue_depth()` (or `_front_insert_depth`, or 0 for a cold start) read under `-play`'s place lock, the slot the song actually takes — while `queued_at` is taken from the command message at dispatch. Two requests resolving together would read one depth at dispatch; at the insert they read consecutive ones. The quantity the field proxies for is stored exactly beside it as `played_at − queued_at`. `enqueue_depth()` reads `display_size()`, never `qsize()`: a claimed song is gone from the pending count and still ahead of a new arrival, so `qsize()` would undercount by one exactly when a `-play` lands during another song's resolve. The two are now `len(_items)` and `len(_items) - _cursor` — one term apart over the same fields, which is why five tests pin them apart and each half of the swap fails a different subset.
 
 `MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) call `_cancel_prefetch()` **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else.
 
@@ -856,7 +856,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
-- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`), `queued_at timestamptz` and `queue_position` (both read at **ask** time — when the user's command message was sent, and how many songs were ahead of it at that moment, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption. `queue_position` is approximate against the insert by design, since the loop dequeues while a command resolves), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
+- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`), `queued_at timestamptz` (read at **ask** time — when the user's command message was sent) and `queue_position` (read at the **insert** — how many songs were ahead of it when it took its slot, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. Rows written before the insert-time mint carry the dispatch-time depth, which differs only when two requests resolved together. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption.), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
 - **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
@@ -935,6 +935,83 @@ flowchart TD
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
 | `PostgresHistoryArchive._init_lock: asyncio.Lock` | `PostgresHistoryArchive` | Double-checked lazy pool creation + migration run (first successful `acquire()` wins) |
+| `_GuildPlays.lock: asyncio.Lock` | `MusicBot._plays[guild]` | A `-play`'s insert alone — see [Play placement](#play-placement) |
+
+### Play placement
+
+`-play` runs in three phases, and only the middle one touches guild state:
+
+| Phase | Guild state | Lock |
+|---|---|---|
+| resolve — `queue_source`, yt-dlp, Spotify; the cold-start join beside it | none (caches keyed by query, one process-wide pool) | none |
+| insert — `queue_put` / `queue_put_front` / `queue_put_next` / `interject` | the queue, the player | `_GuildPlays.lock`, inside `asyncio.timeout(_PLACE_TIMEOUT_SECS)` |
+| reply | none | none |
+
+Requests resolve concurrently and land as each finishes; a `--now` sent behind a
+5,547-track collection interrupts when its own song resolves rather than after the
+collection's 99s extraction. Serializing the insert is what closes the three races a
+fully serialized body used to close — two interjections parking two resume tails for
+one song, two cold starts each joining, two front inserts landing out of order — and
+it does so at the insert, where each request re-validates rather than re-reads:
+
+1. **The player is not retired.** `MusicBot.cleanup()` stamps `MusicPlayer.mark_retired()`
+   immediately after popping the player from `mps`, before any await. A request that
+   bound that player at dispatch (`_PlayRequest.mp`) and reaches the lock after
+   `-stop`, a kick or the alone-watchdog is refused and says so. Without the check the
+   put lands in the Redis mirror alone — the in-memory copy went with the player —
+   and the next restore resurrects it.
+2. **The queue's generation matches the snapshot.** `GuildQueue.clear()` bumps
+   `_generation` under the bulk mutex; a request registered before a `-clear` is refused
+   at the insert, the same way the playback loop's `try_commit_dequeue` refuses a
+   dequeue across a bump. `-clear` and `-stop` name the requests they cut off from the
+   in-flight registry (`_inflight_requests`, read with no await after the act), and
+   each request reports itself.
+3. **The author is still in voice.** `validate_commands` ran at dispatch; the resolve
+   can take 99s. `_voice_refusal` re-runs the same check under the lock and the
+   refusal is sent after it.
+
+The body under the lock is the put and nothing else. Confirmations are built before
+the put (their "Est. playing at" and queued-song decision read the queue as it was)
+and sent after the lock is released, so a 429 on the channel holds no other request.
+`_PLACE_TIMEOUT_SECS` is the same 5s the loop's start write takes for the same
+hazard — the pool sets no `socket_timeout` — and is outer to the lock, so a request
+parked behind a stalled sibling gives up on its own clock. A put cancelled mid-flight
+may have appended in memory with the Redis write unknown; that is the state a crash
+there leaves and restore already replays from.
+
+**`queue_position` is minted at the insert**, not at dispatch: two requests resolving
+together would read the same depth at dispatch, and the depth at the insert is the
+slot the song takes. `queued_at` stays the message snowflake.
+
+**Cold starts share one join.** The first request to find no voice client creates the
+guild's `-join` task (`_GuildPlays.join`); every request that finds none while it runs
+awaits the same task through `asyncio.shield` — `await task` would carry an awaiting
+task's cancellation into the join while another request still waits on it. A creator
+whose resolve fails with nobody else holding the gate cancels its join before tearing
+down, as a single cold start always did; with another participant holding, the join
+and the teardown decision are theirs. A join mid-cancellation settles a tick later,
+and `_cold_join` skips it rather than hand it to a request arriving in that tick.
+Every participant front-inserts (`front` is decided at dispatch: "the bot was
+disconnected when I asked"), so all of them land ahead of the restored leftovers, the
+last to place at the head — the rule two `--next`s already follow. The gate opens
+when the last hold releases.
+
+`_abandon_cold_start` skips when another participant holds the gate, and the rule that
+makes that last-one-out rather than both-skip is that **nothing awaits between the
+decision and the hold's release**: the skipped request leaves its `AsyncExitStack`
+synchronously, so the second failure sees one hold and tears down. `_resolve_and_place`
+returns its notices rather than sending them for exactly this reason, and a test pins
+the rule against the source.
+
+**The cap.** `PLAY_INFLIGHT_MAX` (default 16) bounds a guild's requests in flight. Its
+unit is cheap — one coroutine awaiting a pool future plus one open span — and its job
+is fairness against the shared yt-dlp pool, not latency. Past it a request is declined
+with the existing notice, raised from `play()` before `_play`'s own `except` so it
+reaches `cog_command_error`. `play.inflight` is recorded on the span before the cap
+check, so a declined request carries the count it would have joined.
+
+Per-guild in-memory state is shard-safe — a guild lives on exactly one shard — so none
+of this reaches for Redis coordination.
 
 ---
 

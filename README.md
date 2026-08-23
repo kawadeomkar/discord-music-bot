@@ -498,10 +498,11 @@ alongside it:
 - An interjection is no longer exempt from the "bot is already being used in channel X"
   rule. Queueing into a session running elsewhere still works; **stopping** what that
   channel is hearing now requires being in it.
-- `-play` runs one at a time per server **per placement**, and a second one is declined
-  outright rather than queued behind the first. `--now` and `--next` share a limit with
-  each other and have their own, so an urgent request still goes through while a long
-  playlist is queueing — the same as when `-playnow` was a separate command.
+- `-play` requests sent while another is still being looked up are looked up alongside
+  it and land as each one is ready, so a `--now` sent behind a long playlist interrupts as
+  soon as its own song resolves. `-clear` and `-stop` drop requests still being looked up
+  and say so. A server can have up to 16 looking up at once (`PLAY_INFLIGHT_MAX`);
+  past that a request is declined.
 
 **`-play` takes a `--next` flag**, which queues a song at the front without
 interrupting what is playing:
