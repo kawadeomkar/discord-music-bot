@@ -5700,6 +5700,62 @@ class TestPlayerPauseResume:
         state = await fake_redis.hgetall(music_player.store.state_key())
         assert b"pause_start_epoch" in state
 
+    async def test_pause_records_the_exact_position(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """The ticking task skips paused songs, so without this write the recorded
+        position sits up to one interval behind for the whole pause — and a crash
+        during it replays that much."""
+        assert music_player.store is not None
+        mock_song.start_offset = 10
+        mock_song.elapsed_secs = 32.5
+        music_player.current_song = mock_song
+        vc = MagicMock(spec=discord.VoiceClient)
+
+        await music_player.pause(vc)
+
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert float(state[b"last_position_secs"]) == 42.5
+
+    async def test_pause_with_no_song_records_no_position(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """-pause is reachable with nothing playing. position_secs would raise on
+        None, and a position written here would name whatever song ran last."""
+        assert music_player.store is not None
+        music_player.current_song = None
+        vc = MagicMock(spec=discord.VoiceClient)
+
+        await music_player.pause(vc)
+
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert b"last_position_secs" not in state
+        assert b"pause_start_epoch" in state  # the legacy leg still runs
+
+    async def test_pause_stamps_both_writes_with_one_instant(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """Two clock reads would leave the sliver between them as elapsed the
+        legacy wall-clock math counts as playback and the heartbeat never saw."""
+        assert music_player.store is not None
+        music_player.current_song = mock_song
+        vc = MagicMock(spec=discord.VoiceClient)
+
+        await music_player.pause(vc)
+
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert float(state[b"last_heartbeat_epoch"]) == float(
+            state[b"pause_start_epoch"]
+        )
+
     async def test_pause_schedules_debounced_update(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:

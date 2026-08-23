@@ -1665,7 +1665,16 @@ class MusicPlayer:
         entry point, so a future call site can't forget either side effect."""
         vc.pause()
         if self.store is not None:
-            await self.store.on_pause(time.time())
+            # One instant for both writes, so the legacy wall-clock math cannot
+            # count the gap between them as playback the heartbeat never saw.
+            paused_at = time.time()
+            # The exact pause point: the ticking task skips paused songs, so
+            # without this the position sits an interval behind for the whole pause.
+            if self.current_song is not None:
+                await self.store.heartbeat(self.current_song.position_secs, paused_at)
+            # Still written this release: a rollback to the previous build
+            # reads the wall-clock fields; they go one release after this.
+            await self.store.on_pause(paused_at)
         self.mark_paused()
 
     async def resume(self, vc: discord.VoiceClient) -> None:
