@@ -2445,7 +2445,17 @@ class TestHistoryCommand:
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
     @pytest.mark.parametrize(
-        "name", ["history", "ping", "leaderboard", "debug", "resume"]
+        "name",
+        [
+            "history",
+            "ping",
+            "leaderboard",
+            "debug",
+            "resume",
+            "shuffle",
+            "clear",
+            "remove",
+        ],
     )
     def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
         """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
@@ -2459,6 +2469,12 @@ class TestHistoryCommand:
         two racing on a disconnected bot both read `voice_client is None`, so
         validate_commands' "already being used in channel X" check cannot fire for
         either — both join, and the second MOVES the bot to its own author's channel.
+
+        `-shuffle`/`-clear`/`-remove` for a fifth: all three park on the queue's
+        bulk mutex, which the playback loop holds across the start transaction. A
+        Redis that stalls there wedges them, and every repeat while wedged parks
+        another coroutine holding an OTel span `cog_after_invoke` never closes —
+        plus, for `-shuffle`, a typing keepalive POSTing for the duration.
 
         command_callback() strips decorators everywhere else in this file, so this
         is the only place any of these guards is reachable at all."""

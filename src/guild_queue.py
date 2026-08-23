@@ -526,11 +526,8 @@ class GuildQueue:
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
-    def release(self, context: str = "dequeue") -> None:
-        """Settle a claim being retired without playing (failed to stream, failed
-        to resolve). Warns instead of raising when nothing is claimed."""
-        if not self.try_release():
-            log.warning(f"song_queue was empty on {context} in guild {self._guild.id}")
+    # Settle through try_commit_dequeue() or finish_failed_dequeue(), never
+    # try_release() alone: those two carry the mirror leg with them.
 
     def try_release(self) -> bool:
         """Settle one claim: drop the head and step the cursor back, which leaves
@@ -641,15 +638,19 @@ class GuildQueue:
         if not survivors:
             await self._store.delete_queue()
             return
-        dropped = [_to_entry(s) for s in removed if is_persisted(s)]
+        # The gate needs only a count, and one -remove of a collection link
+        # routinely drops hundreds: serializing 500 entries measured 2.5ms on the
+        # single event loop, counting them 15us.
+        dropped_count = sum(1 for s in removed if is_persisted(s))
         if (
-            dropped
-            and len(dropped) <= _LREM_MAX_ENTRIES
-            and len(dropped) * _LREM_MAX_SHARE <= survivors
+            dropped_count
+            and dropped_count <= _LREM_MAX_ENTRIES
+            and dropped_count * _LREM_MAX_SHARE <= survivors
         ):
-            # Serialized INSIDE the gate: a removal too big for the shortcut —
-            # one -remove of a collection link is routinely hundreds — would
-            # otherwise build blobs only the guard below reads.
+            # Built inside the gate, where the count is capped at
+            # _LREM_MAX_ENTRIES. remove_queue_entries() re-encodes for its own
+            # pipeline, so only the guard below is served here.
+            dropped = [_to_entry(s) for s in removed if is_persisted(s)]
             dropped_blobs = [entry.to_redis() for entry in dropped]
             if not self._claimed_blobs(dropped_blobs):
                 if await self._store.remove_queue_entries(dropped) == len(dropped):

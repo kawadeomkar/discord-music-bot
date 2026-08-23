@@ -3,8 +3,8 @@
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
-import logging
 import dataclasses
+import logging
 import re
 from zoneinfo import ZoneInfo
 import time
@@ -3415,6 +3415,24 @@ class TestEnqueueDepth:
             await music_player._resolve_source(source)
         assert spy.await_args is not None
         assert spy.await_args.kwargs["query_source"] == "spotify.com"
+
+    async def test_resolved_search_passes_its_user_input_through(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The origin, not the generated search.
+
+        Everything downstream treats user_input as what the user typed:
+        `-remove <album link>` matches the tracks the album queued, and
+        SongQueueEntry.from_song parks it in current_song_user_input, so a
+        recovered head stays removable by the collection link."""
+        album = "https://open.spotify.com/album/xyz"
+        source = YTSource(ytsearch="ytsearch:Artist - Title", user_input=album)
+        resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
+        spy = AsyncMock(return_value=resolved)
+        with patch.object(YTDL, "yt_source", new=spy):
+            await music_player._resolve_source(source)
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["user_input"] == album
 
 
 # ── StateRestore ──────────────────────────────────────────────────────────────
@@ -8131,7 +8149,7 @@ class TestInterject:
         mock_vc: MagicMock,
     ) -> None:
         """-play on a paused song means "stop being paused, play this" — the
-                interrupted song comes back PLAYING at its pause position
+                interrupted song comes back playing at its pause position
         ."""
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song

@@ -1674,6 +1674,7 @@ class MusicBot(commands.Cog):
         ),
         extras={"category": "Queue", "examples": ["-shuffle"]},
     )
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.shuffle")
     async def shuffle(self, ctx: commands.Context) -> None:
@@ -1763,6 +1764,7 @@ class MusicBot(commands.Cog):
         ),
         extras={"category": "Queue", "examples": ["-clear", "-c"]},
     )
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.clear")
     async def clear(self, ctx: commands.Context) -> None:
@@ -1830,6 +1832,7 @@ class MusicBot(commands.Cog):
             ),
         },
     )
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.remove")
     async def remove(
