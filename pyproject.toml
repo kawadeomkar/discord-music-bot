@@ -164,6 +164,11 @@ reportMissingParameterType = "error"
 # rest hid 12 real errors. Prefer `# pyright: ignore[reportSomeRule]`, which
 # names the rule and trips this check once it stops being needed.
 reportUnnecessaryTypeIgnoreComment = "error"
+# `just types` passes no paths, so pyright walks the project — which is exactly src/
+# and tests/ in a checkout, and one stray scratch script otherwise. docs/ is local-only
+# working material by convention, so its files are never checked. Naming `exclude` drops
+# pyright's built-in defaults, hence the three that follow.
+exclude = ["docs", "**/node_modules", "**/__pycache__", "**/.*"]
 
 [tool.ruff]
 target-version = "py314"
