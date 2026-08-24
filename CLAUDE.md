@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,105 tests plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,113 tests plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -526,10 +526,14 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
   observes an empty-window queue.
-- Every mirror write goes through `_write_mirror(items, *, removed=())`, which owns the
-  rebuild / DELETE / LREM choice. Empty means DELETE, never skip. **Only a removal may
+- Every mirror write from a BULK mutation goes through `_write_mirror(items, *,
+  removed=())`, which owns the rebuild / DELETE / LREM choice. The append paths
+  (`put`, `put_front`) deliberately do not: routing them through it turns an O(1)
+  RPUSH into a full rebuild under the mutex on every `-play`. They join it only
+  while `mirror_dirty` says the list is the wrong shape, where the rebuild IS the
+  repair. Empty means DELETE, never skip. **Only a removal may
   pass `removed`** — LREM asserts the survivors kept their order, which is false for a
-  shuffle or an insert. Three clauses gate the shortcut: `_LREM_MAX_ENTRIES` (16),
+  shuffle, for an insert, and for a stale list. Three clauses gate the shortcut: `_LREM_MAX_ENTRIES` (16),
   `_LREM_MAX_SHARE` (one in five), and `_claimed_blobs()`. **The count is the bound that
   matters**: LREM is `O(position)`, so N of them cost `O(N × depth)` against a rebuild's
   `O(depth)` — the depth cancels and the crossover is a COUNT, near 18 at the low end of

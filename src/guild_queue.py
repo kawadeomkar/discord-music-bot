@@ -41,10 +41,11 @@ See docs/ARCHITECTURE.md#queue-invariant.
 # the cold-start -play, and -play --next.
 
 import asyncio
+import contextlib
 import random
 import re
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from itertools import islice
 from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
@@ -196,6 +197,7 @@ class GuildQueue:
         "_mutex",
         "_cleared",
         "_generation",
+        "_mirror_dirty",
     )
 
     def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
@@ -210,6 +212,28 @@ class GuildQueue:
         self._mutex = asyncio.Lock()
         self._cleared = False
         self._generation = 0
+        self._mirror_dirty = False
+
+    @property
+    def mirror_dirty(self) -> bool:
+        """True while the Redis list is known to be a different shape from the
+        deque. The next enqueue rebuilds it instead of appending to it."""
+        return self._mirror_dirty
+
+    @contextlib.contextmanager
+    def _mirror_write(self) -> Iterator[None]:
+        """Mark the list stale unless the write inside finishes.
+
+        The deque is mutated before these awaits, so a cancellation — the place
+        lock's 5s bound against a Redis that accepts and then stalls — leaves the
+        list short of what memory holds. Left unmarked, a later dequeue LPOPs an
+        entry that is not the one it dequeued, retiring a song nobody skipped.
+        """
+        try:
+            yield
+        except BaseException:
+            self._mirror_dirty = True
+            raise
 
     # ── Wake discipline ───────────────────────────────────────────────────────
 
@@ -333,14 +357,20 @@ class GuildQueue:
             # Filtered like every other mirror write: a persisted=False entry
             # written here would never be LPOPed at its dequeue (redis_pop_for
             # skips them), leaving the mirror a permanent entry ahead.
+            if self._mirror_dirty:
+                # Repair, not append: an RPUSH onto a list of the wrong shape
+                # preserves the difference. The rebuild IS this put's mirror write.
+                await self._write_mirror(self._items)
+                return queued
             entries = [_to_entry(item) for item in queued if is_persisted(item)]
             if not entries:
                 return queued
-            if batch:
-                await self._store.push_queue_batch(entries)
-            else:
-                for entry in entries:
-                    await self._store.push_queue(entry)
+            with self._mirror_write():
+                if batch:
+                    await self._store.push_queue_batch(entries)
+                else:
+                    for entry in entries:
+                        await self._store.push_queue(entry)
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
@@ -365,7 +395,7 @@ class GuildQueue:
                 self._items.insert(self._cursor, item)
             self._sync_wake()
 
-            if self._cursor:
+            if self._cursor or self._mirror_dirty:
                 await self._write_mirror(self._items)
             elif self._store is not None:
                 # An LPUSH of just the new items, not a replacement — so not
@@ -373,7 +403,8 @@ class GuildQueue:
                 # where nothing ahead of them needs preserving.
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
-                    await self._store.push_queue_front(entries)
+                    with self._mirror_write():
+                        await self._store.push_queue_front(entries)
             return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
@@ -399,8 +430,10 @@ class GuildQueue:
             self._items.clear()
             self._cursor = 0
             self._sync_wake()
-            if self._store is not None:
-                await self._store.delete_queue()
+            # Through _write_mirror like every other bulk mutation, rather than a
+            # DEL of its own: an emptied deque means DELETE there, and it is what
+            # records whether the write landed.
+            await self._write_mirror(self._items)
         return cleared_items
 
     async def shuffle(self) -> ShuffleOutcome:
@@ -674,7 +707,8 @@ class GuildQueue:
 
         `removed` is the LREM shortcut, and only a removal may pass it: LREM assumes
         the survivors kept their order, which is false for shuffle and for any
-        insert. It is capped by COUNT (see _LREM_MAX_ENTRIES) and guarded twice more,
+        insert — and a stale list (mirror_dirty) has no order to keep. It is capped
+        by COUNT (see _LREM_MAX_ENTRIES) and guarded twice more,
         because LREM matches on exact bytes: skipped outright when a removed blob is
         byte-identical to a claimed item's, since LREM takes the head-most copy —
         the entry awaiting a commit-time LPOP — and falling through to the rebuild
@@ -685,11 +719,14 @@ class GuildQueue:
             return
         survivors = sum(1 for s in items if is_persisted(s))
         if not survivors:
-            await self._store.delete_queue()
+            with self._mirror_write():
+                landed = await self._store.delete_queue()
+            self._mirror_dirty = not landed
             return
         dropped = [_to_entry(s) for s in removed if is_persisted(s)]
         if (
             dropped
+            and not self._mirror_dirty
             and len(dropped) <= _LREM_MAX_ENTRIES
             and len(dropped) * _LREM_MAX_SHARE <= survivors
         ):
@@ -704,9 +741,14 @@ class GuildQueue:
                     f"queue mirror diverged from memory in guild {self._guild.id}; "
                     "rebuilding instead of removing"
                 )
-        await self._store.rebuild_queue(
-            [_to_entry(s) for s in items if is_persisted(s)]
-        )
+        with self._mirror_write():
+            landed = await self._store.rebuild_queue(
+                [_to_entry(s) for s in items if is_persisted(s)]
+            )
+        # A rebuild that landed IS the whole list, so it is the one write that can
+        # answer for the shape. One that did not leaves it exactly as unknown as
+        # before, and the next enqueue tries again.
+        self._mirror_dirty = not landed
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a CLAIMED

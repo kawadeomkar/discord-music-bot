@@ -880,19 +880,23 @@ class GuildRedisStore:
             pipe.expire(self.now_playing_key(), GUILD_TTL)
         await pipe.execute()
 
-    @_guild_op(default=None)
-    async def delete_queue(self) -> None:
-        """DELETE the queue key."""
+    @_guild_op(default=False)
+    async def delete_queue(self) -> bool:
+        """DELETE the queue key. True when it landed — the caller uses that to
+        clear a mirror it had marked stale (GuildQueue.mirror_dirty)."""
         await self.redis.delete(self.queue_key())
+        return True
 
-    @_guild_op(default=None)
-    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> None:
-        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window race."""
+    @_guild_op(default=False)
+    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> bool:
+        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window race.
+        True when it landed, which is what makes the list trustworthy again."""
         pipe = self.redis.pipeline(transaction=True)
         pipe.delete(self.queue_key())
         pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
         pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
+        return True
 
     @_guild_op(default=0)
     async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
