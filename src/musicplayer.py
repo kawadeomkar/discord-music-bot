@@ -1858,7 +1858,19 @@ class MusicPlayer:
             # is only settled at the fragment's iteration end — the confirmation
             # this command is about to send can still adopt a different host.
             self._pending_resume_tail = resume
-        await self.queue.put_front(items)
+        try:
+            await self.queue.put_front(items)
+        except BaseException:
+            # Armed above for a tail this put was going to insert. Cancelled here
+            # (the caller's place bound) there is no tail, and a marker left set
+            # eats the interrupted song's history entry for a resume that never
+            # comes. Identity-checked and synchronous, so a marker a later
+            # interjection already replaced is left alone.
+            if self._skip_history_for is current:
+                self._skip_history_for = None
+            if self._pending_resume_tail is resume:
+                self._pending_resume_tail = None
+            raise
 
         # Only if the song we measured is still playing: if the loop moved on, the
         # inserted entries play next anyway and stopping would kill the NEXT song.
@@ -1880,29 +1892,50 @@ class MusicPlayer:
             returns_paused=resume is not None and resume.start_paused,
         )
 
+    async def settle_prefetch(self) -> None:
+        """Take any in-flight prefetch off the board, ahead of an interjection.
+
+        interject() does this itself, but under the caller's place lock, where the
+        cancel of a prefetch pinned in the yt-dlp executor holds the guild's lock
+        for as long as the worker takes. Run first and outside it, the lock covers
+        the put alone; interject()'s own call then finds an empty slot and returns
+        at once. A prefetch the loop spawns in between is a fresh one and short."""
+        await self._neutralize_prefetch()
+
     async def _neutralize_prefetch(self) -> None:
         """Take the in-flight prefetch off the board so the loop's next dequeue comes
-        from the queue head.
+                from the queue head.
 
-        Claim-then-settle: _prefetch_task is nulled synchronously before any await,
-        and the loop's matching read is also a synchronous read-and-null — exactly
-        one of interject()/loop() consumes any given result.
+        Claim-then-settle: the loop's matching read is a synchronous read-and-null,
+                so exactly one of interject()/loop() consumes any given result.
 
-        - running → cancel; its CancelledError handler returns the dequeued item to
-          the pending front, exactly as bulk mutations rely on.
-        - completed → rebuild an equivalent QueueObject, return it to the front, kill
-          its FFmpeg subprocess. Neither the deque slot nor the mirror moved, so
-          requeue_front() rewrites the slot with the resolved form. The rebuild must
-          carry EVERY field — a dropped one is silently gone from the queue entry.
-        - completed-with-None → the prefetch already retired its own dequeue.
+                A RUNNING prefetch keeps the slot until its cancel settles. Nulling first
+                lets loop(), waking on a song that ended naturally, read an empty slot,
+                skip its own await on this task and take a SECOND claim while this one is
+                still open. Two live claims settle by POSITION — requeue_front() writes the
+                oldest slot and gives up the newest — so each takes the other's song: one
+                queued song is retired unplayed and another plays twice, with the deque and
+                the mirror in step the whole way and nothing to warn on.
+
+                - running → cancel; its CancelledError handler returns the dequeued item to
+                  the pending front, exactly as bulk mutations rely on.
+                - completed → rebuild an equivalent QueueObject, return it to the front, kill
+                  its FFmpeg subprocess. Neither the deque slot nor the mirror moved, so
+                  requeue_front() rewrites the slot with the resolved form. The rebuild must
+                  carry EVERY field — a dropped one is silently gone from the queue entry.
+                - completed-with-None → the prefetch already retired its own dequeue.
         """
         task = self._prefetch_task
-        self._prefetch_task = None
         if task is None:
             return
         if not task.done():
             await cancel_task(task)
-            return
+            if self._prefetch_task is not task:
+                # loop() read-and-nulled it while the cancel settled, and awaited
+                # the same task — so the claim is settled either way and the
+                # result, if any, is its consumer's.
+                return
+        self._prefetch_task = None
         try:
             song = task.result()
         # CancelledError is deliberate: this reads a *done* task's result, where a

@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import os
 import re
@@ -756,6 +757,49 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
         qo.thumbnail = data.get("thumbnail")
 
 
+_INFLIGHT_EXTRACTS: dict[str, "asyncio.Future[Optional[YTDLExtractResult]]"] = {}
+
+
+async def _extract_once(
+    key: str, request: ExtractRequest
+) -> Optional[YTDLExtractResult]:
+    """One extraction per distinct query at a time, process-wide.
+
+    Requests resolve concurrently now, so N users pasting the same trending link
+    — or one user retrying — is N identical jobs against a FIFO pool of four
+    workers, all racing to write the same cache entry. The first caller extracts
+    and every other awaits its result. Keyed by the same normalised cache key the
+    lookup above missed on, so a hit never reaches here.
+
+    The waiters share the winner's outcome, exception included: a failure is the
+    answer to their query too, and retrying it N times is the pile-up this exists
+    to prevent. The entry is removed before the result is published, so the next
+    call after a failure extracts again rather than replaying it.
+    """
+    running = _INFLIGHT_EXTRACTS.get(key)
+    if running is not None:
+        trace.get_current_span().set_attribute("ytdl.extract_shared", True)
+        return await asyncio.shield(running)
+    future: asyncio.Future[Optional[YTDLExtractResult]] = (
+        asyncio.get_running_loop().create_future()
+    )
+    _INFLIGHT_EXTRACTS[key] = future
+    try:
+        data = await _run_extract(request)
+    except BaseException as e:
+        _INFLIGHT_EXTRACTS.pop(key, None)
+        if not future.done():
+            future.set_exception(e)
+        # Retrieved by every waiter, or by nobody — asyncio logs an unretrieved
+        # future exception at GC otherwise, and a lone caller is the common case.
+        future.exception()
+        raise
+    _INFLIGHT_EXTRACTS.pop(key, None)
+    if not future.done():
+        future.set_result(data)
+    return data
+
+
 class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -1152,10 +1196,11 @@ class YTDL(discord.FFmpegOpusAudio):
         # format selection, so data["url"] would be absent and the stream-cache write
         # below would silently never happen for direct-URL plays.
         try:
-            data = await _run_extract(
+            data = await _extract_once(
+                cache_key,
                 ExtractRequest(
                     url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
-                )
+                ),
             )
         except ExtractionError as e:
             # parse_url whitelists no domains — any dotted host lands here for yt-dlp

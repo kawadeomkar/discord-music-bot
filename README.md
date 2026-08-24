@@ -467,6 +467,8 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
+| `PLAY_INFLIGHT_MAX` | | `16` | Per-server ceiling on `-play` requests admitted at once; past it a request is declined. One admitted request is one coroutine, one open span and one typing keepalive, so this bounds memory — pool time is `PLAY_RESOLVE_CONCURRENCY` below. Floored at 1 |
+| `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
@@ -480,7 +482,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
-## Upgrading to 2.29.0
+## Upgrading to 2.29.0 and 2.30.0
 
 **`-playnow` and its `pn` alias are gone.** They are replaced by a flag on `-play`:
 
@@ -500,9 +502,12 @@ alongside it:
   channel is hearing now requires being in it.
 - `-play` requests sent while another is still being looked up are looked up alongside
   it and land as each one is ready, so a `--now` sent behind a long playlist interrupts as
-  soon as its own song resolves. `-clear` and `-stop` drop requests still being looked up
-  and say so. A server can have up to 16 looking up at once (`PLAY_INFLIGHT_MAX`);
-  past that a request is declined.
+  soon as its own song resolves. `-clear`, `-stop` and `-remove` drop requests still being
+  looked up and say so. Two ceilings apply, and they bound different things: a server may
+  have 16 requests waiting at once (`PLAY_INFLIGHT_MAX`) and past that one is declined,
+  while only 2 of them hold a yt-dlp worker (`PLAY_RESOLVE_CONCURRENCY`) — the rest wait
+  their turn rather than being refused, so one server's paste burst cannot delay the
+  extractions another server's playback is waiting on.
 
 **`-play` takes a `--next` flag**, which queues a song at the front without
 interrupting what is playing:

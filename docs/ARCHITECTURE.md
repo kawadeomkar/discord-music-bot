@@ -935,7 +935,7 @@ flowchart TD
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
 | `PostgresHistoryArchive._init_lock: asyncio.Lock` | `PostgresHistoryArchive` | Double-checked lazy pool creation + migration run (first successful `acquire()` wins) |
-| `_GuildPlays.lock: asyncio.Lock` | `MusicBot._plays[guild]` | A `-play`'s insert alone — see [Play placement](#play-placement) |
+| `_GuildPlays.lock: asyncio.Lock` | `PlayRegistry` (src/play_placement.py) | A `-play`'s insert alone — see [Play placement](#play-placement) |
 
 ### Play placement
 
@@ -943,8 +943,8 @@ flowchart TD
 
 | Phase | Guild state | Lock |
 |---|---|---|
-| resolve — `queue_source`, yt-dlp, Spotify; the cold-start join beside it | none (caches keyed by query, one process-wide pool) | none |
-| insert — `queue_put` / `queue_put_front` / `queue_put_next` / `interject` | the queue, the player | `_GuildPlays.lock`, inside `asyncio.timeout(_PLACE_TIMEOUT_SECS)` |
+| resolve — `queue_source`, yt-dlp, Spotify; the cold-start join beside it | none (caches keyed by query, one process-wide pool) | `_GuildPlays.resolves`, a per-guild bound on pool workers |
+| insert — `queue_put` / `queue_put_front` / `queue_put_next` / `interject` | the queue, the player | `_GuildPlays.lock`, inside `asyncio.timeout(PLACE_TIMEOUT_SECS)` |
 | reply | none | none |
 
 Requests resolve concurrently and land as each finishes; a `--now` sent behind a
@@ -954,30 +954,72 @@ fully serialized body used to close — two interjections parking two resume tai
 one song, two cold starts each joining, two front inserts landing out of order — and
 it does so at the insert, where each request re-validates rather than re-reads:
 
+The mechanism lives in `src/play_placement.py`: the flag grammar, the voice gate both
+readings share, and `PlayRegistry` — the per-guild in-flight set, its place lock, the
+cold-start singleflight and the pool semaphore. The cog keeps the commands and every
+reply. Its tests stay in `tests/test_musicbot.py`, because what places a song and what
+the channel is told about it are one behaviour.
+
+The argument is parsed twice — once by `play_takes_the_queue` in `before_invoke` to
+decide the voice gate, once by `play()` for the body — and they agree only because both
+call `split_play_args`. A third flag that changes what "takes the queue" means has to be
+reflected in both readings, not just the parser; at that point the gate should hand the
+parsed value forward instead.
+
 1. **The player is not retired.** `MusicBot.cleanup()` stamps `MusicPlayer.mark_retired()`
    immediately after popping the player from `mps`, before any await. A request that
-   bound that player at dispatch (`_PlayRequest.mp`) and reaches the lock after
+   bound that player at dispatch (`PlayRequest.mp`) and reaches the lock after
    `-stop`, a kick or the alone-watchdog is refused and says so. Without the check the
    put lands in the Redis mirror alone — the in-memory copy went with the player —
    and the next restore resurrects it.
 2. **The queue's generation matches the snapshot.** `GuildQueue.clear()` bumps
    `_generation` under the bulk mutex; a request registered before a `-clear` is refused
    at the insert, the same way the playback loop's `try_commit_dequeue` refuses a
-   dequeue across a bump. `-clear` and `-stop` name the requests they cut off from the
-   in-flight registry (`_inflight_requests`, read with no await after the act), and
-   each request reports itself.
-3. **The author is still in voice.** `validate_commands` ran at dispatch; the resolve
-   can take 99s. `_voice_refusal` re-runs the same check under the lock and the
+   dequeue across a bump.
+3. **No command stamped it.** `-clear`, `-stop` and `-remove` name the requests they cut
+   off from the in-flight registry (`PlayRegistry.inflight`, read with no await after the
+   act), and each request reports itself. The stamp is a verdict of its own and not only
+   a label on the two above: a `-stop` that lands before a cold-start join has no player
+   to retire and no queue to bump, so without this check the channel is told the request
+   was dropped and it joins and plays anyway.
+4. **The author is still in voice.** `validate_commands` ran at dispatch; the resolve
+   can take 99s. `voice_refusal` re-runs the same check under the lock and the
    refusal is sent after it.
 
-The body under the lock is the put and nothing else. Confirmations are built before
-the put (their "Est. playing at" and queued-song decision read the queue as it was)
-and sent after the lock is released, so a 429 on the channel holds no other request.
-`_PLACE_TIMEOUT_SECS` is the same 5s the loop's start write takes for the same
-hazard — the pool sets no `socket_timeout` — and is outer to the lock, so a request
-parked behind a stalled sibling gives up on its own clock. A put cancelled mid-flight
-may have appended in memory with the Redis write unknown; that is the state a crash
-there leaves and restore already replays from.
+The verdict is one value (`PlaceResult`) rather than a verdict beside fields the
+caller has to remember to read, and a stall carries which half of the budget ran out
+on the exception it raises.
+
+The body under the lock is the put, and the `queue_position` minted on it. Rendering
+is not: an "Est. playing at" walks the whole queue, and the hold is shared, so under it
+one long queue's walk is time every sibling `-play` spends waiting. The confirmation is
+built before the lock and sent after it is released, which also keeps a 429 on the
+channel off every other request. What that costs is exactness in an estimate — a
+sibling placing in between leaves the quoted time one song short, the same ±1
+`enqueue_depth()` already carries against a queue the loop keeps moving.
+
+`PLACE_TIMEOUT_SECS` is 5s because the pool sets no `socket_timeout`, so a Redis
+that accepts and then stalls has no bound of its own; it is outer to the lock, so a
+request parked behind a stalled sibling gives up on its own clock. The hold is one
+round trip long, so a guild bursting to `PLAY_INFLIGHT_MAX` serializes that many —
+~40ms at the 2.4ms p50 the start transaction measures, and past ~300ms a trip the
+sixteenth request spends its whole budget waiting. That is reported as a busy queue,
+which is what it is. What it must NOT do is disconnect: a cold start refused late —
+by the clock or by a verdict — tears its player down so a join that reached an empty
+channel does not sit there, and once the connection is up and the queue is not empty
+that reasoning is inverted, because the songs in it are a sibling's or a restore's
+(`MusicBot._cold_start_left_something_playable`).
+
+A put cancelled mid-flight may have appended in memory with the Redis write unknown,
+which is why the stall notice declines to say the song is absent and points at `-queue`
+rather than inviting a retry — a live process whose deque and mirror differ by one is
+not the state a crash leaves, and telling the user to send it again mints a duplicate.
+The queue records that divergence itself: `GuildQueue.mirror_dirty` is set when a
+mirror write does not finish, and while it stands the next enqueue REBUILDS the list
+instead of appending to it, the LREM shortcut is refused, and only a rebuild that
+landed clears it. Without that the list keeps its wrong shape, a later dequeue's LPOP
+retires an entry that is not the one it dequeued, and a `-clear` cut short leaves every
+entry it thought it dropped for the next restore to find.
 
 **`queue_position` is minted at the insert**, not at dispatch: two requests resolving
 together would read the same depth at dispatch, and the depth at the insert is the
@@ -990,11 +1032,20 @@ task's cancellation into the join while another request still waits on it. A cre
 whose resolve fails with nobody else holding the gate cancels its join before tearing
 down, as a single cold start always did; with another participant holding, the join
 and the teardown decision are theirs. A join mid-cancellation settles a tick later,
-and `_cold_join` skips it rather than hand it to a request arriving in that tick.
+and `cold_join` skips it rather than hand it to a request arriving in that tick.
 Every participant front-inserts (`front` is decided at dispatch: "the bot was
 disconnected when I asked"), so all of them land ahead of the restored leftovers, the
 last to place at the head — the rule two `--next`s already follow. The gate opens
 when the last hold releases.
+
+**A failed join is reported by each waiter for itself.** `join()` runs on the context
+of the request that created the task and renders its own error there, so `cold_join`
+returns whether this request created it: the creator stays silent (it was just told)
+and every other request answers with `_join_failed_notice`, naming the song it lost.
+Without that split a request could wait out a 1–4s resolve and a failed handshake and
+receive nothing at all. The notice is RETURNED rather than sent, for the no-await rule
+below; the drop is stamped `play.dropped_by="join_failed"` and logged before the
+teardown, since `join()` swallowing its own error leaves the span no other record.
 
 `_abandon_cold_start` skips when another participant holds the gate, and the rule that
 makes that last-one-out rather than both-skip is that **nothing awaits between the
@@ -1003,15 +1054,91 @@ synchronously, so the second failure sees one hold and tears down. `_resolve_and
 returns its notices rather than sending them for exactly this reason, and a test pins
 the rule against the source.
 
-**The cap.** `PLAY_INFLIGHT_MAX` (default 16) bounds a guild's requests in flight. Its
-unit is cheap — one coroutine awaiting a pool future plus one open span — and its job
-is fairness against the shared yt-dlp pool, not latency. Past it a request is declined
-with the existing notice, raised from `play()` before `_play`'s own `except` so it
-reaches `cog_command_error`. `play.inflight` is recorded on the span before the cap
-check, so a declined request carries the count it would have joined.
+**Two bounds, and they measure different things.** `PLAY_INFLIGHT_MAX` (default 16)
+bounds a guild's requests *admitted*: its unit is one coroutine, one open span and one
+typing keepalive, and past it a request is declined, raised from `play()` before
+`_play`'s own `except` so it reaches `cog_command_error`. `play.inflight` is recorded
+before the cap check, so a declined request carries the count it would have joined.
+
+`PLAY_RESOLVE_CONCURRENCY` (default 2, `_GuildPlays.resolves`) bounds how many of those
+are *extracting* — holding one of the process-wide yt-dlp pool's workers. The pool is
+FIFO and shared by every guild, so admission alone is no bound on it: sixteen distinct
+links is sixteen jobs, and with a default pool of four they occupy every worker for
+four waves. What queues behind them is not only other guilds' `-play`s but the playback
+loop's own in-band extractions — a lazy Spotify entry resolving at dequeue, a
+dead-stream re-extraction — which is dead air between songs in a guild that did
+nothing. Half the pool is the default so one guild can never hold all of it. Requests
+wait on the semaphore rather than being refused: within a guild the order is fair, and
+the bound is what keeps it fair between guilds. A collection is one extraction job, not
+one per track, so a `--now` sits behind at most a couple of them.
+
+**Order in the channel is not order in the queue.** Confirmations are sent after the
+lock releases, so two requests that placed A then B can have their embeds arrive B then
+A — a slow edit or a 429 on one send is enough. Each ETA is correct as of its own
+insert; only the reading order drifts, and the `queue_position` each confirmation
+carries is what settles it.
+
+#### The contract a streamed collection places under
+
+Everything above assumes one request makes one atomic put. A resolve that yields tracks
+incrementally cannot: holding the lock for the length of the stream breaks the put-alone
+rule, and taking it per batch makes "the generation matched at my insert" a per-batch
+claim, so a `-clear` mid-stream leaves the batches already placed and drops the rest.
+
+**This is written ahead of the code.** The pieces it names —
+`_begin_collection_enqueue`, `_drain_collection_tail`, `put(..., expected_generation=)`,
+`bump_generation()` — live on `task/spotify-album-streaming` and are not in this tree.
+The point of deciding here is that the branch inherits a contract rather than inventing
+one at merge, where two mechanisms would both answer "may this put land?" and neither
+would answer "half of it did".
+
+1. **The lock covers the first batch. The compare-and-put carries the tail.** A
+   streaming request takes the place lock exactly once, for page 1, and gets one
+   ordinary `PlaceResult` — retired, generation, stamp and voice are decided there and
+   not again. Later batches never take it: each goes in through
+   `put(..., expected_generation=g)`, where `g` is the generation page 1 placed against
+   and the comparison happens inside the queue's own mutex hold. That is the stronger
+   primitive for the tail, not merely the cheaper one — the place lock's read-then-put
+   leaves a window the compare-and-put closes — and a guild-wide lock held across a 99s
+   drain would park every sibling `-play` behind one pasted link.
+
+   What follows from it: **the tail is invalidated by the generation counter alone**, so
+   everything that must stop a stream has to bump it. `clear()` already does;
+   `cleanup()` must, or a `-stop` retires the player while the drain keeps feeding a
+   queue nothing will play.
+
+2. **A partial placement reports a count, not a verdict.** `PlaceResult` stays
+   per-request — it is the answer to one question asked once, and making it per-batch
+   would give a request N verdicts and the channel N replies. The confirmation is sent
+   when page 1 lands, because that is when the music starts and the user has waited long
+   enough. The drain speaks again ONLY when it ended early: *"Queued 340 of 5,547 — the
+   rest was dropped when `-clear` ran."* A clean drain says nothing further, since the
+   page-1 confirmation already promised the collection. The span carries the placed
+   count either way, so an early end is visible even when the channel was told nothing.
+
+3. **The admission slot is held for the whole drain; the pool slot is not.** The request
+   stays in the in-flight registry until its last batch: it is one coroutine, one open
+   span and one typing keepalive, which is exactly what `PLAY_INFLIGHT_MAX` measures,
+   and it is also what lets `-remove` and `-clear` name a stream that is still running.
+   `PLAY_RESOLVE_CONCURRENCY` is the opposite case — it bounds what one guild holds of
+   a shared, process-wide pool, so the drain releases it after each page and re-acquires
+   it for the next. A `--now` arriving mid-drain then waits one page boundary rather
+   than a whole collection.
+
+Two questions this deliberately leaves to the branch, with the constraint each answer
+has to meet. **What the page-1 confirmation may claim**, given `playlist_count` is
+extractor-dependent and `None` on a channel page under a bounded call — whatever it
+says must stay true after a mid-stream `-clear`, which rules out a bare total. And
+**what `-remove <link>` means against a running stream**, which is the one input that
+names a collection in both states at once: tracks already queued, and more still
+coming.
 
 Per-guild in-memory state is shard-safe — a guild lives on exactly one shard — so none
-of this reaches for Redis coordination.
+of this reaches for Redis coordination. The exclusion is a rolling deploy, where two
+instances briefly both field commands: each has its own `_plays`, so the lock, the
+singleflight and the in-flight registry are per process and the races above reopen
+across the pair for that window. It is the same exposure `lock:guild:{id}:recovery`
+exists for, and unlike recovery this side has no Redis lock behind it.
 
 ---
 

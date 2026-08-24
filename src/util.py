@@ -57,10 +57,22 @@ def trace_footer(span: Span) -> Optional[str]:
 
 
 async def cancel_task(task: Optional[asyncio.Task]) -> None:
+    """Cancel `task` and wait for it to finish, swallowing ITS CancelledError.
+
+    Not the caller's. A cancellation aimed at this coroutine — a place timeout, a
+    teardown — arrives at the same await, and swallowing it leaves asyncio.timeout
+    with no exception to convert, so its deadline never raises and the caller runs
+    on past its own bound. cancelling() is what tells them apart: it counts
+    cancel() calls against the CURRENT task, which only an outside canceller made.
+    """
     if task is not None and not task.done():
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
 
 def spawn_background(
@@ -84,17 +96,36 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
         pass  # cosmetic — never let typing failures surface
 
 
+# Refcounted per channel, not per command. -play requests resolve concurrently now,
+# so a paste burst enters this as many times as it has links, and typing is a
+# CHANNEL state: N keepalives say exactly what one says while POSTing the same
+# per-channel route N times, which discord.py then serialises on that bucket.
+_TYPING_HOLDS: dict[int, int] = {}
+_TYPING_TASKS: dict[int, asyncio.Task[None]] = {}
+
+
 @contextlib.asynccontextmanager
 async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
     """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
-    the command body starts immediately, and the keepalive is cancelled when the body
-    finishes. The whole CM lives inside the task — never enter/exit Typing manually
-    across tasks."""
-    task = asyncio.create_task(_typing_keepalive(ctx))
+    the command body starts immediately, and the keepalive is cancelled when the last
+    holder finishes. The whole CM lives inside the task — never enter/exit Typing
+    manually across tasks.
+
+    The task outlives the command that started it, so the indicator does not blink
+    off when the first of several concurrent commands returns."""
+    key = ctx.channel.id
+    _TYPING_HOLDS[key] = _TYPING_HOLDS.get(key, 0) + 1
+    if key not in _TYPING_TASKS:
+        _TYPING_TASKS[key] = asyncio.create_task(_typing_keepalive(ctx))
     try:
         yield
     finally:
-        task.cancel()
+        _TYPING_HOLDS[key] -= 1
+        if _TYPING_HOLDS[key] <= 0:
+            del _TYPING_HOLDS[key]
+            task = _TYPING_TASKS.pop(key, None)
+            if task is not None:
+                task.cancel()
 
 
 def record_span_error(span: Span, e: Exception) -> None:

@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,113 tests plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,159 tests plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -241,6 +241,9 @@ src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
 ├── musicbot.py       # MusicBot cog — every command, per-guild player registry (mps), crash-recovery entry
 ├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP host, ETA, interject
+├── play_placement.py # -play's flag grammar, its voice gate, and PlayRegistry: the per-guild
+│                     # in-flight set and the place lock its inserts serialize on (the cog
+│                     # keeps the commands; its tests live in test_musicbot.py)
 ├── guild_queue.py    # GuildQueue — one deque + cursor, the mirror writer, bulk-mutation mutex
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres)
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
@@ -366,9 +369,9 @@ three separate phases so queueing is instant and songs start with near-zero late
 play():
   ├─ split_play_args: strips a LEADING --now / --next off the argument (PlayMode);
   │        a near-miss like -now becomes a hint, not a search for "now <url>"
-  ├─ _register_play: admit to the guild's in-flight set (PLAY_INFLIGHT_MAX, default
-  │        16, declined past it), snapshot the queue generation. Requests resolve
-  │        CONCURRENTLY; only the insert below is serialized — see _place
+  ├─ PlayRegistry.register: admit to the guild's in-flight set (PLAY_INFLIGHT_MAX,
+  │        default 16, declined past it), snapshot the queue generation. Requests
+  │        resolve CONCURRENTLY; only the insert is serialized — see .place()
   ├─ song live? ──► _interject_flow:
   │      • --now                     → interrupt, park a resume tail (resume_paused=True)
   │      • plain -play + PAUSED song → same flow, resume_paused=False ("-play means play")
@@ -757,7 +760,7 @@ for the whole current song and a bare `put_front` lands BEHIND it (the song woul
 second). It deliberately does not re-spawn the prefetch: `_prefetch_task` is one slot
 under a claim-then-null protocol with `loop()`, and a re-spawn racing the loop's own
 would strand a claim and drift `_cursor` permanently. Both flags are gated by the
-same-channel rule (`_play_takes_the_queue`): line-jumping is queue control, like
+same-channel rule (`play_takes_the_queue`): line-jumping is queue control, like
 `-skip`/`-shuffle`/`-remove`.
 
 ### The Now Playing host system
@@ -895,7 +898,8 @@ Per-guild synchronization primitives and what they protect:
 |---|---|
 | `GuildQueue._mutex` | the deque and its Redis mirror during bulk mutations; dequeue commits |
 | `GuildQueue._wake` (Event) | the pending-item signal a parked `get()` waits on; set iff `_cursor < len(_items)`, and `_sync_wake()` is its ONLY writer — a stale set turns the wait loop into a loop with no suspension point and stops the event loop (measured at 2,000,001 iterations with 0 other loop ticks) |
-| `_GuildPlays.lock` (`MusicBot._plays[guild]`) | the insert alone — one Redis round trip, bounded by `_PLACE_TIMEOUT_SECS` (5s). `-play` resolves with no lock and enters `_place()` for the put, where three checks replace the re-read a serialized body relied on: the player is not `retired` (`-stop`/kick/watchdog since dispatch), `queue.generation` did not move (`-clear`), the author is still in voice. The reply is built under the lock and sent after it. `_GuildPlays.join` is the cold-start singleflight: one `-join` per guild, awaited through `asyncio.shield` by every request that found no voice client. `docs/ARCHITECTURE.md#play-placement` |
+| `_GuildPlays.resolves` (semaphore, src/play_placement.py) | how many of a guild's admitted `-play`s may hold one of the shared, process-wide yt-dlp pool's workers (`PLAY_RESOLVE_CONCURRENCY`, default 2 against 4 workers). Admission is a memory bound; this is the pool bound, and without it one guild's paste burst delays every other guild's extractions — including the playback loop's own in-band ones |
+| `_GuildPlays.lock` (`PlayRegistry`, src/play_placement.py) | the insert alone — one Redis round trip, bounded by `PLACE_TIMEOUT_SECS` (5s). `-play` resolves with no lock and enters `PlayRegistry.place()` for the put, where four checks replace the re-read a serialized body relied on: the player is not `retired` (`-stop`/kick/watchdog since dispatch), `queue.generation` did not move (`-clear`), no command stamped it (`dropped_by` — a `-stop` landing before the join has no player to retire and no queue to bump, so the stamp has to invalidate on its own), the author is still in voice. Under the hold: the put, and the `queue_position` on it. The confirmation is rendered BEFORE the lock — an ETA walks the whole queue — and sent after it. `_GuildPlays.join` is the cold-start singleflight: one `-join` per guild, awaited through `asyncio.shield` by every request that found no voice client. `docs/ARCHITECTURE.md#play-placement` |
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
@@ -911,7 +915,7 @@ One known, documented, accepted race remains open (ISSUE header in guild_queue.p
 bulk mutation OR an insert can land between `try_commit_dequeue()` releasing the mutex and
 the start transaction's server-side LPOP, drifting memory and Redis by one entry. The
 insert direction has three callers (`interject`, the cold-start `-play`, `-play --next`)
-and is the likelier half. Its "cheapest fix" is NOT cheap from where the loop sits — the
+and is the likelier half. The cheapest-looking fix is NOT cheap from where the loop sits — the
 mutex hold would span `vc.play()` — see the header, and read it first if you touch this.
 
 ## Code conventions
@@ -1070,7 +1074,8 @@ duplicated.
 | `LIVENESS_INTERVAL_SECS` | `15.0` | touch cadence. Must stay well under the healthcheck's 90s staleness window; the two are written separately (Dockerfile ↔ config.py) and are not enforced by `just pins` |
 | `POT_PROVIDER_URL` | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
-| `PLAY_INFLIGHT_MAX` | `16` | per-guild ceiling on `-play` requests resolving at once; past it a request is declined with the existing notice. Its unit is one coroutine awaiting a pool future plus one open span, and its job is fairness against the shared pool (one guild pasting fifty links would otherwise hold every worker), not latency — requests resolve concurrently and serialize only at the insert. `play.inflight` on the `bot.play` span is the number that says whether 16 is right. Floored at 1 |
+| `PLAY_INFLIGHT_MAX` | `16` | per-guild ceiling on `-play` requests ADMITTED at once; past it a request is declined with the existing notice. Its unit is one coroutine, one open span and one typing keepalive — memory, not pool time, which `PLAY_RESOLVE_CONCURRENCY` bounds instead. Requests resolve concurrently and serialize only at the insert. `play.inflight` on the `bot.play` span is the number that says whether 16 is right. Floored at 1 |
+| `PLAY_RESOLVE_CONCURRENCY` | `2` | per-guild ceiling on admitted requests HOLDING a yt-dlp worker (`_GuildPlays.resolves`). The pool is process-wide and FIFO, so admission alone bounds nothing on it: sixteen links is sixteen jobs against four workers, and what queues behind them includes the playback loop's own in-band extractions in OTHER guilds — dead air between their songs. Half the default pool, so one guild can never hold all of it; requests wait here rather than being refused. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
 | `STREAM_PROBE_TIMEOUT_SECS` | `2.0` | Cap on the pre-playback stream-URL probe. Short because a single resolve can pay it twice and exceeding it now costs a **cache entry**, not just a verdict — an unconfirmed URL still plays, so firing early is cheap. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
 | `HEARTBEAT_INTERVAL_SECS` | `3.0` | How often a playing guild records its playback position for crash recovery. Bounds the worst-case recovery error — a crash resumes at the last heartbeat, so at most this many seconds replay. Same default as the progress bar because the same reasoning applies, but a separate knob: one is display cadence, the other durability. Floored at 0.5s and refused non-finite — each tick is a Redis write per PLAYING guild, so `0` would be an unbounded HSET loop and `inf` would silently disable recovery |

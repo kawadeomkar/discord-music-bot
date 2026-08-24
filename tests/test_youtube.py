@@ -881,6 +881,57 @@ class TestYTPlaylistAnalytics:
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
 
 
+class TestExtractSingleflight:
+    """One extraction per distinct query at a time, process-wide."""
+
+    async def test_identical_concurrent_queries_extract_once(self) -> None:
+        """Requests resolve concurrently now, so N users pasting the same trending
+        link is N identical jobs against a FIFO pool of four workers, all racing to
+        write the same cache entry."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            request = MagicMock()
+            waiters = [
+                asyncio.create_task(_extract_once("k", request)) for _ in range(4)
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            results = await asyncio.gather(*waiters)
+
+        assert calls == 1
+        assert all(r == {"title": "shared"} for r in results)
+
+    async def test_a_failure_is_not_replayed_by_the_next_caller(self) -> None:
+        """The waiters share the winner's exception — retrying it N times is the
+        pile-up this exists to prevent — but the entry goes before the result is
+        published, so the call AFTER extracts again."""
+        from src.youtube import ExtractionError, _extract_once
+
+        calls = 0
+
+        async def _boom(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            raise ExtractionError("nope")
+
+        with patch("src.youtube._run_extract", new=_boom):
+            for _ in range(2):
+                with pytest.raises(ExtractionError):
+                    await _extract_once("k", MagicMock())
+
+        assert calls == 2
+
+
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
     populates both the ytdl:source and ytdl:stream

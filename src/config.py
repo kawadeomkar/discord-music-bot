@@ -159,6 +159,13 @@ POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 # awaiting a pool future and one open span; the bound is fairness against the
 # shared yt-dlp pool, not latency. 0 would decline every request, hence the floor.
 PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=1)
+# How many of those admitted requests may hold a yt-dlp worker at once. The pool is
+# process-wide and FIFO, so with no per-guild bound one guild's paste burst takes
+# every worker for as many waves as it has links — and what queues behind it
+# includes the playback loop's own in-band extractions in OTHER guilds (a lazy
+# Spotify entry at dequeue, a dead-stream re-extraction), which is dead air between
+# their songs. Half the default pool, so one guild can never hold all of it.
+PLAY_RESOLVE_CONCURRENCY: int = _int_env("PLAY_RESOLVE_CONCURRENCY", 2, minimum=1)
 
 
 def _parse_bool_env(name: str) -> bool:
