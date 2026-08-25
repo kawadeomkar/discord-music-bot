@@ -3634,6 +3634,30 @@ class TestEnqueueSingle:
         mp.repin_now_playing = AsyncMock(return_value=True)
         return mp
 
+    async def test_a_denied_reaction_still_leaves_the_card(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A channel can deny Add Reactions. The reaction rides in the same gather
+        as the reply, and gather does not cancel a sibling that is still running,
+        so the Forbidden surfaces ALONGSIDE the card rather than instead of it —
+        the song is queued by then, and an error with no card would deny that."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        mp = self._playing_mp()  # head is some OTHER song → the card path
+        mock_ctx.message.add_reaction = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "no reactions")
+        )
+
+        with pytest.raises(discord.Forbidden):
+            await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        # gather raises on the first failure while the reply task runs on.
+        for _ in range(4):
+            await asyncio.sleep(0)
+        mp.queue_put.assert_awaited_once_with(qobj)
+        mock_ctx.send.assert_awaited_once()
+
     async def test_reposts_the_block_when_the_song_becomes_the_head(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

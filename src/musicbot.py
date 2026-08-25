@@ -942,28 +942,37 @@ class MusicBot(commands.Cog):
         should_show_queued = mp.queue.qsize() > 0 or (
             isinstance(vc, discord.VoiceClient) and vc.is_playing()
         )
-        # Awaited ahead of the reply rather than gathered with it: the reply's
-        # shape depends on whether this song became the queue head, which the put
-        # decides. One RPUSH under the queue mutex (p50 ~2.4ms).
-        await asyncio.gather(mp.queue_put(qobj), ctx.message.add_reaction("👍"))
+        # The put is awaited alone because the reply's shape depends on whether
+        # this song became the queue head, which only the put decides. One RPUSH
+        # plus its TTL refresh, under the queue mutex.
+        await mp.queue_put(qobj)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
-        if should_show_queued:
-            # The block's "Up next" card renders the queue head in the same layout
-            # the confirmation uses, so when this song IS the head the two are one
-            # card printed twice in one message. Re-host the live block instead and
-            # let its card be the confirmation — dedicated, because a response host
-            # with no own embeds strip-edits to a blank message on retire.
-            if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
-                if warning is not None:
-                    await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+        async def reply() -> None:
+            if should_show_queued:
+                # The block's "Up next" card renders the queue head in the same
+                # layout the confirmation uses, so when this song IS the head the
+                # two are one card printed twice in one message. Re-host the live
+                # block instead and let its card be the confirmation — dedicated,
+                # because a response host with no own embeds strip-edits to a
+                # blank message on retire.
+                if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
+                    if warning is not None:
+                        await ctx.send(
+                            embed=notice_embed(warning, discord.Color.orange())
+                        )
+                    return
+                await ctx.send(embed=mp.build_queued_song_embed(qobj, warning=warning))
                 return
-            await ctx.send(embed=mp.build_queued_song_embed(qobj, warning=warning))
-            return
-        if warning is not None:
-            # Nothing else is being sent on this path — the song starts now and
-            # the NP card speaks for it — so the warning needs its own message.
-            await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+            if warning is not None:
+                # Nothing else is being sent on this path — the song starts now and
+                # the NP card speaks for it — so the warning needs its own message.
+                await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+
+        # Gathered, not sequenced: gather does not cancel a sibling that is still
+        # running, so a channel denying Add Reactions still gets its card — the
+        # reaction's Forbidden surfaces alongside it rather than instead of it.
+        await asyncio.gather(reply(), ctx.message.add_reaction("👍"))
 
     @commands.command(
         name="play",

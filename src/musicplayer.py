@@ -660,13 +660,13 @@ class MusicPlayer:
 
         if isinstance(item, QueueObject):
             # Capped for the same reason _field_value is: a -queue page renders
-            # ten of these into one 4096-char description.
-            # Sanitized too — this lands inside a masked link's LABEL, where a
-            # "]" in the title would close it early and re-point the link.
+            # ten of these into one 4096-char description. Both are yt-dlp
+            # metadata, so both are sanitized: a "]" in the title closes the
+            # masked link early, and a "[x](url)" uploader renders as a live link.
             title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
             requester = _requester_mention(item.requester)
             dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
-            channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or (
+            channel = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or (
                 "Unknown channel"
             )
             if item.is_resume and item.ts:
@@ -1396,10 +1396,11 @@ class MusicPlayer:
                 _NEXT_UP_TITLE_MAX,
             )
             return f"{search}\n*resolving...*"
-        # Sanitized and capped because this lands inside a masked link's LABEL,
-        # where a "]" in the title would close it early and re-point the link.
+        # Both are yt-dlp metadata, so both are sanitized and capped: the title
+        # lands inside a masked link's LABEL, where a "]" closes it early and
+        # re-points the link, and a "[x](url)" uploader renders as a live link.
         title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
-        channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
+        channel = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
         duration = fmt_duration(item.duration) if item.duration is not None else "?:??"
         detail = [f"Channel: {channel}", f"Duration: `{duration}`"]
         if item.is_resume and item.ts:
@@ -1495,11 +1496,14 @@ class MusicPlayer:
         own_embeds: list[discord.Embed],
         *,
         dedicated: bool = False,
-    ) -> None:
+    ) -> bool:
         """Pointer-first host swap. The pointer update is synchronous (atomic on the
         event loop), so any tick starting after this targets the new host. Retiring
         the old one is fire-and-forget; _retire_np_host's lock orders it after any
-        in-flight tick edit against that message."""
+        in-flight tick edit against that message.
+
+        False when `message` was shed instead of adopted — callers that reply
+        THROUGH the host must fall back, since a shed message is deleted."""
         old_msg = self._np_host_message
         old_own = self._np_host_own_embeds
         old_dedicated = self._np_host_dedicated
@@ -1509,7 +1513,7 @@ class MusicPlayer:
             # message would pull the block up from the true bottom — keep the newer
             # host and shed the older message's block instead.
             self._spawn_background(self._retire_np_host(message, own_embeds, dedicated))
-            return
+            return False
         self._np_host_message = message
         self._np_host_own_embeds = own_embeds
         self._np_host_dedicated = dedicated
@@ -1517,6 +1521,7 @@ class MusicPlayer:
             self._spawn_background(
                 self._retire_np_host(old_msg, old_own, old_dedicated)
             )
+        return True
 
     def _adopt_np_host_if_current(
         self,
@@ -1530,10 +1535,10 @@ class MusicPlayer:
         `song` before the send's await, and the song may have ended or been replaced
         in flight; adopting then installs a stale block as host and delete-retires
         the next song's NP message (or leaves a frozen block nothing cleans up), so
-        the just-sent message sheds it instead. True when adopted."""
+        the just-sent message sheds it instead. True when adopted — which the swap
+        itself can still refuse, so its answer is the one returned."""
         if song is not None and self.current_song is song:
-            self._adopt_np_host(message, own_embeds, dedicated=dedicated)
-            return True
+            return self._adopt_np_host(message, own_embeds, dedicated=dedicated)
         self._spawn_background(self._retire_np_host(message, own_embeds, dedicated))
         return False
 
@@ -2129,8 +2134,8 @@ class MusicPlayer:
     ) -> Optional[discord.Message]:
         """Send a dedicated NP host message (its embeds are only the block) and adopt
         it, retiring whatever hosted the block before. None when there is no live
-        song, or the song changed while the send was in flight (the stale message is
-        deleted instead of adopted)."""
+        song, or when the message was deleted rather than adopted — the song changed
+        while the send was in flight, or a newer host already holds the bottom."""
         song = self.current_song
         block = self.np_embed_block(now_playing=now_playing)
         if not block:

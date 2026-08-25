@@ -4946,6 +4946,40 @@ class TestNpHostAdoptRetire:
         newer.edit.assert_not_awaited()
         newer.delete.assert_not_awaited()
 
+    async def test_a_shed_adopt_reports_failure(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The swap's answer is what a caller replying THROUGH the host reads: a
+        shed message is retired, so True there would claim a reply that is gone."""
+        newer = AsyncMock(spec=discord.Message)
+        newer.id = 2
+        assert music_player._adopt_np_host(newer, []) is True
+
+        older = AsyncMock(spec=discord.Message)
+        older.id = 1
+        assert music_player._adopt_np_host(older, []) is False
+        await asyncio.gather(*list(music_player._background_tasks))
+
+    async def test_repin_reports_failure_when_its_message_is_shed(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """repin_now_playing() is the -play head reply's only success signal. An
+        out-of-order send is deleted, so reporting True would answer with a 👍
+        and nothing else."""
+        music_player.current_song = mock_song
+        held = AsyncMock(spec=discord.Message)
+        held.id = 99
+        music_player._adopt_np_host(held, [], dedicated=True)
+
+        sent = AsyncMock(spec=discord.Message)
+        sent.id = 1  # returned after `held`, so it sits ABOVE it in the channel
+        music_player._channel.send = AsyncMock(return_value=sent)
+
+        assert await music_player.repin_now_playing() is False
+        await asyncio.gather(*list(music_player._background_tasks))
+        sent.delete.assert_awaited_once()
+        assert music_player._np_host_message is held
+
     async def test_retire_waits_for_lock_holder(
         self, music_player: MusicPlayer
     ) -> None:
@@ -6196,6 +6230,45 @@ class TestQueueEntryCard:
         assert "[x](http://evil)" not in body
         assert "](https://yt.com/v=1)" in body
         assert body.count("](") == 1
+
+    def test_an_uploader_cannot_forge_a_link(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A channel name is yt-dlp metadata an attacker sets for free, and the
+        Channel line is body text, where a bare "[x](url)" IS a link."""
+        item = QueueObject(
+            "https://yt.com/v=1",
+            "Song 1",
+            mock_author,
+            duration=60,
+            uploader="[CLICK TO VERIFY](http://evil)",
+        )
+        seed_queue(music_player.queue, item)
+
+        body = described(music_player.build_queued_song_embed(item))
+        assert "[CLICK TO VERIFY](http://evil)" not in body
+        assert "CLICK TO VERIFY" in body  # neutralized, not dropped
+        assert body.count("](") == 1  # the song's own masked link, and only it
+
+    def test_an_uploader_cannot_forge_a_link_on_a_queue_row(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The -queue row renders the same attacker-set field through its own
+        formatter, so it needs the guarantee stated separately."""
+        item = QueueObject(
+            "https://yt.com/v=1",
+            "Song 1",
+            mock_author,
+            duration=60,
+            uploader="[CLICK TO VERIFY](http://evil)",
+        )
+        seed_queue(music_player.queue, item)
+
+        line, _ = music_player._format_queue_line(
+            item, 1, *music_player._queue_eta_seed()
+        )
+        assert "[CLICK TO VERIFY](http://evil)" not in line
+        assert line.count("](") == 1
 
     def test_unresolved_ytsource_renders_resolving(
         self, music_player: MusicPlayer
