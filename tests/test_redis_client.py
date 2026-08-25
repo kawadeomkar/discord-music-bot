@@ -2548,6 +2548,22 @@ class TestPopQueueAndStartSong:
         restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
         assert restored.current_song_query_source == "spotify.com"
 
+    async def test_parks_the_user_input(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The playing song's queue entry is LPOPed by this very transaction, so
+        # from here on the hash is the only copy of what the user typed — and
+        # -remove <collection link> is the advertised undo for a flagged -play.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(user_input="https://open.spotify.com/playlist/abc"), 1000.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert (
+            restored.current_song_user_input == "https://open.spotify.com/playlist/abc"
+        )
+
     async def test_parks_the_played_at(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:

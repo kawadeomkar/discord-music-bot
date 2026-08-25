@@ -24,7 +24,7 @@ from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
-    RESTORE_WAIT_SECS,
+    DEPTH_RESTORE_WAIT_SECS,
     _echo,
     _removed_label,
     HISTORY_MAX_LIMIT,
@@ -3404,7 +3404,8 @@ class TestPlayFrontInsertion:
         mp.defer_playback.assert_not_called()
         assert (
             mp.wait_for_restore.await_args is not None
-            and mp.wait_for_restore.await_args.kwargs["timeout"] == RESTORE_WAIT_SECS
+            and mp.wait_for_restore.await_args.kwargs["timeout"]
+            == DEPTH_RESTORE_WAIT_SECS
         )
 
     async def test_cold_path_waits_for_restore_before_enqueueing(

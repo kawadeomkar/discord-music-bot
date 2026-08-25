@@ -182,6 +182,11 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 # that accepts the connection then stalls would hang the command outright.
 RESTORE_WAIT_SECS = 5.0
 
+# How long a warm -play waits for its restore before reading the ask-time queue
+# depth. Short because a timeout here only costs an approximate analytics field:
+# the depth is recorded from whatever has landed and the command proceeds.
+DEPTH_RESTORE_WAIT_SECS = 1.0
+
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
@@ -1051,19 +1056,11 @@ class MusicBot(commands.Cog):
                     if front:
                         position = 0
                     else:
-                        # Wait out any in-flight restore: restore_entries() appends,
-                        # so a put() landing first leaves the deque holding this
-                        # song ahead of entries Redis lists behind it, and every
-                        # later commit-time LPOP then retires the wrong one.
-                        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                            await ctx.send(
-                                embed=notice_embed(
-                                    "Still loading this server's saved queue — try "
-                                    "again in a moment.",
-                                    discord.Color.orange(),
-                                )
-                            )
-                            return
+                        # Wait out any in-flight restore: the queue stays empty
+                        # until restore_entries() replays it, so a -play in the
+                        # crash-recovery window would read 0 behind a queue about
+                        # to reappear. Already set in the common case.
+                        await mp.wait_for_restore(timeout=DEPTH_RESTORE_WAIT_SECS)
                         position = mp.enqueue_depth()
                     analytics = Analytics(
                         queued_at=ctx.message.created_at.timestamp(),

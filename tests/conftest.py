@@ -396,7 +396,7 @@ def ytdl_instance(
     import discord as d
     from src.youtube import YTDL, YTDLVideoInfo
 
-    def _make(data: Optional[dict] = None) -> Any:
+    def _make(data: Optional[dict] = None, **carried: Any) -> Any:
         default_data = {
             "url": "https://r2.googlevideo.com/stream?expire=9999999999",
             "webpage_url": "https://www.youtube.com/watch?v=test",
@@ -425,6 +425,10 @@ def ytdl_instance(
                 # construction; the cast is the info-dict shape assertion.
                 data=cast(YTDLVideoInfo, default_data),
                 requester=mock_author,
+                # Carried QueueObject fields, so a test can drive the paths that
+                # read them back off a REAL YTDL rather than a mock that invents
+                # whatever attribute it is asked for.
+                **carried,
             )
 
     return _make
