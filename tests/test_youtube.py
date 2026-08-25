@@ -226,11 +226,10 @@ class TestYTDLPositionSecs:
 
 
 class TestYtStreamCarriesTheQueueObjectsFields:
-    """`YTDL.yt_stream` is the hop where a queue entry becomes a playing song, and
-    CLAUDE.md's queue-entry-field recipe names it as one of the three sites a new
-    field is silently dropped at. `user_input` reached it late: it is what
-    `-remove` matches on, and a -playnow resume tail is rebuilt from the YTDL, so
-    losing it here leaves the parked track un-removable by origin."""
+    """`YTDL.yt_stream` is where a queue entry becomes a playing song and one of the
+    three sites a new field is silently dropped at. `user_input` is what `-remove`
+    matches on, and a resume tail is rebuilt from the YTDL, so losing it here
+    leaves the parked track un-removable by origin."""
 
     @staticmethod
     async def _played(qobj: QueueObject) -> YTDL:
@@ -313,14 +312,11 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         ) == ("typed", "search", True, True, True, False, 12.5)
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
-        """`_neutralize_prefetch` reads `persisted` back off the playing song to
-        rebuild a QueueObject, so a YTDL without it raises AttributeError on every
-        `-playnow` over a COMPLETED prefetch — failing the command and stranding
-        the claim, which the next commit then settles onto the wrong song.
-
-        False is the value that matters: it marks the crash-recovered head, whose
-        entry is NOT on the Redis list, and a rebuild defaulting to True writes
-        that head into the mirror, where its dequeue never LPOPs."""
+        """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a
+        QueueObject, so a YTDL without it raises on every `-play --now` over a
+        COMPLETED prefetch and strands the claim. False is the value that matters:
+        the crash-recovered head is NOT on the Redis list, and a rebuild defaulting
+        to True writes it into the mirror, where its dequeue never LPOPs."""
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
@@ -1995,7 +1991,7 @@ class TestPrefetchStream:
         assert cached is None
 
 
-class TestYTStreamPlaynowFlags:
+class TestYTStreamInterjectionFlags:
     async def test_flags_carried_onto_ytdl(self, mock_ctx: MagicMock) -> None:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)

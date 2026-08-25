@@ -765,7 +765,7 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
         """LPUSH entries so entries[0] ends up at the queue head, and refresh TTL on
-        all guild keys — the -playnow front insert. LPUSH sends each successive
+        all guild keys — the interjection front insert. LPUSH sends each successive
         argument to the head, so the batch is reversed first to preserve order.
 
         A swallowed failure degrades WORSE than a tail-push failure: the in-memory
