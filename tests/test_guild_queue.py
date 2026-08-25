@@ -1549,7 +1549,7 @@ class TestRemoveMatcher:
 
     def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
-        only thing it can be matched by, and the only place the album link is."""
+        only thing it can be matched by, and the only place that link is."""
         album = "https://open.spotify.com/album/xyz"
         item = YTSource(ytsearch="ytsearch:Track One", user_input=album)
         assert remove_matcher(album)(item) is RemoveMode.ORIGIN
@@ -1692,10 +1692,10 @@ class TestResumeTailDepth:
         )
         assert gq_no_redis.resume_tail_depth() == 3
 
-    async def test_stops_at_the_first_ordinary_song(
+    async def test_ordinary_songs_are_not_counted(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """Songs past the tails were queued normally and were never interrupted.
+        """Songs queued normally were never interrupted, so they park no play.
         Counting them would report depth as "queue length" on any guild that had
         ever interjected."""
         await gq_no_redis.put(
@@ -1703,10 +1703,26 @@ class TestResumeTailDepth:
                 _qobj(9, mock_author),
                 self._tail(1, mock_author),
                 _qobj(5, mock_author),
-                self._tail(2, mock_author),  # not contiguous — not part of the stack
+                _qobj(6, mock_author),
             ]
         )
         assert gq_no_redis.resume_tail_depth() == 1
+
+    async def test_a_tail_separated_from_the_others_still_counts(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Adjacency is not what makes a play parked: `--now` takes a whole playlist,
+        so the layout is [head, *playlist, tail] and a consecutive-run count reads 0
+        for every playlist interjection and for a stack of them."""
+        await gq_no_redis.put(
+            [
+                _qobj(9, mock_author),
+                self._tail(1, mock_author),
+                _qobj(5, mock_author),
+                self._tail(2, mock_author),
+            ]
+        )
+        assert gq_no_redis.resume_tail_depth() == 2
 
     async def test_a_head_that_is_itself_a_tail_is_not_counted(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
@@ -1716,9 +1732,12 @@ class TestResumeTailDepth:
         await gq_no_redis.put([self._tail(1, mock_author), self._tail(2, mock_author)])
         assert gq_no_redis.resume_tail_depth() == 1
 
-    async def test_a_search_entry_breaks_the_run(
+    async def test_a_search_entry_is_not_a_parked_play(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
+        """An unresolved search has never played, so it parks nothing — but it no
+        longer hides the tails behind it either, which is exactly the shape a
+        Spotify playlist `--now` produces: [head, *lazy searches, tail]."""
         await gq_no_redis.put(
             [
                 _qobj(9, mock_author),
@@ -1727,7 +1746,7 @@ class TestResumeTailDepth:
                 self._tail(2, mock_author),
             ]
         )
-        assert gq_no_redis.resume_tail_depth() == 1
+        assert gq_no_redis.resume_tail_depth() == 2
 
 
 # ── crash recovery ────────────────────────────────────────────────────────────
@@ -1827,8 +1846,8 @@ class TestRestoreEntries:
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         """The song branch already carried user_input; the search branch is the new
-        leg, and it is the one that matters — a Spotify-album track holds the album
-        link nowhere else, so losing it here breaks -remove after a restart."""
+        leg, and it is the one that matters — a lazy Spotify-playlist track holds
+        that link nowhere else, so losing it here breaks -remove after a restart."""
         mock_guild.get_member.return_value = mock_author
         album = "https://open.spotify.com/album/abc123"
         assert (
@@ -2482,8 +2501,10 @@ class TestMirrorWriteChoice:
     async def test_a_small_removal_lrems(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        """Small against the SURVIVORS, not in absolute terms — the gate is a
-        ratio, because a rebuild's cost scales with what it rewrites."""
+        """Small in absolute terms AND against the survivors. The crossover is a
+        COUNT — LREM is O(position), so N of them cost O(N x depth) against a
+        rebuild's O(depth) and the depth cancels — while the share clause keeps the
+        shortcut off queues too shallow for it to win anything."""
         await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
         calls = self._spy(store)
 

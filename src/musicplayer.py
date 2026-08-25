@@ -29,6 +29,7 @@ from src.guild_queue import (
     RemoveOutcome,
     ShuffleOutcome,
     is_persisted,
+    item_label,
     remove_matcher,
 )
 from src.guild_state import (
@@ -1230,7 +1231,7 @@ class MusicPlayer:
         """Retire a dequeue that will never play, and record it if a listener
         already heard part of it.
 
-        For an ordinary song the flush is a no-op — nobody heard it. For a -playnow
+        For an ordinary song the flush is a no-op — nobody heard it. For a
         resume TAIL it is the difference between one record and none: the
         interrupted fragment declined to record itself (_skip_history_for), so the
         tail is the only writer left for a play that may have run for minutes. A
@@ -1247,14 +1248,7 @@ class MusicPlayer:
         # rather than a "queue cleared" reply that silently dropped plays.
         await self._flush_played(cleared_items)
         await self._dispose_orphaned_cards(cleared_items)
-        return [
-            (
-                item.title
-                if isinstance(item, QueueObject)
-                else (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-            )
-            for item in cleared_items
-        ]
+        return [item_label(item) for item in cleared_items]
 
     async def queue_shuffle(self) -> str:
         # Neutralize rather than cancel, and before shuffle()'s too-few guard:
@@ -1436,12 +1430,12 @@ class MusicPlayer:
         *,
         index: int,
         title: str,
+        note: str = "",
         warning: Optional[str] = None,
     ) -> discord.Embed:
-        """One queue entry as a card. Shared so the block's "Up next" and the -play
-        confirmation cannot drift: when they describe the same entry the bodies are
-        equal, which is what lets _enqueue_single drop one of them."""
-        description = self._queue_entry_description(item, index)
+        """One queue entry as a card, shared by the block's "Up next" and the -play
+        confirmation so the two cannot drift. `note` follows the ETA line."""
+        description = self._queue_entry_description(item, index) + note
         if warning:
             description += f"\n\n{warning}"
         embed = discord.Embed(
@@ -1452,7 +1446,7 @@ class MusicPlayer:
         return embed
 
     def build_queued_song_embed(
-        self, item: QueueItem, *, warning: Optional[str] = None
+        self, item: QueueItem, *, note: str = "", warning: Optional[str] = None
     ) -> discord.Embed:
         """The -play confirmation. `item` is located by identity, so the ETA is the
         one its real position earns; an entry a concurrent -clear removed renders at
@@ -1462,7 +1456,11 @@ class MusicPlayer:
             (i for i, queued in enumerate(items, 1) if queued is item), len(items) + 1
         )
         return self._build_queue_entry_embed(
-            item, index=index, title=f"Queued song — #{index}", warning=warning
+            item,
+            index=index,
+            title=f"Queued song — #{index}",
+            note=note,
+            warning=warning,
         )
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
@@ -1805,8 +1803,13 @@ class MusicPlayer:
         vc: discord.VoiceClient,
         *,
         resume_paused: bool = True,
+        follow_on: Sequence[QueueItem] = (),
     ) -> Optional[InterjectOutcome]:
         """Play `qobj` immediately; the interrupted song returns afterwards.
+
+        `follow_on` is the rest of a playlist `qobj` is the head of. It goes between
+        the head and the resume entry, so the playlist plays in order and the
+        interrupted song comes back after all of it.
 
         Capture the current song's exact position (frame-counted, frozen if paused),
         front-insert [qobj, resume-entry(ts=position)], stop the current song; the
@@ -1887,15 +1890,15 @@ class MusicPlayer:
                     # classification is not recoverable from webpage_url — a Spotify
                     # link, a search and a pasted link all archive as youtube.com.
                     query_source=current.query_source,
-                    # -remove matches on this: without it the parked tail is the
-                    # one track a playlist link cannot take back out.
+                    # Same reason -remove matches on it: without this the parked
+                    # tail is the one track a collection link cannot take back out.
                     user_input=current.user_input,
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
         # — it plays immediately by definition — while the tail keeps the
         # interrupted song's analytics, unknown ones included.
-        items: list[QueueItem] = [qobj]
+        items: list[QueueItem] = [qobj, *follow_on]
         if resume is not None:
             items.append(resume)
             # The song returns, so it is recorded once — when its tail finishes. A
@@ -1925,6 +1928,8 @@ class MusicPlayer:
         # Attribution only: did this cut in front of another interjected song.
         span.set_attribute("interject.over_interjection", current.interjected)
         span.set_attribute("interject.resume_position", position if resume else -1)
+        # 1 for a single track, so the attribute is always present and comparable.
+        span.set_attribute("interject.playlist_size", len(follow_on) + 1)
         return InterjectOutcome(
             interrupted_title=current.title or "Unknown",
             resume_position=position if resume is not None else None,
@@ -2408,7 +2413,7 @@ class MusicPlayer:
             return None
         if song is None:
             # _stream_source swallowed a failure — retire the dequeue as the raise
-            # path does, or the display/Redis heads sit one entry ahead forever.
+            # path does, or the deque and the mirror sit one entry ahead forever.
             await self._retire_failed_dequeue(source, context="prefetch failure")
             return None
         return song
