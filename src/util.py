@@ -189,6 +189,30 @@ def safe_label(text: str, limit: int) -> str:
     return discord.utils.escape_markdown(neutralized, ignore_links=False)
 
 
+# A masked link's TARGET ends at the first ")", so one inside the URL closes it
+# early and renders the rest as markdown. Whitespace and angle brackets end it
+# too. Percent-encoded, not stripped: the URL still has to resolve.
+_LINK_TARGET_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[()\s<>\\]")
+
+# A yt-dlp webpage_url is echoed from whatever the user handed the extractor, so
+# it is the one unbounded term in a card. 512 keeps a card under Discord's
+# 4096-char description limit whatever else it carries.
+LINK_TARGET_LIMIT = 512
+
+
+def safe_link_target(url: str) -> str:
+    """A URL rendered inside a masked link's TARGET.
+
+    Empty when the URL is not http(s) or is over LINK_TARGET_LIMIT — the caller
+    must then render its label unlinked, since neither can be made safe by
+    escaping: a `javascript:` target is not a web link, and a long one blows the
+    embed's budget rather than the link's syntax.
+    """
+    if not url.startswith(("http://", "https://")) or len(url) > LINK_TARGET_LIMIT:
+        return ""
+    return _LINK_TARGET_UNSAFE.sub(lambda m: f"%{ord(m.group()):02X}", url)
+
+
 def truncate(text: str, limit: int) -> str:
     """Clip to `limit` characters, ellipsizing if clipped."""
     if len(text) <= limit:

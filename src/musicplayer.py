@@ -49,6 +49,7 @@ from src.util import (
     record_span_error,
     trace_footer,
     safe_label,
+    safe_link_target,
     truncate,
     truncate_embed_title,
     get_logger,
@@ -627,15 +628,16 @@ class MusicPlayer:
 
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs: (now_pst, walk).
-        cumulative_secs starts at the current song's total duration as a proxy for
-        its remaining time — an overestimate that avoids showing "now" for
-        everything; uncertain flags an unknown duration anywhere behind."""
+        cumulative_secs starts at the current song's REMAINING time, the same term
+        the now-playing embed's "Estimated finish" renders — the two appear one line
+        apart in a single message. uncertain flags an unknown duration behind."""
         uncertain = False
         cumulative_secs = 0
         if self.current_song is not None:
             secs = getattr(self.current_song, "duration_secs", 0)
             if secs:
-                cumulative_secs = secs
+                position = getattr(self.current_song, "position_secs", 0) or 0
+                cumulative_secs = max(0, secs - int(position))
             else:
                 uncertain = True
         return datetime.datetime.now(tz=self.timezone), EtaWalk(
@@ -675,8 +677,13 @@ class MusicPlayer:
                 ts_note = f"  ·  starts at `{item.ts}s`"
             else:
                 ts_note = ""
+            # webpage_url is echoed from what the user handed the extractor, so it
+            # is neither trusted nor bounded. Unlinked when safe_link_target
+            # refuses it — the title still names the song.
+            link = safe_link_target(item.webpage_url)
+            named = f"[**{title}**]({link})" if link else f"**{title}**"
             line = (
-                f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
+                f"`{index}` {named} · `{dur}`{ts_note} · Est. playing at {est_str}\n"
                 f"{channel} · {requester}"
             )
             walk = walk.advance(_remaining_secs(item))
@@ -690,13 +697,16 @@ class MusicPlayer:
 
         return line, walk
 
-    def _eta_walk_to(self, index: int) -> tuple[datetime.datetime, EtaWalk]:
-        """Seed the ETA walk and advance it over every item ahead of 1-based
-        `index`, so a card renders that position's own estimate. An index past the
-        queue walks all of it, which is the ETA a song appended now would earn.
+    def _eta_walk_to(
+        self, ahead: Sequence[QueueItem]
+    ) -> tuple[datetime.datetime, EtaWalk]:
+        """Seed the ETA walk and advance it over `ahead` — the entries a card's own
+        entry waits behind — so the card renders that position's own estimate. The
+        head waits behind nothing, so it passes an empty sequence and no queue
+        snapshot is taken for it.
         """
         now_pst, walk = self._queue_eta_seed()
-        for earlier in self.queue.display_items()[: index - 1]:
+        for earlier in ahead:
             walk = walk.advance(
                 _remaining_secs(earlier) if isinstance(earlier, QueueObject) else None
             )
@@ -1380,11 +1390,13 @@ class MusicPlayer:
             thumbnail=data.thumbnail,
         )
 
-    def _queue_entry_description(self, item: QueueItem, index: int) -> str:
+    def _queue_entry_description(
+        self, item: QueueItem, ahead: Sequence[QueueItem]
+    ) -> str:
         """The body both single-entry cards render: one labelled fact per line,
-        ending with the ETA position `index` earns. The -queue page keeps
+        ending with the ETA earned by waiting behind `ahead`. The -queue page keeps
         _format_queue_line — a row and a card are different jobs."""
-        now_pst, walk = self._eta_walk_to(index)
+        now_pst, walk = self._eta_walk_to(ahead)
         eta = _fmt_eta(
             now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
         )
@@ -1407,10 +1419,14 @@ class MusicPlayer:
             detail.append(f"⏮ Resumes at `{fmt_duration(item.ts)}`")
         elif item.ts:
             detail.append(f"Starts at `{item.ts}s`")
+        # webpage_url is echoed from what the user handed the extractor, so it is
+        # neither trusted nor bounded. Unlinked when safe_link_target refuses it —
+        # the title still names the song, which a broken card would not.
+        link = safe_link_target(item.webpage_url)
         return "\n".join(
             [
                 f"Requested by: [{_requester_mention(item.requester)}]",
-                f"[**{title}**]({item.webpage_url})",
+                f"[**{title}**]({link})" if link else f"**{title}**",
                 "  ·  ".join(detail),
                 f"Est. playing at {eta}",
             ]
@@ -1420,14 +1436,14 @@ class MusicPlayer:
         self,
         item: QueueItem,
         *,
-        index: int,
+        ahead: Sequence[QueueItem],
         title: str,
         warning: Optional[str] = None,
     ) -> discord.Embed:
         """One queue entry as a card. Shared so the block's "Up next" and the -play
         confirmation cannot drift: when they describe the same entry the bodies are
         equal, which is what lets _enqueue_single drop one of them."""
-        description = self._queue_entry_description(item, index)
+        description = self._queue_entry_description(item, ahead)
         if warning:
             description += f"\n\n{warning}"
         embed = discord.Embed(
@@ -1441,21 +1457,30 @@ class MusicPlayer:
         self, item: QueueItem, *, warning: Optional[str] = None
     ) -> discord.Embed:
         """The -play confirmation. `item` is located by identity, so the ETA is the
-        one its real position earns; an entry a concurrent -clear removed renders at
-        the tail, which is what an appended song's estimate meant before this."""
+        one its real position earns rather than one its equal elsewhere in the queue
+        would. Searched from the tail: its caller appends, so the match is the last
+        entry and a concurrent -clear is what costs a full scan."""
         items = self.queue.display_items()
         index = next(
-            (i for i, queued in enumerate(items, 1) if queued is item), len(items) + 1
+            (
+                len(items) - offset
+                for offset, queued in enumerate(reversed(items))
+                if queued is item
+            ),
+            len(items) + 1,
         )
         return self._build_queue_entry_embed(
-            item, index=index, title=f"Queued song — #{index}", warning=warning
+            item,
+            ahead=items[: index - 1],
+            title=f"Queued song — #{index}",
+            warning=warning,
         )
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
         item = self.queue.peek_next()
         if item is None:
             return None
-        return self._build_queue_entry_embed(item, index=1, title="Up next")
+        return self._build_queue_entry_embed(item, ahead=(), title="Up next")
 
     # ── Now-playing host management ───────────────────────────────────────────
     # The NP block lives in exactly one "host" message at a time — always the newest

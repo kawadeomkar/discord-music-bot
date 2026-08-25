@@ -939,35 +939,41 @@ class MusicBot(commands.Cog):
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
 
-        should_show_queued = mp.queue.qsize() > 0 or (
-            isinstance(vc, discord.VoiceClient) and vc.is_playing()
-        )
-        # The put is awaited alone because the reply's shape depends on whether
-        # this song became the queue head, which only the put decides. One RPUSH
-        # plus its TTL refresh, under the queue mutex.
+        # The put is awaited alone because every question below is about where the
+        # song landed, which only the put answers. One RPUSH plus its TTL refresh,
+        # under the queue mutex.
         await mp.queue_put(qobj)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
+        # display_size(), not qsize(): a song the loop has claimed but not yet
+        # committed is still ahead of this one, and qsize() counts only what is
+        # pending. Read after the put, so > 1 means something else is genuinely
+        # queued — otherwise this song starts now and the NP card speaks for it.
+        waits_behind_something = mp.queue.display_size() > 1 or (
+            isinstance(vc, discord.VoiceClient) and vc.is_playing()
+        )
+
         async def reply() -> None:
-            if should_show_queued:
-                # The block's "Up next" card renders the queue head in the same
-                # layout the confirmation uses, so when this song IS the head the
-                # two are one card printed twice in one message. Re-host the live
-                # block instead and let its card be the confirmation — dedicated,
-                # because a response host with no own embeds strip-edits to a
-                # blank message on retire.
-                if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
-                    if warning is not None:
-                        await ctx.send(
-                            embed=notice_embed(warning, discord.Color.orange())
-                        )
-                    return
-                await ctx.send(embed=mp.build_queued_song_embed(qobj, warning=warning))
+            if not waits_behind_something:
+                if warning is not None:
+                    await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
                 return
-            if warning is not None:
-                # Nothing else is being sent on this path — the song starts now and
-                # the NP card speaks for it — so the warning needs its own message.
-                await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+            # The block's "Up next" card renders the queue head in the same layout
+            # the confirmation uses, so when this song IS the head the two are one
+            # card printed twice in one message.
+            if mp.queue.peek_next() is qobj and ctx.channel.id == mp._channel.id:
+                if warning is not None:
+                    # MusicContext.send attaches the block to whatever it sends,
+                    # so the warning's own message carries the card and IS the
+                    # confirmation.
+                    await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                    return
+                # Nothing else to say, so re-host the live block and let its card
+                # be the reply — dedicated, because a response host with no own
+                # embeds strip-edits to a blank message on retire.
+                if await mp.repin_now_playing():
+                    return
+            await ctx.send(embed=mp.build_queued_song_embed(qobj, warning=warning))
 
         # Gathered, not sequenced: gather does not cancel a sibling that is still
         # running, so a channel denying Add Reactions still gets its card — the

@@ -2082,22 +2082,38 @@ class TestReparkCrashedHead:
 
 
 class TestEtaWalkTo:
-    """_eta_walk_to replaced estimated_playing_at(): both cards need the walk STATE
-    at a position, not a formatted string, and an index past the queue walks all of
-    it — which is the estimate a song appended now earns."""
+    """Both cards need the walk STATE at a position, not a formatted string, so the
+    entries a card waits behind are what it is given. Walking the whole queue is
+    the estimate a song appended now earns."""
 
     def _eta_at(self, mp: MusicPlayer, index: int) -> str:
-        now_pst, walk = mp._eta_walk_to(index)
+        """The ETA a card at 1-based `index` renders: it waits behind every entry
+        before it."""
+        now_pst, walk = mp._eta_walk_to(mp.queue.display_items()[: index - 1])
         return _fmt_eta(
             now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
         )
+
+    def test_seed_is_the_current_song_remaining_not_its_length(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The now-playing embed one line above renders "Estimated finish" from the
+        same term. Seeding with the full length puts the two minutes apart in a
+        single message, growing to the whole song by its end."""
+        song = MagicMock()
+        song.duration_secs = 600
+        song.position_secs = 450.0
+        music_player.current_song = song
+
+        _, walk = music_player._queue_eta_seed()
+        assert walk.cumulative_secs == 150
 
     def test_index_one_is_the_bare_seed(self, music_player: MusicPlayer) -> None:
         seed_queue(
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", MagicMock(), duration=600),
         )
-        assert music_player._eta_walk_to(1)[1] == music_player._queue_eta_seed()[1]
+        assert music_player._eta_walk_to(())[1] == music_player._queue_eta_seed()[1]
 
     def test_accumulates_items_ahead(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -2108,7 +2124,7 @@ class TestEtaWalkTo:
             QueueObject("https://yt.com/v=2", "B", mock_author, duration=90),
         )
         _, seed = music_player._queue_eta_seed()
-        _, walk = music_player._eta_walk_to(3)
+        _, walk = music_player._eta_walk_to(music_player.queue.display_items())
         assert walk.cumulative_secs == seed.cumulative_secs + 150
 
     def test_matches_clock_format(self, music_player: MusicPlayer) -> None:
@@ -2151,9 +2167,8 @@ class TestEtaWalkTo:
     def test_past_the_queue_is_the_append_eta(
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        """An index past the last entry walks the whole queue, so a song appended
-        now starts where the last queued line's ETA ends up — the agreement the
-        deleted estimated_playing_at() asserted by re-deriving it."""
+        """Walking the whole queue puts a song appended now exactly where the last
+        queued line's ETA ends up, which is what the -queue page promises."""
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
@@ -6269,6 +6284,50 @@ class TestQueueEntryCard:
         )
         assert "[CLICK TO VERIFY](http://evil)" not in line
         assert line.count("](") == 1
+
+    def test_a_paren_in_the_url_cannot_close_the_link(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """webpage_url is echoed from whatever the user handed the extractor, and
+        it lands in the link's TARGET, where a ")" ends it and hands the rest to
+        markdown."""
+        item = QueueObject(
+            "https://ok.tld/a)[FREE NITRO](http://evil)", "Song 1", mock_author
+        )
+        seed_queue(music_player.queue, item)
+
+        body = described(music_player.build_queued_song_embed(item))
+        assert "[FREE NITRO](http://evil)" not in body
+        assert body.count("](") == 1
+
+    def test_a_non_http_url_renders_unlinked(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """No escaping makes a javascript: target a web link, so the card names the
+        song without one rather than rendering it."""
+        item = QueueObject("javascript:alert(1)", "Song 1", mock_author)
+        seed_queue(music_player.queue, item)
+
+        body = described(music_player.build_queued_song_embed(item))
+        assert "javascript:" not in body
+        assert "](" not in body
+        assert "Song 1" in body
+
+    def test_an_overlong_url_cannot_blow_the_description_budget(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The URL is the one unbounded term in a card; over the limit Discord 400s
+        the whole send, which reports failure for a song that IS queued."""
+        item = QueueObject(
+            "https://yt.com/v=" + "a" * 5000,
+            "T" * 500,
+            mock_author,
+            uploader="U" * 500,
+        )
+        seed_queue(music_player.queue, item)
+
+        body = described(music_player.build_queued_song_embed(item))
+        assert len(body) < 4096
 
     def test_unresolved_ytsource_renders_resolving(
         self, music_player: MusicPlayer

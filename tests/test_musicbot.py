@@ -57,6 +57,7 @@ from tests.helpers import (
     make_mock_task,
     mocked,
     queue_object,
+    seed_queue,
 )
 
 # Ask-time analytics for direct queue_source/_enqueue_playlist calls — the real
@@ -3622,16 +3623,20 @@ class TestPlayFrontInsertion:
 
 class TestEnqueueSingle:
     @staticmethod
-    def _playing_mp(head: Any = None) -> MagicMock:
+    def _playing_mp(head: Any = None, *, home: Any = None) -> MagicMock:
         """A player with a song live and `head` at the queue front. The default
-        head is a fresh Mock, i.e. NOT the song being queued."""
+        head is a fresh Mock, i.e. NOT the song being queued. `home` is the
+        player's channel — the re-host only ever replies there, so a test wanting
+        that path must hand it the invoking channel."""
         mp = MagicMock()
-        mp.queue.qsize.return_value = 0
+        mp.queue.display_size.return_value = 1
         mp.queue.peek_next = MagicMock(
             return_value=head if head is not None else MagicMock()
         )
         mp.queue_put = AsyncMock()
         mp.repin_now_playing = AsyncMock(return_value=True)
+        if home is not None:
+            mp._channel = home
         return mp
 
     async def test_a_denied_reaction_still_leaves_the_card(
@@ -3667,7 +3672,7 @@ class TestEnqueueSingle:
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
-        mp = self._playing_mp(head=qobj)
+        mp = self._playing_mp(head=qobj, home=mock_ctx.channel)
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
 
@@ -3700,7 +3705,7 @@ class TestEnqueueSingle:
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
-        mp = self._playing_mp(head=qobj)
+        mp = self._playing_mp(head=qobj, home=mock_ctx.channel)
         mp.repin_now_playing = AsyncMock(return_value=False)
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
@@ -3711,18 +3716,22 @@ class TestEnqueueSingle:
             is mp.build_queued_song_embed.return_value
         )
 
-    async def test_warning_gets_its_own_message_on_the_repin_path(
+    async def test_a_warning_replaces_the_repin_rather_than_retiring_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """The re-hosted block has no description of its own to carry the warning."""
+        """A warning needs a message, and MusicContext.send attaches the block to
+        whatever it sends — so that one message already carries the card. Re-hosting
+        first would post a card the warning's own send immediately deletes."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
-        mp = self._playing_mp(head=qobj)
+        mp = self._playing_mp(head=qobj, home=mock_ctx.channel)
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp, warning="watch out")
 
-        mp.repin_now_playing.assert_awaited_once()
+        mp.repin_now_playing.assert_not_awaited()
+        mp.build_queued_song_embed.assert_not_called()
+        mock_ctx.send.assert_awaited_once()
         assert "watch out" in mock_ctx.send.await_args.kwargs["embed"].description
 
     async def test_warning_rides_the_confirmation_when_one_is_sent(
@@ -3746,7 +3755,7 @@ class TestEnqueueSingle:
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
-        mp = self._playing_mp(head=None)
+        mp = self._playing_mp(head=None, home=mock_ctx.channel)
         mp.queue.peek_next = MagicMock(return_value=None)
 
         async def _put(_: Any) -> None:
@@ -3758,6 +3767,89 @@ class TestEnqueueSingle:
 
         mp.repin_now_playing.assert_awaited_once()
 
+    async def test_a_claimed_song_still_counts_as_ahead(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """While the loop holds a claim mid-resolve, nothing is PENDING and nothing
+        is playing yet — but the claimed song plays first, so this one waits and
+        has earned a card. qsize() cannot see that; display_size() can."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = False
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        mp = self._playing_mp()
+        mp.queue.qsize.return_value = 0  # the claim is not pending
+        mp.queue.display_size.return_value = 2  # ...but it is still ahead
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        mp.build_queued_song_embed.assert_called_once_with(qobj, warning=None)
+
+    async def test_an_equal_song_at_the_head_is_not_this_one(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """QueueObject compares field-wise, so the head test has to be identity:
+        queueing a song already in the queue leaves THIS copy at the tail, and
+        answering with the block would describe the other one."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        args = ("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        first, second = QueueObject(*args), QueueObject(*args)
+        assert first == second and first is not second
+        mp = self._playing_mp(head=first, home=mock_ctx.channel)
+
+        await music_bot._enqueue_single(mock_ctx, second, mp)
+
+        mp.repin_now_playing.assert_not_awaited()
+        mp.build_queued_song_embed.assert_called_once_with(second, warning=None)
+
+    async def test_outside_the_home_channel_answers_with_a_card(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The block never leaves the player's channel, so re-hosting it would
+        answer somewhere the user is not looking — and any command from any channel
+        can have re-pointed _channel while this -play was still resolving."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        mp = self._playing_mp(head=qobj, home=MagicMock())  # elsewhere
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        mp.repin_now_playing.assert_not_awaited()
+        mp.build_queued_song_embed.assert_called_once_with(qobj, warning=None)
+
+    async def test_the_card_a_real_player_builds_describes_the_song(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        music_player: MusicPlayer,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every other case here asserts against a MagicMock player, which can only
+        show that the cog CALLED the builder. This one runs the real renderer, so
+        the reply is checked as the thing a user actually reads."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        ahead = QueueObject("https://yt.com/v=0", "Ahead", mock_ctx.author, duration=60)
+        seed_queue(music_player.queue, ahead)
+        # queue_put spawns a prefetch per QueueObject; unstubbed that is a real
+        # yt-dlp request for yt.com in the background.
+        monkeypatch.setattr(YTDL, "prefetch_stream", AsyncMock())
+        qobj = QueueObject(
+            "https://yt.com/v=1",
+            "Real Song",
+            mock_ctx.author,
+            duration=90,
+            uploader="Real Channel",
+        )
+
+        await music_bot._enqueue_single(mock_ctx, qobj, music_player)
+
+        body = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "Real Song" in body
+        assert "Real Channel" in body
+        assert "Est. playing at" in body
+
     async def test_no_queued_embed_when_nothing_playing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -3765,7 +3857,7 @@ class TestEnqueueSingle:
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         mp = MagicMock()
-        mp.queue.qsize.return_value = 0
+        mp.queue.display_size.return_value = 1  # only this song
         mp.queue_put = AsyncMock()
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
@@ -5099,7 +5191,7 @@ class TestTimestampWarningReachesTheUser:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = _mock_mp()
-        mp.queue.qsize = MagicMock(return_value=3)  # something already queued
+        mp.queue.display_size = MagicMock(return_value=4)  # 3 ahead of it
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         await music_bot._enqueue_single(
@@ -5117,7 +5209,7 @@ class TestTimestampWarningReachesTheUser:
         song" embed at all. Riding that embed alone would drop the warning in
         the most ordinary case there is."""
         mp = _mock_mp()
-        mp.queue.qsize = MagicMock(return_value=0)
+        mp.queue.display_size = MagicMock(return_value=1)
         mock_ctx.voice_client = _connected_vc()
         mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)

@@ -671,7 +671,8 @@ While a song is live, the **Now Playing embed block** (`[now_playing, next_up?]`
 Mechanics:
 
 - **`MusicContext.send()`** (installed bot-wide via `get_context`): every command response in the player's channel, while a song is live, is sent as `NP block + response's own embeds` in **one message** (atomic — the bar is never even momentarily buried). After the send, `_adopt_np_host_if_current(message, own, song)` makes that message the new host and retires the old one. The adopt is gated on the song still being current — the send's `await` can cross a song boundary, and adopting a stale block would delete the next song's fresh host (the gate sheds the stale block from the just-sent message instead).
-- **A `-play` whose song lands at the queue head answers with the block alone.** The block's `next_up` card and the `-play` confirmation share one renderer (`_queue_entry_description`), so for that entry they are the same card — the command re-hosts the live block via `repin_now_playing()` instead of sending a second copy. Dedicated, not a response host: a response host with no own embeds strip-edits to a blank message when it retires.
+- **A `-play` whose song lands at the queue head answers with the block.** The block's `next_up` card and the `-play` confirmation share one renderer (`_queue_entry_description`), so for that entry they describe the same song and a second copy would print it twice in one message. With nothing else to say, the command re-hosts the live block via `repin_now_playing()` — dedicated, not a response host, because a response host with no own embeds strip-edits to a blank message when it retires. With a warning to deliver it sends that instead and lets `MusicContext.send` attach the block, since one message already carries the card; re-hosting first would post a card the warning's own send immediately deletes. Both are declined outside the player's home channel, where the block does not go, and the confirmation is sent there instead.
+- **That reply is deleted when the next host is adopted**, at the latest when the song ends — a dedicated host is retired by deletion. The channel keeps no record that the song was queued, which is the cost of the reply being the live card rather than a copy of it.
 - **Retiring the old host**: a *dedicated* NP message (sent by `_send_now_playing` with nothing else) is deleted; a *command-response* host is strip-edited back to its own embeds. All mutations of an old host (progress-tick edits, retires) go through `_np_edit_lock` so a strip/delete is always the final write.
 - **Pointer-first, synchronous adoption** (`_adopt_np_host`): the host pointer swap happens atomically on the event loop before any awaits, so no progress tick can edit a message that is about to be retired.
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
@@ -1548,6 +1549,13 @@ request in Loki/Tempo.
 | `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs |
 | `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
 | `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so neither seam above reaches them |
+
+One reply reaches none of them: a `-play` answered by re-hosting the block sends no
+embeds of its own, and the block carries no trace id by rule (below). So that reply
+shows the block's metrics and no trace/elapsed line. Decorating it would put a trace
+id on a message the tick re-renders, which is the alternation the rule exists to
+stop — and forking the reply's shape on debug mode would make an observation-only
+setting change what the bot does.
 
 Rules each seam encodes:
 
