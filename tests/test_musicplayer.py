@@ -11102,6 +11102,67 @@ class TestInterjectPostNeutralizeRecheck:
         mock_vc.stop.assert_not_called()
 
 
+class TestPrefetchSettling:
+    """The prefetch slot is a claim on the queue head, not just a result box."""
+
+    async def test_the_slot_outlives_the_cancel_it_guards(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """Nulled before the await, loop() — waking on a song that ended naturally —
+        reads an empty slot and takes a SECOND claim while this one is open. Two
+        live claims settle by position, so each takes the other's song: one retired
+        unplayed, another played twice, deque and mirror in step throughout."""
+        observed: list[asyncio.Task[YTDL | None] | None] = []
+
+        async def _pinned() -> YTDL | None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Stands in for _prefetch_next_song's requeue_front handler: what
+                # the slot said while this claim was still settling.
+                observed.append(music_player._prefetch_task)
+                raise
+            return None
+
+        task = asyncio.create_task(_pinned())
+        music_player._prefetch_task = task
+        await asyncio.sleep(0)
+
+        await music_player._neutralize_prefetch()
+
+        assert observed == [task]
+        assert music_player._prefetch_task is None
+
+    async def test_a_slot_the_loop_took_is_left_alone(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """loop() read-and-nulled it and awaited the same task, so the claim is
+        settled and any result is its consumer's — including a prefetch respawned
+        into the slot behind it."""
+
+        async def _idle() -> YTDL | None:
+            await asyncio.Event().wait()
+            return None
+
+        task = asyncio.create_task(_idle())
+        music_player._prefetch_task = task
+        await asyncio.sleep(0)
+        successor = asyncio.create_task(_idle())
+
+        async def _steal() -> None:
+            await asyncio.sleep(0)
+            music_player._prefetch_task = successor
+
+        stealer = asyncio.create_task(_steal())
+        await music_player._neutralize_prefetch()
+        await stealer
+
+        assert music_player._prefetch_task is successor
+        successor.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await successor
+
+
 class TestInterjectStoppedSong:
     """Between note_deliberate_stop() + vc.stop() and the loop's next vc.play(), the
     stopped song is still current_song. Two interjections landing in that window
@@ -11129,6 +11190,33 @@ class TestInterjectStoppedSong:
         assert outcome is None
         assert music_player.queue.display_items() == parked  # no second tail
         assert mock_vc.stop.call_count == 1
+
+    async def test_a_cancelled_put_disarms_the_history_marker(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The marker is armed before the put, so the loop's iteration end cannot
+        record the play first. Cancelled at the put — the caller's place bound —
+        there is no tail to record it later either, and a marker left set eats the
+        interrupted song's history entry for a resume that never comes."""
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+
+        # The class, not the instance: GuildQueue has __slots__.
+        with patch.object(
+            type(music_player.queue),
+            "put_front",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player.interject(interject_obj, mock_vc)
+
+        assert music_player._skip_history_for is None
+        assert music_player._pending_resume_tail is None
+        mock_vc.stop.assert_not_called()  # nothing was inserted to stop for
 
     async def test_a_now_during_a_skip_front_inserts(
         self,

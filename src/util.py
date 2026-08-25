@@ -54,10 +54,19 @@ def trace_footer(span: Span) -> Optional[str]:
 
 
 async def cancel_task(task: Optional[asyncio.Task]) -> None:
+    """Cancel `task` and wait for it, swallowing ITS CancelledError — not the
+    caller's. A cancellation aimed at this coroutine (a place timeout, a teardown)
+    arrives at the same await; swallowed, asyncio.timeout has nothing to convert
+    and the caller runs past its bound. cancelling() counts cancel() calls against
+    the CURRENT task, which only an outside canceller made."""
     if task is not None and not task.done():
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
 
 def spawn_background(
@@ -81,17 +90,31 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
         pass  # cosmetic — never let typing failures surface
 
 
+# Refcounted per channel: concurrent -play requests enter this once per link, and
+# typing is a CHANNEL state — N keepalives would POST the same route N times.
+_TYPING_HOLDS: dict[int, int] = {}
+_TYPING_TASKS: dict[int, asyncio.Task[None]] = {}
+
+
 @contextlib.asynccontextmanager
 async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
-    """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
-    the command body starts immediately, and the keepalive is cancelled when the body
-    finishes. The whole CM lives inside the task — never enter/exit Typing manually
-    across tasks."""
-    task = asyncio.create_task(_typing_keepalive(ctx))
+    """Non-blocking ctx.typing(): the first POST /typing runs in a background task
+    so the command body starts immediately; the keepalive is cancelled when the
+    last holder finishes, so it does not blink off when the first of several
+    concurrent commands returns. The whole CM lives inside the task."""
+    key = ctx.channel.id
+    _TYPING_HOLDS[key] = _TYPING_HOLDS.get(key, 0) + 1
+    if key not in _TYPING_TASKS:
+        _TYPING_TASKS[key] = asyncio.create_task(_typing_keepalive(ctx))
     try:
         yield
     finally:
-        task.cancel()
+        _TYPING_HOLDS[key] -= 1
+        if _TYPING_HOLDS[key] <= 0:
+            del _TYPING_HOLDS[key]
+            task = _TYPING_TASKS.pop(key, None)
+            if task is not None:
+                task.cancel()
 
 
 def record_span_error(span: Span, e: Exception) -> None:
@@ -113,6 +136,26 @@ def notice_embed(
     return discord.Embed(title=title, description=message, color=color)
 
 
+def build_embed(
+    title: str,
+    description: str,
+    color: Optional[discord.Color] = None,
+    footer: Optional[str] = None,
+    thumbnail: Optional[str] = None,
+    fields: Optional[list[tuple[str, str, bool]]] = None,
+) -> discord.Embed:
+    """The embed send_embed sends, for a caller that builds its reply in one place
+    and sends it from another."""
+    embed = discord.Embed(title=title, description=description, color=color)
+    if footer:
+        embed.set_footer(text=footer)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    for name, value, inline in fields or []:
+        embed.add_field(name=name, value=value, inline=inline)
+    return embed
+
+
 async def send_embed(
     destination: discord.abc.Messageable,
     title: str,
@@ -122,14 +165,9 @@ async def send_embed(
     thumbnail: Optional[str] = None,
     fields: Optional[list[tuple[str, str, bool]]] = None,
 ) -> discord.Message:
-    embed = discord.Embed(title=title, description=description, color=color)
-    if footer:
-        embed.set_footer(text=footer)
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-    for name, value, inline in fields or []:
-        embed.add_field(name=name, value=value, inline=inline)
-    return await destination.send(embed=embed)
+    return await destination.send(
+        embed=build_embed(title, description, color, footer, thumbnail, fields)
+    )
 
 
 def first_sendable_channel(

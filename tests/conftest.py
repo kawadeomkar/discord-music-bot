@@ -21,6 +21,7 @@ import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.musicbot import MusicBot
+from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
@@ -298,6 +299,9 @@ def mock_ctx(
     # `extras["observation_only"]` to decide whether to skip get_mp(), and an
     # auto-mock there silently exempts the whole suite.
     ctx.command.extras = {}
+    # A real name, not a MagicMock: check_voice_permissions keys its same-channel
+    # exemption on it, and -play's insert re-runs that check against this author.
+    ctx.command.name = "play"
     return ctx
 
 
@@ -446,7 +450,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
-    cog._play_inflight = set()
+    cog._plays = PlayRegistry()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -495,7 +499,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
-    cog._play_inflight = set()
+    cog._plays = PlayRegistry()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
