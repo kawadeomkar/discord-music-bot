@@ -942,32 +942,28 @@ class MusicBot(commands.Cog):
         should_show_queued = mp.queue.qsize() > 0 or (
             isinstance(vc, discord.VoiceClient) and vc.is_playing()
         )
-        coros: list[Coroutine[Any, Any, Any]] = [
-            mp.queue_put(qobj),
-            ctx.message.add_reaction("👍"),
-        ]
+        # Awaited ahead of the reply rather than gathered with it: the reply's
+        # shape depends on whether this song became the queue head, which the put
+        # decides. One RPUSH under the queue mutex (p50 ~2.4ms).
+        await asyncio.gather(mp.queue_put(qobj), ctx.message.add_reaction("👍"))
+        log.info(f"play qsize: {mp.queue.qsize()}")
+
         if should_show_queued:
-            warning_line = f"\n\n{warning}" if warning else ""
-            coros.append(
-                send_embed(
-                    ctx,
-                    "Queued song",
-                    (
-                        f"Requested by: [{ctx.author.mention}]\n"
-                        f"{qobj.title} - ({qobj.webpage_url})\n"
-                        f"Est. playing at {mp.estimated_playing_at()}"
-                        f"{warning_line}"
-                    ),
-                    discord.Color.blue(),
-                    thumbnail=qobj.thumbnail,
-                )
-            )
-        elif warning is not None:
+            # The block's "Up next" card renders the queue head in the same layout
+            # the confirmation uses, so when this song IS the head the two are one
+            # card printed twice in one message. Re-host the live block instead and
+            # let its card be the confirmation — dedicated, because a response host
+            # with no own embeds strip-edits to a blank message on retire.
+            if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
+                if warning is not None:
+                    await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                return
+            await ctx.send(embed=mp.build_queued_song_embed(qobj, warning=warning))
+            return
+        if warning is not None:
             # Nothing else is being sent on this path — the song starts now and
             # the NP card speaks for it — so the warning needs its own message.
-            coros.append(ctx.send(embed=notice_embed(warning, discord.Color.orange())))
-        await asyncio.gather(*coros)
-        log.info(f"play qsize: {mp.queue.qsize()}")
+            await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
 
     @commands.command(
         name="play",
