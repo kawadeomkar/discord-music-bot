@@ -71,7 +71,7 @@ details, aliases, and examples.
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
 | `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
 | `-leaderboard [--days N]` | `lb`, `top` | Top 10 listeners and top 10 songs by listening time, each song labelled with how it was asked for (Spotify, search, a pasted host) — needs the [play-history archive](#operating-the-play-history-archive) |
-| `-shuffle` | — | Randomly reorder the queue (needs 3+ queued songs) |
+| `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
 | `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
@@ -463,7 +463,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
 | `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg prepared-statement cache size per connection. **Set to `0` behind PgBouncer in transaction-pooling mode** — prepared statements are per-connection state, and transaction pooling hands each transaction a different backend |
 | `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox — meaningful only while the archive is enabled (disabled, the outbox is never written). `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. A drop here is unrecoverable: the Redis history list is capped at 50 entries per guild, so anything older that the cap discards existed only in the outbox. See [Operating the play-history archive](#operating-the-play-history-archive) |
-| `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
+| `ENVIRONMENT` | | `development`; inferred from the git branch (`main` → `production`) when unset and a repo is present | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |

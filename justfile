@@ -233,7 +233,12 @@ lint: (_tools 'ruff')
 types: (_tools 'pyright')
     {{ PYRIGHT }}
 
-# Run the test suite with coverage (~13s); extra pytest flags may be appended
+# Run the test suite (~13s); coverage gates the no-args run, subset runs skip it
+#
+# fail_under is a PROJECT floor, so it answers a whole-suite run or nothing: one file
+# measures ~26% of src/ and fails a green run. No args is the whole suite; test-report
+# sets COVERAGE_GATE because its args are reporting flags, not a selection. The tiers
+# reach the same conclusion by passing --no-cov outright.
 #
 # Shebang + "$@" rather than a plain line + {{ ARGS }}, because {{ ARGS }} flattens to
 # one space-joined string: `just test -k "spotify or youtube"` reached pytest as
@@ -241,12 +246,16 @@ types: (_tools 'pyright')
 # body costs on macOS is noise against a 13s suite. See `set positional-arguments`.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
-[doc('Run the test suite with coverage (~13s); extra pytest flags may be appended')]
+[doc('Run the test suite (~13s); coverage gates the no-args run, subset runs skip it')]
 [group('check')]
 test *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
-    {{ PYTEST }} --tb=short -q "$@"
+    if [ $# -eq 0 ] || [ "${COVERAGE_GATE:-0}" = "1" ]; then
+        {{ PYTEST }} --tb=short -q "$@"
+    else
+        {{ PYTEST }} --tb=short -q --no-cov "$@"
+    fi
 
 # The real-Postgres tier, excluded from `test` by its `pg` marker.
 #
@@ -416,8 +425,13 @@ check: fmt-justfile pins fmt-check lint types test
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
 # a second definition of the gate — only reporting flags differ, and they never affect
-# pass/fail. `set -o pipefail` lives here rather than in the workflow so it cannot be
-# forgotten; without it, `tee` would mask a failing suite.
+# pass/fail. COVERAGE_GATE says so: without it `test` reads these reporting flags as a
+# selection and drops the gate on the one job that exists to enforce it. That miss is
+# loud rather than silent — --cov-report against --no-cov raises CovDisabledWarning and
+# filterwarnings=error fails on it — but do not rely on that alone.
+#
+# `set -o pipefail` lives here rather than in the workflow so it cannot be forgotten;
+# without it, `tee` would mask a failing suite.
 #
 # Under DOCKER=1 only pytest-coverage.txt survives: tee runs on the host, but the xml
 # and junit files are written inside the container relative to /app, which is not
@@ -432,7 +446,7 @@ check: fmt-justfile pins fmt-check lint types test
 test-report *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} test \
+    COVERAGE_GATE=1 {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} test \
         --cov-report=xml --junitxml=pytest.xml "$@" | tee pytest-coverage.txt
 
 # Mirrors CI's container-test job. Its value is proving the IMAGE runs (a runtime stage
