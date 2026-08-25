@@ -9292,6 +9292,9 @@ class TestInterject:
                     pass
             live_song.elapsed_secs = float(30 * n)
             music_player.current_song = live_song
+            # What the loop's vc.play() does: the previous interjection's stop is
+            # over once the next song is live.
+            music_player._stopped_deliberately = False
             qobj = QueueObject(
                 f"https://yt.com/v=cut{n}",
                 f"Cut {n}",
@@ -10790,6 +10793,8 @@ class TestHistorySkipMarker:
         for n in range(1, 4):
             live_song.elapsed_secs = float(30 * n)
             music_player.current_song = live_song
+            # The loop's vc.play() between rounds: the previous stop is over.
+            music_player._stopped_deliberately = False
             await music_player.interject(
                 QueueObject(f"https://yt.com/v=cut{n}", f"Cut {n}", mock_author),
                 mock_vc,
@@ -11095,6 +11100,55 @@ class TestInterjectPostNeutralizeRecheck:
         assert music_player.queue.display_items() == parked
         assert music_player.queue.resume_tail_depth() == 1  # head is a live tail
         mock_vc.stop.assert_not_called()
+
+
+class TestInterjectStoppedSong:
+    """Between note_deliberate_stop() + vc.stop() and the loop's next vc.play(), the
+    stopped song is still current_song. Two interjections landing in that window
+    used to park two resume tails for one play."""
+
+    async def test_a_stopped_song_is_not_interjected_twice(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+
+        first = await music_player.interject(interject_obj, mock_vc)
+        assert first is not None
+        assert music_player._stopped_deliberately  # current is stopped, not replaced
+        parked = music_player.queue.display_items()
+
+        second = QueueObject("https://yt.com/v=2", "Second", mock_author)
+        outcome = await music_player.interject(second, mock_vc)
+
+        assert outcome is None
+        assert music_player.queue.display_items() == parked  # no second tail
+        assert mock_vc.stop.call_count == 1
+
+    async def test_a_now_during_a_skip_front_inserts(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """-skip sets the same flag; an interjection landing mid-skip has nothing
+        to park and falls back to the caller's front insert."""
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        music_player.note_deliberate_stop()
+
+        outcome = await music_player.interject(interject_obj, mock_vc)
+
+        assert outcome is None
+        assert music_player.queue.display_items() == []
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
 
 
 class TestInterjectLoopStart:
