@@ -6285,6 +6285,22 @@ class TestQueueEntryCard:
         assert "[CLICK TO VERIFY](http://evil)" not in line
         assert line.count("](") == 1
 
+    def test_a_queue_row_url_cannot_close_the_link(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The row builds its own masked link, so the target's guarantee has to be
+        stated against it and not only against the card."""
+        item = QueueObject(
+            "https://ok.tld/a)[FREE NITRO](http://evil)", "Song 1", mock_author
+        )
+        seed_queue(music_player.queue, item)
+
+        line, _ = music_player._format_queue_line(
+            item, 1, *music_player._queue_eta_seed()
+        )
+        assert "[FREE NITRO](http://evil)" not in line
+        assert line.count("](") == 1
+
     def test_a_paren_in_the_url_cannot_close_the_link(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
