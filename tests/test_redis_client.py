@@ -368,8 +368,12 @@ class TestDeleteQueue:
         items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert items == []
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.delete_queue()  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        """GuildQueue clears its stale-mirror flag only on a DELETE that landed."""
+        assert await store.delete_queue() is True
+        assert await broken_store.delete_queue() is False  # swallowed, not raised
 
 
 class TestRebuildQueue:
@@ -388,8 +392,12 @@ class TestRebuildQueue:
         ttl = await fake_redis.ttl(store.queue_key())
         assert ttl > 0
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.rebuild_queue([_entry(1)])  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        """GuildQueue clears its stale-mirror flag only on a rebuild that landed."""
+        assert await store.rebuild_queue([_entry(1)]) is True
+        assert await broken_store.rebuild_queue([_entry(1)]) is False  # swallowed
 
 
 class TestRemoveQueueEntries:
@@ -2418,9 +2426,23 @@ class TestPopQueueAndStartSong:
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         await fake_redis.rpush(store.queue_key(), b"first", b"second")
-        await store.pop_queue_and_start_song(_current(), 1000.0)
+        assert await store.pop_queue_and_start_song(_current(), 1000.0) is True
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"second"]
+
+    async def test_a_swallowed_failure_reports_that_the_lpop_did_not_land(
+        self,
+    ) -> None:
+        """@_guild_op logs and returns the default, so this return value is the
+        caller's ONLY signal. Defaulted to True it reads as success, the loop skips
+        its resync, and the mirror keeps an entry memory already dropped — the next
+        start retires the wrong one and a crash inside the drift records a song
+        twice."""
+        bad_redis = MagicMock()
+        bad_redis.pipeline = MagicMock(side_effect=ConnectionError("down"))
+        bad_store = GuildRedisStore(cast(aioredis.Redis, bad_redis), guild_id=1)
+
+        assert await bad_store.pop_queue_and_start_song(_current(), 1000.0) is False
 
     async def test_writes_now_playing_fields_atomically(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -2670,8 +2692,57 @@ class TestSetCurrentSongState:
         await store.set_current_song_state(_current(), 1000.0)
         assert await fake_redis.exists(store.now_playing_key()) == 0
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.set_current_song_state(_current(), 1000.0)  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        assert await store.set_current_song_state(_current(), 1000.0) is True
+        assert await broken_store.set_current_song_state(_current(), 1000.0) is False
+
+
+class TestRebuildQueueAndStartSong:
+    """pop_queue_and_start_song with the list REPLACED rather than LPOPed — the
+    start over a mirror the queue knows is stale, where an LPOP would retire
+    the wrong entry. One MULTI: the song is parked over a correct list, or
+    nothing changed."""
+
+    async def test_replaces_the_list_and_parks_the_song_together(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), b"stale-head", b"old")
+        assert (
+            await store.rebuild_queue_and_start_song(
+                _current("https://yt.com/v=1", "Test Song"),
+                [_entry(2), _entry(3)],
+                1000.5,
+            )
+            is True
+        )
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(2).to_redis(), _entry(3).to_redis()]
+        assert await fake_redis.ttl(store.queue_key()) > 0
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_url"] == b"https://yt.com/v=1"
+        assert state[b"play_start_epoch"] == b"1000.5"
+
+    async def test_nothing_queued_deletes_the_list(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Empty means DELETE, never skip: a stale head left standing is restored
+        and replayed on the next restart."""
+        await fake_redis.rpush(store.queue_key(), b"stale-head")
+        assert await store.rebuild_queue_and_start_song(_current(), [], 1000.0)
+        assert await fake_redis.exists(store.queue_key()) == 0
+        assert await fake_redis.hget(store.state_key(), "current_song_url") == b"url"
+
+    async def test_a_swallowed_failure_reports_that_nothing_landed(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        assert (
+            await broken_store.rebuild_queue_and_start_song(
+                _current(), [_entry(1)], 1000.0
+            )
+            is False
+        )
 
 
 # ── Now-playing operations ────────────────────────────────────────────────────

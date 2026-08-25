@@ -175,6 +175,12 @@ _SONG_COMPLETE_MARGIN_SECS = 5
 # that connects but is never given a song disconnect on the same schedule.
 _PLAYBACK_GATE_TIMEOUT = 300
 
+# Ceiling on the start transaction, the one Redis write under the queue's bulk
+# mutex; the pool sets no socket_timeout. Past it the song plays unpersisted and
+# the queue notes its mirror as stale (GuildQueue.note_mirror_write) — no second
+# write is attempted under the mutex, so a stalled Redis costs one bound per start.
+_START_WRITE_TIMEOUT = 5.0
+
 
 @dataclass(frozen=True)
 class InterjectOutcome:
@@ -445,7 +451,8 @@ class MusicPlayer:
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
         )
         # All queue state (one deque + cursor, Redis mirror, bulk mutex, wake
-        # Event, cleared-flag) lives behind this one object — see guild_queue.py.
+        # Event, generation counter) lives behind this one object — see
+        # guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
         # Played-song history (in-memory ring + Redis mirror) — guild_history.py.
         # Only the DRAINER is wired in: history writes nudge it, nothing here reads
@@ -1080,7 +1087,7 @@ class MusicPlayer:
         Two accepted ±1 windows:
 
         - OVER by one while the loop resolves a stream, since current_song is
-          assigned before try_commit_dequeue() settles the claim, so the play is
+          assigned before commit_dequeue() settles the claim, so the play is
           both current_song and still queued for the length of a probe
           (100ms-seconds).
         - UNDER by one when the live song has a parked tail from an EARLIER play
@@ -1269,12 +1276,17 @@ class MusicPlayer:
         return [item_label(item) for item in cleared_items]
 
     async def queue_shuffle(self) -> str:
-        # Cancel before shuffle()'s too-few guard: a prefetch holding a dequeued
-        # item must be accounted for even when the shuffle is a no-op.
-        await self._cancel_prefetch()
+        # Neutralize rather than cancel, and before shuffle()'s too-few guard:
+        # cancel_task() no-ops on a COMPLETED prefetch, whose claim would then pin
+        # its song to the front of the reorder the user just asked for.
+        await self._neutralize_prefetch()
         outcome = await self.queue.shuffle()
         if outcome is ShuffleOutcome.TOO_FEW_SONGS:
-            return "There must be at least 3 songs to shuffle the queue"
+            return "There must be at least 4 songs to shuffle the queue"
+        # The neutralized prefetch took the resolve of the next song with it;
+        # a song is playing, so re-hide it behind the remainder of this one.
+        if self.current_song is not None and self._prefetch_task is None:
+            self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
         return "Shuffled!"
 
     async def queue_remove(self, needle: str) -> RemoveOutcome:
@@ -1823,6 +1835,10 @@ class MusicPlayer:
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
+                    # The tail is the same play, so a song that was itself a
+                    # -playnow comes back saying so — the span attribute below
+                    # reads it at every level of a stack.
+                    interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
                     # The tail is the same play, so it keeps the interrupted song's
                     # stamps — played_at included, which files the whole play under
@@ -2447,19 +2463,13 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    queue_was_cleared = self.queue.consume_cleared_flag()
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
-                    if prefetched_song is not None and queue_was_cleared:
-                        # Cleared while _prefetch_next_song ran: clear() reset the
-                        # cursor, so the prefetch's claim is already settled — only
-                        # the FFmpeg subprocess is left to reap, and discarding the
-                        # result without cleanup() would leak it.
-                        prefetched_song.cleanup()
-                        prefetched_song = None
-                    # Captured where each path takes its item, and handed back to
-                    # try_commit_dequeue() below: a clear() in between voids this
-                    # dequeue even if a put() has since refilled the queue.
+                    # Captured where each path takes its item and handed back to
+                    # the commit below: a clear() in between voids this dequeue
+                    # even if a put() has since refilled the display. A prefetched
+                    # claim commits under the CURRENT value — a clear() during the
+                    # previous song reset the cursor, and try_release() refuses it.
                     commit_generation = self.queue.generation
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
@@ -2536,99 +2546,161 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    if not await self.queue.try_commit_dequeue(commit_generation):
-                        # Cleared while this song resolved (e.g. inside yt_stream).
-                        # Discard without playing: the clear() that refused this
-                        # commit reset the cursor, so the claim is settled, and
-                        # cleanup() terminates the FFmpeg subprocess yt_stream
-                        # already spawned.
-                        claim_outstanding = False
-                        self.current_song.cleanup()
-                        self.current_song = None
+                    # The commit and the start transaction under ONE mutex hold —
+                    # see GuildQueue.commit_dequeue. The store dispatch is the only
+                    # await in here and _START_WRITE_TIMEOUT bounds it; vc.play()
+                    # and vc.pause() are synchronous and never precede the commit.
+                    vc: discord.VoiceClient
+                    song: YTDL
+                    discarded: Optional[YTDL] = None
+                    landed = False
+                    async with self.queue.commit_dequeue(commit_generation) as ok:
+                        if not ok:
+                            # Cleared while this song resolved, or while the
+                            # prefetch that claimed it ran: the clear() reset the
+                            # cursor, so the claim is already settled. The FFmpeg
+                            # reap waits until the hold is released — cleanup()
+                            # blocks on the subprocess.
+                            claim_outstanding = False
+                            discarded, self.current_song = self.current_song, None
+                        else:
+                            try:
+                                # Safe to assert rather than await readiness: the gate above
+                                # opens only once a voice connection is established
+                                # (channel.connect() awaits the full handshake), so loop() cannot
+                                # reach vc.play() mid-handshake.
+                                voice = self._guild.voice_client
+                                assert isinstance(voice, discord.VoiceClient)
+                                assert self.current_song is not None
+                                vc = voice
+                                # Local binding: pyright's narrowing doesn't survive the awaits
+                                # below, and it keeps every write in this iteration on the same
+                                # song even if current_song is reassigned.
+                                song = self.current_song
+
+                                # The commit settled the claim. Clearing here rather than at
+                                # song end matters: the flag guards a release, and a
+                                # release deletes an item — left standing across the song it
+                                # would settle whatever sits at the head by then, which is the
+                                # next song once the prefetch below claims it.
+                                claim_outstanding = False
+
+                                # Written from the player thread, read after play_next.wait();
+                                # call_soon_threadsafe orders the write before the wait returns.
+                                play_error: list[Optional[Exception]] = [None]
+
+                                def _after_play(
+                                    error: Optional[Exception],
+                                    _title: str = song.title or "",
+                                ) -> None:
+                                    # discord.py hands ffmpeg's failure here and nowhere else —
+                                    # a `lambda _:` would drop it, making a stream that never
+                                    # opened indistinguishable from a song that ended. A
+                                    # deliberate vc.stop() arrives as error=None.
+                                    if error is not None:
+                                        play_error[0] = error
+                                        log.error(
+                                            f"playback error for {_title}: {error}"
+                                        )
+                                    self.bot.loop.call_soon_threadsafe(
+                                        self.play_next.set
+                                    )
+
+                                self._stopped_deliberately = False
+                                vc.play(song, after=_after_play)
+                                if song.start_paused:
+                                    # Park the player thread SYNCHRONOUSLY, before any await, so
+                                    # a song returning paused leaks a frame or two rather than a
+                                    # Redis round-trip of audio. Idempotent with the full pause()
+                                    # below, which runs after the start transaction so its
+                                    # pause_start_epoch survives that transaction's HDEL.
+                                    vc.pause()
+                                play_start = (
+                                    time.time()
+                                )  # capture immediately before any awaits
+                                # Stamped once and inherited by every later fragment (a resume
+                                # tail arrives carrying it). Before the state write below, or
+                                # the parked entry persists 0.0 and a crash recovers no start.
+                                song.played_at = song.played_at or play_start
+
+                                # Mirror the now-playing song to Redis in one MULTI/EXEC:
+                                # every state field plus the display snapshot, and the
+                                # list leg the mirror needs. Clean and persisted → LPOP.
+                                # Stale (a previous start's write did not land) → the
+                                # list is REPLACED from memory, since an LPOP would
+                                # retire the wrong entry. A crash-recovered head was
+                                # never on the list, so only state is written.
+                                if self.store is not None:
+                                    # The -ss offset twice: backdated into the epoch the
+                                    # legacy fallback extrapolates from, and passed as the
+                                    # seed the heartbeat has not written yet. Without it a
+                                    # `?t=` song crashing inside the first interval resumes
+                                    # at 0:00.
+                                    backdated_start = play_start - song.start_offset
+                                    current = SongQueueEntry.from_song(song)
+                                    now_playing = NowPlayingData.from_song(song)
+                                    try:
+                                        async with asyncio.timeout(
+                                            _START_WRITE_TIMEOUT
+                                        ):
+                                            if self.queue.mirror_dirty:
+                                                landed = await self.store.rebuild_queue_and_start_song(
+                                                    current,
+                                                    self.queue.mirror_entries(),
+                                                    backdated_start,
+                                                    now_playing=now_playing,
+                                                    start_offset=song.start_offset,
+                                                )
+                                            elif should_pop_queue:
+                                                landed = await self.store.pop_queue_and_start_song(
+                                                    current,
+                                                    backdated_start,
+                                                    now_playing=now_playing,
+                                                    start_offset=song.start_offset,
+                                                )
+                                            else:
+                                                landed = await self.store.set_current_song_state(
+                                                    current,
+                                                    backdated_start,
+                                                    now_playing=now_playing,
+                                                    start_offset=song.start_offset,
+                                                )
+                                    except TimeoutError:
+                                        log.error(
+                                            f"start transaction timed out after "
+                                            f"{_START_WRITE_TIMEOUT}s in guild "
+                                            f"{self._guild.id}; playing without persisting"
+                                        )
+                                    # In this block because the store is the ticker's only
+                                    # writer: a Redis-less guild would otherwise tick for
+                                    # the whole song to reach a no-op. After the seed above,
+                                    # so the first tick cannot race it; create_task is
+                                    # synchronous, so it does not extend the hold.
+                                    self._heartbeat_task = asyncio.create_task(
+                                        self._heartbeat_updater(song)
+                                    )
+                            finally:
+                                # In a finally so a raise between the settle and the
+                                # write — vc.play() refusing a dropped voice client —
+                                # is recorded like a write that did not land.
+                                if self.store is not None:
+                                    self.queue.note_mirror_write(
+                                        landed=landed, retired=should_pop_queue
+                                    )
+
+                    if discarded is not None:
+                        discarded.cleanup()
                         continue
 
-                    # The commit settled the claim. Cleared here, not at song end:
-                    # the flag guards a release, and left standing across the song
-                    # that release would delete whatever sits at the head by then —
-                    # the next song, once the prefetch below claims it.
-                    claim_outstanding = False
-
-                    # Safe to assert rather than await readiness: the gate above
-                    # opens only once a voice connection is established
-                    # (channel.connect() awaits the full handshake), so loop() cannot
-                    # reach vc.play() mid-handshake.
-                    vc = self._guild.voice_client
-                    assert isinstance(vc, discord.VoiceClient)
-                    assert self.current_song is not None
-                    # Local binding: pyright's narrowing doesn't survive the awaits
-                    # below, and it keeps every write in this iteration on the same
-                    # song even if current_song is reassigned.
-                    song = self.current_song
-
-                    # Written from the player thread, read after play_next.wait();
-                    # call_soon_threadsafe orders the write before the wait returns.
-                    play_error: list[Optional[Exception]] = [None]
-
-                    def _after_play(
-                        error: Optional[Exception], _title: str = song.title or ""
-                    ) -> None:
-                        # discord.py hands ffmpeg's failure here and nowhere else —
-                        # a `lambda _:` would drop it, making a stream that never
-                        # opened indistinguishable from a song that ended. A
-                        # deliberate vc.stop() arrives as error=None.
-                        if error is not None:
-                            play_error[0] = error
-                            log.error(f"playback error for {_title}: {error}")
-                        self.bot.loop.call_soon_threadsafe(self.play_next.set)
-
-                    self._stopped_deliberately = False
-                    vc.play(song, after=_after_play)
-                    if song.start_paused:
-                        # Park the player thread SYNCHRONOUSLY, before any await, so
-                        # a song returning paused leaks a frame or two rather than a
-                        # Redis round-trip of audio. Idempotent with the full pause()
-                        # below, which runs after the start transaction so its
-                        # pause_start_epoch survives that transaction's HDEL.
-                        vc.pause()
-                    play_start = time.time()  # capture immediately before any awaits
-                    # Stamped once and inherited by every later fragment (a resume
-                    # tail arrives carrying it). Before the state write below, or
-                    # the parked entry persists 0.0 and a crash recovers no start.
-                    song.played_at = song.played_at or play_start
-
-                    # Mirror the now-playing song to Redis. should_pop_queue=True →
-                    # one MULTI/EXEC atomically LPOPs the queue and writes every state
-                    # field plus the display snapshot, closing the at-most-once
-                    # window. A crash-recovered "current song" was never on the Redis
-                    # list, so only state is written — an LPOP would drop a queued one.
-                    if self.store is not None:
-                        # The -ss offset twice: backdated into the epoch the legacy
-                        # fallback extrapolates from, and passed as the seed the
-                        # heartbeat has not written yet. Without it a `?t=` song
-                        # crashing inside the first interval resumes at 0:00.
-                        backdated_start = play_start - song.start_offset
-                        current = SongQueueEntry.from_song(song)
-                        now_playing = NowPlayingData.from_song(song)
-                        if should_pop_queue:
-                            await self.store.pop_queue_and_start_song(
-                                current,
-                                backdated_start,
-                                now_playing=now_playing,
-                                start_offset=song.start_offset,
-                            )
-                        else:
-                            await self.store.set_current_song_state(
-                                current,
-                                backdated_start,
-                                now_playing=now_playing,
-                                start_offset=song.start_offset,
-                            )
-                        # In this block because the store is the ticker's only
-                        # writer: a Redis-less guild would otherwise tick for the
-                        # whole song to reach a no-op. After the seed above, so the
-                        # first tick cannot race it.
-                        self._heartbeat_task = asyncio.create_task(
-                            self._heartbeat_updater(song)
+                    if self.store is not None and not landed:
+                        # Memory dropped the entry; the list still holds it. The
+                        # next start replaces the list instead of LPOPing it, and
+                        # a -clear/-shuffle/-remove rebuild repairs it sooner. A
+                        # crash before then replays this song from the stale entry.
+                        log.error(
+                            f"start transaction did not land in guild "
+                            f"{self._guild.id}; the queue mirror is stale until the "
+                            "next song start rebuilds it"
                         )
 
                     if song.start_paused:

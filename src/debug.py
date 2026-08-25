@@ -1059,7 +1059,9 @@ def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> li
     mp = inputs.player
     lines = [
         f"player       {'yes' if mp is not None else 'no'}",
-        f"queue        {mp.queue.qsize() if mp is not None else 0} queued",
+        # display_size(), so a song the loop has claimed but not yet started
+        # still reads as queued.
+        f"queue        {mp.queue.display_size() if mp is not None else 0} queued",
         f"volume       {round(mp.volume * 100) if mp is not None else 100}%",
         f"debug        {'on' if inputs.debug_enabled else 'off'} ({source})",
     ]
