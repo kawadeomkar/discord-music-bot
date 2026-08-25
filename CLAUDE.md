@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,206 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,225 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.

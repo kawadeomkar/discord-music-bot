@@ -4,6 +4,7 @@ import redis.asyncio as aioredis
 import asyncio
 import contextlib
 import dataclasses
+import datetime
 import logging
 import re
 from zoneinfo import ZoneInfo
@@ -37,6 +38,7 @@ from src.musicplayer import (
     _START_WRITE_TIMEOUT,
     _build_progress_bar,
     _reached_end,
+    _fmt_eta,
     _fmt_finish_time,
     _fmt_total_duration,
     _requester_mention,
@@ -2226,13 +2228,43 @@ class TestReparkCrashedHead:
         assert await mp.repark_crashed_head() is False
 
 
-# ── EstimatedPlayingAt ────────────────────────────────────────────────────────
+# ── EtaWalkTo ─────────────────────────────────────────────────────────────────
 
 
-class TestEstimatedPlayingAt:
+class TestEtaWalkTo:
+    """_eta_walk_to replaced estimated_playing_at(): both cards need the walk STATE
+    at a position, not a formatted string, and an index past the queue walks all of
+    it — which is the estimate a song appended now earns."""
+
+    def _eta_at(self, mp: MusicPlayer, index: int) -> str:
+        now_pst, walk = mp._eta_walk_to(index)
+        return _fmt_eta(
+            now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
+        )
+
+    def test_index_one_is_the_bare_seed(self, music_player: MusicPlayer) -> None:
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=1", "Song 1", MagicMock(), duration=600),
+        )
+        assert music_player._eta_walk_to(1)[1] == music_player._queue_eta_seed()[1]
+
+    def test_accumulates_items_ahead(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
+            QueueObject("https://yt.com/v=2", "B", mock_author, duration=90),
+        )
+        _, seed = music_player._queue_eta_seed()
+        _, walk = music_player._eta_walk_to(3)
+        assert walk.cumulative_secs == seed.cumulative_secs + 150
+
     def test_matches_clock_format(self, music_player: MusicPlayer) -> None:
-        result = music_player.estimated_playing_at()
-        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*$", result)
+        assert re.match(
+            r"^\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*$", self._eta_at(music_player, 1)
+        )
 
     def test_uncertain_when_current_song_has_no_duration_secs(
         self, music_player: MusicPlayer
@@ -2240,14 +2272,13 @@ class TestEstimatedPlayingAt:
         mock_current = MagicMock()
         mock_current.duration_secs = 0
         music_player.current_song = mock_current
-        result = music_player.estimated_playing_at()
-        assert result.startswith("~")
+        assert self._eta_at(music_player, 1).startswith("~")
 
     def test_accounts_for_already_queued_songs(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song  # duration_secs = 210
-        empty_eta = music_player.estimated_playing_at()
+        empty_eta = self._eta_at(music_player, 1)
 
         seed_queue(
             music_player.queue,
@@ -2255,9 +2286,7 @@ class TestEstimatedPlayingAt:
                 "https://yt.com/v=1", "Song 1", mock_song.requester, duration=600
             ),
         )
-        later_eta = music_player.estimated_playing_at()
-
-        assert empty_eta != later_eta
+        assert self._eta_at(music_player, 2) != empty_eta
 
     def test_uncertain_when_queued_song_duration_unknown(
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
@@ -2267,23 +2296,19 @@ class TestEstimatedPlayingAt:
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None),
         )
-        result = music_player.estimated_playing_at()
-        assert result.startswith("~")
+        assert self._eta_at(music_player, 2).startswith("~")
 
-    def test_matches_last_queue_line_eta(
+    def test_past_the_queue_is_the_append_eta(
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        """estimated_playing_at() should reflect the same seed used by
-        queue_embed()/_build_next_up_embed() for consistency across embeds."""
+        """An index past the last entry walks the whole queue, so a song appended
+        now starts where the last queued line's ETA ends up — the agreement the
+        deleted estimated_playing_at() asserted by re-deriving it."""
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60),
         )
-        eta = music_player.estimated_playing_at()
-
-        # A song appended now would start right where the last queued line's
-        # ETA ends up, so re-derive it via the same line formatter for index 2.
         now_pst, walk = music_player._queue_eta_seed()
         _, walk = music_player._format_queue_line(
             music_player.queue._items[0], 1, now_pst, walk
@@ -2294,7 +2319,7 @@ class TestEstimatedPlayingAt:
             now_pst,
             walk,
         )
-        assert eta in expected_line
+        assert self._eta_at(music_player, 2) in expected_line
 
 
 # ── BuildNowPlayingEmbed ──────────────────────────────────────────────────────
@@ -6222,6 +6247,214 @@ class TestBuildNextUpEmbed:
         requester_line = described(now_playing_embed).split("\n")[-1]
         finish_time = requester_line.split("Estimated finish: ")[1]
         assert finish_time in described(next_up_embed)
+
+
+# ── QueueEntryCard ────────────────────────────────────────────────────────────
+
+
+class TestQueueEntryCard:
+    """The block's "Up next" and the -play confirmation are one renderer. The
+    -queue page keeps _format_queue_line: a row and a card are different jobs."""
+
+    @staticmethod
+    def _next_up_body(mp: MusicPlayer) -> str:
+        embed = mp._build_next_up_embed()
+        assert embed is not None
+        return described(embed)
+
+    def test_both_cards_share_one_body(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The whole of the shared-format change in one assertion — and the guard
+        against either card growing a line the other does not."""
+        head = QueueObject(
+            "https://yt.com/v=1", "Song 1", mock_author, duration=60, uploader="Chan"
+        )
+        seed_queue(music_player.queue, head)
+
+        next_up = music_player._build_next_up_embed()
+        confirmation = music_player.build_queued_song_embed(head)
+
+        assert next_up is not None
+        assert next_up.description == confirmation.description
+
+    def test_body_is_the_four_labelled_lines(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        item = QueueObject(
+            "https://yt.com/v=1",
+            "Song 1",
+            mock_author,
+            duration=329,
+            uploader="Massive Attack",
+        )
+        seed_queue(music_player.queue, item)
+
+        lines = described(music_player.build_queued_song_embed(item)).split("\n")
+
+        assert lines[0] == f"Requested by: [{mock_author.mention}]"
+        assert lines[1] == "[**Song 1**](https://yt.com/v=1)"
+        assert lines[2] == "Channel: Massive Attack  ·  Duration: `5:29`"
+        assert lines[3].startswith("Est. playing at ")
+
+    def test_renders_resume_offset(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A parked -playnow tail says where it resumes. The row carried this
+        before the cards shared a format; losing it would be silent."""
+        item = QueueObject(
+            "https://yt.com/v=1", "Song 1", mock_author, duration=300, ts=83
+        )
+        item.is_resume = True
+        seed_queue(music_player.queue, item)
+
+        assert "⏮ Resumes at `1:23`" in self._next_up_body(music_player)
+
+    def test_renders_start_offset(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        item = QueueObject(
+            "https://yt.com/v=1", "Song 1", mock_author, duration=300, ts=83
+        )
+        seed_queue(music_player.queue, item)
+
+        assert "Starts at `83s`" in self._next_up_body(music_player)
+
+    def test_placeholders_for_unknown_duration_and_uploader(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        item = QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None)
+        seed_queue(music_player.queue, item)
+
+        body = self._next_up_body(music_player)
+        assert "Duration: `?:??`" in body
+        assert "Channel: Unknown channel" in body
+
+    def test_a_bracket_in_the_title_cannot_close_the_link(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The masked link is what the confirmation gained over its bare URL, and
+        safe_label is why it is safe to have."""
+        item = QueueObject(
+            "https://yt.com/v=1", "Song [x](http://evil) 1", mock_author, duration=60
+        )
+        seed_queue(music_player.queue, item)
+
+        body = described(music_player.build_queued_song_embed(item))
+        # safe_label rewrites the brackets, so the injected text cannot end the
+        # label early and re-point the link — it stays inert inside it.
+        assert "[x](http://evil)" not in body
+        assert "](https://yt.com/v=1)" in body
+        assert body.count("](") == 1
+
+    def test_unresolved_ytsource_renders_resolving(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """A lazy Spotify-playlist entry has no title, URL, duration or requester
+        yet, so the search term and its state are the whole body."""
+        seed_queue(
+            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
+        )
+
+        body = self._next_up_body(music_player)
+        assert body == "some song\n*resolving...*"
+        assert "Requested by" not in body
+
+    def test_eta_is_the_entrys_own_position(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        third = QueueObject("https://yt.com/v=3", "C", mock_author, duration=60)
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=1", "A", mock_author, duration=600),
+            QueueObject("https://yt.com/v=2", "B", mock_author, duration=600),
+            third,
+        )
+
+        # Derived from the SEED, not from _eta_walk_to — an expectation computed
+        # by the code under test moves with it and asserts nothing.
+        now_pst, seed = music_player._queue_eta_seed()
+        expected = _fmt_eta(
+            now_pst + datetime.timedelta(seconds=seed.cumulative_secs + 1200),
+            seed.uncertain,
+        )
+        card = music_player.build_queued_song_embed(third)
+
+        assert f"Est. playing at {expected}" in described(card)
+        assert card.title == "Queued song — #3"
+
+    def test_unqueued_item_falls_back_to_the_tail(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A -clear landing between the put and the reply leaves nothing to locate;
+        the tail is what an appended song's estimate meant before this."""
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
+        )
+        gone = QueueObject("https://yt.com/v=9", "Gone", mock_author, duration=60)
+
+        assert music_player.build_queued_song_embed(gone).title == "Queued song — #2"
+
+    def test_locates_by_identity_not_url(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Two copies of one song are two queue slots. Matching on webpage_url
+        would report the second at the first's position."""
+        first = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=60)
+        second = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=60)
+        seed_queue(music_player.queue, first, second)
+
+        assert music_player.build_queued_song_embed(second).title == "Queued song — #2"
+
+    def test_next_up_card_carries_a_thumbnail(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The one part of the shared layout that reaches beyond -play: the block
+        rides every message the bot sends."""
+        seed_queue(
+            music_player.queue,
+            QueueObject(
+                "https://yt.com/v=1",
+                "Song 1",
+                mock_author,
+                duration=60,
+                thumbnail="https://img.youtube.com/vi/1/0.jpg",
+            ),
+        )
+
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert embed.thumbnail.url == "https://img.youtube.com/vi/1/0.jpg"
+
+    def test_queued_card_thumbnail_present_and_absent(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        with_thumb = QueueObject(
+            "https://yt.com/v=1",
+            "Song 1",
+            mock_author,
+            thumbnail="https://img.youtube.com/vi/1/0.jpg",
+        )
+        without = QueueObject("https://yt.com/v=2", "Song 2", mock_author)
+        seed_queue(music_player.queue, with_thumb, without)
+
+        assert (
+            music_player.build_queued_song_embed(with_thumb).thumbnail.url
+            == "https://img.youtube.com/vi/1/0.jpg"
+        )
+        assert music_player.build_queued_song_embed(without).thumbnail.url is None
+
+    def test_warning_lands_below_the_body(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        item = QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
+        seed_queue(music_player.queue, item)
+
+        body = described(music_player.build_queued_song_embed(item, warning="careful"))
+        assert body.endswith("\n\ncareful")
+        assert "Est. playing at" in body.split("\n\ncareful")[0]
 
 
 # ── PrefetchNextSong ──────────────────────────────────────────────────────────

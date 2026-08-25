@@ -1168,17 +1168,15 @@ class MusicBot(commands.Cog):
         reaches Postgres permanently, so it is read where it is the slot the song
         actually takes.
 
-        Everything else is built BEFORE the lock and sent after it is released.
-        Rendering "Est. playing at" walks the whole queue, and the hold is shared
-        by every -play in the guild, so under it one long queue's walk is time
-        every sibling spends waiting. What it costs is exactness in an estimate: a
-        sibling placing in between leaves the quoted time one song short, which is
-        the same +/-1 enqueue_depth() already documents against a queue the loop
-        keeps moving anyway. A request refused at the lock renders a confirmation
-        nobody sees, which is the same work off the shared hold instead of on it.
-
-        A Discord send under the lock would hold every other -play in the guild
-        for a 429's retry_after.
+        Everything else happens off the lock: the placement-specific embeds are
+        built before it, the tail confirmation after it is released, and every
+        send follows. Rendering "Est. playing at" walks the whole queue, and the
+        hold is shared by every -play in the guild, so under it one long queue's
+        walk is time every sibling spends waiting. Built after the put, the
+        confirmation carries the slot the song actually took, and when that slot
+        is the head the live block is re-hosted in its place. A Discord send
+        under the lock would hold every other -play in the guild for a 429's
+        retry_after.
 
         `warning` rides the confirmation embed when there is one. Every exit
         below sends it either way: the embed is conditional (a song that starts
@@ -1197,6 +1195,7 @@ class MusicBot(commands.Cog):
             if warning is not None
             else None
         )
+        should_show_queued = False
         if placement is Placement.COLD_FRONT:
             # The "Est. playing at" embed would be wrong: a restored queue is
             # non-empty but its entries sit BEHIND this song. The resume notice
@@ -1207,10 +1206,9 @@ class MusicBot(commands.Cog):
             if resume_notice is not None:
                 embeds.append(resume_notice)
         elif placement is Placement.NEXT:
-            # No "Est. playing at": estimated_playing_at() seeds from the
-            # current song's FULL duration as a proxy for what is left of it,
-            # which is badly wrong for the very next slot. It names the song
-            # it waits behind.
+            # No "Est. playing at": the ETA walk seeds from the current song's
+            # FULL duration as a proxy for what is left of it, which is badly
+            # wrong for the very next slot. It names the song it waits behind.
             embeds.append(
                 self._playing_next_embed(ctx, qobj, note=_plays_after_note(mp, vc))
             )
@@ -1223,21 +1221,7 @@ class MusicBot(commands.Cog):
                 or (isinstance(vc, discord.VoiceClient) and vc.is_playing())
             )
             if should_show_queued:
-                warning_line = f"\n\n{warning}" if warning else ""
-                embeds.append(
-                    build_embed(
-                        "Queued song",
-                        (
-                            f"Requested by: [{ctx.author.mention}]\n"
-                            f"{qobj.title} - ({qobj.webpage_url})\n"
-                            f"Est. playing at {mp.estimated_playing_at()}{note}"
-                            f"{warning_line}"
-                        ),
-                        discord.Color.blue(),
-                        thumbnail=qobj.thumbnail,
-                    )
-                )
-                warning_embed = None  # it rode the confirmation
+                warning_embed = None  # it rides the confirmation, built below
             # Otherwise nothing else is being sent on this path — the song starts
             # now and the NP card speaks for it — so the warning needs its own
             # message, which is what carrying it to the end gives it.
@@ -1268,6 +1252,23 @@ class MusicBot(commands.Cog):
         if not verdict.placed:
             await self._report_dropped(req, verdict)
             return
+        if should_show_queued:
+            # After the put, off the lock: the card carries the slot the song took.
+            # The block's "Up next" card renders the queue head in the same layout,
+            # so when this song IS the head the two would be one card printed twice
+            # in one message. Re-host the live block instead and let its card be
+            # the confirmation — dedicated, because a response host with no own
+            # embeds strip-edits to a blank message on retire.
+            if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
+                # What the card would have carried: the note and the warning.
+                said = "\n\n".join(text for text in (note, warning) if text)
+                if said:
+                    color = discord.Color.orange() if warning else discord.Color.blue()
+                    embeds.append(notice_embed(said, color))
+            else:
+                embeds.append(
+                    mp.build_queued_song_embed(qobj, note=note, warning=warning)
+                )
         await _reply(ctx, embeds)
 
     @commands.command(
