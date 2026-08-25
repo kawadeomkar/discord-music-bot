@@ -6222,9 +6222,12 @@ class TestQueueEntryCard:
             third,
         )
 
-        now_pst, walk = music_player._eta_walk_to(3)
+        # Derived from the SEED, not from _eta_walk_to — an expectation computed
+        # by the code under test moves with it and asserts nothing.
+        now_pst, seed = music_player._queue_eta_seed()
         expected = _fmt_eta(
-            now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
+            now_pst + datetime.timedelta(seconds=seed.cumulative_secs + 1200),
+            seed.uncertain,
         )
         card = music_player.build_queued_song_embed(third)
 
