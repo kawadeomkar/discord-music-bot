@@ -912,8 +912,9 @@ class MusicBot(commands.Cog):
         front: bool = False,
         warning: Optional[str] = None,
     ) -> None:
-        """`warning` rides the confirmation embed when there is one. Every exit
-        below sends it either way: the embed is conditional (a song that starts
+        """`warning` rides the confirmation embed when there is one — empty and
+        None both mean nothing to say, matching the builder. Every exit below
+        sends it either way: the embed is conditional (a song that starts
         immediately gets none) and the warning is about what the user typed, so
         losing it on the quietest path would hide it in the common case of
         queueing the first song."""
@@ -931,7 +932,7 @@ class MusicBot(commands.Cog):
             ]
             if resume_notice is not None:
                 coros.append(ctx.send(embed=resume_notice))
-            if warning is not None:
+            if warning:
                 coros.append(
                     ctx.send(embed=notice_embed(warning, discord.Color.orange()))
                 )
@@ -955,14 +956,14 @@ class MusicBot(commands.Cog):
 
         async def reply() -> None:
             if not waits_behind_something:
-                if warning is not None:
+                if warning:
                     await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
                 return
             # The block's "Up next" card renders the queue head in the same layout
             # the confirmation uses, so when this song IS the head the two are one
             # card printed twice in one message.
             if mp.queue.peek_next() is qobj and ctx.channel.id == mp._channel.id:
-                if warning is not None:
+                if warning:
                     # MusicContext.send attaches the block to whatever it sends,
                     # so the warning's own message carries the card and IS the
                     # confirmation.
@@ -976,8 +977,8 @@ class MusicBot(commands.Cog):
             await ctx.send(embed=mp.build_queued_song_embed(qobj, warning=warning))
 
         # Gathered, not sequenced: gather does not cancel a sibling that is still
-        # running, so a channel denying Add Reactions still gets its card — the
-        # reaction's Forbidden surfaces alongside it rather than instead of it.
+        # running, so a channel denying Add Reactions still gets its card and the
+        # reaction's Forbidden surfaces alongside it.
         await asyncio.gather(reply(), ctx.message.add_reaction("👍"))
 
     @commands.command(

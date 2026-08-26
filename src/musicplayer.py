@@ -48,6 +48,7 @@ from src.util import (
     pluralize,
     record_span_error,
     trace_footer,
+    is_web_url,
     safe_label,
     safe_link_target,
     truncate,
@@ -90,8 +91,8 @@ class EtaWalk:
 
 # TODO: every guild's ETAs still render in DEFAULT_TIMEZONE, and in one zone per
 # guild rather than per viewer.
-# queue_embed()'s "Est. playing at" and the now-playing "Estimated finish" read
-# GuildConfig.timezone, but nothing WRITES it — set_timezone has no caller and the
+# The -queue row's and the single-entry card's "Est. playing at", and the
+# now-playing "Estimated finish", all read GuildConfig.timezone, but nothing WRITES it — set_timezone has no caller and the
 # `-options key value` command it exists for does not exist yet — so the field is
 # always absent and every guild is still quoted Pacific time. Two debts, not one:
 # a write path, and then the fact that a guild-wide zone still shows every member
@@ -131,9 +132,17 @@ def _fmt_clock_time(dt: datetime.datetime) -> str:
     return f"{hour}:{dt.minute:02d} {ampm} {dt.tzname() or ''}".rstrip()
 
 
-def _fmt_eta(est_dt: datetime.datetime, uncertain: bool) -> str:
-    prefix = "~" if uncertain else ""
-    return f"{prefix}**{_fmt_clock_time(est_dt)}**"
+def _fmt_eta(now: datetime.datetime, walk: EtaWalk) -> str:
+    """Clock time the walk lands on, dated when that is not today. A queue deep
+    enough to reach tomorrow renders a bare "10:19 AM" for a moment more than a day
+    out, which names no particular one; the weekday runs out after a week, so past
+    that it takes the date.
+    """
+    est_dt = now + datetime.timedelta(seconds=walk.cumulative_secs)
+    days = (est_dt.date() - now.date()).days
+    when = "" if days == 0 else f"{est_dt:%a} " if days < 7 else f"{est_dt:%b %d} "
+    prefix = "~" if walk.uncertain else ""
+    return f"{prefix}**{when}{_fmt_clock_time(est_dt)}**"
 
 
 def _requester_mention(
@@ -224,12 +233,12 @@ def _reached_end(song: YTDL) -> bool:
 
 
 def _remaining_secs(item: QueueObject) -> Optional[int]:
-    """A queued item's expected playtime: full duration, minus the resume offset
-    for a -playnow resume entry — it plays only its tail, so counting the full
-    duration would overestimate everything behind it."""
+    """A queued item's expected playtime: full duration, minus any start offset.
+    A -playnow resume entry and a `?t=` start both play only the tail from `ts`, so
+    counting the full duration would overestimate everything behind them."""
     if item.duration is None:
         return None
-    if item.is_resume and item.ts:
+    if item.ts:
         return max(0, item.duration - item.ts)
     return item.duration
 
@@ -288,7 +297,8 @@ _FIELD_PLACEHOLDER = "—"
 # -leaderboard is ~2.5 KB of that). A field over 1024 characters is a 400 on its
 # own. Both are bounded here rather than at the call sites.
 _FIELD_VALUE_MAX = 200
-# Same budget, for the one queue line the "Up next" embed renders.
+# Same budget, for a song title. Three surfaces render one: the -queue row, the
+# block's "Up next" card, and the -play confirmation.
 _NEXT_UP_TITLE_MAX = 200
 
 
@@ -657,8 +667,7 @@ class MusicPlayer:
         instead: ten of these fold into one description, one of them does not
         read as a card.
         """
-        est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
-        est_str = _fmt_eta(est_dt, walk.uncertain)
+        est_str = _fmt_eta(now_pst, walk)
 
         if isinstance(item, QueueObject):
             # Capped for the same reason _field_value is: a -queue page renders
@@ -1394,20 +1403,20 @@ class MusicPlayer:
         self, item: QueueItem, ahead: Sequence[QueueItem]
     ) -> str:
         """The body both single-entry cards render: one labelled fact per line,
-        ending with the ETA earned by waiting behind `ahead`. The -queue page keeps
-        _format_queue_line — a row and a card are different jobs."""
-        now_pst, walk = self._eta_walk_to(ahead)
-        eta = _fmt_eta(
-            now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
-        )
+        ending with the ETA earned by waiting behind `ahead`. An entry still
+        resolving has none of those facts yet and renders its search term instead.
+        The -queue page keeps _format_queue_line — a row and a card are different
+        jobs."""
         if not isinstance(item, QueueObject):
             # Unresolved Spotify-playlist entry: no title, URL, duration or
-            # requester exists yet, so the search term and its state are the body.
+            # requester exists yet, so the search term and its state are the whole
+            # body — and with no duration of its own there is no ETA to walk for.
             search = safe_label(
                 (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
                 _NEXT_UP_TITLE_MAX,
             )
             return f"{search}\n*resolving...*"
+        eta = _fmt_eta(*self._eta_walk_to(ahead))
         # Both are yt-dlp metadata, so both are sanitized and capped: the title
         # lands inside a masked link's LABEL, where a "]" closes it early and
         # re-points the link, and a "[x](url)" uploader renders as a live link.
@@ -1449,8 +1458,12 @@ class MusicPlayer:
         embed = discord.Embed(
             title=title, description=description, color=discord.Color.blue()
         )
+        # A restored entry's thumbnail comes back off the wire unchecked, and this
+        # card rides the NP block — so a bad one would 400 every send and every
+        # tick edit for the guild, not just drop an image.
         if isinstance(item, QueueObject) and item.thumbnail:
-            embed.set_thumbnail(url=item.thumbnail)
+            if is_web_url(item.thumbnail):
+                embed.set_thumbnail(url=item.thumbnail)
         return embed
 
     def build_queued_song_embed(
@@ -1459,7 +1472,11 @@ class MusicPlayer:
         """The -play confirmation. `item` is located by identity, so the ETA is the
         one its real position earns rather than one its equal elsewhere in the queue
         would. Searched from the tail: its caller appends, so the match is the last
-        entry and a concurrent -clear is what costs a full scan."""
+        entry and a concurrent -clear is what costs a full scan.
+
+        That clear is also why the number is optional — a song no longer in the
+        queue has no position, and naming one would report a place it does not
+        hold. It keeps the card, behind everything still queued."""
         items = self.queue.display_items()
         index = next(
             (
@@ -1467,8 +1484,12 @@ class MusicPlayer:
                 for offset, queued in enumerate(reversed(items))
                 if queued is item
             ),
-            len(items) + 1,
+            None,
         )
+        if index is None:
+            return self._build_queue_entry_embed(
+                item, ahead=items, title="Queued song", warning=warning
+            )
         return self._build_queue_entry_embed(
             item,
             ahead=items[: index - 1],
@@ -2165,16 +2186,25 @@ class MusicPlayer:
         block = self.np_embed_block(now_playing=now_playing)
         if not block:
             return None
-        message = await self._channel.send(embeds=block)
+        try:
+            message = await self._channel.send(embeds=block)
+        except discord.HTTPException as e:
+            # Guarded like _send_now_playing's: a caller that replies through this
+            # answers another way on None, and raising would report a failure for
+            # a -play whose song is already queued.
+            log.warning(f"NP host send failed for guild {self._guild.id}: {e}")
+            return None
         if not self._adopt_np_host_if_current(message, [], song, dedicated=True):
             return None
         return message
 
     async def repin_now_playing(self) -> bool:
-        """-now: re-host the NP block at the bottom as a fresh dedicated message.
-        Does not touch _progress_task — the updater follows the host pointer and
-        picks up the new message next tick. False when no song is live (including one
-        that ended mid-send) so the command can respond another way."""
+        """Re-host the NP block at the bottom as a fresh dedicated message, for
+        -now and for a -play whose song lands at the head. Does not touch
+        _progress_task — the updater follows the host pointer and picks up the new
+        message next tick. False when nothing was hosted: no live song, one that
+        ended mid-send, a send that failed, or a newer host already holding the
+        bottom. Callers answer another way."""
         return await self._send_np_host_message() is not None
 
     async def rehost_np_after_resume(self) -> None:

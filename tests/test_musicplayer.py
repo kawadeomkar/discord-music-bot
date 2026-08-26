@@ -4,7 +4,7 @@ import redis.asyncio as aioredis
 import asyncio
 import contextlib
 import dataclasses
-import datetime
+from dataclasses import replace
 import logging
 import re
 from zoneinfo import ZoneInfo
@@ -2089,10 +2089,7 @@ class TestEtaWalkTo:
     def _eta_at(self, mp: MusicPlayer, index: int) -> str:
         """The ETA a card at 1-based `index` renders: it waits behind every entry
         before it."""
-        now_pst, walk = mp._eta_walk_to(mp.queue.display_items()[: index - 1])
-        return _fmt_eta(
-            now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
-        )
+        return _fmt_eta(*mp._eta_walk_to(mp.queue.display_items()[: index - 1]))
 
     def test_seed_is_the_current_song_remaining_not_its_length(
         self, music_player: MusicPlayer
@@ -4961,6 +4958,18 @@ class TestNpHostAdoptRetire:
         newer.edit.assert_not_awaited()
         newer.delete.assert_not_awaited()
 
+    async def test_repin_reports_failure_when_the_send_fails(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """A caller replying through the host answers another way on False. Raising
+        instead would report a failure for a -play whose song is already queued."""
+        music_player.current_song = mock_song
+        music_player._channel.send = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "no send")
+        )
+
+        assert await music_player.repin_now_playing() is False
+
     async def test_a_shed_adopt_reports_failure(
         self, music_player: MusicPlayer
     ) -> None:
@@ -6156,6 +6165,14 @@ class TestQueueEntryCard:
     -queue page keeps _format_queue_line: a row and a card are different jobs."""
 
     @staticmethod
+    def _eta_of(embed: discord.Embed) -> str:
+        """The card's "Est. playing at" line alone."""
+        body = embed.description or ""
+        return next(
+            line for line in body.splitlines() if line.startswith("Est. playing at")
+        )
+
+    @staticmethod
     def _next_up_body(mp: MusicPlayer) -> str:
         embed = mp._build_next_up_embed()
         assert embed is not None
@@ -6374,26 +6391,77 @@ class TestQueueEntryCard:
         # by the code under test moves with it and asserts nothing.
         now_pst, seed = music_player._queue_eta_seed()
         expected = _fmt_eta(
-            now_pst + datetime.timedelta(seconds=seed.cumulative_secs + 1200),
-            seed.uncertain,
+            now_pst, replace(seed, cumulative_secs=seed.cumulative_secs + 1200)
         )
         card = music_player.build_queued_song_embed(third)
 
         assert f"Est. playing at {expected}" in described(card)
         assert card.title == "Queued song — #3"
 
-    def test_unqueued_item_falls_back_to_the_tail(
+    def test_an_unresolvable_thumbnail_is_left_off(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """A -clear landing between the put and the reply leaves nothing to locate;
-        the tail is what an appended song's estimate meant before this."""
-        seed_queue(
-            music_player.queue,
-            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
+        """A restored entry's thumbnail comes back off the wire unchecked, and this
+        card rides the NP block — a bad one would 400 every send and tick edit for
+        the guild rather than dropping an image."""
+        item = QueueObject(
+            "https://yt.com/v=1", "S", mock_author, thumbnail="not-a-url"
         )
+        seed_queue(music_player.queue, item)
+
+        assert music_player.build_queued_song_embed(item).thumbnail.url is None
+
+    @pytest.mark.parametrize(
+        ("ahead_secs", "pattern"),
+        [
+            (200_000, r"\*\*[A-Z][a-z]{2} \d{1,2}:\d{2} (AM|PM)"),  # ~2 days: weekday
+            (1_200_000, r"\*\*[A-Z][a-z]{2} \d{2} \d{1,2}:\d{2} (AM|PM)"),  # ~14: date
+        ],
+    )
+    def test_an_eta_past_today_carries_its_day(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        ahead_secs: int,
+        pattern: str,
+    ) -> None:
+        """A bare "10:19 AM" for a moment days out names no particular one. The
+        weekday runs out after a week, so past that it takes the date."""
+        song = MagicMock()
+        song.duration_secs = ahead_secs
+        song.position_secs = 0.0
+        music_player.current_song = song
+        item = QueueObject("https://yt.com/v=1", "S", mock_author, duration=60)
+        seed_queue(music_player.queue, item)
+
+        eta = self._eta_of(music_player.build_queued_song_embed(item))
+        assert re.search(pattern, eta), eta
+
+    def test_an_eta_today_carries_no_day(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """...and the ordinary case must not grow a date it does not need."""
+        item = QueueObject("https://yt.com/v=1", "S", mock_author, duration=60)
+        seed_queue(music_player.queue, item)
+
+        eta = self._eta_of(music_player.build_queued_song_embed(item))
+        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*$", eta), eta
+
+    def test_an_unqueued_item_claims_no_position(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A -clear landing between the put and the reply leaves nothing to locate.
+        Numbering it anyway names a place it does not hold; the card still renders,
+        estimated behind everything that IS still queued."""
+        ahead = QueueObject("https://yt.com/v=1", "A", mock_author, duration=60)
+        seed_queue(music_player.queue, ahead)
         gone = QueueObject("https://yt.com/v=9", "Gone", mock_author, duration=60)
 
-        assert music_player.build_queued_song_embed(gone).title == "Queued song — #2"
+        card = music_player.build_queued_song_embed(gone)
+        assert card.title == "Queued song"
+        assert self._eta_of(card) == self._eta_of(
+            music_player._build_queue_entry_embed(gone, ahead=[ahead], title="x")
+        )
 
     def test_locates_by_identity_not_url(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -10320,15 +10388,16 @@ class TestRemainingSecs:
 
         assert _remaining_secs(queue_obj_no_meta) is None
 
-    def test_non_resume_ts_does_not_shrink_duration(
+    def test_a_plain_ts_offset_shrinks_the_duration_too(
         self, mock_author: MagicMock
     ) -> None:
-        # A ?t= start offset is a playback preference, not a shorter song —
-        # only resume entries are known to play just their tail.
+        # A ?t= start seeks with -ss and then plays to the end, so the song
+        # occupies duration - ts of queue time exactly as a resume entry does. A
+        # crash-recovered entry is the same shape: ts set, is_resume false.
         from src.musicplayer import _remaining_secs
 
         item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=150, duration=210)
-        assert _remaining_secs(item) == 210
+        assert _remaining_secs(item) == 60
 
 
 class TestResumeEntryDisplay:

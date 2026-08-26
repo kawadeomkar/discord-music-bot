@@ -200,15 +200,23 @@ _LINK_TARGET_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[()\s<>\\]")
 LINK_TARGET_LIMIT = 512
 
 
+def is_web_url(url: str) -> bool:
+    """True for an http(s) URL short enough for Discord to accept. Stored and
+    yt-dlp-supplied URLs reach embeds unvalidated, and Discord answers a bad link
+    or media target with a 400 for the WHOLE send rather than dropping the field.
+    """
+    return url.startswith(("http://", "https://")) and len(url) <= LINK_TARGET_LIMIT
+
+
 def safe_link_target(url: str) -> str:
     """A URL rendered inside a masked link's TARGET.
 
-    Empty when the URL is not http(s) or is over LINK_TARGET_LIMIT — the caller
-    must then render its label unlinked, since neither can be made safe by
-    escaping: a `javascript:` target is not a web link, and a long one blows the
-    embed's budget rather than the link's syntax.
+    Empty when is_web_url refuses it — the caller must then render its label
+    unlinked, since neither failure can be fixed by escaping: a `javascript:`
+    target is not a web link, and a long one blows the embed's budget rather than
+    the link's syntax.
     """
-    if not url.startswith(("http://", "https://")) or len(url) > LINK_TARGET_LIMIT:
+    if not is_web_url(url):
         return ""
     return _LINK_TARGET_UNSAFE.sub(lambda m: f"%{ord(m.group()):02X}", url)
 
