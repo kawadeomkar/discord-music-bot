@@ -455,6 +455,18 @@ def _stream_cache_key(webpage_url: str) -> str:
     return f"ytdl:stream:{webpage_url}"
 
 
+def _cached_source_is_usable(cached: dict[str, Any]) -> bool:
+    """False for a cached source whose URL is a search term rather than a video page.
+
+    Builds before the empty-search guard cached the ytsearch wrapper itself when a
+    search matched nothing, and those entries live an hour. Ignored on read so the
+    guard runs now instead of after the TTL lapses. Every real extraction answers an
+    http(s) webpage_url, so the scheme is the whole test.
+    """
+    url = cached.get("webpage_url")
+    return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
     """How long a stream URL may be cached, or None when it isn't worth caching.
     `expire` advertises a 6-hour window but YouTube revokes long before it, so
@@ -1126,6 +1138,9 @@ class YTDL(discord.FFmpegOpusAudio):
 
         if redis is not None:
             cached = await cache_get(redis, cache_key)
+            if cached is not None and not _cached_source_is_usable(cached):
+                trace.get_current_span().set_attribute("ytdl.source_cache_stale", True)
+                cached = None
             if cached is not None:
                 trace.get_current_span().set_attribute("ytdl.source_cache_hit", True)
                 trace.get_current_span().set_attribute(
@@ -1183,7 +1198,7 @@ class YTDL(discord.FFmpegOpusAudio):
         # to the result type, and "raw result" vs "chosen entry" are two things.
         selected: YTDLEntry = data
         if "entries" in data:
-            # TODO: Validate search results have a usable audio format before accepting.
+            # TODO: Validate the selected entry has a usable audio format.
             # An entry wins purely by being the first non-playlist result — nothing
             # checks for an https audio URL at a usable bitrate, so a format-less or
             # low-quality entry is accepted here and only blows up at stream time,
@@ -1192,6 +1207,17 @@ class YTDL(discord.FFmpegOpusAudio):
                 if entry and entry.get("_type", None) != "playlist":
                     selected = entry
                     break
+            if selected is data:
+                # Nothing replaced the wrapper, and the wrapper answers webpage_url
+                # ("ytsearch:<query>") and title (the query) — so falling through
+                # caches a QueueObject whose URL is the search term, which enqueues,
+                # displays as a song, and dies at play time as a refused stream.
+                trace.get_current_span().set_attribute("ytdl.search_empty", True)
+                raise Exception(
+                    f"No YouTube results for: {search}. Some tracks — age-restricted "
+                    "ones especially — don't appear in search. Try pasting a direct "
+                    "YouTube link instead."
+                )
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
             # It is accepted but does nothing — the file is never named (prepare_filename)

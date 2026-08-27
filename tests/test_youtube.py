@@ -574,6 +574,77 @@ class TestYTSource:
                     user_input=None,
                 )
 
+    async def test_yt_source_refuses_a_search_that_matched_nothing(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A search with no results returns the ytsearch WRAPPER, which answers
+        webpage_url and title — so an unguarded fall-through mints a QueueObject
+        whose URL is the search term. It enqueues, shows as a song, and only dies at
+        play time as a refused stream."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [],
+            "webpage_url": "ytsearch:no such song anywhere",
+            "title": "no such song anywhere",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = wrapper
+            with pytest.raises(Exception, match="No YouTube results for"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "no such song anywhere",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+
+    async def test_yt_source_refuses_a_search_whose_entries_are_all_playlists(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Same fall-through, reached with a non-empty entries list: the selection
+        loop skips every playlist entry and leaves the wrapper standing."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [{"_type": "playlist", "title": "A mix"}, None],
+            "webpage_url": "ytsearch:only mixes",
+            "title": "only mixes",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = wrapper
+            with pytest.raises(Exception, match="No YouTube results for"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "only mixes",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+
+    async def test_yt_source_nothing_is_cached_for_an_empty_search(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The raise lands before the cache write. Caching the wrapper would make one
+        empty search fail every later play of the same term for the whole hour."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [],
+            "webpage_url": "ytsearch:no such song anywhere",
+            "title": "no such song anywhere",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = wrapper
+            with pytest.raises(Exception, match="No YouTube results for"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "no such song anywhere",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                    redis=fake_redis,
+                )
+
+        assert await fake_redis.keys("ytdl:source:*") == []
+
     async def test_yt_source_unsupported_url_gives_friendly_error(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -754,6 +825,42 @@ class TestYTSource:
             user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
+
+    async def test_yt_source_ignores_a_cached_search_wrapper(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        """A build without the empty-search guard cached the wrapper itself, and those
+        entries live an hour — so honouring one keeps failing every play of that term
+        long after the fix ships. Ignored, and the search runs again."""
+        import orjson as _orjson
+
+        poisoned = {
+            "webpage_url": "ytsearch:cached search",
+            "title": "cached search",
+            "duration": None,
+            "uploader": None,
+            "thumbnail": None,
+        }
+        await fake_redis.set(
+            "ytdl:source:cached search", _orjson.dumps(poisoned), ex=3600
+        )
+        fresh = {
+            "webpage_url": "https://www.youtube.com/watch?v=real",
+            "title": "The Real Song",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fresh
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "cached search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert result.webpage_url == "https://www.youtube.com/watch?v=real"
+        assert result.title == "The Real Song"
 
     async def test_yt_source_caches_thumbnail_for_next_lookup(
         self, mock_ctx: MagicMock, fake_redis: Redis
