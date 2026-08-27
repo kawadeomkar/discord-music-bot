@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.28.1"
+version = "2.29.2"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -66,7 +66,7 @@ pytest-asyncio = ">=0.25"
 # path the unit tier exists to cover. Below this floor the shape is wrong and the
 # guard tests pass against a fiction. The lock has resolved above it for a while;
 # the declared floor had not moved, so a fresh resolve could have gone under it.
-fakeredis = ">=2.37.0"
+fakeredis = ">=2.37.1"
 pytest-cov = "^7.1.0"
 # A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
 # several guards here are asyncio.timeout() calls, and a regression that removes
@@ -105,7 +105,7 @@ pyright = { version = "1.1.411", extras = ["nodejs"] }
 # moved this side silently and the hook then formatted to a different version
 # than `just lint` and CI checked. Bump both in the same commit.
 ruff = "0.15.21"
-pre-commit = "^4.6.0"
+pre-commit = "^4.6.2"
 
 [tool.poetry.group.dev]
 optional = true
@@ -164,6 +164,11 @@ reportMissingParameterType = "error"
 # rest hid 12 real errors. Prefer `# pyright: ignore[reportSomeRule]`, which
 # names the rule and trips this check once it stops being needed.
 reportUnnecessaryTypeIgnoreComment = "error"
+# `just types` passes no paths, so pyright walks the project — which is exactly src/
+# and tests/ in a checkout, and one stray scratch script otherwise. docs/ is local-only
+# working material by convention, so its files are never checked. Naming `exclude` drops
+# pyright's built-in defaults, hence the three that follow.
+exclude = ["docs", "**/node_modules", "**/__pycache__", "**/.*"]
 
 [tool.ruff]
 target-version = "py314"
