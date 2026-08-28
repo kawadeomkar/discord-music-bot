@@ -263,15 +263,17 @@ class YtdlpPool:
                 self._acquire(), _call_with_context, carrier, fn, *args
             )
 
-    def prewarm(self) -> None:
+    def prewarm(self, warm: Callable[[], object] = _warmup_noop) -> None:
         """Spawn the workers now (from setup_hook) so the first -play doesn't absorb
-        process-spawn + yt-dlp-import latency. Fire-and-forget: submits one no-op per
-        worker and returns without awaiting them."""
+        process-spawn + yt-dlp-import latency. `warm` is what each worker runs, supplied
+        by the caller like every run() callable, so a caller can also pay its own
+        first-use costs here. Fire-and-forget: submits one call per worker and returns
+        without awaiting them."""
         executor = self._acquire()
         if not isinstance(executor, ProcessPoolExecutor):
             return  # a thread pool (tests) has nothing to spawn
         for _ in range(self._max_workers):
-            executor.submit(_warmup_noop)
+            executor.submit(warm)
 
     def _close(self) -> Optional[Executor]:
         """Mark the pool closed and unpublish its executor, returning it to be joined.

@@ -237,11 +237,11 @@ class MusicBotApp(commands.AutoShardedBot):
             await self._report_archive_disabled()
         for extension in EXTENSIONS:
             await self.load_extension(extension)
-        # Spawn extraction workers now so the first -play doesn't pay
-        # process-spawn + yt-dlp-import latency. Fire-and-forget.
-        from src.youtube import ytdlp_pool
+        # Spawn extraction workers now so the first -play doesn't pay process-spawn,
+        # yt-dlp-import or first-YoutubeDL-construction latency. Fire-and-forget.
+        from src.youtube import warm_worker, ytdlp_pool
 
-        ytdlp_pool.prewarm()
+        ytdlp_pool.prewarm(warm_worker)
 
     async def _setup_history_archive(self, redis: "aioredis.Redis") -> None:
         """The enabled arm: required DSN, default-password advisory, outbox consumer

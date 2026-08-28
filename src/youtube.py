@@ -191,23 +191,39 @@ _UNUSED_INFO_COLLECTIONS = frozenset(
 _sanitize_info = youtube_dl.YoutubeDL.sanitize_info
 
 
+def _lift_thumbnail(info: dict[str, Any]) -> None:
+    """Keep the one thumbnail URL callers render before `thumbnails` leaves with the
+    other large collections. yt-dlp orders that list ascending by size, so the last
+    entry is the largest; a `thumbnail` the extractor set itself wins."""
+    if info.get("thumbnail"):
+        return
+    thumbs = info.get("thumbnails")
+    if isinstance(thumbs, list) and thumbs:
+        last = thumbs[-1]
+        if isinstance(last, dict) and isinstance(last.get("url"), str):
+            info["thumbnail"] = last["url"]
+
+
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker: sanitize_info()
     reduces the live objects a process=True info-dict carries (LazyList format ladders,
     a _YDLLogger, callables) to JSON primitives, without which every extraction fails on
     an opaque pickling error. The large collections it keeps but no caller reads are
-    dropped here too, top level and per `entries` element.
+    dropped here too, top level and per `entries` element — after the one thumbnail URL
+    callers render is lifted out of one of them.
     """
     info = _sanitize_info(info)
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
+    _lift_thumbnail(info)
     for key in _UNUSED_INFO_COLLECTIONS:
         info.pop(key, None)
     entries = info.get("entries")
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, dict):
+                _lift_thumbnail(entry)
                 for key in _UNUSED_INFO_COLLECTIONS:
                     entry.pop(key, None)
     # cast, not a bare annotation: the checker cannot verify yt-dlp's untyped dict
@@ -261,6 +277,16 @@ async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     return await ytdlp_pool.run(_ytdlp_extract, req)
 
 
+def warm_worker() -> None:
+    """Handed to prewarm(), so it runs once per pool worker. The first YoutubeDL a
+    process builds discovers plugins and probes for a JS runtime, 166-339 ms that every
+    later construction in that worker skips; paying it at startup keeps it off the first
+    -play each worker serves. Top-level so it is picklable, like _ytdlp_extract."""
+    # cast, as at every other yt-dlp boundary: the opts profiles are the plain dicts
+    # yt-dlp accepts, against a params TypedDict the checker cannot match them to.
+    youtube_dl.YoutubeDL(cast(Any, copy.copy(_YTDL_STREAM_OPTS)))
+
+
 class _YtdlpLogger:
     """Routes yt-dlp's own diagnostics into our logger instead of dropping them.
     yt-dlp announces what *precedes* an outage as warnings — formats skipped for a
@@ -303,6 +329,11 @@ _EXTRACTOR_ARGS = {
     "youtube": {
         "player_client": ["default", "-tv_simply"],
     },
+    # Without this a search or playlist extraction opens by downloading the ~880 KB
+    # youtube.com homepage for a ytcfg that only cookie-authenticated playlists read,
+    # and we send no cookies: measured at 0.35s of every search. youtube:search and
+    # youtube:tab both read this key, so one entry covers searches and playlists.
+    "youtubetab": {"skip": ["webpage"]},
     # The plugin's own default is already 127.0.0.1:4416; set explicitly so a
     # deployment where the provider lives elsewhere overrides via env, not code.
     "youtubepot-bgutilhttp": {
@@ -743,10 +774,10 @@ class QueueObject:
 
 
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
-    """Back-fill QueueObject fields that couldn't be populated at enqueue time:
-    yt_playlist()'s flat entries carry no duration/uploader/thumbnail, and pre-unified
-    ytdl:source cache entries may hold None until their TTL lapses. prefetch_stream()
-    has the full data and writes it back onto the same instance for queue_embed().
+    """Back-fill QueueObject fields that couldn't be populated at enqueue time: a
+    ytdl:source cache entry written before a field existed, or a flat entry whose
+    renderer omitted one, hold None until their TTL lapses. prefetch_stream() has the
+    full data and writes it back onto the same instance for queue_embed().
     """
     fetched_duration = data.get("duration")
     if qo.duration is None and fetched_duration is not None:
@@ -760,15 +791,23 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
 _INFLIGHT_EXTRACTS: dict[str, "asyncio.Future[Optional[YTDLExtractResult]]"] = {}
 
 
+def _inflight_key(cache_key: str, profile: str) -> str:
+    """Single-flight key: the cache key the lookup missed on, plus the shape of the
+    request. Results of different profiles are not interchangeable — a flat entry's
+    `url` is the watch page, a processed one's is the CDN stream URL — so sharing one
+    job between them would persist the wrong URL as a song's identity."""
+    return f"{cache_key}|{profile}"
+
+
 async def _extract_once(
     key: str, request: ExtractRequest
 ) -> Optional[YTDLExtractResult]:
     """One extraction per distinct query at a time, process-wide: N users pasting
     the same link are N identical jobs against a four-worker pool, racing to write
     one cache entry. The first caller extracts and the rest await its outcome,
-    exception included — a failure answers their query too. Keyed by the cache key
-    the lookup missed on; the entry is removed before the result is published, so
-    the next call after a failure extracts again."""
+    exception included — a failure answers their query too. Keyed by _inflight_key;
+    the entry is removed before the result is published, so the next call after a
+    failure extracts again."""
     running = _INFLIGHT_EXTRACTS.get(key)
     if running is not None:
         trace.get_current_span().set_attribute("ytdl.extract_shared", True)
@@ -939,10 +978,14 @@ class YTDL(discord.FFmpegOpusAudio):
         try:
             # Single-video cast: _YTDL_STREAM_OPTS on a watch URL never yields a
             # search/playlist wrapper, so the result is always a lone video here.
+            # Single-flighted with the playback loop's own resolve of the same song,
+            # which builds an identical request; a joined caller shares the winner's
+            # dict, so nothing on either path may mutate it.
             data = cast(
                 Optional[YTDLVideoInfo],
-                await _run_extract(
-                    ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
+                await _extract_once(
+                    _inflight_key(cache_key, "stream"),
+                    ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS),
                 ),
             )
             trace.get_current_span().set_attribute(
@@ -994,11 +1037,15 @@ class YTDL(discord.FFmpegOpusAudio):
             if data is None:
                 if extractions >= _MAX_STREAM_EXTRACTIONS:
                     break
-                # Single-video cast, as in prefetch_stream.
+                # Single-video cast, as in prefetch_stream, and single-flighted with
+                # it. _extract_once pops its key before publishing the result, so the
+                # re-extraction this loop performs after a DEAD probe starts a fresh
+                # job rather than rejoining the one that produced the dead URL.
                 data = cast(
                     Optional[YTDLVideoInfo],
-                    await _run_extract(
-                        ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
+                    await _extract_once(
+                        _inflight_key(cache_key, "stream"),
+                        ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS),
                     ),
                 )
                 extractions += 1
@@ -1189,7 +1236,7 @@ class YTDL(discord.FFmpegOpusAudio):
         # below would silently never happen for direct-URL plays.
         try:
             data = await _extract_once(
-                cache_key,
+                _inflight_key(cache_key, "full"),
                 ExtractRequest(
                     url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
                 ),
@@ -1325,6 +1372,11 @@ class YTDL(discord.FFmpegOpusAudio):
             video_url = (
                 entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             )
+            # A flat entry already carries what the queue card shows, so read it here
+            # rather than leaving every track blank until its prefetch lands. duration
+            # is None on a live entry; uploader falls back to channel, which the
+            # lockupViewModel entries carry instead.
+            raw_duration = entry.get("duration")
             # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
             # skipped null entries above must not leave gaps in queue_position.
             # replace() so a field added to Analytics later is carried here.
@@ -1334,6 +1386,9 @@ class YTDL(discord.FFmpegOpusAudio):
                     title,
                     requester,
                     user_input=user_input,
+                    duration=int(raw_duration) if raw_duration is not None else None,
+                    uploader=entry.get("uploader") or entry.get("channel"),
+                    thumbnail=entry.get("thumbnail"),
                     query_source=query_source,
                     analytics=replace(
                         analytics,

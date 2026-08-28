@@ -37,6 +37,7 @@ from src.youtube import (
     _record_serving_format,
     _run_extract,
     ExtractRequest,
+    _inflight_key,
     _slim_info,
     _EXTRACTOR_ARGS,
     _probe_stream_url,
@@ -47,6 +48,7 @@ from src.youtube import (
     _stream_url_ttl,
     _ytdlp_extract,
     _YtdlpLogger,
+    warm_worker,
     YTDLVideoInfo,
     YTDLVideoMetadata,
 )
@@ -927,6 +929,83 @@ class TestExtractSingleflight:
 
         assert calls == 2
 
+    async def test_a_completed_extraction_is_not_replayed_by_the_next_caller(
+        self,
+    ) -> None:
+        """The success half of the same rule: the entry goes before the result is
+        published, so a caller arriving afterwards extracts fresh. That is what makes
+        the playback loop's re-extraction after a DEAD probe a NEW job — rejoining
+        would hand it back the URL that just failed."""
+        from src.youtube import _extract_once
+
+        calls = 0
+
+        async def _once(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {"title": "fresh"}
+
+        with patch("src.youtube._run_extract", new=_once):
+            for _ in range(2):
+                await _extract_once("k", MagicMock())
+
+        assert calls == 2
+
+    async def test_different_profiles_of_one_query_do_not_share_a_job(self) -> None:
+        """The profile is part of the key because the results are not
+        interchangeable: a flat entry's `url` is the watch page, a processed one's is
+        the googlevideo CDN URL. Sharing one job between them would persist a CDN URL
+        as a song's identity — into ytdl:source, the queue, and play_history."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            waiters = [
+                asyncio.create_task(
+                    _extract_once(_inflight_key("ytdl:source:q", profile), MagicMock())
+                )
+                for profile in ("full", "flat", "stream")
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            await asyncio.gather(*waiters)
+
+        assert calls == 3
+
+    async def test_one_profile_of_one_query_still_collapses(self) -> None:
+        """The keying change must not cost the collapse it exists to provide."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            waiters = [
+                asyncio.create_task(
+                    _extract_once(_inflight_key("ytdl:source:q", "full"), MagicMock())
+                )
+                for _ in range(4)
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            await asyncio.gather(*waiters)
+
+        assert calls == 1
+
 
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
@@ -953,6 +1032,31 @@ class TestYTSourceUnifiedExtraction:
         req = mock_extract.call_args[0][0]
         assert req.opts is _YTDL_STREAM_SEARCH_OPTS
         assert req.process is True
+
+    async def test_the_inflight_key_names_the_request_profile(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """yt_source single-flights under the cache key PLUS its profile. Keyed by the
+        cache key alone, a flat caller of the same query would join this job and read
+        `url` — the CDN stream URL on a processed result — as the watch page."""
+        from src.youtube import _INFLIGHT_EXTRACTS
+
+        seen: list[str] = []
+
+        async def _record(_request: Any) -> Any:
+            seen.extend(_INFLIGHT_EXTRACTS)
+            return _fake_ytdl_data()
+
+        with patch("src.youtube._run_extract", new=_record):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "some song",
+                query_source="ytsearch",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert seen == ["ytdl:source:some song|full"]
 
     async def test_fresh_extraction_writes_both_caches(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -1961,6 +2065,71 @@ class TestRecordServingFormat:
         assert {"format_id", "protocol", "vcodec"} <= _STREAM_CACHE_FIELDS
 
 
+class TestStreamExtractionSingleflight:
+    """prefetch_stream and the playback loop's resolve build the same request for the
+    same song. Today the unified play-path extraction pre-warms the stream cache so
+    they rarely both run; a flat-resolved song has no such warm, and then the enqueue
+    prefetch and the loop race on one video."""
+
+    async def test_prefetch_and_loop_resolve_share_one_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _fake_ytdl_data(webpage_url="https://yt.com/v=race")
+
+        qobj = QueueObject("https://yt.com/v=race", "Raced Song", mock_ctx.author)
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(YTDL.prefetch_stream(qobj, redis=fake_redis)),
+                asyncio.create_task(YTDL._resolve_playable_stream(qobj, fake_redis)),
+            ]
+            # Both must clear their cache read (several fakeredis awaits) and reach
+            # the extraction before the gate opens, or the second one is a cache hit
+            # and the test passes for the wrong reason.
+            await asyncio.sleep(0.05)
+            assert calls == 1
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        assert calls == 1
+
+    async def test_a_second_song_is_still_its_own_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The key is per song: single-flighting collapses duplicates of one video,
+        never two different ones."""
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _fake_ytdl_data(webpage_url=request.url)
+
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(
+                    YTDL.prefetch_stream(
+                        QueueObject(f"https://yt.com/v=s{i}", "Song", mock_ctx.author),
+                        redis=fake_redis,
+                    )
+                )
+                for i in range(2)
+            ]
+            await asyncio.sleep(0.05)
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        assert calls == 2
+
+
 class TestPrefetchStream:
     async def test_populates_cache_on_miss(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -2140,6 +2309,13 @@ class TestPotProviderCompatibility:
         assert clients[0] == "default"
         assert not [c for c in clients if not c.startswith("-") and c != "default"]
 
+    def test_tab_extractions_skip_the_homepage_fetch(self) -> None:
+        """Without this every search and playlist extraction opens by downloading the
+        878 KB youtube.com homepage — 0.35s of a 1.00s flat search — for a ytcfg only
+        cookie-authenticated playlists read. The key is `youtubetab`, which
+        youtube:search and youtube:tab both read; under `youtube` it does nothing."""
+        assert _EXTRACTOR_ARGS["youtubetab"]["skip"] == ["webpage"]
+
 
 class TestProcessBoundaryContract:
     """Everything that must survive being pickled to a worker process.
@@ -2174,6 +2350,11 @@ class TestProcessBoundaryContract:
         a module-level function. `is` rather than `==`: pickle resolves the name on the
         far side, and only a real module-level lookup round-trips to the same object."""
         assert pickle.loads(pickle.dumps(_ytdlp_extract)) is _ytdlp_extract
+
+    def test_warm_worker_is_picklable_by_reference(self) -> None:
+        """prewarm() submits it to every worker, so it is pickled by qualified name
+        and must stay a module-level function."""
+        assert pickle.loads(pickle.dumps(warm_worker)) is warm_worker
 
     def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
         """ProcessPoolExecutor pickles `initializer` to every worker, so a closure or
@@ -2222,6 +2403,90 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+class TestWarmWorker:
+    """What prewarm() hands each worker. The pool owns lifecycle only, so the warm-up
+    is supplied by this module, like every other callable it submits."""
+
+    def test_builds_one_youtubedl_from_a_copy_of_the_stream_opts(self) -> None:
+        """The first YoutubeDL a process builds discovers plugins and probes for a JS
+        runtime — 166-339 ms every later construction skips. The copy is the rule
+        _ytdlp_extract already follows: YoutubeDL writes into the params it is given,
+        and the opts profiles are shared module state."""
+        with patch("src.youtube.youtube_dl") as mock_ytdl:
+            warm_worker()
+
+        mock_ytdl.YoutubeDL.assert_called_once()
+        (params,) = mock_ytdl.YoutubeDL.call_args.args
+        assert params == _YTDL_STREAM_OPTS
+        assert params is not _YTDL_STREAM_OPTS
+
+
+class TestYtPlaylistEntries:
+    """What a flat playlist entry puts on its queue card. The entries yt-dlp returns
+    carry duration and uploader outright and a thumbnails collection _slim_info drops,
+    so these run the real slimming rather than a hand-written entry."""
+
+    @staticmethod
+    def _raw_entry(video_id: str, **overrides: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "id": video_id,
+            "title": f"Song {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": 244,
+            "uploader": "a-ha",
+            "channel": "a-ha - Topic",
+            "thumbnails": [
+                {"url": "https://i.ytimg.com/vi/x/default.jpg"},
+                {"url": "https://i.ytimg.com/vi/x/hq720.jpg"},
+            ],
+        }
+        entry.update(overrides)
+        return entry
+
+    async def _playlist(
+        self, mock_ctx: MagicMock, entries: list[Any]
+    ) -> list[QueueObject]:
+        async def _extract(_request: Any) -> Any:
+            return _slim_info({"_type": "playlist", "entries": entries})
+
+        with patch("src.youtube._run_extract", new=_extract):
+            return await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input="https://www.youtube.com/playlist?list=PL1",
+            )
+
+    async def test_a_track_carries_duration_uploader_and_thumbnail(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        (qobj,) = await self._playlist(mock_ctx, [self._raw_entry("abc")])
+        assert qobj.duration == 244
+        assert qobj.uploader == "a-ha"
+        assert qobj.thumbnail == "https://i.ytimg.com/vi/x/hq720.jpg"
+
+    async def test_uploader_falls_back_to_channel(self, mock_ctx: MagicMock) -> None:
+        """yt-dlp also parses lockupViewModel results, which carry fewer fields than
+        the videoRenderer ones."""
+        (qobj,) = await self._playlist(
+            mock_ctx, [self._raw_entry("lockup", uploader=None)]
+        )
+        assert qobj.uploader == "a-ha - Topic"
+
+    async def test_a_live_entry_still_queues_without_a_duration(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """duration is None on a live entry. The card renders an unknown length; the
+        playlist must not lose the track over it."""
+        (qobj,) = await self._playlist(
+            mock_ctx,
+            [self._raw_entry("live", duration=None, live_status="is_live")],
+        )
+        assert qobj.duration is None
+        assert qobj.title == "Song live"
 
 
 class TestSlimInfoReturnContract:
@@ -2282,6 +2547,60 @@ class TestSlimInfoReturnContract:
             for field in _UNUSED_INFO_COLLECTIONS:
                 assert field not in entry
         pickle.loads(pickle.dumps(slim))  # the whole wrapper still round-trips
+
+    def test_slimming_keeps_the_largest_thumbnail_url(self) -> None:
+        """thumbnails[] leaves with the other oversized collections, but the one URL
+        callers render must not go with it. yt-dlp orders that list ascending by size,
+        so the last entry is the one to keep."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info(thumbnail=None)))
+        assert slim["thumbnail"] == "https://img/2.jpg"
+        assert "thumbnails" not in slim
+
+    def test_a_thumbnail_the_extractor_set_itself_wins(self) -> None:
+        """A processed info-dict already names one; the collection is the fallback."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        assert slim["thumbnail"] == "https://img.yt.com/test.jpg"
+
+    def test_no_thumbnails_collection_means_no_thumbnail_key(self) -> None:
+        """Absent stays absent — an invented empty value would be cached and rendered
+        as a real one."""
+        raw = _realistic_raw_info(thumbnail=None)
+        del raw["thumbnails"]
+        slim = cast(dict[str, Any], _slim_info(raw))
+        assert slim.get("thumbnail") is None
+
+    def test_a_thumbnails_entry_without_a_url_is_ignored(self) -> None:
+        """The last element is not guaranteed to be a usable dict. Reading `url` off
+        one that has none raises inside the worker, which fails the whole extraction
+        rather than losing one field."""
+        slim = cast(
+            dict[str, Any],
+            _slim_info(
+                _realistic_raw_info(thumbnail=None, thumbnails=[{"height": 720}])
+            ),
+        )
+        assert slim.get("thumbnail") is None
+
+    def test_an_empty_thumbnails_collection_is_survivable(self) -> None:
+        """yt-dlp emits `thumbnails: []` for a video that has none. Reading the last
+        element of it would raise inside the worker, which fails the whole extraction
+        rather than one field."""
+        slim = cast(
+            dict[str, Any],
+            _slim_info(_realistic_raw_info(thumbnail=None, thumbnails=[])),
+        )
+        assert slim.get("thumbnail") is None
+
+    def test_each_entry_keeps_its_own_largest_thumbnail(self) -> None:
+        """Playlist and search entries carry their own collection, dropped per entry —
+        so the lift has to run at both levels, not just the top."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [_realistic_raw_info(thumbnail=None), None],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        assert slim["entries"][0]["thumbnail"] == "https://img/2.jpg"
+        assert "thumbnails" not in slim["entries"][0]
 
     def test_slim_info_passes_none_through(self) -> None:
         """A failed extract_info returns None; callers branch on `data is None`, so
