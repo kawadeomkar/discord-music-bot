@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,225 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,325 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -173,8 +173,8 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
     command is a minor bump, not a major one: the version is a deploy tag for a
     self-hosted bot, nothing links against these names, and CI validates only that the
     string is semver-shaped. The interjection command was folded into `-p --now` and
-    deleted in 2.29.0 under this rule, and `--now` stopped collapsing a playlist to
-    its first track in the same release. A removal still owes users an
+    deleted under this rule in the release this branch ships, and `--now` stopped
+    collapsing a playlist to its first track in the same one. A removal still owes users an
     `## Upgrading to <version>` section in README.md — nothing else records the
     migration, and the release notes are minted from the tag.
 
@@ -405,15 +405,23 @@ play():
   │        can't start while this input resolves)
   │      • join launched CONCURRENTLY with queue_source (no data dependency);
   │        any failure cancels join and runs full cleanup() (zombie-loop prevention)
-  ├─ every non-TAIL placement: wait_for_restore() BEFORE the insert — ordering is
-  │        load-bearing: put_front LPUSHes Redis, restore_entries replays entries
-  │        already on that list in-memory-only; inserting first double-queues this song
+  ├─ EVERY placement, TAIL included: wait_for_restore() BEFORE the insert —
+  │        ordering is load-bearing: put_front LPUSHes Redis, restore_entries replays
+  │        entries already on that list in-memory-only, so inserting first
+  │        double-queues this song; and a put() before the replay lands this song
+  │        ahead of entries Redis already lists behind it
   ▼
 PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   queue_source → YTDL.yt_source: check ytdl:source:{normalized query} (TTL 1h).
   Miss, and the caller passed ResolveMode.FLAT_OK for a SEARCH → one flat search
   POST: identity only, ~0.6s, ytdl:source alone (the stream URL comes from phase
-  2's prefetch). A live/duration-less first result declines and falls through to:
+  2's prefetch). A COLD START is not FLAT_OK: its song plays immediately, so the
+  stream extraction is on the path to audio either way and flat would only move the
+  failure past the join. What the flat path gives up on the placements that take it
+  is the enqueue-time playability check — an age-gated, region-blocked or
+  members-only video has an id, a title and a duration, so it queues and fails at
+  its turn instead of failing the command. A live/duration-less first result
+  declines — after paying the flat POST — and falls through to:
   Miss on a LINK, an interjection head, or a declined flat entry → ONE unified
   stream-opts extraction returns identity AND a selected playable stream URL, so
   both caches are written from a single network round (probe first — see phase 2).
@@ -567,8 +575,9 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   says the list is the wrong shape, where the rebuild IS the repair. Empty means
   DELETE, never skip. **Only a removal may
   pass `removed`** — LREM asserts the survivors kept their order, which is false for a
-  shuffle, for an insert, and for a stale list. Three clauses gate the shortcut: `_LREM_MAX_ENTRIES` (16),
-  `_LREM_MAX_SHARE` (one in five), and `_claimed_blobs()`. **The count is the bound that
+  shuffle, for an insert, and for a stale list. Four clauses gate the shortcut: `_LREM_MAX_ENTRIES` (16),
+  `_LREM_MAX_SHARE` (one in five), `_claimed_blobs()`, and `mirror_dirty`, which
+  refuses it over a list whose order is already unknown. **The count is the bound that
   matters**: LREM is `O(position)`, so N of them cost `O(N × depth)` against a rebuild's
   `O(depth)` — the depth cancels and the crossover is a COUNT, near 18 at the low end of
   two measurements. It is not a ratio; an earlier revision said it was and admitted
@@ -711,14 +720,14 @@ the decision. Symmetrically, the 300s `_PLAYBACK_GATE_TIMEOUT` re-waits instead 
 tearing down while any hold is outstanding — every hold is released by an `async with`,
 raise or not, so it cannot park forever.
 
-**Six** call sites wait on the restore before touching the queue, bounded by
-`RESTORE_WAIT_SECS` (musicbot.py): `-play` (warm and cold), `-resume`, `-shuffle`,
-`-clear` and `-remove`. The pool sets `socket_connect_timeout` but no `socket_timeout`,
+**Five** call sites wait on the restore before touching the queue, bounded by
+`RESTORE_WAIT_SECS` (musicbot.py): `-play` (one site, covering warm and cold),
+`-resume`, `-shuffle`, `-clear` and `-remove`. The pool sets `socket_connect_timeout` but no `socket_timeout`,
 so a Redis that accepts the connection and then stalls would hang the command outright.
-The two cold-start sites must not **insert** against an unread snapshot — `-play`
-front-inserting there double-queues the song — and the other four must not **rebuild**
+The two cold-start paths must not **insert** against an unread snapshot — `-play`
+front-inserting there double-queues the song — and the other three must not **rebuild**
 the mirror from a deque the restore has not filled, which deletes the saved queue
-outright. All six abandon and say so. `MusicPlayer.restore_read_failed` separates
+outright. All five abandon and say so. `MusicPlayer.restore_read_failed` separates
 "nothing was saved" from "the store could not be read"; only the first may be reported
 to a guild as an empty queue.
 
@@ -936,7 +945,8 @@ Per-guild synchronization primitives and what they protect:
 | `GuildQueue._wake` (Event) | the pending-item signal a parked `get()` waits on; set iff `_cursor < len(_items)`, and `_sync_wake()` is its ONLY writer — a stale set turns the wait loop into a loop with no suspension point and stops the event loop (measured at 2,000,001 iterations with 0 other loop ticks) |
 | `_GuildPlays.resolves` (semaphore, src/play_placement.py) | how many of a guild's admitted `-play`s may hold one of the shared, process-wide yt-dlp pool's workers to RESOLVE (`PLAY_RESOLVE_CONCURRENCY`, default 2 against 4 workers). Admission is a memory bound; this is the pool bound on the resolve, and without it one guild's paste burst delays every other guild's extractions — including the playback loop's own in-band ones |
 | `youtube.prefetch_warm_slot()` (semaphore, process-wide) | how many enqueue-time stream warms may hold a worker. A search resolves flat and leaves the stream to `prefetch_stream`, which `queue_put` spawns per song and nobody awaits — so those never pass through `resolves` and would otherwise be bounded only by `PLAY_INFLIGHT_MAX`. Half the pool, and NOT per guild: the harm is a warm queued ahead of another guild's in-band resolve. The loop's own one-ahead prefetch takes `_stream_source` instead and never waits here |
-| `_GuildPlays.lock` (`PlayRegistry`, src/play_placement.py) | the insert alone — one Redis round trip, bounded by `PLACE_TIMEOUT_SECS` (5s). `-play` resolves with no lock and enters `PlayRegistry.place()` for the put, where four checks replace the re-read a serialized body relied on: the player is not `retired` (`-stop`/kick/watchdog since dispatch), `queue.generation` did not move (`-clear`), no command stamped it (`dropped_by` — a `-stop` landing before the join has no player to retire and no queue to bump, so the stamp has to invalidate on its own), the author is still in voice. Under the hold: the put, and the `queue_position` on it. The confirmation is rendered BEFORE the lock — an ETA walks the whole queue — and sent after it. `_GuildPlays.join` is the cold-start singleflight: one `-join` per guild, awaited through `asyncio.shield` by every request that found no voice client. `docs/ARCHITECTURE.md#play-placement` |
+| `_GuildPlays.lock` (`PlayRegistry`, src/play_placement.py) | the insert alone — one Redis round trip, bounded by `PLACE_TIMEOUT_SECS` (5s). `-play` resolves with no lock and enters `PlayRegistry.place()` for the put, where four checks replace the re-read a serialized body relied on: the player is not `retired` (`-stop`/kick/watchdog since dispatch), `queue.generation` did not move (`-clear`), no command stamped it (`dropped_by` — a `-stop` landing before the join has no player to retire and no queue to bump, so the stamp has to invalidate on its own), the author is still in voice. Under the hold: the put, and the `queue_position` on it. The playlist embeds and the front-insert notices are built BEFORE the lock; the tail confirmation is built AFTER the put and off the lock, so the slot it names is the slot the song took. `_GuildPlays.join` is the cold-start singleflight: one `-join` per guild, awaited through `asyncio.shield` by every request that found no voice client. `docs/ARCHITECTURE.md#play-placement` |
+| `_TYPING_HOLDS` / `_TYPING_TASKS` (src/util.py, process-wide) | one typing keepalive per CHANNEL, refcounted across the concurrent commands sharing it — per channel, not per guild, because that is what Discord's indicator is scoped to |
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
@@ -1016,7 +1026,9 @@ can spend the whole placement budget before the insert begins.
   command's would make a reader check two files to learn what one board looks like;
   `test_debug.py` likewise owns `MusicBot._debug_suffix` and the `-debug` card's
   end-to-end assertions, for the same reason — what the footer says and what puts it
-  there are one behavior), plus `conftest.py` (shared fixtures/seams),
+  there are one behavior; and `test_musicbot.py` owns `play_placement.py`, since what
+  decides where a song lands and what the channel is told about it are one behavior),
+  plus `conftest.py` (shared fixtures/seams),
   `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` is
   the intentionally-least-covered module.
   `test_telemetry.py` restores structlog's PROCESS-wide configuration itself, because

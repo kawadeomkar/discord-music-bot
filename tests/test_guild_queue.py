@@ -2920,7 +2920,7 @@ class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
 
         async with gq.commit_dequeue(generation) as committed:
             assert committed
-            # -playnow, scheduled into the window the hold has to close.
+            # an interjection, scheduled into the window the hold has to close.
             racer = asyncio.create_task(gq.put_front([interjected]))
             await asyncio.sleep(0)
             assert not racer.done(), (
@@ -3098,5 +3098,29 @@ class TestASwallowedAppendMarksTheMirrorStale:
 
         store.delete_queue = _refused
         await gq.clear()
+
+        assert gq.mirror_dirty
+
+
+class TestACutShortLremMarksTheMirrorStale:
+    """The LREM shortcut was the one mirror write outside _mirror_write(): a
+    cancellation there leaves the deque short by N and the list short by fewer,
+    with nothing to tell the next enqueue that appending preserves the difference."""
+
+    async def test_a_cancelled_lrem_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        # Enough survivors that the LREM shortcut is taken at all: one dropped
+        # entry may not exceed one in five (_LREM_MAX_SHARE).
+        await gq.put([_qobj(i, mock_author) for i in range(8)])
+        assert not gq.mirror_dirty
+
+        async def _cancelled(*_a: Any, **_k: Any) -> int:
+            raise asyncio.CancelledError
+
+        store.remove_queue_entries = _cancelled
+
+        with pytest.raises(asyncio.CancelledError):
+            await gq.remove(remove_matcher("https://yt.com/v=1"))
 
         assert gq.mirror_dirty

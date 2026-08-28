@@ -26,6 +26,7 @@ from src.ytdlp_pool import (
     PoolClosedError,
     RemoteCallError,
     YtdlpPool,
+    _call_with_context,
     _picklable_call,
     _warmup_noop,
     _worker_init,
@@ -234,7 +235,11 @@ class TestPrewarm:
 
         assert executor.submit.call_count == 3
         for call in executor.submit.call_args_list:
-            assert call.args[0] is _warmup_noop
+            # Through the picklable-error net, like every run() submission: a warm
+            # that raises a yt-dlp error would otherwise fail to unpickle in the
+            # parent's result thread and brick the pool.
+            assert call.args[0] is _call_with_context
+            assert call.args[2] is _warmup_noop
 
     def test_prewarm_submits_the_warm_up_the_caller_supplies(self) -> None:
         """Lifecycle is all this module owns — what a worker warms is the caller's,
@@ -251,7 +256,8 @@ class TestPrewarm:
 
         assert executor.submit.call_count == 2
         for call in executor.submit.call_args_list:
-            assert call.args[0] is warm
+            assert call.args[0] is _call_with_context
+            assert call.args[2] is warm
 
     def test_prewarm_after_shutdown_raises(self) -> None:
         """The closed gate covers every entry point, not just run()."""

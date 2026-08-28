@@ -81,7 +81,13 @@ def reset_probe_streak() -> Iterator[None]:
     import src.youtube as youtube
 
     youtube._unconfirmed_streak = 0
+    # Same reason, one dict over: _INFLIGHT_EXTRACTS holds futures bound to the loop
+    # that created them, and pytest-asyncio builds a new loop per test. A test that
+    # abandons a leader would otherwise leave a key later tests await on — a hang in
+    # an unrelated test, not a failure in the one that caused it.
+    youtube._INFLIGHT_EXTRACTS.clear()
     yield
+    youtube._INFLIGHT_EXTRACTS.clear()
     youtube._unconfirmed_streak = 0
 
 

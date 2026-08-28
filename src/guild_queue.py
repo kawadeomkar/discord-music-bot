@@ -202,9 +202,8 @@ class GuildQueue:
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
         self._generation = 0
-        # True while the Redis list is known to differ from the deque: a start
-        # transaction's LPOP that did not land, or a mirror write cut short after
-        # the deque was mutated. Cleared only by a write that replaces the list.
+        # True while the Redis list is known to differ from the deque: an LPOP that
+        # did not land, or a mirror write cut short. Cleared by a replacing write.
         self._mirror_dirty = False
 
     @contextlib.contextmanager
@@ -259,10 +258,11 @@ class GuildQueue:
     def requeue_front(self, item: QueueItem) -> None:
         """Give a claim back: the cursor steps back and the item is pending again;
         the mirror never moved. `item` may be the RESOLVED form of what was claimed
-        and replaces it, so a later rebuild serializes the resolved entry. It lands
-        in the OLDEST claimed slot (index 0) and the cursor gives up the NEWEST, so
-        two live claims (the prefetch's and loop()'s) settle by position and the
-        deque stays in step with the mirror."""
+        and replaces it, so a later rebuild serializes the resolved entry.
+
+        It writes index 0 because that is the only claimed slot there is: the
+        prefetch's requeue always lands before loop() can take a second claim, so
+        _cursor is never above 1 here and index 0 IS _cursor."""
         # Guarded like every other cursor decrement: unguarded, _cursor == 0 goes
         # negative and _items[-1] = item clobbers the TAIL.
         if self._cursor > 0:
@@ -387,9 +387,8 @@ class GuildQueue:
 
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything that was on it — the claimed
-        prefix included. The caller records these (MusicPlayer._flush_played), so
-        returning only what was pending would drop a parked resume tail's
-        play_history row with no error.
+        prefix included: the caller records these (MusicPlayer._flush_played), and a
+        parked resume tail is in that prefix.
 
         Bumps the generation under the mutex before draining, and resets the
         cursor: a claim the loop took before this clear() captured the old value
@@ -726,7 +725,9 @@ class GuildQueue:
             dropped = [_to_entry(s) for s in removed if is_persisted(s)]
             dropped_blobs = [entry.to_redis() for entry in dropped]
             if not self._claimed_blobs(dropped_blobs):
-                if await self._store.remove_queue_entries(dropped) == len(dropped):
+                with self._mirror_write():
+                    lremmed = await self._store.remove_queue_entries(dropped)
+                if lremmed == len(dropped):
                     return
                 log.warning(
                     f"queue mirror diverged from memory in guild {self._guild.id}; "
@@ -739,6 +740,12 @@ class GuildQueue:
         # Only a rebuild that landed answers for the whole list; one that did not
         # leaves it as unknown as before, and the next enqueue tries again.
         self._mirror_dirty = not landed
+
+    def holds(self, item: QueueItem) -> bool:
+        """Whether this exact object is on the deque, claimed prefix included.
+        Identity, not equality: the caller is asking about the object it just
+        inserted, and two entries for one song compare equal."""
+        return any(held is item for held in self._items)
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a CLAIMED

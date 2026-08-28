@@ -279,7 +279,9 @@ class YtdlpPool:
         if not isinstance(executor, ProcessPoolExecutor):
             return  # a thread pool (tests) has nothing to spawn
         for _ in range(self._max_workers):
-            executor.submit(warm)
+            # Through _call_with_context like every run() call: it flattens a yt-dlp
+            # exception, which otherwise fails to unpickle and bricks the pool.
+            executor.submit(_call_with_context, {}, warm)
 
     def _close(self) -> Optional[Executor]:
         """Mark the pool closed and unpublish its executor, returning it to be joined.

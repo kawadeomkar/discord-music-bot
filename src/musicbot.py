@@ -411,8 +411,10 @@ def _rebase_positions(
 
 
 def _head_depth(mp: MusicPlayer, placement: Placement) -> int:
-    """`queue_position` for the first song an insert adds, read at the insert:
-    the slot it actually takes. A cold start plays ahead of everything."""
+    """`queue_position` for the first song an insert adds, read at the insert: the
+    slot it actually takes. A cold start takes 0 — it plays ahead of everything at the
+    moment it lands, and concurrent cold starts each record 0 and each are right, the
+    same drift enqueue_depth() carries against a queue the loop keeps moving."""
     if placement is Placement.COLD_FRONT:
         return 0
     if placement is Placement.NEXT:
@@ -965,8 +967,7 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            # Only a search has a cheap metadata-only mode. A link's cost is the watch
-            # page, which no yt-dlp option skips without failing YouTube's bot check.
+            # Only a search has a cheap mode; a link pays the watch page either way.
             flat = mode is ResolveMode.FLAT_OK and (
                 isinstance(source, SpotifySource)
                 or (isinstance(source, YTSource) and source.ytsearch is not None)
@@ -987,9 +988,8 @@ class MusicBot(commands.Cog):
         self, tracks: Sequence[QueueItem], placement: Placement
     ) -> None:
         """Warm the stream URL of a playlist's head when it is about to play. Bulk
-        enqueues pass prefetch=False (N extractions mint URLs that expire before
-        playback reaches them), but under `--next` queue_put_next killed the loop's
-        one-ahead prefetch, so the head would pay a full in-band extraction. A lazy
+        enqueues pass prefetch=False, and under `--next` queue_put_next killed the
+        loop's one-ahead prefetch, so the head is left with no warm at all. A lazy
         Spotify entry has no URL yet; it resolves at dequeue."""
         if placement is not Placement.NEXT or not tracks:
             return
@@ -1014,9 +1014,8 @@ class MusicBot(commands.Cog):
         Spotify playlists arrive as titles needing YouTube search, YouTube playlists
         pre-resolved. Positions are minted at the insert: `analytics` carries the
         ask time and its depth is replaced by the one the head takes."""
-        # A playlist front-inserts in full, in order, under either flag. NEXT uses
-        # queue_put_next: the loop's prefetch holds a claim a plain front-insert
-        # lands behind. COLD_FRONT has no prefetch — the gate is shut.
+        # A playlist front-inserts in full, in order, under either flag. NEXT goes
+        # through queue_put_next, for the claim the loop's prefetch holds.
         enqueue = {
             Placement.TAIL: mp.queue_put,
             Placement.COLD_FRONT: mp.queue_put_front,
@@ -1147,16 +1146,22 @@ class MusicBot(commands.Cog):
         )
         should_show_queued = False
         if placement is Placement.COLD_FRONT:
-            # A restored queue is non-empty but sits BEHIND this song, so the resume
-            # notice replaces the confirmation; built while the queue holds only the
-            # restored entries.
-            resume_notice = mp.build_resume_notice_embed(qobj)
+            # The resume notice calls what sits behind this song "the previous
+            # session", true only while the queue holds restored entries alone. A
+            # sibling cold start that already placed put its own song in there.
+            sibling_landed = self._plays.sibling_placed(req)
+            resume_notice = (
+                None if sibling_landed else mp.build_resume_notice_embed(qobj)
+            )
             if resume_notice is not None:
                 embeds.append(resume_notice)
+            elif sibling_landed:
+                # Every cold start in a burst but the first joins a queue that is
+                # partly its own, so it gets the ordinary slot confirmation.
+                should_show_queued = True
         elif placement is Placement.NEXT:
-            # No "Est. playing at": the ETA walk seeds from the current song's
-            # FULL duration as a proxy for what is left of it, which is badly
-            # wrong for the very next slot. It names the song it waits behind.
+            # No ETA: the walk seeds from the current song's FULL duration, which is
+            # badly wrong one slot out. The note names the song it waits behind.
             embeds.append(
                 self._playing_next_embed(ctx, qobj, note=_plays_after_note(mp, vc))
             )
@@ -1204,10 +1209,9 @@ class MusicBot(commands.Cog):
             await self._report_dropped(req, verdict)
             return
         if should_show_queued:
-            # After the put, off the lock, so the card carries the slot the song
-            # took. When this song IS the head, the block's "Up next" card is the
-            # same card; re-host the live block instead — dedicated, since a
-            # response host with no own embeds strip-edits to a blank message.
+            # After the put, off the lock, so the card names the slot taken. At the
+            # head the NP block's "Up next" IS this card: re-host the live one,
+            # dedicated — a response host with no own embeds strip-edits to blank.
             if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
                 # What the card would have carried: the note and the warning.
                 said = "\n\n".join(text for text in (note, warning) if text)
@@ -1264,20 +1268,22 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # Requests resolve concurrently and serialize only at _place(). The cap is
-    # raised here, before _play's except, so it reaches cog_command_error rather
-    # than rendering as "Failed to queue song".
+    # The inflight cap is raised here, before _play's except, so it reaches
+    # cog_command_error rather than rendering as "Failed to queue song".
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
         # Consume-rest, so a multi-word search arrives whole — it is what -remove
         # matches on. The strip covers callers that bypass discord.py's parser.
         args = split_play_args(url.strip())
-        # Bound here, not after the resolve: every failure path hands this exact
-        # player to _abandon_cold_start, and a get_mp() after its cleanup() would
-        # start a fresh one. cog_before_invoke already created it.
+        # The player is bound here, not after the resolve: every failure path hands
+        # this exact one to _abandon_cold_start. The query is unquoted to match what
+        # _play stores as the entry's origin, which is what -remove matches on.
         req = self._plays.register(
-            ctx, query=args.query, mp=self.get_mp(ctx), mode=args.mode
+            ctx,
+            query=unquote_argument(args.query),
+            mp=self.get_mp(ctx),
+            mode=args.mode,
         )
         try:
             await self._play(ctx, args, req)
@@ -1318,9 +1324,8 @@ class MusicBot(commands.Cog):
         """The body behind -play, taking the argument already split and the
         request the registry admitted."""
         trace.get_current_span().set_attribute("play.mode", args.mode.value)
-        # ONE rebind, so every `origin=url` below is the query with the flag off:
-        # a leaked flag persists a user_input -remove cannot match. read_rest hands
-        # quotes through, and a quoted origin is one -remove would match literally.
+        # ONE rebind, so every `origin=url` below is the flag-free, unquoted query —
+        # the form -remove matches against.
         url = unquote_argument(args.query)
         # The error title names the branch, not the flag: `-p --now x` on an idle
         # bot queues like any other -play.
@@ -1347,8 +1352,7 @@ class MusicBot(commands.Cog):
                     return
 
                 # Bound before the join: every failure path hands this exact player
-                # to _abandon_cold_start, and a get_mp() after its cleanup() would
-                # start a fresh one. cog_before_invoke already created it.
+                # to _abandon_cold_start, and a later get_mp() would build a new one.
                 mp = self.get_mp(ctx)
                 vc = ctx.voice_client
                 # A narrowed Optional: VoiceProtocol carries neither is_playing nor
@@ -1367,9 +1371,8 @@ class MusicBot(commands.Cog):
                         interjecting = True
                         return await self._interject_flow(ctx, url, mp, live_vc, req)
                     if live_vc.is_paused() and args.mode is not PlayMode.NEXT:
-                        # Paused → interject: appending would bury the request behind
-                        # a paused song. The interrupted song returns PLAYING. `--next`
-                        # is excluded — it is next either way.
+                        # Paused → interject, and the interrupted song returns
+                        # PLAYING. `--next` is excluded: it is next either way.
                         interjecting = True
                         return await self._interject_flow(
                             ctx,
@@ -1414,10 +1417,9 @@ class MusicBot(commands.Cog):
         be followed by an await before the gate hold is released."""
         qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
         async with contextlib.AsyncExitStack() as stack:
-            # Not connected: this song jumps ahead of any queue restored from Redis.
-            # The flag decides the analytics shortcut and the join dance; the insert
-            # position is `placement`. A running join counts as cold — discord.py
-            # registers the client BEFORE the handshake completes (join_succeeded).
+            # Not connected: this song goes ahead of any queue restored from Redis. A
+            # running join counts as cold — discord.py registers the client BEFORE
+            # the handshake completes.
             in_flight_join = self._plays.join_in_flight(req.guild_id)
             cold_start = not ctx.voice_client or in_flight_join
             if cold_start:
@@ -1435,9 +1437,8 @@ class MusicBot(commands.Cog):
             )
             resolve_started = time.monotonic()
             if cold_start:
-                # Hold the gate across the join, which opens it the moment the
-                # handshake lands — before queue_source has finished extracting.
-                # Released on exiting the stack, after the front insertion.
+                # Held across the join, which opens the gate the moment the handshake
+                # lands. Released with the stack, after the front insertion.
                 await stack.enter_async_context(mp.defer_playback())
                 # One join per guild, concurrent with this resolve: voice
                 # handshake and yt-dlp extraction have no data dependency.
@@ -1455,25 +1456,35 @@ class MusicBot(commands.Cog):
                             origin=url,
                             mode=resolve_mode_for(placement),
                         )
+                    # Stamped before the join wait below, so play.resolve_secs times
+                    # the extraction alone and not the voice handshake beside it.
+                    trace.get_current_span().set_attribute(
+                        "play.resolve_secs",
+                        round(time.monotonic() - resolve_started, 3),
+                    )
                 except BaseException:
-                    # Alone on this cold start (the hold count is this command's),
-                    # cancel the join before the teardown, or join() rebuilds the
-                    # player it then finds missing. Another holder owns the join.
+                    # Alone on this cold start (the hold count is this command's), so
+                    # the join is cancelled first, before the teardown removes the
+                    # player it would rebuild. Another holder owns its own join.
                     if mp.playback_holds == 1 and not join.done():
                         join.cancel()
                         with contextlib.suppress(asyncio.CancelledError, Exception):
                             await join
-                    # Full cleanup: cog_before_invoke already started a loop() that
-                    # would otherwise zombie for 300s on queue.get() and leave
-                    # clear_connection() unfired — spurious crash recovery.
+                    # Full cleanup: cog_before_invoke already started a loop(), which
+                    # otherwise parks 300s on queue.get() with clear_connection()
+                    # unfired, and the next restart recovers a guild that stopped.
                     await self._abandon_cold_start(ctx, mp)
                     raise
+                join_started = time.monotonic()
                 with contextlib.suppress(Exception):
                     # The join task runs on the CREATOR's context, so a waiter's
                     # trace has to say the join was somebody else's.
                     if not owns_join:
                         trace.get_current_span().set_attribute("play.join_shared", True)
                     await asyncio.shield(join)
+                trace.get_current_span().set_attribute(
+                    "play.join_wait_secs", round(time.monotonic() - join_started, 3)
+                )
                 # Inserting onto a join that produced no usable client hands the
                 # loop a song it can only raise on.
                 if not join_succeeded(ctx):
@@ -1496,20 +1507,20 @@ class MusicBot(commands.Cog):
                         origin=url,
                         mode=resolve_mode_for(placement),
                     )
-            trace.get_current_span().set_attribute(
-                "play.resolve_secs", round(time.monotonic() - resolve_started, 3)
-            )
+                # The cold branch stamps its own above, before the join wait.
+                trace.get_current_span().set_attribute(
+                    "play.resolve_secs",
+                    round(time.monotonic() - resolve_started, 3),
+                )
 
             log.info(f"Voice client: {ctx.voice_client}")
 
             # Every placement waits: put_front LPUSHes the list restore_entries
-            # replays in memory, so inserting first double-queues this song, and a
-            # put() before the replay lands this song ahead of entries Redis lists
-            # behind it. Bounded, since the pool sets no socket_timeout.
+            # replays in memory, and a put() before the replay lands ahead of entries
+            # Redis lists behind it. Bounded — the pool sets no socket_timeout.
             if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                # Cold start ONLY: _abandon_cold_start cancels the player's tasks
-                # and disconnects it, which on a warm player would stop the music
-                # over a Redis blink.
+                # Cold start ONLY: _abandon_cold_start cancels tasks and
+                # disconnects, which on a warm player stops the music mid-song.
                 if cold_start:
                     await self._abandon_cold_start(ctx, mp)
                     return _restore_unreachable_notice()
@@ -1544,10 +1555,9 @@ class MusicBot(commands.Cog):
                     await self._abandon_cold_start(ctx, mp)
                 return _place_stalled_notice(before_the_put=stall.before_the_put)
             if cold_start and not req.placed:
-                # Refused at the lock after the join put the bot in the channel:
-                # tear down like the other exits, or it sits in an empty channel
-                # until the 300s idle — unless the channel has music to play
-                # (_cold_start_left_something_playable).
+                # Refused at the lock, with the join already in the channel: tear
+                # down like the other exits, unless a sibling or a restore left
+                # something playable there.
                 if not self._cold_start_left_something_playable(ctx, mp):
                     await self._abandon_cold_start(ctx, mp)
                 return None
@@ -1565,9 +1575,8 @@ class MusicBot(commands.Cog):
         lazy YTSources. The interrupted song returns after the whole playlist, and
         one `-remove <the link>` takes it all back out. `origin` is the raw command
         argument — for a playlist the link, not the generated titles."""
-        # Ask-time analytics: the message's snowflake time, depth 0 for the head.
-        # Tracks behind it derive 1, 2, … from this base; the caller re-mints the
-        # head's depth on the two paths where it queues instead.
+        # Ask-time analytics: the snowflake time, depth 0 for the head. Tracks behind
+        # it derive 1, 2, … from this base; the caller re-mints the head's own depth.
         analytics = Analytics(
             queued_at=ctx.message.created_at.timestamp(), queue_position=0
         )
@@ -1580,10 +1589,8 @@ class MusicBot(commands.Cog):
             yts = spotify_playlist_to_ytsearch(
                 titles, analytics=analytics, origin=origin
             )
-            # Only the head is resolved — it has to be playable to interrupt with,
-            # which is also why this takes yt_source's full path rather than the flat
-            # one. The rest stay lazy searches resolved at dequeue, so a 100-track
-            # album does not pay 100 searches up front.
+            # The head takes the full path — it has to be playable to interrupt
+            # with. The rest stay lazy searches, resolved at dequeue.
             head = await YTDL.yt_source(
                 ctx.author,
                 yts[0].ytsearch or "",
@@ -1652,14 +1659,15 @@ class MusicBot(commands.Cog):
         # The head only: `interjected` is attribution, which song cut the line.
         qobj.interjected = True
 
-        # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts
-        # seconds of yt-dlp dead air between the interrupt and the new song. Awaited,
-        # not spawned — the current song plays through the wait. No-op without Redis;
-        # also back-fills duration/thumbnail for the embeds below.
-        #
-        # The head only: warming N tracks would be N concurrent extractions
-        # minting URLs that expire before playback reaches them.
-        await YTDL.prefetch_stream(qobj, redis=self.redis)
+        # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
+        # the interrupt and the new song, and the current song plays through the wait.
+        # A gate, not a hint — this flow stops what is playing, so a head that could
+        # not be extracted must not get that far. Also back-fills the embed fields.
+        if not await YTDL.prefetch_stream(qobj, redis=self.redis):
+            raise RuntimeError(
+                "Could not get a playable stream for that song, so the current "
+                "song was left alone."
+            )
 
         # Before the lock: the neutralize can wait on a prefetch pinned in the
         # yt-dlp executor, which under _place would hold the guild's lock.
@@ -1679,17 +1687,15 @@ class MusicBot(commands.Cog):
                     qobj, vc, resume_paused=resume_paused, follow_on=follow_on
                 )
                 if outcome is None:
-                    # The song ended during the resolve. Insert qobj directly, at
-                    # the front — the user asked for "now" and this window can be
-                    # seconds long. It interrupted nothing, so the marker comes off.
+                    # The song ended during the resolve, so this interrupted nothing:
+                    # the marker comes off and the song front-inserts instead.
                     qobj.interjected = False
                     # interject() also returns None when the loop moved on to a
                     # DIFFERENT song, which this insert waits behind: depth 1.
                     qobj.analytics = replace(
                         qobj.analytics, queue_position=_front_insert_depth(mp)
                     )
-                    # queue_put_next: the embed promises "next", and the loop's
-                    # prefetch holds a claim a bare front-insert would land behind.
+                    # queue_put_next, for the claim the loop's prefetch holds.
                     # prefetch=False — the stream URL was warmed above.
                     await mp.queue_put_next([qobj, *follow_on], prefetch=False)
         if not verdict.placed:
@@ -1754,9 +1760,8 @@ class MusicBot(commands.Cog):
                 f"`{outcome.resume_position_str}`."
             )
         if follow_on:
-            # The interrupted song waits behind the whole playlist, so the reply
-            # says so and names the undo (`-remove <the link>` matches user_input).
-            # Tail only, head_playing: the playing song has no queue object.
+            # The interrupted song waits behind the whole playlist, so the reply says
+            # so and names the undo (`-remove <the link>` matches user_input).
             desc += _collection_note(
                 url,
                 len(follow_on),
@@ -1874,9 +1879,8 @@ class MusicBot(commands.Cog):
             if vc is not None and ctx.guild is not None:
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
-            # After the teardown, with no await between, so no request places into
-            # a player that no longer exists. Unconditional: a cold-start -play may
-            # be resolving before there is a client to find.
+            # After the teardown with no await between, so nothing places into a
+            # player that is gone. Unconditional — a cold start has no client yet.
             dropped = self._plays.inflight(play_key(ctx), "stop")
             if dropped:
                 await send_embed(
@@ -2190,9 +2194,8 @@ class MusicBot(commands.Cog):
                 )
                 return
             cleared = await mp.queue_clear()
-            # Right after the clear, with no await between: every request still
-            # resolving fails its generation check at the insert and reports
-            # itself; this names them here too.
+            # Right after the clear, no await between. Each request reports itself at
+            # the insert too, when its generation check fails; this names them here.
             dropped = self._plays.inflight(play_key(ctx), "clear")
             if not cleared and not dropped:
                 await ctx.send(
@@ -2283,9 +2286,8 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            # A -remove during a resolve is routine (a resolve can run 99s). Matched
-            # the way the queue matches — a link literally, text case-folded — so
-            # the same argument takes out the pending request and the queued song.
+            # Matched the way the queue matches — a link literally, text case-folded
+            # — so one argument takes out the pending request and the queued song.
             dropped = self._plays.inflight(
                 play_key(ctx), "remove", lambda r: matches_origin(needle, r.query)
             )

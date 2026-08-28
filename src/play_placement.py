@@ -24,8 +24,7 @@ from src.util import get_logger, record_span_error, spawn_background
 log = get_logger(__name__)
 
 # Bound on a -play's place section: the wait for the guild's lock plus one Redis
-# round trip. The pool sets no socket_timeout, so a stalled Redis would otherwise
-# park every -play in the guild behind the first to reach the lock.
+# round trip. The pool sets no socket_timeout, so this is the only bound on it.
 PLACE_TIMEOUT_SECS = 5.0
 
 
@@ -61,25 +60,26 @@ class Placement(Enum):
 
 
 class ResolveMode(Enum):
-    """Whether a resolve may stop at search metadata. FLAT_OK is every ordinary
-    placement; FULL is for a head that has to be playable before it is used — an
-    interjection stops the current song — and for a lazy entry resolving at dequeue.
-    See docs/ARCHITECTURE.md#resolve-mode."""
+    """Whether a resolve may stop at search metadata. FULL is for a head that has to
+    be playable before it is used: an interjection stops the current song, and a cold
+    start has nothing queued behind it. Every other placement is FLAT_OK; a lazy entry
+    resolving at dequeue passes no mode. See docs/ARCHITECTURE.md#resolve-mode."""
 
     FLAT_OK = "flat_ok"
     FULL = "full"
 
 
 def resolve_mode_for(placement: Placement) -> ResolveMode:
-    """Every placement -play makes without interrupting may resolve flat. A function,
-    not a mapping at each call site, so the policy has one name to change and one
-    test."""
+    """FULL for a cold start, whose song plays immediately and so pays the stream
+    extraction either way; FLAT_OK for every other placement. Enumerated rather than
+    defaulted, so a Placement added later cannot inherit FLAT_OK in silence."""
+    if placement is Placement.COLD_FRONT:
+        return ResolveMode.FULL
     return ResolveMode.FLAT_OK
 
 
-# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
-# hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
-# turns a typed `--` into a single em dash.
+# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`.
+# iOS turns a typed `--` into a single em dash.
 _DASHES: Final[str] = "-‐‑‒–—―−"
 # Built from _FLAG_MODES' keys, so a renamed flag cannot leave a stale near-miss.
 # The group is the flag minus its dashes; split_play_args re-attaches them.
@@ -238,6 +238,9 @@ class PlayRequest:
     mp: MusicPlayer
     generation: int
     mode: PlayMode
+    # Read at dispatch and carried, not re-derived: place() re-runs the voice check
+    # after the resolve, where a -pause landing in between would change the answer.
+    queue_control: bool = False
     dropped_by: str = ""
     # Set under the place lock. A placed request is past the point any command can
     # drop it, but it stays in the registry until its reply is sent.
@@ -256,9 +259,8 @@ class _GuildPlays:
         # PLAY_INFLIGHT_MAX, so a retire's linear removal is bounded.
         self.inflight: list[PlayRequest] = []
         self.join: Optional[asyncio.Task[Any]] = None
-        # PLAY_INFLIGHT_MAX bounds what this guild holds in memory; this bounds
-        # what it holds of the shared yt-dlp pool. Requests wait rather than being
-        # refused, which keeps the pool fair between guilds.
+        # PLAY_INFLIGHT_MAX bounds what this guild holds in memory; this bounds what
+        # it holds of the shared yt-dlp pool. Requests wait rather than being refused.
         self.resolves = asyncio.Semaphore(PLAY_RESOLVE_CONCURRENCY)
 
     def idle(self) -> bool:
@@ -305,6 +307,11 @@ class PlayRegistry:
             mp=mp,
             generation=mp.queue.generation,
             mode=mode,
+            queue_control=mode is not PlayMode.NORMAL
+            or (
+                isinstance(ctx.voice_client, discord.VoiceClient)
+                and ctx.voice_client.is_paused()
+            ),
         )
         plays.inflight.append(req)
         return req
@@ -321,6 +328,14 @@ class PlayRegistry:
     def resolve_slot(self, req: PlayRequest) -> asyncio.Semaphore:
         """The guild's bound on how many of its requests hold a yt-dlp worker."""
         return self._guilds[req.guild_id].resolves
+
+    def sibling_placed(self, req: PlayRequest) -> bool:
+        """Whether another of this guild's in-flight -plays has already landed — what
+        the cold-start resume notice's "previous session" wording depends on."""
+        plays = self._guilds.get(req.guild_id)
+        if plays is None:
+            return False
+        return any(other is not req and other.placed for other in plays.inflight)
 
     def join_in_flight(self, guild_id: int) -> bool:
         """Whether a cold-start join is running for this guild right now."""
@@ -356,8 +371,7 @@ class PlayRegistry:
         if plays is None:
             return []
         # Not the ones that already placed: retire() runs in play()'s finally, so a
-        # request whose song is in the queue is still listed. Stamping it would name
-        # it as dropped beside the song, and mis-attribute a later teardown.
+        # request whose song is in the queue is still listed here.
         dropped = [r for r in plays.inflight if not r.placed and matches(r)]
         for req in dropped:
             req.dropped_by = by
@@ -394,13 +408,11 @@ class PlayRegistry:
     @contextlib.asynccontextmanager
     async def place(self, req: PlayRequest) -> AsyncGenerator[PlaceResult]:
         """The guild's place lock, with the checks a resolved request passes before
-        it may insert: ① the player was retired (a put would land in the Redis
-        mirror alone), ② clear() bumped the generation, ③ a command stamped
-        `dropped_by`, ④ the author's voice state, re-read after the resolve. The
-        body must be the put alone — no Discord call, no resolve, no rendering —
-        and the caller reports every verdict after the block, catching
-        PlaceStalled around it. The hold is one Redis round trip (2.4ms p50), so
-        PLAY_INFLIGHT_MAX requests serialize ~40ms; a stalled tail reports busy."""
+        it may insert: ① the player was retired, ② clear() bumped the generation,
+        ③ a command stamped `dropped_by`, ④ the author's voice state, re-read after
+        the resolve. The body must be the put alone — no Discord call, no resolve, no
+        rendering — and the caller reports every verdict after the block, catching
+        PlaceStalled around it. See docs/ARCHITECTURE.md#play-placement."""
         plays = self._guilds[req.guild_id]
         span = trace.get_current_span()
         waited = time.monotonic()
@@ -423,20 +435,14 @@ class PlayRegistry:
                     return
                 if req.dropped_by:
                     # Stamped by a command that had nothing to retire or bump (-stop
-                    # before the join lands). The stamp has to BE an invalidation, or
-                    # the request places, joins and plays after being reported dropped.
+                    # before the join lands), so the stamp has to BE an invalidation.
                     span.set_attribute("play.verdict", PlaceVerdict.SESSION_ENDED.value)
                     span.set_attribute("play.dropped_by", req.dropped_by)
                     yield PlaceResult(PlaceVerdict.SESSION_ENDED)
                     return
-                # The request's own parsed mode, so this answers exactly what
-                # play_takes_the_queue answered at dispatch.
-                vc = req.ctx.voice_client
-                refusal = voice_refusal(
-                    req.ctx,
-                    queue_control=req.mode is not PlayMode.NORMAL
-                    or (isinstance(vc, discord.VoiceClient) and vc.is_paused()),
-                )
+                # The dispatch-time reading, carried on the request: this answers
+                # exactly what play_takes_the_queue answered when it was admitted.
+                refusal = voice_refusal(req.ctx, queue_control=req.queue_control)
                 if refusal is not None:
                     # dropped_by names a COMMAND, and no command did this — the
                     # verdict is what a "did not place" query has to read.
@@ -444,16 +450,17 @@ class PlayRegistry:
                     yield PlaceResult(PlaceVerdict.VOICE, refusal)
                     return
                 span.set_attribute("play.verdict", PlaceVerdict.PLACE.value)
-                req.placed = True
                 yield PlaceResult(PlaceVerdict.PLACE)
+                # After the body: a put that raised or was cut short queued nothing,
+                # and a placed request is one no command will stamp or report.
+                req.placed = True
         except TimeoutError as e:
             if not bound.expired():
                 # Someone else's deadline (an inner wait_for). Reporting it as a
                 # stalled queue would name the wrong subsystem and swallow the error.
                 raise
             # The only record a stall leaves — both callers turn PlaceStalled into a
-            # notice. The wait is re-read here because the attribute above is set
-            # INSIDE the lock, which a request that never acquired it did not reach.
+            # notice. Re-read here: the attribute above is set INSIDE the lock.
             span.set_attribute("play.verdict", "stalled")
             span.set_attribute(
                 "play.place_wait_secs", round(time.monotonic() - waited, 3)

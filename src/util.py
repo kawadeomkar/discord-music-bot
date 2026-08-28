@@ -11,8 +11,7 @@ from opentelemetry.trace import Span, StatusCode
 
 
 # Discord's embed field-value cap; it rejects the WHOLE send past it. The -remove
-# reply lands after the songs are gone, so the user would read "Command failed"
-# for a removal that happened.
+# reply lands after the songs are gone, so a rejected send reports a false failure.
 _FIELD_VALUE_MAX = 1024
 _TRUNCATION_MARK = "..."
 

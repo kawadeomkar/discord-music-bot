@@ -56,6 +56,7 @@ from src.util import (
 )
 from src.youtube import (
     YTDL,
+    ExtractionError,
     NpHostRef,
     QueueObject,
     invalidate_stream_cache,
@@ -1167,12 +1168,17 @@ class MusicPlayer:
         prefetch: bool = True,
     ) -> None:
         """Insert so this plays NEXT. The loop's prefetch holds a claim on the head
-        for the rest of the current song and nothing may go ahead of a claim (the
-        claimed items are a prefix, retired by LPOP), so the claim is given back
-        first, as interject() does — one killed FFmpeg, a cache-hit re-resolve. The
-        prefetch is not re-spawned: the slot's claim-then-null protocol with loop()
-        would orphan a task with a claim nothing settles. `prefetch` warms the URL."""
+        for the rest of the current song and nothing may go ahead of a claim (they are
+        a prefix, retired by LPOP), so the claim is given back first, as interject()
+        does — one killed FFmpeg, a cache-hit re-resolve. It is not re-spawned: the
+        slot's claim-then-null protocol with loop() has one slot. `prefetch` warms
+        the URL."""
         await self._neutralize_prefetch()
+        if self._prefetch_task is not None:
+            # loop() read-and-nulled the slot while that cancel settled and started
+            # the next song's prefetch, whose claim is open and which put_front lands
+            # behind. Once, not a loop: the window is one song boundary wide.
+            await self._neutralize_prefetch()
         await self.queue_put_front(obj, prefetch=prefetch)
 
     async def queue_get(self) -> QueueItem:
@@ -1869,8 +1875,8 @@ class MusicPlayer:
         await self._neutralize_prefetch()
 
         # Re-check after those awaits (a cancel can block up to yt-dlp's socket
-        # timeout): a song that ended, or one stopped and still current_song until
-        # the loop's next vc.play(), must not get a (second) resume tail.
+        # timeout): a song that ended, or one stopped and still current_song, gets
+        # no resume tail.
         if self.current_song is not current or self._stopped_deliberately:
             return None
 
@@ -1902,7 +1908,7 @@ class MusicPlayer:
                     thumbnail=current.thumbnail,
                     is_resume=True,
                     # The tail is the same play, so a song that was itself a
-                    # -playnow comes back saying so — the span attribute below
+                    # interjection comes back saying so — the span attribute below
                     # reads it at every level of a stack.
                     interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
@@ -1943,13 +1949,14 @@ class MusicPlayer:
         try:
             await self.queue.put_front(items)
         except BaseException:
-            # Cancelled here (the caller's place bound) there is no tail, and an
-            # armed marker would eat the interrupted song's history entry. Identity-
-            # checked, so a marker a later interjection replaced is left alone.
-            if self._skip_history_for is current:
-                self._skip_history_for = None
-            if self._pending_resume_tail is resume:
-                self._pending_resume_tail = None
+            # put_front mutates the deque synchronously and awaits the mirror after,
+            # so a cancellation here can leave the tail queued — disarming over one
+            # that landed records the song twice. Identity-checked against `resume`.
+            if resume is None or not self.queue.holds(resume):
+                if self._skip_history_for is current:
+                    self._skip_history_for = None
+                if self._pending_resume_tail is resume:
+                    self._pending_resume_tail = None
             raise
 
         # Only if the song we measured is still playing: if the loop moved on, the
@@ -2033,7 +2040,10 @@ class MusicPlayer:
             np_host_ref=song.np_host_ref,
         )
         self.queue.requeue_front(rebuilt)
-        song.cleanup()
+        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
+        # communicate(), and this runs under the caller's place lock. loop() keeps
+        # its twin call off its own mutex for the same reason.
+        self._spawn_background(asyncio.to_thread(song.cleanup))
 
     async def _announce_start_offset(self, song: YTDL) -> None:
         """One-line notice for a song starting partway in (a `?t=` link). Sent from
@@ -2108,8 +2118,15 @@ class MusicPlayer:
         except Exception as e:
             ctx = trace.get_current_span().get_span_context()
             trace_id = format(ctx.trace_id, "032x") if ctx.is_valid else "unavailable"
+            # yt-dlp's raw text carries its bug-report boilerplate and its
+            # --cookies-from-browser advice, neither of which means anything here.
             self._last_stream_error = StreamFailure(
-                detail=f"{type(e).__name__}: {e}", trace_id=trace_id
+                detail=(
+                    e.user_message
+                    if isinstance(e, ExtractionError)
+                    else f"{type(e).__name__}: {e}"
+                ),
+                trace_id=trace_id,
             )
             log.error(
                 f"Error processing song: {type(e).__name__}: {e} [trace_id={trace_id}]",
