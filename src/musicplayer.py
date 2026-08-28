@@ -2068,6 +2068,8 @@ class MusicPlayer:
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
+        # Full resolve (yt_source's default): a lazy entry resolving here is about to
+        # play, so the stream URL this extraction yields is wanted immediately.
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
                 self._require_requester(),

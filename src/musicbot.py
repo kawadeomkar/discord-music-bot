@@ -45,10 +45,12 @@ from src.play_placement import (
     PlayMode,
     PlayRegistry,
     PlayRequest,
+    ResolveMode,
     check_voice_permissions,
     join_succeeded,
     play_key,
     play_takes_the_queue,
+    resolve_mode_for,
     split_play_args,
 )
 from src.redis_client import (
@@ -915,6 +917,7 @@ class MusicBot(commands.Cog):
         *,
         analytics: Analytics,
         origin: str,
+        mode: ResolveMode,
     ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable: a
         ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
@@ -923,7 +926,11 @@ class MusicBot(commands.Cog):
         `analytics` is the command's ask-time head value, minted at dispatch;
         playlist tracks derive their per-track positions from it. `origin` is the
         raw command argument, carried onto every resulting item — for a collection
-        the link, not the per-track search its expansion generated."""
+        the link, not the per-track search its expansion generated.
+
+        `mode` is required and has no default: interjection resolves through this
+        same helper, so "a search may go flat" cannot be decided from the input
+        shape — only the caller knows whether the song must be playable on arrival."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
             # they become, carrying this command's analytics.
@@ -958,6 +965,12 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
+            # Only a search has a cheap metadata-only mode. A link's cost is the watch
+            # page, which no yt-dlp option skips without failing YouTube's bot check.
+            flat = mode is ResolveMode.FLAT_OK and (
+                isinstance(source, SpotifySource)
+                or (isinstance(source, YTSource) and source.ytsearch is not None)
+            )
             return await YTDL.yt_source(
                 ctx.author,
                 search,
@@ -966,6 +979,7 @@ class MusicBot(commands.Cog):
                 query_source=query_source_of(source),
                 analytics=analytics,
                 user_input=origin,
+                flat=flat,
             )
 
     @_tracer.start_as_current_span("bot.warm_front_track")
@@ -1426,7 +1440,11 @@ class MusicBot(commands.Cog):
                 try:
                     async with self._plays.resolve_slot(req):
                         qobj = await self.queue_source(
-                            ctx, source, analytics=analytics, origin=url
+                            ctx,
+                            source,
+                            analytics=analytics,
+                            origin=url,
+                            mode=resolve_mode_for(placement),
                         )
                 except BaseException:
                     # Alone on this cold start (the hold count is this command's),
@@ -1463,7 +1481,11 @@ class MusicBot(commands.Cog):
             else:
                 async with self._plays.resolve_slot(req):
                     qobj = await self.queue_source(
-                        ctx, source, analytics=analytics, origin=url
+                        ctx,
+                        source,
+                        analytics=analytics,
+                        origin=url,
+                        mode=resolve_mode_for(placement),
                     )
             trace.get_current_span().set_attribute(
                 "play.resolve_secs", round(time.monotonic() - resolve_started, 3)
@@ -1549,9 +1571,10 @@ class MusicBot(commands.Cog):
             yts = spotify_playlist_to_ytsearch(
                 titles, analytics=analytics, origin=origin
             )
-            # Only the head is resolved — it has to be playable to interrupt with.
-            # The rest stay lazy searches resolved at dequeue, so a 100-track album
-            # does not pay 100 searches up front.
+            # Only the head is resolved — it has to be playable to interrupt with,
+            # which is also why this takes yt_source's full path rather than the flat
+            # one. The rest stay lazy searches resolved at dequeue, so a 100-track
+            # album does not pay 100 searches up front.
             head = await YTDL.yt_source(
                 ctx.author,
                 yts[0].ytsearch or "",
@@ -1582,7 +1605,11 @@ class MusicBot(commands.Cog):
                     )
                 )
             return tracks[0], list(tracks[1:])
-        qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
+        # FULL, not the placement default: interject() stops the current song, so this
+        # head has to be playable before anything is stopped.
+        qobj = await self.queue_source(
+            ctx, source, analytics=analytics, origin=origin, mode=ResolveMode.FULL
+        )
         assert isinstance(qobj, QueueObject)
         return qobj, []
 

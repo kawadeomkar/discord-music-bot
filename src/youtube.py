@@ -156,6 +156,11 @@ class YTDLEntry(YTDLVideoMetadata, total=False):
     webpage_url: str
     id: str
     _type: str
+    # Flat-entry fields. `channel` is what a lockupViewModel result carries where a
+    # videoRenderer one carries `uploader`; `live_status` is how a live entry announces
+    # itself, and is the only warning that its `duration` will be None.
+    channel: str
+    live_status: str
 
 
 class YTDLExtractResult(YTDLEntry, total=False):
@@ -389,6 +394,15 @@ _YTDL_PLAYLIST_OPTS = {
     **_YTDL_BASE_OPTS,
     "noplaylist": False,
     "extract_flat": "in_playlist",
+}
+
+# Used by yt_source(flat=True): one search POST answers with id/title/duration/uploader
+# and (via _slim_info) a thumbnail for the first result, with no watch page and no player
+# call. process stays True — with process=False yt-dlp never iterates the search
+# generator, so no search happens and sanitize_info reprs the islice into a string.
+_YTDL_FLAT_SEARCH_OPTS = {
+    **_YTDL_PLAYLIST_OPTS,
+    "default_search": "auto",
 }
 
 # Legacy alias kept so any external callers that imported YTDL_OPTS still work.
@@ -788,6 +802,51 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
         qo.thumbnail = data.get("thumbnail")
 
 
+# Present on a processed entry — the served format's fields, hoisted by process=True —
+# and never on a flat one. A flat caller handed one of these means the single-flight key
+# stopped separating profiles, and its `url` is a CDN address, not a watch page.
+_PROCESSED_ENTRY_MARKERS = ("format_id", "protocol", "acodec")
+
+
+def _queue_object_from_flat_entry(
+    entry: YTDLEntry,
+    requester: Union[discord.User, discord.Member],
+    *,
+    query_source: str,
+    analytics: Analytics,
+    user_input: Optional[str],
+    ts: Optional[int] = None,
+) -> Optional[QueueObject]:
+    """Build a QueueObject from a flat search entry, or return None when the entry
+    cannot be queued as a plain song — the caller then takes the full path. webpage_url
+    is derived from `id` rather than read from `url`, so the flat and full paths agree
+    by construction: it is the stream-cache key, what -remove matches, and part of
+    play_history's dedup tuple."""
+    video_id = entry.get("id")
+    if not video_id:
+        return None
+    if any(entry.get(marker) is not None for marker in _PROCESSED_ENTRY_MARKERS):
+        log.warning("Refusing a processed entry on the flat path: %s", video_id)
+        return None
+    if entry.get("live_status") in ("is_live", "is_upcoming"):
+        return None
+    raw_duration = entry.get("duration")
+    if raw_duration is None:
+        return None
+    return QueueObject(
+        f"https://www.youtube.com/watch?v={video_id}",
+        entry.get("title") or video_id,
+        requester,
+        ts=ts,
+        user_input=user_input,
+        duration=int(raw_duration),
+        uploader=entry.get("uploader") or entry.get("channel"),
+        thumbnail=entry.get("thumbnail"),
+        query_source=query_source,
+        analytics=analytics,
+    )
+
+
 _INFLIGHT_EXTRACTS: dict[str, "asyncio.Future[Optional[YTDLExtractResult]]"] = {}
 
 
@@ -795,7 +854,8 @@ def _inflight_key(cache_key: str, profile: str) -> str:
     """Single-flight key: the cache key the lookup missed on, plus the shape of the
     request. Results of different profiles are not interchangeable — a flat entry's
     `url` is the watch page, a processed one's is the CDN stream URL — so sharing one
-    job between them would persist the wrong URL as a song's identity."""
+    job between them would persist the wrong URL as a song's identity.
+    See docs/ARCHITECTURE.md#resolve-mode."""
     return f"{cache_key}|{profile}"
 
 
@@ -829,6 +889,45 @@ async def _extract_once(
     _INFLIGHT_EXTRACTS.pop(key, None)
     if not future.done():
         future.set_result(data)
+    return data
+
+
+async def _extract_for_source(
+    key: str, request: ExtractRequest, search: str
+) -> Optional[YTDLExtractResult]:
+    """yt_source's extraction, shared by its two request profiles so that an input
+    yt-dlp refuses fails identically whichever one asked."""
+    try:
+        return await _extract_once(key, request)
+    except ExtractionError as e:
+        # parse_url whitelists no domains — any dotted host lands here for yt-dlp
+        # to accept or reject. An unrecognised site arrives as
+        # ExtractionError.unsupported (flattened in the worker, since
+        # UnsupportedError can't cross the boundary); any other one is re-raised.
+        if e.unsupported:
+            trace.get_current_span().set_attribute("ytdl.unsupported_url", True)
+            raise Exception(
+                f"This link isn't from a site I can play: {search}. Try a "
+                "YouTube, Spotify, or SoundCloud link, another yt-dlp-supported "
+                "site, or just search by name."
+            ) from e
+        raise
+
+
+def _first_video_entry(data: YTDLExtractResult) -> YTDLEntry:
+    """A wrapper carries the video in `entries`; a lone-video result already is the
+    entry. The wrapper itself is the fallback, which is what a result with no usable
+    entry produced before this was a function."""
+    if "entries" not in data:
+        return data
+    # TODO: Validate search results have a usable audio format before accepting.
+    # An entry wins purely by being the first non-playlist result — nothing
+    # checks for an https audio URL at a usable bitrate, so a format-less or
+    # low-quality entry is accepted here and only blows up at stream time,
+    # looking unrelated.
+    for entry in data["entries"]:
+        if entry and entry.get("_type", None) != "playlist":
+            return entry
     return data
 
 
@@ -1189,9 +1288,15 @@ class YTDL(discord.FFmpegOpusAudio):
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
+        flat: bool = False,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject via yt-dlp, using the
         Redis source cache if present.
+
+        flat=True answers a SEARCH from one search POST when the first result is a
+        plain video with a duration — no watch page, no player call, and no stream
+        URL, so the stream cache fills later at prefetch. Anything else falls through
+        to the full extraction below, which is what the query would have done anyway.
 
         query_source, analytics and user_input are REQUIRED so the QueueObject
         leaves here complete — a default would let a new call site forget them and
@@ -1229,31 +1334,62 @@ class YTDL(discord.FFmpegOpusAudio):
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
 
-        # Unified single extraction: one stream-opts call yields identity AND a playable
-        # stream URL, filling both the ytdl:source and ytdl:stream caches from one
-        # network round. process=True is hardcoded — an unprocessed extract_info does no
-        # format selection, so data["url"] would be absent and the stream-cache write
-        # below would silently never happen for direct-URL plays.
-        try:
-            data = await _extract_once(
-                _inflight_key(cache_key, "full"),
-                ExtractRequest(
-                    url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
-                ),
+        if flat:
+            # Metadata only: enough for the card and the queue entry, none of the
+            # format selection. The song's stream URL is extracted later, by the
+            # prefetch queue_put already spawns.
+            trace.get_current_span().set_attribute("ytdl.flat", True)
+            flat_data = await _extract_for_source(
+                _inflight_key(cache_key, "flat"),
+                ExtractRequest(url=search, opts=_YTDL_FLAT_SEARCH_OPTS),
+                search,
             )
-        except ExtractionError as e:
-            # parse_url whitelists no domains — any dotted host lands here for yt-dlp
-            # to accept or reject. An unrecognised site arrives as
-            # ExtractionError.unsupported (flattened in the worker, since
-            # UnsupportedError can't cross the boundary); any other one is re-raised.
-            if e.unsupported:
-                trace.get_current_span().set_attribute("ytdl.unsupported_url", True)
-                raise Exception(
-                    f"This link isn't from a site I can play: {search}. Try a "
-                    "YouTube, Spotify, or SoundCloud link, another yt-dlp-supported "
-                    "site, or just search by name."
-                ) from e
-            raise
+            flat_qobj = (
+                _queue_object_from_flat_entry(
+                    _first_video_entry(flat_data),
+                    requester,
+                    query_source=query_source,
+                    analytics=analytics,
+                    user_input=origin,
+                    ts=ts,
+                )
+                if flat_data is not None
+                else None
+            )
+            if flat_qobj is not None:
+                trace.get_current_span().set_attribute(
+                    "ytdl.result_title", flat_qobj.title
+                )
+                if redis is not None:
+                    await cache_set(
+                        redis,
+                        cache_key,
+                        {
+                            "webpage_url": flat_qobj.webpage_url,
+                            "title": flat_qobj.title,
+                            "duration": flat_qobj.duration,
+                            "uploader": flat_qobj.uploader,
+                            "thumbnail": flat_qobj.thumbnail,
+                        },
+                        _YT_SOURCE_TTL,
+                    )
+                return flat_qobj
+            # A live entry, one without a duration, or no result at all: take the full
+            # path, which is what this query did before the flat one existed.
+            trace.get_current_span().set_attribute("ytdl.flat_fallback", True)
+
+        # Unified single extraction, and the only path for a link: one stream-opts call
+        # yields identity AND a playable stream URL, filling both the ytdl:source and
+        # ytdl:stream caches from one network round. process=True is hardcoded — an
+        # unprocessed extract_info does no format selection, so data["url"] would be
+        # absent and the stream-cache write below would silently never happen.
+        data = await _extract_for_source(
+            _inflight_key(cache_key, "full"),
+            ExtractRequest(
+                url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
+            ),
+            search,
+        )
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
             # Every failure mode raises the same untyped "Could not find song", so
@@ -1262,20 +1398,9 @@ class YTDL(discord.FFmpegOpusAudio):
             # render the identical embed and nothing can retry selectively.
             raise Exception("Could not find song")
 
-        # A wrapper carries the video in `entries`; a lone-video result already is the
-        # entry. Separate from `data` because a leaf (YTDLEntry) is not assignable back
-        # to the result type, and "raw result" vs "chosen entry" are two things.
-        selected: YTDLEntry = data
-        if "entries" in data:
-            # TODO: Validate search results have a usable audio format before accepting.
-            # An entry wins purely by being the first non-playlist result — nothing
-            # checks for an https audio URL at a usable bitrate, so a format-less or
-            # low-quality entry is accepted here and only blows up at stream time,
-            # looking unrelated.
-            for entry in data["entries"]:
-                if entry and entry.get("_type", None) != "playlist":
-                    selected = entry
-                    break
+        # Separate from `data` because a leaf (YTDLEntry) is not assignable back to the
+        # result type, and "raw result" vs "chosen entry" are two things.
+        selected: YTDLEntry = _first_video_entry(data)
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
             # It is accepted but does nothing — the file is never named (prepare_filename)
@@ -1310,7 +1435,9 @@ class YTDL(discord.FFmpegOpusAudio):
             # Warm the stream cache from the same extraction, so queue_put's
             # prefetch_stream is a cache-hit no-op instead of a second extraction.
             # Awaited, not spawned, so the write lands before prefetch_stream's
-            # cache_get can race it. A failed probe never fails yt_source.
+            # cache_get can race it. A failed probe never fails yt_source. Only this
+            # branch can: a flat resolve has no stream URL, and its song's prefetch is
+            # the extraction — single-flighted with the playback loop's own resolve.
             stream_cached = await _probe_and_cache(
                 redis, _stream_cache_key(webpage_url), video_data
             )

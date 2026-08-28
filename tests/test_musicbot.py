@@ -43,16 +43,19 @@ from src.play_placement import (
     PlayArgs,
     PlayMode,
     PlayRequest,
+    ResolveMode,
     _GuildPlays,
     check_voice_permissions,
     join_succeeded,
     play_key,
     play_takes_the_queue,
+    resolve_mode_for,
     split_play_args,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.util import EMBED_FIELD_LIMIT
 from src.sources import (
+    SoundcloudSource,
     SpotifySource,
     SpotifyType,
     YTSource,
@@ -351,7 +354,11 @@ class TestQueueSource:
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         result = await music_bot.queue_source(
-            mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+            mock_ctx,
+            source,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            mode=ResolveMode.FLAT_OK,
         )
         assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
 
@@ -366,7 +373,11 @@ class TestQueueSource:
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, QueueObject)
 
@@ -381,9 +392,115 @@ class TestQueueSource:
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, QueueObject)
+
+
+class TestResolveModeThreading:
+    """Which inputs may answer from search metadata alone, and who decides. The
+    decision cannot be read off the input: interjection resolves through the same
+    helper, and its head must be playable before the current song is stopped."""
+
+    @staticmethod
+    def _passed_flat(spy: AsyncMock) -> bool:
+        assert spy.await_args is not None
+        return spy.await_args.kwargs["flat"]
+
+    async def _resolve(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        source: Any,
+        mode: ResolveMode,
+    ) -> AsyncMock:
+        spy = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN, mode=mode
+            )
+        return spy
+
+    async def test_a_search_goes_flat(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        spy = await self._resolve(
+            music_bot, mock_ctx, parse_input("take on me"), ResolveMode.FLAT_OK
+        )
+        assert self._passed_flat(spy) is True
+
+    async def test_a_spotify_track_goes_flat(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """It resolves to a YouTube title search, so it has the same cheap mode."""
+        assert music_bot.spotify is not None
+        music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
+        spy = await self._resolve(
+            music_bot,
+            mock_ctx,
+            SpotifySource(type=SpotifyType.TRACK, id="tid123"),
+            ResolveMode.FLAT_OK,
+        )
+        assert self._passed_flat(spy) is True
+
+    async def test_a_youtube_link_never_goes_flat(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A link has no cheap mode: its cost is the watch page, and skipping that
+        fails YouTube's bot check."""
+        spy = await self._resolve(
+            music_bot,
+            mock_ctx,
+            YTSource(url="https://yt.com/watch?v=abc", process=False),
+            ResolveMode.FLAT_OK,
+        )
+        assert self._passed_flat(spy) is False
+
+    async def test_a_soundcloud_link_never_goes_flat(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        spy = await self._resolve(
+            music_bot,
+            mock_ctx,
+            SoundcloudSource(url="https://soundcloud.com/a/b"),
+            ResolveMode.FLAT_OK,
+        )
+        assert self._passed_flat(spy) is False
+
+    async def test_full_mode_refuses_flat_even_for_a_search(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        spy = await self._resolve(
+            music_bot, mock_ctx, parse_input("take on me"), ResolveMode.FULL
+        )
+        assert self._passed_flat(spy) is False
+
+    def test_every_placement_may_resolve_flat(self) -> None:
+        """The policy has one name so it has one test. Interjection is not a
+        Placement — it never reaches this function."""
+        for placement in Placement:
+            assert resolve_mode_for(placement) is ResolveMode.FLAT_OK
+
+    async def test_an_interjection_head_resolves_full(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """interject() stops the current song; a head that turns out to be
+        unplayable would have stopped it for nothing."""
+        spy = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        with patch.object(music_bot, "queue_source", new=spy):
+            await music_bot._resolve_interjection_source(
+                mock_ctx, parse_input("take on me"), origin=_ORIGIN
+            )
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["mode"] is ResolveMode.FULL
 
 
 class TestQuerySourceClassification:
@@ -407,7 +524,11 @@ class TestQuerySourceClassification:
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert self._passed_query_source(spy) == "spotify.com"
 
@@ -419,7 +540,11 @@ class TestQuerySourceClassification:
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert self._passed_query_source(spy) == "search"
 
@@ -432,7 +557,11 @@ class TestQuerySourceClassification:
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert self._passed_query_source(spy) == "tiktok.com"
 
@@ -450,7 +579,11 @@ class TestQuerySourceClassification:
         spy = AsyncMock(return_value=tracks)
         with patch("src.musicbot.YTDL.yt_playlist", new=spy):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert self._passed_query_source(spy) == "youtube.com"
@@ -471,7 +604,11 @@ class TestQuerySourceClassification:
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.title for t in result.tracks] == ["T3", "T4", "T5"]
@@ -497,7 +634,11 @@ class TestQuerySourceClassification:
         ]
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
@@ -524,7 +665,11 @@ class TestQuerySourceClassification:
         ]
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.analytics.queue_position for t in result.tracks] == [2, 3, 4]
@@ -539,7 +684,11 @@ class TestQuerySourceClassification:
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert len(result.tracks) == 3
@@ -558,7 +707,11 @@ class TestQuerySourceClassification:
             pytest.raises(PlaylistIndexError) as excinfo,
         ):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert (excinfo.value.index, excinfo.value.total) == (9, 3)
 
@@ -574,7 +727,11 @@ class TestQuerySourceClassification:
             pytest.raises(EmptyPlaylistError),
         ):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
 
     async def test_playlist_timestamp_applies_to_the_linked_video(
@@ -587,7 +744,11 @@ class TestQuerySourceClassification:
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert result.tracks[0].title == "T3"
@@ -604,7 +765,11 @@ class TestQuerySourceClassification:
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert all(t.ts is None for t in result.tracks)
@@ -800,7 +965,11 @@ class TestSpotifyDisabled:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
 
     async def test_spotify_track_raises_when_disabled(
@@ -811,7 +980,11 @@ class TestSpotifyDisabled:
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
 
     async def test_spotify_track_raises_when_credentials_invalid(
@@ -823,7 +996,11 @@ class TestSpotifyDisabled:
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
 
     async def test_non_spotify_source_unaffected_when_disabled(
@@ -840,7 +1017,11 @@ class TestSpotifyDisabled:
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         assert isinstance(result, QueueObject)
 
@@ -864,7 +1045,11 @@ class TestSpotifyDisabled:
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ) as mock_yt:
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         call_args = mock_yt.call_args
         assert call_args[0][1] == "ytsearch:test song"
@@ -886,7 +1071,11 @@ class TestSpotifyDisabled:
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
         ) as mock_playlist:
             result = await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         mock_playlist.assert_awaited_once_with(
             "https://www.youtube.com/playlist?list=PLtest123",
@@ -911,7 +1100,11 @@ class TestSpotifyDisabled:
         )
         with pytest.raises(ValueError, match="list_id"):
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
 
     async def test_youtube_playlist_preserves_full_url(
@@ -931,7 +1124,11 @@ class TestSpotifyDisabled:
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
         ) as mock_playlist:
             await music_bot.queue_source(
-                mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
             )
         mock_playlist.assert_awaited_once_with(
             full_url,
@@ -3523,6 +3720,53 @@ class TestPlayCommand:
 
         mock_create.assert_not_called()
         music_bot.queue_source.assert_awaited_once()
+
+    async def test_the_warm_path_hands_queue_source_the_placement_mode(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The mode has no default, but it could still be hardcoded at one call site
+        and derived at the other. Both must read it from the placement."""
+        mock_ctx.voice_client = _playing_vc(mock_ctx)
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+
+        with _no_typing(), patch("asyncio.create_task"):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
+
+        assert music_bot.queue_source.await_args is not None
+        assert music_bot.queue_source.await_args.kwargs["mode"] is (
+            resolve_mode_for(Placement.TAIL)
+        )
+
+    async def test_the_cold_path_hands_queue_source_the_placement_mode(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+
+        def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
+            coro.close()
+            mock_ctx.voice_client = _connected_vc(mock_ctx)
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
+
+        assert music_bot.queue_source.await_args is not None
+        assert music_bot.queue_source.await_args.kwargs["mode"] is (
+            resolve_mode_for(Placement.COLD_FRONT)
+        )
 
     async def test_cold_join_cancels_inflight_join_when_queue_source_fails(
         self, music_bot: MusicBot, mock_ctx: MagicMock

@@ -60,6 +60,23 @@ class Placement(Enum):
     NEXT = "next"
 
 
+class ResolveMode(Enum):
+    """Whether a resolve may stop at search metadata. FLAT_OK is every ordinary
+    placement; FULL is for a head that has to be playable before it is used — an
+    interjection stops the current song — and for a lazy entry resolving at dequeue.
+    See docs/ARCHITECTURE.md#resolve-mode."""
+
+    FLAT_OK = "flat_ok"
+    FULL = "full"
+
+
+def resolve_mode_for(placement: Placement) -> ResolveMode:
+    """Every placement -play makes without interrupting may resolve flat. A function,
+    not a mapping at each call site, so the policy has one name to change and one
+    test."""
+    return ResolveMode.FLAT_OK
+
+
 # Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
 # hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
 # turns a typed `--` into a single em dash.

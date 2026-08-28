@@ -404,6 +404,22 @@ class TestQueuePutNext:
     def _titles(mp: MusicPlayer) -> list[str]:
         return [queue_object(item).title for item in mp.queue.display_items()]
 
+    async def test_it_warms_the_songs_stream_by_default(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """`--next` already warms: prefetch defaults to True and queue_put_front
+        spawns one prefetch_stream per QueueObject it inserts. For a song whose
+        metadata was resolved without a stream URL, this warm IS the extraction —
+        so anything added elsewhere to "warm the next song" would be a second
+        concurrent extraction of it, not a missing one."""
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put_next(queue_obj)
+            await asyncio.sleep(0)
+        mock_pf.assert_awaited_once()
+        assert mock_pf.call_args[0][0] == queue_obj
+
     async def test_it_lands_ahead_of_a_running_prefetchs_claim(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
