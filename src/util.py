@@ -210,6 +210,27 @@ def truncate_embed_title(title: str) -> str:
     return truncate(title, EMBED_TITLE_LIMIT)
 
 
+# Debug mode's suffix starts its own line. Inline it continues whatever the embed
+# already footers with, and Discord wraps that run wherever the width falls — mid
+# segment, so the two footers read as one paragraph.
+FOOTER_SUFFIX_SEP = "\n"
+
+
+def join_footer(base: str, suffix: str) -> str:
+    """`base` and `suffix` as one footer, the suffix on a line of its own. Either
+    side may be empty, and a lone one is the whole footer — the break is written only
+    where there are two lines to separate.
+
+    A base long enough to threaten the limit is what gets clipped. Clipping the join
+    instead would take the break and the head of the suffix with it, putting the two
+    back on one line at exactly the width where that reads worst.
+    """
+    if not (base and suffix):
+        return truncate(suffix or base, FOOTER_LIMIT)
+    room = max(0, FOOTER_LIMIT - len(suffix) - len(FOOTER_SUFFIX_SEP))
+    return f"{truncate(base, room)}{FOOTER_SUFFIX_SEP}{suffix}"
+
+
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(name)
 

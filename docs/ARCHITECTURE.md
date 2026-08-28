@@ -1587,7 +1587,14 @@ Rules each seam encodes:
   Runtime block from a non-owner and says so in the same embed.
 - **Decoration replaces rather than appends**, and removes a stale suffix when there
   is nothing to show. `play_message` is built once per song, decorated in place, and
-  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle.
+  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle. The mark is
+  the boundary it replaces from, wherever in the footer it sits.
+- **The suffix starts a line of its own** whenever the embed already carries a footer,
+  through `util.join_footer` so all three seams join identically. Inline it continues
+  that footer, and Discord wraps the run at the card's width — mid-segment, so the two
+  read as one paragraph. The break is written only when there is a base to separate
+  from, comes off with the suffix when a `--disable` strips it, and survives a
+  near-limit footer because the clip falls on the base.
 
 `RuntimeSampler` feeds the runtime segments on the NP tick's cadence
 (`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is

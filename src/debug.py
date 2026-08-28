@@ -41,10 +41,11 @@ from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth, read_guild_configs
 from src.util import (
-    FOOTER_LIMIT,
+    FOOTER_SUFFIX_SEP,
     cancel_task,
     fmt_duration,
     get_logger,
+    join_footer,
     trace_footer,
     trace_id_of,
     truncate,
@@ -127,8 +128,8 @@ _OPERATOR_NOTICE = (
     "only. Run `-ping` for dependency health."
 )
 
-# Discord's hard cap on an embed field value; FOOTER_LIMIT is its footer sibling,
-# imported from util.py above.
+# Discord's hard cap on an embed field value; util.py's FOOTER_LIMIT is its footer
+# sibling, applied by the join_footer imported above.
 _FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
@@ -225,15 +226,14 @@ def debug_footer(
 
 
 def _strip_debug_suffix(text: str) -> str:
-    """`text` with any previous debug suffix removed. The first mark is the boundary:
-    no bot-authored footer contains one, so everything from there on is ours —
-    including a doubled suffix written by the pre-idempotency code."""
-    idx = text.find(f" · {_DEBUG_MARK} ")
-    if idx != -1:
-        return text[:idx]
-    if text.startswith(f"{_DEBUG_MARK} "):
-        return ""
-    return text
+    """`text` with any previous debug suffix removed, the line break before it
+    included. The first mark is the boundary: no bot-authored footer contains one
+    (asserted over src/ below), so everything from there on is ours — a doubled
+    suffix included, which is what keeps a re-decorated embed from growing one."""
+    idx = text.find(_DEBUG_MARK)
+    if idx == -1:
+        return text
+    return text[:idx].removesuffix(FOOTER_SUFFIX_SEP)
 
 
 def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
@@ -282,16 +282,10 @@ def decorate_embeds(
 
 
 def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
-    """Join `base` and `suffix` into the footer, clipping the base if the pair does
-    not fit. Clipping the join instead would cut the ` · 🐞 ` boundary off the end,
-    after which _strip_debug_suffix never finds it again and the embed stops
-    accepting a suffix for good.
+    """Write `base` and `suffix` as the footer, the suffix on its own line — the same
+    join the two dashboards make, which is why it lives in util.py.
     """
-    if base and suffix:
-        # 3 for the " · " separator.
-        text = f"{truncate(base, max(0, FOOTER_LIMIT - len(suffix) - 3))} · {suffix}"
-    else:
-        text = truncate(suffix or base, FOOTER_LIMIT)
+    text = join_footer(base, suffix)
     embed.set_footer(
         text=text or None,
         # Discord rejects an icon with no text, so it goes with the text.
@@ -1774,9 +1768,7 @@ def render_snapshot_embed(
     footer = f"environment: {config.ENVIRONMENT}"
     if (tf := trace_footer(trace.get_current_span())) is not None:
         footer += f" \u00b7 {tf}"
-    if inputs.debug_suffix:
-        footer += f" \u00b7 {inputs.debug_suffix}"
-    embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
+    embed.set_footer(text=join_footer(footer, inputs.debug_suffix or ""))
     return embed
 
 

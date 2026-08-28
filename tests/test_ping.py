@@ -434,7 +434,8 @@ class TestDebugFooterOnTheBoard:
         )
         footer = embed.footer.text or ""
         assert footer.startswith("environment:")
-        assert footer.endswith("🐞 shard 0 · cpu 9%")
+        assert footer.endswith("\n🐞 shard 0 · cpu 9%")
+        assert "environment:" in footer.split("\n")[0]
 
     def test_no_suffix_leaves_the_footer_alone(self) -> None:
         embed = render_ping_embed(

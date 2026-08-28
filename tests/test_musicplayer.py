@@ -4639,12 +4639,14 @@ class TestPlayerDebugDecoration:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         """The NP embed already carries a stream-metadata footer (bitrate/sampling/
-        codec). Decoration must extend it, not overwrite it."""
+        codec). Decoration must extend it, not overwrite it — on its own line, since
+        the two joined inline fill the card's width and wrap mid-segment."""
         self._enable(music_player)
         music_player.current_song = mock_song
         footer = self._footers(music_player.np_embed_block())[0]
         assert "Avg Bitrate" in footer
         assert footer.index("Avg Bitrate") < footer.index("🐞")
+        assert footer.split("\n")[1].startswith("🐞")
 
     def test_the_block_carries_no_trace_id(
         self, music_player: MusicPlayer, mock_song: MagicMock

@@ -25,7 +25,7 @@ from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
 from src.musicbot import MusicBot as MusicBotCog
-from src.util import spawn_background
+from src.util import FOOTER_LIMIT, spawn_background
 from src.guild_queue import QueueObject
 from tests.helpers import command_callback, seed_queue
 from src.musicplayer import MusicPlayer
@@ -760,7 +760,7 @@ class TestDecorationIsIdempotent:
         debug.decorate_embeds([embed], shard_id=1)
         debug.decorate_embeds([embed], shard_id=2)
         text = embed.footer.text or ""
-        assert text.startswith("Avg Bitrate: 128 kbps · ")
+        assert text.startswith("Avg Bitrate: 128 kbps\n")
         assert text.count("Avg Bitrate") == 1
         assert text.count(debug._DEBUG_MARK) == 1
         assert "shard 2" in text
@@ -799,15 +799,15 @@ class TestDecorationIsIdempotent:
         debug.decorate_embeds([embed])
         assert embed.footer.text == "environment: test"
 
-    def test_a_doubled_legacy_suffix_is_fully_replaced(self) -> None:
-        """Pre-idempotency footers can carry two suffixes; the first mark is the
-        boundary, so one decoration heals the whole tail."""
+    def test_a_doubled_suffix_is_fully_replaced(self) -> None:
+        """A footer carrying two suffixes; the first mark is the boundary, so one
+        decoration heals the whole tail."""
         embed = discord.Embed(title="x")
         embed.set_footer(
-            text=f"base · {debug._DEBUG_MARK} 3 ms · {debug._DEBUG_MARK} 4 ms"
+            text=f"base\n{debug._DEBUG_MARK} 3 ms\n{debug._DEBUG_MARK} 4 ms"
         )
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"base · {debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == f"base\n{debug._DEBUG_MARK} shard 0"
 
     def test_an_undecorated_footer_is_left_exactly_alone(self) -> None:
         """Nothing to add and nothing stale to strip. Reachable: debug on, in a DM
@@ -833,25 +833,26 @@ class TestDecorationIsIdempotent:
         assert embed.to_dict().get("footer") in (None, {})
 
     def test_a_near_limit_footer_keeps_accepting_a_fresh_suffix(self) -> None:
-        """The clip falls on the base. Truncating the join cuts the ` · 🐞 `
-        boundary off, after which no suffix is ever accepted again."""
+        """The clip falls on the base, so a footer already at the limit still gets a
+        whole suffix on a line of its own rather than a half-written one."""
         embed = discord.Embed(title="x")
-        embed.set_footer(text="B" * (debug.FOOTER_LIMIT - 4))
+        embed.set_footer(text="B" * (FOOTER_LIMIT - 4))
         debug.decorate_embeds([embed], elapsed_ms=5.0, shard_id=0)
         assert "5 ms" in (embed.footer.text or "")
         debug.decorate_embeds([embed], elapsed_ms=9.0, shard_id=0)
         text = embed.footer.text or ""
         assert text.count(debug._DEBUG_MARK) == 1
         assert "9 ms" in text and "5 ms" not in text
-        assert len(text) <= debug.FOOTER_LIMIT
+        assert len(text) <= FOOTER_LIMIT
 
     def test_a_mark_that_is_not_a_suffix_takes_the_tail_with_it(self) -> None:
-        """The first mark is the boundary, so anything after it is discarded. Safe
-        only while no bot-authored footer contains one — asserted below."""
+        """The first mark is the boundary wherever it sits, so anything after it is
+        discarded and one decoration is all a footer ever carries. Safe only while no
+        bot-authored footer contains one — asserted below."""
         embed = discord.Embed(title="x")
         embed.set_footer(text=f"a · {debug._DEBUG_MARK} b · c")
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"a · {debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == f"a · \n{debug._DEBUG_MARK} shard 0"
 
     def test_no_footer_the_bot_writes_contains_the_mark(self) -> None:
         """The invariant the test above depends on. `-debug`'s own mark is in its
@@ -866,6 +867,37 @@ class TestDecorationIsIdempotent:
                 if debug._DEBUG_MARK in match.group(1):
                     offenders.append(f"{path}: {match.group(1)[:60]}")
         assert not offenders, offenders
+
+
+class TestTheSuffixStartsItsOwnLine:
+    """The embed's own footer and the debug suffix are two separate things to read,
+    and a footer near the card's width wraps wherever the width falls — mid-segment,
+    so joined inline they render as one paragraph. The suffix begins a line instead,
+    which also puts the mark in the same place on every card."""
+
+    def test_an_existing_footer_keeps_its_own_line(self) -> None:
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="Avg Bitrate: 128 kbps | Acodec: opus")
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text == (
+            f"Avg Bitrate: 128 kbps | Acodec: opus\n{debug._DEBUG_MARK} shard 0"
+        )
+
+    def test_a_suffix_with_no_footer_under_it_gets_no_break(self) -> None:
+        """Nothing to separate it from: the suffix IS the footer, and a leading break
+        would render the card with an empty first line."""
+        embed = discord.Embed(title="x")
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text == f"{debug._DEBUG_MARK} shard 0"
+
+    def test_stripping_takes_the_break_with_the_suffix(self) -> None:
+        """A --disable mid-song restores the footer exactly, not a footer with a
+        blank line under it."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="environment: test")
+        debug.decorate_embeds([embed], shard_id=0)
+        debug.strip_debug_footers([embed])
+        assert embed.footer.text == "environment: test"
 
 
 class TestOperatorGate:
@@ -1059,7 +1091,8 @@ class TestSnapshotEmbed:
         )
         footer = embed.footer.text or ""
         assert footer.startswith("environment: ")
-        assert footer.endswith("🐞 shard 0 · cpu 9%")
+        assert footer.endswith("\n🐞 shard 0 · cpu 9%")
+        assert "🐞" not in footer.split("\n")[0]
 
     async def test_footer_has_no_suffix_by_default(self, mock_ctx: MagicMock) -> None:
         mock_ctx.guild = None

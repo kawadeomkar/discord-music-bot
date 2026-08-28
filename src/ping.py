@@ -53,6 +53,7 @@ from src.spotify import Spotify
 from src.util import (
     FOOTER_LIMIT,
     get_logger,
+    join_footer,
     send_embed,
     trace_footer,
     truncate,
@@ -415,9 +416,7 @@ def render_ping_embed(
         footer += " · probing…"
     if (tf := trace_footer(span)) is not None:
         footer += f" · {tf}"
-    if debug_suffix:
-        footer += f" · {debug_suffix}"
-    embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
+    embed.set_footer(text=join_footer(footer, debug_suffix or ""))
     return embed
 
 

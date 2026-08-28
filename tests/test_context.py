@@ -303,7 +303,7 @@ class TestDebugDecoration:
         own.set_footer(text="top 10 · last 30 days")
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)
-        assert (own.footer.text or "").startswith("top 10 · last 30 days · 🐞")
+        assert (own.footer.text or "").startswith("top 10 · last 30 days\n🐞")
 
     async def test_shard_id_is_reported(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot

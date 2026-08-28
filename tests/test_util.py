@@ -10,10 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.util import (
+    FOOTER_LIMIT,
     _typing_keepalive,
     background_typing,
     fmt_duration,
     get_logger,
+    join_footer,
     pluralize,
     queue_message,
 )
@@ -173,6 +175,35 @@ class TestFmtDuration:
 
     def test_minute_rollover_pads_seconds(self) -> None:
         assert fmt_duration(61) == "1:01"
+
+
+class TestJoinFooter:
+    """The one definition of how an embed's own footer and debug mode's suffix share
+    a footer. Three seams write one (both decoration seams and the two dashboards),
+    and a seam that joined them differently would put the mark somewhere else."""
+
+    def test_the_suffix_takes_its_own_line(self) -> None:
+        assert join_footer("environment: test", "\U0001f41e shard 0") == (
+            "environment: test\n\U0001f41e shard 0"
+        )
+
+    def test_a_lone_suffix_is_the_whole_footer(self) -> None:
+        assert join_footer("", "\U0001f41e shard 0") == "\U0001f41e shard 0"
+
+    def test_a_lone_base_is_returned_unjoined(self) -> None:
+        assert join_footer("environment: test", "") == "environment: test"
+
+    def test_two_empty_sides_stay_empty(self) -> None:
+        assert join_footer("", "") == ""
+
+    def test_the_clip_falls_on_the_base(self) -> None:
+        """Clipping the join instead would take the break and the head of the suffix,
+        putting both footers back on one line."""
+        suffix = "\U0001f41e shard 0"
+        text = join_footer("B" * FOOTER_LIMIT, suffix)
+        assert len(text) == FOOTER_LIMIT
+        assert text.endswith(f"\n{suffix}")
+        assert text.startswith("BB")
 
 
 class TestBackgroundTyping:
