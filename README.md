@@ -482,6 +482,23 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.31.0
+
+**`-play <search>` answers in about half a second instead of two and a half.** A search —
+typed words, or a Spotify track link, which resolves to one — is now answered from the
+search response itself: title, length, uploader and artwork, with no stream URL. The
+stream is extracted by the background prefetch that already ran for every queued song, so
+nothing new happens on the network per play; measured against the same queries, the reply
+went from ~2.5s to ~0.6s. Pasted links, `-play --now`, and playlists are unchanged.
+
+**One behaviour genuinely changes.** Because a search no longer selects a format at
+enqueue time, a video that cannot be played — private, geo-blocked, age-gated, or with no
+usable audio — is no longer caught by the command. It queues successfully and fails at its
+turn, as a notice in the channel and a gap in playback, the way playlist tracks always
+have. A bad *link* still fails the command with nothing queued.
+
+Nothing to configure, no data touched, and no migration: rolling back is only a redeploy.
+
 ## Upgrading to 2.29.0 and 2.30.0
 
 **`-playnow` and its `pn` alias are gone.** They are replaced by a flag on `-play`:

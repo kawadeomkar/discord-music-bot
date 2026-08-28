@@ -354,8 +354,10 @@ archive would XADD onto an outbox nobody drains), constructs `PostgresHistoryArc
 stay `None`, one INFO says so, a set `POSTGRES_URL` is explicitly ignored (the flag,
 never URL presence, is consent), and a leftover outbox from an earlier enabled run
 draws a WARNING naming the un-drained depth (never auto-deleted). Either way it then
-loads the `src.musicbot` extension and fire-and-forgets `ytdlp_pool.prewarm()` so the
-first `-play` doesn't pay worker-spawn + yt-dlp-import latency. `MusicBotApp.invoke` also
+loads the `src.musicbot` extension and fire-and-forgets
+`ytdlp_pool.prewarm(warm_worker)` so the first `-play` doesn't pay worker-spawn,
+yt-dlp-import or first-`YoutubeDL` latency (the pool stays lifecycle-only: the warm-up
+callable comes from `src.youtube`, like every other callable it runs). `MusicBotApp.invoke` also
 short-circuits `--help` anywhere in a command message straight to that command's help
 embed, before voice checks or argument parsing.
 
@@ -409,9 +411,13 @@ play():
   ▼
 PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   queue_source → YTDL.yt_source: check ytdl:source:{normalized query} (TTL 1h).
-  Miss → ONE unified stream-opts extraction in the process pool returns identity
-  AND a selected playable stream URL, so both the source cache and the stream
-  cache are written from a single network round (probe first — see phase 2).
+  Miss, and the caller passed ResolveMode.FLAT_OK for a SEARCH → one flat search
+  POST: identity only, ~0.6s, ytdl:source alone (the stream URL comes from phase
+  2's prefetch). A live/duration-less first result declines and falls through to:
+  Miss on a LINK, an interjection head, or a declined flat entry → ONE unified
+  stream-opts extraction returns identity AND a selected playable stream URL, so
+  both caches are written from a single network round (probe first — see phase 2).
+  See docs/ARCHITECTURE.md#resolve-mode.
   Spotify track → title search; Spotify playlist → titles → YTSource ytsearch
   entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
   QueueObjects. Enqueue via GuildQueue.put (batch=one round-trip for playlists).
@@ -422,9 +428,10 @@ PHASE 2 — PREFETCH (background):
   • _prefetch_next_song: while song N plays, song N+1 is fully resolved AND its
     YTDL/FFmpeg source constructed, cached in ytdl:stream:{webpage_url}
     (TTL = min(URL expire − 30min, 30min) — YouTube revokes well before `expire`)
-  • every candidate URL is PROBED with a plain no-Range GET (exactly how ffmpeg
-    opens it; HEAD and ranged GETs lie about revoked URLs); only proven-playable
-    URLs are cached
+  • every candidate URL is PROBED with a plain no-Range GET (HEAD and ranged GETs
+    lie about revoked URLs), handed to aiohttp PRE-ENCODED — yarl requotes a plain
+    string and an HLS manifest signs its own path; only proven-playable URLs are
+    cached
   ▼
 PHASE 3 — STREAM (playback loop, usually zero extraction):
   loop(): gate open → dequeue → resolve (if YTSource) → yt_stream (cache hit →
@@ -854,7 +861,9 @@ rule 6a) mints the GVS token `web`'s formats need. Format ladder
 `bestaudio/best[height<=360]/best` — the 360p cap matters: on the muxed fallback rung,
 plain `best` would stream ~120 MB of 1080p video per song just for ffmpeg's `-vn` to
 discard. `_record_serving_format` warns once per format_id when serves degrade to
-muxed/HLS (the observable symptom of the primary path being down). Degradation ladder is
+muxed/HLS (the observable symptom of the primary path being down). `youtubetab:skip=
+webpage` drops the 878 KB homepage every search and playlist extraction used to open
+with — read by youtube:search and youtube:tab alike, and inert without cookies. Degradation ladder is
 designed so every rung lands on a previously-working configuration.
 
 **Revoked-URL healing** (`_resolve_playable_stream`): a revoked URL fails in the worst
@@ -1144,7 +1153,7 @@ duplicated.
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
 | spotify.py `playlist` | FIXME | playlists >100 tracks silently truncated (first page only, `next` cursor never followed) |
 | sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
-| youtube.py `yt_source` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results |
+| youtube.py `yt_source` / `_first_video_entry` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results (the marker moved to `_first_video_entry` with the loop it describes) |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | musicbot.py `play` (playlist branch) | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
 | musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but nothing WRITES it: `set_timezone` has no caller in `src/` and the `-options` command it was built for does not exist, so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a write path, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
