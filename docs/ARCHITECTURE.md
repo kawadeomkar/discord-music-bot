@@ -587,6 +587,8 @@ Returns a `QueueObject`.
 
 **`_extract_once` is keyed by `_inflight_key(cache_key, profile)`** — `"flat"`, `"full"` or `"stream"`. Keyed by the cache key alone, a flat and a full caller of one query would share a job whose `url` means different things to each: the watch page on a flat entry, the googlevideo CDN address on a processed one. The `"stream"` profile is shared by `prefetch_stream` and the playback loop's `_resolve_playable_stream`, which build identical requests; the key is popped before the result publishes, so the loop's re-extraction after a `DEAD` probe still gets a fresh job.
 
+**Every caller awaits the shared job through `asyncio.shield`, the leader included.** The key carries no guild, so the leader and its joiners are routinely different guilds: a `-play` cancelled by `-stop`, by the place bound, or by its own command timeout would otherwise propagate into the job every joiner is waiting on. The worst landing is the playback loop's `_resolve_playable_stream`, which joins on the `"stream"` profile — a `CancelledError` there is not caught by its `except Exception`, `loop()` re-raises it, and that guild has no player until a restart. Shielding the leader too is what makes the job outlive whichever caller started it; the `done_callback` that pops the key is registered before the first shield, so it runs before any awaiter resumes and a retry starts a fresh job rather than rejoining the one that just settled.
+
 ---
 
 ### Playback Loop
@@ -990,7 +992,10 @@ reflected in both readings, not just the parser; at that point the gate should h
 parsed value forward instead.
 
 1. **The player is not retired.** `MusicBot.cleanup()` stamps `MusicPlayer.mark_retired()`
-   immediately after popping the player from `mps`, before any await. A request that
+   through `PlayRegistry.retire_player`, which takes the place lock so the stamp cannot
+   land between a put's deque write and its mirror write, and stamps anyway once that
+   put's own bound expires. The synchronous history claim runs first, above every
+   await, so a song that starts while the fence waits cannot be claimed. A request that
    bound that player at dispatch (`PlayRequest.mp`) and reaches the lock after
    `-stop`, a kick or the alone-watchdog is refused and says so. Without the check the
    put lands in the Redis mirror alone — the in-memory copy went with the player —
@@ -1094,6 +1099,14 @@ nothing. Half the pool is the default so one guild can never hold all of it. Req
 wait on the semaphore rather than being refused: within a guild the order is fair, and
 the bound is what keeps it fair between guilds. A collection is one extraction job, not
 one per track, so a `--now` sits behind at most a couple of them.
+
+It bounds the *resolve*, which is only half of what a `-play` costs the pool. A search
+resolves flat and leaves the stream to `prefetch_stream`, spawned per enqueued song and
+awaited by nobody, so a burst's warms reach the pool outside this semaphore entirely.
+`youtube.prefetch_warm_slot()` is their bound — half the pool, process-wide rather than
+per guild, because the harm it prevents is a warm queued ahead of another guild's
+in-band resolve. The playback loop's own one-ahead prefetch goes through
+`_stream_source`, not this path, so it is never held behind a burst of warms.
 
 **Order in the channel is not order in the queue.** Confirmations are sent after the
 lock releases, so two requests that placed A then B can have their embeds arrive B then

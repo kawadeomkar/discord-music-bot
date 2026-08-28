@@ -884,6 +884,88 @@ class TestYTPlaylistAnalytics:
 class TestExtractSingleflight:
     """One extraction per distinct query at a time, process-wide."""
 
+    async def test_the_leaders_cancellation_does_not_reach_a_joiner(self) -> None:
+        """The key carries no guild, so the leader and a joiner are routinely
+        different guilds. Guild A's -clear cancels its prefetch; published, that
+        cancellation reaches guild B's playback loop, whose `except Exception`
+        cannot catch CancelledError and whose loop() re-raises it — guild B sits in
+        voice with a full queue and no player until a restart."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            leader = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            joiner = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            leader.cancel()
+            await asyncio.sleep(0)
+            gate.set()
+            result = await joiner
+
+        assert leader.cancelled()
+        assert not joiner.cancelled()
+        assert result == {"title": "shared"}
+
+    async def test_an_abandoned_job_still_answers_the_callers_that_stayed(
+        self,
+    ) -> None:
+        """The extraction is a task rather than an inline await, so the leader
+        walking away does not take the work with it — every joiner is still served
+        by the one job, which is the collapse this exists to provide."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            leader = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            joiners = [
+                asyncio.create_task(_extract_once("k", MagicMock())) for _ in range(3)
+            ]
+            await asyncio.sleep(0)
+            leader.cancel()
+            await asyncio.sleep(0)
+            gate.set()
+            results = await asyncio.gather(*joiners)
+
+        assert calls == 1
+        assert results == [{"title": "shared"}] * 3
+
+    async def test_a_joiner_sees_the_leaders_failure_as_that_failure(self) -> None:
+        """A failure answers the joiner's query too — as the error it was, not as a
+        None the caller would render as "Could not find song"."""
+        from src.youtube import ExtractionError, _extract_once
+
+        gate = asyncio.Event()
+
+        async def _boom(_request: Any) -> dict[str, Any]:
+            await gate.wait()
+            raise ExtractionError("nope")
+
+        with patch("src.youtube._run_extract", new=_boom):
+            leader = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            joiner = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            gate.set()
+            with pytest.raises(ExtractionError):
+                await joiner
+            with pytest.raises(ExtractionError):
+                await leader
+
     async def test_identical_concurrent_queries_extract_once(self) -> None:
         """Requests resolve concurrently now, so N users pasting the same trending
         link is N identical jobs against a FIFO pool of four workers, all racing to
@@ -3367,3 +3449,34 @@ class TestProbeSessionSharing:
             assert dict(replayed) == {}
         finally:
             await youtube.close_probe_session()
+
+
+class TestPrefetchWarmSlot:
+    """The bound on enqueue-time stream warms."""
+
+    async def test_a_burst_of_warms_cannot_hold_every_worker(self) -> None:
+        """One warm spawns per enqueued song, so a paste burst is N of them against
+        a four-worker pool. The bound is what keeps a worker free for the in-band
+        resolve another guild's playback loop is parked on."""
+        from src.youtube import prefetch_warm_slot, ytdlp_pool
+
+        slots = max(1, ytdlp_pool.max_workers // 2)
+        assert slots < ytdlp_pool.max_workers, "a bound that holds the pool is no bound"
+
+        sem = prefetch_warm_slot()
+        for _ in range(slots):
+            await sem.acquire()
+        blocked = asyncio.create_task(sem.acquire())
+        await asyncio.sleep(0)
+        try:
+            assert not blocked.done()
+        finally:
+            blocked.cancel()
+            for _ in range(slots):
+                sem.release()
+
+    async def test_one_slot_serves_every_caller_on_the_loop(self) -> None:
+        """A per-call semaphore would bound nothing."""
+        from src.youtube import prefetch_warm_slot
+
+        assert prefetch_warm_slot() is prefetch_warm_slot()

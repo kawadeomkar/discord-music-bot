@@ -54,7 +54,13 @@ from src.util import (
     truncate_embed_title,
     get_logger,
 )
-from src.youtube import YTDL, NpHostRef, QueueObject, invalidate_stream_cache
+from src.youtube import (
+    YTDL,
+    NpHostRef,
+    QueueObject,
+    invalidate_stream_cache,
+    prefetch_warm_slot,
+)
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports MusicPlayer); the
@@ -1120,9 +1126,17 @@ class MusicPlayer:
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                    self._spawn_background(self._warm_stream(item))
+
+    async def _warm_stream(self, item: QueueObject) -> None:
+        """One enqueue-time stream warm, under the process-wide background bound.
+        One spawns per song, so a paste burst is N of them at once against a four-
+        worker pool; the bound is what keeps a worker free for the in-band resolve
+        another guild's playback loop is waiting on."""
+        if self.store is None:
+            return
+        async with prefetch_warm_slot():
+            await YTDL.prefetch_stream(item, redis=self.store.redis)
 
     async def queue_put_front(
         self,
@@ -1144,9 +1158,7 @@ class MusicPlayer:
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                    self._spawn_background(self._warm_stream(item))
 
     async def queue_put_next(
         self,

@@ -9027,6 +9027,48 @@ def interject_obj(mock_author: MagicMock) -> QueueObject:
 
 
 class TestInterject:
+    async def test_the_resume_tail_reads_a_real_ytdl(
+        self,
+        music_player: MusicPlayer,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+        ytdl_instance: Callable[..., Any],
+    ) -> None:
+        """The second of the two sites that turn a playing song back into a
+        QueueObject; _neutralize_prefetch's rebuild is the other and is already
+        driven off a real YTDL. Every field the tail carries must exist there —
+        persisted and user_input were each lost once through exactly this gap, and
+        a MagicMock current_song invents whichever one goes missing."""
+        song = ytdl_instance(
+            None,
+            user_input="https://open.spotify.com/playlist/abc",
+            query_source="spotify.com",
+            played_at=1234.5,
+            interjected=True,
+            is_resume=False,
+            start_paused=False,
+            persisted=True,
+        )
+        music_player.current_song = song
+
+        outcome = await music_player.interject(interject_obj, mock_vc)
+
+        assert outcome is not None
+        tail = queue_object(music_player.queue.display_items()[-1])
+        assert tail.is_resume is True
+        assert tail.webpage_url == song.webpage_url
+        assert tail.title == song.title
+        # The tail writes the ONLY row for this play, so every stamp on it is the
+        # interrupted song's own.
+        assert tail.user_input == "https://open.spotify.com/playlist/abc"
+        assert tail.query_source == "spotify.com"
+        assert tail.played_at == 1234.5
+        assert tail.analytics == song.analytics
+        assert tail.interjected is True
+        assert tail.duration == song.duration_secs
+        assert tail.uploader == song.uploader
+        assert tail.thumbnail == song.thumbnail
+
     async def test_follow_on_sits_between_the_head_and_the_resume_tail(
         self,
         music_player: MusicPlayer,
@@ -11855,3 +11897,61 @@ class TestQueueLinesCannotForgeALink:
         now, walk = music_player._queue_eta_seed()
         line, _ = music_player._format_queue_line(item, 1, now, walk)
         assert "[" not in line and "](" not in line
+
+
+class TestRetiredFlag:
+    """place()'s verdict ① reads MusicPlayer.retired; cleanup() is its only
+    producer. Both halves were only ever driven through MagicMocks."""
+
+    async def test_mark_retired_flips_the_flag(self, music_player: MusicPlayer) -> None:
+        assert not music_player.retired
+        music_player.mark_retired()
+        assert music_player.retired
+
+    async def test_the_stamp_is_idempotent(self, music_player: MusicPlayer) -> None:
+        """cleanup() stamps once, and retire_player stamps again on its own timeout
+        path — a second stamp must not unset the first."""
+        music_player.mark_retired()
+        music_player.mark_retired()
+        assert music_player.retired
+
+
+class TestEnqueueWarmBound:
+    """The enqueue-time stream warm shares the pool with in-band resolves."""
+
+    async def test_a_warm_holds_a_pool_slot_for_its_extraction(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """One warm spawns per enqueued song, so a paste burst is N of them at once
+        against a four-worker pool. Without the slot they queue ahead of the in-band
+        resolve another guild's playback loop is parked on — dead air over there."""
+        sem = asyncio.Semaphore(1)
+        held: list[bool] = []
+
+        async def _prefetch(_item: Any, *, redis: Any) -> None:
+            held.append(sem.locked())
+
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        with (
+            patch("src.musicplayer.prefetch_warm_slot", return_value=sem),
+            patch.object(YTDL, "prefetch_stream", new=_prefetch),
+        ):
+            await music_player._warm_stream(qobj)
+
+        assert held == [True], "the extraction ran outside the bound"
+        assert not sem.locked(), "the slot outlived the warm"
+
+    async def test_an_enqueue_warms_through_the_bound(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The wiring, not the bound: queue_put spawning YTDL.prefetch_stream
+        directly would leave the semaphore in place and bypassed."""
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        warmed: list[Any] = []
+        warm = AsyncMock(side_effect=lambda item: warmed.append(item))
+
+        with patch.object(MusicPlayer, "_warm_stream", new=warm):
+            await music_player.queue_put(qobj)
+            await asyncio.sleep(0)
+
+        assert warmed == [qobj]

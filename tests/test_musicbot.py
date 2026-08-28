@@ -1147,6 +1147,52 @@ class TestEnqueuePlaylist:
         mock_ctx.message.add_reaction = AsyncMock()
         return mp
 
+    async def test_a_next_playlist_settles_the_prefetch_off_the_lock(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Both branches of _enqueue_playlist take the place lock, and both reach
+        queue_put_next's neutralize under it — so the settle is hoisted once, above
+        the branch, for the same reason the single-track route hoists its own."""
+        qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
+            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+        ]
+        mp = self._make_enqueue_mp(mock_ctx)
+        order: list[str] = []
+        mp.queue_put_next = AsyncMock()
+        mp.settle_prefetch = AsyncMock(side_effect=lambda: order.append("settle"))
+        real_place = music_bot._plays.place
+
+        @contextlib.asynccontextmanager
+        async def _spy(req: PlayRequest) -> AsyncIterator[PlaceResult]:
+            order.append("place")
+            async with real_place(req) as verdict:
+                yield verdict
+
+        music_bot._plays.place = _spy
+        await music_bot._enqueue_playlist(
+            mock_ctx,
+            YTSource(url="https://www.youtube.com/playlist?list=PLx", list_id="PLx"),
+            ResolvedYoutubePlaylist(tracks=qobjs),
+            mp,
+            _admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            placement=Placement.NEXT,
+        )
+
+        assert order == ["settle", "place"]
+
+    async def test_a_lazy_spotify_head_is_not_warmed(self, music_bot: MusicBot) -> None:
+        """--next warms the playlist head because queue_put_next killed the loop's
+        one-ahead prefetch. A Spotify collection's head is still a YTSource — it
+        resolves at dequeue — and prefetch_stream reads a webpage_url it has not
+        got, which would raise AFTER the tracks are already queued."""
+        head = YTSource(ytsearch="ytsearch:song one")
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock()) as warm:
+            await music_bot._warm_front_track([head], Placement.NEXT)
+        warm.assert_not_awaited()
+
     # ── YouTube playlist path ─────────────────────────────────────────────────
 
     async def test_yt_sends_embed_with_song_count_and_playlist_url(
@@ -1670,6 +1716,31 @@ class TestCleanup:
                 missing.append(cmd.name)
 
         assert missing == [], f"commands with no span: {missing}"
+
+    async def test_cleanup_claims_the_song_before_it_awaits_the_retire(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """claim_current_song_for_history is synchronous by design — it reads the
+        song and takes the _skip_history_for marker with no await between. Behind
+        retire_player's wait on the place lock, the loop can end this song, record
+        it and start the next one inside the window, and the claim then writes a
+        play_history row for a song that played a fraction of a second, with a
+        fresh played_at that ON CONFLICT will not dedup."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(
+            side_effect=lambda: order.append("claim")
+        )
+
+        async def _retire(guild_id: int, mp: Any) -> None:
+            order.append("retire")
+
+        music_bot._plays.retire_player = _retire
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert order == ["claim", "retire"]
 
     async def test_cleanup_retires_the_player_before_its_first_await(
         self, music_bot: MusicBot, mock_guild: MagicMock
@@ -6279,6 +6350,45 @@ class TestNowFlag:
 
         assert order == ["settle", "place"]
 
+    async def test_next_settles_the_prefetch_before_the_place_lock(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """--next reaches the same cancel by another road: queue_put_next
+        neutralizes the prefetch, and a prefetch pinned in the yt-dlp executor
+        cannot be interrupted. Run under the lock it holds the guild's place
+        section for the whole extraction, and a --next that outlives the bound is
+        cancelled mid-neutralize — not queued, while the notice says it may be."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "Next up", mock_ctx.author)
+        )
+
+        order: list[str] = []
+        live_mp.settle_prefetch = AsyncMock(
+            side_effect=lambda *a, **k: order.append("settle")
+        )
+        real_place = music_bot._plays.place
+
+        @contextlib.asynccontextmanager
+        async def _spy(req: PlayRequest) -> AsyncIterator[PlaceResult]:
+            order.append("place")
+            async with real_place(req) as verdict:
+                yield verdict
+
+        music_bot._plays.place = _spy
+        with _no_typing(), patch.object(YTDL, "prefetch_stream", new=AsyncMock()):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="--next test"
+            )
+
+        assert order == ["settle", "place"]
+        live_mp.interject.assert_not_awaited()  # --next never interrupts
+
     async def test_warms_stream_cache_before_interjecting(
         self,
         music_bot: MusicBot,
@@ -8432,3 +8542,50 @@ class TestColdStartSingleflight:
         guard = inspect.getsource(MusicBot._abandon_cold_start).splitlines()
         read = next(n for n, line in enumerate(guard) if "playback_holds > 1" in line)
         assert guard[read + 1].strip().startswith("return"), guard[read + 1]
+
+
+class TestRetirePlayerFence:
+    """retire_player stamps a player retired without landing mid-placement."""
+
+    async def test_it_waits_for_a_put_in_progress(self, music_bot: MusicBot) -> None:
+        """The put writes the deque and then the mirror, and a flag set between the
+        two leaves the song in one leg only. So the stamp takes the place lock, and
+        a put holding it finishes first."""
+        plays = _GuildPlays()
+        music_bot._plays._guilds[7] = plays
+        mp = MagicMock()
+        await plays.lock.acquire()
+
+        retire = asyncio.create_task(music_bot._plays.retire_player(7, cast(Any, mp)))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        mp.mark_retired.assert_not_called()
+
+        plays.lock.release()
+        await retire
+        mp.mark_retired.assert_called_once()
+
+    async def test_a_stalled_put_does_not_hold_the_stamp_forever(
+        self, music_bot: MusicBot
+    ) -> None:
+        """A stalled Redis must not keep a teardown from retiring the player: past
+        the put's own bound the stamp lands anyway, or every later -play places into
+        a player that is already torn down."""
+        plays = _GuildPlays()
+        music_bot._plays._guilds[7] = plays
+        mp = MagicMock()
+        await plays.lock.acquire()  # never released
+
+        with patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01):
+            await music_bot._plays.retire_player(7, cast(Any, mp))
+
+        mp.mark_retired.assert_called_once()
+        plays.lock.release()
+
+    async def test_a_guild_with_no_requests_retires_without_a_lock(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Nothing to fence against, so the stamp is immediate."""
+        mp = MagicMock()
+        await music_bot._plays.retire_player(999, cast(Any, mp))
+        mp.mark_retired.assert_called_once()

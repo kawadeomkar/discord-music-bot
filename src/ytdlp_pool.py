@@ -168,6 +168,12 @@ class YtdlpPool:
         self._log_queue: Optional[Any] = None
         self._log_listener: Optional[QueueListener] = None
 
+    @property
+    def max_workers(self) -> int:
+        """Worker count this pool runs with, for callers sizing their own bounds
+        against it — YTDLP_POOL_WORKERS stays read in one place."""
+        return self._max_workers
+
     def _spawn_process_pool(self) -> Executor:
         # initializer runs _worker_init() per worker so yt-dlp's warnings reach the
         # parent structured. Cheap under the lock: __init__ does not spawn.

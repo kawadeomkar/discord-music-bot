@@ -662,12 +662,12 @@ class MusicBot(commands.Cog):
         trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         if mp is None:
             return
+        # Before any await, so the loop's iteration end cannot land in the window.
+        # Nothing else records this song: it left the queue at start, and
+        # clear_connection() drops the parked copy.
+        pending_history = mp.claim_current_song_for_history()
         await self._plays.retire_player(guild.id, mp)
         log.info("going to cleanup/disconnect")
-        # Claim the song being abandoned mid-play, before any await so the loop
-        # cannot slip its iteration end into the window. Nothing else records it: it
-        # left the queue at start, and clear_connection() drops the parked copy.
-        pending_history = mp.claim_current_song_for_history()
         try:
             # Cancel tasks before disconnecting so the loop cannot wake and start
             # the next song between voice_client.stop() and cancellation.
@@ -1022,6 +1022,10 @@ class MusicBot(commands.Cog):
             Placement.COLD_FRONT: mp.queue_put_front,
             Placement.NEXT: mp.queue_put_next,
         }[placement]
+        if placement is Placement.NEXT:
+            # Off the lock, for the reason _enqueue_single spells out: both branches
+            # below take the place lock, and queue_put_next neutralizes inside it.
+            await mp.settle_prefetch()
         warning = timestamp_warning(source)
         warning_line = f"\n\n{warning}" if warning else ""
         # "Queued playlist" on its own reads as "at the back".
@@ -1170,6 +1174,11 @@ class MusicBot(commands.Cog):
             # warning needs its own message.
         if warning_embed is not None:
             embeds.append(warning_embed)
+        if placement is Placement.NEXT:
+            # Outside the lock: this cancel can wait out a whole yt-dlp extraction
+            # (an executor call is not interruptible), and every sibling -play in the
+            # guild spends its place bound waiting on the lock.
+            await mp.settle_prefetch()
         async with self._plays.place(req) as verdict:
             if verdict.placed:
                 depth = _head_depth(mp, placement)

@@ -333,10 +333,15 @@ class GuildQueue:
                 return queued
             with self._mirror_write():
                 if batch:
-                    await self._store.push_queue_batch(entries)
+                    landed = await self._store.push_queue_batch(entries)
                 else:
+                    landed = True
                     for entry in entries:
-                        await self._store.push_queue(entry)
+                        if not await self._store.push_queue(entry):
+                            landed = False
+            # A swallowed RPUSH is the common way this mirror goes short: the context
+            # manager above sees only a cancellation, so the flag rides the return.
+            self._mirror_dirty = not landed
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
@@ -370,7 +375,8 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     with self._mirror_write():
-                        await self._store.push_queue_front(entries)
+                        landed = await self._store.push_queue_front(entries)
+                    self._mirror_dirty = not landed
             return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────

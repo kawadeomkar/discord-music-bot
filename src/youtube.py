@@ -858,6 +858,23 @@ def _queue_object_from_flat_entry(
 
 _INFLIGHT_EXTRACTS: dict[str, "asyncio.Future[Optional[YTDLExtractResult]]"] = {}
 
+_prefetch_gate: Optional[asyncio.Semaphore] = None
+_prefetch_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def prefetch_warm_slot() -> asyncio.Semaphore:
+    """The bound on enqueue-time stream warms, which are spawned one per song and
+    share the pool with the in-band resolves of every OTHER guild's playback loop.
+    Half the workers, so one guild's paste burst can never hold all of them.
+    Rebuilt when the running loop changes — a Semaphore binds to the first loop
+    that awaits it and refuses another."""
+    global _prefetch_gate, _prefetch_gate_loop
+    loop = asyncio.get_running_loop()
+    if _prefetch_gate is None or _prefetch_gate_loop is not loop:
+        _prefetch_gate = asyncio.Semaphore(max(1, ytdlp_pool.max_workers // 2))
+        _prefetch_gate_loop = loop
+    return _prefetch_gate
+
 
 def _inflight_key(cache_key: str, profile: str) -> str:
     """Single-flight key: the cache key the lookup missed on, plus the shape of the
@@ -871,34 +888,21 @@ def _inflight_key(cache_key: str, profile: str) -> str:
 async def _extract_once(
     key: str, request: ExtractRequest
 ) -> Optional[YTDLExtractResult]:
-    """One extraction per distinct query at a time, process-wide: N users pasting
-    the same link are N identical jobs against a four-worker pool, racing to write
-    one cache entry. The first caller extracts and the rest await its outcome,
-    exception included — a failure answers their query too. Keyed by _inflight_key;
-    the entry is removed before the result is published, so the next call after a
-    failure extracts again."""
+    """One extraction per distinct query at a time, process-wide: N users pasting the
+    same link are N identical jobs against a four-worker pool, racing to write one
+    cache entry. The first caller starts the job and the rest await its outcome,
+    exception included. Every caller reaches it through shield, the leader included:
+    the key carries no guild, so one guild's cancellation must not reach another's."""
     running = _INFLIGHT_EXTRACTS.get(key)
     if running is not None:
         trace.get_current_span().set_attribute("ytdl.extract_shared", True)
         return await asyncio.shield(running)
-    future: asyncio.Future[Optional[YTDLExtractResult]] = (
-        asyncio.get_running_loop().create_future()
-    )
-    _INFLIGHT_EXTRACTS[key] = future
-    try:
-        data = await _run_extract(request)
-    except BaseException as e:
-        _INFLIGHT_EXTRACTS.pop(key, None)
-        if not future.done():
-            future.set_exception(e)
-        # Retrieved by every waiter, or by nobody — asyncio logs an unretrieved
-        # future exception at GC otherwise, and a lone caller is the common case.
-        future.exception()
-        raise
-    _INFLIGHT_EXTRACTS.pop(key, None)
-    if not future.done():
-        future.set_result(data)
-    return data
+    job = asyncio.ensure_future(_run_extract(request))
+    _INFLIGHT_EXTRACTS[key] = job
+    # Registered before the shield, so it runs first: the key is gone before any
+    # awaiter resumes, and a re-extraction starts a fresh job.
+    job.add_done_callback(lambda _f: _INFLIGHT_EXTRACTS.pop(key, None))
+    return await asyncio.shield(job)
 
 
 async def _extract_for_source(
