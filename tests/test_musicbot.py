@@ -1836,17 +1836,48 @@ class TestPauseCommand:
         await command_callback(MusicBot.pause)(music_bot, mock_ctx)
         mock_ctx.send.assert_not_awaited()
 
-    async def test_noop_when_not_playing(
+    async def test_notice_when_nothing_is_playing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=False)
         mock_ctx.voice_client = vc
         mp = MagicMock()
         mp.pause = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
         await command_callback(MusicBot.pause)(music_bot, mock_ctx)
         mp.pause.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.description == "No song is currently playing."
+
+    async def test_notice_when_not_in_voice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        mp = MagicMock()
+        mp.pause = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.pause)(music_bot, mock_ctx)
+        mp.pause.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.description == "No song is currently playing."
+
+    async def test_notice_when_already_paused(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=True)
+        mock_ctx.voice_client = vc
+        mp = MagicMock()
+        mp.pause = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.pause)(music_bot, mock_ctx)
+        # Not "no song is playing": a paused song is loaded and resumable.
+        mp.pause.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Already paused" in embed.description
 
 
 class TestResumeCommand:

@@ -1523,6 +1523,16 @@ class MusicBot(commands.Cog):
                 embed = mp.build_pause_confirmation_embed()
                 if embed is not None:
                     await ctx.send(embed=embed)
+                return
+            # Out of voice, already paused, or between two songs: nothing to pause,
+            # and a paused song is not "nothing playing" — it is loaded and resumable.
+            # No queue advice on the other line, which also covers the seconds
+            # between two songs, where the queue is not empty at all.
+            if isinstance(vc, discord.VoiceClient) and vc.is_paused():
+                notice = "Already paused — `-resume` to carry on."
+            else:
+                notice = "No song is currently playing."
+            await ctx.send(embed=notice_embed(notice, discord.Color.orange()))
         except Exception as e:
             await self._command_error(ctx, e)
 
