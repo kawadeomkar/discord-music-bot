@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.31.0"
+version = "2.31.1"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -33,6 +33,9 @@ discord-py = "2.7.1"
 redis = ">=8.1.0"
 orjson = ">=3.12.0"
 aiohttp = ">=3.14.3"
+# Imported directly by the stream probe, which hands aiohttp a pre-encoded URL so a
+# signed HLS path is not requoted. aiohttp requires it too; declared because we import it.
+yarl = ">=1.20"
 opentelemetry-api = ">=1.27.0"
 opentelemetry-sdk = ">=1.27.0"
 opentelemetry-exporter-otlp-proto-grpc = ">=1.27.0"

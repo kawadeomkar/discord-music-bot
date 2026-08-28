@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import discord
 import orjson
+from yarl import URL
 import pytest
 from redis.asyncio import Redis
-from yarl import URL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
@@ -1761,6 +1761,34 @@ class TestRevokedStreamUrl:
         session.get.return_value.__aexit__ = AsyncMock(return_value=False)
         with patch("src.youtube._get_probe_session", return_value=session):
             assert await _probe_stream_url("https://cdn/x") is expected
+
+    async def test_a_signed_hls_path_is_probed_without_being_requoted(self) -> None:
+        """yarl requotes a plain URL string, decoding the %3D/%3B that an HLS
+        manifest carries INSIDE its signed path (`sgoap/gir%3Dyes%3Bitag%3D140`).
+        Google signs the encoded form, so the requoted URL 403s and the probe called
+        every live stream and every HLS rung of the format ladder DEAD — while ffmpeg
+        played the same URL. Verified live: requoted 403, encoded 200."""
+        url = (
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/"
+            "sgoap/gir%3Dyes%3Bitag%3D140/xpc/EgVo2aDSNQ%3D%3D/index.m3u8"
+        )
+        response = MagicMock()
+        response.status = 200
+        session = MagicMock()
+        session.get.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+        with patch("src.youtube._get_probe_session", return_value=session):
+            assert await _probe_stream_url(url) is StreamProbe.PLAYABLE
+
+        (sent,) = session.get.call_args.args
+        # A plain str is what aiohttp requotes: it builds URL(str) itself, and only a
+        # URL handed in already-encoded survives that step intact.
+        assert isinstance(sent, URL)
+        assert str(sent) == url
+        assert str(URL(str(sent))) != url, (
+            "yarl no longer requotes this shape — the fix may be obsolete, but do not "
+            "delete it without re-measuring against a live manifest URL"
+        )
 
     async def test_a_probe_bug_is_logged_at_error_not_swallowed_as_a_verdict(
         self, caplog: pytest.LogCaptureFixture

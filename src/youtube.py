@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import discord
 import yt_dlp as youtube_dl
+from yarl import URL
 from yt_dlp.utils import UnsupportedError, YoutubeDLError
 
 import redis.asyncio as aioredis
@@ -616,6 +617,12 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
 
     A probe that never completed says nothing about the URL, hence UNCONFIRMED rather
     than DEAD — the caller still plays it and lets ffmpeg judge.
+
+    The URL goes in pre-encoded. yarl requotes a plain string, which decodes the
+    %3D/%3B inside an HLS manifest's SIGNED path (`sgoap/gir%3Dyes%3Bitag%3D140`) and
+    earns a 403 on a URL ffmpeg plays — reported as DEAD, so every live stream and
+    every HLS rung of the format ladder died at playback. yt-dlp emits these fully
+    encoded; there is nothing left to quote.
     """
     if not stream_url:
         return StreamProbe.DEAD
@@ -625,7 +632,9 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
         # and aiohttp otherwise fills its StreamReader from the moment headers land
         # until the transport is paused — audio we pay for and discard. Nothing is
         # lost: an unread body means the connection could not be pooled anyway.
-        async with session.get(stream_url, read_bufsize=0) as response:
+        async with session.get(
+            URL(stream_url, encoded=True), read_bufsize=0
+        ) as response:
             # Only a definite client-side refusal is DEAD. 429 and 5xx say "not
             # right now" exactly as a timeout does, and routing them to DEAD would
             # delete the cache entry and refuse a song ffmpeg's own -reconnect
