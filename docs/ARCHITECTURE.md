@@ -1564,10 +1564,10 @@ join key for every log line and span, so pasting one out of Discord finds the ex
 request in Loki/Tempo.
 
 "Every embed" is sent from four places, so four seams apply it — all through the one
-`DebugSettings.decorate()`, which owns the enabled check, the strip fallback and every
-segment the caller does not vary (environment, shard, the sampler's runtime figures).
-A seam passes only what it alone knows: the span to name, and elapsed-ms where a
-command timed something. Adding a segment reaches every embed at once:
+`DebugSettings.decorate()`, which owns the enabled check, the strip fallback and the
+shard and runtime figures; `debug_footer` supplies the environment itself. A seam
+passes only what it alone knows: the span to name, and elapsed-ms where a command
+timed something. Adding a segment reaches every embed at once:
 
 | Seam | Covers |
 |---|---|
@@ -1582,8 +1582,12 @@ Rules each seam encodes:
   command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
   produces one, and the tick refreshes the metrics alongside the bar.
 - **The environment leads the suffix**, because it says which deployment everything
-  after it describes. Read at decoration time, never captured: `main()` may infer it
-  from the git branch long after the module is imported.
+  after it describes. `debug_footer` reads `config.ENVIRONMENT` itself rather than
+  taking it as an argument — it is a property of the process, so a caller able to
+  supply it is a caller able to name the wrong one — and reads it late, since `main()`
+  may infer it from the git branch long after the module is imported. The two
+  dashboards suppress it with `skip_environment`, the way they already suppress the
+  trace, because both cards open their own footer with `environment: <name>`.
 - **The block carries the PLAYING SONG's trace id**, captured once into
   `MusicPlayer._playback_span` when that song starts and read by both block render
   sites. Read from the ambient span instead it would alternate on a single message —

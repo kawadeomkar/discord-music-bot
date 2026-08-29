@@ -785,18 +785,20 @@ class TestDecorationIsIdempotent:
         debug.decorate_embeds([embed], span=span, elapsed_ms=2.0)
         assert (embed.footer.text or "").count(TestTraceIdInTheFooter.HEX) == 1
 
-    def test_nothing_to_show_strips_a_stale_suffix(self) -> None:
+    def test_turning_debug_off_strips_the_suffix(self) -> None:
+        """decorate_embeds always has the environment to show, so removing a suffix
+        is the strip path's job — what a guild sees after `-debug --disable`."""
         embed = discord.Embed(title="x")
         debug.decorate_embeds([embed], shard_id=0)
         assert embed.footer.text is not None
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.footer.text is None
 
-    def test_nothing_to_show_restores_the_original_footer(self) -> None:
+    def test_the_strip_restores_the_original_footer(self) -> None:
         embed = discord.Embed(title="x")
         embed.set_footer(text="environment: test")
         debug.decorate_embeds([embed], shard_id=0)
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.footer.text == "environment: test"
 
     def test_a_doubled_suffix_is_fully_replaced(self) -> None:
@@ -807,20 +809,21 @@ class TestDecorationIsIdempotent:
             text=f"base\n{debug._DEBUG_MARK} 3 ms\n{debug._DEBUG_MARK} 4 ms"
         )
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"base\n{debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == (
+            f"base\n{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
 
-    def test_an_undecorated_footer_is_left_exactly_alone(self) -> None:
-        """Nothing to add and nothing stale to strip. Reachable: debug on, in a DM
-        (no shard), before the sampler's first tick, outside a command span."""
+    def test_a_footers_icon_survives_decoration(self) -> None:
+        """The icon rides with the text, so it must survive a footer growing one."""
         embed = discord.Embed(title="x")
         embed.set_footer(text="environment: test", icon_url="https://e/i.png")
         debug.decorate_embeds([embed])
-        assert embed.footer.text == "environment: test"
+        assert (embed.footer.text or "").startswith("environment: test\n")
         assert embed.footer.icon_url == "https://e/i.png"
 
-    def test_an_empty_footer_stays_empty(self) -> None:
+    def test_an_undecorated_embed_stays_empty_while_debug_is_off(self) -> None:
         embed = discord.Embed(title="x")
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.footer.text is None
 
     def test_a_footer_that_is_only_a_suffix_loses_its_icon_too(self) -> None:
@@ -829,7 +832,7 @@ class TestDecorationIsIdempotent:
         embed.set_footer(
             text=f"{debug._DEBUG_MARK} shard 0", icon_url="https://e/i.png"
         )
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.to_dict().get("footer") in (None, {})
 
     def test_a_near_limit_footer_keeps_accepting_a_fresh_suffix(self) -> None:
@@ -852,7 +855,9 @@ class TestDecorationIsIdempotent:
         embed = discord.Embed(title="x")
         embed.set_footer(text=f"a · {debug._DEBUG_MARK} b · c")
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"a · \n{debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == (
+            f"a · \n{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
 
     def test_no_footer_the_bot_writes_contains_the_mark(self) -> None:
         """The invariant the test above depends on. `-debug`'s own mark is in its
@@ -873,15 +878,27 @@ class TestTheEnvironmentSegment:
     """Which deployment the card came from. It leads the suffix, because everything
     after it describes that deployment."""
 
-    def test_it_leads(self) -> None:
-        assert debug.debug_footer(environment="production", shard_id=0) == (
+    def test_it_leads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        assert debug.debug_footer(shard_id=0) == (
             f"{debug._DEBUG_MARK} production · shard 0"
         )
 
-    def test_a_caller_that_omits_it_gets_the_old_shape(self) -> None:
-        """The two dashboards open their own footer with `environment: <name>`, and
-        twice in one line reads as two deployments."""
-        assert debug.debug_footer(shard_id=0) == f"{debug._DEBUG_MARK} shard 0"
+    def test_no_caller_can_name_a_different_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It is a property of the process, not of the request, so it is read here
+        rather than passed — and read late, since main() may infer it from the git
+        branch long after this module is imported."""
+        monkeypatch.setattr(config, "ENVIRONMENT", "staging")
+        assert "staging" in debug.debug_footer(shard_id=0)
+
+    def test_the_dashboards_suppress_it_like_a_trace(self) -> None:
+        """Both cards open their own footer with `environment: <name>`, and twice in
+        one line reads as two deployments."""
+        assert debug.debug_footer(shard_id=0, skip_environment=True) == (
+            f"{debug._DEBUG_MARK} shard 0"
+        )
 
     def test_the_dashboard_suffix_leaves_it_out(self) -> None:
         settings = debug.DebugSettings()
@@ -947,7 +964,8 @@ class TestTheSuffixStartsItsOwnLine:
         embed.set_footer(text="Avg Bitrate: 128 kbps | Acodec: opus")
         debug.decorate_embeds([embed], shard_id=0)
         assert embed.footer.text == (
-            f"Avg Bitrate: 128 kbps | Acodec: opus\n{debug._DEBUG_MARK} shard 0"
+            "Avg Bitrate: 128 kbps | Acodec: opus\n"
+            f"{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
         )
 
     def test_a_suffix_with_no_footer_under_it_gets_no_break(self) -> None:
@@ -955,7 +973,9 @@ class TestTheSuffixStartsItsOwnLine:
         would render the card with an empty first line."""
         embed = discord.Embed(title="x")
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"{debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == (
+            f"{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
 
     def test_stripping_takes_the_break_with_the_suffix(self) -> None:
         """A --disable mid-song restores the footer exactly, not a footer with a
@@ -2099,7 +2119,7 @@ class TestFooterRuntimeSegment:
 
     def test_full_segment(self) -> None:
         footer = debug.debug_footer(
-            elapsed_ms=412, shard_id=0, runtime=self._snapshot()
+            elapsed_ms=412, shard_id=0, runtime=self._snapshot(), skip_environment=True
         )
         assert footer == (
             "🐞 412 ms · shard 0 · cpu 12% · mem 88% · lag 2.1 ms · tasks 87 · pool 4"
@@ -2116,7 +2136,10 @@ class TestFooterRuntimeSegment:
         assert "lag 2.1 ms" in footer
 
     def test_no_snapshot_yields_no_runtime_segment(self) -> None:
-        assert debug.debug_footer(elapsed_ms=1, shard_id=0) == "🐞 1 ms · shard 0"
+        assert (
+            debug.debug_footer(elapsed_ms=1, shard_id=0, skip_environment=True)
+            == "🐞 1 ms · shard 0"
+        )
 
 
 class TestContainerMetrics:
@@ -2631,9 +2654,10 @@ class TestGuardsMutationTestingFound:
         assert "⚠️" not in row
 
     def test_a_footer_with_nothing_to_say_is_empty(self) -> None:
-        """Not a bare mark. A DM reply in the first seconds after DEBUG_MODE=true has
-        no elapsed time, no shard and no snapshot — the marker alone is noise."""
-        assert debug.debug_footer() == ""
+        """Not a bare mark. The dashboards suppress the environment (they print it
+        themselves) and the trace, so on a -debug in a DM before the sampler's first
+        tick there is nothing left — and the marker alone is noise."""
+        assert debug.debug_footer(skip_environment=True) == ""
 
     def test_a_warming_up_voice_client_does_not_claim_an_average(self) -> None:
         """latency is inf until the first heartbeat ACK. If average_latency happens

@@ -193,25 +193,27 @@ _DEBUG_MARK = "🐞"
 
 def debug_footer(
     *,
-    environment: Optional[str] = None,
     span: Optional[trace.Span] = None,
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
     runtime: Optional[RuntimeSnapshot] = None,
+    skip_environment: bool = False,
     skip_trace: bool = False,
 ) -> str:
     """The debug suffix, or "" when nothing is known worth showing.
 
-    Every part is optional because every part has an absent case: the two dashboards
-    print the environment themselves, a send outside any command has no elapsed time,
-    a DM has no shard, an unsampled span has no trace id, and the runtime segment is
-    absent until the sampler's first tick.
+    The environment leads, because it says which deployment everything after it
+    describes. Read here rather than taken as an argument: it is a property of the
+    process, so a caller able to supply it is a caller able to name the wrong one.
+    Suppressed the same way a trace is, and for the same reason — see skip_trace.
 
-    Environment leads, because it says which deployment everything after it describes.
+    Every other part is optional because every other part has an absent case: a send
+    outside any command has no elapsed time, a DM has no shard, an unsampled span has
+    no trace id, and the runtime segment is absent until the sampler's first tick.
     """
     parts: list[str] = []
-    if environment:
-        parts.append(environment)
+    if not skip_environment:
+        parts.append(config.ENVIRONMENT)
     if elapsed_ms is not None:
         parts.append(f"{round(elapsed_ms)} ms")
     if shard_id is not None:
@@ -259,7 +261,6 @@ def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
 def decorate_embeds(
     embeds: Sequence[discord.Embed],
     *,
-    environment: Optional[str] = None,
     span: Optional[trace.Span] = None,
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
@@ -267,14 +268,16 @@ def decorate_embeds(
 ) -> None:
     """Write the debug footer onto each embed, in place, replacing a previous suffix
     rather than appending after it. That is what keeps a cached embed sent more than
-    once (`play_message`, re-served by -now) from growing a footer per send. With
-    nothing to show it removes a stale suffix instead of leaving it.
+    once (`play_message`, re-served by -now) from growing a footer per send.
+
+    Every embed reaching here gets one: the environment alone is always worth showing,
+    which is why there is no "nothing to add" path. Removing a suffix is what
+    strip_debug_footers is for, on the debug-off side.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
         base = _strip_debug_suffix(existing)
         suffix = debug_footer(
-            environment=environment,
             span=span,
             elapsed_ms=elapsed_ms,
             shard_id=shard_id,
@@ -284,8 +287,6 @@ def decorate_embeds(
             # previous suffix must not suppress the fresh one replacing it.
             skip_trace="trace:" in base or "trace " in base,
         )
-        if not suffix and base == existing:
-            continue  # nothing to add, nothing stale to replace
         _write_footer(embed, base, suffix)
 
 
@@ -1973,10 +1974,11 @@ class DebugSettings:
             return None
         return (
             debug_footer(
-                # No environment either: both cards open their footer with it, and
-                # twice in one line reads as two deployments.
                 shard_id=guild.shard_id if guild else None,
                 runtime=self.snapshot if host_metrics else None,
+                # Both cards open their own footer with `environment: <name>`, and
+                # twice in one line reads as two deployments.
+                skip_environment=True,
                 # Both cards already print `trace: <id>` themselves, and the same id
                 # twice reads as two traces. Inert while no span is passed; kept so
                 # adding one later cannot silently double it.
@@ -2008,9 +2010,6 @@ class DebugSettings:
             return
         decorate_embeds(
             embeds,
-            # Read at call time: main() may infer it from the git branch long after
-            # this module is imported.
-            environment=config.ENVIRONMENT,
             span=span,
             elapsed_ms=elapsed_ms,
             shard_id=guild.shard_id if guild else None,
