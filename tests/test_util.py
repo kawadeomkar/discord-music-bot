@@ -8,9 +8,12 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from opentelemetry import trace as trace_api
 
 from src.util import (
     FOOTER_LIMIT,
+    current_traceparent,
+    traceparent_context,
     _typing_keepalive,
     background_typing,
     fmt_duration,
@@ -175,6 +178,42 @@ class TestFmtDuration:
 
     def test_minute_rollover_pads_seconds(self) -> None:
         assert fmt_duration(61) == "1:01"
+
+
+class TestTraceparentRoundTrip:
+    """How a span context crosses the stream cache and comes back as a link."""
+
+    @staticmethod
+    def _span(trace_id: int) -> trace_api.NonRecordingSpan:
+        return trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=trace_id,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+
+    def test_it_round_trips_a_span(self) -> None:
+        trace_id = 0x4BF92F3577B34DA6A3CE929D0E0E4736
+        with trace_api.use_span(self._span(trace_id), end_on_exit=False):
+            carried = current_traceparent()
+        assert carried.startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        ctx = traceparent_context(carried)
+        assert ctx is not None and ctx.trace_id == trace_id
+        # is_remote marks it as arriving from elsewhere, which a link's context is.
+        assert ctx.is_remote
+
+    def test_no_span_carries_nothing(self) -> None:
+        """Reachable: prewarm, a cache write outside any command, the whole suite."""
+        assert current_traceparent() == ""
+
+    def test_an_absent_or_broken_value_is_no_link(self) -> None:
+        """A pre-feature cache entry has no traceparent, and a truncated one must
+        not raise on the playback path — both are simply "nothing to link"."""
+        assert traceparent_context("") is None
+        assert traceparent_context("not-a-traceparent") is None
+        assert traceparent_context("00-" + "0" * 32 + "-" + "0" * 16 + "-01") is None
 
 
 class TestJoinFooter:

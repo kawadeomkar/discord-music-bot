@@ -48,6 +48,7 @@ from src.util import (
     pluralize,
     record_span_error,
     trace_footer,
+    traceparent_context,
     safe_label,
     truncate,
     truncate_embed_title,
@@ -330,6 +331,22 @@ def _build_now_playing_base_embed(
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     return embed
+
+
+def _link_stream_provenance(span: trace.Span, song: YTDL) -> None:
+    """Link this song's trace to the extraction that minted its stream URL.
+
+    _cache_stream stamps the traceparent of whichever span wrote the cache entry, so
+    this reaches the enqueue-time warm — a child of the -play that queued the song —
+    or the one-ahead prefetch, which ran in the previous song's trace. A URL
+    extracted in band produces no link: that work is already here, and a span
+    linking to its own trace is noise. A LINK, never a parent: a parent would put
+    every song sharing a -play back into one never-ending trace.
+    """
+    ctx = traceparent_context(song.data.get("traceparent", ""))
+    if ctx is None or ctx.trace_id == span.get_span_context().trace_id:
+        return
+    span.add_link(ctx, {"link.kind": "stream_extraction"})
 
 
 class MusicPlayer:
@@ -2554,6 +2571,7 @@ class MusicPlayer:
                         continue
 
                     span.set_attribute("song.title", self.current_song.title or "")
+                    _link_stream_provenance(span, self.current_song)
                     # Advances with the SONG, not with the iteration: a resolve that
                     # failed renders no card, so the previous song's tail keeps naming
                     # its own trace. A finalize outlives even that — it captures the

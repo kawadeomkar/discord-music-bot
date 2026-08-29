@@ -49,7 +49,7 @@ from src.musicplayer import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
-from src.util import cancel_task, fmt_duration, trace_id_of
+from src.util import cancel_task, current_traceparent, fmt_duration, trace_id_of
 from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
 
@@ -105,6 +105,10 @@ def mock_song() -> MagicMock:
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
     # writes the real clock here, and the epoch clamp raises on a MagicMock.
     song.played_at = 0.0
+    # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
+    # reads `traceparent` off it to link this song's trace to the extraction that
+    # minted its URL, and a MagicMock there would be a str where a str is parsed.
+    song.data = {}
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
@@ -4584,6 +4588,10 @@ _PLAYBACK_SPAN = trace_api.NonRecordingSpan(
     )
 )
 
+# The extraction that minted a song's stream URL, carried on its cache entry.
+_EXTRACTION_TRACE_HEX = "5a6b7c8d9e0f10111213141516171819"
+_EXTRACTION_TRACEPARENT = f"00-{_EXTRACTION_TRACE_HEX}-00f067aa0ba902b7-01"
+
 # The song that takes the slot next, for the finalize race below.
 _NEXT_TRACE_HEX = "1122334455667788990aabbccddeeff0"
 _NEXT_SPAN = trace_api.NonRecordingSpan(
@@ -5035,6 +5043,87 @@ class TestEachSongRootsItsOwnTrace:
         assert trace_id_of(music_player._playback_span) == format(
             _iterations(exporter)[0].context.trace_id, "032x"
         )
+
+    async def test_the_song_links_to_the_extraction_that_minted_its_url(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+    ) -> None:
+        """_cache_stream stamps the traceparent of whatever span wrote the entry, so
+        a song playing a cached URL links to the enqueue-time warm — a child of the
+        -play that queued it — or to the one-ahead prefetch in the previous song's
+        trace. Neither is reachable from this trace any other way."""
+        self._armed(music_player, songs=1)
+        mock_song.start_paused = False
+        mock_song.data = {"traceparent": _EXTRACTION_TRACEPARENT}
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            _recording_tracer() as exporter,
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        (iteration,) = _iterations(exporter)
+        assert len(iteration.links) == 1
+        assert format(iteration.links[0].context.trace_id, "032x") == (
+            _EXTRACTION_TRACE_HEX
+        )
+        # A LINK, not a parent: rooting is what keeps one song to one trace.
+        assert iteration.parent is None
+
+    async def test_an_in_band_extraction_is_not_linked_to_itself(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+    ) -> None:
+        """A URL extracted at this song's own turn is already in this trace. Linking
+        it would draw an edge from the trace to itself."""
+        self._armed(music_player, songs=1)
+        mock_song.start_paused = False
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        async def _stream(*_a: object, **_k: object) -> MagicMock:
+            # Stamped from inside the iteration, as a fresh extraction would be.
+            mock_song.data = {"traceparent": current_traceparent()}
+            return mock_song
+
+        with (
+            _recording_tracer() as exporter,
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(MusicPlayer, "_stream_source", new=_stream),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        (iteration,) = _iterations(exporter)
+        assert iteration.links == ()
 
     async def test_a_song_that_never_resolved_leaves_it_alone(
         self, music_player: MusicPlayer, queue_obj: QueueObject
@@ -8363,6 +8452,10 @@ class TestLoopAdditional:
         # epoch clamp in HistoryEntry raises on a MagicMock.
         song.played_at = 0.0
         song.persisted = True
+        # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the
+        # loop reads `traceparent` off it to link this song's trace to the
+        # extraction that minted its URL, and that value is parsed as a string.
+        song.data = {}
         return song
 
     async def test_update_activity_called_at_song_start_and_end(
