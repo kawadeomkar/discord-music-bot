@@ -129,7 +129,7 @@ _OPERATOR_NOTICE = (
 )
 
 # Discord's hard cap on an embed field value; util.py's FOOTER_LIMIT is its footer
-# sibling, applied by the join_footer imported above.
+# sibling.
 _FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
@@ -202,14 +202,11 @@ def debug_footer(
 ) -> str:
     """The debug suffix, or "" when nothing is known worth showing.
 
-    The environment leads, because it says which deployment everything after it
-    describes. Read here rather than taken as an argument: it is a property of the
-    process, so a caller able to supply it is a caller able to name the wrong one.
-    Suppressed the same way a trace is, and for the same reason — see skip_trace.
-
-    Every other part is optional because every other part has an absent case: a send
-    outside any command has no elapsed time, a DM has no shard, an unsampled span has
-    no trace id, and the runtime segment is absent until the sampler's first tick.
+    The environment leads and comes from config — it is a property of the process,
+    not of the request. Every other part is optional because every other part has an
+    absent case: a send outside any command has no elapsed time, a DM has no shard,
+    an unsampled span has no trace id, and the runtime segment is absent until the
+    sampler's first tick.
     """
     parts: list[str] = []
     if not skip_environment:
@@ -234,10 +231,9 @@ def debug_footer(
 
 
 def _strip_debug_suffix(text: str) -> str:
-    """`text` with any previous debug suffix removed, the line break before it
-    included. The first mark is the boundary: no bot-authored footer contains one
-    (asserted over src/ below), so everything from there on is ours — a doubled
-    suffix included, which is what keeps a re-decorated embed from growing one."""
+    """`text` with any previous debug suffix removed, including the line break before
+    it. The first mark is the boundary — no bot-authored footer contains one, asserted
+    over src/ below — so a doubled suffix heals in one pass."""
     idx = text.find(_DEBUG_MARK)
     if idx == -1:
         return text
@@ -270,9 +266,8 @@ def decorate_embeds(
     rather than appending after it. That is what keeps a cached embed sent more than
     once (`play_message`, re-served by -now) from growing a footer per send.
 
-    Every embed reaching here gets one: the environment alone is always worth showing,
-    which is why there is no "nothing to add" path. Removing a suffix is what
-    strip_debug_footers is for, on the debug-off side.
+    Every embed reaching here gets a suffix — the environment alone is always worth
+    showing. strip_debug_footers is the removal path.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
@@ -291,9 +286,7 @@ def decorate_embeds(
 
 
 def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
-    """Write `base` and `suffix` as the footer, the suffix on its own line — the same
-    join the two dashboards make, which is why it lives in util.py.
-    """
+    """Write `base` and `suffix` as the footer, the suffix on its own line."""
     text = join_footer(base, suffix)
     embed.set_footer(
         text=text or None,
@@ -1976,12 +1969,11 @@ class DebugSettings:
             debug_footer(
                 shard_id=guild.shard_id if guild else None,
                 runtime=self.snapshot if host_metrics else None,
-                # Both cards open their own footer with `environment: <name>`, and
-                # twice in one line reads as two deployments.
+                # Both cards print `environment: <name>` and `trace: <id>` in their
+                # own footer, and twice in one line reads as two. The trace flag is
+                # inert while no span is passed, and kept so adding one cannot double
+                # it.
                 skip_environment=True,
-                # Both cards already print `trace: <id>` themselves, and the same id
-                # twice reads as two traces. Inert while no span is passed; kept so
-                # adding one later cannot silently double it.
                 skip_trace=True,
             )
             or None
@@ -1996,11 +1988,8 @@ class DebugSettings:
         elapsed_ms: Optional[float] = None,
     ) -> None:
         """Put debug mode's footer on `embeds`, or take a stale one off. The single
-        entry point for every embed the bot sends: the seams differ only in the span
-        they name and whether a command timed anything, so everything else — the
-        enabled check, the environment, the shard, the sampler's runtime figures — is
-        decided here rather than at each call site. Adding a segment reaches all of
-        them; the seam that forgets to pass one cannot exist.
+        entry point for every embed the bot sends: a seam passes only the span it
+        names and, for a command response, its elapsed time.
 
         Off is a STRIP, not a skip: `play_message` and a host's cached embeds outlive
         a mid-song `--disable`. See docs/ARCHITECTURE.md#debug-footer-seams.

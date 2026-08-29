@@ -1607,12 +1607,13 @@ Rules each seam encodes:
   differs, so a per-tick-varying footer would edit the board until its deadline.
 - **`-debug` gates the runtime segment on `operator`.** That card withholds its
   Runtime block from a non-owner and says so in the same embed.
-- **Decoration replaces rather than appends**, and removes a stale suffix when there
-  is nothing to show. `play_message` is built once per song, decorated in place, and
-  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle. The mark is
-  the boundary it replaces from, wherever in the footer it sits.
+- **Decoration replaces rather than appends.** `play_message` is built once per song,
+  decorated in place, and re-sent by `-now`, so it outlives both a re-send and a
+  mid-song toggle. The mark is the boundary it replaces from, wherever in the footer
+  it sits. Every decorated embed gets a suffix — the environment alone is always worth
+  showing — so removing one is `strip_debug_footers`' job, on the debug-off side.
 - **The suffix starts a line of its own** whenever the embed already carries a footer,
-  through `util.join_footer` so all three seams join identically. Inline it continues
+  through `util.join_footer`, so every place that writes one joins identically. Inline it continues
   that footer, and Discord wraps the run at the card's width — mid-segment, so the two
   read as one paragraph. The break is written only when there is a base to separate
   from, comes off with the suffix when a `--disable` strips it, and survives a

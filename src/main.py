@@ -112,9 +112,8 @@ class MusicContext(commands.Context):
     def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
         """Add the debug footer to this response's own embeds. The NP block is
         decorated by the player instead, at build time, so the progress tick cannot
-        re-render it back to bare. Elapsed-ms is what this seam knows and the others
-        do not: it times the phase of the command that is answering.
-        See docs/ARCHITECTURE.md#debug-footer-seams."""
+        re-render it back to bare. Elapsed-ms times the phase of the command that is
+        answering. See docs/ARCHITECTURE.md#debug-footer-seams."""
         cog = self._music_cog()
         if cog is None:
             return

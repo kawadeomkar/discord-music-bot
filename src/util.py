@@ -41,14 +41,8 @@ _TRACE_PROPAGATOR: Final = TraceContextTextMapPropagator()
 def current_traceparent() -> str:
     """The current span as a W3C traceparent, or "" when nothing is being traced.
 
-    The pair with traceparent_context() below is how a span context crosses a store
-    and comes back as a LINK: a parent would put both sides in one trace, which for
-    playback means every song a guild plays under whichever request cached its URL.
-
-    Guarded on is_valid like _trace_carrier's, rather than left to inject(): the
-    propagator's own check is an equality against INVALID_SPAN_CONTEXT, which a
-    stand-in span passes before failing on the format of its ids.
-    """
+    The is_valid check is here because inject() skips only a context that equals
+    INVALID_SPAN_CONTEXT."""
     if not get_current_span().get_span_context().is_valid:
         return ""
     carrier: dict[str, str] = {}
@@ -57,10 +51,8 @@ def current_traceparent() -> str:
 
 
 def traceparent_context(traceparent: str) -> Optional[SpanContext]:
-    """The span a traceparent names, ready for Span.add_link(). None when the value
-    is absent or unparseable — extract() answers an invalid span rather than raising,
-    so a truncated or pre-feature value degrades to "no link" instead of an error on
-    a playback path."""
+    """The span a traceparent names, for Span.add_link(). None when the value is
+    absent or unparseable: extract() answers an invalid span rather than raising."""
     if not traceparent:
         return None
     span_ctx = get_current_span(
@@ -247,22 +239,17 @@ def truncate_embed_title(title: str) -> str:
     return truncate(title, EMBED_TITLE_LIMIT)
 
 
-# Debug mode's suffix starts its own line. Inline it continues whatever the embed
-# already footers with, and Discord wraps that run wherever the width falls — mid
-# segment, so the two footers read as one paragraph.
+# Debug mode's suffix starts a line of its own rather than continuing the embed's
+# own footer. See docs/ARCHITECTURE.md#debug-footer-seams.
 FOOTER_SUFFIX_SEP = "\n"
 
 
 def join_footer(base: str, suffix: str) -> str:
-    """`base` and `suffix` as one footer, the suffix on a line of its own. Either
-    side may be empty, and a lone one is the whole footer — the break is written only
-    where there are two lines to separate.
+    """`base` and `suffix` as one footer, the suffix on a line of its own. The break
+    is written only where there are two lines to separate.
 
-    A base long enough to threaten the limit is what gets clipped. Clipping the join
-    instead would take the break and the head of the suffix with it, putting the two
-    back on one line at exactly the width where that reads worst. A suffix with no
-    room left for a base drops it: truncate() to a limit of zero returns an ellipsis
-    on a nearly whole string, so clamping the width alone would not fit.
+    The clip falls on the base, and a suffix leaving no room drops it whole:
+    truncate() to a limit of zero returns an ellipsis on a nearly complete string.
     """
     if not (base and suffix):
         return truncate(suffix or base, FOOTER_LIMIT)

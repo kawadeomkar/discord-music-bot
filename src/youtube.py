@@ -145,8 +145,7 @@ class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
     """
 
     # Stamped by _cache_stream, never by yt-dlp: the trace of the extraction that
-    # minted this entry's URL, so playback can link back to it. Absent on a fresh
-    # extraction and on entries written before this field existed.
+    # minted this URL. Absent on a fresh extraction.
     traceparent: str
 
 
@@ -636,9 +635,8 @@ async def _cache_stream(
     stripped: dict[str, Any] = {
         k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None
     }
-    # Whatever span reaches here IS the extraction that minted the URL — the
-    # enqueue-time warm, the one-ahead prefetch, or an in-band resolve. Recording it
-    # is what lets the song that eventually plays this URL link back to it.
+    # The span here is the extraction that minted the URL; the song that plays it
+    # links back. See docs/ARCHITECTURE.md#observability.
     if traceparent := current_traceparent():
         stripped["traceparent"] = traceparent
     ttl = _stream_url_ttl(data.get("url", ""))

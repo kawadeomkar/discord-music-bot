@@ -334,15 +334,9 @@ def _build_now_playing_base_embed(
 
 
 def _link_stream_provenance(span: trace.Span, song: YTDL) -> None:
-    """Link this song's trace to the extraction that minted its stream URL.
-
-    _cache_stream stamps the traceparent of whichever span wrote the cache entry, so
-    this reaches the enqueue-time warm — a child of the -play that queued the song —
-    or the one-ahead prefetch, which ran in the previous song's trace. A URL
-    extracted in band produces no link: that work is already here, and a span
-    linking to its own trace is noise. A LINK, never a parent: a parent would put
-    every song sharing a -play back into one never-ending trace.
-    """
+    """Link this song's trace to the extraction that minted its stream URL, which
+    _cache_stream stamped onto the cache entry. A URL extracted in band is already in
+    this trace and links to nothing. See docs/ARCHITECTURE.md#observability."""
     ctx = traceparent_context(song.data.get("traceparent", ""))
     if ctx is None or ctx.trace_id == span.get_span_context().trace_id:
         return
@@ -453,8 +447,7 @@ class MusicPlayer:
 
         self.current_song = None
         # The playing song's trace, captured once at its start and read by every
-        # NP-block render. Taken from the ambient span instead, the id would be the
-        # command's on an attach and the loop's on the next tick.
+        # NP-block render. See docs/ARCHITECTURE.md#debug-footer-seams.
         self._playback_span: Optional[trace.Span] = None
         # Set by _stream_source() on a failed resolve; read by the loop to build a
         # descriptive skip notice, then cleared.
@@ -1296,9 +1289,9 @@ class MusicPlayer:
         """Add the debug footer to what the player sends or edits itself, which
         MusicContext.send never sees. Freshly built embeds only: the cached
         _np_host_own_embeds keep their send-time footer. No elapsed_ms — no command
-        here took any time. NP-block callers pass the PLAYBACK span rather than the
-        ambient one, so a block re-rendered under a command keeps naming its own
-        song. See docs/ARCHITECTURE.md#debug-footer-seams.
+        here took any time. NP-block callers pass the playback span, so a block
+        re-rendered under a command keeps naming its own song.
+        See docs/ARCHITECTURE.md#debug-footer-seams.
         """
         self._cog.debug_settings.decorate(embeds, self._guild, span=span)
 
@@ -2205,11 +2198,9 @@ class MusicPlayer:
         footer's metrics moving with the bar. `own_embeds` is excluded: cached, and
         already decorated at send time.
 
-        `span` follows `song` — passed by the caller, never read off self here, and
-        with no fallback to it: the finalize awaits _np_edit_lock, which a debounced
-        edit can hold across a PATCH, so by the time this runs _playback_span may name
-        the song that replaced the one being finalized. The two live-card callers read
-        it at their own call time, where it is the song they are drawing."""
+        `span` follows `song`: passed by the caller, never read off self. The
+        finalize awaits _np_edit_lock, which a debounced edit can hold across a PATCH,
+        so by then _playback_span may name the song that replaced this one."""
         try:
             embed = self._build_now_playing_embed(
                 song, position_override=position_override
@@ -2308,9 +2299,8 @@ class MusicPlayer:
         *,
         completed: bool = True,
     ) -> None:
-        # _playback_span read HERE, synchronously, for the same reason the caller
-        # passes song and message: the task it spawns can wake after the next song
-        # claimed the slot.
+        # _playback_span read here, synchronously: the task this spawns can wake
+        # after the next song has claimed the slot.
         self._spawn_background(
             self._finalize_now_playing(
                 song,
@@ -2480,9 +2470,8 @@ class MusicPlayer:
             # so it never describes a different item than the one claimed.
             claim_persisted = True
             # Each iteration spans a full song (3–5 min), staying open across
-            # play_next.wait(), and roots its own trace: the loop task inherits the
-            # context that created the player, so an inherited parent files every song
-            # the guild ever plays under one -play, in a trace that never ends.
+            # play_next.wait(), and roots its own trace so one song is one trace.
+            # See docs/ARCHITECTURE.md#observability.
             with _tracer.start_as_current_span(
                 "player.loop.iteration",
                 context=Context(),
@@ -2572,10 +2561,9 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
                     _link_stream_provenance(span, self.current_song)
-                    # Advances with the SONG, not with the iteration: a resolve that
-                    # failed renders no card, so the previous song's tail keeps naming
-                    # its own trace. A finalize outlives even that — it captures the
-                    # span at spawn (_fire_finalize_now_playing).
+                    # Advances with the song, not the iteration: a failed resolve
+                    # renders no card, so the previous song's tail keeps naming its
+                    # own trace.
                     self._playback_span = span
 
                     # The commit and the start transaction under ONE mutex hold —
