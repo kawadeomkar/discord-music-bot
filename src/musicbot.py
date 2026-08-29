@@ -1518,11 +1518,12 @@ class MusicBot(commands.Cog):
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
                 mp = self.get_mp(ctx)
-                await mp.pause(vc)
+                await mp.pause(vc, by=ctx.author)
                 await ctx.message.add_reaction("⏸️")
-                embed = mp.build_pause_confirmation_embed()
-                if embed is not None:
-                    await ctx.send(embed=embed)
+                # The paused card rides in the block, so the reply is the block: a
+                # dedicated re-pin, which puts it at the bottom of the channel and
+                # leaves nothing behind to strip when the next host takes over.
+                await mp.repin_now_playing()
                 return
             # Out of voice, already paused, or between two songs: nothing to pause,
             # and a paused song is not "nothing playing" — it is loaded and resumable.
