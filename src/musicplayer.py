@@ -2188,17 +2188,18 @@ class MusicPlayer:
         footer's metrics moving with the bar. `own_embeds` is excluded: cached, and
         already decorated at send time.
 
-        `span` follows `song` — passed by the caller, never read off self here. The
-        finalize awaits _np_edit_lock, and a debounced edit can hold it across a
-        PATCH; by the time this runs, _playback_span may name the song that replaced
-        the one being finalized."""
+        `span` follows `song` — passed by the caller, never read off self here, and
+        with no fallback to it: the finalize awaits _np_edit_lock, which a debounced
+        edit can hold across a PATCH, so by the time this runs _playback_span may name
+        the song that replaced the one being finalized. The two live-card callers read
+        it at their own call time, where it is the song they are drawing."""
         try:
             embed = self._build_now_playing_embed(
                 song, position_override=position_override
             )
             next_up = self._build_next_up_embed()
             block = [embed] + ([next_up] if next_up else [])
-            self._decorate_for_debug(block, span=span or self._playback_span)
+            self._decorate_for_debug(block, span=span)
             embeds = block + own_embeds
             # Discord's per-message cap: an attach accepted at the cap can overflow
             # here if a next-up embed appears later. Drop the own-embeds tail, never
@@ -2234,7 +2235,9 @@ class MusicPlayer:
             host = self._np_host_message
             if host is None:
                 return
-            if not await self._push_np_edit(song, host, self._np_host_own_embeds):
+            if not await self._push_np_edit(
+                song, host, self._np_host_own_embeds, span=self._playback_span
+            ):
                 # Adopt is lock-free, so a command response may have swapped in a
                 # new host during this PATCH — releasing would orphan its block.
                 if self._np_host_message is host:
@@ -2320,7 +2323,7 @@ class MusicPlayer:
                     if host is None:
                         continue  # dormant: no visible NP until re-hosted
                     if not await self._push_np_edit(
-                        song, host, self._np_host_own_embeds
+                        song, host, self._np_host_own_embeds, span=self._playback_span
                     ):
                         # Host deleted by a user — go dormant rather than die; the
                         # next command response (or -now) re-hosts. Adopt is

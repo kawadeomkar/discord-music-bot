@@ -14,13 +14,6 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from src import config
 from src.config import spotify_enabled
 
-# Reaches yt_dlp transitively (src.debug -> src.ping -> yt_dlp.version), and the
-# console script imports THIS module at module scope — so the yt-dlp pool's
-# spawn/forkserver bootstrap re-imports it too, measured at ~+500ms per bootstrap.
-# Kept because it is paid once at forkserver bootstrap on the deploy target (Linux),
-# happens inside the fire-and-forget prewarm() rather than on the loop, and is
-# arguably the point: prewarm()'s promise is that the first -play does not absorb
-# yt-dlp import latency, which was only half true before.
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (

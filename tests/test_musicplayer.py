@@ -4711,17 +4711,19 @@ class TestPlayerDebugDecoration:
         assert "4bf92f3577b34da6a3ce929d0e0e4736" not in footer
         assert "cpu 12%" in footer and "shard" in footer
 
-    async def test_the_tick_carries_it_too(
+    async def test_the_live_card_edit_carries_it_too(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The block's other render site. The two are separate calls, so wiring one
-        alone leaves the card's id flipping every 3 seconds."""
+        """Driven through the real caller, not _push_np_edit: the span is the
+        caller's to supply, so a test that passed it directly would pass while the
+        edit paths still drew a card with no trace on it."""
         self._enable(music_player)
         music_player.current_song = mock_song
         music_player._playback_span = _PLAYBACK_SPAN
         message = AsyncMock(spec=discord.Message)
+        music_player._np_host_message = message
         with _current_span():
-            await music_player._push_np_edit(mock_song, message, [])
+            await music_player._edit_now_playing_once()
         footer = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
         assert _PLAYBACK_TRACE_HEX in footer
         assert "4bf92f3577b34da6a3ce929d0e0e4736" not in footer

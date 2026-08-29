@@ -1562,7 +1562,7 @@ request (`debug_footer()`). The trace id is what makes it useful: it is already 
 join key for every log line and span, so pasting one out of Discord finds the exact
 request in Loki/Tempo.
 
-"Every embed" is sent from three places, so three seams apply it — all through the one
+"Every embed" is sent from four places, so four seams apply it — all through the one
 `DebugSettings.decorate()`, which owns the enabled check, the strip fallback and every
 segment the caller does not vary (environment, shard, the sampler's runtime figures).
 A seam passes only what it alone knows: the span to name, and elapsed-ms where a
@@ -1572,7 +1572,7 @@ command timed something. Adding a segment reaches every embed at once:
 |---|---|
 | `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs; the only seam with elapsed-ms |
 | `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
-| `VoiceRecovery` (recovery.py) | the channels-deleted notice, which has no player to decorate it |
+| `restore_guild` (recovery.py) | the channels-deleted notice, which has no player to decorate it |
 | `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so no decoration seam reaches them. Takes `DebugSettings.footer()` — the string form, which omits the environment and the trace because both cards print those themselves |
 
 Rules each seam encodes:
