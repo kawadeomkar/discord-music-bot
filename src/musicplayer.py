@@ -290,6 +290,12 @@ _FIELD_VALUE_MAX = 200
 # Same budget, for the one queue line the "Up next" embed renders.
 _NEXT_UP_TITLE_MAX = 200
 
+# The card's title says which state the song is in. One definition each, because
+# the -pause confirmation renders the paused one too and the two sit in the same
+# message — a drifted copy would read as two different songs.
+_NOW_PLAYING_TITLE_PREFIX = "Now playing: "
+_PAUSED_TITLE_PREFIX = "⏸️ Paused: "
+
 
 def _field_value(value: str) -> str:
     return truncate(value, _FIELD_VALUE_MAX) if value else _FIELD_PLACEHOLDER
@@ -1287,6 +1293,15 @@ class MusicPlayer:
             runtime=self._cog.debug_settings.snapshot,
         )
 
+    def _title_prefix_for(self, song: YTDL) -> str:
+        """The paused prefix only while the voice client holds THIS song paused.
+        The source check scopes it to the live card: a finalize edit for the song
+        that just ended can land after the next one has started paused."""
+        vc = self._guild.voice_client
+        if isinstance(vc, discord.VoiceClient) and vc.source is song and vc.is_paused():
+            return _PAUSED_TITLE_PREFIX
+        return _NOW_PLAYING_TITLE_PREFIX
+
     def _build_now_playing_embed(
         self, song: YTDL, *, position_override: Optional[float] = None
     ) -> discord.Embed:
@@ -1321,7 +1336,7 @@ class MusicPlayer:
         return _build_now_playing_base_embed(
             # No markdown: Discord renders embed titles literally, so
             # "**Now playing:**" would show its asterisks inside the link text.
-            title=f"Now playing: {song.title}",
+            title=f"{self._title_prefix_for(song)}{song.title}",
             description=description,
             webpage_url=fields.webpage_url,
             uploader=fields.uploader,
@@ -1334,11 +1349,10 @@ class MusicPlayer:
         )
 
     def build_pause_confirmation_embed(self) -> Optional[discord.Embed]:
-        """Slim -pause confirmation: just the pause position. The response hosts the
-        live NP block right below, so repeating the bar/requester/thumbnail would
-        render them twice — the paused state is the one thing the block does not
-        show. position_secs is frozen while paused, so it is the exact point (-ss
-        offset included). None when no song is live."""
+        """Slim -pause confirmation: the pause position, and nothing the live NP
+        block in the same message already carries — the paused title, the frozen
+        bar, the thumbnail. position_secs is frozen while paused, so the position
+        is the exact point (-ss offset included). None when no song is live."""
         song = self.current_song
         if song is None:
             return None
@@ -1349,7 +1363,7 @@ class MusicPlayer:
         else:
             paused_at = fmt_duration(position)
         return discord.Embed(
-            title=f"⏸️ Paused: {song.title}",
+            title=f"{_PAUSED_TITLE_PREFIX}{song.title}",
             description=f"Paused at: `{paused_at}`",
             color=discord.Color.orange(),
         )
@@ -1368,7 +1382,7 @@ class MusicPlayer:
             lines.append("")
         lines.append(f"Requester: [{data.requester_mention}]")
         return _build_now_playing_base_embed(
-            title=f"Now playing: {data.title}",  # literal, as above
+            title=f"{_NOW_PLAYING_TITLE_PREFIX}{data.title}",  # literal, as above
             description="\n".join(lines),
             webpage_url=data.webpage_url,
             uploader=data.uploader,

@@ -2292,6 +2292,35 @@ class TestBuildNowPlayingEmbed:
         assert "*" not in embed.title
         assert embed.title.startswith("Now playing: ")
 
+    def test_embed_title_says_paused_while_this_song_is_paused(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = True
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert embed.title == f"⏸️ Paused: {mock_song.title}"
+
+    def test_embed_title_says_now_playing_while_this_song_plays(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert embed.title == f"Now playing: {mock_song.title}"
+
+    def test_embed_title_ignores_a_pause_belonging_to_another_song(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The finalize edit for a song that just ended can land after the next one
+        started paused. That card is a record of a finished song, not a paused one."""
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = MagicMock()  # the song that started paused after this one ended
+        vc.is_paused.return_value = True
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert embed.title == f"Now playing: {mock_song.title}"
+
     def test_embed_title_truncated_to_discord_limit(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -2472,7 +2501,21 @@ class TestBuildNowPlayingEmbed:
 class TestBuildPauseConfirmationEmbed:
     """Slim by design: the -pause response hosts the live NP block directly below
     this embed, so a bar, requester, links or thumbnail here would render twice. It
-    carries only what the NP block doesn't — paused state and pause position."""
+    carries only what the NP block doesn't — the pause position."""
+
+    def test_title_prefix_matches_the_np_card(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Both titles sit in one message, so a drift reads as two songs."""
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = True
+        music_player.current_song = mock_song
+        confirmation = music_player.build_pause_confirmation_embed()
+        assert confirmation is not None
+        assert (
+            confirmation.title == music_player._build_now_playing_embed(mock_song).title
+        )
 
     def test_returns_none_when_no_current_song(self, music_player: MusicPlayer) -> None:
         music_player.current_song = None
@@ -4566,6 +4609,21 @@ class TestNpEmbedBlock:
         assert len(block) == 2
         assert block[0].colour == discord.Color.green()
         assert block[1].title == "Up next"
+
+    async def test_block_says_paused_after_pause(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The end of the -pause path: the confirmation attaches this block, so the
+        card the user is left with must already carry the paused title."""
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        music_player.current_song = mock_song
+        vc.pause.side_effect = lambda: vc.is_paused.configure_mock(return_value=True)
+
+        await music_player.pause(cast(discord.VoiceClient, vc))
+
+        assert music_player.np_embed_block()[0].title == f"⏸️ Paused: {mock_song.title}"
 
 
 @contextlib.contextmanager
