@@ -1562,25 +1562,36 @@ request (`debug_footer()`). The trace id is what makes it useful: it is already 
 join key for every log line and span, so pasting one out of Discord finds the exact
 request in Loki/Tempo.
 
-"Every embed" is sent from three places, so three seams apply it:
+"Every embed" is sent from three places, so three seams apply it — all through the one
+`DebugSettings.decorate()`, which owns the enabled check, the strip fallback and every
+segment the caller does not vary (environment, shard, the sampler's runtime figures).
+A seam passes only what it alone knows: the span to name, and elapsed-ms where a
+command timed something. Adding a segment reaches every embed at once:
 
 | Seam | Covers |
 |---|---|
-| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs |
+| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs; the only seam with elapsed-ms |
 | `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
-| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so neither seam above reaches them |
+| `VoiceRecovery` (recovery.py) | the channels-deleted notice, which has no player to decorate it |
+| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so no decoration seam reaches them. Takes `DebugSettings.footer()` — the string form, which omits the environment and the trace because both cards print those themselves |
 
 Rules each seam encodes:
 
 - **The block decorates at build time, not at the attach site**, so every render —
   command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
   produces one, and the tick refreshes the metrics alongside the bar.
+- **The environment leads the suffix**, because it says which deployment everything
+  after it describes. Read at decoration time, never captured: `main()` may infer it
+  from the git branch long after the module is imported.
 - **The block carries the PLAYING SONG's trace id**, captured once into
   `MusicPlayer._playback_span` when that song starts and read by both block render
   sites. Read from the ambient span instead it would alternate on a single message —
   the command's when a response attaches the block, the loop's on the next tick.
   It advances with the song rather than with the loop iteration, so a resolve that
-  failed leaves it alone and an ended song's finalize edit still names its own trace.
+  failed leaves the previous song's tail naming its own trace. The song-end finalize
+  captures the span at spawn, beside `song`/`message`/`own_embeds` and for the same
+  reason: it awaits `_np_edit_lock`, which a debounced edit can hold across a PATCH,
+  so a span read at edit time can already name the song that replaced this one.
   One-shot notices carry the ambient span's id, which is that same trace when the
   player raised it.
 - **A host's cached own embeds are never re-decorated.** Their elapsed-ms records the

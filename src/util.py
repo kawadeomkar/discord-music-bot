@@ -223,11 +223,15 @@ def join_footer(base: str, suffix: str) -> str:
 
     A base long enough to threaten the limit is what gets clipped. Clipping the join
     instead would take the break and the head of the suffix with it, putting the two
-    back on one line at exactly the width where that reads worst.
+    back on one line at exactly the width where that reads worst. A suffix with no
+    room left for a base drops it: truncate() to a limit of zero returns an ellipsis
+    on a nearly whole string, so clamping the width alone would not fit.
     """
     if not (base and suffix):
         return truncate(suffix or base, FOOTER_LIMIT)
-    room = max(0, FOOTER_LIMIT - len(suffix) - len(FOOTER_SUFFIX_SEP))
+    room = FOOTER_LIMIT - len(suffix) - len(FOOTER_SUFFIX_SEP)
+    if room <= 0:
+        return truncate(suffix, FOOTER_LIMIT)
     return f"{truncate(base, room)}{FOOTER_SUFFIX_SEP}{suffix}"
 
 

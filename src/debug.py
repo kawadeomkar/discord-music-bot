@@ -193,6 +193,7 @@ _DEBUG_MARK = "🐞"
 
 def debug_footer(
     *,
+    environment: Optional[str] = None,
     span: Optional[trace.Span] = None,
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
@@ -201,11 +202,16 @@ def debug_footer(
 ) -> str:
     """The debug suffix, or "" when nothing is known worth showing.
 
-    Every part is optional because every part has an absent case: a send outside
-    any command has no elapsed time, a DM has no shard, an unsampled span has no
-    trace id, and the runtime segment is absent until the sampler's first tick.
+    Every part is optional because every part has an absent case: the two dashboards
+    print the environment themselves, a send outside any command has no elapsed time,
+    a DM has no shard, an unsampled span has no trace id, and the runtime segment is
+    absent until the sampler's first tick.
+
+    Environment leads, because it says which deployment everything after it describes.
     """
     parts: list[str] = []
+    if environment:
+        parts.append(environment)
     if elapsed_ms is not None:
         parts.append(f"{round(elapsed_ms)} ms")
     if shard_id is not None:
@@ -253,6 +259,7 @@ def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
 def decorate_embeds(
     embeds: Sequence[discord.Embed],
     *,
+    environment: Optional[str] = None,
     span: Optional[trace.Span] = None,
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
@@ -267,6 +274,7 @@ def decorate_embeds(
         existing = embed.footer.text or ""
         base = _strip_debug_suffix(existing)
         suffix = debug_footer(
+            environment=environment,
             span=span,
             elapsed_ms=elapsed_ms,
             shard_id=shard_id,
@@ -1965,6 +1973,8 @@ class DebugSettings:
             return None
         return (
             debug_footer(
+                # No environment either: both cards open their footer with it, and
+                # twice in one line reads as two deployments.
                 shard_id=guild.shard_id if guild else None,
                 runtime=self.snapshot if host_metrics else None,
                 # Both cards already print `trace: <id>` themselves, and the same id
@@ -1973,6 +1983,38 @@ class DebugSettings:
                 skip_trace=True,
             )
             or None
+        )
+
+    def decorate(
+        self,
+        embeds: Sequence[discord.Embed],
+        guild: Optional[discord.Guild],
+        *,
+        span: Optional[trace.Span] = None,
+        elapsed_ms: Optional[float] = None,
+    ) -> None:
+        """Put debug mode's footer on `embeds`, or take a stale one off. The single
+        entry point for every embed the bot sends: the seams differ only in the span
+        they name and whether a command timed anything, so everything else — the
+        enabled check, the environment, the shard, the sampler's runtime figures — is
+        decided here rather than at each call site. Adding a segment reaches all of
+        them; the seam that forgets to pass one cannot exist.
+
+        Off is a STRIP, not a skip: `play_message` and a host's cached embeds outlive
+        a mid-song `--disable`. See docs/ARCHITECTURE.md#debug-footer-seams.
+        """
+        if not self.enabled(guild.id if guild else None):
+            strip_debug_footers(embeds)
+            return
+        decorate_embeds(
+            embeds,
+            # Read at call time: main() may infer it from the git branch long after
+            # this module is imported.
+            environment=config.ENVIRONMENT,
+            span=span,
+            elapsed_ms=elapsed_ms,
+            shard_id=guild.shard_id if guild else None,
+            runtime=self.snapshot,
         )
 
     # ── Mutations ─────────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from src.debug import RuntimeSnapshot
+from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_queue import GuildQueue, RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
@@ -4584,6 +4584,17 @@ _PLAYBACK_SPAN = trace_api.NonRecordingSpan(
     )
 )
 
+# The song that takes the slot next, for the finalize race below.
+_NEXT_TRACE_HEX = "1122334455667788990aabbccddeeff0"
+_NEXT_SPAN = trace_api.NonRecordingSpan(
+    trace_api.SpanContext(
+        trace_id=int(_NEXT_TRACE_HEX, 16),
+        span_id=0x00B2C3D4E5F60718,
+        is_remote=False,
+        trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+    )
+)
+
 
 @contextlib.contextmanager
 def _recording_tracer() -> Generator[InMemorySpanExporter]:
@@ -4622,8 +4633,9 @@ def _current_span() -> Generator[None]:
 class TestPlayerDebugDecoration:
     """The player's half of debug mode's footer — what MusicContext.send never sees.
 
-    The cog is a MagicMock pinned off in mock_ctx, so enabling means setting both
-    halves: an auto-mock runtime would render garbage.
+    The cog is a MagicMock, but its debug_settings is REAL: decoration runs through
+    DebugSettings.decorate, and a mocked one would swallow every footer while every
+    assertion below still read as if it had been written.
     """
 
     @staticmethod
@@ -4633,12 +4645,14 @@ class TestPlayerDebugDecoration:
         cpu: float = 12.0,
         mem: float = 34.0,
         lag: float = 1.0,
-    ) -> None:
-        cog = mocked(music_player._cog)
-        cog.debug_settings.enabled.return_value = True
-        cog.debug_settings.snapshot = RuntimeSnapshot(
+    ) -> DebugSettings:
+        settings = DebugSettings()
+        settings._overrides[mocked(music_player._guild).id] = True
+        settings._sampler._snapshot = RuntimeSnapshot(
             cpu_percent=cpu, mem_percent=mem, lag_ms=lag, tasks=7, pool_workers=4
         )
+        mocked(music_player._cog).debug_settings = settings
+        return settings
 
     @staticmethod
     def _footers(embeds: Sequence[discord.Embed]) -> list[str]:
@@ -4712,6 +4726,25 @@ class TestPlayerDebugDecoration:
         assert _PLAYBACK_TRACE_HEX in footer
         assert "4bf92f3577b34da6a3ce929d0e0e4736" not in footer
 
+    async def test_the_finalize_keeps_the_ended_songs_trace(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The finalize is fire-and-forget and awaits _np_edit_lock, which a debounced
+        edit can hold across a PATCH. Read off self at edit time, the card for the song
+        that ENDED gets stamped with the trace of the song that replaced it — so the
+        span is captured at spawn, beside song and message."""
+        self._enable(music_player)
+        music_player._playback_span = _PLAYBACK_SPAN
+        message = AsyncMock(spec=discord.Message)
+
+        music_player._fire_finalize_now_playing(mock_song, message, [])
+        music_player._playback_span = _NEXT_SPAN  # the next song claimed the slot
+        await asyncio.gather(*list(music_player._background_tasks))
+
+        footer = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
+        assert _PLAYBACK_TRACE_HEX in footer
+        assert _NEXT_TRACE_HEX not in footer
+
     def test_no_song_yet_means_no_trace(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -4776,7 +4809,9 @@ class TestPlayerDebugDecoration:
         await music_player._push_np_edit(mock_song, message, [])
         assert "🐞" in (message.edit.call_args.kwargs["embeds"][0].footer.text or "")
 
-        mocked(music_player._cog).debug_settings.enabled.return_value = False
+        mocked(music_player._cog).debug_settings._overrides[
+            mocked(music_player._guild).id
+        ] = False
         await music_player._push_np_edit(mock_song, message, [])
         after = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
         assert "🐞" not in after
@@ -4807,7 +4842,9 @@ class TestPlayerDebugDecoration:
         music_player.np_embed_block(now_playing=cached)
         assert "🐞" in (cached.footer.text or "")
 
-        mocked(music_player._cog).debug_settings.enabled.return_value = False
+        mocked(music_player._cog).debug_settings._overrides[
+            mocked(music_player._guild).id
+        ] = False
         music_player.np_embed_block(now_playing=cached)
         assert "🐞" not in (cached.footer.text or "")
         assert "Avg Bitrate" in (cached.footer.text or "")  # its own footer survives

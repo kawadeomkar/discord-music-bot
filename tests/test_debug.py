@@ -869,6 +869,73 @@ class TestDecorationIsIdempotent:
         assert not offenders, offenders
 
 
+class TestTheEnvironmentSegment:
+    """Which deployment the card came from. It leads the suffix, because everything
+    after it describes that deployment."""
+
+    def test_it_leads(self) -> None:
+        assert debug.debug_footer(environment="production", shard_id=0) == (
+            f"{debug._DEBUG_MARK} production · shard 0"
+        )
+
+    def test_a_caller_that_omits_it_gets_the_old_shape(self) -> None:
+        """The two dashboards open their own footer with `environment: <name>`, and
+        twice in one line reads as two deployments."""
+        assert debug.debug_footer(shard_id=0) == f"{debug._DEBUG_MARK} shard 0"
+
+    def test_the_dashboard_suffix_leaves_it_out(self) -> None:
+        settings = debug.DebugSettings()
+        settings._default = True
+        settings._sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=1.0, mem_percent=2.0, lag_ms=0.5, tasks=3, pool_workers=4
+        )
+        suffix = settings.footer(None) or ""
+        assert "cpu 1%" in suffix
+        assert config.ENVIRONMENT not in suffix
+
+
+class TestOneDecorationEntryPoint:
+    """Every embed the bot sends is decorated through DebugSettings.decorate, so the
+    environment, the shard and the runtime figures are assembled once. A seam that
+    forgot a segment used to be possible; now there is nowhere to forget it."""
+
+    @staticmethod
+    def _settings(guild_id: int, *, on: bool) -> debug.DebugSettings:
+        settings = debug.DebugSettings()
+        settings._overrides[guild_id] = on
+        settings._sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=5.0, mem_percent=6.0, lag_ms=0.5, tasks=3, pool_workers=4
+        )
+        return settings
+
+    def test_it_carries_every_segment_the_caller_did_not_pass(self) -> None:
+        guild = MagicMock(spec=discord.Guild)
+        guild.id, guild.shard_id = 7, 2
+        embed = discord.Embed(title="x")
+        self._settings(7, on=True).decorate([embed], guild)
+        footer = embed.footer.text or ""
+        assert config.ENVIRONMENT in footer
+        assert "shard 2" in footer and "cpu 5%" in footer
+
+    def test_a_dm_has_no_guild_and_still_decorates(self) -> None:
+        settings = debug.DebugSettings()
+        settings._default = True
+        embed = discord.Embed(title="x")
+        settings.decorate([embed], None)
+        footer = embed.footer.text or ""
+        assert config.ENVIRONMENT in footer
+        assert "shard" not in footer
+
+    def test_off_strips_rather_than_skips(self) -> None:
+        """play_message and a host's cached embeds outlive a mid-song --disable."""
+        guild = MagicMock(spec=discord.Guild)
+        guild.id, guild.shard_id = 7, 2
+        embed = discord.Embed(title="x")
+        embed.set_footer(text=f"base\n{debug._DEBUG_MARK} shard 2")
+        self._settings(7, on=False).decorate([embed], guild)
+        assert embed.footer.text == "base"
+
+
 class TestTheSuffixStartsItsOwnLine:
     """The embed's own footer and the debug suffix are two separate things to read,
     and a footer near the card's width wraps wherever the width falls — mid-segment,

@@ -205,6 +205,13 @@ class TestJoinFooter:
         assert text.endswith(f"\n{suffix}")
         assert text.startswith("BB")
 
+    def test_a_suffix_with_no_room_left_drops_the_base(self) -> None:
+        """truncate() to a limit of zero returns an ellipsis on a nearly whole string,
+        so clamping the width alone would return a footer over the limit."""
+        text = join_footer("B" * 400, "S" * FOOTER_LIMIT)
+        assert len(text) == FOOTER_LIMIT
+        assert "B" not in text
+
 
 class TestBackgroundTyping:
     """Typing indicator must never delay the command body."""

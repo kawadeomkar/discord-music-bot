@@ -23,7 +23,6 @@ from opentelemetry import trace
 from opentelemetry.context import Context
 
 from src import config
-from src.debug import decorate_embeds, strip_debug_footers
 from src.guild_history import GuildHistory
 from src.guild_queue import (
     GuildQueue,
@@ -1284,16 +1283,7 @@ class MusicPlayer:
         ambient one, so a block re-rendered under a command keeps naming its own
         song. See docs/ARCHITECTURE.md#debug-footer-seams.
         """
-        if not self._cog.debug_settings.enabled(self._guild.id):
-            # Strip rather than return: play_message outlives a mid-song --disable.
-            strip_debug_footers(embeds)
-            return
-        decorate_embeds(
-            embeds,
-            span=span,
-            shard_id=self._guild.shard_id,
-            runtime=self._cog.debug_settings.snapshot,
-        )
+        self._cog.debug_settings.decorate(embeds, self._guild, span=span)
 
     def _build_now_playing_embed(
         self, song: YTDL, *, position_override: Optional[float] = None
@@ -2187,6 +2177,7 @@ class MusicPlayer:
         own_embeds: list[discord.Embed],
         *,
         position_override: Optional[float] = None,
+        span: Optional[trace.Span] = None,
     ) -> bool:
         """Rebuild the host's embeds — a fresh NP block, then its cached own embeds —
         and push one edit. Shared by the periodic tick, the debounced pause/resume
@@ -2195,14 +2186,19 @@ class MusicPlayer:
 
         Rebuilding and re-decorating the block each tick is what keeps the debug
         footer's metrics moving with the bar. `own_embeds` is excluded: cached, and
-        already decorated at send time."""
+        already decorated at send time.
+
+        `span` follows `song` — passed by the caller, never read off self here. The
+        finalize awaits _np_edit_lock, and a debounced edit can hold it across a
+        PATCH; by the time this runs, _playback_span may name the song that replaced
+        the one being finalized."""
         try:
             embed = self._build_now_playing_embed(
                 song, position_override=position_override
             )
             next_up = self._build_next_up_embed()
             block = [embed] + ([next_up] if next_up else [])
-            self._decorate_for_debug(block, span=self._playback_span)
+            self._decorate_for_debug(block, span=span or self._playback_span)
             embeds = block + own_embeds
             # Discord's per-message cap: an attach accepted at the cap can overflow
             # here if a next-up embed appears later. Drop the own-embeds tail, never
@@ -2251,6 +2247,7 @@ class MusicPlayer:
         own_embeds: list[discord.Embed],
         *,
         completed: bool = True,
+        span: Optional[trace.Span] = None,
     ) -> None:
         """One last embed edit once a song has stopped, so the bar lands on its true
         final state rather than wherever the last tick fell (up to
@@ -2258,9 +2255,9 @@ class MusicPlayer:
         completed=False renders where it actually stopped, since a 100% bar for a
         skipped or interjected song would be a false record.
 
-        song/message/own_embeds are captured by the CALLER, not read off self: both
-        may already point at the next song by the time this fire-and-forget task
-        runs. loop() released the host before this fires, so no tick or retire can
+        song/message/own_embeds/span are captured by the CALLER, not read off self:
+        all of them may already point at the next song by the time this
+        fire-and-forget task runs. loop() released the host before this fires, so no tick or retire can
         START against the message — but a debounce-spawned _edit_now_playing_once
         that captured the host before the release can still have a PATCH in flight.
         It holds _np_edit_lock across its edit, so taking the lock here orders this
@@ -2276,6 +2273,7 @@ class MusicPlayer:
                 # None → falls back to the live position_secs, frozen at the stop
                 # point (and, for a paused song, at the pause point).
                 position_override=song.duration_secs if completed else None,
+                span=span,
             )
 
     def _spawn_background(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
@@ -2290,8 +2288,17 @@ class MusicPlayer:
         *,
         completed: bool = True,
     ) -> None:
+        # _playback_span read HERE, synchronously, for the same reason the caller
+        # passes song and message: the task it spawns can wake after the next song
+        # claimed the slot.
         self._spawn_background(
-            self._finalize_now_playing(song, message, own_embeds, completed=completed)
+            self._finalize_now_playing(
+                song,
+                message,
+                own_embeds,
+                completed=completed,
+                span=self._playback_span,
+            )
         )
 
     async def _progress_updater(self, song: YTDL) -> None:
@@ -2545,8 +2552,9 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
                     # Advances with the SONG, not with the iteration: a resolve that
-                    # failed renders no card, and an ended song's finalize edit still
-                    # names its own trace when it lands after the next dequeue.
+                    # failed renders no card, so the previous song's tail keeps naming
+                    # its own trace. A finalize outlives even that — it captures the
+                    # span at spawn (_fire_finalize_now_playing).
                     self._playback_span = span
 
                     # The commit and the start transaction under ONE mutex hold —
