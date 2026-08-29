@@ -17,6 +17,9 @@ import discord
 import orjson
 import pytest
 from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.debug import RuntimeSnapshot
 from src.guild_queue import GuildQueue, RemoveMode
@@ -31,6 +34,7 @@ from src.guild_state import (
     parse_queue_entry,
 )
 from src.redis_client import GuildRedisStore
+from src import musicplayer
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -45,7 +49,7 @@ from src.musicplayer import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
-from src.util import cancel_task, fmt_duration
+from src.util import cancel_task, fmt_duration, trace_id_of
 from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
 
@@ -4568,6 +4572,37 @@ class TestNpEmbedBlock:
         assert block[1].title == "Up next"
 
 
+# A song's playback trace, distinct from _current_span()'s so a test can tell which
+# of the two a card is naming.
+_PLAYBACK_TRACE_HEX = "9f0e1d2c3b4a59687776554433221100"
+_PLAYBACK_SPAN = trace_api.NonRecordingSpan(
+    trace_api.SpanContext(
+        trace_id=int(_PLAYBACK_TRACE_HEX, 16),
+        span_id=0x00A1B2C3D4E5F607,
+        is_remote=False,
+        trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+    )
+)
+
+
+@contextlib.contextmanager
+def _recording_tracer() -> Generator[InMemorySpanExporter]:
+    """A real SDK tracer on the player's module-level `_tracer`, so the loop's spans
+    are recorded rather than no-ops. Without a provider the no-op tracer hands back
+    whatever span is already current, which is the very thing rooting changes."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with patch.object(musicplayer, "_tracer", provider.get_tracer("test")):
+        yield exporter
+
+
+def _iterations(exporter: InMemorySpanExporter) -> list[Any]:
+    return [
+        s for s in exporter.get_finished_spans() if s.name == "player.loop.iteration"
+    ]
+
+
 @contextlib.contextmanager
 def _current_span() -> Generator[None]:
     """Make a span with a valid, sampled context current. conftest installs no
@@ -4648,17 +4683,45 @@ class TestPlayerDebugDecoration:
         assert footer.index("Avg Bitrate") < footer.index("🐞")
         assert footer.split("\n")[1].startswith("🐞")
 
-    def test_the_block_carries_no_trace_id(
+    def test_the_block_carries_the_playing_songs_trace(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The block re-renders under the command span at attach and the playback
-        span on the next tick, so a trace id there would alternate on one message."""
+        """Read from the AMBIENT span the id would alternate on one message — the
+        command's at attach, the loop's on the next tick. It comes off the song."""
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        music_player._playback_span = _PLAYBACK_SPAN
+        with _current_span():  # a command attaching the block, under its own trace
+            footer = self._footers(music_player.np_embed_block())[0]
+        assert _PLAYBACK_TRACE_HEX in footer
+        assert "4bf92f3577b34da6a3ce929d0e0e4736" not in footer
+        assert "cpu 12%" in footer and "shard" in footer
+
+    async def test_the_tick_carries_it_too(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The block's other render site. The two are separate calls, so wiring one
+        alone leaves the card's id flipping every 3 seconds."""
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        music_player._playback_span = _PLAYBACK_SPAN
+        message = AsyncMock(spec=discord.Message)
+        with _current_span():
+            await music_player._push_np_edit(mock_song, message, [])
+        footer = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
+        assert _PLAYBACK_TRACE_HEX in footer
+        assert "4bf92f3577b34da6a3ce929d0e0e4736" not in footer
+
+    def test_no_song_yet_means_no_trace(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The crash-recovery window: a restored play_message renders before the loop
+        has started a song, so there is no playback trace to name."""
         self._enable(music_player)
         music_player.current_song = mock_song
         with _current_span():
             footer = self._footers(music_player.np_embed_block())[0]
         assert "trace" not in footer
-        assert "cpu 12%" in footer and "shard" in footer
 
     async def test_the_dedicated_host_send_is_decorated(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -4817,7 +4880,8 @@ class TestPlayerDebugDecoration:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """It carries its own `trace: <id>` from trace_footer(span), so skip_trace
-        must dedup against it rather than naming the same trace twice."""
+        must dedup against it rather than naming the same trace twice. The id is the
+        song's, so the notice and the card the user screenshots agree."""
         self._enable(music_player)
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -4825,6 +4889,7 @@ class TestPlayerDebugDecoration:
         seed_queue(music_player.queue, queue_obj)
 
         with (
+            _recording_tracer() as exporter,
             _current_span(),
             patch.object(
                 MusicPlayer,
@@ -4834,10 +4899,12 @@ class TestPlayerDebugDecoration:
         ):
             await music_player.loop()
 
+        song_trace = format(_iterations(exporter)[0].context.trace_id, "032x")
         footer = (
             mocked(music_player._channel.send).call_args.kwargs["embed"].footer.text
-        )
-        assert (footer or "").count("4bf92f3577b34da6a3ce929d0e0e4736") == 1
+        ) or ""
+        assert footer.count(song_trace) == 1
+        assert "4bf92f3577b34da6a3ce929d0e0e4736" not in footer
 
     async def test_a_one_shot_notice_keeps_its_trace_id(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -4851,6 +4918,103 @@ class TestPlayerDebugDecoration:
             await music_player._announce_resume(mock_song)
         embed = music_player._channel.send.call_args.kwargs["embed"]
         assert "trace" in (embed.footer.text or "")
+
+
+class TestEachSongRootsItsOwnTrace:
+    """What makes the id on the card worth pasting. The loop task inherits the context
+    that created the player, so a parented iteration span files every song the guild
+    ever plays under the one -play that built it — one id, one trace, never ending."""
+
+    @staticmethod
+    def _armed(mp: MusicPlayer, songs: int) -> None:
+        mp._restore_complete.set()
+        mp.bot.wait_until_ready = AsyncMock()
+        mocked(mp.bot.is_closed).side_effect = [False] * songs + [True]
+        mp.bot.loop = asyncio.get_running_loop()
+        mp._channel.send = AsyncMock()
+
+    async def test_two_songs_are_two_traces_and_neither_is_the_commands(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        self._armed(music_player, songs=2)
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=1", "One", mock_author),
+            QueueObject("https://yt.com/v=2", "Two", mock_author),
+        )
+
+        with (
+            _recording_tracer() as exporter,
+            _current_span(),  # the -play that built the player, still on the stack
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(side_effect=Exception())
+            ),
+        ):
+            await music_player.loop()
+
+        spans = _iterations(exporter)
+        assert len(spans) == 2
+        assert all(s.parent is None for s in spans)
+        assert len({s.context.trace_id for s in spans}) == 2
+        assert all(
+            format(s.context.trace_id, "032x") != "4bf92f3577b34da6a3ce929d0e0e4736"
+            for s in spans
+        )
+
+    async def test_the_span_is_captured_when_the_song_starts(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+    ) -> None:
+        """The card reads _playback_span, so the loop has to hand it over."""
+        self._armed(music_player, songs=1)
+        mock_song.start_paused = False
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            _recording_tracer() as exporter,
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        assert music_player._playback_span is not None
+        assert trace_id_of(music_player._playback_span) == format(
+            _iterations(exporter)[0].context.trace_id, "032x"
+        )
+
+    async def test_a_song_that_never_resolved_leaves_it_alone(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Captured with the SONG, not at the top of the iteration: a resolve that
+        failed renders no card, and advancing there would point an ended song's
+        finalize edit at the trace of the song that replaced it."""
+        self._armed(music_player, songs=1)
+        seed_queue(music_player.queue, queue_obj)
+
+        with (
+            _recording_tracer(),
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(side_effect=Exception())
+            ),
+        ):
+            await music_player.loop()
+
+        assert music_player._playback_span is None
 
 
 class TestNpHostAdoptRetire:

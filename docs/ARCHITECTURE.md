@@ -582,7 +582,7 @@ flowchart LR
 
 ### Playback Loop
 
-`MusicPlayer.loop()` runs as a long-lived asyncio task. It first awaits `bot.wait_until_ready()` and `_restore_complete` (so crash-restore finishes populating the queue before the first dequeue). Each iteration is wrapped in a `player.loop.iteration` span and carries a `claim_outstanding` flag so the exception handler can release a claim no other path settled.
+`MusicPlayer.loop()` runs as a long-lived asyncio task. It first awaits `bot.wait_until_ready()` and `_restore_complete` (so crash-restore finishes populating the queue before the first dequeue). Each iteration is wrapped in a `player.loop.iteration` span — rooted, so a song is a trace — and carries a `claim_outstanding` flag so the exception handler can release a claim no other path settled.
 
 ```mermaid
 flowchart TD
@@ -987,6 +987,7 @@ Configured in `src/telemetry.py`; `setup_telemetry()` is the first call in `main
 Span conventions worth knowing:
 - Every command invocation gets a `command.{name}` span opened in `cog_before_invoke` and closed in `cog_after_invoke` (error path ends it early).
 - `player.loop.iteration` spans deliberately stay open for the full song duration (3–5 min typically) — this is expected, not a leak.
+- `player.loop.iteration` is a ROOT span (`context=Context()`), so **one song is one trace**: its resolve, its stream extraction, the prefetch it launches for the next song, and every log line the loop emits while it plays. The loop task inherits the context of whatever created the player — a `-play` or `guild.restore` — so an inherited parent files every song a guild ever plays under that one command, in a trace that never ends. The id is what the Now Playing card and the playback-error notice both print.
 - The alone-countdown span covers only the post-sleep decision so it doesn't sit open for 10 s.
 - Error embeds include a `trace: {trace_id}` footer (`util.trace_footer`) for cross-referencing user reports with Tempo.
 - `shutdown_telemetry()` force-flushes on close, run in an executor because it can block up to 30 s.
@@ -1574,9 +1575,14 @@ Rules each seam encodes:
 - **The block decorates at build time, not at the attach site**, so every render —
   command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
   produces one, and the tick refreshes the metrics alongside the bar.
-- **The block carries no trace id.** It re-renders under the command span when a
-  response attaches it and under the playback span on the next tick, so a trace id
-  there would alternate on a single message. One-shot notices do carry theirs.
+- **The block carries the PLAYING SONG's trace id**, captured once into
+  `MusicPlayer._playback_span` when that song starts and read by both block render
+  sites. Read from the ambient span instead it would alternate on a single message —
+  the command's when a response attaches the block, the loop's on the next tick.
+  It advances with the song rather than with the loop iteration, so a resolve that
+  failed leaves it alone and an ended song's finalize edit still names its own trace.
+  One-shot notices carry the ambient span's id, which is that same trace when the
+  player raised it.
 - **A host's cached own embeds are never re-decorated.** Their elapsed-ms records the
   request that sent them, so a command response that became the host before a toggle
   keeps the footer it was sent with until a new host replaces it.

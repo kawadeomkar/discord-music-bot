@@ -895,7 +895,11 @@ when in a span, and command context (`guild_id`, `user_id`, `command`) bound in
 closes it, `cog_command_error` records onto it). `_DiscordGatewayFilter` drops
 discord.py-internal HTTP spans. Redis and aiohttp are auto-instrumented. Spans embed
 their `trace_id` in error-embed footers (`trace_footer`) so a user report can be joined
-to a trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env-tunable)
+to a trace. **`player.loop.iteration` is a ROOT span**, so one song is one trace — the
+loop task inherits the context that created the player, and an inherited parent files
+every song a guild ever plays under one `-play`. Its id is captured into
+`MusicPlayer._playback_span` at the song's start and printed on the Now Playing card
+and the playback-error notice, which is why both name the same trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env-tunable)
 probing Discord/Redis/Spotify/Postgres/OTEL and reporting bot/yt-dlp/ffmpeg
 versions; `max_concurrency(1, guild)`.
 

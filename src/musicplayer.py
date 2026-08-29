@@ -20,6 +20,7 @@ from discord.ext import commands
 import redis.asyncio as aioredis
 
 from opentelemetry import trace
+from opentelemetry.context import Context
 
 from src import config
 from src.debug import decorate_embeds, strip_debug_footers
@@ -340,6 +341,7 @@ class MusicPlayer:
         "_last_author",
         "_cog",
         "current_song",
+        "_playback_span",
         "play_next",
         "queue",
         "play_message",
@@ -377,6 +379,7 @@ class MusicPlayer:
     _last_author: Optional[Union[discord.User, discord.Member]]
     _cog: MusicBot
     current_song: Optional[YTDL]
+    _playback_span: Optional[trace.Span]
     play_next: asyncio.Event
     queue: GuildQueue
     play_message: Optional[discord.Embed]
@@ -433,6 +436,10 @@ class MusicPlayer:
         self._cog = cog
 
         self.current_song = None
+        # The playing song's trace, captured once at its start and read by every
+        # NP-block render. Taken from the ambient span instead, the id would be the
+        # command's on an attach and the loop's on the next tick.
+        self._playback_span: Optional[trace.Span] = None
         # Set by _stream_source() on a failed resolve; read by the loop to build a
         # descriptive skip notice, then cleared.
         self._last_stream_error: Optional[StreamFailure] = None
@@ -1273,8 +1280,9 @@ class MusicPlayer:
         """Add the debug footer to what the player sends or edits itself, which
         MusicContext.send never sees. Freshly built embeds only: the cached
         _np_host_own_embeds keep their send-time footer. No elapsed_ms — no command
-        here took any time. NP-block callers pass no span, so a re-rendered block
-        cannot alternate trace ids. See docs/ARCHITECTURE.md#debug-footer-seams.
+        here took any time. NP-block callers pass the PLAYBACK span rather than the
+        ambient one, so a block re-rendered under a command keeps naming its own
+        song. See docs/ARCHITECTURE.md#debug-footer-seams.
         """
         if not self._cog.debug_settings.enabled(self._guild.id):
             # Strip rather than return: play_message outlives a mid-song --disable.
@@ -1486,7 +1494,7 @@ class MusicPlayer:
         next_up = self._build_next_up_embed()
         if next_up is not None:
             block.append(next_up)
-        self._decorate_for_debug(block)
+        self._decorate_for_debug(block, span=self._playback_span)
         return block
 
     def _adopt_np_host(
@@ -2194,7 +2202,7 @@ class MusicPlayer:
             )
             next_up = self._build_next_up_embed()
             block = [embed] + ([next_up] if next_up else [])
-            self._decorate_for_debug(block)
+            self._decorate_for_debug(block, span=self._playback_span)
             embeds = block + own_embeds
             # Discord's per-message cap: an attach accepted at the cap can overflow
             # here if a next-up embed appears later. Drop the own-embeds tail, never
@@ -2444,10 +2452,13 @@ class MusicPlayer:
             # None — and None defaults to popping. Written beside the flag above,
             # so it never describes a different item than the one claimed.
             claim_persisted = True
-            # Each iteration spans a full song (3–5 min). Expected — the span stays
-            # open across play_next.wait().
+            # Each iteration spans a full song (3–5 min), staying open across
+            # play_next.wait(), and roots its own trace: the loop task inherits the
+            # context that created the player, so an inherited parent files every song
+            # the guild ever plays under one -play, in a trace that never ends.
             with _tracer.start_as_current_span(
                 "player.loop.iteration",
+                context=Context(),
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
@@ -2533,6 +2544,10 @@ class MusicPlayer:
                         continue
 
                     span.set_attribute("song.title", self.current_song.title or "")
+                    # Advances with the SONG, not with the iteration: a resolve that
+                    # failed renders no card, and an ended song's finalize edit still
+                    # names its own trace when it lands after the next dequeue.
+                    self._playback_span = span
 
                     # The commit and the start transaction under ONE mutex hold —
                     # see GuildQueue.commit_dequeue. The store dispatch is the only
