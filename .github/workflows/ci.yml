@@ -443,6 +443,45 @@ jobs:
           cache-from: type=gha,scope=runtime
           cache-to: type=gha,mode=max,scope=runtime
 
+      # The same commit, without the charts extra. Published as a parallel `-slim` tag
+      # family rather than replacing anything: the archive ships OFF, so most
+      # deployments can never reach -analytics and pay 230MB for it, but an operator
+      # who does enable it must not be silently downgraded by a tag they already use.
+      - name: Extract metadata (slim)
+        id: meta-slim
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # onlatest so `latest` becomes `latest-slim` too, rather than colliding with
+          # the full image's moving tag.
+          flavor: suffix=-slim,onlatest=true
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve-env.outputs.version }},enable={{is_default_branch}}
+
+      - name: Build slim runtime image (push only from main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: ${{ env.PUBLISH }}
+          # CHART_EXTRAS= is EMPTY on purpose and is the entire slim mechanism — it
+          # overrides the Dockerfile ARG's charts-included default. Deleting the
+          # trailing `=` would pass the arg through from the environment instead,
+          # which is unset here, and buildx would fall back to that same default:
+          # a second identical image under a -slim name.
+          build-args: |
+            ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+            GIT_SHA=${{ github.sha }}
+            CHART_EXTRAS=
+          tags: ${{ steps.meta-slim.outputs.tags }}
+          labels: ${{ steps.meta-slim.outputs.labels }}
+          # Same scope as the full build: the two share every layer up to the poetry
+          # install, so a separate scope would re-export all of them.
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
+
   release:
     name: Tag & Release
     runs-on: ubuntu-latest

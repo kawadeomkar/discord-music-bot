@@ -218,11 +218,13 @@ data volume, and a silently-changed value would lock the bot out of its own data
 
 `poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
 and `dev` groups are optional, so running the bot does not pull in pyright and its
-bundled Node runtime.
+bundled Node runtime. It also leaves out the `charts` extra — matplotlib and its
+tree, 133 MB — which only `-analytics` needs; add `--extras charts` to run that
+command from a local checkout.
 
-Contributors should use `just install`, which adds those three groups. `just check`
-requires them; the error "ruff not found … run 'just install' first" means they are
-missing.
+Contributors should use `just install`, which adds those three groups and the extra.
+`just check` requires them; the error "ruff not found … run 'just install' first"
+means they are missing.
 
 Every recipe below uses the project's virtualenv. With pyenv-virtualenv (this
 project ships a `.python-version`), `poetry install` installs into that environment
@@ -317,7 +319,7 @@ just test --maxfail=1              # stop at the first failure
 
 | Recipe | Does |
 |---|---|
-| `just image` | Build the runtime image as `:latest` and `:<git-sha>` — no test gate |
+| `just image` | Build the runtime image as `:latest` and `:<git-sha>`, plus the `-slim` pair without the chart renderer — no test gate |
 
 `just image` has no test gate; the gate lives in the pipeline
 (`./build_docker.sh`). Use `just image` when you want the artifact and have already

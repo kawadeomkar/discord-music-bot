@@ -1074,6 +1074,15 @@ class TestDebugCardCarriesTheSuffixEndToEnd:
     """The cog→card wiring, driven through the real command. TestSnapshotEmbed above
     hand-builds a DebugInputs, so it pins only the renderer's concatenation."""
 
+    @pytest.fixture(autouse=True)
+    def _fixed_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The footer opens with `environment: {config.ENVIRONMENT}`, which in CI is
+        the branch slug. The withheld-metrics test below greps the WHOLE footer for
+        labels like "pool ", so a branch named task/analytics-4-pool made it fail on
+        its own name — and equally would any branch ending in cpu, mem, lag or tasks.
+        Pinned by setattr, not setenv: config reads the variable once at import."""
+        monkeypatch.setattr(config, "ENVIRONMENT", "testing")
+
     @staticmethod
     def _enable(cog: MusicBotCog, ctx: MagicMock) -> None:
         cog.debug_settings._overrides[ctx.guild.id] = True
@@ -1393,6 +1402,28 @@ class TestRuntimeBlock:
         line = next(line for line in debug.runtime_lines() if line.startswith("uptime"))
         assert "<t:" not in line
         assert line == "uptime       1:02:05"
+
+    async def test_both_process_pools_are_reported(self) -> None:
+        """The chart pool is reported even when it has never spawned, which is the
+        common case: "not spawned" is the answer to "why is this bot not holding
+        173MB of matplotlib", and an absent row reads as a missing feature."""
+        lines = debug.runtime_lines(tasks=3)
+        chart = next(line for line in lines if line.startswith("chart pool"))
+        assert "1 worker" in chart
+        assert "not spawned" in chart
+        assert any(line.startswith("yt-dlp pool") for line in lines)
+
+    async def test_the_chart_pool_row_reads_the_patched_pool(self) -> None:
+        """conftest's use_thread_chart_pool patches src.chart_pool.chart_pool, so
+        this must resolve the name per call — a captured reference would report the
+        production singleton's state instead, silently, and -debug would answer for
+        a pool nothing in the process is using."""
+        import src.chart_pool as chart_pool_mod
+        from src.ytdlp_pool import YtdlpPool
+
+        with patch.object(chart_pool_mod, "chart_pool", YtdlpPool(max_workers=9)):
+            assert debug.chart_pool_state().max_workers == 9
+            assert "9 worker" in "".join(debug.runtime_lines(tasks=1))
 
 
 class TestGitSha:
