@@ -73,6 +73,15 @@ async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
         task.cancel()
 
 
+def refund_cooldown(ctx: commands.Context) -> None:
+    """Hand back the cooldown discord.py charged in prepare().
+
+    `Context.command` is Optional, but inside a command's own body it never is —
+    the guard is for the type checker, not for a case that happens."""
+    if ctx.command is not None:
+        ctx.command.reset_cooldown(ctx)
+
+
 def record_span_error(span: Span, e: Exception) -> None:
     """Record an exception on a span and mark its status as ERROR."""
     span.record_exception(e)

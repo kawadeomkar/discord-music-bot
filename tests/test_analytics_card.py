@@ -887,7 +887,7 @@ class TestChartFallback:
 
         with (
             patch("src.chart_pool.chart_pool.run", AsyncMock(side_effect=_hang)),
-            patch("src.musicbot.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
+            patch("src.analytics_card.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
         ):
             await command_callback(MusicBot.analytics)(
                 self._bot(music_bot), mock_ctx, flags=_flags()
@@ -973,7 +973,8 @@ class TestPngCache:
         run = AsyncMock()
         with (
             patch(
-                "src.musicbot.analytics_png_get", AsyncMock(return_value=b"\x89PNGx")
+                "src.analytics_card.analytics_png_get",
+                AsyncMock(return_value=b"\x89PNGx"),
             ),
             patch("src.chart_pool.chart_pool.run", run),
         ):
@@ -1006,9 +1007,9 @@ class TestPngCache:
         )
         with (
             patch("src.chart_pool.chart_pool.run", _slow),
-            patch("src.musicbot.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
-            patch("src.musicbot.analytics_png_get", AsyncMock(return_value=None)),
-            patch("src.musicbot.analytics_png_set", setter),
+            patch("src.analytics_card.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
+            patch("src.analytics_card.analytics_png_get", AsyncMock(return_value=None)),
+            patch("src.analytics_card.analytics_png_set", setter),
         ):
             await command_callback(MusicBot.analytics)(
                 music_bot, mock_ctx, flags=_flags()
@@ -1060,8 +1061,8 @@ class TestPngCache:
         )
         setter = AsyncMock()
         with (
-            patch("src.musicbot.analytics_png_get", AsyncMock(return_value=None)),
-            patch("src.musicbot.analytics_png_set", setter),
+            patch("src.analytics_card.analytics_png_get", AsyncMock(return_value=None)),
+            patch("src.analytics_card.analytics_png_set", setter),
             patch("src.chart_pool.chart_pool.run", AsyncMock(return_value=b"\x89PNGy")),
         ):
             await command_callback(MusicBot.analytics)(
@@ -1108,8 +1109,8 @@ class TestPngCache:
         music_bot.history_archive = _fake_archive(_metrics())
         setter = AsyncMock()
         with (
-            patch("src.musicbot.analytics_png_get", AsyncMock(return_value=None)),
-            patch("src.musicbot.analytics_png_set", setter),
+            patch("src.analytics_card.analytics_png_get", AsyncMock(return_value=None)),
+            patch("src.analytics_card.analytics_png_set", setter),
             patch(
                 "src.chart_pool.chart_pool.run",
                 AsyncMock(side_effect=RemoteCallError("boom")),

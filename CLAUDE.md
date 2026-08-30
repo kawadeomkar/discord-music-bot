@@ -269,8 +269,10 @@ src/
 ├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), and the alone-in-channel leave watchdog
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
 │                     # the command itself stays on the cog)
-├── analytics_card.py # -analytics: --days allowlist, both cache codecs, the embed. Every
-│                     # human-authored string renders HERE, never in the image
+├── analytics_card.py # -analytics, everything but the command and the figure. Pure half:
+│                     # --days allowlist, both cache codecs, the embed — every
+│                     # human-authored string renders HERE, never in the image. IO half:
+│                     # the chart pool, the PNG cache, the send
 ├── analytics_render.py # the six-panel figure; imports matplotlib INSIDE build_figure and
 │                     # constructs nothing at module scope (a worker re-imports it)
 ├── chart_pool.py     # the chart pool's only home: one YtdlpPool(max_workers=1). Exists so

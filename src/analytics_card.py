@@ -1,7 +1,9 @@
-"""`-analytics` — the window allowlist, the Redis cache codec, and the embed.
+"""`-analytics` — everything the command needs except the figure and the pool.
 
-Everything here is pure: it takes an `AnalyticsMetrics` and returns keys, dicts or an
-embed. The command stays on the MusicBot cog, the same split `leaderboard.py` makes.
+Two halves, and the file is ordered that way. The first is PURE: an
+`AnalyticsMetrics` in, keys, dicts or an embed out. The second does IO — it drives
+the chart pool, reads and writes the PNG cache, and sends the card. Only the command
+itself stays on the MusicBot cog, where discord.py needs it.
 
 Every human-authored string the command shows renders HERE, never in the chart image:
 the runtime image ships no system fonts and matplotlib's bundled face covers no CJK,
@@ -12,16 +14,20 @@ Named `analytics_card` because `guild_state.Analytics` already exists — a per-
 enqueue stamp — and the two would sit one capital apart.
 """
 
+import asyncio
 import hashlib
+import io
 import re
 import time
-from typing import Any, Final, Optional
+from typing import TYPE_CHECKING, Any, Final, Optional
 
 import discord
 import orjson
 from discord.ext import commands
+from opentelemetry import trace
 
-from src import analytics_render
+from src import analytics_render, chart_pool as chart_pool_mod
+from src.config import ANALYTICS_RENDER_DEADLINE_SECS
 from src.guild_state import (
     WAIT_UNAVAILABLE,
     AnalyticsMetrics,
@@ -35,7 +41,14 @@ from src.guild_state import (
     TopListener,
     TopSong,
 )
-from src.util import fmt_duration, pluralize, safe_label
+from src.redis_client import analytics_png_get, analytics_png_set
+from src.util import fmt_duration, get_logger, pluralize, safe_label, spawn_background
+
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
+
+log = get_logger(__name__)
+_tracer = trace.get_tracer(__name__)
 
 # The four windows -analytics answers, and the whole of its key space. A closed key
 # space is what makes the day-long TTL a rate bound: one recompute per guild per
@@ -362,3 +375,143 @@ def invalid_days_notice() -> str:
         f"`--days` must be one of: {allowed}. "
         f"Omit it for the default of {DEFAULT_DAYS}."
     )
+
+
+# ── The IO half ───────────────────────────────────────────────────────────────
+# Everything above is pure. Below drives the chart pool, the PNG cache and Discord.
+# `redis` and `tasks` arrive as parameters rather than through a cog, so the split
+# survives: nothing here reaches back into MusicBot.
+
+
+async def render_chart(
+    ctx: commands.Context,
+    metrics: AnalyticsMetrics,
+    *,
+    redis: Optional[aioredis.Redis],
+    tasks: set[asyncio.Task],
+) -> Optional[bytes]:
+    """The chart, or None to send the card without one.
+
+    Every failure here degrades to the embed-only card rather than to an error:
+    the numbers are already in hand, and a chart that could not be drawn must not
+    take them with it. The catch below is deliberately broad for that reason.
+    """
+    guild = ctx.guild
+    if guild is None or not chart_pool_mod.chart_available():
+        # The slim runtime image, which ships without matplotlib. One line, and no
+        # worker is spawned to discover it.
+        if guild is not None:
+            log.warning(
+                "matplotlib is not installed — sending -analytics without its chart"
+            )
+        return None
+    me = guild.me
+    perms = ctx.channel.permissions_for(me) if me is not None else None
+    if perms is not None and not perms.attach_files:
+        # This is the bot's FIRST file upload, and many existing installs' grants
+        # predate it. Preflighted rather than discovered at send time, so the
+        # render is not paid for a message Discord will refuse.
+        log.info("missing Attach Files — sending -analytics without its chart")
+        return None
+    # Keyed to a digest of the aggregate it was rendered from, so a stale PNG
+    # MISSES rather than pairing a chart from one hour with numbers recomputed
+    # in another — with nothing on the card to say the two disagree.
+    key = png_cache_key(guild.id, metrics.days, aggregate_digest(metrics))
+    cached = await analytics_png_get(redis, key)
+    # Its own span: this is the command's most expensive step, and png.cached
+    # separates a cache hit from a render at a glance.
+    with _tracer.start_as_current_span("analytics.render") as span:
+        span.set_attribute("png.cached", cached is not None)
+        if cached is not None:
+            span.set_attribute("png.bytes", len(cached))
+            return cached
+        render = asyncio.ensure_future(
+            chart_pool_mod.chart_pool.run(analytics_render.render_dashboard, metrics)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {render}, timeout=ANALYTICS_RENDER_DEADLINE_SECS
+            )
+            if not done:
+                # A ProcessPoolExecutor cannot cancel a running call, so the
+                # worker finishes regardless — it finishes into the cache.
+                # See docs/ARCHITECTURE.md#analytics-rendering.
+                span.set_attribute("png.timed_out", True)
+                spawn_background(
+                    cache_late_render(key, render, metrics, redis=redis), tasks
+                )
+                return None
+            png = render.result()
+            span.set_attribute("png.bytes", len(png))
+            await analytics_png_set(redis, key, png, cache_ttl_secs(metrics))
+            return png
+        except Exception as e:
+            # Exception, because the docstring's promise is every failure:
+            # _picklable_call re-raises whatever pickles, so worker exceptions
+            # arrive as themselves. CancelledError is a BaseException and still
+            # propagates. The message is fixed — matplotlib's name filesystem
+            # paths.
+            span.record_exception(e)
+            log.warning(f"analytics chart render failed: {type(e).__name__}: {e}")
+            return None
+
+
+async def cache_late_render(
+    key: str,
+    render: asyncio.Future[bytes],
+    metrics: AnalyticsMetrics,
+    *,
+    redis: Optional[aioredis.Redis],
+) -> None:
+    """Store a chart whose caller already gave up on it.
+
+    The TTL is recomputed here rather than captured: a render that overran the
+    deadline may have crossed midnight, and cache_ttl_secs returns non-positive
+    for exactly that, which skips the write."""
+    try:
+        png = await render
+    except Exception as e:
+        log.warning(f"late analytics render failed: {type(e).__name__}: {e}")
+        return
+    ttl = cache_ttl_secs(metrics)
+    if ttl > 0:
+        await analytics_png_set(redis, key, png, ttl)
+
+
+async def send_card(
+    ctx: commands.Context,
+    metrics: AnalyticsMetrics,
+    png: Optional[bytes],
+    guild: Optional[discord.Guild],
+) -> None:
+    """One message through ctx.send, so the Now Playing block rides along and the
+    card may adopt the NP host — this command sends once and never edits, unlike
+    -ping and -debug.
+
+    A Discord refusal of the upload retries without it: a permission can change
+    between the preflight and the send.
+
+    A missing chart says so on the card only when the reason is actionable. The
+    permission is re-read here — permissions_for is local — which keeps
+    render_chart's contract at "bytes or no bytes"."""
+    note = None
+    if png is None and guild is not None:
+        me = guild.me
+        perms = ctx.channel.permissions_for(me) if me is not None else None
+        if perms is not None and not perms.attach_files:
+            note = "Chart omitted — the bot needs Attach Files in this channel."
+    if png is not None:
+        try:
+            await ctx.send(
+                embed=build_embed(metrics, guild=guild, image_filename=IMAGE_FILENAME),
+                file=discord.File(io.BytesIO(png), filename=IMAGE_FILENAME),
+            )
+            return
+        except discord.HTTPException as e:
+            # Refusals only: 403 for permission, 400/413 for the file. A 5xx can
+            # be raised after Discord created the message, so retrying it would
+            # post the card twice.
+            if not isinstance(e, discord.Forbidden) and e.status not in (400, 413):
+                raise
+            log.warning(f"analytics chart upload refused: {e}")
+    await ctx.send(embed=build_embed(metrics, guild=guild, chart_note=note))
