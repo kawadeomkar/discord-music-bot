@@ -757,6 +757,42 @@ class TestClose:
 
         shutdown.assert_called_once()
 
+    async def test_a_failing_chart_pool_close_does_not_cost_the_span_flush(
+        self, app: MusicBotApp
+    ) -> None:
+        """Every step in close() is individually guarded because a hung Postgres once
+        made archive.close() raise, and _teardown_started short-circuits the retry —
+        so every step after the raiser was skipped for good. The chart pool sits
+        between the yt-dlp pool and the probe session; a raise here would cost the
+        span flush, which is the record of the failed shutdown."""
+        app._redis_pool = None
+        with (
+            patch(
+                "src.chart_pool.chart_pool.aclose",
+                new=AsyncMock(side_effect=RuntimeError("join wedged")),
+            ),
+            patch("src.telemetry.shutdown_telemetry") as shutdown,
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()  # must not raise
+
+        shutdown.assert_called_once()
+
+    async def test_the_chart_pool_is_closed_on_the_way_down(
+        self, app: MusicBotApp
+    ) -> None:
+        """It is never spawned on a bot that never ran -analytics, in which case this
+        only flips the closed flag — but an unclosed one that WAS spawned leaves a
+        worker to the 61s atexit join aclose() exists to bound."""
+        app._redis_pool = None
+        with (
+            patch("src.chart_pool.chart_pool.aclose", new=AsyncMock()) as aclose,
+            patch("src.telemetry.shutdown_telemetry"),
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()
+        aclose.assert_awaited_once()
+
 
 class TestHelpFlag:
     """`--help` anywhere in a command message diverts to that command's help
@@ -1007,3 +1043,97 @@ class TestIntents:
         no-guild case (test_debug.py: "-debug is DM-reachable"). Dropping this
         leaves both unreachable in production with every test still green."""
         assert intents.dm_messages is True
+
+
+class TestChartPoolWarm:
+    """setup_hook warms the chart worker so the first -analytics does not pay
+    matplotlib's import in front of a user — but only where the command is reachable."""
+
+    async def test_the_chart_pool_is_warmed_when_the_archive_is_on(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        with (
+            patch("src.chart_pool.warm") as warm,
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+        ):
+            await app.setup_hook()
+        warm.assert_called_once()
+
+    async def test_a_default_deployment_never_spawns_a_chart_worker(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """-analytics is archive-gated, so a bot with the archive off can never reach
+        that pool. Paying ~60MB for it would be pure waste, and the archive is OFF by
+        default — this is the narrowing that makes warming affordable at all."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        with (
+            patch("src.chart_pool.warm") as warm,
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_report_archive_disabled", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+        ):
+            await app.setup_hook()
+        warm.assert_not_called()
+
+    async def test_the_chart_pool_is_warmed_after_the_ytdlp_pool(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order is load-bearing: yt-dlp's prewarm is what brings the forkserver up and
+        pays the entry-module import in it, so warming after costs a ~21ms fork rather
+        than repeating ~1.7s of imports."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        order: list[str] = []
+        with (
+            patch("src.chart_pool.warm", side_effect=lambda: order.append("chart")),
+            patch(
+                "src.youtube.ytdlp_pool.prewarm",
+                side_effect=lambda *a, **k: order.append("ytdlp"),
+            ),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+        ):
+            await app.setup_hook()
+        assert order == ["ytdlp", "chart"]
+
+
+class TestChartPoolWarmCallable:
+    def test_warm_does_nothing_without_matplotlib(self) -> None:
+        """No worker is spawned to discover the import will fail — that would leave a
+        ~60MB process resident for nothing."""
+        import src.chart_pool as cp
+
+        with (
+            patch.object(cp, "chart_available", return_value=False),
+            patch.object(cp.chart_pool, "prewarm") as prewarm,
+        ):
+            cp.warm()
+        prewarm.assert_not_called()
+
+    def test_warm_submits_the_matplotlib_importing_callable(self) -> None:
+        """The default no-op would spawn the worker and warm nothing that matters:
+        matplotlib is imported inside render_dashboard, so a no-op never touches it."""
+        import src.chart_pool as cp
+
+        with (
+            patch.object(cp, "chart_available", return_value=True),
+            patch.object(cp.chart_pool, "prewarm") as prewarm,
+        ):
+            cp.warm()
+        prewarm.assert_called_once_with(cp._warm_worker)
+
+    def test_the_warm_callable_is_importable_by_qualified_name(self) -> None:
+        """It is pickled to the worker by name, so it must be module-level — a closure
+        or a local would fail at submit time, on the startup path."""
+        import pickle
+
+        import src.chart_pool as cp
+
+        assert pickle.loads(pickle.dumps(cp._warm_worker)) is cp._warm_worker
