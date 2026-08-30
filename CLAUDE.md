@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.29.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.32.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,970 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,200 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): a 98-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -115,7 +115,7 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    `CLAUDE.md` and `docs/ARCHITECTURE.md`, which describe the client strategy for a
    specific version: Dependabot moves pyproject + `poetry.lock` without touching either,
    and main has carried a stale copy for exactly that reason.
-   **Three pairs are NOT enforced — this list is what a maintainer checks by hand,
+   **Four pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
    `brainicism/bgutil-ytdlp-pot-provider` image tag in `docker-compose.yml`. The plugin
@@ -136,6 +136,16 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    every build: the symptom lands on the metrics path, where a missing `docker_stats`
    series leaves `-debug`'s cpu/mem row reading `n/a (no metrics source)`, which is also
    exactly what "the `metrics` profile is not running" looks like.
+   (d) `MPLCONFIGDIR`, written in **three** places that must agree on a WRITABLE path:
+   the Dockerfile's test stage (`/tmp/mplcache`, beside `RUFF_CACHE_DIR`), its runtime
+   stage (`/home/app/.cache/matplotlib`, created and chowned in the same `RUN` as
+   `useradd`), and `tests/conftest.py` at module scope. The three deliberately hold
+   DIFFERENT paths — what must agree is that each is writable by the uid that runs
+   there, which is why this cannot be a `just pins` string comparison. Unwritable is
+   the failure, and in the two Dockerfile copies it is quiet: matplotlib falls back to
+   a temp directory and warns once per process, so the symptom is a stderr line nobody
+   reads. The conftest copy is the exception — the suite renders in-process, so rule
+   11 turns that warning into a red build.
 7. **Do not create `pyrightconfig.json`.** `[tool.pyright]` in `pyproject.toml` is the
    single source of truth; a `pyrightconfig.json` would silently override it for editors
    only. Do not re-add `venvPath`/`venv` there either — `just types` passes
@@ -252,6 +262,12 @@ src/
 ├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), and the alone-in-channel leave watchdog
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
 │                     # the command itself stays on the cog)
+├── analytics_card.py # -analytics: --days allowlist, both cache codecs, the embed. Every
+│                     # human-authored string renders HERE, never in the image
+├── analytics_render.py # the six-panel figure; imports matplotlib INSIDE build_figure and
+│                     # constructs nothing at module scope (a worker re-imports it)
+├── chart_pool.py     # the chart pool's only home: one YtdlpPool(max_workers=1). Exists so
+│                     # main.py/debug.py/conftest.py have a name to resolve per call
 ├── db_migrate.py     # SQL migration runner (`python -m src.db_migrate`, EXPECTED_SCHEMA_VERSION)
 ├── backfill_history.py # ONE-SHOT operator script: pre-archive Redis history → Postgres, direct
 │                     # (not via the outbox). Run BEFORE deploying this build — see below
@@ -342,7 +358,9 @@ archive would XADD onto an outbox nobody drains), constructs `PostgresHistoryArc
 stay `None`, one INFO says so, a set `POSTGRES_URL` is explicitly ignored (the flag,
 never URL presence, is consent), and a leftover outbox from an earlier enabled run
 draws a WARNING naming the un-drained depth (never auto-deleted). Either way it then
-loads the `src.musicbot` extension and fire-and-forgets `ytdlp_pool.prewarm()` so the
+loads the `src.musicbot` extension and fire-and-forgets `ytdlp_pool.prewarm()` — then
+`chart_pool.warm()`, but only while the archive is enabled, so a default deployment
+never spawns the matplotlib worker — so the
 first `-play` doesn't pay worker-spawn + yt-dlp-import latency. `MusicBotApp.invoke` also
 short-circuits `--help` anywhere in a command message straight to that command's help
 embed, before voice checks or argument parsing.
@@ -350,6 +368,7 @@ embed, before voice checks or argument parsing.
 `close()` order: `history_drainer.stop()` (final drain, needs Redis AND the archive) →
 `history_archive.close()` — both skipped when the archive tier is off (the attrs are
 `None`) → close Redis pool → `super().close()` → `ytdlp_pool.aclose()`
+→ `chart_pool.aclose()` (inert when the worker was never spawned)
 (10s join timeout, then `terminate_workers()` — an unbounded join measured 61s to exit)
 → `close_probe_session()` (latches the module closed, so a player loop still running
 during the flush below cannot rebuild a session nothing will close)
@@ -888,6 +907,8 @@ Per-guild synchronization primitives and what they protect:
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
 | `Spotify._auth_lock` | token refresh double-fire |
+| `PostgresHistoryArchive._analytics_slot` | one -analytics aggregate in flight per process. Deliberately NOT `_read_slots`: that budget is two against a max_size=4 pool, sized when leaderboard was its only taker, and this is the heaviest of the three readers |
+| `chart_pool` (1 worker) | matplotlib off the event loop AND off the GIL. A thread is no better than no thread — figure construction is pure Python and contends with discord.py's audio player thread; measured loop lag spikes to 108ms threaded, against 4.23ms frame lateness in a process. Warmed at `setup_hook` **only when the archive is enabled**, after the yt-dlp prewarm that brings the forkserver up — the cold first render is 688ms warmed against 2,976ms not |
 | `lock:guild:{id}:recovery` (Redis) | two instances recovering the same guild |
 | `history:outbox` consumer group (Redis) | replaced the `history:drainer` lease. Not mutual exclusion — `XREADGROUP >` gives two drainers **disjoint** entries and `XACK` settles by ID, so a second drainer duplicates work instead of destroying plays it never inserted |
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
@@ -1077,6 +1098,7 @@ duplicated.
 | `HEARTBEAT_INTERVAL_SECS` | `3.0` | How often a playing guild records its playback position for crash recovery. Bounds the worst-case recovery error — a crash resumes at the last heartbeat, so at most this many seconds replay. Same default as the progress bar because the same reasoning applies, but a separate knob: one is display cadence, the other durability. Floored at 0.5s and refused non-finite — each tick is a Redis write per PLAYING guild, so `0` would be an unbounded HSET loop and `inf` would silently disable recovery |
 | `PING_TICK_SECS` / `PING_DEADLINE_SECS` | `1.0` / `3.0` | -ping live-edit loop |
 | `DEBUG_TICK_SECS` / `DEBUG_DEADLINE_SECS` | `1.0` / `8.0` | -debug live-edit loop. Longer deadline than -ping's: each block does more work (the Postgres probe brackets a 2s sampling window between two stats queries, plus a Prometheus round trip) and a straggler renders `⚠️ timed out` rather than being retried — keep the deadline comfortably above that ~2.2s floor. The tick is a CEILING, not a cadence — the loop wakes on the first probe to finish |
+| `ANALYTICS_RENDER_DEADLINE_SECS` | `20.0` | How long `-analytics` waits for its chart before sending the card without one. Sized for the COLD path, which dominates: measured end to end in the deployed image at **5.9s**, of which the render is ~1.0s — the rest is what a spawned worker pays on the way up (`import src.main` 3.6s under forkserver, matplotlib 2.4s). Twenty rather than ten because expiring is SILENT: the card still sends, just without its chart. It bounds the CALLER, not the pool — a `ProcessPoolExecutor` cannot cancel a running call, so the worker finishes its render regardless. Same `_float_env` floor as the dashboard knobs |
 | `OTEL_SDK_DISABLED` | `false` | `true` disables tracing/log export (stdout logs remain) |
 | `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` | `discord-music-bot` / `http://localhost:4317` | |
 
