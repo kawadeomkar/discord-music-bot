@@ -242,6 +242,19 @@ class MusicBotApp(commands.AutoShardedBot):
         from src.youtube import ytdlp_pool
 
         ytdlp_pool.prewarm()
+        # Then the chart worker, only when the archive is on. After the line above,
+        # which brings the forkserver up, so this fork is cheap. Fire-and-forget; the
+        # matplotlib import happens in the worker.
+        if archive_enabled:
+            from src.chart_pool import warm as warm_chart_pool
+
+            try:
+                warm_chart_pool()
+            except Exception as e:
+                # Guarded like every optional participant in close(): warm() builds
+                # a Queue, a listener thread and an executor, and a raise here would
+                # abort startup over an optional feature.
+                log.warning(f"chart pool warm failed: {e}")
 
     async def _setup_history_archive(self, redis: "aioredis.Redis") -> None:
         """The enabled arm: required DSN, default-password advisory, outbox consumer
@@ -486,6 +499,7 @@ class MusicBotApp(commands.AutoShardedBot):
         loop = asyncio.get_running_loop()
         # Awaited directly rather than via the executor below — only aclose() knows
         # which half blocks; it owns its off-loop join and bounds the wait.
+        from src.chart_pool import chart_pool
         from src.youtube import close_probe_session, ytdlp_pool
 
         try:
@@ -495,6 +509,13 @@ class MusicBotApp(commands.AutoShardedBot):
             # timeout, so this arm is for the unexpected — which would otherwise cost
             # the span flush below, the record of the failed shutdown.
             log.warning(f"yt-dlp pool shutdown failed: {e}")
+        try:
+            # Never spawned on a bot that never ran -analytics, in which case this
+            # only flips the closed flag. Guarded like every step around it: a raise
+            # here would cost the span flush below, the record of the failed shutdown.
+            await chart_pool.aclose()
+        except Exception as e:
+            log.warning(f"chart pool shutdown failed: {e}")
         try:
             await close_probe_session()
         except Exception as e:
