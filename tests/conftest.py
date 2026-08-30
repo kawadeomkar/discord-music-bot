@@ -1,5 +1,6 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import os
 import re
 import sys
 import time
@@ -26,6 +27,14 @@ from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
 from tests.helpers import noop_ffmpeg_init, tier_enabled
+
+# Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
+# is first imported, so a per-test setenv would lose the race with whichever test
+# imports it first. An unwritable config dir makes it fall back to a temp directory
+# and warn per process; on a fresh checkout the first render also builds a font cache
+# here, which is what would otherwise look like `just test` hanging. Third copy of
+# this path — Dockerfile's test and runtime stages hold the other two (rule 6).
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplcache")
 
 
 def pytest_collection_modifyitems(
