@@ -17,6 +17,7 @@ Postgres rejects the way production will.
 import asyncio
 import itertools
 import os
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from collections.abc import AsyncIterator, Iterator
 from urllib.parse import urlsplit, urlunsplit
@@ -28,6 +29,7 @@ from redis.asyncio import Redis
 from src.db_migrate import EXPECTED_SCHEMA_VERSION, migrate
 from src.backfill_history import backfill
 from src.guild_state import (
+    WAIT_UNAVAILABLE,
     HistoryEntry,
     parse_history_entry,
     serialize_history_entry,
@@ -170,6 +172,7 @@ def _play(
     duration_secs: int = 200,
     played_at: float,
     query_source: str = "",
+    uploader: str = "",
 ) -> HistoryEntry:
     """A leaderboard fixture row: everything the aggregates group or rank by is
     a parameter, and played_at is required because play_history_dedup collapses
@@ -184,6 +187,7 @@ def _play(
         requester_name=requester_name,
         played_at=played_at,
         query_source=query_source,
+        uploader=uploader,
     )
 
 
@@ -1414,3 +1418,450 @@ class TestArchiveStats:
         delta_hit = second.blks_hit - first.blks_hit
         delta_read = second.blks_read - first.blks_read
         assert delta_hit + delta_read >= 0
+
+
+def _midnight_utc(days_ago: int = 0) -> float:
+    """Epoch of a UTC midnight, `days_ago` before today's. The window's own
+    boundaries, so a fixture can place a row on either side of one deliberately."""
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return (today - timedelta(days=days_ago)).timestamp()
+
+
+class TestAnalyticsQuerySemantics:
+    """_ANALYTICS_SQL against a real server. Everything here is a property of the
+    SQL rather than of the Python around it, so none of it is reachable from the
+    unit tier — and three of them (the divide-by-zero, the bucket-11 overflow and
+    the integer-division collapse) are the kind that return a plausible-looking
+    wrong chart rather than an error."""
+
+    async def test_a_zero_duration_row_does_not_abort_the_query(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """The P0. Every column of play_history is NOT NULL with a default, so an
+        absent duration is a literal 0 — a livestream — and the unguarded ratio
+        raises division_by_zero. Because one statement feeds every panel AND every
+        KPI, an unguarded ratio takes the whole command down, not one chart. The
+        live archive holds such a row today (a lofi radio stream)."""
+        await archive.insert_batch(
+            [
+                _play(
+                    url="https://y/live",
+                    played_at=_midnight_utc(1) + 3600,
+                    duration_secs=0,
+                    played_secs=1052,
+                ),
+                _play(
+                    url="https://y/ok",
+                    played_at=_midnight_utc(1) + 7200,
+                    duration_secs=200,
+                    played_secs=200,
+                ),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        # Counted as a play everywhere, excluded from the completion panel alone.
+        assert m.plays == 2
+        assert m.livestream_plays == 1
+        assert sum(c.plays for c in m.completion) == 1
+
+    async def test_the_completion_ratio_spreads_across_all_ten_buckets(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Pins the ::float8. Both columns are `integer`, so the unguarded
+        expression is integer division and yields only 0 or 1 — measured on the
+        live archive as bucket 1 = 34, bucket 10 = 122, nothing between."""
+        await archive.insert_batch(
+            [
+                _play(
+                    url=f"https://y/{i}",
+                    played_at=_midnight_utc(1) + i * 60,
+                    duration_secs=1000,
+                    played_secs=int(1000 * r),
+                )
+                for i, r in enumerate([0.05, 0.15, 0.25, 0.45, 0.65, 0.85, 0.95])
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert sorted(c.bucket for c in m.completion) == [1, 2, 3, 5, 7, 9, 10]
+
+    async def test_a_ratio_of_exactly_one_lands_in_bucket_ten(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """width_bucket's upper bound is EXCLUSIVE, so width_bucket(1.0, 0, 1, 10)
+        returns 11 — and a fully played song is the modal case (126 of 156 live
+        rows), so the busiest bar would land in an overflow bucket the panel does
+        not draw. Clamping the ratio is not enough on its own; the bucket is folded
+        too."""
+        await archive.insert_batch(
+            [
+                _play(
+                    url="https://y/whole",
+                    played_at=_midnight_utc(1) + 60,
+                    duration_secs=200,
+                    played_secs=200,
+                ),
+                # Nothing constrains played_secs <= duration_secs, so a ratio ABOVE
+                # 1 is representable and must land in the same place.
+                _play(
+                    url="https://y/over",
+                    played_at=_midnight_utc(1) + 120,
+                    duration_secs=200,
+                    played_secs=260,
+                ),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert [c.bucket for c in m.completion] == [10]
+        assert m.completion[0].plays == 2
+
+    async def test_the_window_is_n_complete_days(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Both edges land on a UTC midnight: a row stamped today is excluded, and
+        one stamped at yesterday's 23:59 is included. This is what the day-long
+        cache TTL rests on — the artifact is immutable until midnight — and it is
+        the case a future refactor is most likely to break."""
+        await archive.insert_batch(
+            [
+                _play(url="https://y/today", played_at=_midnight_utc(0) + 60),
+                _play(url="https://y/late", played_at=_midnight_utc(0) - 60),
+                _play(url="https://y/old", played_at=_midnight_utc(31)),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.plays == 1
+        assert m.window_end_epoch == _midnight_utc(0)
+        assert m.window_start_epoch == _midnight_utc(30)
+        assert [s.webpage_url for s in m.top_songs] == ["https://y/late"]
+
+    async def test_a_future_dated_row_needs_no_separate_guard(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """played_at is the host's clock with a year-9999 ceiling, and one row from
+        an NTP step or a restored snapshot stretched a 30-day window to three years
+        — compressing the real bars into 3% of the plot, with no error. The
+        complete-days upper bound retires that hazard on its own; this test should
+        FAIL if a separate now() guard is ever added back, because it would be dead
+        code claiming to do this job."""
+        await archive.insert_batch(
+            [
+                _play(url="https://y/future", played_at=_midnight_utc(-400)),
+                _play(url="https://y/real", played_at=_midnight_utc(1) + 60),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.plays == 1
+        assert m.window_end_epoch == _midnight_utc(0)
+
+    async def test_365_days_returns_weekly_buckets(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """The downsample is pure SQL and reachable only here. Past ~100 points
+        bars are sub-pixel, so 365 of them is noise rendered expensively; 53 weeks
+        is the global maximum x-extent, and the 90-day daily series (90) is the
+        runner-up."""
+        await archive.insert_batch(
+            [
+                _play(url=f"https://y/{i}", played_at=_midnight_utc(i + 1))
+                for i in range(120)
+            ]
+        )
+        weekly = await archive.analytics(42, days=365, top_n=5)
+        daily = await archive.analytics(42, days=90, top_n=5)
+        assert weekly.bucket_unit == "week"
+        assert daily.bucket_unit == "day"
+        assert len(weekly.daily) <= 53
+        assert len(weekly.daily) < len(daily.daily)
+        # Weeks snap at BOTH ends, so this is the one window that does not end
+        # yesterday: its upper bound is the last complete week boundary.
+        assert weekly.window_end_epoch <= _midnight_utc(0)
+        assert (weekly.window_end_epoch - weekly.window_start_epoch) % (7 * 86400) == 0
+
+    async def test_sentinel_queued_at_rows_are_excluded_from_the_wait(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """queued_at carries the same epoch-0 sentinel as played_at, so a backfilled
+        row reads as a ~1.79e9-second wait. Excluded, not clamped — clamping would
+        report a confident 0s for a guild that has no wait data at all."""
+        played = _midnight_utc(1) + 3600
+        await archive.insert_batch(
+            [
+                HistoryEntry(
+                    guild_id=42,
+                    webpage_url="https://y/sentinel",
+                    played_at=played,
+                    queued_at=0.0,
+                    duration_secs=200,
+                    played_secs=200,
+                ),
+                HistoryEntry(
+                    guild_id=42,
+                    webpage_url="https://y/real",
+                    played_at=played + 60,
+                    queued_at=played + 30,
+                    duration_secs=200,
+                    played_secs=200,
+                ),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.plays == 2
+        # 30s from the one real row, not a mean dragged to ~9e8 by the sentinel.
+        assert m.wait_p50_secs == 30.0
+
+    async def test_an_all_sentinel_guild_reports_no_wait_at_all(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch(
+            [
+                HistoryEntry(
+                    guild_id=42,
+                    webpage_url="https://y/s",
+                    played_at=_midnight_utc(1) + 60,
+                    queued_at=0.0,
+                )
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.plays == 1
+        assert m.wait_pcts == ()
+        assert m.wait_p50_secs == WAIT_UNAVAILABLE
+
+    async def test_negative_drift_clamps_to_zero(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """queued_at is on Discord's clock and played_at on the host's, so their
+        difference goes slightly negative under drift. The schema documents this as
+        expected; it is the benign case and clamps rather than being dropped."""
+        played = _midnight_utc(1) + 3600
+        await archive.insert_batch(
+            [
+                HistoryEntry(
+                    guild_id=42,
+                    webpage_url="https://y/drift",
+                    played_at=played,
+                    queued_at=played + 5,
+                )
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.wait_p50_secs == 0.0
+
+    async def test_an_empty_guild_returns_empty_branches_never_none(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """jsonb_agg over zero rows returns SQL NULL, not '[]' — which reaches
+        Python as None and raises in the decoder, on a brand-new guild's very first
+        -analytics. n_rows is the one explicit emptiness signal."""
+        m = await archive.analytics(999, days=30, top_n=5)
+        assert m.plays == 0
+        assert m.is_empty
+        assert (m.daily, m.heat, m.completion, m.durations, m.wait_pcts) == (
+            (),
+            (),
+            (),
+            (),
+            (),
+        )
+        assert (m.top_listeners, m.top_artists, m.top_songs) == ((), (), ())
+
+    async def test_buckets_do_not_move_with_the_servers_timezone(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """The 'UTC' literals are what make the answer deployment-independent. A
+        later "simplification" to date_trunc('day', played_at) would silently pick
+        up the session zone, and every guild's chart would then depend on where its
+        Postgres happens to be configured."""
+        await archive.insert_batch(
+            [
+                _play(url="https://y/a", played_at=_midnight_utc(1) + 60),
+                _play(url="https://y/b", played_at=_midnight_utc(1) + 82_800),
+            ]
+        )
+        baseline = await archive.analytics(42, days=30, top_n=5)
+        pool = await archive._ensure()
+        async with pool.acquire() as conn:
+            await conn.execute("SET TIME ZONE 'Pacific/Auckland'")
+            shifted = await archive.analytics(42, days=30, top_n=5)
+        assert shifted.window_start_epoch == baseline.window_start_epoch
+        assert shifted.window_end_epoch == baseline.window_end_epoch
+        assert shifted.daily == baseline.daily
+        assert shifted.heat == baseline.heat
+
+    async def test_dst_cannot_reach_the_buckets(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """UTC has no transitions, so every day has exactly 24 hour-buckets. A row
+        recorded across a US/Pacific DST boundary lands in the UTC hour it was
+        recorded in — a test asserting 23-or-25-hour days would be asserting the
+        session-zone dependency the test above forbids."""
+        base = _midnight_utc(1)
+        await archive.insert_batch(
+            [
+                _play(url=f"https://y/h{h}", played_at=base + h * 3600 + 60)
+                for h in range(24)
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert sorted(c.hour for c in m.heat) == list(range(24))
+        assert len({c.dow for c in m.heat}) == 1
+
+    async def test_the_unique_kpis_agree_with_the_leaderboards_filters(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """requester_id > 0 and webpage_url <> '' exactly as _TOP_REQUESTERS_SQL
+        and _TOP_SONGS_SQL already do, so -analytics and -leaderboard cannot
+        disagree by one. There are no NULLs to filter — the sentinel is the
+        zero-value."""
+        at = _midnight_utc(1)
+        await archive.insert_batch(
+            [
+                _play(url="https://y/1", played_at=at + 1, requester_id=7),
+                _play(url="https://y/1", played_at=at + 2, requester_id=7),
+                _play(url="", played_at=at + 3, requester_id=0),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.plays == 3
+        assert m.unique_songs == 1
+        assert m.unique_listeners == 1
+
+    async def test_top_n_names_resolve_to_the_most_recent_play(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """The LATERAL, not max(): max would mean "lexicographically largest name",
+        so a renamed user would appear under two different names in two commands."""
+        at = _midnight_utc(1)
+        await archive.insert_batch(
+            [
+                _play(
+                    url="https://y/1",
+                    played_at=at + 1,
+                    requester_id=7,
+                    requester_name="zzz_old",
+                ),
+                _play(
+                    url="https://y/2",
+                    played_at=at + 2,
+                    requester_id=7,
+                    requester_name="new",
+                ),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert [t.requester_name for t in m.top_listeners] == ["new"]
+
+    async def test_the_source_and_artist_branches_carry_real_rows(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Five aggregates were reachable only through a helper that stamped no
+        uploader and an empty query_source, so they were stubbed in the unit tier and
+        asserted as () here -- verified nowhere. daily_by_source drives the headline
+        chart, unique_artists drives a KPI, and top_artists is a whole card section."""
+        await archive.insert_batch(
+            [
+                _play(
+                    url="https://y/a",
+                    played_at=_midnight_utc(1) + 3600,
+                    query_source="youtube.com",
+                    uploader="Lofi Girl",
+                    duration_secs=200,
+                    played_secs=200,
+                ),
+                _play(
+                    url="https://y/b",
+                    played_at=_midnight_utc(1) + 7200,
+                    query_source="search",
+                    uploader="Lofi Girl",
+                    duration_secs=300,
+                    played_secs=150,
+                ),
+                _play(
+                    url="https://y/c",
+                    played_at=_midnight_utc(2) + 3600,
+                    query_source="search",
+                    uploader="Someone Else",
+                    duration_secs=100,
+                    played_secs=100,
+                ),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+
+        assert {r.source for r in m.daily_by_source} == {"youtube.com", "search"}
+        assert sum(r.plays for r in m.daily_by_source) == 3
+        assert m.unique_artists == 2
+        assert [(a.uploader, a.plays) for a in m.top_artists] == [
+            ("Lofi Girl", 2),
+            ("Someone Else", 1),
+        ]
+        # Duration-weighted, per source: search played 250 of 400 queued seconds.
+        weighted = {
+            c.source: (c.played_secs, c.duration_secs) for c in m.source_completion
+        }
+        assert weighted["search"] == (250, 400)
+        assert weighted["youtube.com"] == (200, 200)
+        # Song-length histogram: 200s and 300s fall in minute buckets 3 and 5, 100s in 1.
+        assert {d.minutes: d.plays for d in m.durations} == {1: 1, 3: 1, 5: 1}
+        assert m.listen_secs == 450
+
+    async def test_an_empty_query_source_still_reaches_the_chart(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Every pre-archive backfill row carries query_source = '', so it is a real
+        archived value rather than a gap. It must reach daily_by_source as its own
+        series -- the renderer mints its label."""
+        await archive.insert_batch(
+            [_play(url="https://y/old", played_at=_midnight_utc(1) + 3600)]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert [r.source for r in m.daily_by_source] == [""]
+
+    async def test_top_n_labels_come_from_inside_the_window(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """The lateral resolving a title and a name was bounded by guild only, so it
+        returned the guild's most recent play of that key -- and the window excludes
+        TODAY, whose rows are both newer and outside it. A song renamed on a play made
+        today was labelled with the new title on a card about last month.
+
+        (The same bound on _LEADERBOARD_SQL is a planner hint only: that window is
+        open-ended above, so its newest row is always inside it.)"""
+        await archive.insert_batch(
+            [
+                _play(
+                    url="https://y/s",
+                    title="Title In Window",
+                    requester_name="in-window",
+                    played_at=_midnight_utc(2) + 3600,
+                ),
+                # Today: excluded from the window, newer than everything in it.
+                _play(
+                    url="https://y/s",
+                    title="Renamed Today",
+                    requester_name="today",
+                    played_at=_midnight_utc(0) + 3600,
+                ),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert [t.title for t in m.top_songs] == ["Title In Window"]
+        assert [listener.requester_name for listener in m.top_listeners] == [
+            "in-window"
+        ]
+
+    async def test_another_guilds_rows_are_invisible(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        at = _midnight_utc(1)
+        await archive.insert_batch(
+            [
+                _play(guild_id=42, url="https://y/mine", played_at=at + 1),
+                _play(guild_id=43, url="https://y/theirs", played_at=at + 2),
+            ]
+        )
+        m = await archive.analytics(42, days=30, top_n=5)
+        assert m.plays == 1
+        assert [s.webpage_url for s in m.top_songs] == ["https://y/mine"]

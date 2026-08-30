@@ -36,13 +36,15 @@ See docs/ARCHITECTURE.md#history-archive-tier.
 """
 
 import asyncio
+import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional, Protocol, cast
+from typing import Any, Final, Optional, Protocol, cast
 
 import asyncpg
+import orjson
 import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import Span
@@ -52,7 +54,20 @@ from src import config
 from src.db_migrate import EXPECTED_SCHEMA_VERSION
 from src.guild_state import (
     TS_MAX,
+    WAIT_MEDIAN_INDEX,
+    WAIT_PERCENTILES,
+    WAIT_UNAVAILABLE,
+    AnalyticsMetrics,
+    CompletionBucket,
+    DailyPoint,
+    DurationBucket,
+    HeatCell,
     HistoryEntry,
+    SourceCompletion,
+    SourceDay,
+    TopArtist,
+    TopListener,
+    TopSong,
     parse_history_entry,
     serialize_history_entry,
 )
@@ -171,6 +186,178 @@ CROSS JOIN LATERAL (
 ORDER BY t.played_secs DESC, t.plays DESC, t.webpage_url
 """
 
+# ── -analytics ────────────────────────────────────────────────────────────────
+# Seven aggregates over one guild-and-window slice, in one statement returning one
+# row of JSON. play_history_recent serves the predicate; no migration behind it.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+#
+# $1 guild_id, $2 window in days, $3 bucket unit ('day' or 'week').
+#
+# The window is N COMPLETE units, [end - N, end), both edges on a UTC boundary, so
+# every bar covers a whole bucket and the artifact is immutable until the boundary
+# turns — which is what lets the cache TTL run to end of day. Buckets are UTC
+# because that is the frame played_at was written in.
+# Interpolated below so the array and every consumer of its length move together.
+_WAIT_PCT_SQL: Final[str] = ",".join(str(pct) for pct in WAIT_PERCENTILES)
+
+_ANALYTICS_SQL = f"""
+WITH bounds AS (
+    SELECT ($3::text = 'week')                            AS weekly,
+           date_trunc('day',  now() AT TIME ZONE 'UTC')   AS day_end,
+           date_trunc('week', now() AT TIME ZONE 'UTC')   AS week_end
+), win AS (
+    SELECT (CASE WHEN weekly THEN week_end ELSE day_end END) AT TIME ZONE 'UTC'
+               AS w_end,
+           (CASE WHEN weekly
+                 THEN date_trunc('week',
+                        (CASE WHEN weekly THEN week_end ELSE day_end END)
+                        - ($2::int * interval '1 day'))
+                 ELSE day_end - ($2::int * interval '1 day')
+            END) AT TIME ZONE 'UTC'                        AS w_start
+    FROM bounds
+), slice AS MATERIALIZED (
+    -- webpage_url and uploader are projected for their DISTINCT counts alone.
+    -- They widen the tuplestore; see docs/ARCHITECTURE.md#analytics-rendering.
+    SELECT (played_at AT TIME ZONE 'UTC')                  AS lt,
+           played_secs, duration_secs, query_source,
+           requester_id, webpage_url, uploader,
+           -- Sentinel queued_at (the epoch-0 backfill default) is EXCLUDED, not
+           -- clamped: it would read as a ~1.79e9-second wait. Real cross-clock
+           -- drift goes slightly negative and clamps to 0, which is the benign case.
+           CASE WHEN queued_at > to_timestamp(0)
+                THEN greatest(extract(epoch FROM played_at - queued_at), 0)
+           END                                              AS wait_secs
+    FROM play_history, win
+    WHERE guild_id = $1
+      AND played_at >= win.w_start
+      AND played_at <  win.w_end
+)
+SELECT
+  (SELECT extract(epoch FROM w_start) FROM win)             AS window_start,
+  (SELECT extract(epoch FROM w_end)   FROM win)             AS window_end,
+  -- Today's UTC midnight, whatever the bucket unit. The cache's expiry is derived
+  -- from THIS rather than from a second clock read, so an aggregate computed a
+  -- millisecond before midnight cannot be cached as if it covered the new day.
+  (SELECT extract(epoch FROM (day_end AT TIME ZONE 'UTC')) FROM bounds)
+                                                            AS today_start,
+  -- The ONE explicit emptiness signal. Never inferred from a branch's shape:
+  -- every aggregate below coalesces to '[]', so an empty series also describes a
+  -- guild whose rows all failed that branch's own filter.
+  (SELECT count(*) FROM slice)                              AS n_rows,
+  (SELECT coalesce(extract(epoch FROM min(lt)), 0) FROM slice)
+                                                            AS first_play,
+  (SELECT coalesce(sum(played_secs), 0) FROM slice)         AS listen_secs,
+  -- count(*) over a DISTINCT subquery: Postgres has no hashed count(DISTINCT), and
+  -- this form plans as a HashAggregate over a tuplestore each scan rescans.
+  (SELECT count(*) FROM (
+      SELECT DISTINCT webpage_url FROM slice WHERE webpage_url <> '') u)
+                                                            AS unique_songs,
+  (SELECT count(*) FROM (
+      SELECT DISTINCT requester_id FROM slice WHERE requester_id > 0) u)
+                                                            AS unique_listeners,
+  (SELECT count(*) FROM (
+      SELECT DISTINCT uploader FROM slice WHERE uploader <> '') u)
+                                                            AS unique_artists,
+  (SELECT count(*) FROM slice WHERE duration_secs <= 0)     AS livestream_plays,
+  coalesce((SELECT jsonb_agg(x) FROM (
+      SELECT to_char(date_trunc($3, lt), 'YYYY-MM-DD') AS d,
+             count(*) AS plays, sum(played_secs) AS secs
+      FROM slice GROUP BY 1 ORDER BY 1) x), '[]'::jsonb)     AS daily,
+  coalesce((SELECT jsonb_agg(x) FROM (
+      SELECT to_char(date_trunc($3, lt), 'YYYY-MM-DD') AS d,
+             query_source AS src, count(*) AS plays
+      FROM slice GROUP BY 1,2) x), '[]'::jsonb)              AS daily_by_source,
+  coalesce((SELECT jsonb_agg(x) FROM (
+      SELECT extract(isodow FROM lt)::int AS dow,
+             extract(hour   FROM lt)::int AS hr, count(*) AS plays
+      FROM slice GROUP BY 1,2) x), '[]'::jsonb)              AS heat,
+  -- Three guards, all reachable live. nullif: duration_secs = 0 is a legal
+  -- livestream. ::float8: both columns are integer. The ratio is clamped at 1.0 and
+  -- the BUCKET folded separately, because width_bucket's upper bound is exclusive
+  -- and a ratio of exactly 1.0 returns eleven. CASE keeps NULL a livestream.
+  coalesce((SELECT jsonb_agg(x) FROM (
+      SELECT src, CASE WHEN b > 10 THEN 10 ELSE b END AS b, count(*) AS plays
+      FROM (SELECT query_source AS src,
+                   width_bucket(least(played_secs::float8
+                                / nullif(duration_secs, 0), 1.0), 0, 1, 10) AS b
+            FROM slice WHERE duration_secs > 0) r
+      GROUP BY 1,2) x), '[]'::jsonb)                         AS completion,
+  coalesce((SELECT jsonb_agg(x) FROM (
+      SELECT least(duration_secs / 60, 20) AS b, count(*) AS plays
+      FROM slice WHERE duration_secs > 0 GROUP BY 1 ORDER BY 1) x), '[]'::jsonb)
+                                                            AS durations,
+  coalesce((SELECT jsonb_agg(x) FROM (
+      SELECT query_source AS src, sum(played_secs) AS played,
+             sum(duration_secs) AS dur
+      FROM slice WHERE duration_secs > 0 GROUP BY 1) x), '[]'::jsonb)
+                                                            AS source_completion,
+  coalesce((SELECT to_jsonb(percentile_cont(ARRAY[{_WAIT_PCT_SQL}])
+                            WITHIN GROUP (ORDER BY wait_secs))
+            FROM slice WHERE wait_secs IS NOT NULL), '[]'::jsonb)
+                                                            AS wait_pcts
+"""
+
+# The three text-keyed top-N branches stay out of the CTE so it can project
+# narrowly; resolving a display name needs a lateral to the winner's newest play.
+# $3/$4 are the window the main query resolved, so the clock is read once.
+_ANALYTICS_TOP_LISTENERS_SQL = """
+SELECT t.requester_id, l.requester_name, t.plays, t.played_secs
+FROM (
+    SELECT requester_id, count(*) AS plays, sum(played_secs) AS played_secs
+    FROM play_history
+    WHERE guild_id = $1 AND requester_id > 0
+      AND played_at >= $3 AND played_at < $4
+    GROUP BY requester_id
+    ORDER BY played_secs DESC, plays DESC, requester_id
+    LIMIT $2
+) t
+CROSS JOIN LATERAL (
+    -- Window-bound, so the index serves the lookup and the name comes from a play
+    -- inside the window it describes.
+    SELECT p.requester_name FROM play_history p
+    WHERE p.guild_id = $1 AND p.requester_id = t.requester_id
+      AND p.played_at >= $3 AND p.played_at < $4
+    ORDER BY p.played_at DESC, p.id DESC LIMIT 1
+) l
+ORDER BY t.played_secs DESC, t.plays DESC, t.requester_id
+"""
+
+# No LATERAL: uploader IS the display name, so there is nothing to resolve.
+_ANALYTICS_TOP_ARTISTS_SQL = """
+SELECT uploader, count(*) AS plays, sum(played_secs) AS played_secs
+FROM play_history
+WHERE guild_id = $1 AND uploader <> ''
+  AND played_at >= $3 AND played_at < $4
+GROUP BY uploader
+ORDER BY played_secs DESC, plays DESC, uploader
+LIMIT $2
+"""
+
+_ANALYTICS_TOP_SONGS_SQL = """
+SELECT t.webpage_url, l.title, l.query_source, t.plays, t.played_secs
+FROM (
+    SELECT webpage_url, count(*) AS plays, sum(played_secs) AS played_secs
+    FROM play_history
+    WHERE guild_id = $1 AND webpage_url <> ''
+      AND played_at >= $3 AND played_at < $4
+    GROUP BY webpage_url
+    ORDER BY played_secs DESC, plays DESC, webpage_url
+    LIMIT $2
+) t
+CROSS JOIN LATERAL (
+    -- Window-bound, as the listeners lateral above.
+    SELECT p.title, p.query_source FROM play_history p
+    WHERE p.guild_id = $1 AND p.webpage_url = t.webpage_url
+      AND p.played_at >= $3 AND p.played_at < $4
+    ORDER BY p.played_at DESC, p.id DESC LIMIT 1
+) l
+ORDER BY t.played_secs DESC, t.plays DESC, t.webpage_url
+"""
+
+# Past this window the daily series downsamples to weeks — 371 days of whole weeks
+# is 53 bars. The switch rides the --days allowlist, so it has one known value.
+WEEKLY_BUCKET_MIN_DAYS: Final[int] = 365
+
 _SCHEMA_VERSION_SQL = "SELECT max(version) FROM schema_migrations"
 
 # Cap on the asyncpg message in play_history_rejected.error_detail: enough for
@@ -230,6 +417,122 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
         datetime.fromtimestamp(entry.queued_at, tz=timezone.utc),
         entry.queue_position,
         entry.query_source,
+    )
+
+
+def _json(row: asyncpg.Record, key: str) -> list:
+    """One jsonb branch of the analytics row, as a list.
+
+    asyncpg has no default jsonb codec and this pool passes no `init=`, so the
+    value arrives as `str` — adding a codec would change behaviour for every other
+    caller of this pool. Every branch is `coalesce(..., '[]')` in SQL precisely so
+    this never sees None: `jsonb_agg` over zero rows returns SQL NULL, which would
+    raise here on a brand-new guild's very first -analytics.
+    """
+    raw = row[key]
+    if raw is None:
+        return []
+    parsed = orjson.loads(raw if isinstance(raw, (bytes, str)) else str(raw))
+    return parsed if isinstance(parsed, list) else []
+
+
+def _row_to_metrics(
+    row: asyncpg.Record,
+    listener_rows: Sequence[asyncpg.Record],
+    artist_rows: Sequence[asyncpg.Record],
+    song_rows: Sequence[asyncpg.Record],
+    days: int,
+    unit: str,
+) -> AnalyticsMetrics:
+    """Decode one _ANALYTICS_SQL row plus its three top-N result sets.
+
+    Free of asyncpg types on the way OUT by design: what this returns is pickled to
+    a chart worker, so every value is an int, float, str or tuple of the frozen
+    guild_state records.
+    """
+    window_end = float(row["window_end"])
+    first_play = float(row["first_play"])
+    # The requested window, clamped to what the archive actually covers. A 30-day
+    # frame that is 93% empty is a worse answer than a 2-day frame that says so —
+    # and the title names BOTH, so the requested number stays visible.
+    archived = days
+    if first_play > 0:
+        archived = max(1, min(days, math.ceil((window_end - first_play) / 86400)))
+    pcts = tuple(float(v) for v in _json(row, "wait_pcts"))
+    return AnalyticsMetrics(
+        days=days,
+        bucket_unit=unit,
+        window_start_epoch=float(row["window_start"]),
+        window_end_epoch=window_end,
+        today_start_epoch=float(row["today_start"]),
+        archived_days=archived,
+        plays=int(row["n_rows"]),
+        listen_secs=int(row["listen_secs"]),
+        unique_songs=int(row["unique_songs"]),
+        unique_listeners=int(row["unique_listeners"]),
+        unique_artists=int(row["unique_artists"]),
+        # Index 2 of p10/p25/p50/p75/p90. Empty means every queued_at in the window
+        # was the epoch-0 sentinel, which renders "unavailable" rather than 0s.
+        wait_p50_secs=(
+            pcts[WAIT_MEDIAN_INDEX]
+            if len(pcts) == len(WAIT_PERCENTILES)
+            else WAIT_UNAVAILABLE
+        ),
+        livestream_plays=int(row["livestream_plays"]),
+        daily=tuple(
+            DailyPoint(day=e["d"], plays=int(e["plays"]), listen_secs=int(e["secs"]))
+            for e in _json(row, "daily")
+        ),
+        daily_by_source=tuple(
+            SourceDay(day=e["d"], source=e["src"], plays=int(e["plays"]))
+            for e in _json(row, "daily_by_source")
+        ),
+        heat=tuple(
+            HeatCell(dow=int(e["dow"]), hour=int(e["hr"]), plays=int(e["plays"]))
+            for e in _json(row, "heat")
+        ),
+        completion=tuple(
+            CompletionBucket(source=e["src"], bucket=int(e["b"]), plays=int(e["plays"]))
+            for e in _json(row, "completion")
+        ),
+        durations=tuple(
+            DurationBucket(minutes=int(e["b"]), plays=int(e["plays"]))
+            for e in _json(row, "durations")
+        ),
+        source_completion=tuple(
+            SourceCompletion(
+                source=e["src"],
+                played_secs=int(e["played"]),
+                duration_secs=int(e["dur"]),
+            )
+            for e in _json(row, "source_completion")
+        ),
+        wait_pcts=pcts,
+        top_listeners=tuple(
+            TopListener(
+                requester_id=r["requester_id"],
+                requester_name=r["requester_name"],
+                plays=r["plays"],
+                played_secs=r["played_secs"],
+            )
+            for r in listener_rows
+        ),
+        top_artists=tuple(
+            TopArtist(
+                uploader=r["uploader"], plays=r["plays"], played_secs=r["played_secs"]
+            )
+            for r in artist_rows
+        ),
+        top_songs=tuple(
+            TopSong(
+                title=r["title"],
+                webpage_url=r["webpage_url"],
+                query_source=r["query_source"],
+                plays=r["plays"],
+                played_secs=r["played_secs"],
+            )
+            for r in song_rows
+        ),
     )
 
 
@@ -411,6 +714,10 @@ class ArchiveReader(Protocol):
         self, guild_id: int, limit: int, *, since_epoch: float = 0.0
     ) -> Leaderboard: ...
 
+    async def analytics(
+        self, guild_id: int, *, days: int, top_n: int
+    ) -> AnalyticsMetrics: ...
+
 
 class HistoryArchive(Protocol):
     """The archive surface the drainer (writes) and the backfill tool program
@@ -451,6 +758,9 @@ class PostgresHistoryArchive:
         # Per instance, not module-level: one archive owns one pool, and a
         # shared counter would leak across tests that build several.
         self._read_slots = asyncio.Semaphore(_READ_CONCURRENCY)
+        # Taken in addition to _read_slots, which is what keeps the reader ceiling
+        # at the budget. This one serializes analytics inside it.
+        self._analytics_slot = asyncio.Semaphore(1)
 
     async def _create_pool(self) -> asyncpg.Pool:
         return await asyncpg.create_pool(
@@ -606,6 +916,55 @@ class PostgresHistoryArchive:
                 for r in song_rows
             ),
         )
+
+    async def analytics(
+        self, guild_id: int, *, days: int, top_n: int
+    ) -> AnalyticsMetrics:
+        """Every -analytics aggregate for one guild and one complete-days window.
+
+        Four statements on one connection: the CTE above, then the three text-keyed
+        top-N branches, which take the window the CTE already resolved rather than
+        reading the clock again — so the buckets, the footer and the cache TTL can
+        never disagree about when the day turned.
+
+        Two semaphores, in this order: _analytics_slot serializes analytics, then
+        _read_slots counts it against the budget leaderboard() draws on, which keeps
+        the reader ceiling where the drainer and -ping expect it. The caller must
+        release before rendering."""
+        unit = "week" if days >= WEEKLY_BUCKET_MIN_DAYS else "day"
+        async with (
+            asyncio.timeout(_READ_DEADLINE_SECS),
+            self._analytics_slot,
+            self._read_slots,
+        ):
+            pool = await self._ensure()
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
+                row = await conn.fetchrow(_ANALYTICS_SQL, guild_id, days, unit)
+                if row is None or not row["n_rows"]:
+                    # No second round trip for a guild with nothing in the window:
+                    # three top-N queries over an empty slice are three index probes
+                    # that can only return nothing.
+                    return AnalyticsMetrics(
+                        days=days,
+                        bucket_unit=unit,
+                        window_start_epoch=float(row["window_start"]) if row else 0.0,
+                        window_end_epoch=float(row["window_end"]) if row else 0.0,
+                        today_start_epoch=float(row["today_start"]) if row else 0.0,
+                    )
+                start = datetime.fromtimestamp(
+                    float(row["window_start"]), tz=timezone.utc
+                )
+                end = datetime.fromtimestamp(float(row["window_end"]), tz=timezone.utc)
+                listener_rows = await conn.fetch(
+                    _ANALYTICS_TOP_LISTENERS_SQL, guild_id, top_n, start, end
+                )
+                artist_rows = await conn.fetch(
+                    _ANALYTICS_TOP_ARTISTS_SQL, guild_id, top_n, start, end
+                )
+                song_rows = await conn.fetch(
+                    _ANALYTICS_TOP_SONGS_SQL, guild_id, top_n, start, end
+                )
+        return _row_to_metrics(row, listener_rows, artist_rows, song_rows, days, unit)
 
     async def record_rejection(
         self,
