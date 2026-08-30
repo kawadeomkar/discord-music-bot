@@ -844,6 +844,13 @@ def pool_state() -> "PoolState":
     return ytdlp_pool.state
 
 
+def chart_pool_state() -> "PoolState":
+    # Same per-call rule, same reason: conftest patches src.chart_pool.chart_pool.
+    from src.chart_pool import chart_pool
+
+    return chart_pool.state
+
+
 def runtime_lines(
     *,
     cpu: Optional[float] = None,
@@ -884,6 +891,15 @@ def runtime_lines(
     spawned = "spawned" if state.spawned else "not spawned"
     healed = f" · {state.generation} generations" if state.generation > 1 else ""
     lines.append(f"yt-dlp pool  {state.max_workers} workers · {spawned}{healed}")
+    # Reported even when it has never spawned, which is the common case: "not
+    # spawned" is the answer to "why is this bot not holding 173 MB of matplotlib",
+    # and an absent row would read as a missing feature instead.
+    chart = chart_pool_state()
+    chart_spawned = "spawned" if chart.spawned else "not spawned"
+    chart_healed = f" · {chart.generation} generations" if chart.generation > 1 else ""
+    lines.append(
+        f"chart pool   {chart.max_workers} worker · {chart_spawned}{chart_healed}"
+    )
     return lines
 
 

@@ -163,6 +163,39 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def use_thread_chart_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Render -analytics charts on an in-process ThreadPoolExecutor.
+
+    Sibling of use_thread_ytdlp_pool, and autouse for the same reason rather than by
+    convention: that fixture patches exactly ONE name (youtube.ytdlp_pool), so a
+    second module-level pool gets no protection at all and any test reaching the
+    command body would spawn a real worker — ~150ms of spawn plus ~1s of src.main
+    re-import, x8 under xdist, and green the whole time.
+
+    Patches src.chart_pool.chart_pool: the same name main.py closes and debug.py
+    reads, both of which resolve it per call precisely so this fixture is seen. The
+    real process boundary is covered by tests/test_chart_pool.py's
+    TestRealWorkerProcess, which spawns a real worker and renders through it; the
+    pickle round-trip covers the arguments that cross.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import src.chart_pool as chart_pool_mod
+    from src.ytdlp_pool import YtdlpPool
+
+    pool = YtdlpPool(
+        max_workers=1,
+        executor_factory=lambda: ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="chart-test"
+        ),
+        name="chart render",
+    )
+    monkeypatch.setattr(chart_pool_mod, "chart_pool", pool)
+    yield
+    pool.shutdown(wait=False)
+
+
+@pytest.fixture(autouse=True)
 def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the env the suite asserts against, whatever shell it runs in.
 

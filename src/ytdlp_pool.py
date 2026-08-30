@@ -21,7 +21,7 @@ import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
-from concurrent.futures import Executor, ProcessPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
@@ -60,7 +60,7 @@ def _worker_init(log_queue: Optional[Any] = None) -> None:
     try:
         configure_worker_logging(log_queue)
     except Exception:
-        print("yt-dlp worker logging setup failed:", file=sys.stderr)
+        print("worker logging setup failed:", file=sys.stderr)
         traceback.print_exc()
 
 
@@ -140,19 +140,29 @@ class PoolState:
 
 class YtdlpPool:
     """The process's yt-dlp extraction pool: lazy creation, break-healing, shutdown.
-    One instance per process, held by src.youtube. Deliberately not a singleton — tests
+    One instance per consumer: src.youtube holds the yt-dlp pool and src.chart_pool
+    the chart renderer's, which is what `name` distinguishes in the logs. Deliberately
+    not a singleton — tests
     build their own with a thread-pool factory, since a ProcessPoolExecutor pickles the
     submitted callable and the MagicMock patched onto _ytdlp_extract is unpicklable. The
     executor is lazy because under spawn/forkserver each worker re-imports the parent's
     modules, and an eager pool would have every worker construct a nested one.
+
+    `name` is what this pool calls itself in log lines and in PoolClosedError. Only the
+    strings are yt-dlp-specific; everything the class does — lazy creation, heal-once,
+    the off-loop join, worker-log plumbing — is generic, which is why src.chart_pool
+    reuses it rather than forking ~300 lines of lifecycle. Without the parameter a
+    chart-render failure reads as an extraction failure in Loki.
     """
 
     def __init__(
         self,
         max_workers: int = _DEFAULT_WORKERS,
         executor_factory: Optional[Callable[[], Executor]] = None,
+        name: str = "yt-dlp extraction",
     ) -> None:
         self._max_workers = max_workers
+        self._name = name
         self._executor_factory = executor_factory or self._spawn_process_pool
         self._executor: Optional[Executor] = None
         self._closed = False
@@ -218,7 +228,7 @@ class YtdlpPool:
         """The live executor, building it on first use. Raises once shut down."""
         with self._lock:
             if self._closed:
-                raise PoolClosedError("yt-dlp extraction pool is shut down")
+                raise PoolClosedError(f"{self._name} pool is shut down")
             if self._executor is None:
                 self._executor = self._executor_factory()
                 self._generation += 1
@@ -237,7 +247,7 @@ class YtdlpPool:
         try:
             broken.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
-            log.debug(f"discarding broken yt-dlp pool raised: {e}")
+            log.debug(f"discarding broken {self._name} pool raised: {e}")
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """Run `fn(*args)` in the pool, healing a broken pool once. A ProcessPoolExecutor
@@ -255,23 +265,37 @@ class YtdlpPool:
             )
         except BrokenProcessPool:
             log.warning(
-                f"yt-dlp process pool #{self._generation} broke (a worker died) — "
-                "rebuilding and retrying once"
+                f"{self._name} process pool #{self._generation} broke (a worker "
+                "died) — rebuilding and retrying once"
             )
             self._replace(executor)
             return await loop.run_in_executor(
                 self._acquire(), _call_with_context, carrier, fn, *args
             )
 
-    def prewarm(self) -> None:
-        """Spawn the workers now (from setup_hook) so the first -play doesn't absorb
-        process-spawn + yt-dlp-import latency. Fire-and-forget: submits one no-op per
-        worker and returns without awaiting them."""
+    def prewarm(self, warm: Callable[[], Any] = _warmup_noop) -> None:
+        """Spawn the workers now (from setup_hook) so the first real call doesn't
+        absorb process-spawn and import latency. Fire-and-forget: submits `warm` once
+        per worker and returns without awaiting them.
+
+        `warm` is a parameter because the default no-op only warms what a worker pays
+        on the way UP. For yt-dlp that is the whole cost — the extractor is imported by
+        the entry module the forkserver already holds. The chart pool's dominant cost
+        is matplotlib, which nothing imports until a render actually runs, so it passes
+        a callable that imports it. Must be picklable, hence module-level.
+        """
         executor = self._acquire()
         if not isinstance(executor, ProcessPoolExecutor):
             return  # a thread pool (tests) has nothing to spawn
         for _ in range(self._max_workers):
-            executor.submit(_warmup_noop)
+            # concurrent.futures never reports an unretrieved exception the way
+            # asyncio does, so without the callback a warm that raises is silent.
+            executor.submit(warm).add_done_callback(self._log_warm_failure)
+
+    def _log_warm_failure(self, future: Future[Any]) -> None:
+        error = future.exception()
+        if error is not None:
+            log.warning(f"{self._name} worker warm failed: {error}")
 
     def _close(self) -> Optional[Executor]:
         """Mark the pool closed and unpublish its executor, returning it to be joined.
@@ -299,8 +323,8 @@ class YtdlpPool:
                     await loop.run_in_executor(None, join)
             except TimeoutError:
                 log.warning(
-                    f"yt-dlp pool #{self._generation} did not finish joining within "
-                    f"{timeout}s — terminating its workers"
+                    f"{self._name} pool #{self._generation} did not finish joining "
+                    f"within {timeout}s — terminating its workers"
                 )
                 # shutdown(wait=False) does not bound exit: the abandoned join keeps
                 # the manager thread alive and _python_exit joins it at interpreter
