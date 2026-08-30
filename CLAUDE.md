@@ -930,6 +930,13 @@ touch Discord; a caller with no Redis write to make passes an empty body.
   as errors; ruff `ANN` rules enabled except `ANN401` (the `Any`s at the yt-dlp and
   discord.py boundaries are load-bearing and documented). `cast()` (not bare
   annotations) for assertions the checker can't verify — `grep cast(` is the audit trail.
+- **Annotations are never quoted** (ruff `UP037`, autofixed by `just fmt`). Python 3.14
+  evaluates them lazily (PEP 649), so a `TYPE_CHECKING`-only name is legal unquoted,
+  and a quoted one is just a string to an IDE — no go-to-definition, no rename. The
+  rule holds because nothing here RESOLVES annotations at runtime: adding
+  `get_type_hints`, pydantic or attrs would reintroduce the constraint the quotes used
+  to satisfy. discord.py DOES evaluate command-callback parameters to pick converters,
+  but those name runtime imports either way.
 - **Dataclasses**: schema/value objects are `frozen=True, slots=True, kw_only=True`;
   `kw_only` is deliberately load-bearing where adjacent same-type params could transpose
   (see `ExtractRequest`).

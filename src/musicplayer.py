@@ -79,7 +79,7 @@ class EtaWalk:
     cumulative_secs: int
     uncertain: bool
 
-    def advance(self, remaining: Optional[int]) -> "EtaWalk":
+    def advance(self, remaining: Optional[int]) -> EtaWalk:
         """The next walk state after a queue item whose remaining time is
         `remaining`, or None when its duration is unknown."""
         if remaining is None:
@@ -375,7 +375,7 @@ class MusicPlayer:
     _guild: discord.Guild
     _channel: discord.TextChannel
     _last_author: Optional[Union[discord.User, discord.Member]]
-    _cog: "MusicBot"
+    _cog: MusicBot
     current_song: Optional[YTDL]
     play_next: asyncio.Event
     queue: GuildQueue
@@ -417,7 +417,7 @@ class MusicPlayer:
         bot: commands.Bot,
         guild: discord.Guild,
         channel: discord.TextChannel,
-        cog: "MusicBot",
+        cog: MusicBot,
         redis: Optional[aioredis.Redis] = None,
     ) -> None:
         self.bot = bot
@@ -517,7 +517,7 @@ class MusicPlayer:
         bot: commands.Bot,
         ctx: commands.Context,
         redis: Optional[aioredis.Redis] = None,
-    ) -> "MusicPlayer":
+    ) -> MusicPlayer:
         assert ctx.guild is not None
         assert isinstance(ctx.channel, discord.TextChannel)
         assert ctx.cog is not None

@@ -35,8 +35,8 @@ if TYPE_CHECKING:
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
-_tracer_provider: Optional["TracerProvider"] = None
-_log_provider: Optional["LoggerProvider"] = None
+_tracer_provider: Optional[TracerProvider] = None
+_log_provider: Optional[LoggerProvider] = None
 # Separate from _tracer_provider: with OTEL_SDK_DISABLED=true no provider is ever
 # built, so that global cannot serve as the double-call guard on the disabled path.
 _setup_done = False
@@ -110,7 +110,7 @@ def get_tracer(name: str) -> trace.Tracer:
     return trace.get_tracer(name)
 
 
-def configure_worker_logging(log_queue: Optional["Queue"] = None) -> None:
+def configure_worker_logging(log_queue: Optional[Queue] = None) -> None:
     """Configure structured logging inside a yt-dlp pool worker (called via
     ytdlp_pool._worker_init, which wraps this so a failure can't break the pool). With a
     log_queue (production; the thread-pool test seam passes none), the stdout

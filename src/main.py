@@ -151,13 +151,13 @@ class MusicContext(commands.Context):
             runtime=cog.debug_settings.snapshot,
         )
 
-    def _music_cog(self) -> Optional["MusicBot"]:
+    def _music_cog(self) -> Optional[MusicBot]:
         from src.musicbot import MusicBot
 
         cog = self.bot.get_cog("MusicBot")
         return cog if isinstance(cog, MusicBot) else None
 
-    def _np_player(self) -> Optional["MusicPlayer"]:
+    def _np_player(self) -> Optional[MusicPlayer]:
         """The guild's MusicPlayer, only when attaching is appropriate: guild message,
         MusicBot cog loaded, player exists, a song is live, and this channel is the
         player's home channel (the host never leaves it)."""
@@ -266,7 +266,7 @@ class MusicBotApp(commands.AutoShardedBot):
                 # abort startup over an optional feature.
                 log.warning(f"chart pool warm failed: {e}")
 
-    async def _setup_history_archive(self, redis: "aioredis.Redis") -> None:
+    async def _setup_history_archive(self, redis: aioredis.Redis) -> None:
         """The enabled arm: required DSN, default-password advisory, outbox consumer
         group, archive + drainer. The operator opted in, so a bot that cannot deliver
         the archive must say so loudly. `redis` is a parameter rather than a self.redis

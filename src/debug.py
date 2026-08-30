@@ -68,7 +68,7 @@ class ArchiveStatsReader(Protocol):
     ArchiveStats annotation stays behind TYPE_CHECKING so it is a type, not an edge.
     """
 
-    async def stats(self) -> "ArchiveStats": ...
+    async def stats(self) -> ArchiveStats: ...
 
 
 # Stamped at import: the extension loads within seconds of process start, so this
@@ -195,7 +195,7 @@ def debug_footer(
     span: Optional[trace.Span] = None,
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
-    runtime: Optional["RuntimeSnapshot"] = None,
+    runtime: Optional[RuntimeSnapshot] = None,
     skip_trace: bool = False,
 ) -> str:
     """The debug suffix, or "" when nothing is known worth showing.
@@ -256,7 +256,7 @@ def decorate_embeds(
     span: Optional[trace.Span] = None,
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
-    runtime: Optional["RuntimeSnapshot"] = None,
+    runtime: Optional[RuntimeSnapshot] = None,
 ) -> None:
     """Write the debug footer onto each embed, in place, replacing a previous suffix
     rather than appending after it. That is what keeps a cached embed sent more than
@@ -515,8 +515,8 @@ class DebugInputs:
     # question does not arise.
     debug_persisted: bool = True
     players: int
-    player: Optional["MusicPlayer"] = None
-    redis: Optional["aioredis.Redis"] = None
+    player: Optional[MusicPlayer] = None
+    redis: Optional[aioredis.Redis] = None
     store: Optional[GuildRedisStore] = None
     archive: Optional[ArchiveStatsReader] = None
     archive_enabled: bool = False
@@ -555,7 +555,7 @@ async def _safe_block_async(
         return [f"unavailable ({type(e).__name__})"]
 
 
-async def _dbsize(redis: Optional["aioredis.Redis"]) -> Optional[int]:
+async def _dbsize(redis: Optional[aioredis.Redis]) -> Optional[int]:
     if redis is None:
         return None
     try:
@@ -836,7 +836,7 @@ async def measure_loop_lag(delay: float) -> float:
     return max(0.0, (loop.time() - start - delay) * 1000)
 
 
-def pool_state() -> "PoolState":
+def pool_state() -> PoolState:
     # Resolved per call rather than imported at module scope: the test seam
     # monkeypatches src.youtube.ytdlp_pool, and a captured reference would miss it.
     from src.youtube import ytdlp_pool
@@ -844,7 +844,7 @@ def pool_state() -> "PoolState":
     return ytdlp_pool.state
 
 
-def chart_pool_state() -> "PoolState":
+def chart_pool_state() -> PoolState:
     # Same per-call rule, same reason: conftest patches src.chart_pool.chart_pool.
     from src.chart_pool import chart_pool
 
@@ -1109,7 +1109,7 @@ class RedisSample:
     monotonic: float
 
 
-async def read_redis_sample(redis: Optional["aioredis.Redis"]) -> Optional[RedisSample]:
+async def read_redis_sample(redis: Optional[aioredis.Redis]) -> Optional[RedisSample]:
     """One INFO read, or None when Redis is absent or unreachable. Two of these
     bracketing a window give Redis's CPU%, the same way the bot's own is measured.
     """
@@ -1368,7 +1368,7 @@ def _bytes_rate(value: float) -> str:
     return f"{value:.0f} B/s"
 
 
-def _wait_parenthetical(stats: "ArchiveStats") -> str:
+def _wait_parenthetical(stats: ArchiveStats) -> str:
     """Only nonzero wait kinds; `(0 waiting)` when every active backend is on-CPU
     (that IS information); nothing at 0 active — a parenthetical on zero is noise.
     On-CPU is implied (active − waits), never printed."""
@@ -1393,8 +1393,8 @@ def _wait_parenthetical(stats: "ArchiveStats") -> str:
 
 def postgres_lines(
     container: Optional[ContainerMetrics],
-    before: Optional["ArchiveStats"],
-    after: "ArchiveStats",
+    before: Optional[ArchiveStats],
+    after: ArchiveStats,
 ) -> list[str]:
     """Pure renderer over the two-sample bracket _postgres_probe takes. Instant
     fields come from `after` alone; the load/throughput/mem-signal rates are
@@ -1465,7 +1465,7 @@ async def _none() -> None:
 async def checks_lines(
     sample: Optional[RedisSample],
     *,
-    redis: Optional["aioredis.Redis"],
+    redis: Optional[aioredis.Redis],
     store: Optional[GuildRedisStore],
     archive_enabled: bool,
     default_password: Optional[bool],
@@ -1528,7 +1528,7 @@ async def checks_lines(
 
 
 async def _outbox_check(
-    redis: Optional["aioredis.Redis"], *, archive_enabled: bool
+    redis: Optional[aioredis.Redis], *, archive_enabled: bool
 ) -> str:
     if redis is None:
         return _check(None, "outbox", "unknown (no Redis)")
@@ -1831,7 +1831,7 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
         versions = await collect_versions()
         blocks["Versions"] = _safe_block("versions", lambda: version_lines(versions))
 
-    def _settle(key: str, outcome: "dict[str, list[str]] | Exception") -> None:
+    def _settle(key: str, outcome: dict[str, list[str]] | Exception) -> None:
         if isinstance(outcome, Exception):
             # _safe_block guards each collector, so reaching here means the probe
             # itself broke rather than one block. Fail only its own blocks.
@@ -1986,7 +1986,7 @@ class DebugSettings:
     # ── Mutations ─────────────────────────────────────────────────────────────
 
     async def hydrate(
-        self, redis: Optional["aioredis.Redis"], guilds: Sequence[discord.Guild]
+        self, redis: Optional[aioredis.Redis], guilds: Sequence[discord.Guild]
     ) -> None:
         """Hydrate the in-memory cache from each guild's stored config.
 
@@ -2029,7 +2029,7 @@ class DebugSettings:
         self.sync_sampler()
 
     async def toggle(
-        self, redis: Optional["aioredis.Redis"], guild_id: int, enabled: bool
+        self, redis: Optional[aioredis.Redis], guild_id: int, enabled: bool
     ) -> bool:
         """Apply an explicit choice for one guild. Returns whether it reached Redis;
         the caller reports that, since a setting that quietly reverts on the next
@@ -2058,7 +2058,7 @@ class DebugSettings:
         )
         return persisted
 
-    async def forget(self, redis: Optional["aioredis.Redis"], guild_id: int) -> None:
+    async def forget(self, redis: Optional[aioredis.Redis], guild_id: int) -> None:
         """Drop a departed guild's override, cache and durable copy alike.
 
         One bool per guild, so this is hygiene rather than a leak — but the override

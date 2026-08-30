@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.32.0"
+version = "2.32.1"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -195,7 +195,14 @@ target-version = "py314"
 # its exit code, so CI read a clean pass out of a rule that was never evaluated.
 # Anything added here must be a rule the tool actually has — verify with
 # `ruff rule <CODE>` before adding.
-extend-select = ["ANN"]
+# UP037 keeps annotations UNQUOTED. Python 3.14 evaluates them lazily (PEP 649), so
+# a name that only exists under TYPE_CHECKING no longer needs quoting to be legal —
+# and a quoted one is a string to an IDE, losing go-to-definition and rename. Nothing
+# here resolves annotations at runtime, which is the one thing that would still need
+# the name importable: no get_type_hints, no pydantic. discord.py DOES evaluate
+# command-callback parameters for converters, but those name runtime imports either
+# way. Autofixable, so `just fmt` keeps it true.
+extend-select = ["ANN", "UP037"]
 # ANN401 (`Any` in a signature) is the one ANN rule that is not mechanical: the
 # `Any`s in this repo are load-bearing at the yt-dlp and discord.py boundaries,
 # where the upstream types are genuinely dynamic. Narrowing the ones that *can*
