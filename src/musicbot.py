@@ -826,7 +826,7 @@ class MusicBot(commands.Cog):
     async def _cache_late_render(
         self,
         key: str,
-        render: "asyncio.Future[bytes]",
+        render: asyncio.Future[bytes],
         metrics: AnalyticsMetrics,
     ) -> None:
         """Store a chart whose caller already gave up on it.
@@ -2644,7 +2644,7 @@ class MusicBot(commands.Cog):
         except Exception as e:
             await self._command_error(ctx, e)
 
-    async def _debug_inputs(self, ctx: commands.Context) -> "debug_mode.DebugInputs":
+    async def _debug_inputs(self, ctx: commands.Context) -> debug_mode.DebugInputs:
         """Everything the snapshot cannot reach on its own (src/debug.py importing
         MusicBot would be a cycle)."""
         guild_id = ctx.guild.id if ctx.guild else None
@@ -2699,7 +2699,7 @@ class MusicBot(commands.Cog):
             return False
 
     async def _toggle_debug_mode(
-        self, ctx: commands.Context, action: "debug_mode.DebugAction"
+        self, ctx: commands.Context, action: debug_mode.DebugAction
     ) -> None:
         """Apply `--enable`/`--disable` to the invoking guild and confirm it."""
         if ctx.guild is None:

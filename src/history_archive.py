@@ -1231,7 +1231,7 @@ class HistoryOutboxDrainer:
         self._task = asyncio.create_task(self._run(), name="history-outbox-drainer")
         self._task.add_done_callback(self._on_task_done)
 
-    def _on_task_done(self, task: "asyncio.Task[None]") -> None:
+    def _on_task_done(self, task: asyncio.Task[None]) -> None:
         """Supervision. _run only ever exits via cancellation, so any exception
         here is a bug — one that leaves the non-evictable outbox growing with
         nothing draining it. Log loudly, then restart with exponential damping

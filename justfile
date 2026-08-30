@@ -128,7 +128,7 @@ default:
 # Create the venv with main + test + lint + dev dependencies
 [group('setup')]
 install:
-    poetry install --with test,lint,dev
+    poetry install --with test,lint,dev --extras charts
 
 # Install the git hooks (ruff on commit, `just check` on push)
 [group('setup')]
@@ -318,6 +318,31 @@ pins:
         echo "ruff pin drift: pyproject.toml=[$want_ruff] .pre-commit-config.yaml rev=[v$hook_ruff]" >&2
         echo "  Bump both in the same commit." >&2
         fail=1
+    fi
+
+    # The extra's NAME, in the one place that defines it and the three that select it.
+    # A typo in a selector is silent in the worst direction: poetry ignores an unknown
+    # extra, so the build succeeds and ships an image whose charts are simply missing —
+    # indistinguishable from the slim variant, and visible only as a chartless card.
+    # Each SITE is asserted separately: the Dockerfile names the extra twice, so a
+    # count would let a typo in either one hide behind the other.
+    want_extra="$(sed -n 's/^\([a-z]*\) = \["matplotlib"\]$/\1/p' pyproject.toml)"
+    if [ -z "$want_extra" ]; then
+        echo "charts extra: no [tool.poetry.extras] entry defining matplotlib" >&2
+        fail=1
+    else
+        check_extra() {  # <description> <file> <regex>
+            grep -qE -- "$3" "$2" || {
+                echo "charts extra drift: pyproject defines [$want_extra] but $1 does not name it" >&2
+                fail=1
+            }
+        }
+        check_extra "the Dockerfile ARG default" Dockerfile \
+            "^ARG CHART_EXTRAS=--extras=$want_extra\$"
+        check_extra "the Dockerfile test stage" Dockerfile \
+            "poetry install --only=main,test,lint --extras=$want_extra "
+        check_extra "just install" justfile \
+            "poetry install --with test,lint,dev --extras $want_extra\$"
     fi
 
     just_image="$(sed -n 's/^IMAGE := "\(.*\)"$/\1/p' justfile)"
@@ -842,6 +867,10 @@ image:
     # (build_docker.sh already exports it; this path did not).
     export GIT_SHA="$tag"
     build_runtime_image "{{ IMAGE }}:latest" "{{ IMAGE }}:$tag"
+    # The slim shape, same commit. CHART_EXTRAS is set-but-empty here (see
+    # build_common.sh); the two builds share every layer up to the poetry install,
+    # so the second is the dependency resolve and nothing else.
+    CHART_EXTRAS= build_runtime_image "{{ IMAGE }}:latest-slim" "{{ IMAGE }}:$tag-slim"
 
 # Deploy an already-built image; pass a git sha to roll back
 [group('deploy')]

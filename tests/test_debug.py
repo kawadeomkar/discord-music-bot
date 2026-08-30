@@ -1074,6 +1074,15 @@ class TestDebugCardCarriesTheSuffixEndToEnd:
     """The cog→card wiring, driven through the real command. TestSnapshotEmbed above
     hand-builds a DebugInputs, so it pins only the renderer's concatenation."""
 
+    @pytest.fixture(autouse=True)
+    def _fixed_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The footer opens with `environment: {config.ENVIRONMENT}`, which in CI is
+        the branch slug. The withheld-metrics test below greps the WHOLE footer for
+        labels like "pool ", so a branch named task/analytics-4-pool made it fail on
+        its own name — and equally would any branch ending in cpu, mem, lag or tasks.
+        Pinned by setattr, not setenv: config reads the variable once at import."""
+        monkeypatch.setattr(config, "ENVIRONMENT", "testing")
+
     @staticmethod
     def _enable(cog: MusicBotCog, ctx: MagicMock) -> None:
         cog.debug_settings._overrides[ctx.guild.id] = True

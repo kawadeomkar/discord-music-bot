@@ -699,8 +699,8 @@ def _guild_op(
     default: Any = None,
     default_factory: Optional[Callable[[], Any]] = None,
 ) -> Callable[
-    [Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]]],
-    Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]],
+    [Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]]],
+    Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]],
 ]:
     """Enforce GuildRedisStore's 'log, never raise' contract in one place.
 
@@ -718,11 +718,11 @@ def _guild_op(
     """
 
     def decorator(
-        func: Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]],
-    ) -> Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]]:
+        func: Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]],
+    ) -> Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]]:
         @wraps(func)
         async def wrapper(
-            self: "GuildRedisStore", *args: _P.args, **kwargs: _P.kwargs
+            self: GuildRedisStore, *args: _P.args, **kwargs: _P.kwargs
         ) -> _R:
             try:
                 return await func(self, *args, **kwargs)

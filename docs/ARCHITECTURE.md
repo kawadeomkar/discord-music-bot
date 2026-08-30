@@ -1691,6 +1691,41 @@ opted into the archive wants its headline feature, and the latency is worth the
 residency. Dropping the `warm_chart_pool()` call in `setup_hook` is the one-line lever
 if the bet ever stops paying — it is not a defect either way.
 
+#### The charts extra
+
+matplotlib is the only OPTIONAL entry in `[tool.poetry.dependencies]`, exposed as the
+`charts` extra. It and its transitive tree (numpy, pillow, fonttools, contourpy,
+kiwisolver, cycler, pyparsing) are 133 MB installed — 40% of the venv — and 230 MB of
+image once `compileall` emits their bytecode. The archive ships OFF, so the default
+deployment can never reach the command that draws with them.
+
+The runtime image is therefore published in two shapes per commit. `CHART_EXTRAS` is a
+Dockerfile ARG defaulting to `--extras=charts`, so an unqualified build is the full
+image; CI passes it EMPTY for a parallel `-slim` tag family (`sha-<commit>-slim`,
+`latest-slim`, `<version>-slim`). Measured: 1.38 GB full, 1.15 GB slim.
+
+The default is the full image on purpose. Slim is opt-in, so an operator already
+running `latest` with the archive on cannot be silently downgraded by a tag they did
+not change.
+
+What makes the extra cheap is import discipline that already existed for another
+reason: `analytics_render`'s module scope is stdlib plus `guild_state`, and matplotlib
+is imported inside `build_figure` and the panel helpers, which run only in the worker.
+So `musicbot` and `analytics_card` import the module normally in a slim install, and
+`chart_pool.chart_available()` — a `find_spec` lookup, never an import — is what
+decides. It gates two things: `warm()`, which would otherwise spawn a worker that dies
+on the import and stays resident, and `_render_analytics_chart`, which returns `None`
+so the card is sent with its numbers and no attachment.
+
+Pairing the slim image with `HISTORY_ARCHIVE_ENABLED=true` is legal and degrades to
+exactly that chartless card. `setup_hook` says so once at startup, because the only
+other signal is a per-invocation log line and a card missing its chart is
+indistinguishable from a render that failed.
+
+`just pins` asserts the extra's NAME across the four files that spell it. A typo is
+silent in the worst direction: poetry ignores an unknown extra, so the build succeeds
+and ships an image whose charts are simply absent.
+
 #### Known limits of this design
 
 Recorded rather than fixed, because each is a trade rather than a defect.

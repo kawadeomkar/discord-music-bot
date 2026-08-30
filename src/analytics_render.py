@@ -317,7 +317,7 @@ def _panel_daily_by_source(
             text.set_color(_MUTED)
 
 
-def _panel_heatmap(ax: Any, m: AnalyticsMetrics, fig: "Figure") -> None:
+def _panel_heatmap(ax: Any, m: AnalyticsMetrics, fig: Figure) -> None:
     grid = [[0 for _ in range(24)] for _ in range(7)]
     for cell in m.heat:
         if 1 <= cell.dow <= 7 and 0 <= cell.hour <= 23:
@@ -546,7 +546,7 @@ def _panel_wait(ax: Any, m: AnalyticsMetrics) -> None:
     ax.set_ylim(0.6, 1.8)
 
 
-def build_figure(metrics: AnalyticsMetrics) -> "Figure":
+def build_figure(metrics: AnalyticsMetrics) -> Figure:
     """The six panels, as a Figure — split from the rasterization so a test can make
     a dozen structural assertions against one construction and only one pays savefig.
 

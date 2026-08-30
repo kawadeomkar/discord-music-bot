@@ -18,7 +18,7 @@ from src.youtube import QueueObject
 
 
 def command_callback(
-    command: "commands.Command[Any, ..., Any]",
+    command: commands.Command[Any, ..., Any],
 ) -> Callable[..., Coroutine[Any, Any, Any]]:
     """Return a command's raw callback, invocable as ``callback(cog, ctx, ...)``.
 
@@ -38,7 +38,7 @@ def mocked(obj: object) -> MagicMock:
     return cast(MagicMock, obj)
 
 
-def described(embed: "discord.Embed") -> str:
+def described(embed: discord.Embed) -> str:
     """An embed's description, asserted non-empty.
 
     `.description` is `Optional[str]` and every assertion means "present, and it
