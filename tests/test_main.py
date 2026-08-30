@@ -1103,6 +1103,48 @@ class TestChartPoolWarm:
             await app.setup_hook()
         assert order == ["ytdlp", "chart"]
 
+    async def test_slim_image_with_the_archive_on_warns_at_startup(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The slim image pairs a working -analytics with no chart. Nothing else says
+        so at startup: warm() returns silently and the only other signal is a
+        per-invocation line, so the operator sees a chartless card and reads it as a
+        render failure."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        with (
+            patch("src.chart_pool.chart_available", return_value=False),
+            patch("src.chart_pool.warm"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+            patch("src.main.log.warning") as warn,
+        ):
+            await app.setup_hook()
+        assert any("matplotlib is not installed" in str(c) for c in warn.call_args_list)
+
+    async def test_a_full_image_warns_about_nothing(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pairing above is the ONLY thing that warning describes — firing it on a
+        normal deployment would train the operator to ignore it."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        with (
+            patch("src.chart_pool.chart_available", return_value=True),
+            patch("src.chart_pool.warm"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+            patch("src.main.log.warning") as warn,
+        ):
+            await app.setup_hook()
+        assert not any("matplotlib" in str(c) for c in warn.call_args_list), (
+            warn.call_args_list
+        )
+
 
 class TestChartPoolWarmCallable:
     def test_warm_does_nothing_without_matplotlib(self) -> None:

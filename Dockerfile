@@ -23,9 +23,14 @@ COPY pyproject.toml poetry.lock ./
 
 # BuildKit cache mounts: reuse pip/poetry download cache across builds.
 # Critical for yt-dlp (large, frequent updates) and pynacl (C extension compile).
+# CHART_EXTRAS selects the image SHAPE, and defaults to the full one so an
+# unqualified build is unchanged. Empty builds the `-slim` variant: no matplotlib and
+# no transitive tree (133MB), which a deployment with the archive disabled can never
+# reach. See docs/ARCHITECTURE.md#the-charts-extra.
+ARG CHART_EXTRAS=--extras=charts
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --only=main --no-root
+    poetry install --only=main $CHART_EXTRAS --no-root
 
 # Bytecode-compile the venv. Poetry leaves site-packages as .py only, and the runtime
 # stage runs as uid 10001 against a root-owned /app/.venv — so the interpreter cannot
@@ -61,7 +66,7 @@ FROM builder AS test
 # the build is the point — the assumption is then re-examined rather than silently lost.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --only=main,test,lint --no-root \
+    poetry install --only=main,test,lint --extras=charts --no-root \
  && test -d /app/.venv/lib/python*/site-packages/nodejs_wheel/include \
  && rm -rf /app/.venv/lib/python*/site-packages/nodejs_wheel/include
 

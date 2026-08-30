@@ -98,9 +98,10 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    never creates the group, and a mis-shaped key is inert — downgraded to a startup
    warning by the leftover-outbox probe.)
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces eight pairs — it is a dep of `check` and CI also runs it as its own step,
-   deliberately: Dependabot's `pip` and `pre-commit` ecosystems open SEPARATE PRs that
-   each move one half, and those PRs are validated by CI and never by a local `check`.
+   enforces eight pairs and one name — it is a dep of `check` and CI also runs it as
+   its own step, deliberately: Dependabot's `pip` and `pre-commit` ecosystems open
+   SEPARATE PRs that each move one half, and those PRs are validated by CI and never
+   by a local `check`.
    The eight: the ruff pin (pyproject) ↔ the ruff hook `rev` in
    `.pre-commit-config.yaml`; the image name (justfile `IMAGE` ↔ `build_common.sh`
    `IMAGE_NAME`); and `postgres:18-alpine` / `redis:7-alpine` each across three files —
@@ -115,6 +116,12 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    `CLAUDE.md` and `docs/ARCHITECTURE.md`, which describe the client strategy for a
    specific version: Dependabot moves pyproject + `poetry.lock` without touching either,
    and main has carried a stale copy for exactly that reason.
+   The **name** is the `charts` extra: `[tool.poetry.extras]` defines it, and three
+   sites select it (the `CHART_EXTRAS` ARG default and the test stage in `Dockerfile`,
+   and `just install`). Each site is asserted separately rather than counted — the
+   Dockerfile names it twice, so a count lets a typo in either hide behind the other.
+   Poetry IGNORES an unknown extra, so drift builds green and ships an image whose
+   charts are silently absent. See `docs/ARCHITECTURE.md#the-charts-extra`.
    **Three pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the

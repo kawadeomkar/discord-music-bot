@@ -246,8 +246,18 @@ class MusicBotApp(commands.AutoShardedBot):
         # which brings the forkserver up, so this fork is cheap. Fire-and-forget; the
         # matplotlib import happens in the worker.
         if archive_enabled:
-            from src.chart_pool import warm as warm_chart_pool
+            from src.chart_pool import chart_available, warm as warm_chart_pool
 
+            if not chart_available():
+                # The slim image with the archive ON. -analytics still answers — the
+                # numbers are the card, the chart is an attachment — so this is a
+                # warning, not a raise. Said HERE because the only other signal is a
+                # per-invocation log line, and a card arriving without its chart is
+                # indistinguishable from a render that failed.
+                log.warning(
+                    "matplotlib is not installed, so -analytics will answer without "
+                    "its chart — deploy the image tag without the -slim suffix"
+                )
             try:
                 warm_chart_pool()
             except Exception as e:
