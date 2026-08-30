@@ -1001,7 +1001,7 @@ class TestRecoveryLockCompareAndDelete:
             def __init__(self, pipe: Any) -> None:
                 self._pipe = pipe
 
-            async def __aenter__(self) -> "_StealAfterGet":
+            async def __aenter__(self) -> _StealAfterGet:
                 await self._pipe.__aenter__()
                 return self
 

@@ -50,7 +50,7 @@ _TIMESTAMP_ECHO_MAX = 40
 
 
 def timestamp_warning(
-    source: Union["SpotifySource", "YTSource", "SoundcloudSource"],
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
 ) -> Optional[str]:
     """One line naming a `t=` value that did not parse, or None.
 

@@ -1001,7 +1001,7 @@ class TestOutboxDrainHelpers:
             async def execute(self) -> Any:
                 raise boom
 
-            async def __aenter__(self) -> "_DeadPipeline":
+            async def __aenter__(self) -> _DeadPipeline:
                 return self
 
             async def __aexit__(self, *exc: Any) -> None:

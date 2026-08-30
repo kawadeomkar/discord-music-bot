@@ -1047,7 +1047,7 @@ class YTDL(discord.FFmpegOpusAudio):
         volume: float = 1.0,
         redis: Optional[aioredis.Redis] = None,
         allow_reextract: bool = True,
-    ) -> "YTDL":
+    ) -> YTDL:
         """Resolve a queued song to a playable YTDL source, using the Redis
         stream-URL cache if present and extracting fresh via yt-dlp otherwise.
 

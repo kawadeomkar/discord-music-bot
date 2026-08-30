@@ -38,7 +38,7 @@ ALONE_DISCONNECT_SECS = 10
 
 
 @_tracer.start_as_current_span("guild.restore")
-async def restore_guild(cog: "MusicBot", guild: discord.Guild) -> None:
+async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
     """Attempt to rejoin voice and restore queue for one guild after restart."""
     if cog.redis is None:
         return
@@ -176,7 +176,7 @@ class VoiceWatchdog:
 
     __slots__ = ("_cog", "_timers")
 
-    def __init__(self, cog: "MusicBot") -> None:
+    def __init__(self, cog: MusicBot) -> None:
         self._cog = cog
         self._timers: dict[int, asyncio.Task] = {}
 

@@ -592,7 +592,7 @@ async def run_health_dashboard(
         )
         return [e for e in (warning, embed) if e is not None]
 
-    def _settle(label: str, outcome: "ProbeResult | Exception") -> None:
+    def _settle(label: str, outcome: ProbeResult | Exception) -> None:
         # _timed guards the probe BODY, not everything a probe does: probe_otel parses
         # a URL before it. The driver hands the failure over already resolved rather
         # than as a task to unwrap, so this cannot re-raise into the driver's own task

@@ -30,7 +30,7 @@ T = TypeVar("T")
 _MIN_WAIT_SECS = 0.01
 
 
-def _retrieve_exception(task: "asyncio.Task[Any]") -> None:
+def _retrieve_exception(task: asyncio.Task[Any]) -> None:
     """Mark a settled probe's exception as retrieved, wherever it settles.
 
     Attached at creation rather than handled in the driver's `finally`, because a
@@ -70,7 +70,7 @@ async def safe_edit(message: discord.Message, embeds: list[discord.Embed]) -> bo
         return True
 
 
-def outcome_of(task: "asyncio.Task[T]") -> "T | Exception":
+def outcome_of(task: asyncio.Task[T]) -> T | Exception:
     """A finished task's value, or the exception it died of.
 
     CancelledError is deliberately not caught: the driver only reads tasks it has
@@ -87,7 +87,7 @@ async def run_live_dashboard(
     ctx: commands.Context,
     *,
     probes: Mapping[str, Callable[[], Coroutine[Any, Any, T]]],
-    settle: Callable[[str, "T | Exception"], None],
+    settle: Callable[[str, T | Exception], None],
     abandon: Callable[[str], None],
     render: Callable[[], list[discord.Embed]],
     tick_secs: float,
