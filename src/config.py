@@ -95,6 +95,15 @@ DEBUG_DEADLINE_SECS: float = _float_env(
     "DEBUG_DEADLINE_SECS", 8.0, minimum=_MIN_DASHBOARD_SECS
 )
 
+# How long -analytics waits for its chart before sending the card without one. Sized
+# for the cold path, which dominates. Expiring is silent — the card still sends — so
+# the deadline's job is bounding a wedged worker holding the guild's concurrency
+# slot. It bounds the CALLER: a ProcessPoolExecutor cannot cancel a running call.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+ANALYTICS_RENDER_DEADLINE_SECS: float = _float_env(
+    "ANALYTICS_RENDER_DEADLINE_SECS", 20.0, minimum=_MIN_DASHBOARD_SECS
+)
+
 
 # Floor for the playback heartbeat. Higher than the dashboard floor because each
 # tick is a Redis write per PLAYING guild rather than a local timer: at 0.05 that
