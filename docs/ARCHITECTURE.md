@@ -45,6 +45,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Queue invariant](#queue-invariant)
     - [Now Playing host invariants](#now-playing-host-invariants)
     - [Debug footer seams](#debug-footer-seams)
+    - [Analytics rendering](#analytics-rendering)
 16. [Design Decisions](#design-decisions)
 
 ---
@@ -179,6 +180,9 @@ graph TD
     dashboard["src/dashboard.py\noptimistic-send + live-edit driver"]
     ping["src/ping.py\n-ping probes + rendering"]
     debug_mod["src/debug.py\n-debug snapshot + debug mode"]
+    analytics_card["src/analytics_card.py\n-analytics flags + cache + embed"]
+    analytics_render["src/analytics_render.py\nsix-panel figure"]
+    chart_pool["src/chart_pool.py\nchart render pool"]
     util["src/util.py\nlogging + embed helpers"]
 
     main --> musicbot
@@ -212,6 +216,13 @@ graph TD
     redis_client --> guild_state
     youtube --> redis_client
     youtube --> ytdlp_pool
+    musicbot --> analytics_card
+    musicbot --> analytics_render
+    musicbot --> chart_pool
+    analytics_card --> guild_state
+    analytics_render --> guild_state
+    chart_pool --> ytdlp_pool
+    main --> chart_pool
     spotify --> redis_client
 ```
 
@@ -232,8 +243,11 @@ graph TD
 | `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
 | `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `read_guild_configs` (pipelined, chunked — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose") and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
+| `analytics_card.py` | `-analytics`'s window allowlist (`{7, 30, 90, 365}` — see [Analytics rendering](#analytics-rendering)), `AnalyticsFlags`, both Redis cache codecs (the orjson aggregate and the PNG's aggregate-digest key), and the embed renderer. Pure, like `leaderboard.py`, and named `_card` because `guild_state.Analytics` already exists. **Every human-authored string the command shows is rendered here**, never in the image. |
+| `analytics_render.py` | The six-panel figure. Imports matplotlib **inside** `build_figure`, never at module scope, and constructs nothing at module scope at all — a spawned worker re-imports it. `_ascii_safe()` raises on anything the bundled font cannot draw. Imports nothing from `src/` except `guild_state`. |
+| `chart_pool.py` | The chart pool's only home: one lazily-spawned `YtdlpPool(max_workers=1, name="chart render")`, plus `chart_available()` (a `find_spec` lookup, so it never pays matplotlib's import). Exists so there IS a stable name for `main.py` to close, `debug.py` to read and `conftest.py` to patch; imports only `ytdlp_pool`. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
-| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0), and the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0) — read through `_float_env`, which refuses non-finite values separately from its floor because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. Plus the call-time accessors: `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
+| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0), the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0), and `ANALYTICS_RENDER_DEADLINE_SECS` (20.0) — read through `_float_env`, which refuses non-finite values separately from its floor because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. Plus the call-time accessors: `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
 | `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver `-ping` and `-debug` share. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row, a block of rendered lines) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. Both callers reply through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
 | `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
@@ -280,6 +294,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-queue` | `q` | — | Display the next 10 songs with per-song ETA. |
 | `-history` | `h` | `[--limit N]` | Display the last N played songs (default 10, max 50). Served from the capped Redis list alone, in both archive modes — see [History read path](#history-read-path). |
 | `-leaderboard` | `lb`, `top` | `[--days N]` | Top 10 listeners and top 10 songs for this server, ranked by total listening time; `--days` scopes both boards to a rolling window. Aggregated from the Postgres archive (the first production reader of it) behind a 60 s Redis cache; replies with a notice when the archive is disabled. |
+| `-analytics` | `an` | `[--days N]` | Six-panel chart of this server's listening (plays per day by source, weekday x hour heatmap, listening time, per-play completion by source, song-length mix, queue-wait percentiles) plus top listeners/artists/songs. Postgres-only, like `-leaderboard`, and gated on the archive the same way. `--days` is an **allowlist** of 7/30/90/365 — a free-form range would defeat its own cache; the window is N COMPLETE UTC days, so today is excluded and the answer is immutable until midnight, which is when the Redis cache expires. Rendered in a worker process; every render failure degrades to the embed-only card. One in flight per guild, and one run per guild per 30 s — the two cover different axes, so neither substitutes for the other. See [Analytics rendering](#analytics-rendering). |
 | `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to Redis. |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | — | Live-editing service-health dashboard: probes Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, and reports the bot / yt-dlp / FFmpeg versions. One in flight per guild. |
 | `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing/runtime footer to every embed the bot sends in that guild, the live Now Playing card included) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
@@ -324,6 +339,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `POSTGRES_URL` | No | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). Unset → the entire Postgres tier is off (no outbox writes, no drainer, pre-Postgres read behavior) |
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
+| `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC endpoint (default `http://localhost:4317`) |
 | `OTEL_SDK_DISABLED` | No | `true` disables telemetry entirely (tests set this) |
@@ -842,6 +858,8 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
+| `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
+| `analytics:png:v{n}:{guild_id}:{days}:{digest}` | Bytes | the rendered chart, keyed by a digest of the aggregate it was drawn from so a stale entry MISSES rather than pairing an old chart with fresh numbers. Raw bytes, not orjson — that would base64 it for a 33% penalty | to the next UTC midnight |
 | `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
@@ -882,7 +900,9 @@ One token, no dataclass per site: a constant for each special-cased service (`yo
 
 ## Concurrency Model
 
-Single asyncio event loop. All I/O is async. yt-dlp extraction is offloaded to the `YtdlpPool`'s `ProcessPoolExecutor` (`YTDLP_POOL_WORKERS`, default 4).
+Single asyncio event loop. All I/O is async. yt-dlp extraction is offloaded to the `YtdlpPool`'s `ProcessPoolExecutor` (`YTDLP_POOL_WORKERS`, default 4), and `-analytics` chart rendering to a **second, separate** one-worker pool (`src/chart_pool.py`) — see [Analytics rendering](#analytics-rendering) for why it is a process and why it is not the yt-dlp instance.
+
+The analytics archive read takes its **own `Semaphore(1)`** rather than a share of `history_archive`'s `_read_slots`. That budget is `_READ_CONCURRENCY = 2` against a `max_size=4` pool, sized when `leaderboard()` and `stats()` were its only takers; the analytics aggregate is the heaviest of the three, and a third consumer there is what makes the drainer's starvation reachable. The render runs **after** that slot and its connection are released.
 
 ```mermaid
 flowchart TD
@@ -1572,6 +1592,248 @@ Rules each seam encodes:
 `RuntimeSampler` feeds the runtime segments on the NP tick's cadence
 (`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is
 effectively debug-enabled.
+
+### Analytics rendering
+
+`-analytics` is one PNG plus one embed, sent as a single `ctx.send`. Three decisions
+carry it, and each was measured rather than assumed.
+
+**The library.** matplotlib (Agg), at 460 ms per render and ~123 MB installed. Pillow
+renders the same six panels 24x faster (19.5 ms) but renders *primitives*: that version
+has no axis tick labels on four of the six panels, no legend, no colorbar and aliased
+lines, so the 19.5 ms is not a like-for-like number. Every one of those is bespoke
+layout code whose failure mode is *visual*, i.e. invisible to the test suite. seaborn is
+a styling layer over matplotlib that adds pandas and scipy (~90 MB) to restyle six
+panels an `rcParams` dict covers; plotly's static export ships a headless Chromium;
+Discord does not render SVG attachments inline, which disqualifies pygal outright; and
+any external renderer ships guild listening data to a third party, inverting the
+consent gate `HISTORY_ARCHIVE_ENABLED` exists to be.
+
+**A process, never a thread**, and the *event loop* is the reason. matplotlib's figure
+construction is pure Python holding the GIL and so is discord.py's audio player thread,
+so they contend directly:
+
+| Where the render runs | Loop lag p50 / max | Audio-frame lateness max |
+|---|---|---|
+| on the event loop | 389.55 / 389.55 ms | — |
+| in a `ThreadPoolExecutor` | 3.61 / **108.07** ms | 76.88 ms |
+| 4 renders / 2 threads | 4.76 / **183.71** ms | 83.91 ms |
+| in a worker process | — | **4.23 ms** (idle control: 5.00) |
+
+A thread keeps the loop mostly responsive and still spikes to 108 ms, and to 184 ms
+under concurrency — and every guild's command latency and every heartbeat rides that
+loop. The audio-frame counts prove less than they look like (`_do_run` uses an absolute
+deadline with drift correction, so one ~60 ms stall is counted once per frame while the
+loop catches up, and no frames are dropped), which is why the loop measurement carries
+the decision on its own.
+
+The pool is `src/chart_pool.py` — a second `YtdlpPool` with `max_workers=1` and its own
+`name=`. Reusing the class inherits lazy creation, heal-once, the bounded off-loop join
+and worker-log plumbing for a ~15-line diff. Reusing the *instance* would not: those
+four workers each hold yt-dlp at 80-120 MB and adding matplotlib's ~173 MB to all four
+costs ~700 MB for a command that may never run, while a render would queue behind 1-4 s
+extractions and an extraction behind a render, delaying `-play`.
+
+**The worker is warmed at startup, and the venv is bytecode-compiled.** Both exist
+because the cold path was 2,976 ms — measured in the runtime image, production-shaped
+(`__main__` importing `src.main`, so the forkserver holds the bot graph the way it
+really does). Three changes took it to 688 ms:
+
+| | cold first render | warm |
+|---|---|---|
+| baseline | 2,976 ms | ~770 ms |
+| + bytecode-compiled venv | 1,668 ms | ~655 ms |
+| + `chart_pool.warm()` at `setup_hook` | **688 ms** | ~650 ms |
+
+The bytecode one is not analytics-specific and is the larger systemic win: Poetry leaves
+site-packages as `.py` only and the runtime stage runs as uid 10001 against a root-owned
+venv, so the interpreter cannot write `__pycache__` and **re-compiles every module on
+every import, in every process, for the life of the container**. `import src.main`
+measured 3,747 ms against 1,670 ms compiled, `import matplotlib` 2,485 ms against
+1,300 ms (medians of 7, page cache warm). That is paid by bot startup, by the
+forkserver, and by every yt-dlp worker the first `-play` spawns.
+
+`warm()` runs only when the archive is enabled — `-analytics` is gated on it, so a
+default deployment can never reach the pool and must not pay the ~141 MB Pss a resident
+worker costs. It is called AFTER `ytdlp_pool.prewarm()`, which is what brings the
+forkserver up and pays the entry-module import in it; warming after costs a ~21 ms fork
+rather than repeating that. The parent blocks 6.8 ms; matplotlib's import happens in the
+worker while startup continues.
+
+A **forkserver preload** of matplotlib (`set_forkserver_preload`) is rejected, and the
+reason is memory — measured head to head in the runtime image, one forkserver and one
+worker that renders:
+
+| | forkserver | worker | combined Pss | combined Rss | first render |
+|---|---|---|---|---|---|
+| lazy import (current) | 11.5 MB | 63.0 MB | **74.5 MB** | **101.8 MB** | 1,718 ms |
+| `set_forkserver_preload` | 40.0 MB | 49.9 MB | **89.8 MB** | **147.5 MB** | **463 ms** |
+
+Preload costs **+15 MB Pss and +46 MB Rss** because copy-on-write does not hold: the
+forkserver keeps matplotlib for the life of the process, and the worker still
+privatizes most of those pages once it renders — its Rss falls by only 4 MB. The
+library is paid for roughly twice. Production is worse than the table, because one
+forkserver serves both pools, so all four yt-dlp workers would inherit the mapping for
+a library they never call — and a matplotlib import failure would then break extraction
+rather than one command.
+
+Preload's 3.7x faster cold render buys nothing here, because `warm()` already pays that
+cost at startup. The remaining choice was **warm vs lazy**, and warm is **decided**:
+
+- **warm** (chosen): ~139 MB Pss resident for the process's life on any archive-enabled
+  deployment, first `-analytics` ~460 ms.
+- **lazy**: nothing until the first `-analytics`, then the same ~139 MB, first call
+  ~690 ms.
+
+They differ only for a deployment that enables the archive and never runs the command,
+which pays 139 MB for nothing. Warming takes that bet deliberately: an operator who
+opted into the archive wants its headline feature, and the latency is worth the
+residency. Dropping the `warm_chart_pool()` call in `setup_hook` is the one-line lever
+if the bet ever stops paying — it is not a defect either way.
+
+#### Known limits of this design
+
+Recorded rather than fixed, because each is a trade rather than a defect.
+
+**A hung worker is not recovered.** `run()` heals a *dead* worker (`BrokenProcessPool`)
+once, but a worker that is alive and stuck is invisible to it, and `max_workers=1` means
+one such call disables `-analytics` process-wide until restart. Recycling the executor on
+a render timeout would fix it and would also defeat the late-render cache write above,
+which exists because a slow render is far more likely than a wedged one. Deliberately
+not built on a speculative trigger; if it is ever observed, the fix is a `_replace()`
+on the timeout path and the cache write has to move behind it.
+
+**matplotlib is a mandatory dependency for an opt-in feature.** The *import* is already
+gated and costs nothing: it happens inside `build_figure`, in the worker, and
+`grep -c matplotlib /proc/<pid>/maps` is **0** for the bot, the forkserver and every
+yt-dlp worker on a running container — only the chart worker maps it. A runtime
+`if archive_enabled: import matplotlib` would therefore change nothing.
+
+What is not gated is the **install**. matplotlib and its dependencies are 147 MB of the
+venv's 308 MB, so every deployment carries them — including the default
+`HISTORY_ARCHIVE_ENABLED=false`, which can never reach `-analytics`. Because they land
+in the same layer as `poetry install`, every dependency bump re-pushes all of it.
+
+Gating that needs a **build-time** switch, not a runtime one: an optional `analytics`
+extra plus a Dockerfile `ARG`, since `HISTORY_ARCHIVE_ENABLED` is read long after the
+image is built. The embed-only path it would land on already exists and is tested
+(`chart_available()` → card without a chart), so the change is mostly packaging — and
+it would make `chart_available()` load-bearing instead of a check for a configuration
+this project declares unsupported. The cost is a second install path (Dockerfile, the
+test stage, `just install`, CI) that nothing enforces agreement on, for a saving only
+an operator who opts out of the default build ever sees.
+
+**The analytics row dataclasses live in `guild_state.py`.** Unpickling a dataclass
+imports its defining module, which rules out `history_archive` (asyncpg) and
+`analytics_card` (discord); it does not uniquely select `guild_state`, and a dedicated
+stdlib-only module would satisfy the same constraint. They are the only types there
+whose wire format lives elsewhere (`analytics_card._WIRE`), so that file now hosts two
+conventions. A coverage test holds `_WIRE ∪ _SCALARS` to the dataclass, which is the
+mitigation.
+
+**Under multi-process sharding every shard would hold its own chart worker** (~141 MB),
+warmed at `setup_hook` whether or not any guild it owns runs the command. The
+`release_idle()` sketched above is the same fix.
+
+**Orphaned PNG keys.** The key carries the aggregate digest, and the aggregate is
+immutable for its UTC day — but a late drainer insert into a completed day, or a
+`db-backfill`, moves it. The superseded key is not deleted and lives out its TTL.
+
+**`jit` is left at the server default.** The analytics plan carries ~20 InitPlans, so a
+large guild's 365-day aggregate can cross `jit_above_cost` and pay LLVM compilation on a
+query run at most four times per guild per day. Not yet reachable at observed table
+sizes; `SET LOCAL jit = off` on the analytics connection is the lever.
+
+The figure uses a **fixed `subplots_adjust`**, not `tight_layout()`, which measured every
+drawn string to re-solve a layout that has exactly one answer — 1,263 `get_window_extent`
+calls, 266 ms of a 476 ms `build_figure`. It is applied before the panels are drawn,
+because `fig.colorbar(ax=…)` steals its space from the parent axes' position at creation
+time and an adjustment made afterwards moves the axes out from under the colorbar.
+
+**No idle reaper, and one cannot be built on this class as it stands.** `_close()` sets
+`_closed` and nothing clears it, so a reaper calling `aclose()` bricks `-analytics` for
+the life of the process — silently, since `run()` heals `BrokenProcessPool` only and
+`PoolClosedError` falls through to the embed-only card. The private `_replace()` escape
+is worse: it bumps `_generation`, whose contract (read by `-debug`) is "a value above 1
+means a worker died abnormally", and calls `shutdown(wait=False)`, the unbounded-exit
+shape `aclose`'s own comment measured at 61 s. Reclaiming the RSS needs its own change —
+a non-terminal `release_idle()` that leaves `_closed` false — gated on a measurement
+that reaping reclaims anything.
+
+**No human-authored string reaches the image.** `python:3.14-slim` ships no fonts at all
+and matplotlib's bundled DejaVu Sans covers 5,943 codepoints — no CJK, no Thai, no
+emoji, all ordinary in YouTube titles and channel names. In production the failure is
+SILENT: warning filters do not cross a process boundary, so the spawned worker starts
+with the defaults, emits one unstructured line to raw stderr (bypassing the
+`QueueHandler → QueueListener → Loki` plumbing entirely) and ships a PNG full of tofu.
+`_ascii_safe()` is therefore the only guard and it *raises* — never an `assert`, which
+`python -O` strips. Titles, uploaders and requester names render in the embed, where
+Discord's own full-Unicode stack, masked links and live mentions all work.
+
+`query_source` is the one archive-derived string that legitimately reaches the figure,
+in the legend. What makes it safe is its character DOMAIN, not membership in a fixed
+list: `sources.py` stores a parsed hostname accepted against `[a-z0-9.-]{1,64}`, so it
+can never produce tofu. It is not a closed vocabulary, which is why the dimension is
+capped at five plus an `"other"` bucket the renderer mints.
+
+**Panel forms.** Two are load-bearing rather than aesthetic. Panel 6 is a **box /
+percentile strip** (`Axes.bxp` over server-computed percentiles — `boxplot` would want
+every raw wait shipped from Postgres to re-derive them): box p25-p75, median p50,
+whiskers p10-p90. Bars per percentile, which it briefly drew, invite reading five
+independent quantities where there is one distribution. Because those whiskers are not
+`bxp`'s 1.5x IQR default, the panel states its own definition. Panel 2 is a **single-hue
+sequential ramp**, blue, stepped 700 -> 100 — magnitude, not identity, so a multi-hue map
+(magma, viridis) is exactly what the rule forbids: the reader decodes hue instead of
+lightness and its floor is a pure black unrelated to the panel. An hour with no plays is
+absence rather than the ramp's floor, so it takes the panel colour and recedes
+(`vmin=1` plus `with_extremes(under=…)`, never the pending-deprecated `set_under`).
+
+**Palette.** The dataviz reference palette's dark steps in its validated slot order
+(`#3987e5, #d95926, #199e70, #c98500, #d55181`, plus `#9085e9` for `"other"`). Ordering
+is the colour-blindness mechanism rather than cosmetics: against the `#2b2d31` surface
+the worst *adjacent* pair — which is what a stacked bar and a legend are — is ΔE 8.4
+under protanopia and 19.3 with normal vision, both clear of the floors. The figure is
+explicitly dark because a PNG cannot follow the viewer's theme the way an embed does.
+PNG at dpi 110 / 1100x792: Discord renders an embed image at ~550 px wide on desktop, so
+that is exactly 2x for HiDPI, and JPEG measured 65% LARGER for this content (93.3 KiB
+against 56.6 KiB) *and* lower quality — flat-colour panels with thin lines and text are
+the DCT pathological case.
+
+**The chart is an embed image, and it is already at that box's ceiling.** Discord
+renders an embed image inside a **400x300** box; this figure fills 96% of it at
+400x285. A bare attachment renders larger (~486x350, about 1.5x the area) and was
+tried side by side, but the inline card reads better and the split into two blocks is
+not worth 1.5x. Clicking either opens the full 1100x792, which is where six panels are
+legible at all.
+
+Two things follow, and they constrain any future attempt at this:
+
+- **A taller figure is worse, not better.** The 300px height cap binds before the
+  width cap, so a 1:1 image renders 300x300 — *less* area than today's 400x285.
+- **Bigger type does not fix it.** Legible inline labels (~9 CSS px) would need 16pt in
+  a 200x95 panel. The only real lever is fewer panels, at the cost of metrics.
+
+The cost of keeping `set_image` is one property nothing can verify from this side:
+whether an `attachment://` URL in a **re-sent** embed still resolves after the Now
+Playing block's later, file-less edits. Live smoke confirms the initial send renders;
+the re-send case is server behaviour with a documented class of v10 breakage behind it.
+The testable half is that `handle_message_parameters` writes `payload['attachments']`
+only when the argument is not MISSING, so both NP edit sites passing neither
+`attachments=` nor `files=` is what preserves the file — pinned by a test. If the
+re-send case ever does fail, dropping `set_image` for a bare attachment is the known
+fallback and costs only the layout.
+
+**The live-dashboard pattern was considered and declined.** `-ping` and `-debug` send a
+skeleton and edit it as probes land; applying that here does not fit, and the reasons
+are worth recording so they are not re-derived. The six panels are not six pieces of
+work — they are branches of one CTE and regions of one figure, and you cannot repaint
+one panel of a PNG, so six progressive updates means six full re-renders and six
+re-uploads. `dashboard.safe_edit` takes `embeds` only, and adding a file on edit is
+documented v10 breakage. There is no straggler to route around: that driver was built
+for "real IO across several services", and this command touches one, with a warm path of
+~66 ms of SQL plus ~460 ms of render. And an edit-loop-owned message must bypass
+`MusicContext.send`, which would cost the NP block. `background_typing(ctx)` covers the
+one real gap — the ~2.0 s first invocation in a process.
 
 ## Design Decisions
 

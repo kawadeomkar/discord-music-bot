@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.29.1"
+version = "2.29.2"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -40,6 +40,11 @@ opentelemetry-instrumentation-redis = ">=0.48b0"
 opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
 asyncpg = ">=0.30"
+# The -analytics chart renderer. A caret range, not an exact pin: unlike the eight
+# pairs `just pins` enforces, this version is written in exactly one file, so there is
+# no second copy to drift from. Rendering runs in its own worker process — see
+# docs/ARCHITECTURE.md#analytics-rendering.
+matplotlib = "^3.11"
 
 # The three groups below are optional, which is what makes `--with` mean anything.
 # Poetry installs every NON-optional group by default and `--with` is documented as

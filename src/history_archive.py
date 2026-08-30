@@ -133,9 +133,12 @@ WITH top AS (
 SELECT t.requester_id, l.requester_name, t.plays, t.played_secs
 FROM top t
 CROSS JOIN LATERAL (
+    -- The cutoff belongs here too, so play_history_recent serves the lookup
+    -- instead of filtering over the guild's whole history.
     SELECT p.requester_name
     FROM play_history p
     WHERE p.guild_id = $1 AND p.requester_id = t.requester_id
+      AND p.played_at >= $3
     ORDER BY p.played_at DESC, p.id DESC
     LIMIT 1
 ) l
@@ -157,9 +160,11 @@ SELECT t.webpage_url, l.title, l.duration_secs, l.query_source,
        t.plays, t.played_secs
 FROM top t
 CROSS JOIN LATERAL (
+    -- Cutoff-bound for the same reason as the requesters lateral above.
     SELECT p.title, p.duration_secs, p.query_source
     FROM play_history p
     WHERE p.guild_id = $1 AND p.webpage_url = t.webpage_url
+      AND p.played_at >= $3
     ORDER BY p.played_at DESC, p.id DESC
     LIMIT 1
 ) l
