@@ -21,7 +21,17 @@ from typing import Any, Optional, cast
 
 from redis.asyncio import Redis
 
-from src.guild_state import TS_MAX, HistoryEntry, serialize_history_entry
+from src.guild_state import (
+    TS_MAX,
+    WAIT_UNAVAILABLE,
+    CompletionBucket,
+    DailyPoint,
+    DurationBucket,
+    HeatCell,
+    HistoryEntry,
+    SourceCompletion,
+    serialize_history_entry,
+)
 from src.history_archive import (
     _INSERT_SQL,
     _POISON,
@@ -2591,3 +2601,293 @@ class TestPoisonClassification:
             asyncpg.exceptions.PostgresConnectionError("down"),
         ):
             assert not isinstance(exc, _POISON), exc
+
+
+class TestAnalyticsQuery:
+    """The -analytics read path's plumbing: the bucket-unit switch, one connection
+    for all four statements, the window reused rather than re-read, and the row →
+    dataclass decode. The SQL's semantics belong to the pg tier — mocking fetch()
+    here would only assert the mock."""
+
+    # A row shaped exactly like _ANALYTICS_SQL's, with the jsonb branches as the
+    # `str` asyncpg actually hands back (no default jsonb codec, and this pool
+    # passes no init=). Anything that decodes these must survive that.
+    @staticmethod
+    def _row(**over: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "window_start": 1_785_369_600.0,
+            "window_end": 1_787_961_600.0,
+            "today_start": 1_787_961_600.0,
+            "n_rows": 3,
+            "first_play": 1_787_788_800.0,
+            "listen_secs": 600,
+            "unique_songs": 3,
+            "unique_listeners": 2,
+            "unique_artists": 2,
+            "livestream_plays": 1,
+            "daily": '[{"d": "2026-08-27", "plays": 3, "secs": 600}]',
+            "daily_by_source": '[{"d": "2026-08-27", "src": "search", "plays": 3}]',
+            "heat": '[{"dow": 4, "hr": 22, "plays": 3}]',
+            "completion": '[{"src": "search", "b": 10, "plays": 2}]',
+            "durations": '[{"b": 3, "plays": 2}]',
+            "source_completion": '[{"src": "search", "played": 600, "dur": 700}]',
+            "wait_pcts": "[1.0, 2.0, 3.5, 9.0, 40.0]",
+        }
+        return base | over
+
+    def _stubbed_pool(
+        self, row: Optional[dict[str, Any]], **tops: list[dict[str, Any]]
+    ) -> tuple[MagicMock, MagicMock]:
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=None if row is None else _as_record(row))
+        conn.fetch = AsyncMock(
+            side_effect=[
+                tops.get("listeners", []),
+                tops.get("artists", []),
+                tops.get("songs", []),
+            ]
+        )
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+        return pool, conn
+
+    @staticmethod
+    def _archive() -> PostgresHistoryArchive:
+        return PostgresHistoryArchive("postgresql://nope:1/nope")
+
+    @pytest.mark.parametrize(
+        "days,unit", [(7, "day"), (30, "day"), (90, "day"), (365, "week")]
+    )
+    async def test_the_bucket_unit_rides_the_window(self, days: int, unit: str) -> None:
+        """365 days of daily bars is 365 sub-pixel bars; the series downsamples to
+        weeks there and nowhere else. The unit reaches the caller because the
+        y-axis label has to move with it — "plays per week" is not "plays per day",
+        and the switch is invisible otherwise."""
+        archive = self._archive()
+        pool, conn = self._stubbed_pool(self._row())
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            metrics = await archive.analytics(42, days=days, top_n=5)
+        assert conn.fetchrow.await_args.args[3] == unit
+        assert metrics.bucket_unit == unit
+        assert metrics.days == days
+
+    async def test_one_connection_carries_all_four_statements(self) -> None:
+        # One acquire out of the max_size=4 pool the drainer and -ping also draw
+        # from. Described rather than compared to the constants: asserting the SQL
+        # equals the SQL restates the code.
+        archive = self._archive()
+        pool, conn = self._stubbed_pool(self._row())
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.analytics(42, days=30, top_n=5)
+        pool.acquire.assert_called_once()
+        sqls = [c.args[0] for c in conn.fetch.await_args_list]
+        assert len(sqls) == 3
+        assert "GROUP BY requester_id" in sqls[0]
+        assert "GROUP BY uploader" in sqls[1]
+        assert "GROUP BY webpage_url" in sqls[2]
+
+    async def test_the_top_n_queries_reuse_the_windows_own_bounds(self) -> None:
+        """The clock is read once, inside the CTE. If the top-N queries re-read it
+        they can straddle a midnight the buckets did not, so a listener's plays and
+        the chart beside them would cover different windows."""
+        archive = self._archive()
+        row = self._row()
+        pool, conn = self._stubbed_pool(row)
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.analytics(42, days=30, top_n=5)
+        expected = (
+            datetime.fromtimestamp(row["window_start"], tz=timezone.utc),
+            datetime.fromtimestamp(row["window_end"], tz=timezone.utc),
+        )
+        for call in conn.fetch.await_args_list:
+            assert call.args[3:5] == expected
+
+    async def test_an_empty_window_skips_the_top_n_round_trip(self) -> None:
+        """Three index probes that can only return nothing. n_rows is the explicit
+        emptiness signal — never a branch's shape, since every aggregate coalesces
+        to '[]' and an empty series also describes a filter that matched nothing."""
+        archive = self._archive()
+        pool, conn = self._stubbed_pool(self._row(n_rows=0))
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            metrics = await archive.analytics(42, days=30, top_n=5)
+        conn.fetch.assert_not_awaited()
+        assert metrics.is_empty
+        assert metrics.plays == 0
+        # The window still reaches the caller: the empty notice names it.
+        assert metrics.window_end_epoch == 1_787_961_600.0
+        # And the day boundary, which is what cache_ttl_secs derives the TTL from.
+        # Without it every empty guild re-runs the heaviest query in the bot on
+        # every invocation, since a non-positive TTL skips the cache write.
+        assert metrics.today_start_epoch > 0
+
+    async def test_jsonb_branches_decode_from_the_str_asyncpg_returns(self) -> None:
+        archive = self._archive()
+        pool, _ = self._stubbed_pool(
+            self._row(),
+            listeners=[
+                {
+                    "requester_id": 7,
+                    "requester_name": "Ann",
+                    "plays": 2,
+                    "played_secs": 400,
+                }
+            ],
+            artists=[{"uploader": "Lofi Girl", "plays": 1, "played_secs": 200}],
+            songs=[
+                {
+                    "webpage_url": "https://y/1",
+                    "title": "Song",
+                    "query_source": "search",
+                    "plays": 2,
+                    "played_secs": 400,
+                }
+            ],
+        )
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            m = await archive.analytics(42, days=30, top_n=5)
+        assert m.daily == (DailyPoint(day="2026-08-27", plays=3, listen_secs=600),)
+        assert m.heat == (HeatCell(dow=4, hour=22, plays=3),)
+        assert m.completion == (CompletionBucket(source="search", bucket=10, plays=2),)
+        assert m.durations == (DurationBucket(minutes=3, plays=2),)
+        assert m.source_completion == (
+            SourceCompletion(source="search", played_secs=600, duration_secs=700),
+        )
+        assert m.wait_pcts == (1.0, 2.0, 3.5, 9.0, 40.0)
+        assert m.wait_p50_secs == 3.5
+        assert m.livestream_plays == 1
+        assert m.top_listeners[0].requester_name == "Ann"
+        assert m.top_artists[0].uploader == "Lofi Girl"
+        assert m.top_songs[0].title == "Song"
+
+    async def test_a_null_jsonb_branch_does_not_raise(self) -> None:
+        """Every branch is coalesce(..., '[]') in SQL precisely so this cannot
+        happen — jsonb_agg over zero rows returns SQL NULL, which reaches Python as
+        None. Belt and braces, because the failure lands on a brand-new guild's
+        very first -analytics: the one path the empty-window notice exists for."""
+        archive = self._archive()
+        pool, _ = self._stubbed_pool(self._row(daily=None, heat=None, wait_pcts=None))
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            m = await archive.analytics(42, days=30, top_n=5)
+        assert m.daily == ()
+        assert m.heat == ()
+        assert m.wait_pcts == ()
+        assert m.wait_p50_secs == WAIT_UNAVAILABLE
+
+    async def test_an_all_sentinel_guild_reports_wait_unavailable(self) -> None:
+        """Not 0s. Every queued_at in the window was the epoch-0 backfill sentinel,
+        so there is no wait to report — and 0 is a legitimate answer (a song queued
+        into an empty queue), so the two must not collapse."""
+        archive = self._archive()
+        pool, _ = self._stubbed_pool(self._row(wait_pcts="[]"))
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            m = await archive.analytics(42, days=30, top_n=5)
+        assert m.wait_p50_secs == WAIT_UNAVAILABLE
+        assert m.wait_p50_secs < 0
+
+    async def test_coverage_is_clamped_to_what_the_archive_holds(self) -> None:
+        """A 30-day frame that is 93% empty is a worse answer than a 2-day frame
+        that says so — and the title names both, so the requested window stays
+        visible for the FlagConverter trap the naming exists to mitigate."""
+        archive = self._archive()
+        # Two days before the window's end.
+        row = self._row(first_play=1_787_961_600.0 - 2 * 86400)
+        pool, _ = self._stubbed_pool(row)
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            m = await archive.analytics(42, days=30, top_n=5)
+        assert m.archived_days == 2
+        assert m.days == 30
+
+    async def test_coverage_never_exceeds_the_requested_window(self) -> None:
+        archive = self._archive()
+        pool, _ = self._stubbed_pool(self._row(first_play=1.0))
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            m = await archive.analytics(42, days=7, top_n=5)
+        assert m.archived_days == 7
+
+    async def test_analytics_counts_against_the_leaderboard_read_budget(self) -> None:
+        """_read_slots is two against a max_size=4 pool so the drainer and -ping each
+        keep one. Analytics holding a slot of its OWN instead of one of these raises
+        the reader ceiling to three and spends that reserve — insert_batch then waits
+        out _ACQUIRE_TIMEOUT_SECS and backs off against a non-evictable outbox."""
+        archive = self._archive()
+        pool, _ = self._stubbed_pool(self._row())
+        held: list[int] = []
+
+        async def _watch(*_a: object, **_k: object) -> Optional[asyncpg.Record]:
+            held.append(archive._read_slots._value)
+            return _as_record(self._row())
+
+        conn = pool.acquire.return_value.__aenter__.return_value
+        conn.fetchrow = AsyncMock(side_effect=_watch)
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.analytics(42, days=30, top_n=5)
+        assert held == [_READ_CONCURRENCY - 1]
+
+    async def test_the_reader_ceiling_stays_at_the_budget(self) -> None:
+        """The arithmetic the reserve depends on: however the two bounds are
+        composed, no more than _READ_CONCURRENCY readers may hold a connection at
+        once, or the drainer and -ping have nothing left to acquire."""
+        archive = self._archive()
+        pool, _ = self._stubbed_pool(self._row())
+        live = 0
+        peak = 0
+
+        async def _watch(*_a: object, **_k: object) -> Optional[asyncpg.Record]:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0)
+            live -= 1
+            return _as_record(self._row())
+
+        conn = pool.acquire.return_value.__aenter__.return_value
+        conn.fetchrow = AsyncMock(side_effect=_watch)
+        conn.fetch = AsyncMock(return_value=[])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await asyncio.gather(
+                *(archive.analytics(g, days=30, top_n=5) for g in range(6))
+            )
+        assert peak <= _READ_CONCURRENCY
+
+    async def test_one_analytics_read_in_flight_at_a_time(self) -> None:
+        archive = self._archive()
+        live = 0
+        peak = 0
+
+        async def _slow(*_a: object, **_k: object) -> Optional[asyncpg.Record]:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0)
+            live -= 1
+            return _as_record(self._row(n_rows=0))
+
+        pool, conn = self._stubbed_pool(self._row(n_rows=0))
+        conn.fetchrow = AsyncMock(side_effect=_slow)
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await asyncio.gather(
+                *(archive.analytics(g, days=30, top_n=5) for g in range(8))
+            )
+        assert peak == 1
+
+    async def test_a_hung_server_is_bounded_by_the_read_deadline(self) -> None:
+        """The pool sets no socket_timeout, so a server that accepts the connection
+        and then stops answering is otherwise bounded only by command_timeout —
+        longer than the drainer's whole drain deadline."""
+        archive = self._archive()
+
+        async def _hang(*_a: object, **_k: object) -> Optional[asyncpg.Record]:
+            await asyncio.sleep(3600)
+            return None
+
+        pool, conn = self._stubbed_pool(self._row())
+        conn.fetchrow = AsyncMock(side_effect=_hang)
+        with (
+            patch.object(archive, "_ensure", AsyncMock(return_value=pool)),
+            patch("src.history_archive._READ_DEADLINE_SECS", 0.01),
+            pytest.raises(TimeoutError),
+        ):
+            await archive.analytics(42, days=30, top_n=5)
