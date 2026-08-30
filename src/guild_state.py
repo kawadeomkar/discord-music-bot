@@ -1259,3 +1259,192 @@ class GuildRecoveryGate:
         mid-play at crash time. GuildPlaybackSnapshot.has_restorable_playback over
         the queue length."""
         return self.pending_count > 0 or self.state.has_crashed_song
+
+
+# ── -analytics: the render worker's boundary payload ──────────────────────────
+# Unpickling a dataclass imports its defining module, so their home decides what a
+# chart worker drags in — this module is stdlib + orjson.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+#
+# Every field defaults, so an entry written by an older build still decodes through
+# analytics_card.from_cache.
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DailyPoint:
+    """One x-position of the per-day series. `day` is an ISO date (`YYYY-MM-DD`)
+    naming the bucket's first UTC day — at --days 365 the bucket is a week, and
+    the date is its Monday."""
+
+    day: str = ""
+    plays: int = 0
+    listen_secs: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SourceDay:
+    """One segment of a stacked bar: how many plays a query_source contributed to
+    one bucket. Sparse — a source with no plays that day has no row."""
+
+    day: str = ""
+    source: str = ""
+    plays: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HeatCell:
+    """One weekday x hour-of-day cell. `dow` is ISO (1 = Monday), `hour` is 0-23,
+    both in UTC — the frame play_history was written in."""
+
+    dow: int = 0
+    hour: int = 0
+    plays: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompletionBucket:
+    """Plays whose played/duration ratio fell in one tenth, per source. `bucket` is
+    1-10 covering [0,0.1) .. [0.9,1.0]; the SQL folds width_bucket's overflow 11
+    into 10 because a ratio of exactly 1.0 is the modal value."""
+
+    source: str = ""
+    bucket: int = 0
+    plays: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DurationBucket:
+    """Plays by song length in whole minutes, 0-19, with 20 meaning "20 min or
+    longer" — an open top bucket, since an hour-long mix must not stretch the axis
+    over every three-minute song."""
+
+    minutes: int = 0
+    plays: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SourceCompletion:
+    """DURATION-WEIGHTED completion for one source: the sums, not the ratio, so the
+    renderer divides once and the zero case is visible rather than encoded.
+
+    This is a different question from CompletionBucket and the two disagree by
+    design — on the live archive pasted YouTube links play 21% of their seconds but
+    14 of 16 individual plays run to the end, because a handful of abandoned
+    hour-long mixes dominate the weighted number.
+    """
+
+    source: str = ""
+    played_secs: int = 0
+    duration_secs: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TopListener:
+    """One row of the embed's listeners section. Distinct from history_archive's
+    RequesterLeader, which serves -leaderboard: this one may not live in a module
+    the render worker would have to import (see the block comment above)."""
+
+    requester_id: int = 0
+    requester_name: str = ""
+    plays: int = 0
+    played_secs: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TopArtist:
+    uploader: str = ""
+    plays: int = 0
+    played_secs: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TopSong:
+    title: str = ""
+    webpage_url: str = ""
+    query_source: str = ""
+    plays: int = 0
+    played_secs: int = 0
+
+
+# Sentinel for "no usable queue-wait data in this window". Negative because 0 is a
+# legitimate wait — a song queued into an empty queue — and the two must not collapse.
+WAIT_UNAVAILABLE: Final[float] = -1.0
+# The queue-wait percentiles and the median's index within them. The SQL array, the
+# length checks and the figure's labels all read from here.
+WAIT_PERCENTILES: Final[tuple[float, ...]] = (0.1, 0.25, 0.5, 0.75, 0.9)
+WAIT_MEDIAN_INDEX: Final[int] = WAIT_PERCENTILES.index(0.5)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AnalyticsMetrics:
+    """Everything -analytics knows about one guild and one window.
+
+    The whole object crosses to the chart worker, including the three top-N lists
+    it never draws: they are ~2 KB against a ~15 KB payload, and one boundary type
+    is worth more than the split. What the worker may NOT draw is any of their
+    strings — the runtime image has no CJK, Thai or emoji glyphs, so a human-authored
+    name renders as tofu, silently. _ascii_safe() enforces that in analytics_render.
+
+    `days` is the REQUESTED window and archived_days its real coverage; the title
+    names both when they differ, because a 30-day frame that is 93% empty is a worse
+    answer than a 2-day frame that says so.
+    """
+
+    days: int = 0
+    # Both epochs, so the footer and the cache TTL read the same clock the buckets
+    # did. window_end is exclusive and is the day (or, at --days 365, the week)
+    # boundary the window stops at — never "now".
+    window_start_epoch: float = 0.0
+    window_end_epoch: float = 0.0
+    # "day" or "week". At 365 days a daily series would be 365 sub-pixel bars, so
+    # the SQL downsamples; the y-axis label has to move with it.
+    bucket_unit: str = "day"
+    # Today's UTC midnight, from the same clock read as the bounds. The cache expiry
+    # derives from this, so it cannot outlive the day the aggregate covers.
+    today_start_epoch: float = 0.0
+    archived_days: int = 0
+
+    plays: int = 0
+    listen_secs: int = 0
+    unique_songs: int = 0
+    unique_listeners: int = 0
+    unique_artists: int = 0
+    wait_p50_secs: float = WAIT_UNAVAILABLE
+    # Plays with duration_secs <= 0 — livestreams. Counted everywhere else and
+    # excluded from the completion panel alone, which names the number so a guild
+    # with many of them is not silently reading a partial chart.
+    livestream_plays: int = 0
+
+    daily: tuple[DailyPoint, ...] = ()
+    daily_by_source: tuple[SourceDay, ...] = ()
+    heat: tuple[HeatCell, ...] = ()
+    completion: tuple[CompletionBucket, ...] = ()
+    durations: tuple[DurationBucket, ...] = ()
+    source_completion: tuple[SourceCompletion, ...] = ()
+    # p10/p25/p50/p75/p90 of queue wait, seconds. Empty when no row in the window
+    # had a non-sentinel queued_at.
+    wait_pcts: tuple[float, ...] = ()
+
+    top_listeners: tuple[TopListener, ...] = ()
+    top_artists: tuple[TopArtist, ...] = ()
+    top_songs: tuple[TopSong, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether the window holds nothing. Reads the explicit play count, never a
+        branch's shape: every aggregate coalesces to `[]`, so an empty daily series
+        also describes a guild whose rows all failed one branch's filter."""
+        return self.plays == 0
+
+    @property
+    def period_label(self) -> str:
+        """The window as a period, in the unit it is actually bucketed by.
+
+        365 mod 7 is 1, so `date_trunc('week', end - 365 days)` snaps back six days
+        and the weekly window covers 53 whole weeks — 371 days. Calling that "last
+        365 days" names six fewer days than the chart draws. Lives here because the
+        card and the figure must agree and the figure cannot import the card."""
+        if self.bucket_unit == "week":
+            weeks = -(-self.days // 7)
+            return f"last {weeks} week{'s' if weeks != 1 else ''}"
+        return f"last {self.days} day{'s' if self.days != 1 else ''}"
