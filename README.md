@@ -71,6 +71,7 @@ details, aliases, and examples.
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
 | `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
 | `-leaderboard [--days N]` | `lb`, `top` | Top 10 listeners and top 10 songs by listening time, each song labelled with how it was asked for (Spotify, search, a pasted host) — needs the [play-history archive](#operating-the-play-history-archive) |
+| `-analytics [--days N]` | `an` | A six-panel chart of this server's listening — plays per day by source, when it listens, listening time, how much of each song gets played, song lengths and queue wait — plus top listeners, artists and songs. `--days` is one of 7, 30, 90, 365; the window covers COMPLETE UTC days, so today is not included — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
 | `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
@@ -185,7 +186,7 @@ runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
 2. Under **Bot**, enable the **Message Content Intent** and **Server Members Intent**
 3. Under **OAuth2 → URL Generator**, select the `bot` scope with these permissions:
    - **Voice**: Connect, Speak
-   - **Text**: Send Messages, Embed Links, Add Reactions, Read Message History
+   - **Text**: Send Messages, Embed Links, Attach Files, Add Reactions, Read Message History
 4. Invite the bot to your server with the generated URL
 
 ### 2. Install and configure
@@ -475,6 +476,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `PROMETHEUS_HOST_PORT` | | `9090` | Host port the metrics stack's Prometheus publishes on (loopback only). Read by Compose, never by the bot; `DEBUG_PROMETHEUS_URL`'s default follows it. Change it when something on this machine already owns 9090 — a collision fails the whole `docker compose up`, not just the metrics row |
 | `DEBUG_TICK_SECS` | | `1.0` | `-debug` snapshot: a ceiling on how long the card can be stale, not a polling interval — the loop wakes as soon as a block is ready |
 | `DEBUG_DEADLINE_SECS` | | `8.0` | `-debug` snapshot: how long a block may collect before it renders `timed out`. Longer than `-ping`'s because each block does strictly more work (a Postgres stats query, a Prometheus round trip) and a straggler is not retried |
+| `ANALYTICS_RENDER_DEADLINE_SECS` | | `20.0` | `-analytics`: how long to wait for the chart before sending the card without one. Sized for the COLD path, which dominates. Expiry is **silent** — the card still sends, just without its chart — so raise this rather than lower it if charts go missing |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
