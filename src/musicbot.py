@@ -1,4 +1,5 @@
 import asyncio
+import io
 import contextlib
 import time
 from dataclasses import dataclass, replace
@@ -18,6 +19,7 @@ from discord.ext import commands
 import redis.asyncio as aioredis
 
 from src.config import (
+    ANALYTICS_RENDER_DEADLINE_SECS,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
     debug_prometheus_url,
@@ -25,16 +27,20 @@ from src.config import (
     spotify_enabled,
     using_default_postgres_password,
 )
+from src import analytics_render, chart_pool as chart_pool_mod
 from src import debug as debug_mode
-from src import leaderboard
+from src import analytics_card, leaderboard
 from src.guild_history import history_embeds
-from src.guild_state import Analytics
+from src.guild_state import Analytics, AnalyticsMetrics
+from src.analytics_card import AnalyticsFlags
 from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
 )
 from src.musicplayer import MusicPlayer
 from src.redis_client import (
+    analytics_png_get,
+    analytics_png_set,
     HISTORY_CACHE_LIMIT,
     GuildRedisStore,
     cache_get,
@@ -198,6 +204,15 @@ _ECHO_ROW_MAX = 70
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
 _MAX_SHOWN_POSITIONS = 60
+
+
+def _refund_cooldown(ctx: commands.Context) -> None:
+    """Hand back the cooldown discord.py charged in prepare().
+
+    `Context.command` is Optional, but inside a command's own body it never is —
+    the guard is for the type checker, not for a case that happens."""
+    if ctx.command is not None:
+        ctx.command.reset_cooldown(ctx)
 
 
 def _echo(text: str, limit: int = _ECHO_MAX) -> str:
@@ -701,6 +716,15 @@ class MusicBot(commands.Cog):
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
             )
+        elif isinstance(error, commands.CommandOnCooldown):
+            # Raised in prepare(), before the body. The retry seconds are named so
+            # the refusal reads as a limit rather than a fault.
+            await ctx.send(
+                embed=notice_embed(
+                    f"That was just run here — try again in {error.retry_after:.0f}s.",
+                    discord.Color.orange(),
+                )
+            )
         elif isinstance(error, commands.MaxConcurrencyReached):
             # Raised in prepare(), before the body, so the command's own try/except
             # never sees it (e.g. a second -ping while one is live). Worded off the
@@ -723,6 +747,148 @@ class MusicBot(commands.Cog):
         if msg:
             await ctx.send(embed=notice_embed(msg, discord.Color.red()))
             raise commands.CommandError(msg)
+
+    async def _render_analytics_chart(
+        self, ctx: commands.Context, metrics: AnalyticsMetrics
+    ) -> Optional[bytes]:
+        """The chart, or None to send the card without one.
+
+        Every failure here degrades to the embed-only card rather than to an error:
+        the numbers are already in hand, and a chart that could not be drawn must not
+        take them with it. The catch below is deliberately broad for that reason.
+        """
+        guild = ctx.guild
+        if guild is None or not chart_pool_mod.chart_available():
+            # matplotlib is a plain main dependency, so this is a hand-built
+            # environment. One line, and no worker is spawned to discover it.
+            if guild is not None:
+                log.warning(
+                    "matplotlib is not installed — sending -analytics without its chart"
+                )
+            return None
+        me = guild.me
+        perms = ctx.channel.permissions_for(me) if me is not None else None
+        if perms is not None and not perms.attach_files:
+            # This is the bot's FIRST file upload, and many existing installs' grants
+            # predate it. Preflighted rather than discovered at send time, so the
+            # render is not paid for a message Discord will refuse.
+            log.info("missing Attach Files — sending -analytics without its chart")
+            return None
+        # Keyed to a digest of the aggregate it was rendered from, so a stale PNG
+        # MISSES rather than pairing a chart from one hour with numbers recomputed
+        # in another — with nothing on the card to say the two disagree.
+        key = analytics_card.png_cache_key(
+            guild.id, metrics.days, analytics_card.aggregate_digest(metrics)
+        )
+        cached = await analytics_png_get(self.redis, key)
+        # Its own span: this is the command's most expensive step, and png.cached
+        # separates a cache hit from a render at a glance.
+        with _tracer.start_as_current_span("analytics.render") as span:
+            span.set_attribute("png.cached", cached is not None)
+            if cached is not None:
+                span.set_attribute("png.bytes", len(cached))
+                return cached
+            render = asyncio.ensure_future(
+                chart_pool_mod.chart_pool.run(
+                    analytics_render.render_dashboard, metrics
+                )
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {render}, timeout=ANALYTICS_RENDER_DEADLINE_SECS
+                )
+                if not done:
+                    # A ProcessPoolExecutor cannot cancel a running call, so the
+                    # worker finishes regardless — it finishes into the cache.
+                    # See docs/ARCHITECTURE.md#analytics-rendering.
+                    span.set_attribute("png.timed_out", True)
+                    spawn_background(
+                        self._cache_late_render(key, render, metrics),
+                        self._restore_tasks,
+                    )
+                    return None
+                png = render.result()
+                span.set_attribute("png.bytes", len(png))
+                await analytics_png_set(
+                    self.redis, key, png, analytics_card.cache_ttl_secs(metrics)
+                )
+                return png
+            except Exception as e:
+                # Exception, because the docstring's promise is every failure:
+                # _picklable_call re-raises whatever pickles, so worker exceptions
+                # arrive as themselves. CancelledError is a BaseException and still
+                # propagates. The message is fixed — matplotlib's name filesystem
+                # paths.
+                span.record_exception(e)
+                log.warning(f"analytics chart render failed: {type(e).__name__}: {e}")
+                return None
+
+    async def _cache_late_render(
+        self,
+        key: str,
+        render: "asyncio.Future[bytes]",
+        metrics: AnalyticsMetrics,
+    ) -> None:
+        """Store a chart whose caller already gave up on it.
+
+        The TTL is recomputed here rather than captured: a render that overran the
+        deadline may have crossed midnight, and cache_ttl_secs returns non-positive
+        for exactly that, which skips the write."""
+        try:
+            png = await render
+        except Exception as e:
+            log.warning(f"late analytics render failed: {type(e).__name__}: {e}")
+            return
+        ttl = analytics_card.cache_ttl_secs(metrics)
+        if ttl > 0:
+            await analytics_png_set(self.redis, key, png, ttl)
+
+    async def _send_analytics_card(
+        self,
+        ctx: commands.Context,
+        metrics: AnalyticsMetrics,
+        png: Optional[bytes],
+        guild: Optional[discord.Guild],
+    ) -> None:
+        """One message through ctx.send, so the Now Playing block rides along and the
+        card may adopt the NP host — this command sends once and never edits, unlike
+        -ping and -debug.
+
+        A Discord refusal of the upload retries without it: a permission can change
+        between the preflight and the send.
+
+        A missing chart says so on the card only when the reason is actionable. The
+        permission is re-read here — permissions_for is local — which keeps
+        _render_analytics_chart's contract at "bytes or no bytes"."""
+        note = None
+        if png is None and guild is not None:
+            me = guild.me
+            perms = ctx.channel.permissions_for(me) if me is not None else None
+            if perms is not None and not perms.attach_files:
+                note = "Chart omitted — the bot needs Attach Files in this channel."
+        if png is not None:
+            try:
+                await ctx.send(
+                    embed=analytics_card.build_embed(
+                        metrics,
+                        guild=guild,
+                        image_filename=analytics_card.IMAGE_FILENAME,
+                    ),
+                    file=discord.File(
+                        io.BytesIO(png), filename=analytics_card.IMAGE_FILENAME
+                    ),
+                )
+                return
+            except discord.HTTPException as e:
+                # Refusals only: 403 for permission, 400/413 for the file. A 5xx can
+                # be raised after Discord created the message, so retrying it would
+                # post the card twice.
+                if not isinstance(e, discord.Forbidden) and e.status not in (400, 413):
+                    raise
+                log.warning(f"analytics chart upload refused: {e}")
+        await ctx.send(
+            embed=analytics_card.build_embed(metrics, guild=guild, chart_note=note)
+        )
 
     async def _command_error(
         self,
@@ -2137,6 +2303,121 @@ class MusicBot(commands.Cog):
                 e,
                 title="Leaderboard unavailable",
                 detail="The long-term archive could not be reached. Try again in a moment.",
+            )
+
+    @commands.command(
+        name="analytics",
+        aliases=["an"],
+        brief="charts and totals for this server (long-term archive)",
+        usage="[--days N]",
+        help=(
+            "Shows a chart of this server's listening — plays per day by source, "
+            "when the server listens, listening time, how much of each song gets "
+            "played, song lengths and queue wait — with the top listeners, artists "
+            "and songs beside it.\n\n"
+            "`--days N` picks the window: 7, 30, 90 or 365. It covers COMPLETE "
+            "days, so today is not included — `-history` shows what just played. "
+            "The numbers come from this server's long-term play archive."
+        ),
+        extras={
+            "category": "Queue",
+            # Read by cog_before_invoke to skip get_mp(): this command reads the
+            # archive and never touches voice, so manufacturing a player for it
+            # starts _restore_state() and a 300s gate on a guild doing nothing.
+            "observation_only": True,
+            "examples": ["-analytics", "-an", "-analytics --days 90"],
+            "note": (
+                "Available only when this server's host has enabled the "
+                "optional long-term archive. Times are UTC."
+            ),
+        },
+    )
+    # No validate_commands: reading a chart needs no voice channel. Two bounds on
+    # different axes — max_concurrency bounds how many run at once, the cooldown how
+    # often. See docs/ARCHITECTURE.md#analytics-rendering.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @commands.cooldown(1, 30.0, commands.BucketType.guild)
+    @_tracer.start_as_current_span("bot.analytics")
+    async def analytics(self, ctx: commands.Context, *, flags: AnalyticsFlags) -> None:
+        try:
+            # Locals: ctx.guild is a property and history_archive an attribute, so
+            # narrowing on either would not survive the awaits below.
+            guild = ctx.guild
+            archive = self.history_archive
+            # The cooldown is charged in prepare(), before the body, and protects
+            # Postgres. The three refusals below never reach it, so each refunds.
+            if guild is None:
+                _refund_cooldown(ctx)
+                await ctx.send(
+                    embed=notice_embed(
+                        "Analytics are per server — use this in a server channel.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            if archive is None:
+                _refund_cooldown(ctx)
+                await ctx.send(
+                    embed=notice_embed(
+                        "This server's host has not enabled the long-term play "
+                        "archive, so there is nothing to chart.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            days = analytics_card.resolve_days(flags.days)
+            if days is None:
+                # Before the cache and before the archive: an unlisted window must
+                # not reach Postgres and must not take a read slot, which is the
+                # whole point of the allowlist.
+                _refund_cooldown(ctx)
+                await ctx.send(
+                    embed=notice_embed(
+                        analytics_card.invalid_days_notice(), discord.Color.red()
+                    )
+                )
+                return
+            key = analytics_card.cache_key(guild.id, days)
+            # Typing spans the query and the render: an aggregate hit with a PNG
+            # miss still waits on the worker.
+            async with background_typing(ctx):
+                metrics = analytics_card.from_cache(await cache_get(self.redis, key))
+                if metrics is None:
+                    with _tracer.start_as_current_span("analytics.query") as span:
+                        span.set_attribute("analytics.days", days)
+                        metrics = await archive.analytics(
+                            guild.id, days=days, top_n=analytics_card.TOP_N
+                        )
+                        span.set_attribute("analytics.plays", metrics.plays)
+                    ttl = analytics_card.cache_ttl_secs(metrics)
+                    if ttl > 0:
+                        # Non-positive means the day turned while the query ran, so
+                        # the aggregate does not cover the day it would be served for.
+                        await cache_set(
+                            self.redis, key, analytics_card.to_cache(metrics), ttl
+                        )
+                if metrics.is_empty:
+                    await ctx.send(
+                        embed=notice_embed(
+                            analytics_card.empty_notice(days, metrics.bucket_unit),
+                            discord.Color.orange(),
+                        )
+                    )
+                    return
+                # Rendered after the archive call returns: the semaphore and the
+                # connection are released by then.
+                png = await self._render_analytics_chart(ctx, metrics)
+            await self._send_analytics_card(ctx, metrics, png, guild)
+        except Exception as e:
+            # Fixed copy, as -leaderboard does: the default detail would publish the
+            # archive's host and port. The trace footer still joins the span.
+            await self._command_error(
+                ctx,
+                e,
+                title="Analytics unavailable",
+                detail=(
+                    "The long-term archive could not be reached. Try again in a moment."
+                ),
             )
 
     @commands.command(

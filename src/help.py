@@ -28,6 +28,7 @@ CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
         "now",
         "history",
         "leaderboard",
+        "analytics",
         "shuffle",
         "remove",
         "clear",
