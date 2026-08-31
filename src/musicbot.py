@@ -31,6 +31,7 @@ from src.commands import history as history_cmd
 from src.commands import jump as jump_cmd
 from src.commands import leaderboard as leaderboard_cmd
 from src.commands import now as now_cmd
+from src.commands import pause as pause_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import shuffle as shuffle_cmd
@@ -1454,14 +1455,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.pause")
     async def pause(self, ctx: commands.Context) -> None:
         try:
-            vc = ctx.voice_client
-            if isinstance(vc, discord.VoiceClient) and vc.is_playing():
-                mp = self.get_mp(ctx)
-                await mp.pause(vc)
-                await ctx.message.add_reaction("⏸️")
-                embed = mp.build_pause_confirmation_embed()
-                if embed is not None:
-                    await ctx.send(embed=embed)
+            await pause_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
