@@ -35,6 +35,7 @@ from src.commands import pause as pause_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import shuffle as shuffle_cmd
+from src.commands import skip as skip_cmd
 from src.commands import volume as volume_cmd
 from src.musicplayer import RESTORE_WAIT_SECS
 from src.util import ECHO_ROW_MAX
@@ -86,7 +87,6 @@ from src.telemetry import get_tracer
 from src.util import (
     background_typing,
     cancel_task,
-    fmt_duration,
     notice_embed,
     pluralize,
     queue_message,
@@ -1359,54 +1359,10 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.skip")
     async def skip(self, ctx: commands.Context) -> None:
         try:
-            vc = ctx.voice_client
-            if not isinstance(vc, discord.VoiceClient):
-                return
-            # is_playing() is False while paused, so gating on it alone made -skip
-            # a total no-op on a paused song — not even the reaction.
-            if not (vc.is_playing() or vc.is_paused()):
-                return
-
-            # Capture before stop(): the loop's song-end bookkeeping clears
-            # current_song, and the notice must name the song actually skipped.
-            # Primitives, not the object — the player thread calls cleanup() on it.
-            skipped_title: Optional[str] = None
-            skipped_position = ""
-            assert ctx.guild is not None  # validate_commands rejects DMs before this
-            # mps, not get_mp(): this must not build a player, and one lookup keeps
-            # the mark and the paused read on the same object — cog_before_invoke can
-            # rebuild a player mid-command.
-            mp_for_stop = self.mps.get(ctx.guild.id)
-            if vc.is_paused() and mp_for_stop is not None:
-                song = mp_for_stop.current_song
-                if song is not None:
-                    skipped_title = song.title
-                    # position_secs is frozen while paused: the exact leave point.
-                    skipped_position = fmt_duration(int(song.position_secs))
-
-            # Before vc.stop(): a skip inside ffmpeg's startup window otherwise looks
-            # exactly like a stream that never opened.
-            if mp_for_stop is not None:
-                mp_for_stop.note_deliberate_stop()
-            vc.stop()
-
-            coros: list[Coroutine[Any, Any, Any]] = []
-            if not ctx.invoked_parents:
-                coros.append(ctx.message.add_reaction("⏭"))
-            if skipped_title is not None:
-                # A paused song makes no sound, so stopping it gives no audible
-                # cue — unlike an ordinary skip, where the music changing is it.
-                coros.append(
-                    ctx.send(
-                        embed=notice_embed(
-                            f"⏭ Skipped **{skipped_title}** — was paused at "
-                            f"`{skipped_position}`.",
-                            discord.Color.blue(),
-                        )
-                    )
-                )
-            if coros:
-                await asyncio.gather(*coros)
+            # validate_commands rejects DMs, so a guild is guaranteed. mps, not
+            # get_mp: -skip must not build a player.
+            assert ctx.guild is not None
+            await skip_cmd.run(ctx, mp=self.mps.get(ctx.guild.id))
         except Exception as e:
             await self._command_error(ctx, e)
 
