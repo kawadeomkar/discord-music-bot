@@ -28,6 +28,7 @@ from src.config import (
 from src import debug as debug_mode
 from src.commands import clear as clear_cmd
 from src.commands import leaderboard as leaderboard_cmd
+from src.commands import now as now_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import shuffle as shuffle_cmd
@@ -559,7 +560,9 @@ class MusicBot(commands.Cog):
             if ctx.command is not None and ctx.command.extras.get("observation_only"):
                 return
             old_channel = (
-                self.mps[ctx.guild.id]._channel if ctx.guild.id in self.mps else None
+                self.mps[ctx.guild.id].home_channel
+                if ctx.guild.id in self.mps
+                else None
             )
             mp = self.get_mp(ctx)
             if (
@@ -1760,37 +1763,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.now")
     async def now(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            vc = ctx.guild.voice_client if ctx.guild else None
-            song = mp.current_song
-            if (
-                vc is not None
-                and isinstance(vc, discord.VoiceClient)
-                and (vc.is_playing() or vc.is_paused())
-                and song is not None
-            ):
-                if ctx.channel.id != mp._channel.id:
-                    # Outside the player's home channel: the host never leaves
-                    # home, so answer HERE with a static snapshot (MusicContext's
-                    # channel guard keeps it unattached).
-                    await ctx.send(embed=mp._build_now_playing_embed(song))
-                    return
-                # Re-host the live block at the bottom (retiring the old host)
-                # rather than sending a snapshot that immediately goes stale.
-                if await mp.repin_now_playing():
-                    return
-                # Song ended between the liveness check and the repin — fall
-                # through to the static/none responses instead of silence.
-            if mp.play_message is not None:
-                # Crash-recovery window: current_song isn't live yet but a snapshot
-                # survived the restart. Static embed (no bar) until loop() starts.
-                await ctx.send(embed=mp.play_message)
-            else:
-                await ctx.send(
-                    embed=notice_embed(
-                        "No songs are currently playing.", discord.Color.orange()
-                    )
-                )
+            await now_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
