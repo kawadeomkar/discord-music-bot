@@ -80,7 +80,6 @@ from src.util import (
     notice_embed,
     pluralize,
     queue_message,
-    refund_cooldown,
     safe_label,
     record_span_error,
     send_embed,
@@ -2185,76 +2184,13 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.analytics")
     async def analytics(self, ctx: commands.Context, *, flags: AnalyticsFlags) -> None:
         try:
-            # Locals: ctx.guild is a property and history_archive an attribute, so
-            # narrowing on either would not survive the awaits below.
-            guild = ctx.guild
-            archive = self.history_archive
-            # The cooldown is charged in prepare(), before the body, and protects
-            # Postgres. The three refusals below never reach it, so each refunds.
-            if guild is None:
-                refund_cooldown(ctx)
-                await ctx.send(
-                    embed=notice_embed(
-                        "Analytics are per server — use this in a server channel.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            if archive is None:
-                refund_cooldown(ctx)
-                await ctx.send(
-                    embed=notice_embed(
-                        "This server's host has not enabled the long-term play "
-                        "archive, so there is nothing to chart.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            days = analytics_card.resolve_days(flags.days)
-            if days is None:
-                # Before the cache and before the archive: an unlisted window must
-                # not reach Postgres and must not take a read slot, which is the
-                # whole point of the allowlist.
-                refund_cooldown(ctx)
-                await ctx.send(
-                    embed=notice_embed(
-                        analytics_card.invalid_days_notice(), discord.Color.red()
-                    )
-                )
-                return
-            key = analytics_card.cache_key(guild.id, days)
-            # Typing spans the query and the render: an aggregate hit with a PNG
-            # miss still waits on the worker.
-            async with background_typing(ctx):
-                metrics = analytics_card.from_cache(await cache_get(self.redis, key))
-                if metrics is None:
-                    with _tracer.start_as_current_span("analytics.query") as span:
-                        span.set_attribute("analytics.days", days)
-                        metrics = await archive.analytics(
-                            guild.id, days=days, top_n=analytics_card.TOP_N
-                        )
-                        span.set_attribute("analytics.plays", metrics.plays)
-                    ttl = analytics_card.cache_ttl_secs(metrics)
-                    if ttl > 0:
-                        # Non-positive means the day turned while the query ran, so
-                        # the aggregate does not cover the day it would be served for.
-                        await cache_set(
-                            self.redis, key, analytics_card.to_cache(metrics), ttl
-                        )
-                if metrics.is_empty:
-                    await ctx.send(
-                        embed=notice_embed(
-                            analytics_card.empty_notice(days, metrics.bucket_unit),
-                            discord.Color.orange(),
-                        )
-                    )
-                    return
-                # Rendered after the archive call returns: the semaphore and the
-                # connection are released by then.
-                png = await analytics_card.render_chart(
-                    ctx, metrics, redis=self.redis, tasks=self._restore_tasks
-                )
-            await analytics_card.send_card(ctx, metrics, png, guild)
+            await analytics_card.run(
+                ctx,
+                flags,
+                archive=self.history_archive,
+                redis=self.redis,
+                tasks=self._restore_tasks,
+            )
         except Exception as e:
             # Fixed copy, as -leaderboard does: the default detail would publish the
             # archive's host and port. The trace footer still joins the span.

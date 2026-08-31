@@ -568,7 +568,7 @@ class TestAnalyticsCommand:
         archive = _fake_archive(_metrics())
         music_bot.history_archive = archive
         cached = analytics_card.to_cache(_metrics(plays=999))
-        with patch("src.musicbot.cache_get", AsyncMock(return_value=cached)):
+        with patch("src.analytics_card.cache_get", AsyncMock(return_value=cached)):
             await command_callback(MusicBot.analytics)(
                 music_bot, mock_ctx, flags=_flags()
             )
@@ -583,8 +583,8 @@ class TestAnalyticsCommand:
         )
         setter = AsyncMock()
         with (
-            patch("src.musicbot.cache_get", AsyncMock(return_value=None)),
-            patch("src.musicbot.cache_set", setter),
+            patch("src.analytics_card.cache_get", AsyncMock(return_value=None)),
+            patch("src.analytics_card.cache_set", setter),
         ):
             await command_callback(MusicBot.analytics)(
                 music_bot, mock_ctx, flags=_flags()
@@ -602,8 +602,8 @@ class TestAnalyticsCommand:
         )
         setter = AsyncMock()
         with (
-            patch("src.musicbot.cache_get", AsyncMock(return_value=None)),
-            patch("src.musicbot.cache_set", setter),
+            patch("src.analytics_card.cache_get", AsyncMock(return_value=None)),
+            patch("src.analytics_card.cache_set", setter),
         ):
             await command_callback(MusicBot.analytics)(
                 music_bot, mock_ctx, flags=_flags()
@@ -1045,7 +1045,7 @@ class TestPngCache:
 
         music_bot.history_archive = _fake_archive(_metrics())
         with (
-            patch("src.musicbot.background_typing", _typing),
+            patch("src.analytics_card.background_typing", _typing),
             patch("src.chart_pool.chart_pool.run", _render),
         ):
             await command_callback(MusicBot.analytics)(
