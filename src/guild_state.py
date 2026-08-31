@@ -1097,9 +1097,10 @@ class HistoryEntry:
         heard across every earlier fragment. Capped at duration like from_song's.
 
         The host ids come off the tail's np_* fields, which name the card its
-        interrupted fragment left frozen. Still resolvable here: the cleanup that
-        deletes that card fires only when a tail STARTS, and a flushed tail never
-        does. 0/0 when the tail was never stamped.
+        interrupted fragment left frozen. Provenance, not a live link: every exit
+        that flushes a tail also disposes of that card, so the ids name a message
+        that is being deleted alongside this record. 0/0 when the tail was never
+        stamped.
         """
         played = item.ts or 0
         duration = item.duration or 0

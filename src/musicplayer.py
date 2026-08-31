@@ -1212,18 +1212,24 @@ class MusicPlayer:
     async def _retire_failed_dequeue(
         self, item: Optional[QueueItem], *, context: str
     ) -> None:
-        """Retire a dequeue that will never play, and record it if a listener
-        already heard part of it.
+        """Retire a dequeue that will never play — the third queue exit, alongside
+        -clear and -remove, and owed the same pair as either.
 
         For an ordinary song the flush is a no-op — nobody heard it. For a -playnow
         resume TAIL it is the difference between one record and none: the
         interrupted fragment declined to record itself (_skip_history_for), so the
         tail is the only writer left for a play that may have run for minutes. A
         tail behind a deep stack waits minutes while ytdl:stream:* caps at 30, so
-        every level of a stack is an independent chance to lose one."""
+        every level of a stack is an independent chance to lose one.
+
+        The disposal is owed for the same reason: a tail holds the ONLY pointer to
+        the card its fragment left frozen, and disposal normally fires when the
+        tail STARTS, so a tail that never starts strands that card exactly as
+        -clear would."""
         await self.queue.finish_failed_dequeue(item, context=context)
         if item is not None:
             await self._flush_played([item])
+            await self._dispose_orphaned_cards([item])
 
     async def queue_clear(self) -> list[str]:
         await self._cancel_prefetch()  # before the drain — see _cancel_prefetch
