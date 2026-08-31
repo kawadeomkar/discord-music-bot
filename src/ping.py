@@ -160,7 +160,7 @@ async def probe_spotify(
     spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
 ) -> ProbeResult:
     """Spotify's row: the *source's* usability, not just reachability. `status` (from
-    MusicBot._spotify_status' startup probe) separates "configured but rejected" from
+    MusicBot.spotify_status' startup probe) separates "configured but rejected" from
     "reachable but slow" without spending a doomed API call; it defaults to enabled so a
     caller with no status still gets the plain reachability probe.
     """

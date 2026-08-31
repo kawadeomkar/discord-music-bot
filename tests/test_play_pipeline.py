@@ -843,7 +843,7 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot
     ) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         with pytest.raises(SpotifyDisabledError) as exc:
             music_bot._require_spotify()
         assert exc.value.status is SpotifyStatus.DISABLED
@@ -853,7 +853,7 @@ class TestSpotifyDisabled:
     ) -> None:
         """Credentials were present (client built) but rejected at startup: the
         gate still refuses, and the error reports invalid rather than disabled."""
-        music_bot._spotify_status = SpotifyStatus.INVALID
+        music_bot.spotify_status = SpotifyStatus.INVALID
         with pytest.raises(SpotifyDisabledError) as exc:
             music_bot._require_spotify()
         assert exc.value.status is SpotifyStatus.INVALID
@@ -862,7 +862,7 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         with pytest.raises(SpotifyDisabledError):
             await play_pipeline.queue_source(
@@ -873,7 +873,7 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
             await play_pipeline.queue_source(
@@ -885,7 +885,7 @@ class TestSpotifyDisabled:
     ) -> None:
         """Even with a live client object, an invalid status short-circuits the
         source before any Spotify API call is attempted."""
-        music_bot._spotify_status = SpotifyStatus.INVALID
+        music_bot.spotify_status = SpotifyStatus.INVALID
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
             await play_pipeline.queue_source(
@@ -897,7 +897,7 @@ class TestSpotifyDisabled:
     ) -> None:
         """A YouTube link still resolves normally with Spotify turned off."""
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         source = YTSource(url="https://yt.com/watch?v=abc", process=False)
         fake_qobj = QueueObject(
             "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author

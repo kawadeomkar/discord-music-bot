@@ -28,6 +28,7 @@ from src.commands import jump as jump_cmd
 from src.commands import leaderboard as leaderboard_cmd
 from src.commands import now as now_cmd
 from src.commands import pause as pause_cmd
+from src.commands import ping as ping_cmd
 from src.commands import play as play_cmd
 from src.commands import playnow as playnow_cmd
 from src.commands import queue as queue_cmd
@@ -64,7 +65,6 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.ping import run_health_dashboard
 from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
@@ -174,7 +174,7 @@ class MusicBot(commands.Cog):
         # then probes the live API and downgrades to invalid if they don't
         # authenticate. The optimistic start is safe because cog_load runs inside
         # setup_hook, before the gateway connects — no command can arrive first.
-        self._spotify_status: SpotifyStatus = (
+        self.spotify_status: SpotifyStatus = (
             SpotifyStatus.ENABLED
             if self.spotify is not None
             else SpotifyStatus.DISABLED
@@ -194,7 +194,7 @@ class MusicBot(commands.Cog):
         """Kick off Spotify credential validation without blocking startup.
         discord.py awaits this inside setup_hook, before the bot connects, so
         anything awaited here delays it. The probe is a live network call, spawned
-        fire-and-forget; _spotify_status stays optimistically enabled meanwhile."""
+        fire-and-forget; spotify_status stays optimistically enabled meanwhile."""
         # At load, not only on toggles — RuntimeSampler.apply's docstring has the
         # reason. The hydration re-syncs it once the stored choices land.
         self.debug_settings.sync_sampler()
@@ -249,10 +249,10 @@ class MusicBot(commands.Cog):
             await asyncio.wait_for(
                 spotify.validate(SPOTIFY_TEST_TRACK_ID), timeout=10.0
             )
-            self._spotify_status = SpotifyStatus.ENABLED
+            self.spotify_status = SpotifyStatus.ENABLED
             log.info("Spotify credentials validated — Spotify source enabled")
         except SpotifyAuthError as e:
-            self._spotify_status = SpotifyStatus.INVALID
+            self.spotify_status = SpotifyStatus.INVALID
             log.error(
                 f"Spotify rejected the configured credentials ({e}); Spotify links "
                 "will be declined. Check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET."
@@ -269,8 +269,8 @@ class MusicBot(commands.Cog):
         its credentials failed startup validation. Call at every Spotify dispatch:
         it narrows the Optional away AND produces the user-facing error, whose text
         depends on why Spotify is unavailable."""
-        if self.spotify is None or self._spotify_status is not SpotifyStatus.ENABLED:
-            raise SpotifyDisabledError(self._spotify_status)
+        if self.spotify is None or self.spotify_status is not SpotifyStatus.ENABLED:
+            raise SpotifyDisabledError(self.spotify_status)
         return self.spotify
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
@@ -1083,18 +1083,7 @@ class MusicBot(commands.Cog):
         live in src/ping.py; this is only the command surface. Reached only by a
         top-level -ping — the internal join/play path uses send_latency_line."""
         try:
-            await run_health_dashboard(
-                ctx,
-                bot_latency=self.bot.latency,
-                redis=self.redis,
-                spotify=self.spotify,
-                # The startup validation outcome, not just "is a client
-                # configured": lets the Spotify row say *why* the source is
-                # unusable without spending a doomed API call (see probe_spotify).
-                spotify_status=self._spotify_status,
-                archive=self.history_archive,
-                debug_suffix=self.debug_suffix(ctx),
-            )
+            await ping_cmd.run(ctx, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
 
