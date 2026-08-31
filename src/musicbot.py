@@ -20,6 +20,7 @@ from src.config import (
     spotify_enabled,
 )
 from src import debug as debug_mode
+from src.commands import analytics as analytics_cmd
 from src.commands import clear as clear_cmd
 from src.commands import debug as debug_cmd
 from src.commands import history as history_cmd
@@ -44,8 +45,7 @@ from src.commands.history import (
     HistoryFlags,
 )
 from src.play_pipeline import PlaylistInputError
-from src import analytics_card
-from src.analytics_card import AnalyticsFlags
+from src.commands.analytics import AnalyticsFlags
 from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -983,7 +983,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.analytics")
     async def analytics(self, ctx: commands.Context, *, flags: AnalyticsFlags) -> None:
         try:
-            await analytics_card.run(
+            await analytics_cmd.run(
                 ctx,
                 flags,
                 archive=self.history_archive,

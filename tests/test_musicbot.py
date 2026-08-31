@@ -130,7 +130,7 @@ class TestCheckVoicePermissions:
         assert _check_voice_permissions(member, None, "skip") is None
 
 
-# ── New coverage: __init__, get_mp, cleanup, validate_commands, commands, on_ready ──
+# ── __init__, get_mp, cleanup, validate_commands, on_ready ──
 
 
 class TestMusicBotInit:
