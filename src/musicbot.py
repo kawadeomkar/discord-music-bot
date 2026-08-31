@@ -34,6 +34,7 @@ from src.commands import now as now_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import shuffle as shuffle_cmd
+from src.commands import volume as volume_cmd
 from src.musicplayer import RESTORE_WAIT_SECS
 from src.util import ECHO_ROW_MAX
 from src.commands.history import (
@@ -1960,44 +1961,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.volume")
     async def volume(self, ctx: commands.Context, volume: str) -> None:
         try:
-            try:
-                volume_pct = int(volume)
-            except ValueError:
-                await ctx.send(
-                    embed=notice_embed(
-                        "Volume must be a number between 0 and 100",
-                        discord.Color.red(),
-                    )
-                )
-                return
-            if not 0 <= volume_pct <= 100:
-                await ctx.send(
-                    embed=notice_embed(
-                        "Volume must be between 0 and 100", discord.Color.red()
-                    )
-                )
-                return
-            mp = self.get_mp(ctx)
-            mp.volume = volume_pct / 100
-            persisted = False
-            if mp.store is not None:
-                persisted = await mp.store.set_volume(mp.volume)
-            # Same rule as the debug toggle: the help promises this survives a
-            # restart, so a write that did not land is named rather than rounded
-            # up to success — a level that quietly reverts reads as being ignored.
-            durability = (
-                "It is saved for this server."
-                if persisted
-                else "⚠️ It could not be saved (Redis is unavailable), so it "
-                "applies until the bot restarts."
-            )
-            await ctx.send(
-                embed=notice_embed(
-                    f"Set volume to {volume_pct}% (takes effect on next song). "
-                    + durability,
-                    discord.Color.blue(),
-                )
-            )
+            await volume_cmd.run(ctx, volume, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
