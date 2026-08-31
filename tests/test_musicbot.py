@@ -2263,7 +2263,12 @@ class TestRestartCommand:
         from src.musicplayer import RestartOutcome
 
         mp = MagicMock()
+        # A real position: the command refuses a song still at its beginning, and a
+        # bare MagicMock's __int__ answers 1 — right at the threshold, so the guard
+        # would be passing by accident rather than by intent.
         mp.current_song = MagicMock()
+        mp.current_song.position_secs = 151.0
+        mp.current_song.title = "Original Song"
         mp.restart_current = AsyncMock(
             return_value=RestartOutcome(title="Original Song", position=151)
         )
@@ -2284,13 +2289,21 @@ class TestRestartCommand:
         live_mp.restart_current.assert_awaited_once()
         call = live_mp.restart_current.await_args
         assert call.args == (live_vc,)
-        # The ask is this message, and the replay plays immediately.
+        # The ask is this message by this caller, and it plays immediately. Both
+        # columns must name the same person: split, the archive row claims the
+        # original requester asked for the song at the moment someone else typed.
         assert call.kwargs["analytics"] == Analytics(
             queued_at=mock_ctx.message.created_at.timestamp(), queue_position=0
         )
+        assert call.kwargs["requester"] is mock_ctx.author
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "Original Song" in embed.description
         assert "2:31" in embed.description
+        # Both wordings name the title and the position, so only the state
+        # separates them — asserting the two alone passes for either.
+        assert "from `0:00`" in embed.description
+        assert "paused" not in embed.description
+        assert embed.color == discord.Color.blue()
         mock_ctx.message.add_reaction.assert_awaited_once_with("🔁")
 
     async def test_paused_song_is_announced_as_returning_paused(
@@ -2369,8 +2382,81 @@ class TestRestartCommand:
         await command_callback(MusicBot.restart)(music_bot, mock_ctx)
 
         embed = mock_ctx.send.await_args.kwargs["embed"]
-        assert "finished before it could be restarted" in embed.description
+        assert "no longer playing" in embed.description
         mock_ctx.message.add_reaction.assert_not_awaited()
+
+    async def test_refuses_a_song_still_at_its_beginning(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """Nothing to rewind — and it is also how a repeat mints history entries
+        nobody heard: a replay parks at 0:00, so restarting it again stops a song
+        with no frames, which the loop still records. Each such row LTRIMs a real
+        play out of the 50-entry window, and with the archive off that list is the
+        only record there is."""
+        live_mp.current_song.position_secs = 0.4
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        live_mp.restart_current.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "already at the beginning" in embed.description
+        assert "Original Song" in embed.description
+        mock_ctx.message.add_reaction.assert_not_awaited()
+
+    async def test_a_paused_reply_does_not_look_like_playback(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """Blue and 🔁 are what the bot uses for "something is playing". A restart
+        that comes back paused makes no sound, so it says so first and in the colour
+        -pause uses."""
+        from src.musicplayer import RestartOutcome
+
+        live_vc.is_playing.return_value = False
+        live_vc.is_paused.return_value = True
+        live_mp.restart_current = AsyncMock(
+            return_value=RestartOutcome(
+                title="Original Song", position=151, returns_paused=True
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.color == discord.Color.orange()
+        assert "still paused" in embed.description
+
+    async def test_shows_typing_while_the_replay_resolves(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """restart_current awaits a yt-dlp resolve on a cold cache. Without the
+        wrapper the user gets no ack, no reaction and no typing for seconds, and a
+        second -restart in that window is declined by max_concurrency — so the bot
+        looks like it ignored them. Every sibling that awaits an extraction
+        (-play, -playnow, -resume, -shuffle) wraps its body the same way."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        typing_cm = MagicMock(return_value=contextlib.nullcontext())
+
+        with patch("src.musicbot.background_typing", typing_cm):
+            await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        typing_cm.assert_called_once_with(mock_ctx)
 
     async def test_failure_renders_the_command_error(
         self,
@@ -2629,6 +2715,18 @@ class TestHistoryCommand:
         assert guard.number == 1
         assert guard.per is commands.BucketType.guild
         assert guard.wait is False
+
+    def test_restart_is_rate_limited_as_well_as_serialized(self) -> None:
+        """max_concurrency bounds how many run at once; it does not bound how OFTEN.
+        -restart is the one command that consumes nothing and can be repeated on the
+        same song forever, and every repeat writes a history entry — which LTRIMs a
+        real play out of the 50-entry window that, with the archive off, is the only
+        record a guild has. Deleting the decorator left the whole suite green."""
+        buckets = MusicBot.restart._buckets
+        assert buckets.valid, "-restart lost its cooldown"
+        assert buckets._cooldown is not None
+        assert buckets._cooldown.rate == 1
+        assert buckets.type is commands.BucketType.guild
 
     def test_the_shuffle_copy_and_the_refusal_quote_the_same_number(self) -> None:
         """The FIXME this closed was exactly this drift: the code refused at one

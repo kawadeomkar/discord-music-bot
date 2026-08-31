@@ -273,6 +273,11 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             "ts",
             # Runtime-only NP handle; a live Message cannot be carried on a source.
             "np_host_ref",
+            # Runtime-only, and read only while the entry is IN the queue: it marks
+            # a -restart replay so the card does not read as the live song queued
+            # behind itself. A playing song is no longer "up next", so nothing on
+            # the YTDL side would ever read it.
+            "is_replay",
         }
         carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
         params = set(inspect.signature(YTDL.__init__).parameters)

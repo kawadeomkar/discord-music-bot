@@ -706,7 +706,7 @@ class QueueObject:
     # it was never RPUSHed to the Redis queue list (it lives in current_song_url state),
     # so the loop must skip its redis_pop_for(). Read via guild_queue.is_persisted().
     persisted: bool = True
-    # ── -playnow interjection flags ──
+    # ── Interrupt flags (-playnow, -restart) ──
     # Queued via -playnow. Attribution only — interjections stack, so nothing reads
     # this except the span attribute.
     interjected: bool = False
@@ -714,9 +714,17 @@ class QueueObject:
     # notice the loop's start path sends: "Resuming…" for these, "Starting song at
     # Xs" for an ordinary ?t= entry.
     is_resume: bool = False
-    # The interrupted song was paused at interjection time: the loop re-pauses
-    # immediately after vc.play() so it returns parked.
+    # Park the song at vc.play() so it comes back paused: the song -playnow
+    # interrupted, or a -restart replay of one. Set with is_resume for the first
+    # and without it for the second, so neither implies the other.
     start_paused: bool = False
+    # A -restart replay of the song that is playing. RUNTIME-ONLY, like np_host_ref
+    # below: it describes the handover, not the entry, and the entry outlives the
+    # handover by milliseconds. A crash in that window restores an ordinary queued
+    # song, which is exactly what it then is — so it is deliberately absent from
+    # SongQueueEntry. Read only to render the queue card that would otherwise show
+    # the live song queued behind itself.
+    is_replay: bool = field(default=False, repr=False)
     # ── Ask-time analytics, set at construction and carried thereafter ──
     # queued_at + queue_position in one frozen container (guild_state.Analytics).
     # yt_source/yt_playlist REQUIRE it, so a QueueObject leaves them complete;

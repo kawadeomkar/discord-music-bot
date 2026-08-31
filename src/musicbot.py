@@ -33,7 +33,7 @@ from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
 )
-from src.musicplayer import MusicPlayer
+from src.musicplayer import _MIN_RESTART_POSITION_SECS, MusicPlayer
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     GuildRedisStore,
@@ -700,6 +700,16 @@ class MusicBot(commands.Cog):
             # try/except never sees it — e.g. `-history --limit abc`.
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
+            )
+        elif isinstance(error, commands.CommandOnCooldown):
+            # Also raised in prepare(), so the body never sees it. Worded off the
+            # command name for the same reason as the concurrency notice below.
+            cmd = ctx.command.name if ctx.command else "command"
+            await ctx.send(
+                embed=notice_embed(
+                    f"`{cmd}` is on cooldown — try again in {error.retry_after:.0f}s.",
+                    discord.Color.orange(),
+                )
             )
         elif isinstance(error, commands.MaxConcurrencyReached):
             # Raised in prepare(), before the body, so the command's own try/except
@@ -1666,10 +1676,10 @@ class MusicBot(commands.Cog):
         brief="play the current song again from the beginning",
         help=(
             "Starts the song that is playing over from 0:00.\n\n"
-            "The queue is untouched: the song plays again first, then everything "
-            "behind it follows as before. A **paused** song comes back paused at "
-            "the beginning — `-restart` moves the position, not the play/pause "
-            "state."
+            "Nothing is dropped from the queue: the song plays again first, then "
+            "everything behind it follows in the same order, each one a song-length "
+            "further out. A **paused** song comes back paused at the beginning — "
+            "`-restart` moves the position, not the play/pause state."
         ),
         extras={
             "category": "Playback",
@@ -1677,67 +1687,89 @@ class MusicBot(commands.Cog):
             "note": (
                 "The interrupted play is recorded in `-history` at the point it "
                 "reached, the way a skipped song is; the restarted one is recorded "
-                "again when it ends."
+                "again when it ends. A song still at its beginning is left alone."
             ),
         },
     )
     @commands.before_invoke(validate_commands)
-    # As -playnow: restart_current() re-checks current_song, but current_song
-    # outlives that check by a whole song, so two callers would each front-insert a
-    # replay and the song would play three times.
+    # As -playnow: restart_current() re-checks the live song, but that check cannot
+    # serialize two callers of THIS command — each would front-insert a replay and
+    # the song would play three times. The cooldown is the other axis: every restart
+    # writes a history entry, and the list is LTRIMmed to HISTORY_CACHE_LIMIT on
+    # every write, so an unpaced repeat evicts plays a guild cannot get back.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @commands.cooldown(1, 5.0, commands.BucketType.guild)
     @_tracer.start_as_current_span("bot.restart")
     async def restart(self, ctx: commands.Context) -> None:
-        try:
-            mp = self.get_mp(ctx)
-            vc = ctx.voice_client
-            if (
-                mp.current_song is None
-                or not isinstance(vc, discord.VoiceClient)
-                or not (vc.is_playing() or vc.is_paused())
-            ):
-                await ctx.send(
-                    embed=notice_embed(
-                        "No songs are currently playing.", discord.Color.orange()
+        async with background_typing(ctx):
+            try:
+                mp = self.get_mp(ctx)
+                vc = ctx.voice_client
+                song = mp.current_song
+                if (
+                    song is None
+                    or not isinstance(vc, discord.VoiceClient)
+                    or not (vc.is_playing() or vc.is_paused())
+                ):
+                    await ctx.send(
+                        embed=notice_embed(
+                            "No songs are currently playing.", discord.Color.orange()
+                        )
                     )
+                    return
+                if int(song.position_secs) < _MIN_RESTART_POSITION_SECS:
+                    # Nothing to rewind, and restarting a song parked at 0:00 is how
+                    # a repeat mints history entries nobody heard.
+                    await ctx.send(
+                        embed=notice_embed(
+                            f"**{safe_label(song.title or 'That song', _ECHO_MAX)}** is already "
+                            "at the beginning.",
+                            discord.Color.orange(),
+                        )
+                    )
+                    return
+                outcome = await mp.restart_current(
+                    vc,
+                    # The replay is this caller's ask: both the requester column and
+                    # the ask-time analytics name them, or -leaderboard credits the
+                    # play to whoever queued the song originally.
+                    requester=ctx.author,
+                    analytics=Analytics(
+                        queued_at=ctx.message.created_at.timestamp(), queue_position=0
+                    ),
                 )
-                return
-            outcome = await mp.restart_current(
-                vc,
-                # Ask-time analytics, minted as -playnow's are: the message's
-                # snowflake time, and depth 0 — the replay plays immediately.
-                analytics=Analytics(
-                    queued_at=ctx.message.created_at.timestamp(), queue_position=0
-                ),
-            )
-            if outcome is None:
-                # The song ended inside restart_current's stream warm, so nothing
-                # was inserted. Distinct from the guard above: something WAS playing
-                # when this command was dispatched.
-                await ctx.send(
-                    embed=notice_embed(
-                        "That song finished before it could be restarted.",
+                if outcome is None:
+                    # Nothing was inserted: the song stopped being the live one while
+                    # the replay resolved. Separate from the guard above, where
+                    # nothing was playing at dispatch at all.
+                    await ctx.send(
+                        embed=notice_embed(
+                            "That song is no longer playing — nothing was restarted.",
+                            discord.Color.orange(),
+                        )
+                    )
+                    return
+                if outcome.returns_paused:
+                    # Orange, not blue: this outcome makes no sound. The loop sends
+                    # its own notice under the card; this one answers the command.
+                    embed = notice_embed(
+                        f"⏸️ **{safe_label(outcome.title, _ECHO_MAX)}** restarted to `0:00` — "
+                        f"still paused at the start. Use `-resume` to play it. "
+                        f"(Was paused at `{outcome.position_str}`.)",
                         discord.Color.orange(),
                     )
-                )
-                return
-            detail = (
-                f"was paused at `{outcome.position_str}` and comes back paused — "
-                "use `-resume` to play it."
-                if outcome.returns_paused
-                else f"was at `{outcome.position_str}`."
-            )
-            await asyncio.gather(
-                ctx.send(
-                    embed=notice_embed(
-                        f"🔁 Restarting **{outcome.title}** — {detail}",
+                else:
+                    embed = notice_embed(
+                        f"🔁 Restarting **{safe_label(outcome.title, _ECHO_MAX)}** from `0:00` "
+                        f"— was at `{outcome.position_str}`.",
                         discord.Color.blue(),
                     )
-                ),
-                ctx.message.add_reaction("🔁"),
-            )
-        except Exception as e:
-            await self._command_error(ctx, e, title="Failed to restart song")
+                await asyncio.gather(
+                    ctx.send(embed=embed),
+                    ctx.message.add_reaction("🔁"),
+                )
+            except Exception as e:
+                await self._command_error(ctx, e, title="Failed to restart song")
 
     @commands.command(
         name="shuffle",
