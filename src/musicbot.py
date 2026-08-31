@@ -28,6 +28,7 @@ from src.config import (
 from src import debug as debug_mode
 from src.commands import clear as clear_cmd
 from src.commands import history as history_cmd
+from src.commands import join as join_cmd
 from src.commands import jump as jump_cmd
 from src.commands import leaderboard as leaderboard_cmd
 from src.commands import now as now_cmd
@@ -82,7 +83,7 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.ping import run_health_dashboard, send_latency_line
+from src.ping import run_health_dashboard
 from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
@@ -1588,38 +1589,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.join")
     async def join(self, ctx: commands.Context) -> None:
         try:
-            assert (
-                isinstance(ctx.author, discord.Member) and ctx.author.voice is not None
-            )
-            assert ctx.guild is not None
-            channel = ctx.author.voice.channel
-            assert channel is not None
-
-            if not ctx.voice_client:
-                await channel.connect(timeout=10.0)
-            vc = ctx.voice_client
-            if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
-                await vc.move_to(channel)
-            await ctx.guild.change_voice_state(
-                channel=channel, self_mute=False, self_deaf=True
-            )
-
-            mp = self.get_mp(ctx)
-            if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):
-                await mp.store.set_connection(channel.id, ctx.channel.id)
-
-            # Voice is up — release the loop so a persisted queue resumes. No-op
-            # while -play holds the gate: it front-inserts its song first, then
-            # opens.
-            mp.open_playback_gate()
-
-            await asyncio.gather(
-                ctx.message.add_reaction("👋"),
-                # Not ctx.invoke(self.ping): that runs the full ~3s dashboard on
-                # every join/cold-play AND skips prepare(), losing ping's
-                # max_concurrency guard. Cheap one-liner only.
-                send_latency_line(ctx, self.bot.latency),
-            )
+            await join_cmd.run(ctx, mp=self.get_mp(ctx), bot_latency=self.bot.latency)
         except Exception as e:
             await self._command_error(ctx, e)
 
