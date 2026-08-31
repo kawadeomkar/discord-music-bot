@@ -28,6 +28,8 @@ from src.config import (
 from src import debug as debug_mode
 from src.commands import leaderboard as leaderboard_cmd
 from src.commands import queue as queue_cmd
+from src.commands import shuffle as shuffle_cmd
+from src.musicplayer import RESTORE_WAIT_SECS
 from src import analytics_card
 from src.guild_history import history_embeds
 from src.guild_state import Analytics
@@ -177,11 +179,6 @@ HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = Discord's
 # per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
-
-# How long a cold-start command (-play, -resume) waits for its restore. Generous for
-# one pipelined read; bounded because the pool sets no socket_timeout, so a server
-# that accepts the connection then stalls would hang the command outright.
-RESTORE_WAIT_SECS = 5.0
 
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
@@ -1685,26 +1682,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.shuffle")
     async def shuffle(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
-            # so running it before restore_entries() has replayed the saved queue
-            # writes an unrestored deque over it and deletes the persisted entries.
-            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                await ctx.send(
-                    embed=notice_embed(
-                        "Still loading this server's saved queue — try again in "
-                        "a moment.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            async with background_typing(ctx):
-                await ctx.send(
-                    embed=notice_embed("Please wait... shuffling", discord.Color.blue())
-                )
-                msg = await mp.queue_shuffle()
-                await ctx.message.add_reaction("🔀")
-                await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
+            await shuffle_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
