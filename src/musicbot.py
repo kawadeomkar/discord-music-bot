@@ -1661,6 +1661,85 @@ class MusicBot(commands.Cog):
             await mp.repark_crashed_head()
 
     @commands.command(
+        name="restart",
+        aliases=["rs", "replay"],
+        brief="play the current song again from the beginning",
+        help=(
+            "Starts the song that is playing over from 0:00.\n\n"
+            "The queue is untouched: the song plays again first, then everything "
+            "behind it follows as before. A **paused** song comes back paused at "
+            "the beginning — `-restart` moves the position, not the play/pause "
+            "state."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": ["-restart", "-rs", "-replay"],
+            "note": (
+                "The interrupted play is recorded in `-history` at the point it "
+                "reached, the way a skipped song is; the restarted one is recorded "
+                "again when it ends."
+            ),
+        },
+    )
+    @commands.before_invoke(validate_commands)
+    # As -playnow: restart_current() re-checks current_song, but current_song
+    # outlives that check by a whole song, so two callers would each front-insert a
+    # replay and the song would play three times.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @_tracer.start_as_current_span("bot.restart")
+    async def restart(self, ctx: commands.Context) -> None:
+        try:
+            mp = self.get_mp(ctx)
+            vc = ctx.voice_client
+            if (
+                mp.current_song is None
+                or not isinstance(vc, discord.VoiceClient)
+                or not (vc.is_playing() or vc.is_paused())
+            ):
+                await ctx.send(
+                    embed=notice_embed(
+                        "No songs are currently playing.", discord.Color.orange()
+                    )
+                )
+                return
+            outcome = await mp.restart_current(
+                vc,
+                # Ask-time analytics, minted as -playnow's are: the message's
+                # snowflake time, and depth 0 — the replay plays immediately.
+                analytics=Analytics(
+                    queued_at=ctx.message.created_at.timestamp(), queue_position=0
+                ),
+            )
+            if outcome is None:
+                # The song ended inside restart_current's stream warm, so nothing
+                # was inserted. Distinct from the guard above: something WAS playing
+                # when this command was dispatched.
+                await ctx.send(
+                    embed=notice_embed(
+                        "That song finished before it could be restarted.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            detail = (
+                f"was paused at `{outcome.position_str}` and comes back paused — "
+                "use `-resume` to play it."
+                if outcome.returns_paused
+                else f"was at `{outcome.position_str}`."
+            )
+            await asyncio.gather(
+                ctx.send(
+                    embed=notice_embed(
+                        f"🔁 Restarting **{outcome.title}** — {detail}",
+                        discord.Color.blue(),
+                    )
+                ),
+                ctx.message.add_reaction("🔁"),
+            )
+        except Exception as e:
+            await self._command_error(ctx, e, title="Failed to restart song")
+
+    @commands.command(
         name="shuffle",
         brief="randomly reorder the queue",
         help=(

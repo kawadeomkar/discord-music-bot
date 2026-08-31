@@ -60,6 +60,7 @@ details, aliases, and examples.
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
+| `-restart` | `rs`, `replay` | Play the current song again from the beginning (the queue behind it is untouched) |
 | `-stop` | `st` | Stop playback, drop the queue, and disconnect |
 | `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (applies from the next song; saved per server) |
 

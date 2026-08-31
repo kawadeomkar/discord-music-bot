@@ -32,6 +32,7 @@ from src.guild_queue import (
     remove_matcher,
 )
 from src.guild_state import (
+    Analytics,
     DEFAULT_TIMEZONE,
     HistoryEntry,
     NowPlayingData,
@@ -201,6 +202,22 @@ class InterjectOutcome:
     @property
     def resume_position_str(self) -> str:
         return fmt_duration(self.resume_position or 0)
+
+
+@dataclass(frozen=True)
+class RestartOutcome:
+    """What MusicPlayer.restart_current() did — what -restart needs for its
+    confirmation wording."""
+
+    title: str
+    position: int  # where the replaced play was stopped
+    # The song was paused, so the replay comes back parked at 0:00: -restart moves
+    # the position, never the play/pause state.
+    returns_paused: bool = False
+
+    @property
+    def position_str(self) -> str:
+        return fmt_duration(self.position)
 
 
 @dataclass(frozen=True)
@@ -2020,6 +2037,82 @@ class MusicPlayer:
             await self._channel.send(embed=self._notice(text, discord.Color.blue()))
         except Exception as e:
             log.warning(f"Failed to send resume notice in guild {self._guild.id}: {e}")
+
+    # ── -restart ──────────────────────────────────────────────────────────────
+
+    @_tracer.start_as_current_span("player.restart")
+    async def restart_current(
+        self, vc: discord.VoiceClient, *, analytics: Analytics
+    ) -> Optional[RestartOutcome]:
+        """Play the live song again from its beginning.
+
+        A rebuilt copy goes to the front of the queue with no `ts` (so no -ss) and
+        the live song is stopped; the loop's ordinary dequeue -> play cycle does the
+        rest. The queue behind it is untouched, and the copy is persisted, so a crash
+        mid-restart recovers like any other front insert.
+
+        The stopped play records its own history entry, as a -skip does: unlike a
+        -playnow tail the replay does not span what was already heard, so suppressing
+        it would lose that listening outright.
+
+        None when there is nothing to replay — no live song, no URL to rebuild from,
+        or the song ended inside the stream warm below.
+        """
+        current = self.current_song
+        if current is None or not current.webpage_url:
+            return None
+        span = trace.get_current_span()
+        span.set_attribute("discord.guild_id", str(self._guild.id))
+
+        replay = QueueObject(
+            current.webpage_url,
+            current.title or "",
+            current.requester or self._require_requester(),
+            duration=current.duration_secs or None,
+            uploader=current.uploader,
+            thumbnail=current.thumbnail,
+            # The ask is this -restart and it plays immediately, so the caller's
+            # depth-0 analytics rather than the interrupted song's; played_at stays
+            # unstamped so the loop mints one and the replay files as its own play.
+            # query_source and user_input describe where the song came from, which a
+            # restart does not change and neither of which is recoverable from
+            # webpage_url once dropped.
+            analytics=analytics,
+            query_source=current.query_source,
+            user_input=current.user_input,
+        )
+        # Warmed before the interrupt, as -playnow does: ytdl:stream caps at 30
+        # minutes, so a song past that point is a miss, and a miss at dequeue puts
+        # seconds of yt-dlp dead air between the stop and the replay.
+        await YTDL.prefetch_stream(
+            replay, redis=self.store.redis if self.store is not None else None
+        )
+        # A completed prefetch bypasses the queue and would play INSTEAD of the
+        # front-inserted replay — take it off the board first.
+        await self._neutralize_prefetch()
+        # Re-check after those awaits: if the song ended and the loop moved on,
+        # replaying it would interrupt a song nobody asked to restart.
+        if self.current_song is not current:
+            return None
+
+        # Both read at the last synchronous moment: a -pause or -resume landing
+        # during the awaits above changes what the song must come back as, and the
+        # position is what the confirmation reports.
+        replay.start_paused = vc.is_paused()
+        position = int(current.position_secs)
+        await self.queue.put_front([replay])
+
+        # Only if the song we measured is still playing: if the loop moved on, the
+        # replay plays next anyway and stopping would kill the NEXT song.
+        if self.current_song is current:
+            self.note_deliberate_stop()
+            vc.stop()
+        span.set_attribute("restart.position", position)
+        return RestartOutcome(
+            title=current.title or "Unknown",
+            position=position,
+            returns_paused=replay.start_paused,
+        )
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 

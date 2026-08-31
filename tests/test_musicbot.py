@@ -2249,6 +2249,147 @@ class TestResumeCommand:
         assert "no queue was left" not in sent.description
 
 
+class TestRestartCommand:
+    @pytest.fixture
+    def live_vc(self) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        return vc
+
+    @pytest.fixture
+    def live_mp(self) -> MagicMock:
+        """A MusicPlayer mock with a song playing, restarted successfully."""
+        from src.musicplayer import RestartOutcome
+
+        mp = MagicMock()
+        mp.current_song = MagicMock()
+        mp.restart_current = AsyncMock(
+            return_value=RestartOutcome(title="Original Song", position=151)
+        )
+        return mp
+
+    async def test_restarts_the_live_song(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        live_mp.restart_current.assert_awaited_once()
+        call = live_mp.restart_current.await_args
+        assert call.args == (live_vc,)
+        # The ask is this message, and the replay plays immediately.
+        assert call.kwargs["analytics"] == Analytics(
+            queued_at=mock_ctx.message.created_at.timestamp(), queue_position=0
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Original Song" in embed.description
+        assert "2:31" in embed.description
+        mock_ctx.message.add_reaction.assert_awaited_once_with("🔁")
+
+    async def test_paused_song_is_announced_as_returning_paused(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The song comes back parked at 0:00 and makes no sound, so the reply has
+        to say so — the reaction alone looks like a bot that did nothing."""
+        from src.musicplayer import RestartOutcome
+
+        live_vc.is_playing.return_value = False
+        live_vc.is_paused.return_value = True
+        live_mp.restart_current = AsyncMock(
+            return_value=RestartOutcome(
+                title="Original Song", position=151, returns_paused=True
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        description = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "paused at `2:31`" in description
+        assert "-resume" in description
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            pytest.param({"current_song": None}, id="nothing-live"),
+            pytest.param({"voice_client": None}, id="not-in-voice"),
+            pytest.param({"idle": True}, id="connected-but-idle"),
+        ],
+    )
+    async def test_reports_nothing_playing(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+        state: dict[str, Any],
+    ) -> None:
+        if "current_song" in state:
+            live_mp.current_song = None
+        if state.get("idle"):
+            live_vc.is_playing.return_value = False
+            live_vc.is_paused.return_value = False
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc if "voice_client" not in state else None
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        live_mp.restart_current.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.description == "No songs are currently playing."
+        assert embed.color == discord.Color.orange()
+        mock_ctx.message.add_reaction.assert_not_awaited()
+
+    async def test_song_ending_mid_restart_is_not_reported_as_idle(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """restart_current returns None when the song ends inside its stream warm.
+        Something WAS playing at dispatch, so the generic idle notice would read as
+        the bot having ignored the command."""
+        live_mp.restart_current = AsyncMock(return_value=None)
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "finished before it could be restarted" in embed.description
+        mock_ctx.message.add_reaction.assert_not_awaited()
+
+    async def test_failure_renders_the_command_error(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        live_mp.restart_current = AsyncMock(side_effect=RuntimeError("boom"))
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.title == "Failed to restart song"
+        assert embed.color == discord.Color.red()
+
+
 class TestVolumeCommand:
     @staticmethod
     def _description(ctx: MagicMock) -> str:
@@ -2452,6 +2593,7 @@ class TestHistoryCommand:
             "leaderboard",
             "debug",
             "resume",
+            "restart",
             "shuffle",
             "clear",
             "remove",
@@ -2470,7 +2612,11 @@ class TestHistoryCommand:
         validate_commands' "already being used in channel X" check cannot fire for
         either — both join, and the second MOVES the bot to its own author's channel.
 
-        `-shuffle`/`-clear`/`-remove` for a fifth: all three park on the queue's
+        `-restart` for a fifth: restart_current() re-checks the live song, but
+        current_song outlives that check by a whole song, so two racing callers each
+        front-insert a replay and the song plays three times.
+
+        `-shuffle`/`-clear`/`-remove` for a sixth: all three park on the queue's
         bulk mutex, which the playback loop holds across the start transaction. A
         Redis that stalls there wedges them, and every repeat while wedged parks
         another coroutine holding an OTel span `cog_after_invoke` never closes —
