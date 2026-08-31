@@ -27,6 +27,7 @@ from src.config import (
 )
 from src import debug as debug_mode
 from src.commands import leaderboard as leaderboard_cmd
+from src.commands import queue as queue_cmd
 from src import analytics_card
 from src.guild_history import history_embeds
 from src.guild_state import Analytics
@@ -2185,8 +2186,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.queue")
     async def queue(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            await ctx.send(embed=mp.queue_embed())
+            await queue_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
