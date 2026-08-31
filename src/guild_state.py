@@ -635,7 +635,7 @@ class SongQueueEntry:
     uploader: str | None = None
     thumbnail: str | None = None
     persisted: bool = True
-    # Interrupt flags (-playnow, -restart) — see the QueueObject field comments.
+    # -playnow flags — see the matching QueueObject field comments.
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False

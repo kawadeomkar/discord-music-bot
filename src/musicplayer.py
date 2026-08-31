@@ -159,10 +159,10 @@ _PAUSE_DEBOUNCE_SECS = 0.5
 # Below this many seconds remaining, an interjected song gets no resume entry —
 # there is nothing meaningful to return to.
 _MIN_RESUME_REMAINING_SECS = 5
-# Below this, -restart refuses: the song IS at its beginning. Also what keeps a
-# replay parked paused at 0:00 from being restarted again — each restart would
-# otherwise write a 0-second history entry, and the list is LTRIMmed to
-# HISTORY_CACHE_LIMIT on every write, so repeats evict real plays.
+# Below this, -restart refuses: the song IS at its beginning. Also the other half
+# of the command's rate limit — every restart writes a history entry, and the list
+# is LTRIMmed to HISTORY_CACHE_LIMIT on every write, so a song repeatedly restarted
+# at 0:00 would evict real plays.
 _MIN_RESTART_POSITION_SECS = 1
 # How long -restart waits for the replay's source before stopping the live song.
 # The resolve continues in the background either way and the loop consumes it, so
@@ -220,9 +220,6 @@ class RestartOutcome:
 
     title: str
     position: int  # where the replaced play was stopped
-    # The song was paused, so the replay comes back parked at 0:00: -restart moves
-    # the position, never the play/pause state.
-    returns_paused: bool = False
 
     @property
     def position_str(self) -> str:
@@ -379,6 +376,7 @@ class MusicPlayer:
         "_restore_complete",
         "_restore_read_failed",
         "_stopped_deliberately",
+        "_interrupted_song",
         "_playback_gate",
         "_playback_holds",
         "_background_tasks",
@@ -419,6 +417,7 @@ class MusicPlayer:
     _restore_complete: asyncio.Event
     _restore_read_failed: bool
     _stopped_deliberately: bool
+    _interrupted_song: Optional[YTDL]
     _playback_gate: asyncio.Event
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
@@ -503,6 +502,8 @@ class MusicPlayer:
         # Zero frames alone cannot tell a stream that never opened from one we stopped
         # before its first frame; this is the half that says which.
         self._stopped_deliberately = False
+        # The song -playnow or -restart has already stopped; see _still_live().
+        self._interrupted_song: Optional[YTDL] = None
         # Restore and *play* are separate concerns: the gate stays shut until a
         # command establishes a voice connection, so a player built by a command that
         # never connects — every command that reaches the cog hook builds one, and
@@ -1861,9 +1862,9 @@ class MusicPlayer:
         await self._neutralize_prefetch()
 
         # Re-check after those awaits (cancellation can block up to yt-dlp's socket
-        # timeout): if the song ended and the loop moved on, bail to the command's
+        # timeout): if the song is no longer the live one, bail to the command's
         # fallback rather than build a resume entry for a finished song.
-        if self.current_song is not current:
+        if not self._still_live(current):
             return None
 
         was_paused = vc.is_paused()
@@ -1934,11 +1935,7 @@ class MusicPlayer:
             self._pending_resume_tail = resume
         await self.queue.put_front(items)
 
-        # Only if the song we measured is still playing: if the loop moved on, the
-        # inserted entries play next anyway and stopping would kill the NEXT song.
-        if self.current_song is current:
-            self.note_deliberate_stop()
-            vc.stop()
+        self._stop_if_live(current, vc)
 
         # After the insert, so the tail just built is counted.
         span.set_attribute("interject.depth", self.queue.resume_tail_depth())
@@ -2074,8 +2071,11 @@ class MusicPlayer:
         copy is persisted, so a crash mid-restart recovers like any other front
         insert.
 
-        The stopped play records its own history entry, as a -skip does — a replay
-        starts at 0:00 and so spans none of what was already heard.
+        A PAUSED song comes back playing, on -play's precedent ("-play means play"):
+        the caller named this song, so the ask is for it to sound.
+
+        The stopped play records its own history entry: a replay starts at 0:00, so
+        it spans none of what was already heard.
 
         `requester` is the caller, not the song's original requester: the replay is a
         new ask, and it carries the caller's analytics for the same reason. Both
@@ -2083,7 +2083,9 @@ class MusicPlayer:
         someone who did not ask for it.
 
         None when there is nothing to replay — no live song, no URL to rebuild from,
-        or the song stopped being the live one while the replay resolved.
+        or the song stopped being the live one while the replay resolved. Residual
+        race: a teardown completing inside that resolve leaves the replay queued, so
+        a later -resume plays it.
         """
         current = self.current_song
         if current is None or not current.webpage_url:
@@ -2117,10 +2119,6 @@ class MusicPlayer:
         if not self._still_live(current):
             return None
 
-        # Read before put_front, which serializes the entry: setting it after would
-        # leave the flag in memory and `false` on the wire, so a crash mid-restart
-        # would bring a paused song back playing.
-        replay.start_paused = vc.is_paused()
         position = int(current.position_secs)
         await self.queue.put_front([replay])
         # Resolve into a real source, exactly as the loop prefetches any next song:
@@ -2128,41 +2126,22 @@ class MusicPlayer:
         # interrupted song is still playing, instead of in the silence after the
         # stop. Bounded because the caller is a command; shielded because the loop
         # consumes whatever this produces whether or not we waited for it.
-        self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
-        with contextlib.suppress(asyncio.TimeoutError):
-            async with asyncio.timeout(_RESTART_RESOLVE_TIMEOUT):
-                await asyncio.shield(self._prefetch_task)
+        resolving = asyncio.create_task(self._prefetch_next_song())
+        self._prefetch_task = resolving
+        # asyncio.wait rather than a timeout around the task: it neither cancels the
+        # prefetch when the bound expires nor re-raises when a teardown cancels it,
+        # so the loop still consumes whatever it produces and only OUR cancellation
+        # propagates.
+        await asyncio.wait({resolving}, timeout=_RESTART_RESOLVE_TIMEOUT)
 
-        # Only if the song we measured is still the live one: if the loop moved on,
-        # the replay plays next anyway and stopping would kill the NEXT song.
-        if self._still_live(current):
+        if self._stop_if_live(current, vc):
             # Its card would otherwise stay frozen at the interrupt position,
-            # directly above the replay's own card, naming the same song.
+            # directly above the replay's own card, naming the same song. Set after
+            # the stop because nothing awaits between them: the loop cannot reach
+            # the iteration end that reads this until we yield.
             self._retire_np_for = current
-            self.note_deliberate_stop()
-            vc.stop()
         span.set_attribute("restart.position", position)
-        return RestartOutcome(
-            title=current.title or "Unknown",
-            position=position,
-            returns_paused=replay.start_paused,
-        )
-
-    async def _announce_paused_start(self, song: YTDL) -> None:
-        """One-line notice for a song parked paused at 0:00 — a -restart of a paused
-        song. Sent from the loop's start path, like _announce_resume. Without it the
-        newest message in the channel is a Now Playing card with a bar that never
-        moves, above a bot making no sound."""
-        text = (
-            f"⏸️ Restarted **{song.title}** to `0:00` — still paused. "
-            f"Use `-resume` to play it."
-        )
-        try:
-            await self._channel.send(embed=self._notice(text, discord.Color.orange()))
-        except Exception as e:
-            log.warning(
-                f"Failed to send paused-start notice in guild {self._guild.id}: {e}"
-            )
+        return RestartOutcome(title=current.title or "Unknown", position=position)
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
@@ -2203,14 +2182,38 @@ class MusicPlayer:
             return None
 
     def _still_live(self, song: YTDL) -> bool:
-        """Is `song` still the song the loop is playing?
+        """Is `song` still the song the loop is playing? `current_song is song` alone
+        is not enough; each term below names a window a command can resume in.
 
-        `current_song is song` alone is not enough: the loop clears it two task
-        cancels AFTER play_next fires, so a command resuming in that window sees a
-        song the loop has already finished, and acting on it replays a finished song
-        and stops the next one. play_next is set by the audio thread and cleared at
-        the top of the next iteration, so it marks exactly that window."""
-        return self.current_song is song and not self.play_next.is_set()
+        - play_next: the loop clears current_song two task cancels AFTER the audio
+          thread sets this, and it is cleared again at the top of the next iteration
+          — so a command waking in that window would replay a finished song and stop
+          the next one.
+        - _interrupted_song: max_concurrency is per-Command, so -restart and -playnow
+          hold different buckets and neither declines the other. Without this term
+          both front-insert against the same song and it plays three times.
+        - a finished loop task is a torn-down player (-stop, the alone watchdog, a
+          voice kick): the voice client is gone, so the stop would land on a
+          disconnected one and the confirmation would describe a bot that has left.
+        """
+        return (
+            self.current_song is song
+            and not self.play_next.is_set()
+            and self._interrupted_song is not song
+            and not (self._player is not None and self._player.done())
+        )
+
+    def _stop_if_live(self, song: YTDL, vc: discord.VoiceClient) -> bool:
+        """Stop `song`, but only if it is still the live one: if the loop moved on,
+        the entries just front-inserted play next anyway and stopping would kill the
+        NEXT song. Recording the stop is what keeps the OTHER interrupt command from
+        acting on the same song; the loop clears it at its next vc.play()."""
+        if not self._still_live(song):
+            return False
+        self._interrupted_song = song
+        self.note_deliberate_stop()
+        vc.stop()
+        return True
 
     def note_deliberate_stop(self) -> None:
         """Record that the live song is about to be stopped by us, not by ffmpeg.
@@ -2748,6 +2751,7 @@ class MusicPlayer:
                                     )
 
                                 self._stopped_deliberately = False
+                                self._interrupted_song = None
                                 vc.play(song, after=_after_play)
                                 if song.start_paused:
                                     # Park the player thread SYNCHRONOUSLY, before any await, so
@@ -2845,18 +2849,13 @@ class MusicPlayer:
                         )
 
                     if song.start_paused:
-                        # Parked before its first frame — where -playnow interrupted
-                        # it, or at 0:00 for a -restart replay (the player thread was
-                        # already paused synchronously at vc.play). The full pause()
-                        # runs here so the Redis pause epochs and the debounced
-                        # embed/Activity refresh all engage.
+                        # Parked before its first frame, where -playnow interrupted
+                        # it (the player thread was already paused synchronously at
+                        # vc.play). The full pause() runs here so the Redis pause
+                        # epochs and the debounced embed/Activity refresh all engage.
                         await self.pause(vc)
                     if song.is_resume:
                         await self._announce_resume(song)
-                    elif song.start_paused:
-                        # Not is_resume, so nothing above named it: a -restart
-                        # replay parked at its own start.
-                        await self._announce_paused_start(song)
                     elif song.start_offset > 0:
                         await self._announce_start_offset(song)
 

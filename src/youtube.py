@@ -714,9 +714,8 @@ class QueueObject:
     # notice the loop's start path sends: "Resuming…" for these, "Starting song at
     # Xs" for an ordinary ?t= entry.
     is_resume: bool = False
-    # Park the song at vc.play() so it comes back paused: the song -playnow
-    # interrupted, or a -restart replay of one. Set with is_resume for the first
-    # and without it for the second, so neither implies the other.
+    # The interrupted song was paused at interjection time: the loop re-pauses
+    # immediately after vc.play() so it returns parked.
     start_paused: bool = False
     # A -restart replay of the song that is playing. RUNTIME-ONLY, like np_host_ref
     # below: it describes the handover, not the entry, and the entry outlives the

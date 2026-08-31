@@ -1678,8 +1678,8 @@ class MusicBot(commands.Cog):
             "Starts the song that is playing over from 0:00.\n\n"
             "Nothing is dropped from the queue: the song plays again first, then "
             "everything behind it follows in the same order, each one a song-length "
-            "further out. A **paused** song comes back paused at the beginning — "
-            "`-restart` moves the position, not the play/pause state."
+            "further out. A **paused** song comes back playing, the way `-play` "
+            "does — you named this song, so the ask is for it to sound."
         ),
         extras={
             "category": "Playback",
@@ -1692,11 +1692,13 @@ class MusicBot(commands.Cog):
         },
     )
     @commands.before_invoke(validate_commands)
-    # As -playnow: restart_current() re-checks the live song, but that check cannot
-    # serialize two callers of THIS command — each would front-insert a replay and
-    # the song would play three times. The cooldown is the other axis: every restart
-    # writes a history entry, and the list is LTRIMmed to HISTORY_CACHE_LIMIT on
-    # every write, so an unpaced repeat evicts plays a guild cannot get back.
+    # As -playnow. restart_current() declines a song another interrupt has already
+    # stopped, which is what keeps -restart and -playnow — separate max_concurrency
+    # buckets — from both front-inserting against it; this closes the same hazard
+    # between two callers of THIS command. The cooldown is the other axis: every
+    # restart writes a history entry, and the list is LTRIMmed to
+    # HISTORY_CACHE_LIMIT on every write, so an unpaced repeat evicts plays a guild
+    # cannot get back.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.cooldown(1, 5.0, commands.BucketType.guild)
     @_tracer.start_as_current_span("bot.restart")
@@ -1749,21 +1751,11 @@ class MusicBot(commands.Cog):
                         )
                     )
                     return
-                if outcome.returns_paused:
-                    # Orange, not blue: this outcome makes no sound. The loop sends
-                    # its own notice under the card; this one answers the command.
-                    embed = notice_embed(
-                        f"⏸️ **{safe_label(outcome.title, _ECHO_MAX)}** restarted to `0:00` — "
-                        f"still paused at the start. Use `-resume` to play it. "
-                        f"(Was paused at `{outcome.position_str}`.)",
-                        discord.Color.orange(),
-                    )
-                else:
-                    embed = notice_embed(
-                        f"🔁 Restarting **{safe_label(outcome.title, _ECHO_MAX)}** from `0:00` "
-                        f"— was at `{outcome.position_str}`.",
-                        discord.Color.blue(),
-                    )
+                embed = notice_embed(
+                    f"🔁 Restarting **{safe_label(outcome.title, _ECHO_MAX)}** from `0:00` "
+                    f"— was at `{outcome.position_str}`.",
+                    discord.Color.blue(),
+                )
                 await asyncio.gather(
                     ctx.send(embed=embed),
                     ctx.message.add_reaction("🔁"),

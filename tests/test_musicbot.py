@@ -2306,32 +2306,34 @@ class TestRestartCommand:
         assert embed.color == discord.Color.blue()
         mock_ctx.message.add_reaction.assert_awaited_once_with("🔁")
 
-    async def test_paused_song_is_announced_as_returning_paused(
+    async def test_a_paused_song_is_restarted_and_confirmed_the_same_way(
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """The song comes back parked at 0:00 and makes no sound, so the reply has
-        to say so — the reaction alone looks like a bot that did nothing."""
+        """A paused song comes back playing, so there is one wording rather than
+        two. The dispatch guard admits a paused voice client for the same reason:
+        refusing there would make -restart the one playback verb a pause turns
+        off."""
         from src.musicplayer import RestartOutcome
 
         live_vc.is_playing.return_value = False
         live_vc.is_paused.return_value = True
         live_mp.restart_current = AsyncMock(
-            return_value=RestartOutcome(
-                title="Original Song", position=151, returns_paused=True
-            )
+            return_value=RestartOutcome(title="Original Song", position=151)
         )
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
 
         await command_callback(MusicBot.restart)(music_bot, mock_ctx)
 
-        description = mock_ctx.send.await_args.kwargs["embed"].description
-        assert "paused at `2:31`" in description
-        assert "-resume" in description
+        live_mp.restart_current.assert_awaited_once()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.color == discord.Color.blue()
+        assert "from `0:00`" in embed.description
+        assert "paused" not in embed.description
 
     @pytest.mark.parametrize(
         "state",
@@ -2408,34 +2410,6 @@ class TestRestartCommand:
         assert "already at the beginning" in embed.description
         assert "Original Song" in embed.description
         mock_ctx.message.add_reaction.assert_not_awaited()
-
-    async def test_a_paused_reply_does_not_look_like_playback(
-        self,
-        music_bot: MusicBot,
-        mock_ctx: MagicMock,
-        live_mp: MagicMock,
-        live_vc: MagicMock,
-    ) -> None:
-        """Blue and 🔁 are what the bot uses for "something is playing". A restart
-        that comes back paused makes no sound, so it says so first and in the colour
-        -pause uses."""
-        from src.musicplayer import RestartOutcome
-
-        live_vc.is_playing.return_value = False
-        live_vc.is_paused.return_value = True
-        live_mp.restart_current = AsyncMock(
-            return_value=RestartOutcome(
-                title="Original Song", position=151, returns_paused=True
-            )
-        )
-        music_bot.get_mp = MagicMock(return_value=live_mp)
-        mock_ctx.voice_client = live_vc
-
-        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
-
-        embed = mock_ctx.send.await_args.kwargs["embed"]
-        assert embed.color == discord.Color.orange()
-        assert "still paused" in embed.description
 
     async def test_shows_typing_while_the_replay_resolves(
         self,
@@ -2727,6 +2701,13 @@ class TestHistoryCommand:
         assert buckets._cooldown is not None
         assert buckets._cooldown.rate == 1
         assert buckets.type is commands.BucketType.guild
+
+    def test_restart_requires_the_author_in_the_voice_channel(self) -> None:
+        """command_callback() hands back the raw callback, so every test of -restart
+        runs with its decorators bypassed — deleting this one leaves the suite green
+        while the command reaches ctx.voice_client for a user who is not in the
+        channel, and restarts a song for a guild the caller is not listening to."""
+        assert MusicBot.restart._before_invoke is MusicBot.validate_commands
 
     def test_the_shuffle_copy_and_the_refusal_quote_the_same_number(self) -> None:
         """The FIXME this closed was exactly this drift: the code refused at one
