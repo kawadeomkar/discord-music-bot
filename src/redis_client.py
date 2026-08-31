@@ -76,7 +76,7 @@ OUTBOX_FIELD = b"e"
 GUILD_TTL = 86400
 # The retention cap, the display cap and the -history ceiling at once — the same
 # number on purpose. push_history LTRIMs the list to this on every write and
-# PERSISTs it, and musicbot.HISTORY_MAX_LIMIT is pinned to this constant, so the
+# PERSISTs it, and guild_history.HISTORY_MAX_LIMIT is pinned to this constant, so the
 # command can never ask for more slots than the window holds. "Slots", not "plays":
 # the equality leaves no headroom, so anything that costs a slot without yielding a
 # renderable play shortens the answer by one — a corrupt entry (get_history drops
