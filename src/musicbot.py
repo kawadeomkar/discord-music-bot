@@ -26,11 +26,12 @@ from src.config import (
     using_default_postgres_password,
 )
 from src import debug as debug_mode
-from src import analytics_card, leaderboard
+from src.commands import leaderboard as leaderboard_cmd
+from src import analytics_card
 from src.guild_history import history_embeds
 from src.guild_state import Analytics
 from src.analytics_card import AnalyticsFlags
-from src.leaderboard import LeaderboardFlags
+from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
 )
@@ -38,8 +39,6 @@ from src.musicplayer import MusicPlayer
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     GuildRedisStore,
-    cache_get,
-    cache_set,
 )
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
@@ -2074,67 +2073,9 @@ class MusicBot(commands.Cog):
         self, ctx: commands.Context, *, flags: LeaderboardFlags
     ) -> None:
         try:
-            # Locals: ctx.guild is a property and history_archive an attribute,
-            # so narrowing on either would not survive the awaits below.
-            guild = ctx.guild
-            archive = self.history_archive
-            if guild is None:
-                await ctx.send(
-                    embed=notice_embed(
-                        "Leaderboards are per server — use this in a server channel.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            if archive is None:
-                await ctx.send(
-                    embed=notice_embed(
-                        "This server's host has not enabled the long-term play "
-                        "archive, so there is no leaderboard data.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            if not 0 <= flags.days <= leaderboard.MAX_DAYS:
-                await ctx.send(
-                    embed=notice_embed(
-                        f"--days must be between 1 and {leaderboard.MAX_DAYS}. "
-                        "Omit it, or pass 0, for all-time.",
-                        discord.Color.red(),
-                    )
-                )
-                return
-            key = leaderboard.cache_key(guild.id, flags.days, leaderboard.TOP_N)
-            board = leaderboard.from_cache(
-                await cache_get(self.redis, key), top_n=leaderboard.TOP_N
+            await leaderboard_cmd.run(
+                ctx, flags, archive=self.history_archive, redis=self.redis
             )
-            if board is None:
-                since = time.time() - flags.days * 86400 if flags.days else 0.0
-                async with background_typing(ctx):
-                    board = await archive.leaderboard(
-                        guild.id, leaderboard.TOP_N, since_epoch=since
-                    )
-                await cache_set(
-                    self.redis,
-                    key,
-                    leaderboard.to_cache(board),
-                    leaderboard.CACHE_TTL_SECS,
-                )
-            embed = leaderboard.build_embed(board, days=flags.days, guild=guild)
-            if embed is None:
-                window = (
-                    f"in the last {flags.days} {pluralize(flags.days, 'day')}"
-                    if flags.days
-                    else "yet"
-                )
-                await ctx.send(
-                    embed=notice_embed(
-                        f"Nothing has been archived {window} — play something first!",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            await ctx.send(embed=embed)
         except Exception as e:
             # Fixed copy rather than the exception text: this is the only command
             # whose failures come from infrastructure, so the default detail would
