@@ -31,6 +31,8 @@ from src.guild_state import (
 )
 from tests.helpers import mocked
 from src.redis_client import (
+    analytics_png_get,
+    analytics_png_set,
     GUILD_TTL,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_GROUP,
@@ -3056,3 +3058,45 @@ class TestGuildConfigStore:
         await store.set_debug_mode(True)
         assert await store.clear_config() is True
         assert await fake_redis.exists(store.config_key()) == 0
+
+
+class TestAnalyticsPngCache:
+    """Raw bytes in and out. Deliberately not cache_get/cache_set: those
+    orjson-encode, which would base64 a PNG for a 33% penalty."""
+
+    async def test_round_trip_preserves_the_bytes_exactly(
+        self, fake_redis: Redis
+    ) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:abc", png, 60)
+        assert await analytics_png_get(fake_redis, "analytics:png:v1:1:30:abc") == png
+
+    async def test_a_miss_is_none_not_an_error(self, fake_redis: Redis) -> None:
+        assert await analytics_png_get(fake_redis, "analytics:png:v1:1:30:nope") is None
+
+    async def test_a_non_positive_ttl_writes_nothing(self, fake_redis: Redis) -> None:
+        """A non-positive TTL means the aggregate straddled a midnight, so it does
+        not cover the day it would be served for. Writing it with no expiry at all
+        would also put an unbounded key in a volatile-lru store."""
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:stale", b"x", 0)
+        assert (
+            await analytics_png_get(fake_redis, "analytics:png:v1:1:30:stale") is None
+        )
+
+    async def test_the_entry_carries_a_ttl(self, fake_redis: Redis) -> None:
+        """It must stay an eviction CANDIDATE — golden rule 12's non-evictable keys
+        are the outbox, the history lists and the per-guild config, and a persistent
+        chart blob has no business joining them."""
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:ttl", b"x", 120)
+        assert 0 < await fake_redis.ttl("analytics:png:v1:1:30:ttl") <= 120
+
+    async def test_neither_helper_raises_when_redis_is_none(self) -> None:
+        await analytics_png_set(None, "k", b"x", 60)
+        assert await analytics_png_get(None, "k") is None
+
+    async def test_neither_helper_raises_when_redis_fails(self) -> None:
+        broken = MagicMock()
+        broken.set = AsyncMock(side_effect=ConnectionError("down"))
+        broken.get = AsyncMock(side_effect=ConnectionError("down"))
+        await analytics_png_set(broken, "k", b"x", 60)
+        assert await analytics_png_get(broken, "k") is None

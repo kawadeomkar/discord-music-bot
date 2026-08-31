@@ -26,9 +26,10 @@ from src.config import (
     using_default_postgres_password,
 )
 from src import debug as debug_mode
-from src import leaderboard
+from src import analytics_card, leaderboard
 from src.guild_history import history_embeds
 from src.guild_state import Analytics
+from src.analytics_card import AnalyticsFlags
 from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -700,6 +701,15 @@ class MusicBot(commands.Cog):
             # try/except never sees it — e.g. `-history --limit abc`.
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
+            )
+        elif isinstance(error, commands.CommandOnCooldown):
+            # Raised in prepare(), before the body. The retry seconds are named so
+            # the refusal reads as a limit rather than a fault.
+            await ctx.send(
+                embed=notice_embed(
+                    f"That was just run here — try again in {error.retry_after:.0f}s.",
+                    discord.Color.orange(),
+                )
             )
         elif isinstance(error, commands.MaxConcurrencyReached):
             # Raised in prepare(), before the body, so the command's own try/except
@@ -2137,6 +2147,60 @@ class MusicBot(commands.Cog):
                 e,
                 title="Leaderboard unavailable",
                 detail="The long-term archive could not be reached. Try again in a moment.",
+            )
+
+    @commands.command(
+        name="analytics",
+        aliases=["an"],
+        brief="charts and totals for this server (long-term archive)",
+        usage="[--days N]",
+        help=(
+            "Shows a chart of this server's listening — plays per day by source, "
+            "when the server listens, listening time, how much of each song gets "
+            "played, song lengths and queue wait — with the top listeners, artists "
+            "and songs beside it.\n\n"
+            "`--days N` picks the window: 7, 30, 90 or 365. It covers COMPLETE "
+            "days, so today is not included — `-history` shows what just played. "
+            "The numbers come from this server's long-term play archive."
+        ),
+        extras={
+            "category": "Queue",
+            # Read by cog_before_invoke to skip get_mp(): this command reads the
+            # archive and never touches voice, so manufacturing a player for it
+            # starts _restore_state() and a 300s gate on a guild doing nothing.
+            "observation_only": True,
+            "examples": ["-analytics", "-an", "-analytics --days 90"],
+            "note": (
+                "Available only when this server's host has enabled the "
+                "optional long-term archive. Times are UTC."
+            ),
+        },
+    )
+    # No validate_commands: reading a chart needs no voice channel. Two bounds on
+    # different axes — max_concurrency bounds how many run at once, the cooldown how
+    # often. See docs/ARCHITECTURE.md#analytics-rendering.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @commands.cooldown(1, 30.0, commands.BucketType.guild)
+    @_tracer.start_as_current_span("bot.analytics")
+    async def analytics(self, ctx: commands.Context, *, flags: AnalyticsFlags) -> None:
+        try:
+            await analytics_card.run(
+                ctx,
+                flags,
+                archive=self.history_archive,
+                redis=self.redis,
+                tasks=self._restore_tasks,
+            )
+        except Exception as e:
+            # Fixed copy, as -leaderboard does: the default detail would publish the
+            # archive's host and port. The trace footer still joins the span.
+            await self._command_error(
+                ctx,
+                e,
+                title="Analytics unavailable",
+                detail=(
+                    "The long-term archive could not be reached. Try again in a moment."
+                ),
             )
 
     @commands.command(

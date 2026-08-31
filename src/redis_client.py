@@ -277,6 +277,47 @@ async def spotify_token_get_with_ttl(
         return None
 
 
+# ── -analytics rendered chart cache ───────────────────────────────────────────
+# Raw bytes, not cache_get/cache_set: those orjson-encode, which would base64 a PNG.
+# The pool is decode_responses=False, so redis.get() already hands back bytes.
+#
+# Never-raise, like every cache helper here. Both keys are TTL'd, so they are
+# volatile-lru candidates and rule 12's non-evictable keys are untouched. A ~86 KiB
+# PNG is large enough to evict other TTL'd keys, which the closed key space — four
+# windows per guild per day — is what bounds.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+
+
+async def analytics_png_set(
+    redis: Optional[aioredis.Redis], key: str, png: bytes, ttl: int
+) -> None:
+    """Store a rendered chart. No-ops when redis is None, when the TTL is not
+    positive (the aggregate straddled a midnight, so it does not cover the day it
+    would be served for), or on any Redis error."""
+    if redis is None or ttl <= 0:
+        return
+    try:
+        await redis.set(key, png, ex=ttl)
+    except Exception as e:
+        log.warning(f"analytics_png_set failed [{key}]: {e}")
+
+
+async def analytics_png_get(
+    redis: Optional[aioredis.Redis], key: str
+) -> Optional[bytes]:
+    """The cached chart, or None on miss/error. The key carries a digest of the
+    aggregate it was rendered FROM, so a stale entry simply misses rather than
+    pairing a chart from one hour with numbers from another."""
+    if redis is None:
+        return None
+    try:
+        value = await redis.get(key)
+        return value if isinstance(value, bytes) else None
+    except Exception as e:
+        log.warning(f"analytics_png_get failed [{key}]: {e}")
+        return None
+
+
 # ── History outbox (drain side) ───────────────────────────────────────────────
 # Consumed only by HistoryOutboxDrainer (history_archive.py). Unlike the cache
 # helpers above, these DO raise on Redis failure — the drainer's backoff loop is the
