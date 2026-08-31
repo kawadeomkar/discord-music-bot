@@ -8,7 +8,6 @@ from typing import (
     Optional,
     Union,
     assert_never,
-    cast,
 )
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 
@@ -20,13 +19,11 @@ import redis.asyncio as aioredis
 from src.config import (
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
-    debug_prometheus_url,
-    history_archive_enabled,
     spotify_enabled,
-    using_default_postgres_password,
 )
 from src import debug as debug_mode
 from src.commands import clear as clear_cmd
+from src.commands import debug as debug_cmd
 from src.commands import history as history_cmd
 from src.commands import join as join_cmd
 from src.commands import jump as jump_cmd
@@ -56,9 +53,6 @@ from src.history_archive import (
     ArchiveReader,
 )
 from src.musicplayer import MusicPlayer
-from src.redis_client import (
-    GuildRedisStore,
-)
 from src.sources import (
     timestamp_warning,
     unquote_argument,
@@ -1787,7 +1781,7 @@ class MusicBot(commands.Cog):
                 # unusable without spending a doomed API call (see probe_spotify).
                 spotify_status=self._spotify_status,
                 archive=self.history_archive,
-                debug_suffix=self._debug_suffix(ctx),
+                debug_suffix=self.debug_suffix(ctx),
             )
         except Exception as e:
             await self._command_error(ctx, e)
@@ -1796,7 +1790,7 @@ class MusicBot(commands.Cog):
     # The state machine is DebugSettings (src/debug.py); what stays here is the
     # command surface and the permission policy around the toggle.
 
-    def _debug_suffix(
+    def debug_suffix(
         self, ctx: commands.Context, *, host_metrics: bool = True
     ) -> Optional[str]:
         """The dashboards' debug footer, for a ctx rather than a guild."""
@@ -1856,144 +1850,9 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.debug")
     async def debug(self, ctx: commands.Context, *, arg: str = "") -> None:
         try:
-            action = debug_mode.parse_debug_arg(arg)
-            if action is None:
-                await ctx.send(
-                    embed=notice_embed(
-                        debug_mode.unknown_arg_message(arg), discord.Color.red()
-                    )
-                )
-                return
-            if action is not debug_mode.DebugAction.STATUS:
-                await self._toggle_debug_mode(ctx, action)
-                return
-            inputs = await self._debug_inputs(ctx)
-            # No typing indicator and no ctx.send: the dashboard sends its own
-            # skeleton immediately and edits it as blocks land, so the reply IS the
-            # acknowledgement. It uses channel.send to stay off the Now Playing host,
-            # which an edit loop must not own (src/dashboard.py).
-            await debug_mode.run_debug_dashboard(ctx, inputs)
+            await debug_cmd.run(ctx, arg, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
-
-    async def _debug_inputs(self, ctx: commands.Context) -> debug_mode.DebugInputs:
-        """Everything the snapshot cannot reach on its own (src/debug.py importing
-        MusicBot would be a cycle)."""
-        guild_id = ctx.guild.id if ctx.guild else None
-        archive_enabled = history_archive_enabled()
-        operator = await self._is_owner(ctx)
-        # Asked symmetrically — not only when the password IS the default — because a
-        # row that renders for False and vanishes for True makes its own absence the
-        # answer. Moot while the whole Checks block is owner-only, and it stays right
-        # if that ever loosens.
-        default_password = (
-            (using_default_postgres_password() and archive_enabled)
-            if operator
-            else None
-        )
-        return debug_mode.DebugInputs(
-            debug_enabled=self.debug_settings.enabled(guild_id),
-            debug_overridden=self.debug_settings.has_override(guild_id),
-            debug_persisted=self.debug_settings.is_persisted(guild_id),
-            players=len(self.mps),
-            player=self.mps.get(guild_id) if guild_id is not None else None,
-            redis=self.redis,
-            store=GuildRedisStore(self.redis, guild_id)
-            if self.redis is not None and guild_id is not None
-            else None,
-            # Structural: PostgresHistoryArchive satisfies ArchiveStatsReader, and
-            # a cog built without an archive (tests, disabled tier) passes None.
-            archive=cast(
-                Optional["debug_mode.ArchiveStatsReader"], self.history_archive
-            ),
-            archive_enabled=archive_enabled,
-            prometheus_url=debug_prometheus_url(),
-            operator=operator,
-            default_password=default_password,
-            # Gated on `operator`: the card withholds its Runtime block from a
-            # non-owner and says so, so the footer must not print those figures.
-            debug_suffix=self._debug_suffix(ctx, host_metrics=operator),
-        )
-
-    async def _is_owner(self, ctx: commands.Context) -> bool:
-        """Is the caller the bot owner? Fails CLOSED.
-
-        `is_owner()` falls through to an `application_info()` REST call when neither
-        owner_id nor owner_ids is configured (MusicBotApp sets neither), and it RAISES
-        rather than returning False — a diagnostic must not disclose the host just
-        because Discord blinked. discord.py caches the answer onto the bot afterwards,
-        so this is one round trip per process, not per command.
-        """
-        try:
-            return await ctx.bot.is_owner(ctx.author)
-        except Exception as e:  # noqa: BLE001 — an unreachable owner is not an owner
-            log.warning(f"owner check failed, denying: {type(e).__name__}: {e}")
-            return False
-
-    async def _toggle_debug_mode(
-        self, ctx: commands.Context, action: debug_mode.DebugAction
-    ) -> None:
-        """Apply `--enable`/`--disable` to the invoking guild and confirm it."""
-        if ctx.guild is None:
-            await ctx.send(
-                embed=notice_embed(
-                    "Debug mode is set per server, so it can't be toggled from a "
-                    f"direct message. It is currently "
-                    f"**{'on' if self.debug_settings.default else 'off'}** here, following "
-                    "the host's `DEBUG_MODE` default.",
-                    discord.Color.orange(),
-                )
-            )
-            return
-        # A moderator action: the toggle is guild-wide and every member sees the
-        # result on every reply, so it is not the invoking user's to make alone.
-        # Reading `-debug` stays open to everyone; only writing is gated.
-        author = ctx.author
-        may_toggle = (
-            isinstance(author, discord.Member) and author.guild_permissions.manage_guild
-        ) or await self._is_owner(ctx)
-        if not may_toggle:
-            await ctx.send(
-                embed=notice_embed(
-                    "Debug mode changes what **every** embed in this server looks "
-                    "like, so switching it needs the Manage Server permission. Run "
-                    "`-debug` on its own to see the current state.",
-                    discord.Color.red(),
-                )
-            )
-            return
-        enabled = action is debug_mode.DebugAction.ENABLE
-        persisted = await self.debug_settings.toggle(self.redis, ctx.guild.id, enabled)
-        # Say which kind of change this was. A guild told "on" that quietly reverts
-        # on the next restart reads as the bot ignoring them, so a degraded write is
-        # named rather than rounded up to success.
-        durability = (
-            "The setting is saved for this server."
-            if persisted
-            else "⚠️ It could not be saved (Redis is unavailable), so it applies "
-            "until the bot restarts."
-        )
-        # Names what enabling publishes, at the moment the choice is made: the
-        # footer reports the whole process's load, and the Now Playing card carries
-        # it passively to everyone who can read the channel while music plays.
-        scope = (
-            " While it is on, every embed here — including the live Now Playing "
-            "card — shows the bot process's load to anyone who can read the channel."
-            if enabled
-            else ""
-        )
-        await ctx.send(
-            embed=notice_embed(
-                f"Debug mode is now **{'on' if enabled else 'off'}** for this "
-                "server. Embeds "
-                + ("carry" if enabled else "no longer carry")
-                + " a debug footer; nothing about playback changes either way."
-                + scope
-                + " "
-                + durability,
-                discord.Color.blue(),
-            )
-        )
 
     # ── Restart recovery listeners ────────────────────────────────────────────
 

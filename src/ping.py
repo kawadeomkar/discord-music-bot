@@ -517,7 +517,7 @@ async def run_health_dashboard(
     # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
     # Defaulted, unlike `archive`: None here is a real state (debug mode off, what
-    # MusicBot._debug_suffix returns) rather than an unknown, and forgetting it
+    # MusicBot.debug_suffix returns) rather than an unknown, and forgetting it
     # costs a footer, not a wrong health answer.
     debug_suffix: Optional[str] = None,
 ) -> None:
