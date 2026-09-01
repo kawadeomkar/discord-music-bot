@@ -14,6 +14,7 @@ import discord
 import fakeredis
 import pytest
 
+from src import play_pipeline
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -559,3 +560,20 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
     return cog
+
+
+_PLAY_STAGES = ("queue_source", "enqueue_single", "enqueue_playlist")
+
+
+@pytest.fixture(autouse=True)
+def _restore_play_stages() -> Iterator[None]:
+    """Put the pipeline's stage functions back after a test stubs them.
+
+    They are module globals, so an assignment outlives the test that made it and the
+    next one runs against the previous one's mock. Here rather than in one test file
+    because -play, -playnow and the pipeline's own tests all stub them.
+    """
+    saved = {name: getattr(play_pipeline, name) for name in _PLAY_STAGES}
+    yield
+    for name, fn in saved.items():
+        setattr(play_pipeline, name, fn)
