@@ -6,7 +6,6 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from contextlib import AbstractAsyncContextManager
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -544,13 +543,21 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
         )
 
 
+def _looks_like_url(query: str) -> bool:
+    """Whether a resolve input is a link rather than words to search with. One
+    predicate, because two places branch on it and they must agree: the cache key
+    (a link's is not case-folded) and the revalidation (a link's mapping cannot
+    drift)."""
+    return "://" in query.strip()
+
+
 def _source_cache_key(search: str) -> str:
     """The ytdl:source key for a query. Case-folded so "Destiny" and "destiny " reach
     one entry — but never for a URL: YouTube video ids are case-sensitive, so `?v=aB`
     and `?v=Ab` would share an entry and the second would be served the first's song
     for the whole TTL."""
     query = search.strip()
-    return f"ytdl:source:{query if '://' in query else query.lower()}"
+    return f"ytdl:source:{query if _looks_like_url(query) else query.lower()}"
 
 
 def _source_entry_is_stale(cached: Any) -> bool:
@@ -1123,7 +1130,9 @@ def _inflight_key(cache_key: str, profile: str) -> str:
     return f"{cache_key}|{profile}"
 
 
-def _held(slot: Optional[asyncio.Semaphore]) -> AbstractAsyncContextManager[Any]:
+def _held(
+    slot: Optional[asyncio.Semaphore],
+) -> contextlib.AbstractAsyncContextManager[Any]:
     """`slot` as an async context manager, or nothing to hold. A resolve reached
     outside a command (a lazy entry at dequeue, a test) passes None."""
     return slot if slot is not None else contextlib.nullcontext()
@@ -1678,7 +1687,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
                 stale = _source_entry_is_stale(cached)
                 trace.get_current_span().set_attribute("ytdl.source_stale", stale)
-                if stale and "://" not in search.strip():
+                if stale and not _looks_like_url(search):
                     # Served now, refreshed behind the reply: what ages is the
                     # ranking a search resolved through, and a link's mapping is
                     # the link. Not awaited — this play uses the entry it has.
