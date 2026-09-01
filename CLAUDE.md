@@ -1071,8 +1071,13 @@ touch Discord; a caller with no Redis write to make passes an empty body.
 ## CI/CD and deployment
 
 `ci.yml` jobs: **resolve-env** (environment name + semver-validated version from
-pyproject — single source for image and release tags) → **lint** (justfile fmt/parse,
-pin agreement, ruff, pyright) and **test** (coverage + PR comment) and **container-test**
+pyproject — single source for image and release tags) → **version-bump** (pull
+requests only: that version must be strictly above the base branch TIP's, compared as
+major.minor.patch, so every merge moves it. Nothing else enforces the per-PR bump —
+`release` treats an unchanged version as the ordinary no-op. It is deliberately absent
+from `build`'s `needs`: a job `if`-skipped on push would skip `build` with it, and it
+blocks a merge only once branch protection lists it as required) → **lint**
+(justfile fmt/parse, pin agreement, ruff, pyright) and **test** (coverage + PR comment) and **container-test**
 (suite inside the test image; deliberately runs with a read-only token — it executes PR
 code) and **pg-integration** (the `pg` tier against a postgres service container) and
 **redis-integration** (the `redis` tier against a redis service container) — both real
