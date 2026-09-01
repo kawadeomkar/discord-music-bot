@@ -440,3 +440,36 @@ class TestRemoveCommand:
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         assert removal_embed.colour == discord.Color.orange()
+
+    async def test_lazy_playlist_tracks_are_named_not_rendered_as_unknown(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A Spotify playlist enqueues one lazy YTSource per track, and YTSource has
+        no `title`, so the Songs field rendered `?` for every track — the case the
+        field exists for, since there is no undo."""
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[
+                    YTSource(ytsearch=f"ytsearch:Track {i} Artist") for i in range(3)
+                ],
+                positions=[1, 2, 3],
+                mode=RemoveMode.ORIGIN,
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://open.spotify.com/playlist/abc"
+        )
+
+        songs = next(
+            f
+            for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
+            if f.name == "Songs"
+        )
+        assert "Track 0 Artist" in (songs.value or "")
+        assert "ytsearch:" not in (songs.value or "")
+        assert "?" not in (songs.value or "")

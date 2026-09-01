@@ -187,6 +187,10 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     mp.repark_crashed_head = AsyncMock()
     mp.queue_put_front = AsyncMock()
     mp.queue_put = AsyncMock()
+    # `--next` inserts through its own wrapper, which neutralizes the loop's
+    # prefetch first — a plain front insert lands behind that claim.
+    mp.queue_put_next = AsyncMock()
+    mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in
     # Analytics.queue_position and rides to Postgres through HistoryEntry's

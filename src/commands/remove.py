@@ -10,6 +10,7 @@ from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.musicplayer import MusicPlayer
 from src.sources import QUERY_SOURCE_SEARCH
 from src.util import (
+    ECHO_MAX,
     ECHO_ROW_MAX,
     EMBED_FIELD_LIMIT,
     notice_embed,
@@ -23,17 +24,12 @@ from src.youtube import QueueObject
 from src.commands._common import await_restore
 
 
-# Bound on one echoed needle, which owns a field to itself. Discord renders
-# markdown in field values, so what a user typed goes through safe_label first.
-_ECHO_MAX = 200
-
-
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
 _MAX_SHOWN_POSITIONS = 60
 
 
-def _echo(text: str, limit: int = _ECHO_MAX) -> str:
+def _echo(text: str, limit: int = ECHO_MAX) -> str:
     """A needle safe to put in an embed — see util.safe_label."""
     return safe_label(text, limit)
 

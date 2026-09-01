@@ -758,8 +758,8 @@ class QueueObject:
     # it was never RPUSHed to the Redis queue list (it lives in current_song_url state),
     # so the loop must skip its redis_pop_for(). Read via guild_queue.is_persisted().
     persisted: bool = True
-    # ── -playnow interjection flags ──
-    # Queued via -playnow. Attribution only — interjections stack, so nothing reads
+    # ── interjection flags ──
+    # Queued by an interjection. Attribution only — they stack, so nothing reads
     # this except the span attribute.
     interjected: bool = False
     # The rebuilt tail of an interrupted song (ts = interrupt position). Drives which
@@ -907,7 +907,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
         self.start_offset: int = start_offset
-        # -playnow flags carried through from the QueueObject (see its fields).
+        # Interjection flags carried through from the QueueObject (see its fields).
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
@@ -916,11 +916,10 @@ class YTDL(discord.FFmpegOpusAudio):
         self.analytics: Analytics = analytics
         self.query_source: str = query_source
         # What the user typed, carried so -remove still matches a song that has
-        # become a playing one — a -playnow resume tail is rebuilt from here.
+        # become a playing one — a resume tail is rebuilt from here.
         self.user_input: Optional[str] = user_input
-        # Whether this song's entry is still on the Redis list (QueueObject.persisted):
-        # read by the loop to decide whether settling its claim LPOPs. A crash-
-        # recovered head that came back True would retire an entry never its own.
+        # Whether this song's entry is still on the Redis list: the loop reads it to
+        # decide whether settling its claim LPOPs (QueueObject.persisted).
         self.persisted: bool = persisted
         # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
         # which inherits the interrupted song's start (see QueueObject.played_at).

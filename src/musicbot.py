@@ -31,7 +31,6 @@ from src.commands import now as now_cmd
 from src.commands import pause as pause_cmd
 from src.commands import ping as ping_cmd
 from src.commands import play as play_cmd
-from src.commands import playnow as playnow_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import resume as resume_cmd
@@ -46,6 +45,7 @@ from src.commands.history import (
 )
 from src.play_pipeline import PlaylistInputError
 from src.commands.analytics import AnalyticsFlags
+from src.play_placement import PlayMode
 from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -184,6 +184,8 @@ class MusicBot(commands.Cog):
         self._active_spans: dict[int, ActiveCommand] = {}
         self.voice_watchdog = VoiceWatchdog(self)
         self._restore_tasks: set[asyncio.Task] = set()
+        # One -play in flight per guild PER PLACEMENT — see commands.play.play_bucket.
+        self._play_inflight: set[tuple[int, PlayMode]] = set()
         # Debug mode: the durable per-guild choice, its read cache and the runtime
         # sampler, all owned by DebugSettings (src/debug.py). MusicContext.send and
         # MusicPlayer read this attribute directly. Named debug_settings, not debug:
@@ -556,87 +558,63 @@ class MusicBot(commands.Cog):
         name="play",
         aliases=["p", "sing"],
         brief="queue a song and start playing",
-        usage="<url|search>",
+        usage="[--now|--next] <url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track or playlist link, a SoundCloud link, or "
-            "plain words to search YouTube with.\n\n"
+            "playlist, a Spotify track or playlist link, a SoundCloud link, or plain "
+            "words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
-            "If something is already playing, the song is appended to the queue "
-            "and you get an estimated start time. A YouTube link carrying a "
-            "`?t=` / `?ts=` timestamp starts the song at that offset.\n\n"
-            "A YouTube playlist link copied from partway through — one carrying "
-            "an `&index=` — queues from that position, skipping the songs "
-            "before it. Drop the `&index=` to queue the whole playlist."
+            "Otherwise the song is appended to the queue with an estimated start time. "
+            "A `?t=` / `?ts=` timestamp starts it at that offset, and a playlist link's "
+            "`&index=` starts from that position instead of from the first track.\n\n"
+            "One option, as the first word:\n\n"
+            "`--now` plays it immediately. The interrupted song returns from the exact "
+            "position it left off at, paused if it was paused, unless it was nearly "
+            "over. Interrupt again and the parked songs unwind most recent first.\n\n"
+            "`--next` queues it at the front instead, without interrupting anything."
+            "\n\n"
+            "Both take a whole playlist in full. With `--now` that means the "
+            "interrupted song does not return until the last track — `-remove` with "
+            "the same link takes the whole thing back out."
         ),
         extras={
             "category": "Playback",
             "examples": [
                 "-play never gonna give you up",
+                "-p --now never gonna give you up",
+                "-p --next https://youtu.be/dQw4w9WgXcQ",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
                 "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
-                "Spotify links are matched to YouTube audio one title at a time, "
-                "so a long playlist takes a few seconds to finish queueing."
+                "Spotify links are matched to YouTube audio one title at a time, so a "
+                "long playlist takes a few seconds to finish queueing — and one plain "
+                "`-play` runs at a time per server, so a second one sent meanwhile is "
+                "declined rather than queued. `--now` and `--next` have their own "
+                "limit, so an urgent request still goes through."
             ),
         },
     )
-    # Serialized per guild, like -resume: two concurrent invocations both read a
-    # live current_song and both park a resume tail for it, so one play comes back
-    # twice. wait=False — the second caller is told to wait rather than queued
-    # behind a 1-4s extraction.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    # Serialized per guild PER PLACEMENT by commands.play.play_bucket, not by
+    # max_concurrency: the decorator acquires before the argument is parsed, so it
+    # cannot see which placement was asked for.
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
         try:
             await play_cmd.run(ctx, url, cog=self)
+        except commands.MaxConcurrencyReached:
+            # The per-placement bucket's refusal, raised by hand inside the body
+            # because the decorator cannot see the flag. cog_command_error owns the
+            # wording; an embed here would fork it.
+            raise
+        except play_cmd.InterjectionFailed as e:
+            # The branch the user asked for, not the command they typed.
+            await self._command_error(ctx, e.cause, title="Failed to play song now")
         except Exception as e:
             await self._command_error(ctx, e, title="Failed to queue song")
-
-    @commands.command(
-        name="playnow",
-        aliases=["pn"],
-        brief="play a song immediately, resuming the current one after",
-        usage="<url|search>",
-        help=(
-            "Interrupts whatever is playing so your song starts right now. The "
-            "interrupted song is not lost — it comes back from the exact position "
-            "it left off at, and if it was paused it returns paused.\n\n"
-            "Takes the same input as `-play`. If nothing is playing there is "
-            "nothing to interrupt, so this behaves exactly like `-play`.\n\n"
-            "A playlist can't be interjected — only its **first track** is played, "
-            "since queueing the whole thing would delay the interrupted song "
-            "indefinitely. Use `-play` for the full playlist."
-        ),
-        extras={
-            "category": "Playback",
-            "examples": [
-                "-playnow never gonna give you up",
-                "-pn https://youtu.be/dQw4w9WgXcQ",
-            ],
-            "note": (
-                "`-play` adds to the back of the queue; `-playnow` cuts the line and "
-                "hands the current song back afterwards. A song that was nearly over "
-                "will not return. Otherwise they stack: run it again and the song "
-                "you just interrupted waits its turn too, each one resuming from "
-                "where it left off, most recent first."
-            ),
-        },
-    )
-    # See -play: interject() re-checks current_song, but current_song outlives
-    # the check by a whole song, so the re-check cannot serialize two callers.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
-    @commands.before_invoke(validate_commands)
-    @_tracer.start_as_current_span("bot.playnow")
-    async def playnow(self, ctx: commands.Context, *, url: str) -> None:
-        try:
-            await playnow_cmd.run(ctx, url, cog=self)
-        except Exception as e:
-            await self._command_error(ctx, e, title="Failed to play song now")
 
     @commands.command(
         name="skip",

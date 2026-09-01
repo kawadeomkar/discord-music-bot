@@ -29,6 +29,7 @@ from src.guild_queue import (
     RemoveOutcome,
     ShuffleOutcome,
     is_persisted,
+    item_label,
     remove_matcher,
 )
 from src.guild_state import (
@@ -54,7 +55,13 @@ from src.util import (
     truncate_embed_title,
     get_logger,
 )
-from src.youtube import YTDL, NpHostRef, QueueObject, invalidate_stream_cache
+from src.youtube import (
+    YTDL,
+    NpHostRef,
+    QueueObject,
+    invalidate_stream_cache,
+    prefetch_warm_slot,
+)
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports MusicPlayer); the
@@ -155,7 +162,7 @@ _BAR_HEAD = "🔘"
 # instead of an API call pair per toggle.
 _PAUSE_DEBOUNCE_SECS = 0.5
 
-# ── -playnow interjection ──────────────────────────
+# ── interjection ───────────────────────────────────
 # Below this many seconds remaining, an interjected song gets no resume entry —
 # there is nothing meaningful to return to.
 _MIN_RESUME_REMAINING_SECS = 5
@@ -194,7 +201,7 @@ DEPTH_RESTORE_WAIT_SECS = 1.0
 
 @dataclass(frozen=True)
 class InterjectOutcome:
-    """What MusicPlayer.interject() did — everything -playnow needs for its
+    """What MusicPlayer.interject() did — everything `-play --now` needs for its
     confirmation wording."""
 
     interrupted_title: str
@@ -204,7 +211,7 @@ class InterjectOutcome:
     resume_position: Optional[int]
     was_paused: bool  # the OBSERVED state when it was interrupted
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
-    # -playnow restores what it interrupted while -play brings it back playing.
+    # `--now` restores what it interrupted while plain -play brings it back playing.
     # Wording must key off this, or a -play interjection announces "will return
     # paused" for a song that returns playing.
     returns_paused: bool = False
@@ -235,7 +242,7 @@ def _reached_end(song: YTDL) -> bool:
 
 def _remaining_secs(item: QueueObject) -> Optional[int]:
     """A queued item's expected playtime: full duration, minus the resume offset
-    for a -playnow resume entry — it plays only its tail, so counting the full
+    for a resume entry — it plays only its tail, so counting the full
     duration would overestimate everything behind it."""
     if item.duration is None:
         return None
@@ -1104,7 +1111,7 @@ class MusicPlayer:
           both current_song and still queued for the length of a probe
           (100ms-seconds).
         - UNDER by one when the live song has a parked tail from an EARLIER play
-          of the same URL (-play X, -playnow Y, -playnow X), which
+          of the same URL (-play X, -p --now Y, -p --now X), which
           has_resume_tail matches by URL."""
         depth = self.queue.display_size()
         current = self.current_song
@@ -1136,6 +1143,16 @@ class MusicPlayer:
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
 
+    async def _warm_stream(self, item: QueueObject) -> None:
+        """One enqueue-time stream warm, under the process-wide background bound.
+        One spawns per song, so a paste burst is N of them at once against a four-
+        worker pool; the bound is what keeps a worker free for the in-band resolve
+        another guild's playback loop is waiting on."""
+        if self.store is None:
+            return
+        async with prefetch_warm_slot():
+            await YTDL.prefetch_stream(item, redis=self.store.redis)
+
     async def queue_put_front(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
@@ -1156,9 +1173,7 @@ class MusicPlayer:
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                    self._spawn_background(self._warm_stream(item))
 
     async def queue_put_next(
         self,
@@ -1167,12 +1182,17 @@ class MusicPlayer:
         prefetch: bool = True,
     ) -> None:
         """Insert so this plays NEXT. The loop's prefetch holds a claim on the head
-        for the rest of the current song and nothing may go ahead of a claim (the
-        claimed items are a prefix, retired by LPOP), so the claim is given back
-        first, as interject() does — one killed FFmpeg, a cache-hit re-resolve. The
-        prefetch is not re-spawned: the slot's claim-then-null protocol with loop()
-        would orphan a task with a claim nothing settles. `prefetch` warms the URL."""
+        for the rest of the current song and nothing may go ahead of a claim (they are
+        a prefix, retired by LPOP), so the claim is given back first, as interject()
+        does — one killed FFmpeg, a cache-hit re-resolve. It is not re-spawned: the
+        slot's claim-then-null protocol with loop() has one slot. `prefetch` warms
+        the URL."""
         await self._neutralize_prefetch()
+        if self._prefetch_task is not None:
+            # loop() read-and-nulled the slot while that cancel settled and started
+            # the next song's prefetch, whose claim is open and which put_front lands
+            # behind. Once, not a loop: the window is one song boundary wide.
+            await self._neutralize_prefetch()
         await self.queue_put_front(obj, prefetch=prefetch)
 
     async def queue_get(self) -> QueueItem:
@@ -1192,7 +1212,7 @@ class MusicPlayer:
         good — the -clear/-remove half of "a song is recorded exactly once, when
         its queue object exits the queue".
 
-        These are -playnow resume tails: songs a listener heard part of, whose
+        These are interjection resume tails: songs a listener heard part of, whose
         remaining tail is discarded, so nothing else records them (the loop's single
         write site only fires for a song it played to its end). `played_at > 0.0` is
         the whole test — the loop stamps it at vc.play() and the tail inherits it;
@@ -1256,7 +1276,7 @@ class MusicPlayer:
         """Retire a dequeue that will never play, and record it if a listener
         already heard part of it.
 
-        For an ordinary song the flush is a no-op — nobody heard it. For a -playnow
+        For an ordinary song the flush is a no-op — nobody heard it. For a
         resume TAIL it is the difference between one record and none: the
         interrupted fragment declined to record itself (_skip_history_for), so the
         tail is the only writer left for a play that may have run for minutes. A
@@ -1273,14 +1293,7 @@ class MusicPlayer:
         # rather than a "queue cleared" reply that silently dropped plays.
         await self._flush_played(cleared_items)
         await self._dispose_orphaned_cards(cleared_items)
-        return [
-            (
-                item.title
-                if isinstance(item, QueueObject)
-                else (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-            )
-            for item in cleared_items
-        ]
+        return [item_label(item) for item in cleared_items]
 
     async def queue_shuffle(self) -> str:
         # Neutralize rather than cancel, and before shuffle()'s too-few guard:
@@ -1343,7 +1356,7 @@ class MusicPlayer:
         requester_line = f"Requester: [{_requester_mention(song.requester)}]"
         if song.duration_secs > 0:
             # Remaining, not total: a song started mid-stream (?t=, crash
-            # recovery, -playnow resume) finishes sooner than its full length.
+            # recovery, an interjection's resume) finishes sooner than its full length.
             remaining = max(0, song.duration_secs - int(position))
             requester_line += (
                 f"  ·  Estimated finish: {_fmt_finish_time(remaining, self.timezone)}"
@@ -1454,12 +1467,12 @@ class MusicPlayer:
         *,
         index: int,
         title: str,
+        note: str = "",
         warning: Optional[str] = None,
     ) -> discord.Embed:
-        """One queue entry as a card. Shared so the block's "Up next" and the -play
-        confirmation cannot drift: when they describe the same entry the bodies are
-        equal, which is what lets _enqueue_single drop one of them."""
-        description = self._queue_entry_description(item, index)
+        """One queue entry as a card, shared by the block's "Up next" and the -play
+        confirmation so the two cannot drift. `note` follows the ETA line."""
+        description = self._queue_entry_description(item, index) + note
         if warning:
             description += f"\n\n{warning}"
         embed = discord.Embed(
@@ -1470,7 +1483,7 @@ class MusicPlayer:
         return embed
 
     def build_queued_song_embed(
-        self, item: QueueItem, *, warning: Optional[str] = None
+        self, item: QueueItem, *, note: str = "", warning: Optional[str] = None
     ) -> discord.Embed:
         """The -play confirmation. `item` is located by identity, so the ETA is the
         one its real position earns; an entry a concurrent -clear removed renders at
@@ -1480,7 +1493,11 @@ class MusicPlayer:
             (i for i, queued in enumerate(items, 1) if queued is item), len(items) + 1
         )
         return self._build_queue_entry_embed(
-            item, index=index, title=f"Queued song — #{index}", warning=warning
+            item,
+            index=index,
+            title=f"Queued song — #{index}",
+            note=note,
+            warning=warning,
         )
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
@@ -1602,7 +1619,7 @@ class MusicPlayer:
 
         Takes either form of the same tail — the YTDL the loop is about to play, or
         the QueueObject a bulk mutation is destroying — since both carry the np_*
-        fields and the card outlives whichever goes away. Without it a -playnow
+        fields and the card outlives whichever goes away. Without it an interjected
         stack accumulates one dead partial bar per interjection.
 
         With the live ref this is _retire_np_host verbatim, so a card hosted by a
@@ -1814,7 +1831,7 @@ class MusicPlayer:
             self._spawn_background(self._edit_now_playing_once())
         self._spawn_background(self.update_activity(self.current_song))
 
-    # ── -playnow interjection ─────────────────────────────────────────────────
+    # ── interjection ──────────────────────────────────────────────────────────
 
     @_tracer.start_as_current_span("player.interject")
     async def interject(
@@ -1823,8 +1840,13 @@ class MusicPlayer:
         vc: discord.VoiceClient,
         *,
         resume_paused: bool = True,
+        follow_on: Sequence[QueueItem] = (),
     ) -> Optional[InterjectOutcome]:
         """Play `qobj` immediately; the interrupted song returns afterwards.
+
+        `follow_on` is the rest of a playlist `qobj` is the head of. It goes between
+        the head and the resume entry, so the playlist plays in order and the
+        interrupted song comes back after all of it.
 
         Capture the current song's exact position (frame-counted, frozen if paused),
         front-insert [qobj, resume-entry(ts=position)], stop the current song; the
@@ -1837,7 +1859,7 @@ class MusicPlayer:
         actually reached rather than at its own fragment's start.
 
         resume_paused decides whether a song interrupted while PAUSED comes back
-        paused: True (-playnow) restores what it interrupted, False (-play) brings it
+        paused: True (`--now`) restores what it interrupted, False (plain) brings it
         back playing. No effect on a song that wasn't paused.
 
         None when there is no current song, or it ended during prefetch
@@ -1858,10 +1880,10 @@ class MusicPlayer:
         # front-inserted qobj — take it off the board first.
         await self._neutralize_prefetch()
 
-        # Re-check after those awaits (cancellation can block up to yt-dlp's socket
-        # timeout): if the song ended and the loop moved on, bail to the command's
-        # fallback rather than build a resume entry for a finished song.
-        if self.current_song is not current:
+        # Re-check after those awaits (a cancel can block up to yt-dlp's socket
+        # timeout): a song that ended, or one stopped and still current_song, gets
+        # no resume tail.
+        if self.current_song is not current or self._stopped_deliberately:
             return None
 
         was_paused = vc.is_paused()
@@ -1892,7 +1914,7 @@ class MusicPlayer:
                     thumbnail=current.thumbnail,
                     is_resume=True,
                     # The tail is the same play, so a song that was itself a
-                    # -playnow comes back saying so — the span attribute below
+                    # -play --now comes back saying so — the span attribute below
                     # reads it at every level of a stack.
                     interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
@@ -1905,22 +1927,22 @@ class MusicPlayer:
                     # classification is not recoverable from webpage_url — a Spotify
                     # link, a search and a pasted link all archive as youtube.com.
                     query_source=current.query_source,
-                    # -remove matches on this: without it the parked tail is the
-                    # one track a playlist link cannot take back out.
+                    # Same reason -remove matches on it: without this the parked
+                    # tail is the one track a collection link cannot take back out.
                     user_input=current.user_input,
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
         # — it plays immediately by definition — while the tail keeps the
         # interrupted song's analytics, unknown ones included.
-        items: list[QueueItem] = [qobj]
+        items: list[QueueItem] = [qobj, *follow_on]
         if resume is not None:
             items.append(resume)
             # The song returns, so it is recorded once — when its tail finishes. A
             # song with no resume entry (nearly over) keeps its own entry, matching
             # -skip. One marker is enough at any depth: each interjection stops
             # exactly one song, and that song's iteration consumes the marker before
-            # the next -playnow can finish resolving.
+            # the next interjection can finish resolving.
             #
             # Taken BEFORE the put_front await and unconditionally: everything from
             # the guard above to here is synchronous, so there is no window in which
@@ -1940,9 +1962,11 @@ class MusicPlayer:
 
         # After the insert, so the tail just built is counted.
         span.set_attribute("interject.depth", self.queue.resume_tail_depth())
-        # Attribution only: did this cut in front of another -playnow song.
+        # Attribution only: did this cut in front of another interjected song.
         span.set_attribute("interject.over_interjection", current.interjected)
         span.set_attribute("interject.resume_position", position if resume else -1)
+        # 1 for a single track, so the attribute is always present and comparable.
+        span.set_attribute("interject.playlist_size", len(follow_on) + 1)
         return InterjectOutcome(
             interrupted_title=current.title or "Unknown",
             resume_position=position if resume is not None else None,
@@ -1984,7 +2008,7 @@ class MusicPlayer:
             song = None
         if song is None:
             return
-        # Carry the -ss offset, every -playnow flag and the analytics through the
+        # Carry the -ss offset, every interjection flag and the analytics through the
         # rebuild: dropping them restarts a neutralized resume entry from 0:00
         # (unpaused, unannounced), loses a prefetched song's ?t= offset, and zeroes
         # the ask this play was queued against, which nothing re-mints.
@@ -2461,7 +2485,7 @@ class MusicPlayer:
             return None
         if song is None:
             # _stream_source swallowed a failure — retire the dequeue as the raise
-            # path does, or the display/Redis heads sit one entry ahead forever.
+            # path does, or the deque and the mirror sit one entry ahead forever.
             await self._retire_failed_dequeue(source, context="prefetch failure")
             return None
         return song
@@ -2767,7 +2791,7 @@ class MusicPlayer:
                         )
 
                     if song.start_paused:
-                        # Returns parked where -playnow interrupted it (the player
+                        # Returns parked where the interjection interrupted it (the player
                         # thread was already paused synchronously at vc.play). The
                         # full pause() runs here so the Redis pause epochs and the
                         # debounced embed/Activity refresh all engage.
@@ -2796,7 +2820,7 @@ class MusicPlayer:
                     # Zero frames AND an ffmpeg error means the stream never opened
                     # (typically a 403 on a revoked URL). Both conditions matter:
                     # zero frames alone also describes a song parked paused by
-                    # -playnow or stopped the instant it started (vc.stop() reports
+                    # an interjection or stopped the instant it started (vc.stop() reports
                     # no error), and an error alone also describes a mid-song death
                     # that delivered real audio and earns its history entry.
                     # A THIRD case joins these below: zero frames, no error, and no

@@ -223,6 +223,10 @@ FOOTER_LIMIT = 2048
 # after the command has already mutated state.
 EMBED_FIELD_LIMIT = 1024
 
+# Bound on one echoed needle, which owns a field to itself. Discord renders
+# markdown in field values, so what a user typed goes through safe_label first.
+ECHO_MAX = 200
+
 # One row of a multi-row field — ten of these share the budget one echoed needle
 # gets. Passed to safe_label wherever a list of user-supplied titles is rendered.
 ECHO_ROW_MAX = 70

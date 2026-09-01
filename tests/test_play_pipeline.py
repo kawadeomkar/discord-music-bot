@@ -1,6 +1,6 @@
 """Tests for the -play/-playnow pipeline (src/play_pipeline.py)."""
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -29,6 +29,7 @@ from src.youtube import QueueObject
 from tests.helpers import (
     connected_vc,
     mock_mp,
+    queue_object,
 )
 
 
@@ -112,6 +113,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -140,6 +142,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -164,6 +167,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -187,6 +191,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -211,6 +216,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         mp.queue_put.assert_awaited_once()
@@ -233,6 +239,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -253,6 +260,7 @@ class TestEnqueuePlaylist:
             mp,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
+            cog=music_bot,
         )
 
         mp.queue_put.assert_awaited_once()
@@ -302,7 +310,7 @@ class TestEnqueueSingle:
         await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
 
         mp.repin_now_playing.assert_not_awaited()
-        mp.build_queued_song_embed.assert_called_once_with(qobj, warning=None)
+        mp.build_queued_song_embed.assert_called_once_with(qobj, note="", warning=None)
         assert (
             mock_ctx.send.await_args.kwargs["embed"]
             is mp.build_queued_song_embed.return_value
@@ -351,7 +359,9 @@ class TestEnqueueSingle:
 
         await play_pipeline.enqueue_single(mock_ctx, qobj, mp, warning="watch out")
 
-        mp.build_queued_song_embed.assert_called_once_with(qobj, warning="watch out")
+        mp.build_queued_song_embed.assert_called_once_with(
+            qobj, note="", warning="watch out"
+        )
 
     async def test_enqueues_before_reading_the_head(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -707,10 +717,11 @@ class TestQuerySourceClassification:
         assert "ValueError" not in embed.description
         assert "EmptyPlaylistError" not in embed.description
 
-    async def test_playnow_honours_the_playlist_index(
+    async def test_an_interjection_honours_the_playlist_index(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow interjects the track the link was copied at, not track 1."""
+        """`--now` starts at the track the link was copied at, not track 1 — and
+        the rest of the collection follows it rather than being discarded."""
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
@@ -720,7 +731,11 @@ class TestQuerySourceClassification:
             result = await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
-        assert result.title == "T2"
+        head, follow_on = result
+        assert head.title == "T2"
+        # The tail is kept now: `--now` takes the whole collection, and the
+        # interrupted song returns after the last of it.
+        assert [cast(QueueObject, t).title for t in follow_on] == ["T3", "T4"]
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
 
@@ -782,9 +797,9 @@ class TestQuerySourceClassification:
     async def test_playnow_indexed_playlist_rebases_only_the_track_it_keeps(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow interjects exactly one track. Rebasing the rest is work whose
-        only consumer throws it away, so keep_first_only trims first — and the
-        one survivor still lands at 0, the depth an interjection actually has."""
+        """The head lands at 0, the depth an interjection actually has, and every
+        track kept behind it is rebased off that — the dropped ones never enqueue,
+        so an `&index=N` link must not record the survivors N-1 too deep."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
         source = parse_input(url)
         tracks = [
@@ -803,11 +818,12 @@ class TestQuerySourceClassification:
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
 
-        assert kept is tracks[3]
-        assert kept.analytics.queue_position == 0
-        # The discarded tail keeps its construction-time positions — untouched,
-        # which is the whole point of trimming before the rebase.
-        assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
+        head, follow_on = kept
+        assert head is tracks[3]
+        assert head.analytics.queue_position == 0
+        # Rebased kept-relative, so the tail reads 1, 2 rather than 4, 5.
+        assert follow_on == tracks[4:]
+        assert [t.analytics.queue_position for t in follow_on] == [1, 2]
 
     async def test_playnow_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1006,3 +1022,61 @@ class TestSpotifyDisabled:
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
         )
+
+
+class TestInterjectionCollectionHandling:
+    """`--now` takes the whole collection: the head interrupts, the tail follows."""
+
+    @staticmethod
+    def _yt_tracks(author: MagicMock, count: int) -> list[QueueObject]:
+        return [
+            QueueObject(f"https://yt.com/watch?v=v{i}", f"T{i}", author)
+            for i in range(count)
+        ]
+
+    async def test_interjection_honours_the_playlist_index(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An interjection plays the track the link was copied at, not track 1."""
+        url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
+        source = parse_input(url)
+        tracks = self._yt_tracks(mock_ctx.author, 5)
+        with patch(
+            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
+        ):
+            head, rest = await play_pipeline._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN, cog=music_bot
+            )
+        assert head.title == "T2"
+        # The tracks after it come too, in order.
+        assert [queue_object(item).title for item in rest] == ["T3", "T4"]
+        notice = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "#3" in notice
+
+    async def test_interjection_indexed_playlist_rebases_every_kept_track(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The head lands at 0 — the depth an interjection actually has — and the
+        tracks behind it count up from there. Without the rebase an `&index=4` link
+        would file every track three deeper than it played."""
+        url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
+        source = parse_input(url)
+        tracks = [
+            QueueObject(
+                f"https://yt.com/watch?v=v{i}",
+                f"T{i}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
+            )
+            for i in range(6)
+        ]
+        with patch(
+            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
+        ):
+            head, rest = await play_pipeline._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN, cog=music_bot
+            )
+
+        assert head is tracks[3]
+        assert head.analytics.queue_position == 0
+        assert [queue_object(item).analytics.queue_position for item in rest] == [1, 2]

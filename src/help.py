@@ -22,7 +22,7 @@ HELP_COLOR = discord.Color.blurple()
 # Display order: categories as rendered, and within each by frequency of use (daily
 # verbs first, housekeeping last) — not alphabetically, which put `pause` above `play`.
 CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
-    "Playback": ("play", "playnow", "pause", "resume", "skip", "stop", "volume"),
+    "Playback": ("play", "pause", "resume", "skip", "stop", "volume"),
     "Queue": (
         "queue",
         "now",

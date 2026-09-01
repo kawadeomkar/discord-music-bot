@@ -18,7 +18,8 @@ extends that hold over the caller's Redis write (see commit_dequeue).
 Invalidation is carried by the generation counter and the cursor (see clear()).
 
 Two counters, adjacent names, different sets: qsize() is PENDING (len - cursor),
-display_size() is pending PLUS in-flight (len).
+display_size() is pending PLUS in-flight (len). display_size() is the sole input to
+a Postgres column.
 
 Not known here:
 - stream prefetch — MusicPlayer cancels its prefetch task before
@@ -84,16 +85,15 @@ class RemoveMode(StrEnum):
 RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
 
 
-# A link, for folding purposes: a scheme, or a bare dotted host that parse_url
-# also accepts (`-play youtu.be/X` is an ordinary input).
+# A link, for folding purposes: a scheme, or a bare dotted host parse_url also
+# accepts. Angle brackets go first: Discord adds them when suppressing an embed.
 _LOOKS_LIKE_A_LINK = re.compile(r"^(?:\w+://|[\w-]+(?:\.[\w-]+)+/)")
 
 
 def _normalize(s: str) -> str:
-    """Fold a needle for comparison: collapse whitespace, and casefold anything
-    that is not a link. Links keep their case because IDs inside them are
-    case-sensitive — a casefolded Spotify base62 id would let ".../playlist/AbC"
-    match a different playlist's ".../playlist/abc"."""
+    """Fold a needle for comparison: collapse whitespace, casefold anything that is
+    not a link. Links keep their case — IDs inside them are case-sensitive, and a
+    casefolded Spotify base62 id would match a different playlist's."""
     s = " ".join(s.split()).strip("<>")
     return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
@@ -146,6 +146,14 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     if isinstance(item, QueueObject):
         return SongQueueEntry.from_queue_object(item)
     return SearchQueueEntry.from_ytsource(item)
+
+
+def item_label(item: QueueItem) -> str:
+    """What to call a queued item in a reply. A YTSource is an unresolved search
+    with no `title`, so its term stands in, `ytsearch:` prefix off."""
+    if isinstance(item, QueueObject):
+        return item.title or "?"
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
 def is_persisted(item: Optional[QueueItem]) -> bool:
@@ -221,8 +229,8 @@ class GuildQueue:
 
         `while`, never `if`: Event.wait() wakes EVERY waiter and the prefetch's
         get_nowait() is a second consumer, so a woken getter can find the item
-        already taken. No await between the claim and the return, so a claim is
-        atomic on the event loop."""
+        already taken, as can one cancelled after being woken. No await between the
+        claim and the return, so a claim is atomic on the event loop."""
         while self._cursor >= len(self._items):
             await self._wake.wait()
         item = self._items[self._cursor]
@@ -329,8 +337,8 @@ class GuildQueue:
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
-        """Insert items at the front of the queue — the -playnow interjection path.
-        Under the bulk-mutation mutex, like every multi-leg mutation.
+        """Insert items at the front of the queue — the interjection path. Under
+        the bulk-mutation mutex, like every multi-leg mutation.
 
         An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
         the inserted items and forces the mirror down the rebuild path: its Redis
@@ -371,8 +379,8 @@ class GuildQueue:
 
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything that was on it — the claimed
-        prefix included, because the caller records these
-        (MusicPlayer._flush_played) and a parked -playnow tail is in it.
+        prefix included: the caller records these (MusicPlayer._flush_played), and a
+        parked resume tail is in that prefix.
 
         Bumps the generation under the mutex before draining, and resets the
         cursor: a claim the loop took before this clear() captured the old value
@@ -412,6 +420,8 @@ class GuildQueue:
             self._items = deque(head + tail)
             self._sync_wake()
 
+            # DELETE when nothing persisted survives: it heals a mirror
+            # holding entries memory no longer has.
             if tail:
                 await self._write_mirror(self._items)
 
@@ -423,7 +433,9 @@ class GuildQueue:
         a removed entry can be the last record of a song that already played. An
         in-flight dequeue is never removed even on a match (it is committed to play;
         stopping it is -skip's job) but still occupies a display position — hence
-        the numbering offset. The matching policy is remove_matcher's."""
+        the numbering offset.
+
+        The matching policy is remove_matcher's."""
         removed_positions: list[int] = []
         removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []
@@ -527,21 +539,15 @@ class GuildQueue:
         )
 
     def resume_tail_depth(self) -> int:
-        """How many parked plays are waiting behind the song that just cut the line
-        — the run of consecutive resume tails after it. 1 is a plain -playnow, 2+ a
-        stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
-        gone by the time this runs and only its tail is queued.
-
-        The interjected song is not always at index 0 — put_front inserts behind a
-        dequeued-but-uncommitted item — so the run starts after the claimed prefix,
-        which _cursor names directly."""
-        # islice, not a slice copy: the run read here is almost always 1-3 long.
-        depth = 0
-        for item in islice(self._items, self._cursor + 1, None):
-            if not (isinstance(item, QueueObject) and item.is_resume):
-                break
-            depth += 1
-        return depth
+        """How many parked plays wait behind the song that just cut the line: 1 is
+        a plain interjection, 2+ a stack. Counts every pending tail past the claimed
+        prefix (`--now` takes a whole playlist, so tails are not adjacent) — plays,
+        not fragments. O(len(_items)), once per interjection."""
+        return sum(
+            1
+            for item in islice(self._items, self._cursor + 1, None)
+            if isinstance(item, QueueObject) and item.is_resume
+        )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
@@ -665,8 +671,12 @@ class GuildQueue:
         """Bring the Redis mirror in line with `items` — the persisted subset, in
         order — by whichever of DELETE, LREM or rebuild is right.
 
-        The rebuild is DELETE + RPUSH in MULTI: a plain pipeline leaves a window
-        where a concurrent LPOP sees an empty queue. Callers hold the bulk-mutation
+        Cost on a big queue: 5,000 entries serialize in ~38ms (25ms building the
+        entries, 13ms of orjson) for a ~2.1MB RPUSH, and that span is synchronous —
+        it blocks every guild's gateway traffic. Bounded by playlist length.
+
+        Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a window
+        where a concurrent LPOP sees an empty queue). Callers hold the bulk-mutation
         mutex, so a concurrent put()'s pushes can't be wiped by a rebuild that
         predates them. persisted=False items were never RPUSHed — never write them in.
 
