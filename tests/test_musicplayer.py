@@ -10731,6 +10731,28 @@ class TestInterjectPostNeutralizeRecheck:
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
 
+    async def test_a_bail_at_dispatch_leaves_the_prefetch_alone(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The mirror of -restart's: neutralizing before the liveness check spends
+        the next song's fully-resolved source to reach a refusal that did not need
+        it, so the fallback enqueue then pays a cold extraction already paid for."""
+        music_player.current_song = live_song
+        music_player._interrupted_song = live_song  # already stopped by -restart
+        prefetch = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = prefetch
+
+        try:
+            assert await music_player.interject(playnow_obj, mock_vc) is None
+            assert not prefetch.done()
+            assert music_player._prefetch_task is prefetch
+        finally:
+            prefetch.cancel()
+
     async def test_a_song_restart_already_stopped_is_not_interjected_over(
         self,
         music_player: MusicPlayer,
@@ -11262,6 +11284,60 @@ class TestRestartCurrent:
         replay = music_player.queue.display_items()[0]
         assert isinstance(replay, QueueObject)
         assert replay.title == live_song.title
+
+    async def test_a_bail_at_dispatch_leaves_the_next_songs_prefetch_alone(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        restarter: MagicMock,
+    ) -> None:
+        """The neutralize is destructive and the liveness answer does not depend on
+        it, so checking only afterwards spends the next song's fully-resolved source
+        to reach a refusal — the user is told nothing was restarted AND the next
+        transition pays a cold extraction it had already paid for."""
+        music_player.current_song = live_song
+        music_player._interrupted_song = live_song  # already stopped by -playnow
+        prefetch = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = prefetch
+
+        try:
+            assert (
+                await music_player.restart_current(
+                    mock_vc, requester=restarter, analytics=RESTART_ASK
+                )
+                is None
+            )
+            assert not prefetch.done()
+            assert music_player._prefetch_task is prefetch
+        finally:
+            prefetch.cancel()
+
+    async def test_reports_the_stop_it_declined_to_make(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        restarter: MagicMock,
+    ) -> None:
+        """The song ended while the replay resolved: the replay is real and plays
+        next, but nothing was interrupted. Reported as a restart, the reply names a
+        position the user watched the song run past."""
+        music_player.current_song = live_song
+
+        async def resolve_and_advance(_self: Any) -> None:
+            music_player.current_song = MagicMock()
+
+        with patch.object(MusicPlayer, "_prefetch_next_song", new=resolve_and_advance):
+            outcome = await music_player.restart_current(
+                mock_vc, requester=restarter, analytics=RESTART_ASK
+            )
+
+        assert outcome is not None
+        assert outcome.stopped is False
+        mock_vc.stop.assert_not_called()
+        # The replay is still queued — it plays next, which is what the reply says.
+        assert len(music_player.queue.display_items()) == 1
 
     async def test_song_changed_during_neutralize_returns_none(
         self,

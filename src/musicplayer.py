@@ -220,6 +220,10 @@ class RestartOutcome:
 
     title: str
     position: int  # where the replaced play was stopped
+    # False when the loop moved on before the stop: the replay is queued at the
+    # front and plays next, so it is a queue placement rather than a restart, and
+    # the confirmation has to say which of the two happened.
+    stopped: bool = True
 
     @property
     def position_str(self) -> str:
@@ -1851,7 +1855,10 @@ class MusicPlayer:
         a real in-flight head and takes its rebuild branch.
         """
         current = self.current_song
-        if current is None:
+        # Liveness twice, here and after the neutralize below: a song already gone
+        # at dispatch bails for free, where checking only afterwards has destroyed
+        # the next song's prefetch to reach the same answer.
+        if current is None or not self._still_live(current):
             return None
         span = trace.get_current_span()
         span.set_attribute("discord.guild_id", str(self._guild.id))
@@ -2065,7 +2072,9 @@ class MusicPlayer:
     ) -> Optional[RestartOutcome]:
         """Play the live song again from its beginning.
 
-        A rebuilt copy goes to the front of the queue with no `ts` (so no -ss), is
+        A rebuilt copy goes to the front of the queue with no `ts` — so no -ss, and
+        a `?t=` song's requested offset is dropped: 0:00 is what "restart" means. It
+        is
         resolved into a real source the way any next song is prefetched, and the live
         song is stopped; the loop's ordinary dequeue -> play cycle does the rest. The
         copy is persisted, so a crash mid-restart recovers like any other front
@@ -2090,6 +2099,11 @@ class MusicPlayer:
         current = self.current_song
         if current is None or not current.webpage_url:
             return None
+        # Checked here as well as after the neutralize below: a song already gone at
+        # dispatch bails for free, where checking only afterwards has destroyed the
+        # next song's prefetch to answer "nothing was restarted".
+        if not self._still_live(current):
+            return None
         span = trace.get_current_span()
         span.set_attribute("discord.guild_id", str(self._guild.id))
 
@@ -2101,9 +2115,11 @@ class MusicPlayer:
             uploader=current.uploader,
             thumbnail=current.thumbnail,
             analytics=analytics,
-            # A restart does not change where the song came from, and the
-            # classification is not in webpage_url — a Spotify link, a search and a
-            # pasted link all archive as youtube.com.
+            # Inherited rather than re-minted for the caller: this classifies how
+            # the SONG was found, and a replay of it was found the same way. Minting
+            # a fresh one splits one song's -leaderboard rows between its original
+            # ask and its replays, and webpage_url cannot rebuild it — a Spotify
+            # link, a search and a pasted link all archive as youtube.com.
             query_source=current.query_source,
             user_input=current.user_input,  # -remove matches on this
             # Renders the queue card as a replay rather than as the live song
@@ -2134,14 +2150,18 @@ class MusicPlayer:
         # propagates.
         await asyncio.wait({resolving}, timeout=_RESTART_RESOLVE_TIMEOUT)
 
-        if self._stop_if_live(current, vc):
+        stopped = self._stop_if_live(current, vc)
+        if stopped:
             # Its card would otherwise stay frozen at the interrupt position,
             # directly above the replay's own card, naming the same song. Set after
             # the stop because nothing awaits between them: the loop cannot reach
             # the iteration end that reads this until we yield.
             self._retire_np_for = current
         span.set_attribute("restart.position", position)
-        return RestartOutcome(title=current.title or "Unknown", position=position)
+        span.set_attribute("restart.stopped", stopped)
+        return RestartOutcome(
+            title=current.title or "Unknown", position=position, stopped=stopped
+        )
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 

@@ -25,6 +25,7 @@ from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
     RESTORE_WAIT_SECS,
+    _NOTHING_PLAYING,
     _echo,
     _removed_label,
     HISTORY_MAX_LIMIT,
@@ -49,7 +50,7 @@ from src.sources import (
     parse_url,
     timestamp_warning,
 )
-from src.musicplayer import InterjectOutcome
+from src.musicplayer import InterjectOutcome, RestartOutcome
 from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
@@ -2260,8 +2261,6 @@ class TestRestartCommand:
     @pytest.fixture
     def live_mp(self) -> MagicMock:
         """A MusicPlayer mock with a song playing, restarted successfully."""
-        from src.musicplayer import RestartOutcome
-
         mp = MagicMock()
         # A real position: the command refuses a song still at its beginning, and a
         # bare MagicMock's __int__ answers 1 — right at the threshold, so the guard
@@ -2317,8 +2316,6 @@ class TestRestartCommand:
         two. The dispatch guard admits a paused voice client for the same reason:
         refusing there would make -restart the one playback verb a pause turns
         off."""
-        from src.musicplayer import RestartOutcome
-
         live_vc.is_playing.return_value = False
         live_vc.is_paused.return_value = True
         live_mp.restart_current = AsyncMock(
@@ -2410,6 +2407,101 @@ class TestRestartCommand:
         assert "already at the beginning" in embed.description
         assert "Original Song" in embed.description
         mock_ctx.message.add_reaction.assert_not_awaited()
+
+    async def test_a_song_that_ended_first_is_reported_as_queued_not_restarted(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The stop is declined when the loop moved on while the replay resolved.
+        The replay is real — it is at the queue front and plays next — but nothing
+        was interrupted, so "Restarting … was at 2:31" describes an event that did
+        not happen, on a song the user watched end."""
+        live_mp.restart_current = AsyncMock(
+            return_value=RestartOutcome(
+                title="Original Song", position=151, stopped=False
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        description = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "ended first" in description
+        assert "playing next" in description
+        assert "was at" not in description
+
+    async def test_a_missing_reaction_permission_does_not_report_failure(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """gather does not cancel siblings, so the confirmation lands and the raise
+        then reaches the command's except — rendering a red "Failed to restart
+        song" beside it for a restart that has already happened and cannot be
+        undone. The reaction is decoration; the send is the answer."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        mock_ctx.message.add_reaction = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(), "missing permissions")
+        )
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        assert mock_ctx.send.await_count == 1
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Restarting" in embed.description
+        assert embed.color == discord.Color.blue()
+
+    async def test_the_gap_between_songs_is_not_reported_as_an_idle_guild(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """current_song is None for the 1-4s a connected bot spends resolving the
+        next song. Answering that with the idle notice tells a user watching a
+        queue they can see that there is nothing playing."""
+        live_mp.current_song = None
+        live_mp.queue.empty = MagicMock(return_value=False)
+        live_vc.is_playing.return_value = False
+        live_vc.is_paused.return_value = False
+        live_vc.is_connected.return_value = True
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        description = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "still loading" in description
+        live_mp.restart_current.assert_not_awaited()
+
+    async def test_an_idle_guild_with_no_queue_still_gets_the_shared_notice(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The other side of the branch above: -now and -restart answer the same
+        state, so they must answer it with the same sentence."""
+        live_mp.current_song = None
+        live_mp.queue.empty = MagicMock(return_value=True)
+        live_vc.is_playing.return_value = False
+        live_vc.is_paused.return_value = False
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+
+        await command_callback(MusicBot.restart)(music_bot, mock_ctx)
+
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert embed.description == _NOTHING_PLAYING
 
     async def test_shows_typing_while_the_replay_resolves(
         self,
@@ -2702,6 +2794,16 @@ class TestHistoryCommand:
         assert buckets._cooldown is not None
         assert buckets._cooldown.rate == 1
         assert buckets.type is commands.BucketType.guild
+
+    def test_restart_advertises_only_aliases_it_answers_to(self) -> None:
+        """-help prints these as runnable examples. A typo in the tuple — `relpay`
+        for `replay` — survives the whole suite while every example the help embed
+        prints for that alias 404s, because nothing else reads both."""
+        assert set(MusicBot.restart.aliases) == {"rs", "replay"}
+        examples = MusicBot.restart.extras["examples"]
+        names = {MusicBot.restart.name, *MusicBot.restart.aliases}
+        for example in examples:
+            assert example.lstrip("-").split()[0] in names, example
 
     def test_restart_requires_the_author_in_the_voice_channel(self) -> None:
         """command_callback() hands back the raw callback, so every test of -restart

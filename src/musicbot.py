@@ -188,6 +188,11 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
+# Both -now and -restart answer an idle guild, and a user meeting one after the
+# other must not be told two different things about the same state.
+_NOTHING_PLAYING = "No songs are currently playing."
+
+
 # Bound on one echoed needle, which owns a field to itself. Discord renders
 # markdown in field values, so what a user typed goes through safe_label first.
 _ECHO_MAX = 200
@@ -1690,7 +1695,9 @@ class MusicBot(commands.Cog):
             "note": (
                 "The interrupted play is recorded in `-history` at the point it "
                 "reached, the way a skipped song is; the restarted one is recorded "
-                "again when it ends. A song still at its beginning is left alone."
+                "again when it ends. A song still at its beginning is left alone, "
+                "and a song queued with a `?t=` timestamp restarts from `0:00` "
+                "rather than from its timestamp."
             ),
         },
     )
@@ -1716,9 +1723,21 @@ class MusicBot(commands.Cog):
                     or not isinstance(vc, discord.VoiceClient)
                     or not (vc.is_playing() or vc.is_paused())
                 ):
+                    # A connected bot with a queue is between songs, not idle: the
+                    # next one is 1-4s of extraction away and the flat refusal reads
+                    # as a bot that lost the queue it is visibly working through.
+                    loading = (
+                        isinstance(vc, discord.VoiceClient)
+                        and vc.is_connected()
+                        and not mp.queue.empty()
+                    )
                     await ctx.send(
                         embed=notice_embed(
-                            "No songs are currently playing.", discord.Color.orange()
+                            "The next song is still loading — try `-restart` again "
+                            "in a moment."
+                            if loading
+                            else _NOTHING_PLAYING,
+                            discord.Color.orange(),
                         )
                     )
                     return
@@ -1754,15 +1773,27 @@ class MusicBot(commands.Cog):
                         )
                     )
                     return
-                embed = notice_embed(
-                    f"🔁 Restarting **{safe_label(outcome.title, _ECHO_MAX)}** from `0:00` "
-                    f"— was at `{outcome.position_str}`.",
-                    discord.Color.blue(),
-                )
-                await asyncio.gather(
-                    ctx.send(embed=embed),
-                    ctx.message.add_reaction("🔁"),
-                )
+                if outcome.stopped:
+                    text = (
+                        f"🔁 Restarting **{safe_label(outcome.title, _ECHO_MAX)}** from "
+                        f"`0:00` — was at `{outcome.position_str}`."
+                    )
+                else:
+                    # The song ended while the replay resolved, so nothing was
+                    # interrupted — it is queued at the front and plays next.
+                    text = (
+                        f"🔁 **{safe_label(outcome.title, _ECHO_MAX)}** ended first — "
+                        f"queued it again from `0:00`, playing next."
+                    )
+                embed = notice_embed(text, discord.Color.blue())
+                # NOT gathered with the reaction: the restart is already committed
+                # and irreversible here, so a guild without Add Reactions would get
+                # the confirmation AND a red "Failed to restart song" for an
+                # operation that worked. gather does not cancel siblings, so the
+                # send lands either way — it is the error path that is wrong.
+                await ctx.send(embed=embed)
+                with contextlib.suppress(discord.HTTPException):
+                    await ctx.message.add_reaction("🔁")
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to restart song")
 
@@ -2063,9 +2094,7 @@ class MusicBot(commands.Cog):
                 await ctx.send(embed=mp.play_message)
             else:
                 await ctx.send(
-                    embed=notice_embed(
-                        "No songs are currently playing.", discord.Color.orange()
-                    )
+                    embed=notice_embed(_NOTHING_PLAYING, discord.Color.orange())
                 )
         except Exception as e:
             await self._command_error(ctx, e)
