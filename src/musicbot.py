@@ -774,7 +774,12 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.join")
     async def join(self, ctx: commands.Context) -> None:
         try:
-            await join_cmd.run(ctx, mp=self.get_mp(ctx), bot_latency=self.bot.latency)
+            await join_cmd.run(
+                ctx,
+                mp=self.get_mp(ctx),
+                bot_latency=self.bot.latency,
+                tracked=self._restore_tasks,
+            )
         except Exception as e:
             await self._command_error(ctx, e)
 

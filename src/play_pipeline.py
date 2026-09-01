@@ -13,7 +13,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from itertools import islice
 from typing import TYPE_CHECKING, Optional, Union, assert_never
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 import discord
 from discord.ext import commands
@@ -253,6 +253,11 @@ def _head_depth(mp: MusicPlayer, placement: Placement) -> int:
     return mp.enqueue_depth()
 
 
+async def _nothing_to_release() -> None:
+    """Default `release_hold` for the enqueue helpers. A warm placement holds no
+    playback gate, so there is nothing to release when its put lands."""
+
+
 async def _reply(
     ctx: commands.Context, embeds: Sequence[discord.Embed], reaction: str = "👍"
 ) -> None:
@@ -399,6 +404,7 @@ async def enqueue_playlist(
     analytics: Analytics,
     origin: str,
     placement: Placement = Placement.TAIL,
+    release_hold: Callable[[], Awaitable[None]] = _nothing_to_release,
     cog: MusicBot,
 ) -> None:
     """Queue a resolved playlist under the place lock and notify the channel.
@@ -488,6 +494,9 @@ async def enqueue_playlist(
     if not verdict.placed:
         await cog._report_dropped(req, verdict)
         return
+    # The songs are in the queue, which is all the cold-start gate hold was
+    # waiting for. What follows is a Discord send and a stream warm.
+    await release_hold()
     await asyncio.gather(
         _reply(ctx, [embed]), _warm_front_track(tracks, placement, cog=cog)
     )
@@ -504,6 +513,7 @@ async def enqueue_single(
     note: str = "",
     warning: Optional[str] = None,
     follow_on: Sequence[QueueItem] = (),
+    release_hold: Callable[[], Awaitable[None]] = _nothing_to_release,
     cog: MusicBot,
 ) -> None:
     """Insert one resolved song under the place lock, then confirm. Under the
@@ -578,6 +588,13 @@ async def enqueue_single(
     if not verdict.placed:
         await cog._report_dropped(req, verdict)
         return
+    # The song is in the queue, which is the whole of what the cold-start gate
+    # hold was waiting for (see MusicPlayer.defer_playback). Everything below is
+    # presentation — an embed send, a reaction, possibly a re-host edit — and on
+    # a cold start those Discord round trips sat between the front insert and the
+    # first note. Idempotent, so every path that does NOT place still releases
+    # through the stack that owns the hold.
+    await release_hold()
     if should_show_queued:
         # After the put, off the lock, so the card names the slot taken. At the
         # head the NP block's "Up next" IS this card: re-host the live one,

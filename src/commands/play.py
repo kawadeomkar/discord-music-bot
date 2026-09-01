@@ -186,6 +186,12 @@ async def _resolve_and_place(
     be followed by an await before the gate hold is released."""
     qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
     async with contextlib.AsyncExitStack() as stack:
+        # The cold-start gate hold lives on its own stack, so the path that PLACES
+        # can release it the moment the put lands rather than holding the first note
+        # behind a confirmation embed. aclose() is idempotent — an already-unwound
+        # stack unwinds nothing — so every other exit still releases through the
+        # outer stack exactly as it did.
+        hold = await stack.enter_async_context(contextlib.AsyncExitStack())
         # Not connected: this song goes ahead of any queue restored from Redis. A
         # running join counts as cold — discord.py registers the client BEFORE
         # the handshake completes.
@@ -206,9 +212,10 @@ async def _resolve_and_place(
         )
         resolve_started = time.monotonic()
         if cold_start:
-            # Held across the join, which opens the gate the moment the handshake
-            # lands. Released with the stack, after the front insertion.
-            await stack.enter_async_context(mp.defer_playback())
+            # Held across the join, which opens the gate the moment the
+            # handshake lands. Released at the insert on the placed path, and
+            # with the stack on every other.
+            await hold.enter_async_context(mp.defer_playback())
             # One join per guild, concurrent with this resolve: voice
             # handshake and yt-dlp extraction have no data dependency.
             join, owns_join = cog._plays.cold_join(
@@ -307,6 +314,7 @@ async def _resolve_and_place(
                     req,
                     placement=placement,
                     warning=timestamp_warning(source),
+                    release_hold=hold.aclose,
                     cog=cog,
                 )
             else:
@@ -319,6 +327,7 @@ async def _resolve_and_place(
                     placement=placement,
                     analytics=analytics,
                     origin=url,
+                    release_hold=hold.aclose,
                     cog=cog,
                 )
         except PlaceStalled as stall:

@@ -4086,3 +4086,143 @@ class TestAQuotedRequestIsDroppable:
             assert [r.query for r in inflight] == ["some song"]
             gate.set()
             await task
+
+
+class TestTheGateHoldEndsAtTheInsert:
+    """defer_playback keeps a Redis-restored head from starting before this request's
+    put_front lands. The put is what satisfies it; the confirmation is not."""
+
+    @staticmethod
+    def _cold(music_bot: MusicBot, mock_ctx: MagicMock) -> MagicMock:
+        mock_ctx.voice_client = None
+        mp = _holding_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._restore_tasks = set()
+
+        async def _join(*_a: Any, **_k: Any) -> None:
+            mock_ctx.voice_client = connected_vc(mock_ctx)
+
+        mock_ctx.invoke = AsyncMock(side_effect=_join)
+        return mp
+
+    async def test_the_hold_is_gone_before_the_confirmation_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An embed send plus a reaction is one or two Discord round trips, and they
+        used to sit between the front insert and the first note."""
+        mp = self._cold(music_bot, mock_ctx)
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        replying = asyncio.Event()
+        holds_at_reply: list[int] = []
+
+        async def _slow_reply(*_a: Any, **_k: Any) -> None:
+            holds_at_reply.append(mp.playback_holds)
+            replying.set()
+            await asyncio.sleep(0)
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.play_pipeline._reply", new=_slow_reply),
+        ):
+            play = asyncio.create_task(
+                command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
+            )
+            await settle()
+            await play
+
+        mp.queue_put_front.assert_awaited_once()
+        assert replying.is_set()
+        assert holds_at_reply == [0]  # released at the put, not at the reply
+
+    async def test_a_playlist_releases_before_its_reply_and_warm(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = self._cold(music_bot, mock_ctx)
+        tracks = [song(1, mock_ctx), song(2, mock_ctx)]
+        play_pipeline.queue_source = AsyncMock(
+            return_value=ResolvedYoutubePlaylist(tracks, skipped=0)
+        )
+        play_pipeline._warm_front_track = AsyncMock()
+        holds_at_reply: list[int] = []
+
+        async def _slow_reply(*_a: Any, **_k: Any) -> None:
+            holds_at_reply.append(mp.playback_holds)
+
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLx",
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id="PLx",
+        )
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.play_pipeline._reply", new=_slow_reply),
+            patch("src.commands.play.parse_input", return_value=source),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://www.youtube.com/playlist?list=PLx"
+            )
+
+        mp.queue_put_front.assert_awaited_once()
+        assert holds_at_reply == [0]
+
+    async def test_a_request_that_does_not_place_still_releases(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The early release is idempotent, so the stack that owns the hold is still
+        what covers every exit that never reached a put."""
+        mp = self._cold(music_bot, mock_ctx)
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        play_cmd.abandon_cold_start = AsyncMock()
+        mp.wait_for_restore = AsyncMock(return_value=False)
+
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
+
+        mp.queue_put_front.assert_not_awaited()
+        assert mp.playback_holds == 0
+
+
+class TestTheJoinAcknowledgementIsSpawned:
+    """-join's 👋 and latency line are two Discord round trips after the handshake.
+    Every cold-start -play awaits the whole join task before it may place."""
+
+    async def test_a_cold_start_places_while_the_greeting_is_still_sending(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        mp = _holding_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._restore_tasks = set()
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        mp.store = None  # join() persists the channel pair only when there is one
+        sending = asyncio.Event()
+
+        async def _slow_reaction(emoji: str) -> None:
+            # Only the greeting stalls; the confirmation's own 👍 must still land,
+            # or this asserts nothing about which of the two the place waited on.
+            if emoji != "👋":
+                return
+            sending.set()
+            await asyncio.Event().wait()  # never completes
+
+        mock_ctx.message.add_reaction = AsyncMock(side_effect=_slow_reaction)
+
+        async def _join(*_a: Any, **_k: Any) -> None:
+            mock_ctx.voice_client = connected_vc(mock_ctx)
+            await command_callback(MusicBot.join)(music_bot, mock_ctx)
+
+        mock_ctx.invoke = AsyncMock(side_effect=_join)
+
+        with no_typing("src.commands.play.background_typing"):
+            play = asyncio.create_task(
+                command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
+            )
+            await settle()
+            assert sending.is_set()  # the greeting really did start
+            # Bounded: awaited rather than spawned, the greeting never returns and
+            # this would hang out the suite deadline instead of failing.
+            async with asyncio.timeout(5):
+                await play
+
+        mp.queue_put_front.assert_awaited_once()  # and the song landed anyway
