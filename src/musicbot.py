@@ -35,6 +35,7 @@ from src.commands import now as now_cmd
 from src.commands import pause as pause_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
+from src.commands import resume as resume_cmd
 from src.commands import shuffle as shuffle_cmd
 from src.commands import skip as skip_cmd
 from src.commands import stop as stop_cmd
@@ -46,6 +47,7 @@ from src.commands.history import (
     HISTORY_MIN_LIMIT,
     HistoryFlags,
 )
+from src.recovery import abandon_cold_start, join_succeeded
 from src import analytics_card
 from src.guild_state import Analytics
 from src.analytics_card import AnalyticsFlags
@@ -272,20 +274,6 @@ def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> No
     # matching some other part of a YouTube URL is not a case that arises.
     if source.video_id in tracks[0].webpage_url:
         tracks[0].ts = source.ts
-
-
-def _join_succeeded(ctx: commands.Context) -> bool:
-    """Did the join a cold-start command just ran leave a USABLE voice client?
-
-    is_connected(), not just the type: discord.py registers the client on the guild
-    BEFORE the handshake completes, and vc.play() on a still-connecting one raises
-    once per restored song. join also swallows its own failures, so a failed one
-    arrives here as an absent client rather than an exception. Shared by -play and
-    -resume — the two checks must never diverge, since a type-only check is exactly
-    the bug this guards.
-    """
-    vc = ctx.voice_client
-    return isinstance(vc, discord.VoiceClient) and vc.is_connected()
 
 
 def _check_voice_permissions(
@@ -1049,12 +1037,12 @@ class MusicBot(commands.Cog):
                             # zombie for up to 300s on queue.get() with
                             # clear_connection() never firing — spurious crash
                             # recovery on restart.
-                            await self._abandon_cold_start(ctx, mp)
+                            await abandon_cold_start(self, ctx, mp)
                             raise
                         # Inserting onto a join that produced no usable client hands
                         # the loop a song it can only raise on.
-                        if not _join_succeeded(ctx):
-                            await self._abandon_cold_start(ctx, mp)
+                        if not join_succeeded(ctx):
+                            await abandon_cold_start(self, ctx, mp)
                             return
                     else:
                         qobj = await self.queue_source(
@@ -1070,7 +1058,7 @@ class MusicBot(commands.Cog):
                         # that never lands is therefore a reason NOT to insert — and
                         # the wait is bounded, since the pool sets no socket_timeout.
                         if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                            await self._abandon_cold_start(ctx, mp)
+                            await abandon_cold_start(self, ctx, mp)
                             await ctx.send(
                                 embed=notice_embed(
                                     "Couldn't reach this server's saved queue, so "
@@ -1439,120 +1427,9 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.resume")
     async def resume(self, ctx: commands.Context) -> None:
         try:
-            vc = ctx.voice_client
-            if not isinstance(vc, discord.VoiceClient):
-                # Not in voice: the paused song went with the voice client, but the
-                # queue outlives it in Redis. Join and pick that up instead.
-                await self._resume_disconnected(ctx)
-                return
-            if vc.is_playing():
-                await ctx.send(
-                    embed=notice_embed(
-                        "Already playing — nothing is paused.", discord.Color.orange()
-                    )
-                )
-                return
-            if not vc.is_paused():
-                # No queue advice here: this branch also covers the seconds
-                # between two songs, where the queue is not empty at all.
-                await ctx.send(
-                    embed=notice_embed("Nothing is paused.", discord.Color.orange())
-                )
-                return
-            mp = self.get_mp(ctx)
-            await mp.resume(vc)
-            await ctx.message.add_reaction("⏭️")
-            # If the -pause confirmation hosts the block, re-host it so
-            # "⏸️ Paused at…" becomes history instead of sitting beneath a
-            # live, advancing bar for the rest of the song.
-            await mp.rehost_np_after_resume()
+            await resume_cmd.run(ctx, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
-
-    async def _resume_disconnected(self, ctx: commands.Context) -> None:
-        """`-resume` with the bot out of voice: join the author's channel and let the
-        persisted queue play again.
-
-        A `-stop`, an eject and a crash all leave `guild:{id}:queue` intact, so there
-        is something to come back to; only a crash also leaves the song that was
-        playing, which restore re-queues at its position (cleanup() scrubs those
-        state fields on the other two).
-        """
-        assert ctx.guild is not None  # validate_commands rejects DMs before this
-        async with background_typing(ctx):
-            mp = self.get_mp(ctx)
-            if not mp.can_rejoin_cold():
-                # An eject that never reached on_voice_state_update, so cleanup never
-                # ran. Rejoining around it announces a resume its wedged loop cannot
-                # deliver.
-                await self.cleanup(ctx.guild)
-                mp = self.get_mp(ctx)
-            # Restore first, unlike -play: there is no extraction to hide the join
-            # behind, and joining first parks the bot in a channel for an empty queue.
-            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                await ctx.send(
-                    embed=notice_embed(
-                        "Still loading this server's saved queue — try `-resume` "
-                        "again in a moment.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            # Built before the gate opens, while the queue head is still the
-            # restored one — the loop pops it out from under this.
-            embed = mp.build_rejoin_resume_embed()
-            if embed is None:
-                # A failed read lands here too, with a queue it never filled. Saying
-                # "nothing was left" would assert what it cannot know.
-                detail = (
-                    "Nothing to resume — no queue was left from a previous "
-                    "session. Use `-play` to start one."
-                    if mp.store is not None and not mp.restore_read_failed
-                    else "Can't reach the queue store, so there is nothing to "
-                    "resume from. Use `-play` to start a new queue."
-                )
-                await ctx.send(embed=notice_embed(detail, discord.Color.orange()))
-                return
-
-            # The hold -play takes across its join: without it the head starts playing,
-            # and posts its NP card, before the reply explaining the join lands.
-            async with mp.defer_playback():
-                try:
-                    await ctx.invoke(self.join)
-                    joined = _join_succeeded(ctx)
-                except BaseException:
-                    # join swallows Exceptions, so an escape means its error REPORTING
-                    # failed, or the command was cancelled. Same wreckage, same exit.
-                    await self._abandon_cold_start(ctx, mp)
-                    raise
-                if not joined:
-                    # join already told the user why; nothing to add here.
-                    await self._abandon_cold_start(ctx, mp)
-                    return
-                await ctx.send(embed=embed)
-
-    async def _abandon_cold_start(self, ctx: commands.Context, mp: MusicPlayer) -> None:
-        """Drop the player a cold-start command (`-play`, `-resume`) was about to
-        hand a voice connection to.
-
-        defer_playback opens the gate as it unwinds whether or not the join worked,
-        and a loop waking with no voice client fails its `vc` assertion once per
-        restored song — draining the in-memory queue while Redis keeps every entry.
-        Tearing down first makes that gate-open land on a cancelled loop, which is inert.
-
-        The re-park FOLLOWS cleanup(): dropping the player is what loses a
-        crash-recovered head, and clear_connection() HDELs the fields it writes.
-
-        Skipped entirely while another command holds the gate — it is mid-join on this
-        same player and owns the teardown call.
-        """
-        if mp.playback_holds > 1:  # this command's own hold, plus someone else's
-            return
-        if ctx.guild is not None:
-            with contextlib.suppress(Exception):
-                await self.cleanup(ctx.guild)
-        with contextlib.suppress(Exception):
-            await mp.repark_crashed_head()
 
     @commands.command(
         name="shuffle",
