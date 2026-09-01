@@ -785,26 +785,32 @@ class GuildRedisStore:
 
     # Queue operations
 
-    @_guild_op(default=None)
-    async def push_queue(self, entry: QueueEntry) -> None:
-        """RPUSH one queue entry and refresh TTL on all guild keys."""
+    @_guild_op(default=False)
+    async def push_queue(self, entry: QueueEntry) -> bool:
+        """RPUSH one queue entry and refresh TTL on all guild keys. Reports whether
+        it landed: the failure is swallowed here, and the caller has no other way to
+        learn its mirror is now short of the deque."""
         pipe = self.redis.pipeline()
         pipe.rpush(self.queue_key(), entry.to_redis())
         self._pipe_expire_all(pipe)
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> None:
-        """RPUSH all entries in one pipeline round-trip and refresh TTL on all guild keys."""
+    @_guild_op(default=False)
+    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> bool:
+        """RPUSH all entries in one pipeline round-trip and refresh TTL on all guild
+        keys. Reports whether it landed, like push_queue; nothing to write is a
+        landed write, since the mirror already agrees with the deque."""
         if not entries:
-            return
+            return True
         pipe = self.redis.pipeline()
         pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
         self._pipe_expire_all(pipe)
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
+    @_guild_op(default=False)
+    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> bool:
         """LPUSH entries so entries[0] ends up at the queue head, and refresh TTL on
         all guild keys — the -playnow front insert. LPUSH sends each successive
         argument to the head, so the batch is reversed first to preserve order.
@@ -812,13 +818,15 @@ class GuildRedisStore:
         A swallowed failure degrades WORSE than a tail-push failure: the in-memory
         legs end up len(entries) ahead of Redis at the HEAD, so the next commit-time
         LPOPs retire other songs' entries, and a crash before the mismatch drains
-        restores a queue shifted by up to that many songs."""
+        restores a queue shifted by up to that many songs — so the landed bool this
+        reports is what lets put_front mark the mirror stale instead."""
         if not entries:
-            return
+            return True
         pipe = self.redis.pipeline()
         pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
         self._pipe_expire_all(pipe)
         await pipe.execute()
+        return True
 
     @_guild_op(default=None)
     async def pop_queue(self) -> None:
