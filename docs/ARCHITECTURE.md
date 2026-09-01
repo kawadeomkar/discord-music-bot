@@ -608,6 +608,18 @@ Returns a `QueueObject`.
 
 ---
 
+### Where the resolve bound is taken
+
+`PLAY_RESOLVE_CONCURRENCY` (`_GuildPlays.resolves`) bounds how many of a guild's admitted `-play`s may hold one of the shared pool's workers. It is acquired inside `_extract_once`, around the job it starts — **not** around the caller's whole resolve.
+
+That distinction is the difference between the bound doing its job and the bound being the problem. A resolve is not all pool work: a repeat `-play` is a `ytdl:source` GET, a re-pasted collection is a `ytdl:playlist` GET, and a Spotify playlist is Spotify HTTP plus Redis and never touches yt-dlp at all. Held around the whole resolve, every one of those queued behind two in-flight extractions in the same guild — the exact request class that should be instant. Held at the extraction, they proceed while the two long lookups run.
+
+A caller that **joins** an in-flight job takes no slot either: the leader is the one holding a worker, and charging its joiners would let one popular link exhaust a guild's budget with jobs that are not running.
+
+The slot is passed down as `pool_slot` — through `queue_source`, `yt_source` and `yt_playlist` — rather than read from a registry, because `src/youtube.py` knows nothing about guilds. A resolve reached outside a command (a lazy `SearchQueueEntry` at dequeue, a prefetch, a test) passes `None` and is bounded by `prefetch_warm_slot()` or by nothing, as before.
+
+---
+
 ### The playlist cache
 
 `yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.

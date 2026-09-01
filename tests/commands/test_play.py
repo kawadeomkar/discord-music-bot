@@ -2899,7 +2899,6 @@ class TestResolveThenPlace:
         assert waiter.placed
 
 
-
 class TestPlacementRevalidation:
     """What the insert re-checks, and what a command can still take back."""
 

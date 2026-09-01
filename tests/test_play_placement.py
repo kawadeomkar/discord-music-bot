@@ -2,13 +2,16 @@
 registry whose place lock makes "check, then insert" atomic."""
 
 import asyncio
+import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import orjson
+import redis.asyncio as aioredis
 
 import pytest
 from discord.ext import commands
 
-from src import play_pipeline
 from src.musicbot import MusicBot
 from src.play_placement import (
     PlayArgs,
@@ -17,7 +20,6 @@ from src.play_placement import (
     play_key,
     split_play_args,
 )
-from src.youtube import QueueObject
 from tests.helpers import (
     admit,
     command_callback,
@@ -26,7 +28,6 @@ from tests.helpers import (
     no_typing,
     recording_span,
     settle,
-    song,
 )
 
 
@@ -267,12 +268,25 @@ class TestPlayRegistry:
         assert "Too many" in text and "resolving" in text
 
 
+def _extracted_song(video_id: str) -> dict[str, Any]:
+    """The shape one yt-dlp stream-opts extraction returns for a link — enough for
+    yt_source to build its QueueObject and warm both caches."""
+    return {
+        "url": f"https://r2.googlevideo.com/{video_id}?expire={int(time.time()) + 7200}",
+        "webpage_url": f"https://yt.com/v={video_id}",
+        "title": f"Song {video_id}",
+        "duration": 100,
+        "uploader": "Chan",
+    }
+
+
 class TestResolveConcurrency:
     """PLAY_INFLIGHT_MAX bounds what a guild holds in memory; this bounds what it
-    holds of the shared, process-wide yt-dlp pool."""
+    holds of the shared, process-wide yt-dlp pool. Asserted at the EXTRACTION, which
+    is where the slot is taken — around the resolve it also caught cache hits."""
 
     async def test_a_guild_holds_at_most_that_many_workers_at_once(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: aioredis.Redis
     ) -> None:
         """Without it one guild's paste burst takes every worker for as many waves
         as it has links, and the jobs queued behind include the playback loop's own
@@ -280,26 +294,29 @@ class TestResolveConcurrency:
         mp = mock_mp()
         mock_ctx.voice_client = connected_vc(mock_ctx)
         music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.redis = fake_redis
         live = 0
         peak = 0
         release = asyncio.Event()
 
-        async def _resolve(*_a: Any, **_k: Any) -> QueueObject:
+        async def _extract(_request: Any) -> Any:
             nonlocal live, peak
             live += 1
             peak = max(peak, live)
             await release.wait()
             live -= 1
-            return song(1, mock_ctx)
+            return _extracted_song("x")
 
-        play_pipeline.queue_source = AsyncMock(side_effect=_resolve)
         with (
             no_typing("src.commands.play.background_typing"),
             patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
+            patch("src.youtube._run_extract", new=_extract),
         ):
             tasks = [
                 asyncio.create_task(
-                    command_callback(MusicBot.play)(music_bot, mock_ctx, url=f"s{n}")
+                    command_callback(MusicBot.play)(
+                        music_bot, mock_ctx, url=f"https://yt.com/v=s{n}"
+                    )
                 )
                 for n in range(5)
             ]
@@ -309,6 +326,61 @@ class TestResolveConcurrency:
             await asyncio.gather(*tasks)
 
         assert mp.queue_put.await_count == 5  # and all of them still land
+
+    async def test_a_cache_hit_does_not_queue_behind_two_extractions(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The request class the bound is meant to protect, not to delay: a repeat
+        -play needs no worker at all, and around the whole resolve it waited for two
+        that were still extracting."""
+        mp = mock_mp()
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.redis = fake_redis
+        await fake_redis.set(
+            "ytdl:source:https://yt.com/v=warm",
+            orjson.dumps(
+                {
+                    "webpage_url": "https://yt.com/v=warm",
+                    "title": "Already Resolved",
+                    "duration": 100,
+                    "uploader": "Chan",
+                    "thumbnail": None,
+                    "cached_at": time.time(),
+                }
+            ),
+        )
+        release = asyncio.Event()
+
+        async def _extract(_request: Any) -> Any:
+            await release.wait()
+            return _extracted_song("x")
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
+            patch("src.youtube._run_extract", new=_extract),
+        ):
+            holding = [
+                asyncio.create_task(
+                    command_callback(MusicBot.play)(
+                        music_bot, mock_ctx, url=f"https://yt.com/v=cold{n}"
+                    )
+                )
+                for n in range(2)
+            ]
+            await settle()
+            hit = asyncio.create_task(
+                command_callback(MusicBot.play)(
+                    music_bot, mock_ctx, url="https://yt.com/v=warm"
+                )
+            )
+            await settle()
+            assert hit.done()  # both slots held, and it never needed one
+            release.set()
+            await asyncio.gather(*holding)
+
+        assert mp.queue_put.await_count == 3
 
 
 class TestRetirePlayerFence:

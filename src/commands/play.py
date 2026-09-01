@@ -217,15 +217,15 @@ async def _resolve_and_place(
                 tracked=cog._restore_tasks,
             )
             try:
-                async with cog._plays.resolve_slot(req):
-                    qobj = await play_pipeline.queue_source(
-                        ctx,
-                        source,
-                        analytics=analytics,
-                        origin=url,
-                        mode=resolve_mode_for(placement),
-                        cog=cog,
-                    )
+                qobj = await play_pipeline.queue_source(
+                    ctx,
+                    source,
+                    analytics=analytics,
+                    origin=url,
+                    mode=resolve_mode_for(placement),
+                    pool_slot=cog._plays.resolve_slot(req),
+                    cog=cog,
+                )
                 # Stamped before the join wait below, so play.resolve_secs times
                 # the extraction alone and not the voice handshake beside it.
                 trace.get_current_span().set_attribute(
@@ -267,15 +267,15 @@ async def _resolve_and_place(
                 # await may land between the teardown decision and the release.
                 return None if owns_join else _join_failed_notice(url)
         else:
-            async with cog._plays.resolve_slot(req):
-                qobj = await play_pipeline.queue_source(
-                    ctx,
-                    source,
-                    analytics=analytics,
-                    origin=url,
-                    mode=resolve_mode_for(placement),
-                    cog=cog,
-                )
+            qobj = await play_pipeline.queue_source(
+                ctx,
+                source,
+                analytics=analytics,
+                origin=url,
+                mode=resolve_mode_for(placement),
+                pool_slot=cog._plays.resolve_slot(req),
+                cog=cog,
+            )
             # The cold branch stamps its own above, before the join wait.
             trace.get_current_span().set_attribute(
                 "play.resolve_secs",
