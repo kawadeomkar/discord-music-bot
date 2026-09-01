@@ -273,7 +273,9 @@ class TestPingCommand:
         redis_spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
 
         with (
-            patch("src.musicbot.send_latency_line", new=AsyncMock()) as latency_line,
+            patch(
+                "src.commands.join.send_latency_line", new=AsyncMock()
+            ) as latency_line,
             patch("src.ping.probe_redis", new=redis_spy),
         ):
             await command_callback(MusicBot.join)(music_bot, mock_ctx)
@@ -286,7 +288,7 @@ class TestPingReportsSpotifySource:
     """End-to-end: the Spotify row reports the *source's* startup state — never
     configured, configured-but-rejected, or live — so a user can see why Spotify
     links are declined without reading the logs. probe_spotify is left unpatched
-    here: the cog's _spotify_status is what is under test."""
+    here: the cog's spotify_status is what is under test."""
 
     def _patch_everything_but_spotify(self) -> Any:
         async def _make(res: ProbeResult) -> ProbeResult:
