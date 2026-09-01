@@ -45,7 +45,7 @@ from src.commands.history import (
 )
 from src.play_pipeline import PlaylistInputError
 from src.commands.analytics import AnalyticsFlags
-from src.play_placement import PlayMode
+from src.play_placement import PlayMode, split_play_args
 from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -120,18 +120,37 @@ class ActiveCommand:
     started: float
 
 
+def _play_takes_the_queue(
+    ctx: commands.Context, voice_client: Optional[discord.VoiceClient]
+) -> bool:
+    """Whether this -play decides what a channel hears next (`--now` stops the
+    song, `--next` takes the front) rather than appending, and so is gated on the
+    same channel every other queue command is. Reads the PARSED argument:
+    Command.prepare() parses before call_before_hooks. A paused client counts
+    without checking for a current song — the gate cannot build a player."""
+    if voice_client is None:
+        return False
+    if voice_client.is_paused():
+        return True
+    return split_play_args(str(ctx.kwargs.get("url", ""))).mode is not PlayMode.NORMAL
+
+
 def _check_voice_permissions(
     author: Union[discord.Member, discord.User],
     voice_client: Optional[discord.VoiceClient],
     command_name: str,
+    *,
+    queue_control: bool = False,
 ) -> Optional[str]:
-    """Returns an error message string if validation fails, None if OK."""
+    """Returns an error message if validation fails, None if OK. Plain -play is
+    exempt from the same-channel rule (appending costs listeners elsewhere
+    nothing); queue control is gated like -skip/-shuffle/-remove/-clear."""
     if isinstance(author, discord.User):
         return f"You must be a member of this channel {author}"
     if not author.voice or not author.voice.channel:
         return f"You are not connected to a voice channel, you silly baka {author}"
     if (
-        command_name != "play"
+        (command_name != "play" or queue_control)
         and voice_client is not None
         and voice_client.channel != author.voice.channel
     ):
@@ -505,7 +524,12 @@ class MusicBot(commands.Cog):
         vc = ctx.voice_client
         voice_client = vc if isinstance(vc, discord.VoiceClient) else None
         command_name = ctx.command.name if ctx.command is not None else ""
-        msg = _check_voice_permissions(ctx.author, voice_client, command_name)
+        msg = _check_voice_permissions(
+            ctx.author,
+            voice_client,
+            command_name,
+            queue_control=_play_takes_the_queue(ctx, voice_client),
+        )
         if msg:
             await ctx.send(embed=notice_embed(msg, discord.Color.red()))
             raise commands.CommandError(msg)

@@ -17,9 +17,11 @@ from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
     MusicBot,
     _check_voice_permissions,
+    _play_takes_the_queue,
 )
 from src.spotify import SpotifyAuthError
 from tests.helpers import (
+    described,
     make_mock_task,
 )
 
