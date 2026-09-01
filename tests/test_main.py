@@ -954,7 +954,9 @@ class TestCommandNotFound:
                 self._ctx("x" * 2000), commands.CommandNotFound("...")
             )
         logged = mock_log.debug.call_args.args[0]
-        assert len(logged) < 64, logged
+        # The cap itself, not a bound loose enough to survive widening it.
+        assert "x" * 32 in logged
+        assert "x" * 33 not in logged
 
     @pytest.mark.parametrize("token", ["milk", "pn", "playnow", "paly"])
     async def test_no_token_earns_a_reply(self, app: MusicBotApp, token: str) -> None:

@@ -231,10 +231,11 @@ class GuildQueue:
     def requeue_front(self, item: QueueItem) -> None:
         """Give a claim back: the cursor steps back and the item is pending again;
         the mirror never moved. `item` may be the RESOLVED form of what was claimed
-        and replaces it, so a later rebuild serializes the resolved entry. It lands
-        in the OLDEST claimed slot (index 0) and the cursor gives up the NEWEST, so
-        two live claims (the prefetch's and loop()'s) settle by position and the
-        deque stays in step with the mirror."""
+        and replaces it, so a later rebuild serializes the resolved entry.
+
+        It writes index 0 because that is the only claimed slot there is: the
+        prefetch's requeue always lands before loop() can take a second claim, so
+        _cursor is never above 1 here and index 0 IS _cursor."""
         # Guarded like every other cursor decrement: unguarded, _cursor == 0 goes
         # negative and _items[-1] = item clobbers the TAIL.
         if self._cursor > 0:
