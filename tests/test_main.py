@@ -122,6 +122,24 @@ class TestSetupHook:
         for ext in EXTENSIONS:
             mock_load.assert_any_await(ext)
 
+    async def test_prewarms_the_pool_with_the_worker_warm_up(
+        self, app: MusicBotApp
+    ) -> None:
+        """The warm-up is a parameter with a default, so a setup_hook that forgot it
+        would still spawn workers, still type-check, and still pay the
+        first-YoutubeDL cost on the first -play. Only this pins the wiring."""
+        from src.youtube import warm_worker
+
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch("src.youtube.ytdlp_pool.prewarm") as mock_prewarm,
+        ):
+            await app.setup_hook()
+
+        mock_prewarm.assert_called_once_with(warm_worker)
+
     @pytest.mark.parametrize("value", [None, ""])
     async def test_missing_postgres_url_refuses_to_start(
         self,
