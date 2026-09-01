@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import os
 import re
@@ -810,6 +811,24 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
 _INFLIGHT_EXTRACTS: dict[str, asyncio.Future[Optional[YTDLExtractResult]]] = {}
 
 
+_prefetch_gate: Optional[asyncio.Semaphore] = None
+_prefetch_gate_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def prefetch_warm_slot() -> asyncio.Semaphore:
+    """The bound on enqueue-time stream warms, which are spawned one per song and
+    share the pool with the in-band resolves of every OTHER guild's playback loop.
+    Half the workers, so one guild's paste burst can never hold all of them.
+    Rebuilt when the running loop changes — a Semaphore binds to the first loop
+    that awaits it and refuses another."""
+    global _prefetch_gate, _prefetch_gate_loop
+    loop = asyncio.get_running_loop()
+    if _prefetch_gate is None or _prefetch_gate_loop is not loop:
+        _prefetch_gate = asyncio.Semaphore(max(1, ytdlp_pool.max_workers // 2))
+        _prefetch_gate_loop = loop
+    return _prefetch_gate
+
+
 def _inflight_key(cache_key: str, profile: str) -> str:
     """Single-flight key: the cache key the lookup missed on, plus the shape of the
     request. Results of different profiles are not interchangeable — a flat entry's
@@ -1258,7 +1277,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 _inflight_key(cache_key, "full"),
                 ExtractRequest(
                     url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
-                )
+                ),
             )
         except ExtractionError as e:
             # parse_url whitelists no domains — any dotted host lands here for yt-dlp

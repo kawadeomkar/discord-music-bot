@@ -207,6 +207,12 @@ class YtdlpPool:
             listener.stop()
 
     @property
+    def max_workers(self) -> int:
+        """Worker count this pool runs with, for callers sizing their own bounds
+        against it — YTDLP_POOL_WORKERS stays read in one place."""
+        return self._max_workers
+
+    @property
     def is_closed(self) -> bool:
         with self._lock:
             return self._closed
