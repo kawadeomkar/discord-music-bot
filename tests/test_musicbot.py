@@ -737,14 +737,14 @@ class TestCogUnloadReleasesSpotify:
 
 class TestCogLoadSpotifyValidation:
     """cog_load spawns the credential probe as a background task so startup is
-    never blocked, and the probe resolves _spotify_status without ever raising."""
+    never blocked, and the probe resolves spotify_status without ever raising."""
 
     async def test_no_op_when_spotify_disabled(self, music_bot: MusicBot) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         music_bot._restore_tasks = set()
         await music_bot.cog_load()
-        assert music_bot._spotify_status is SpotifyStatus.DISABLED
+        assert music_bot.spotify_status is SpotifyStatus.DISABLED
         assert not _running(music_bot, "_validate_spotify_credentials")
 
     async def test_cog_load_spawns_probe_without_blocking(
@@ -754,7 +754,7 @@ class TestCogLoadSpotifyValidation:
         runs as a tracked background task, not inline."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(return_value=None)
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         music_bot._restore_tasks = set()
 
         await music_bot.cog_load()
@@ -765,23 +765,23 @@ class TestCogLoadSpotifyValidation:
 
         await asyncio.gather(*music_bot._restore_tasks)  # let the probe finish
         music_bot.spotify.validate.assert_awaited_once()
-        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+        assert music_bot.spotify_status is SpotifyStatus.ENABLED
 
     async def test_valid_credentials_stay_enabled(self, music_bot: MusicBot) -> None:
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(return_value=None)
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         await music_bot._validate_spotify_credentials()
         music_bot.spotify.validate.assert_awaited_once()
-        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+        assert music_bot.spotify_status is SpotifyStatus.ENABLED
 
     async def test_auth_error_flips_to_invalid(self, music_bot: MusicBot) -> None:
         """Only an authentication rejection disables Spotify."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(side_effect=SpotifyAuthError(400))
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         await music_bot._validate_spotify_credentials()  # must not raise
-        assert music_bot._spotify_status is SpotifyStatus.INVALID
+        assert music_bot.spotify_status is SpotifyStatus.INVALID
 
     async def test_network_error_leaves_enabled(self, music_bot: MusicBot) -> None:
         """A non-auth failure is inconclusive: Spotify stays enabled."""
@@ -789,17 +789,17 @@ class TestCogLoadSpotifyValidation:
         music_bot.spotify.validate = AsyncMock(
             side_effect=OSError("connection refused")
         )
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         await music_bot._validate_spotify_credentials()  # must not raise
-        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+        assert music_bot.spotify_status is SpotifyStatus.ENABLED
 
     async def test_timeout_leaves_enabled(self, music_bot: MusicBot) -> None:
         """A probe timeout is inconclusive (not an auth rejection): stays enabled."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(side_effect=asyncio.TimeoutError)
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         await music_bot._validate_spotify_credentials()  # must not raise
-        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+        assert music_bot.spotify_status is SpotifyStatus.ENABLED
 
 
 class TestSetup:

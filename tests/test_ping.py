@@ -318,7 +318,7 @@ class TestPingReportsSpotifySource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         latency = await self._run(music_bot, mock_ctx)
         assert "Spotify API" in latency
         assert "n/a (not configured)" in latency
@@ -328,7 +328,7 @@ class TestPingReportsSpotifySource:
     ) -> None:
         """The startup probe found the credentials invalid: the row is red and
         names the cause rather than reporting a generic outage."""
-        music_bot._spotify_status = SpotifyStatus.INVALID
+        music_bot.spotify_status = SpotifyStatus.INVALID
         latency = await self._run(music_bot, mock_ctx)
         assert "down (credentials rejected)" in latency
 
@@ -336,7 +336,7 @@ class TestPingReportsSpotifySource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mocked(music_bot.spotify).http_call = AsyncMock(return_value={"x": 1})
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         latency = await self._run(music_bot, mock_ctx)
         assert "ms" in latency
         assert "rejected" not in latency and "not configured" not in latency

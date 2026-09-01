@@ -496,7 +496,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.spotify = MagicMock(spec=Spotify)
     cog.spotify.client_id = "cid"
     cog.spotify.client_secret = "secret"
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     # None, not a mock: this fixture builds the cog without __init__, so an unset
     # attribute raises AttributeError rather than returning None. Tests that care
@@ -544,7 +544,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.spotify = MagicMock(spec=Spotify)
     cog.spotify.client_id = "cid"
     cog.spotify.client_secret = "secret"
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
     # None, not a mock, and set explicitly: this fixture builds the cog without
     # __init__, and _debug_inputs reads history_archive — left unset it would be an

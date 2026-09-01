@@ -28,7 +28,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
     cog.voice_watchdog = VoiceWatchdog(cog)
