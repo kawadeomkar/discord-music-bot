@@ -907,6 +907,23 @@ class TestTheTwoCounters:
     `play_history.queue_position` (MusicPlayer.enqueue_depth), so a swap writes a
     plausible wrong number to Postgres permanently, with no error to notice."""
 
+    async def test_claim_outstanding_follows_the_cursor(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The third view of the same two fields, and the one that survives the
+        handoff: between loop() taking a prefetch result out of its slot and
+        committing it, this is the only thing that says a song is on its way —
+        `_prefetch_task` is already None and `current_song` is not yet set."""
+        a = _qobj(1, mock_author)
+        await gq.put([a])
+        assert gq.claim_outstanding() is False
+
+        claimed = gq.get_nowait()
+        assert gq.claim_outstanding() is True
+
+        gq.requeue_front(claimed)
+        assert gq.claim_outstanding() is False
+
     async def test_they_differ_by_exactly_the_in_flight_head(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:

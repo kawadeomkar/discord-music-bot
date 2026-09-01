@@ -399,6 +399,152 @@ class TestQueuePut:
         mock_pf.assert_not_awaited()
 
 
+# ── QueuePutNext ──────────────────────────────────────────────────────────────
+
+
+class TestQueuePutNext:
+    """ "Next" means next, which put_front alone does not deliver: the loop's
+    prefetch holds a claim for the rest of the current song, so a bare put_front
+    lands behind it and plays second. Every test here is that ordering, or the
+    bookkeeping that makes it safe."""
+
+    @staticmethod
+    def _titles(mp: MusicPlayer) -> list[str]:
+        return [queue_object(item).title for item in mp.queue.display_items()]
+
+    async def test_it_lands_ahead_of_a_running_prefetchs_claim(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The headline case, and the common one: a song is playing and B is
+        queued, so the prefetch already owns B. Without the neutralize the new
+        song plays after B rather than before it."""
+        first = QueueObject("https://yt.com/v=b", "B", mock_author)
+        await music_player.queue.put([first])
+        claimed = asyncio.Event()
+
+        async def hang(_source: Any) -> QueueObject:
+            claimed.set()
+            await asyncio.sleep(30)
+            raise AssertionError("unreachable")
+
+        # Patched on the class, not the instance: MusicPlayer has __slots__.
+        with patch.object(
+            MusicPlayer, "_resolve_source", new_callable=AsyncMock, side_effect=hang
+        ):
+            music_player._prefetch_task = asyncio.create_task(
+                music_player._prefetch_next_song()
+            )
+            await claimed.wait()
+            # The claim is real: B has left the pending region entirely.
+            assert music_player.queue.qsize() == 0
+
+            newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
+            await music_player.queue_put_next(newcomer, prefetch=False)
+
+        assert self._titles(music_player) == ["X", "B"]
+        assert music_player.queue.qsize() == 2
+
+    async def test_a_completed_prefetch_is_rebuilt_behind_the_new_song(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """A finished prefetch bypasses the queue entirely — it would have played
+        INSTEAD of the insert. Its rebuilt equivalent goes back behind the
+        newcomer, and its FFmpeg subprocess is killed rather than leaked."""
+        original = QueueObject("https://yt.com/v=b", "B", mock_author)
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+        live_song.cleanup = MagicMock()
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
+        await music_player.queue_put_next(newcomer, prefetch=False)
+
+        live_song.cleanup.assert_called_once()
+        assert self._titles(music_player) == ["X", live_song.title]
+
+    async def test_it_never_respawns_the_prefetch(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """_prefetch_task is a single slot with a claim-then-null protocol shared with
+        loop(). Re-spawning here would race the loop's own spawn at the next song
+        start and orphan a task with a claim nothing settles; the one-song gap is
+        accepted, as interject() accepts it."""
+        await music_player.queue.put(
+            [QueueObject("https://yt.com/v=b", "B", mock_author)]
+        )
+        await music_player.queue_put_next(
+            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+        )
+        assert music_player._prefetch_task is None
+
+    async def test_with_no_prefetch_it_is_a_plain_front_insert(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player._prefetch_task = None
+        for title in ("B", "C"):
+            await music_player.queue.put(
+                [QueueObject(f"https://yt.com/v={title}", title, mock_author)]
+            )
+
+        await music_player.queue_put_next(
+            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+        )
+
+        assert self._titles(music_player) == ["X", "B", "C"]
+
+    async def test_an_empty_queue_degrades_to_an_append(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """ "Play next" and "play" are the same request when nothing is queued —
+        which is what lets --next need no special case for an idle bot."""
+        await music_player.queue_put_next(
+            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+        )
+        assert self._titles(music_player) == ["X"]
+
+    async def test_it_mirrors_the_new_order_to_redis(
+        self, music_player: MusicPlayer, mock_author: MagicMock, fake_redis: Any
+    ) -> None:
+        """The mirror is the queue a restart reads back, so an insert that is
+        right in memory and wrong in Redis survives exactly until the next
+        crash."""
+        assert music_player.store is not None
+        await music_player.queue.put(
+            [QueueObject("https://yt.com/v=b", "B", mock_author)]
+        )
+
+        await music_player.queue_put_next(
+            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+        )
+
+        stored = [
+            orjson.loads(raw)["title"]
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert stored == ["X", "B"]
+
+    async def test_it_still_warms_the_stream_url(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The prefetch it suppresses is loop()'s queue-claiming one. This one only
+        writes ytdl:stream:*, and it is what keeps the neutralize affordable: the
+        song about to play is warmed even though no claim is held for it."""
+        newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put_next(newcomer)
+            await asyncio.sleep(0)
+        mock_pf.assert_awaited_once()
+        assert mock_pf.call_args[0][0] == newcomer
+
+
 # ── QueueClear ────────────────────────────────────────────────────────────────
 
 

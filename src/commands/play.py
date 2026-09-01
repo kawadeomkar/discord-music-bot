@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Union
 import discord
 from discord.ext import commands
 
+from opentelemetry import trace
+
 from src.guild_state import Analytics
+from src.play_placement import PlayArgs, split_play_args
 from src.musicplayer import DEPTH_RESTORE_WAIT_SECS, RESTORE_WAIT_SECS
 from src.recovery import abandon_cold_start, join_succeeded
 from src.sources import (
@@ -45,16 +48,24 @@ if TYPE_CHECKING:
 
 
 async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
-    """`-play` — resolve the input, join if needed, and queue it.
+    """`-play` — split the placement flag off, then resolve, join if needed, queue.
 
     Takes the cog: the cold path runs -join through discord.py, tears the player
     down when that join produces no usable client, and resolves the player itself.
     """
-    # Consume-rest, so a multi-word search arrives whole: this value is what
-    # `origin` is stamped from, and -remove matches on that. read_rest hands
-    # the quotes through, hence the unquote — a quoted origin is one -remove
-    # would have to match literally.
-    url = unquote_argument(url.strip())
+    # Consume-rest, so a multi-word search arrives whole — it is what -remove
+    # matches on. The strip covers callers that bypass discord.py's parser.
+    args = split_play_args(url.strip())
+    await _run_placed(ctx, args, cog=cog)
+
+
+async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -> None:
+    """The body behind -play, taking the argument already split."""
+    trace.get_current_span().set_attribute("play.mode", args.mode.value)
+    # ONE rebind, so every `origin=url` below is the query with the flag off:
+    # a leaked flag persists a user_input -remove cannot match. read_rest hands
+    # quotes through, and a quoted origin is one -remove would match literally.
+    url = unquote_argument(args.query)
     async with background_typing(ctx):
         # Paused → interject, not append: appending leaves the bot silent
         # with the request buried behind a paused song. The interrupted song
@@ -74,7 +85,7 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
                     cog=cog,
                 )
 
-        source = parse_input(url, ctx.message.content)
+        source = parse_input(url)
 
         qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
         async with contextlib.AsyncExitStack() as stack:

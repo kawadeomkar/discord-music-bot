@@ -376,7 +376,7 @@ async def enqueue_single(
         await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
 
 
-async def _resolve_playnow_source(
+async def _resolve_interjection_source(
     ctx: commands.Context,
     source: Union[SpotifySource, YTSource, SoundcloudSource],
     *,
@@ -471,8 +471,8 @@ async def interject_flow(
     is appended instead. Reading it here rather than at command entry also means
     a song that fails to resolve never stops the paused song.
     """
-    source = parse_input(url, ctx.message.content)
-    qobj = await _resolve_playnow_source(ctx, source, origin=url, cog=cog)
+    source = parse_input(url)
+    qobj = await _resolve_interjection_source(ctx, source, origin=url, cog=cog)
     qobj.interjected = True
 
     # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts

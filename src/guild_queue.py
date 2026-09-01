@@ -257,6 +257,12 @@ class GuildQueue:
     def empty(self) -> bool:
         return self._cursor >= len(self._items)
 
+    def claim_outstanding(self) -> bool:
+        """Is a consumer holding an item it has not settled yet? True across the
+        prefetch's claim and loop()'s own (from taking the prefetch result until
+        commit_dequeue()), when `_prefetch_task` is None and `current_song` unset."""
+        return self._cursor > 0
+
     def qsize(self) -> int:
         """PENDING only — what is still waiting to be claimed."""
         return len(self._items) - self._cursor
