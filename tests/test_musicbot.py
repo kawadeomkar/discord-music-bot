@@ -2651,6 +2651,7 @@ class TestHistoryCommand:
             "history",
             "ping",
             "leaderboard",
+            "analytics",
             "debug",
             "resume",
             "restart",
@@ -2805,6 +2806,27 @@ class TestMaxConcurrencyNotice:
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "already running" in embed.description
         assert "ping" in embed.description
+
+    async def test_a_cooldown_says_how_long_is_left(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """This arm is the only place a user learns why they were refused. Deleting
+        it falls through to the generic handler, and zeroing retry_after reads as
+        "try again now". It names the command because -analytics and -restart both
+        carry a cooldown now, so an unnamed refusal does not say which one it
+        answers — and the copy was unpinned until two branches wrote two different
+        strings for it."""
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "analytics"
+        await music_bot.cog_command_error(
+            mock_ctx,
+            commands.CommandOnCooldown(
+                commands.Cooldown(1, 30.0), 12.0, commands.BucketType.guild
+            ),
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "12" in embed.description
+        assert "analytics" in embed.description
 
 
 def _running(cog: MusicBot, coro_name: str) -> bool:
@@ -5227,6 +5249,13 @@ class TestDebugObservesWithoutCreating:
         passing on a command that lost it."""
         assert MusicBot.debug.extras.get("observation_only") is True
         assert MusicBot.play.extras.get("observation_only") is None
+
+    async def test_analytics_carries_the_flag_too(self) -> None:
+        """-analytics reads the archive and never touches voice. Without the flag
+        cog_before_invoke builds a player for it, which starts _restore_state() and
+        then parks on the 300s gate before tearing itself down — observed in the
+        deployed bot as a gate timeout logged under command=analytics."""
+        assert MusicBot.analytics.extras.get("observation_only") is True
 
     async def test_debug_does_not_create_a_player(
         self, music_bot: MusicBot, mock_ctx: MagicMock

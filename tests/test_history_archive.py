@@ -21,6 +21,7 @@ from typing import Any, Optional, cast
 
 from redis.asyncio import Redis
 
+from src import analytics_card
 from src.guild_state import (
     TS_MAX,
     WAIT_UNAVAILABLE,
@@ -2722,6 +2723,7 @@ class TestAnalyticsQuery:
         # Without it every empty guild re-runs the heaviest query in the bot on
         # every invocation, since a non-positive TTL skips the cache write.
         assert metrics.today_start_epoch > 0
+        assert analytics_card.cache_ttl_secs(metrics, now=metrics.today_start_epoch) > 0
 
     async def test_jsonb_branches_decode_from_the_str_asyncpg_returns(self) -> None:
         archive = self._archive()
