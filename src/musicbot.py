@@ -27,25 +27,30 @@ from src.config import (
 )
 from src import debug as debug_mode
 from src.commands import clear as clear_cmd
+from src.commands import history as history_cmd
 from src.commands import jump as jump_cmd
+from src.commands import leaderboard as leaderboard_cmd
 from src.commands import now as now_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import shuffle as shuffle_cmd
-from src import analytics_card, leaderboard
-from src.guild_history import history_embeds
+from src.musicplayer import RESTORE_WAIT_SECS
+from src.util import ECHO_ROW_MAX
+from src.commands.history import (
+    HISTORY_MAX_LIMIT,
+    HISTORY_MIN_LIMIT,
+    HistoryFlags,
+)
+from src import analytics_card
 from src.guild_state import Analytics
 from src.analytics_card import AnalyticsFlags
-from src.leaderboard import LeaderboardFlags
+from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
 )
-from src.musicplayer import RESTORE_WAIT_SECS, MusicPlayer
+from src.musicplayer import MusicPlayer
 from src.redis_client import (
-    HISTORY_CACHE_LIMIT,
     GuildRedisStore,
-    cache_get,
-    cache_set,
 )
 from src.sources import (
     timestamp_warning,
@@ -77,7 +82,6 @@ from src.ping import run_health_dashboard, send_latency_line
 from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
-    ECHO_ROW_MAX,
     background_typing,
     cancel_task,
     fmt_duration,
@@ -170,20 +174,6 @@ class EmptyPlaylistError(PlaylistInputError):
             "That playlist has no songs I can queue — it may be empty, or every "
             "video in it may be private or unavailable.",
         )
-
-
-HISTORY_MIN_LIMIT = 1
-# Pinned to HISTORY_CACHE_LIMIT. recent() serves this command from the Redis list
-# alone, which holds exactly that many entries, so a larger ceiling here returns a
-# short page instead of failing. Raise both together or neither.
-HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
-# 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = Discord's
-# per-message cap of 10, so the block always fits and is never shed.
-HISTORY_EMBEDS_PER_MESSAGE = 8
-
-
-class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
-    limit: int = 10
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1806,32 +1796,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.history")
     async def history(self, ctx: commands.Context, *, flags: HistoryFlags) -> None:
         try:
-            if not (HISTORY_MIN_LIMIT <= flags.limit <= HISTORY_MAX_LIMIT):
-                await ctx.send(
-                    embed=notice_embed(
-                        f"--limit must be between {HISTORY_MIN_LIMIT} and {HISTORY_MAX_LIMIT}",
-                        discord.Color.red(),
-                    )
-                )
-                return
-            mp = self.get_mp(ctx)
-            entries = await mp.history.recent(flags.limit)
-            if not entries:
-                await ctx.send(
-                    embed=notice_embed(
-                        "No songs have been played yet.", discord.Color.orange()
-                    )
-                )
-                return
-            embeds = history_embeds(entries)
-            # 8 per message keeps every chunk within Discord's 10-embed cap once
-            # MusicContext.send prepends the ≤2-embed NP block. Each chunk goes
-            # through ctx.send — never bare channel.send in the player's channel —
-            # so the adopt/retire machinery walks the block down to the last chunk.
-            for start in range(0, len(embeds), HISTORY_EMBEDS_PER_MESSAGE):
-                await ctx.send(
-                    embeds=embeds[start : start + HISTORY_EMBEDS_PER_MESSAGE]
-                )
+            await history_cmd.run(ctx, flags, history=self.get_mp(ctx).history)
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1868,67 +1833,9 @@ class MusicBot(commands.Cog):
         self, ctx: commands.Context, *, flags: LeaderboardFlags
     ) -> None:
         try:
-            # Locals: ctx.guild is a property and history_archive an attribute,
-            # so narrowing on either would not survive the awaits below.
-            guild = ctx.guild
-            archive = self.history_archive
-            if guild is None:
-                await ctx.send(
-                    embed=notice_embed(
-                        "Leaderboards are per server — use this in a server channel.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            if archive is None:
-                await ctx.send(
-                    embed=notice_embed(
-                        "This server's host has not enabled the long-term play "
-                        "archive, so there is no leaderboard data.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            if not 0 <= flags.days <= leaderboard.MAX_DAYS:
-                await ctx.send(
-                    embed=notice_embed(
-                        f"--days must be between 1 and {leaderboard.MAX_DAYS}. "
-                        "Omit it, or pass 0, for all-time.",
-                        discord.Color.red(),
-                    )
-                )
-                return
-            key = leaderboard.cache_key(guild.id, flags.days, leaderboard.TOP_N)
-            board = leaderboard.from_cache(
-                await cache_get(self.redis, key), top_n=leaderboard.TOP_N
+            await leaderboard_cmd.run(
+                ctx, flags, archive=self.history_archive, redis=self.redis
             )
-            if board is None:
-                since = time.time() - flags.days * 86400 if flags.days else 0.0
-                async with background_typing(ctx):
-                    board = await archive.leaderboard(
-                        guild.id, leaderboard.TOP_N, since_epoch=since
-                    )
-                await cache_set(
-                    self.redis,
-                    key,
-                    leaderboard.to_cache(board),
-                    leaderboard.CACHE_TTL_SECS,
-                )
-            embed = leaderboard.build_embed(board, days=flags.days, guild=guild)
-            if embed is None:
-                window = (
-                    f"in the last {flags.days} {pluralize(flags.days, 'day')}"
-                    if flags.days
-                    else "yet"
-                )
-                await ctx.send(
-                    embed=notice_embed(
-                        f"Nothing has been archived {window} — play something first!",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            await ctx.send(embed=embed)
         except Exception as e:
             # Fixed copy rather than the exception text: this is the only command
             # whose failures come from infrastructure, so the default detail would

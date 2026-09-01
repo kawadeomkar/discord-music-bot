@@ -1,11 +1,11 @@
 """`-leaderboard` — the board's tunables, its Redis result cache codec, and its
 renderer.
 
-Everything here is pure: it takes a `Leaderboard` (from history_archive) and
-returns strings, dicts or an embed. The command itself stays on the MusicBot cog
-in musicbot.py, because that is where Discord dispatch, the archive handle and
-the error-embed policy live; this module holds what that command would otherwise
-make the cog twice as long.
+Two halves. The first is PURE: it takes a `Leaderboard` (from history_archive)
+and returns strings, dicts or an embed. The second is `run()`, the command body —
+it reads the cache, queries the archive and sends. Only the wrapper stays on the
+MusicBot cog in musicbot.py, because discord.py needs the command there and
+because the error-embed policy is the cog's.
 
 NOT in util.py, which is imported by the yt-dlp worker graph and must stay free
 of asyncpg — this module reads history_archive's row types, so it may not move
@@ -16,11 +16,10 @@ says leaderboard; musicbot imports the module, not the names.
 """
 
 import re
-from typing import Final, Optional
+from typing import TYPE_CHECKING, Final, Optional
 from urllib.parse import urlsplit
 
 import discord
-from discord.ext import commands
 
 from src.history_archive import Leaderboard, RequesterLeader, SongLeader
 from src.sources import (
@@ -30,6 +29,9 @@ from src.sources import (
     QUERY_SOURCE_YOUTUBE,
 )
 from src.util import fmt_duration, pluralize, truncate
+
+if TYPE_CHECKING:
+    pass
 
 TOP_N: Final[int] = 10
 MAX_DAYS: Final[int] = 3650
@@ -63,10 +65,6 @@ _QUERY_SOURCE_LABELS: Final[dict[str, str]] = {
 # the rest of the markdown as its own text, and U+2028/9 do the same on some
 # clients. Flattened rather than dropped so words do not run together.
 _LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
-
-
-class LeaderboardFlags(commands.FlagConverter, prefix="--", delimiter=" "):
-    days: int = 0  # 0 = all-time; otherwise a rolling now - N*86400 window
 
 
 def cache_key(guild_id: int, days: int, top_n: int) -> str:
