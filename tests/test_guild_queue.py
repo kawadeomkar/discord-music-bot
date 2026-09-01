@@ -2359,8 +2359,9 @@ async def _stall_one_put(
     that the list no longer matches."""
     stall = asyncio.Event()
 
-    async def _hang(*_a: Any, **_k: Any) -> None:
+    async def _hang(*_a: Any, **_k: Any) -> bool:
         await stall.wait()
+        return True
 
     original = store.push_queue
     store.push_queue = _hang
@@ -2799,8 +2800,9 @@ class TestAMirrorWriteCutShort:
     ) -> None:
         stall = asyncio.Event()
 
-        async def _hang(*_a: Any, **_k: Any) -> None:
+        async def _hang(*_a: Any, **_k: Any) -> bool:
             await stall.wait()
+            return True
 
         store.push_queue_front = _hang
         with pytest.raises(TimeoutError):

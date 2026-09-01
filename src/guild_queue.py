@@ -166,10 +166,9 @@ class GuildQueue:
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
         self._generation = 0
-        # True while the Redis list is known to differ from the deque: a start
-        # transaction's LPOP that did not land, or a mirror write cut short after
-        # the deque was mutated. Cleared by the next write that replaces the list:
-        # a rebuild, a DELETE, or the next song start.
+        # True while the Redis list is known to differ from the deque: an LPOP that
+        # did not land, or a mirror write cut short. Cleared by the next write that
+        # replaces the list: a rebuild, a DELETE, or the next song start.
         self._mirror_dirty = False
 
     @contextlib.contextmanager
@@ -279,10 +278,15 @@ class GuildQueue:
                 return queued
             with self._mirror_write():
                 if batch:
-                    await self._store.push_queue_batch(entries)
+                    landed = await self._store.push_queue_batch(entries)
                 else:
+                    landed = True
                     for entry in entries:
-                        await self._store.push_queue(entry)
+                        if not await self._store.push_queue(entry):
+                            landed = False
+            # A swallowed RPUSH is the common way this mirror goes short: the context
+            # manager above sees only a cancellation, so the flag rides the return.
+            self._mirror_dirty = not landed
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
@@ -310,7 +314,8 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     with self._mirror_write():
-                        await self._store.push_queue_front(entries)
+                        landed = await self._store.push_queue_front(entries)
+                    self._mirror_dirty = not landed
             return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
@@ -611,6 +616,12 @@ class GuildQueue:
         # Only a rebuild that landed answers for the whole list; one that did not
         # leaves it as unknown as before, and the next enqueue tries again.
         self._mirror_dirty = not landed
+
+    def holds(self, item: QueueItem) -> bool:
+        """Whether this exact object is on the deque, claimed prefix included.
+        Identity, not equality: the caller is asking about the object it just
+        inserted, and two entries for one song compare equal."""
+        return any(held is item for held in self._items)
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a
