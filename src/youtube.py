@@ -717,12 +717,9 @@ class QueueObject:
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
-    # A -restart replay of the song that is playing. RUNTIME-ONLY, like np_host_ref
-    # below: it describes the handover, not the entry, and the entry outlives the
-    # handover by milliseconds. A crash in that window restores an ordinary queued
-    # song, which is exactly what it then is — so it is deliberately absent from
-    # SongQueueEntry. Read only to render the queue card that would otherwise show
-    # the live song queued behind itself.
+    # A -restart replay. Runtime-only, like np_host_ref below, and so absent from
+    # SongQueueEntry: it is read to render the queue card, and a crash restores an
+    # ordinary queued song, which is what it then is.
     is_replay: bool = field(default=False, repr=False)
     # ── Ask-time analytics, set at construction and carried thereafter ──
     # queued_at + queue_position in one frozen container (guild_state.Analytics).

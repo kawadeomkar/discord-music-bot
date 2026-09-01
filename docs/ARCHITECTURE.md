@@ -286,7 +286,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
 | `-resume` | `r` | — | Resume paused playback; re-hosts the Now Playing block so the pause confirmation becomes plain history. |
-| `-restart` | `rs`, `replay` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`MusicPlayer.restart_current()` → `RestartOutcome`), resolved through the loop's own prefetch path so the extraction/probe/FFmpeg spawn are paid while the song still plays, and the song is stopped. Nothing is dropped from the queue, and a `?t=` song's requested offset is dropped with the restart — `0:00` is what the verb means. When the loop moves on before the stop, `RestartOutcome.stopped` is false and the reply says the song was queued rather than restarted. The replay is the CALLER's ask — requester and ask-time analytics both name them — while `query_source`/`user_input` stay with the song. A paused song comes back PLAYING, on -play's precedent; the interrupted play keeps its own `-history` entry (unlike a `-playnow` tail, the replay spans none of what was already heard) and its NP card is RETIRED rather than left frozen, since it would otherwise sit directly above the replay's own card naming the same song. Refused below `_MIN_RESTART_POSITION_SECS` — a song at its start has nothing to rewind, and repeatedly restarting one there would mint history entries nobody heard, evicting real plays from the capped list. |
+| `-restart` | `rs`, `replay` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`MusicPlayer.restart_current()` → `RestartOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `_MIN_RESTART_POSITION_SECS`. See [-restart Replay](#-restart-replay). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
@@ -510,6 +510,59 @@ Key properties:
 - **Stacking**: interjecting on top of another `-playnow` song parks it like any other, in front of the tails already waiting, so the queue unwinds LIFO and every parked song returns. Depth is unbounded and recorded on the span as `interject.depth` (the run of consecutive `is_resume` entries starting after the claimed prefix — `_cursor + 1`, not display index 1, because `put_front` inserts behind a dequeued-but-uncommitted item — i.e. parked *plays*, via `GuildQueue.resume_tail_depth`). `ts` is absolute at every level, so a tail of a tail resumes at the position actually reached rather than at its own fragment's start.
 - **History once**: `_skip_history_for` holds the parked song's identity so the stop-transition's history step skips it — it is recorded exactly once, when its resume tail finishes. It holds the song object (not a bare flag) because the song can end naturally during `interject()`'s awaits. The same marker is what lets a *teardown* record safely: `cog.cleanup` claims the mid-play song through `MusicPlayer.claim_current_song_for_history()`, which declines when the marker already names it (a parked tail will record the play on `-resume`) and otherwise takes the marker so the loop cannot record it twice.
 - **Crash-safe**: resume entries are ordinary persisted `SongQueueEntry`s (LPUSHed to the front of the Redis list), so a crash mid-interjection recovers the parked song from the queue like any other.
+
+---
+
+### -restart Replay
+
+`-restart` (`rs`, `replay`) plays the live song again from `0:00`. It reuses
+`-playnow`'s skeleton — neutralize the prefetch, front-insert, stop the live song,
+let the loop's ordinary dequeue do the rest — and differs in four decided ways.
+
+- **The interrupted play keeps its own history entry.** `-playnow` suppresses the
+  parked fragment's entry via `_skip_history_for` because its resume tail spans the
+  whole play. A replay starts at `0:00` and spans none of what was already heard, so
+  suppressing here would lose that listening with no row, no log line and no reject.
+  Two plays, two rows; `played_at` is stamped fresh on the replay, so the
+  `(guild_id, played_at, webpage_url)` dedup index does not collide.
+- **The replay is the caller's ask.** `requester` and the ask-time `analytics` both
+  name whoever ran `-restart`, not the original requester, or `-leaderboard` credits
+  a play to someone who did not ask for it. `query_source` and `user_input` stay with
+  the song: they classify how the song was *found*, which a replay does not change.
+- **A paused song comes back playing**, on `-play`'s precedent ("`-play` means
+  play") and `-skip`'s: the caller named this song, so the ask is for it to sound.
+  Nothing sets `start_paused`, so the flag keeps its single `-playnow` producer.
+- **The interrupted song's NP card is retired, not finalized.** A replay is the same
+  song, so a bar frozen at the interrupt position would stand directly above the
+  replay's own card naming it again. `_retire_np_for` carries the song's identity to
+  the loop's iteration end, the way `_skip_history_for` does.
+
+**Liveness.** `MusicPlayer._still_live()` is the single test both `restart_current()`
+and `interject()` use before acting on a song, and every term is a window a command
+can wake up in:
+
+| Term | Window it closes |
+|---|---|
+| `current_song is song` | the obvious one |
+| `not play_next.is_set()` | the audio thread sets `play_next` two task cancels before the loop clears `current_song`; acting there replays a finished song and stops the next one |
+| `_interrupted_song is not song` | `max_concurrency` is per-`Command`, so `-restart` and `-playnow` hold different buckets and neither declines the other — without this both front-insert against the same song and it plays three times. The loop clears the marker at its next `vc.play()` |
+| loop task not done | a torn-down player (`-stop`, the alone watchdog, a voice kick): the voice client is gone, so the stop would land on a disconnected one |
+
+It is checked twice per command — at dispatch and again after `_neutralize_prefetch()`
+— because the neutralize destroys the next song's resolved source and a song already
+gone needs neither.
+
+**Bounding the resolve.** The replay is resolved through the loop's own
+`_prefetch_next_song()`, so the extraction, probe and FFmpeg spawn are paid while the
+interrupted song is still playing rather than in the silence after the stop. The wait
+is `asyncio.wait({task}, timeout=...)`: it does not cancel the task when the bound
+expires, and does not re-raise when a teardown cancels it — `cleanup()` cancels
+exactly this task, and a direct `await` would put that `CancelledError` into a command
+body whose `except Exception` cannot catch it.
+
+**Residual race.** A teardown completing *inside* that resolve leaves the replay on
+the queue, so a later `-resume` plays it. The stop is guarded, so nothing is sent to a
+disconnected client.
 
 ---
 

@@ -188,8 +188,7 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
-# Both -now and -restart answer an idle guild, and a user meeting one after the
-# other must not be told two different things about the same state.
+# -now and -restart answer the same idle state, so they answer it identically.
 _NOTHING_PLAYING = "No songs are currently playing."
 
 
@@ -709,9 +708,8 @@ class MusicBot(commands.Cog):
             )
         elif isinstance(error, commands.CommandOnCooldown):
             # Also raised in prepare(), so the body never sees it. Named off the
-            # command for the same reason as the concurrency notice below: two
-            # commands are cooldowned now, so an unnamed refusal does not say which
-            # one it is answering. The retry seconds read as a limit, not a fault.
+            # command, as the concurrency notice below is: more than one command
+            # carries a cooldown.
             cmd = ctx.command.name if ctx.command else "command"
             await ctx.send(
                 embed=notice_embed(
@@ -1702,13 +1700,9 @@ class MusicBot(commands.Cog):
         },
     )
     @commands.before_invoke(validate_commands)
-    # As -playnow. restart_current() declines a song another interrupt has already
-    # stopped, which is what keeps -restart and -playnow — separate max_concurrency
-    # buckets — from both front-inserting against it; this closes the same hazard
-    # between two callers of THIS command. The cooldown is the other axis: every
-    # restart writes a history entry, and the list is LTRIMmed to
-    # HISTORY_CACHE_LIMIT on every write, so an unpaced repeat evicts plays a guild
-    # cannot get back.
+    # As -playnow: one restart per guild at a time, so two callers cannot both
+    # front-insert a replay. The cooldown bounds history churn — every restart
+    # writes an entry to a list LTRIMmed to HISTORY_CACHE_LIMIT.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.cooldown(1, 5.0, commands.BucketType.guild)
     @_tracer.start_as_current_span("bot.restart")
@@ -1723,9 +1717,7 @@ class MusicBot(commands.Cog):
                     or not isinstance(vc, discord.VoiceClient)
                     or not (vc.is_playing() or vc.is_paused())
                 ):
-                    # A connected bot with a queue is between songs, not idle: the
-                    # next one is 1-4s of extraction away and the flat refusal reads
-                    # as a bot that lost the queue it is visibly working through.
+                    # A connected bot with a queue is between songs, not idle.
                     loading = (
                         isinstance(vc, discord.VoiceClient)
                         and vc.is_connected()
@@ -1742,8 +1734,8 @@ class MusicBot(commands.Cog):
                     )
                     return
                 if int(song.position_secs) < _MIN_RESTART_POSITION_SECS:
-                    # Nothing to rewind, and restarting a song parked at 0:00 is how
-                    # a repeat mints history entries nobody heard.
+                    # Nothing to rewind, and a repeat here mints history entries
+                    # nobody heard.
                     await ctx.send(
                         embed=notice_embed(
                             f"**{safe_label(song.title or 'That song', _ECHO_MAX)}** is already "
@@ -1754,18 +1746,16 @@ class MusicBot(commands.Cog):
                     return
                 outcome = await mp.restart_current(
                     vc,
-                    # The replay is this caller's ask: both the requester column and
-                    # the ask-time analytics name them, or -leaderboard credits the
-                    # play to whoever queued the song originally.
+                    # The replay is this caller's ask: the requester column and the
+                    # ask-time analytics both name them.
                     requester=ctx.author,
                     analytics=Analytics(
                         queued_at=ctx.message.created_at.timestamp(), queue_position=0
                     ),
                 )
                 if outcome is None:
-                    # Nothing was inserted: the song stopped being the live one while
-                    # the replay resolved. Separate from the guard above, where
-                    # nothing was playing at dispatch at all.
+                    # The song stopped being live while the replay resolved —
+                    # distinct from the guard above, where nothing was playing.
                     await ctx.send(
                         embed=notice_embed(
                             "That song is no longer playing — nothing was restarted.",
@@ -1779,18 +1769,14 @@ class MusicBot(commands.Cog):
                         f"`0:00` — was at `{outcome.position_str}`."
                     )
                 else:
-                    # The song ended while the replay resolved, so nothing was
-                    # interrupted — it is queued at the front and plays next.
+                    # Nothing was interrupted: the replay is queued and plays next.
                     text = (
                         f"🔁 **{safe_label(outcome.title, _ECHO_MAX)}** ended first — "
                         f"queued it again from `0:00`, playing next."
                     )
                 embed = notice_embed(text, discord.Color.blue())
-                # NOT gathered with the reaction: the restart is already committed
-                # and irreversible here, so a guild without Add Reactions would get
-                # the confirmation AND a red "Failed to restart song" for an
-                # operation that worked. gather does not cancel siblings, so the
-                # send lands either way — it is the error path that is wrong.
+                # Not gathered with the reaction: the restart is already committed,
+                # so a guild without Add Reactions must not also be told it failed.
                 await ctx.send(embed=embed)
                 with contextlib.suppress(discord.HTTPException):
                     await ctx.message.add_reaction("🔁")
