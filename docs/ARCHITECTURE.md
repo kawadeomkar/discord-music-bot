@@ -578,7 +578,7 @@ flowchart LR
 
 Returns a `QueueObject`.
 
-**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). After a full Phase 1 it is a cache-hit no-op (one Redis GET); after a flat one it **is** the stream extraction, single-flighted with the playback loop's own resolve of the same song, and it runs a full extraction for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
+**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). After a full Phase 1 it is a cache-hit no-op (one Redis GET); after a flat one it **is** the stream extraction, single-flighted with the playback loop's own resolve of the same song, and it runs a full extraction for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`, joined through `_start_stream_warm` so a warm yt_source already started is shared rather than repeated — see [Warming the stream cache](#warming-the-stream-cache)), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
 
 **Phase 2** (`YTDL.yt_stream`): Called just before playback. Cache hit → construct `YTDL` with no yt-dlp call; miss → extract and cache.
 
@@ -605,6 +605,18 @@ Returns a `QueueObject`.
 **`process` stays `True` on the flat path.** With `process=False` yt-dlp returns `entries` as an unconsumed `itertools.islice` and never iterates it — no search is performed at all — and `sanitize_info` reduces the islice to its `repr()`, so what crosses the process boundary is a 40-character string. `extract_flat: "in_playlist"` with `process=True` is the configuration `yt_playlist` has always run.
 
 **The flat path may write `ytdl:source`** because `_queue_object_from_flat_entry` refuses any entry without a duration, so every entry it writes carries the same five fields the full path writes. The one difference measured between the two is the duration itself: the search renderer's `lengthSeconds` can disagree with the processed value by a second (322 against 321 on one of three live queries), which the enqueue card, the queue listing and the ETA inherit — `play_history` does not: `HistoryEntry.from_song` reads `YTDL.duration_secs`, set from the stream extraction. It derives `webpage_url` from the entry's `id` rather than reading `url`: that string is the `ytdl:stream` cache key, what `-remove` matches, and part of `play_history`'s dedup tuple, so the two paths have to agree on it by construction.
+
+---
+
+### Warming the stream cache
+
+A full Phase 1 extraction yields a selected stream URL alongside the identity, and that URL is worth caching — but only once it has been **probed**, which is a network round trip bounded by `_STREAM_PROBE_TIMEOUT` (2 s). The reply needs the identity alone, so `yt_source` **starts** the probe-and-cache and returns without awaiting it (`_start_stream_warm`). Every link's `-play` gets its confirmation that much sooner.
+
+**The warm is registered, not fired blindly.** `_INFLIGHT_STREAM_WARMS` holds the job under its cache key, and every reader of that cache goes through `_stream_cache_get`, which joins a warm in flight rather than treating the miss as a miss. Without that join the enqueue-time `prefetch_stream` — spawned by `queue_put` moments later — would find nothing and pay a **second full extraction** of the URL the warm is about to write, and a cold start's playback loop would do the same on its way to audio. The join is shielded: the warm is shared, and a cancelled prefetch (every bulk queue mutation cancels one) must leave it running for whoever else is waiting.
+
+**Nobody is obliged to await it**, so the done-callback retrieves any exception itself and logs it. An unretrieved one would surface at collection time in a task with no caller left to name. The callback also pops the key before any joiner resumes, so a later miss starts a fresh warm instead of joining a settled one — the same ordering `_extract_once` depends on.
+
+**`probed_at` closes the double-probe.** `_cache_stream` stamps the entry when the verdict was PLAYABLE, and `_resolve_playable_stream` reuses that verdict for `_PROBE_REUSE_SECS` (10 s) instead of re-probing a URL the resolve confirmed seconds ago against a signature good for half an hour. Only PLAYABLE stamps: an UNCONFIRMED entry was never confirmed by anything and is probed as before. Inside the window a revocation costs one ffmpeg spawn, which is what `produced_audio` already catches — the same exposure as a URL revoked between probe and first read.
 
 ---
 

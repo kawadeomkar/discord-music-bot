@@ -1,6 +1,7 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import contextlib
 import logging
 import redis.asyncio as aioredis
 import pickle
@@ -88,6 +89,14 @@ def playable_urls(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     probe = AsyncMock(return_value=StreamProbe.PLAYABLE)
     monkeypatch.setattr("src.youtube._probe_stream_url", probe)
     return probe
+
+
+async def _settle_stream_warms() -> None:
+    """Drain the stream-cache warms yt_source starts and does not await. The reply
+    is what stops waiting for them; every reader of that cache still joins."""
+    await asyncio.gather(
+        *tuple(youtube._INFLIGHT_STREAM_WARMS.values()), return_exceptions=True
+    )
 
 
 def _fake_ytdl_data(**overrides: Any) -> YTDLVideoInfo:
@@ -1166,7 +1175,11 @@ class TestYTSourceUnifiedExtraction:
                 user_input=None,
             )
 
+        # The source entry is written on the reply path; the stream entry lands
+        # behind it, which is the point of not awaiting the probe.
         source_entry = await fake_redis.get("ytdl:source:unified search")
+        assert await fake_redis.get("ytdl:stream:https://yt.com/v=uni1") is None
+        await _settle_stream_warms()
         stream_entry = await fake_redis.get("ytdl:stream:https://yt.com/v=uni1")
         assert source_entry is not None
         assert stream_entry is not None
@@ -1213,6 +1226,7 @@ class TestYTSourceUnifiedExtraction:
 
         assert isinstance(result, QueueObject)
         assert result.webpage_url == "https://yt.com/v=uni3"
+        await _settle_stream_warms()
         assert await fake_redis.get("ytdl:source:dead probe search") is not None
         assert await fake_redis.get("ytdl:stream:https://yt.com/v=uni3") is None
 
@@ -2784,7 +2798,9 @@ class TestFlatYtSource:
         assert mock_extract.call_args_list[0][0][0].opts is _YTDL_FLAT_SEARCH_OPTS
         assert mock_extract.call_args_list[1][0][0].opts is _YTDL_STREAM_SEARCH_OPTS
         assert qobj.webpage_url == "https://yt.com/v=lofi"
-        # The full path warms the stream cache, as it does for every link.
+        # The full path warms the stream cache, as it does for every link — behind
+        # the reply, so the assertion settles the warm first.
+        await _settle_stream_warms()
         assert await fake_redis.keys("ytdl:stream:*") != []
 
     async def test_a_flat_and_a_full_resolve_of_one_query_do_not_share_a_job(
@@ -2893,6 +2909,169 @@ class TestFlatYtSource:
 
         assert mock_extract.call_args[0][0].opts is _YTDL_STREAM_OPTS
         assert song.title == "Playable"
+
+
+class TestTheStreamWarmIsSharedNotAwaited:
+    """yt_source starts the stream-cache warm from the extraction it already paid for
+    and returns without waiting for the probe behind it. Everything that reads that
+    cache joins the same job, so the reply gets faster and nothing extracts twice."""
+
+    async def test_yt_source_returns_before_the_probe_finishes(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The probe is a network round trip bounded only by _STREAM_PROBE_TIMEOUT,
+        and the reply needs identity, not a probed URL."""
+        release = asyncio.Event()
+
+        async def _stalled_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _stalled_probe
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=slowprobe")
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "slow probe search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert qobj.webpage_url == "https://yt.com/v=slowprobe"
+        warm = youtube._INFLIGHT_STREAM_WARMS["ytdl:stream:https://yt.com/v=slowprobe"]
+        assert not warm.done()
+        release.set()
+        await _settle_stream_warms()
+        assert await fake_redis.get("ytdl:stream:https://yt.com/v=slowprobe")
+
+    async def test_the_prefetch_joins_the_warm_instead_of_extracting_again(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The regression this guards: with the warm unawaited, an enqueue-time
+        prefetch that read the cache directly would miss and pay a second full
+        extraction of the URL the warm is about to write."""
+        release = asyncio.Event()
+
+        async def _stalled_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _stalled_probe
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=joined")
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "joined search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            prefetch = asyncio.ensure_future(
+                YTDL.prefetch_stream(qobj, redis=fake_redis)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not prefetch.done()  # parked on the warm, not extracting
+            release.set()
+            assert await prefetch is True
+        mock_extract.assert_not_called()
+
+    async def test_a_cancelled_joiner_leaves_the_warm_running(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Every bulk queue mutation cancels a prefetch, and the warm is shared."""
+        release = asyncio.Event()
+
+        async def _stalled_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _stalled_probe
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=cancelled")
+        cache_key = "ytdl:stream:https://yt.com/v=cancelled"
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "cancelled search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        prefetch = asyncio.ensure_future(YTDL.prefetch_stream(qobj, redis=fake_redis))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        prefetch.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await prefetch
+
+        assert not youtube._INFLIGHT_STREAM_WARMS[cache_key].cancelled()
+        release.set()
+        await _settle_stream_warms()
+        assert await fake_redis.get(cache_key)
+
+    async def test_two_warms_of_one_url_are_one_job(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=once")
+        first = youtube._start_stream_warm(fake_redis, "ytdl:stream:once", data)
+        second = youtube._start_stream_warm(fake_redis, "ytdl:stream:once", data)
+        assert first is second
+        await _settle_stream_warms()
+
+
+class TestProbeReuse:
+    """A URL confirmed playable seconds ago is not re-probed at play time."""
+
+    def test_only_a_stamped_entry_inside_the_window_reuses_the_verdict(self) -> None:
+        assert not youtube._probe_is_recent(_fake_ytdl_data())
+        assert youtube._probe_is_recent(_fake_ytdl_data(probed_at=time.time()))
+        assert not youtube._probe_is_recent(
+            _fake_ytdl_data(probed_at=time.time() - youtube._PROBE_REUSE_SECS - 1)
+        )
+
+    async def test_an_unconfirmed_entry_is_never_stamped(
+        self, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Only a PLAYABLE verdict earns the skip — an unconfirmed URL was never
+        confirmed by anything."""
+        playable_urls.return_value = StreamProbe.UNCONFIRMED
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=unconf")
+        await youtube._probe_and_cache(fake_redis, "ytdl:stream:unconf", data)
+        cached = orjson.loads(await fake_redis.get("ytdl:stream:unconf") or b"{}")
+        assert "probed_at" not in cached
+
+    async def test_a_recent_cache_hit_skips_the_play_time_probe(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=recent", "Recent", mock_ctx.author)
+        cached = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=recent", probed_at=time.time()
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=recent", orjson.dumps(cached)
+        )
+        resolved = await YTDL._resolve_playable_stream(qobj, fake_redis)
+        assert resolved["webpage_url"] == "https://yt.com/v=recent"
+        playable_urls.assert_not_awaited()
+
+    async def test_a_stale_stamp_is_probed_as_before(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=old", "Old", mock_ctx.author)
+        cached = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=old",
+            probed_at=time.time() - youtube._PROBE_REUSE_SECS - 1,
+        )
+        await fake_redis.set("ytdl:stream:https://yt.com/v=old", orjson.dumps(cached))
+        await YTDL._resolve_playable_stream(qobj, fake_redis)
+        playable_urls.assert_awaited_once()
 
 
 class TestSourceCacheKey:

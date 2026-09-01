@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import os
 import re
@@ -149,6 +150,10 @@ class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
     # Stamped by _cache_stream, never by yt-dlp: the trace of the extraction that
     # minted this URL. Absent on a fresh extraction.
     traceparent: str
+    # Not from yt-dlp: stamped by _cache_stream when the URL probed PLAYABLE, so a
+    # play seconds later can skip re-probing what was just confirmed. Absent on a
+    # fresh info-dict and on entries written before the stamp existed.
+    probed_at: float
 
 
 class YTDLEntry(YTDLVideoMetadata, total=False):
@@ -456,6 +461,12 @@ _STREAM_PROBE_TIMEOUT = float(os.environ.get("STREAM_PROBE_TIMEOUT_SECS", "2.0")
 # served as-is.
 _UNCONFIRMED_STREAK_LIMIT = 3
 
+# How long a PLAYABLE verdict stands in for a fresh probe. The resolve probes a URL
+# and the play probes it again seconds later, against a signature good for half an
+# hour. Short, because within it a revocation costs one ffmpeg spawn — `produced_audio`
+# is what catches that, exactly as it does for a URL revoked between probe and read.
+_PROBE_REUSE_SECS = 10.0
+
 # Ceiling on how long an UNCONFIRMED URL may be cached. It is cached at all because
 # probe failures are process-wide: declining the write would stop anything repopulating
 # the cache and put every song through a fresh extraction. This bounds a wrong entry.
@@ -748,10 +759,13 @@ async def _cache_stream(
     data: YTDLVideoInfo,
     *,
     max_ttl: Optional[int] = None,
+    probed: bool = False,
 ) -> bool:
     """Persist a probed stream URL. True when an entry was written, False when the URL
     isn't worth caching (no usable expiry). `max_ttl` caps the lifetime below the URL's
-    own — used for a URL that could not be confirmed."""
+    own — used for a URL that could not be confirmed. `probed` stamps the entry as
+    CONFIRMED playable just now, which is what lets a play seconds later skip its own
+    probe; an unconfirmed entry must never carry it."""
     # Absent keys are dropped, not written as None: `{"title": None}` would contradict
     # YTDLVideoInfo, which types title as str and treats absent fields as *missing*.
     stripped: dict[str, Any] = {
@@ -761,6 +775,8 @@ async def _cache_stream(
     # links back. See docs/ARCHITECTURE.md#observability.
     if traceparent := current_traceparent():
         stripped["traceparent"] = traceparent
+    if probed:
+        stripped["probed_at"] = time.time()
     ttl = _stream_url_ttl(data.get("url", ""))
     if ttl:
         if max_ttl is not None:
@@ -768,6 +784,16 @@ async def _cache_stream(
         await cache_set(redis, cache_key, stripped, ttl)
         return True
     return False
+
+
+def _probe_is_recent(data: YTDLVideoInfo) -> bool:
+    """Whether this cached entry's URL was confirmed playable inside
+    _PROBE_REUSE_SECS. Only a PLAYABLE verdict stamps one, so an unconfirmed entry
+    reads False and is probed as before. The window is short because the URL is what
+    it re-checks — and `produced_audio` still catches a revocation inside it, at the
+    cost of one ffmpeg spawn."""
+    stamped = data.get("probed_at")
+    return stamped is not None and time.time() - stamped < _PROBE_REUSE_SECS
 
 
 async def _probe_and_cache(
@@ -789,7 +815,7 @@ async def _probe_and_cache(
     probe = await _probe_stream_url(data.get("url", ""))
     span.set_attribute("ytdl.stream_probe", probe.value)
     if probe is StreamProbe.PLAYABLE:
-        return await _cache_stream(redis, cache_key, data)
+        return await _cache_stream(redis, cache_key, data, probed=True)
     if probe is StreamProbe.UNCONFIRMED:
         log.warning(
             "could not confirm a freshly extracted stream URL — caching it for "
@@ -799,6 +825,59 @@ async def _probe_and_cache(
             redis, cache_key, data, max_ttl=_UNCONFIRMED_STREAM_TTL
         )
     return False
+
+
+# Stream-cache warms in flight, keyed by their cache key. yt_source starts one from
+# the extraction it already paid for and does NOT await it — the reply needs identity,
+# not a probed URL. Everything that reads the stream cache joins through
+# _stream_cache_get, so the warm is shared rather than raced into a second extraction
+# of the same URL. See docs/ARCHITECTURE.md#warming-the-stream-cache.
+_INFLIGHT_STREAM_WARMS: dict[str, asyncio.Future[bool]] = {}
+
+
+def _start_stream_warm(
+    redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
+) -> asyncio.Future[bool]:
+    """Probe and cache one stream URL in the background, or return the job already
+    doing it. Nobody is obliged to await the result, so the done-callback retrieves
+    any exception itself: an unretrieved one would surface at collection time, in a
+    task with no caller left to name."""
+    running = _INFLIGHT_STREAM_WARMS.get(cache_key)
+    if running is not None:
+        return running
+    job = asyncio.ensure_future(_probe_and_cache(redis, cache_key, data))
+    _INFLIGHT_STREAM_WARMS[cache_key] = job
+
+    # Registered before anything can await the job, so the key is gone by the time a
+    # joiner resumes and the next miss starts a fresh warm rather than joining a
+    # settled one — the same ordering _extract_once depends on.
+    def _settle(finished: asyncio.Future[bool]) -> None:
+        _INFLIGHT_STREAM_WARMS.pop(cache_key, None)
+        if not finished.cancelled() and finished.exception() is not None:
+            log.warning(
+                f"stream cache warm failed for {cache_key}: {finished.exception()!r}"
+            )
+
+    job.add_done_callback(_settle)
+    return job
+
+
+async def _stream_cache_get(
+    redis: Optional[aioredis.Redis], cache_key: str
+) -> Optional[YTDLVideoInfo]:
+    """Read the stream cache, joining a warm still in flight for this key rather than
+    starting a second extraction of the URL it is about to write. Shielded: the warm
+    is shared, so one caller's cancellation must not take it from the others."""
+    cached = cast(Optional[YTDLVideoInfo], await cache_get(redis, cache_key))
+    if cached is not None:
+        return cached
+    warm = _INFLIGHT_STREAM_WARMS.get(cache_key)
+    if warm is None:
+        return None
+    trace.get_current_span().set_attribute("ytdl.joined_stream_warm", True)
+    with contextlib.suppress(Exception):
+        await asyncio.shield(warm)
+    return cast(Optional[YTDLVideoInfo], await cache_get(redis, cache_key))
 
 
 async def invalidate_stream_cache(
@@ -1234,7 +1313,7 @@ class YTDL(discord.FFmpegOpusAudio):
             trace.get_current_span().set_attribute("ytdl.skipped", True)
             return True
         cache_key = _stream_cache_key(qo.webpage_url)
-        cached: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
+        cached = await _stream_cache_get(redis, cache_key)
         already_cached = cached is not None
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
         if already_cached:
@@ -1263,7 +1342,10 @@ class YTDL(discord.FFmpegOpusAudio):
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return False
         if data is not None:
-            await _probe_and_cache(redis, cache_key, data)
+            # Shielded like every other join: a cancelled prefetch (every bulk queue
+            # mutation cancels one) must leave the warm running for whoever else is
+            # waiting on this key. The CancelledError still propagates from here.
+            await asyncio.shield(_start_stream_warm(redis, cache_key, data))
             _enrich_queueobject(qo, data)
             return True
         return False
@@ -1294,7 +1376,7 @@ class YTDL(discord.FFmpegOpusAudio):
         span = trace.get_current_span()
         cache_key = _stream_cache_key(qo.webpage_url)
 
-        data: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
+        data = await _stream_cache_get(redis, cache_key)
         span.set_attribute("ytdl.cache_hit", data is not None)
 
         extractions = 0
@@ -1318,13 +1400,21 @@ class YTDL(discord.FFmpegOpusAudio):
                     raise RuntimeError("Could not extract stream data")
                 extracted_fresh = True
 
+            if not extracted_fresh and _probe_is_recent(data):
+                # The resolve probed this URL seconds ago and cached the verdict with
+                # it. Re-probing spends a network round trip to re-confirm a signature
+                # good for half an hour.
+                span.set_attribute("ytdl.probe_reused", True)
+                _record_serving_format(data)
+                return data
+
             probe = await _probe_stream_url(data.get("url", ""))
             span.set_attribute("ytdl.stream_probe", probe.value)
 
             if probe is StreamProbe.PLAYABLE:
                 _record_serving_format(data)
                 if extracted_fresh:
-                    await _cache_stream(redis, cache_key, data)
+                    await _cache_stream(redis, cache_key, data, probed=True)
                 return data
 
             if probe is StreamProbe.UNCONFIRMED:
@@ -1605,12 +1695,12 @@ class YTDL(discord.FFmpegOpusAudio):
                 redis, cache_key, _source_cache_value(identity), _YT_SOURCE_TTL
             )
             # Warms the stream cache from the same extraction, so queue_put's
-            # prefetch_stream is a cache hit. Awaited, so the write lands before its
-            # cache_get; a failed probe never fails yt_source.
-            stream_cached = await _probe_and_cache(
-                redis, _stream_cache_key(webpage_url), video_data
-            )
-            trace.get_current_span().set_attribute("ytdl.stream_cached", stream_cached)
+            # prefetch_stream is a cache hit. STARTED, not awaited: the reply needs
+            # identity, and the probe behind that write is a network round trip
+            # bounded only by _STREAM_PROBE_TIMEOUT. Whoever reaches the cache first
+            # joins the same job through _stream_cache_get.
+            _start_stream_warm(redis, _stream_cache_key(webpage_url), video_data)
+            trace.get_current_span().set_attribute("ytdl.stream_warm_started", True)
 
         return _queue_object_from_identity(
             identity,
