@@ -55,6 +55,9 @@ if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
     from src.history_archive import ArchiveStats
+
+    # A runtime import would close the cycle (musicbot imports this module); the cog
+    # is only named in annotations. Same guard recovery.py and musicplayer.py use.
     from src.musicplayer import MusicPlayer
     from src.ytdlp_pool import PoolState
 

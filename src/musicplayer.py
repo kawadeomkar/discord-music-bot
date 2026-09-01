@@ -181,6 +181,11 @@ _PLAYBACK_GATE_TIMEOUT = 300
 # write is attempted under the mutex, so a stalled Redis costs one bound per start.
 _START_WRITE_TIMEOUT = 5.0
 
+# How long a command waits for wait_for_restore() before giving up and saying so.
+# Generous for one pipelined read; bounded because the pool sets no socket_timeout,
+# so a server that accepts the connection then stalls would hang the command outright.
+RESTORE_WAIT_SECS = 5.0
+
 
 @dataclass(frozen=True)
 class InterjectOutcome:
@@ -2147,6 +2152,24 @@ class MusicPlayer:
         if not self._adopt_np_host_if_current(message, [], song, dedicated=True):
             return None
         return message
+
+    @property
+    def home_channel(self) -> discord.TextChannel:
+        """The text channel this player posts in — where the Now Playing host lives.
+
+        Read from outside to answer "is this command in the player's home channel?",
+        which decides whether a reply may carry the live block or has to be a static
+        copy. cog_before_invoke re-points it when a command arrives from elsewhere.
+        """
+        return self._channel
+
+    def now_playing_snapshot(self, song: YTDL) -> discord.Embed:
+        """A static Now Playing card for `song`, its bar frozen where the song is.
+
+        What `-now` answers with outside home_channel: the live host never leaves
+        home, so a copy sent elsewhere cannot be updated and must not pretend to be.
+        """
+        return self._build_now_playing_embed(song)
 
     async def repin_now_playing(self) -> bool:
         """-now: re-host the NP block at the bottom as a fresh dedicated message.

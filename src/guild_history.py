@@ -12,11 +12,11 @@ recent() never asks Postgres: the list is written synchronously at song end so i
 LEADS the archive, and is capped at exactly the window -history can ask for.
 See docs/ARCHITECTURE.md#history-read-path.
 
-history_embeds() at the bottom renders what recent() returns. Storage and
-rendering share a module the way src/leaderboard.py does it — one feature's data
-and its embed, with the command itself on the MusicBot cog. It was in util.py,
-which made util import guild_state purely to name HistoryEntry; util is imported
-by the yt-dlp worker graph and is better off a leaf.
+history_embeds() renders what recent() returns, and run() at the bottom is the
+whole of `-history` — storage, its embed and its command in one module, the way
+src/leaderboard.py does it; only the try/except wrapper stays on the MusicBot cog.
+It was in util.py, which made util import guild_state purely to name HistoryEntry;
+util is imported by the yt-dlp worker graph and is better off a leaf.
 
 The wire format belongs to guild_state.py; this class never sees wire bytes.
 """

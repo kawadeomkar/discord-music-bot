@@ -154,7 +154,7 @@ class MusicContext(commands.Context):
         mp = cog.mps.get(self.guild.id)
         if mp is None or mp.current_song is None:
             return None
-        if self.channel.id != mp._channel.id:
+        if self.channel.id != mp.home_channel.id:
             return None
         return mp
 

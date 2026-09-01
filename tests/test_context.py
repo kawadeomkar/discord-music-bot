@@ -29,7 +29,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
     cog.voice_watchdog = VoiceWatchdog(cog)
@@ -69,7 +69,7 @@ def live_mp(
     mock_bot.get_cog = MagicMock(return_value=music_bot_cog)
     mp = MagicMock()
     mp.current_song = MagicMock()
-    mp._channel = mock_channel  # same channel object the ctx sends to
+    mp.home_channel = mock_channel  # same channel object the ctx sends to
     mp.np_embed_block.return_value = [
         discord.Embed(title="NP"),
         discord.Embed(title="Up next"),
@@ -209,7 +209,7 @@ class TestMusicContextVanillaFallthrough:
         self, mctx: MusicContext, live_mp: MagicMock
     ) -> None:
         other_channel = MagicMock(spec=discord.TextChannel)
-        live_mp._channel = other_channel  # distinct MagicMock → distinct .id
+        live_mp.home_channel = other_channel  # distinct MagicMock → distinct .id
         await self._assert_vanilla(mctx, live_mp)
 
 

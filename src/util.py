@@ -203,6 +203,10 @@ FOOTER_LIMIT = 2048
 # after the command has already mutated state.
 EMBED_FIELD_LIMIT = 1024
 
+# One row of a multi-row field — ten of these share the budget one echoed needle
+# gets. Passed to safe_label wherever a list of user-supplied titles is rendered.
+ECHO_ROW_MAX = 70
+
 
 # Control characters end a rendered embed line early, hiding whatever follows.
 # Flattened rather than escaped — they have no visible form.
