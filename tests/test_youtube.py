@@ -47,6 +47,7 @@ from src.youtube import (
     _record_serving_format,
     _run_extract,
     ExtractRequest,
+    _extract_once,
     _inflight_key,
     _queue_object_from_flat_entry,
     _slim_info,
@@ -900,6 +901,65 @@ class TestYTPlaylistAnalytics:
 
 class TestExtractSingleflight:
     """One extraction per distinct query at a time, process-wide."""
+
+    async def test_a_full_pool_slot_does_not_split_one_key_into_two_jobs(self) -> None:
+        """The slot is taken inside the job for this reason. Awaited before the
+        registry write, every caller for one key reads an empty registry while it
+        queues and starts a job of its own — losing the single flight in a paste
+        burst, which is the only time it is worth anything."""
+        slot = asyncio.Semaphore(1)
+        started = 0
+        release = asyncio.Event()
+
+        async def _extract(_request: Any) -> Any:
+            nonlocal started
+            started += 1
+            await release.wait()
+            return {"webpage_url": "https://yt.com/v=one", "url": "u"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            async with slot:  # the guild's only slot, held elsewhere
+                callers = [
+                    asyncio.ensure_future(
+                        _extract_once(
+                            "ytdl:source:same|full", MagicMock(), pool_slot=slot
+                        )
+                    )
+                    for _ in range(3)
+                ]
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert started == 0  # all three queued behind the held slot
+            release.set()
+            results = await asyncio.gather(*callers)
+
+        assert started == 1
+        assert all(r == results[0] for r in results)
+
+    async def test_a_joiner_takes_no_slot_of_its_own(self) -> None:
+        """The leader holds the worker. Charging its joiners lets one popular link
+        exhaust a guild's budget with jobs that are not running."""
+        slot = asyncio.Semaphore(1)
+        release = asyncio.Event()
+
+        async def _extract(_request: Any) -> Any:
+            await release.wait()
+            return {"webpage_url": "https://yt.com/v=two", "url": "u"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            leader = asyncio.ensure_future(
+                _extract_once("ytdl:source:shared|full", MagicMock(), pool_slot=slot)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            joiner = asyncio.ensure_future(
+                _extract_once("ytdl:source:shared|full", MagicMock(), pool_slot=slot)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert slot.locked()  # the leader's job, and only it
+            release.set()
+            assert await leader == await joiner
 
     async def test_the_leaders_cancellation_does_not_reach_a_joiner(self) -> None:
         """The key carries no guild, so the leader and a joiner are routinely

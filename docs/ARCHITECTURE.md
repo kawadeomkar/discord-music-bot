@@ -618,6 +618,8 @@ That distinction is the difference between the bound doing its job and the bound
 
 A caller that **joins** an in-flight job takes no slot either: the leader is the one holding a worker, and charging its joiners would let one popular link exhaust a guild's budget with jobs that are not running.
 
+**The slot is acquired inside the job, not before the registry write.** Nothing may be awaited between `_extract_once`'s read of `_INFLIGHT_EXTRACTS` and its write, or the single flight is lost exactly when it is worth most: with the semaphore full, every caller for one key reads an empty registry while it queues, and each starts a job of its own. `_gated_extract` holds the slot for as long as the extraction runs, so a queued job is still a registered one and its key still deduplicates.
+
 The slot is passed down as `pool_slot` — through `queue_source`, `yt_source` and `yt_playlist` — rather than read from a registry, because `src/youtube.py` knows nothing about guilds. A resolve reached outside a command (a lazy `SearchQueueEntry` at dequeue, a prefetch, a test) passes `None` and is bounded by `prefetch_warm_slot()` or by nothing, as before.
 
 ---
