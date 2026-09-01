@@ -21,6 +21,7 @@ from discord.ext import commands
 from opentelemetry import trace as trace_api
 
 from src import config, debug
+from src.commands import debug as debug_cmd
 from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
@@ -1139,7 +1140,7 @@ class TestDebugSuffixBuilder:
     def test_none_while_the_guild_has_debug_off(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        assert music_bot._debug_suffix(mock_ctx) is None
+        assert music_bot.debug_suffix(mock_ctx) is None
 
     def test_carries_shard_and_runtime_but_never_a_trace(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
@@ -1153,7 +1154,7 @@ class TestDebugSuffixBuilder:
             cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
         )
         with trace_api.use_span(TestTraceIdInTheFooter._span(), end_on_exit=False):
-            suffix = music_bot._debug_suffix(mock_ctx)
+            suffix = music_bot.debug_suffix(mock_ctx)
         assert suffix is not None
         assert "shard 4" in suffix and "cpu 9%" in suffix
         assert "trace" not in suffix
@@ -1168,7 +1169,7 @@ class TestDebugSuffixBuilder:
         music_bot.debug_settings._sampler._snapshot = debug.RuntimeSnapshot(
             cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
         )
-        suffix = music_bot._debug_suffix(mock_ctx) or ""
+        suffix = music_bot.debug_suffix(mock_ctx) or ""
         assert "cpu 9%" in suffix
         assert "shard" not in suffix
 
@@ -1179,7 +1180,7 @@ class TestDebugSuffixBuilder:
         None` stops a lone 🐞 reaching the card."""
         mock_ctx.guild = None
         music_bot.debug_settings._default = True
-        assert music_bot._debug_suffix(mock_ctx) is None
+        assert music_bot.debug_suffix(mock_ctx) is None
 
     def test_the_first_segment_is_the_shard_not_an_elapsed_time(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
@@ -1188,7 +1189,7 @@ class TestDebugSuffixBuilder:
         debug_footer puts first — would differ every tick."""
         music_bot.debug_settings._overrides[mock_ctx.guild.id] = True
         mock_ctx.guild.shard_id = 0
-        suffix = music_bot._debug_suffix(mock_ctx) or ""
+        suffix = music_bot.debug_suffix(mock_ctx) or ""
         assert suffix.removeprefix("🐞 ").split(" · ")[0] == "shard 0"
 
 
@@ -2778,8 +2779,8 @@ class TestDebugModeIsPerGuildAndDurable:
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug.DebugAction.ENABLE
+        await debug_cmd.toggle(
+            mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
         )
         store = GuildRedisStore(cast(Any, music_bot_with_redis.redis), 42)
         assert (await store.get_config()).debug_mode is True
@@ -2875,8 +2876,8 @@ class TestDebugModeIsPerGuildAndDurable:
 
         async def read_then_user_toggles(*_a: object, **_k: object) -> dict[int, Any]:
             # The read has resolved; the toggle lands before the loop applies it.
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug.DebugAction.ENABLE
+            await debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
             )
             return {42: GuildConfig(debug_mode=False)}  # what the read saw
 
@@ -2896,8 +2897,8 @@ class TestDebugModeIsPerGuildAndDurable:
             "pipeline",
             side_effect=RuntimeError("down"),
         ):
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug.DebugAction.ENABLE
+            await debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
             )
         description = mock_ctx.send.await_args.kwargs["embed"].description
         assert "could not be saved" in description
@@ -2917,11 +2918,11 @@ class TestDebugModeIsPerGuildAndDurable:
             "pipeline",
             side_effect=RuntimeError("down"),
         ):
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug.DebugAction.ENABLE
+            await debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
             )
 
-        inputs = await music_bot_with_redis._debug_inputs(mock_ctx)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
 
         assert inputs.debug_overridden is True
         assert inputs.debug_persisted is False
@@ -2931,10 +2932,10 @@ class TestDebugModeIsPerGuildAndDurable:
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug.DebugAction.ENABLE
+        await debug_cmd.toggle(
+            mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
         )
-        inputs = await music_bot_with_redis._debug_inputs(mock_ctx)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
         assert inputs.debug_persisted is True
 
     async def test_hydration_clears_a_stale_unpersisted_mark(
@@ -2954,8 +2955,8 @@ class TestDebugModeIsPerGuildAndDurable:
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug.DebugAction.ENABLE
+        await debug_cmd.toggle(
+            mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
         )
         description = mock_ctx.send.await_args.kwargs["embed"].description
         assert "saved for this server" in description
