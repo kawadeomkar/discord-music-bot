@@ -13,6 +13,7 @@ import aiohttp
 import discord
 import fakeredis
 import pytest
+
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -26,7 +27,7 @@ from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
-from tests.helpers import noop_ffmpeg_init, tier_enabled
+from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
 
 # Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
 # is first imported, so a per-test setenv would lose the race with whichever test
@@ -355,7 +356,12 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
     bot.history_drainer = MagicMock()
-    # No create_task mock needed — MusicPlayer.start() is never called in tests
+    # start() IS reached now: a command wrapper resolves its player as an argument,
+    # so get_mp() runs on every path including the early returns a body used to take
+    # before it. Without this the loop() coroutine is created, never scheduled by the
+    # mock, and finalized by the GC — a "never awaited" warning that filterwarnings
+    # turns into a failure on whichever test the collection lands in.
+    bot.loop.create_task = stub_create_task()
     return bot
 
 

@@ -8,13 +8,20 @@ import inspect
 import re
 import orjson
 from types import SimpleNamespace
-from contextlib import AbstractContextManager
 from typing import Any, Optional, cast
 from collections.abc import Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+
+from tests.helpers import (
+    connected_vc,
+    mock_mp,
+    no_typing,
+    paused_vc,
+    playing_vc,
+)
 from discord.ext import commands
 from redis.asyncio import Redis
 
@@ -1482,7 +1489,7 @@ class TestCogBeforeInvoke:
         store.set_connection = AsyncMock()
 
         mp = MagicMock()
-        mp._channel = old_channel
+        mp.home_channel = old_channel
         mp.store = store
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -1507,7 +1514,7 @@ class TestCogBeforeInvoke:
         store.set_connection = AsyncMock()
 
         mp = MagicMock()
-        mp._channel = channel  # same object → no change
+        mp.home_channel = channel  # same object → no change
         mp.store = store
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -1528,7 +1535,7 @@ class TestCogBeforeInvoke:
         store.set_connection = AsyncMock()
 
         mp = MagicMock()
-        mp._channel = old_channel
+        mp.home_channel = old_channel
         mp.store = store
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -1901,7 +1908,7 @@ class TestResumeCommand:
     ) -> None:
         """Silence was the old answer on every no-op branch; a reply has to say
         why nothing happened."""
-        mock_ctx.voice_client = _playing_vc()
+        mock_ctx.voice_client = playing_vc()
         mp = MagicMock()
         mp.resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -1979,7 +1986,7 @@ class TestResumeCommand:
         async def fake_invoke(*_a: Any, **_kw: Any) -> None:
             if calls is not None:
                 calls.append("join")
-            mock_ctx.voice_client = _paused_vc()
+            mock_ctx.voice_client = paused_vc()
 
         return AsyncMock(side_effect=fake_invoke)
 
@@ -1994,7 +2001,7 @@ class TestResumeCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = self._join_sets_voice_client(mock_ctx)
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         mock_ctx.invoke.assert_awaited_once_with(music_bot.join)
@@ -2023,7 +2030,7 @@ class TestResumeCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = self._join_sets_voice_client(mock_ctx, calls)
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         # join last: the embed describes the queue head, and the head is gone
@@ -2045,7 +2052,7 @@ class TestResumeCommand:
         mock_ctx.invoke = self._join_sets_voice_client(mock_ctx, calls)
         mock_ctx.send = AsyncMock(side_effect=lambda **_kw: calls.append("send"))
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         assert calls == ["hold-enter", "join", "send", "hold-exit"]
@@ -2060,7 +2067,7 @@ class TestResumeCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         mock_ctx.invoke.assert_not_awaited()
@@ -2080,7 +2087,7 @@ class TestResumeCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         mock_ctx.invoke.assert_not_awaited()
@@ -2102,7 +2109,7 @@ class TestResumeCommand:
         mock_ctx.invoke = AsyncMock(side_effect=RuntimeError("send failed"))
         music_bot.cleanup = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2120,7 +2127,7 @@ class TestResumeCommand:
         mock_ctx.invoke = AsyncMock()  # leaves voice_client None
         music_bot.cleanup = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2141,7 +2148,7 @@ class TestResumeCommand:
         mock_ctx.invoke = AsyncMock()  # leaves voice_client None
         music_bot.cleanup = AsyncMock(side_effect=lambda _g: calls.append("cleanup"))
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         assert calls == ["cleanup", "repark"]
@@ -2159,7 +2166,7 @@ class TestResumeCommand:
         mock_ctx.invoke = AsyncMock()  # leaves voice_client None
         music_bot.cleanup = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         music_bot.cleanup.assert_not_awaited()
@@ -2183,7 +2190,7 @@ class TestResumeCommand:
         mock_ctx.invoke = AsyncMock(side_effect=fake_invoke)
         music_bot.cleanup = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2203,7 +2210,7 @@ class TestResumeCommand:
         music_bot.cleanup = AsyncMock()
         mock_ctx.invoke = self._join_sets_voice_client(mock_ctx)
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2222,7 +2229,7 @@ class TestResumeCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         mock_ctx.invoke.assert_not_awaited()
@@ -2240,7 +2247,7 @@ class TestResumeCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
         mock_ctx.invoke.assert_not_awaited()
@@ -2771,76 +2778,6 @@ class TestClearCommand:
         assert "Song A" in embed.description
 
 
-def _no_typing() -> AbstractContextManager[MagicMock]:
-    """Stub play()'s background_typing wrapper with an inert async CM: TestPlayCommand
-    patches asyncio.create_task as a join-task spy, and without this the typing
-    keepalive hits the same patch, polluting call counts and taking the fake join
-    future. The wrapper itself is covered by TestBackgroundTyping."""
-    return patch(
-        "src.musicbot.background_typing",
-        MagicMock(return_value=contextlib.nullcontext()),
-    )
-
-
-def _connected_vc() -> MagicMock:
-    """Connected voice client, nothing playing — what a successful cold join leaves
-    behind. is_connected is explicit: the cold path checks it, because discord.py
-    registers the client on the guild before the handshake completes."""
-    vc = MagicMock(spec=discord.VoiceClient)
-    vc.is_playing.return_value = False
-    vc.is_paused.return_value = False
-    vc.is_connected.return_value = True
-    return vc
-
-
-def _playing_vc() -> MagicMock:
-    """Connected voice client, actively playing. Both flags must be set explicitly:
-    an unstubbed is_paused() returns a truthy Mock, silently sending -play down the
-    interjection branch instead of the append path."""
-    vc = MagicMock(spec=discord.VoiceClient)
-    vc.is_playing.return_value = True
-    vc.is_paused.return_value = False
-    vc.is_connected.return_value = True
-    return vc
-
-
-def _paused_vc() -> MagicMock:
-    """Connected voice client with a song parked paused. is_connected is explicit:
-    -resume's rejoin checks it, and an auto-vivified one answers True by accident
-    rather than by choice."""
-    vc = MagicMock(spec=discord.VoiceClient)
-    vc.is_playing.return_value = False
-    vc.is_paused.return_value = True
-    vc.is_connected.return_value = True
-    return vc
-
-
-def _mock_mp(qsize: int = 0) -> MagicMock:
-    """MusicPlayer stand-in for the -play cold path, with the playback-gate
-    hooks awaitable: play() takes defer_playback() as an async context manager
-    and awaits wait_for_restore() before front-inserting."""
-    mp = MagicMock()
-    mp.defer_playback = MagicMock(return_value=contextlib.nullcontext())
-    mp.wait_for_restore = AsyncMock(return_value=True)
-    # Numeric, not auto-vivified: _abandon_cold_start COMPARES this, and a Mock
-    # raises TypeError there rather than answering.
-    mp.playback_holds = 1  # the hold this command itself takes
-    mp.repark_crashed_head = AsyncMock()
-    mp.queue_put_front = AsyncMock()
-    mp.queue_put = AsyncMock()
-    mp.queue.qsize = MagicMock(return_value=qsize)
-    # Numeric for the same reason as playback_holds: this lands in
-    # Analytics.queue_position and rides to Postgres through HistoryEntry's
-    # integer clamp, which a Mock raises on rather than answering.
-    mp.enqueue_depth = MagicMock(return_value=qsize)
-    # Mirrors the real builder's contract: a notice only when the restore
-    # actually left something in the queue (see build_resume_notice_embed).
-    mp.build_resume_notice_embed = MagicMock(
-        return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
-    )
-    return mp
-
-
 class TestPlayCommand:
     """Tests for play()'s cold-join parallelism. asyncio.Future stands in for the
     join_task: unlike AsyncMock it is directly awaitable, matching what the real
@@ -2860,15 +2797,15 @@ class TestPlayCommand:
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
+            mock_ctx.voice_client = connected_vc()  # what a real join leaves
             return join_task
 
         with (
-            _no_typing(),
+            no_typing("src.musicbot.background_typing"),
             patch("asyncio.create_task", side_effect=fake_create_task) as mock_create,
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -2881,14 +2818,17 @@ class TestPlayCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """When already in voice, no join task is created and queue_source runs directly."""
-        mock_ctx.voice_client = _playing_vc()
+        mock_ctx.voice_client = playing_vc()
         fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
 
-        with _no_typing(), patch("asyncio.create_task") as mock_create:
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task") as mock_create,
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mock_create.assert_not_called()
@@ -2909,14 +2849,17 @@ class TestPlayCommand:
         join_task.cancel = cancel_spy
 
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
         music_bot.cleanup = AsyncMock()
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
             coro.close()
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         cancel_spy.assert_called_once()
@@ -2939,14 +2882,17 @@ class TestPlayCommand:
         join_task.cancel = cancel_spy
 
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
         music_bot.cleanup = AsyncMock()
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
             coro.close()
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         cancel_spy.assert_not_called()  # already done, nothing to cancel
@@ -2966,14 +2912,17 @@ class TestPlayCommand:
         join_task.cancel = cancel_spy
 
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
         music_bot.cleanup = AsyncMock()
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
             coro.close()
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         cancel_spy.assert_called_once()
@@ -2991,8 +2940,8 @@ class TestPlayAnalytics:
     async def test_warm_path_carries_the_ask_time_and_the_player_depth(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        mock_ctx.voice_client = _playing_vc()
-        mp = _mock_mp()
+        mock_ctx.voice_client = playing_vc()
+        mp = mock_mp()
         mp.enqueue_depth = MagicMock(return_value=7)
         music_bot.get_mp = MagicMock(return_value=mp)
         spy = AsyncMock(
@@ -3001,7 +2950,7 @@ class TestPlayAnalytics:
         music_bot.queue_source = spy
         music_bot._enqueue_single = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
@@ -3017,7 +2966,7 @@ class TestPlayAnalytics:
         """A cold-start song front-inserts ahead of the restored queue and plays
         first, so its depth is 0 by construction — the queue is never asked."""
         mock_ctx.voice_client = None
-        mp = _mock_mp()
+        mp = mock_mp()
         mp.enqueue_depth = MagicMock(return_value=7)  # would be wrong if read
         music_bot.get_mp = MagicMock(return_value=mp)
         spy = AsyncMock(
@@ -3032,10 +2981,13 @@ class TestPlayAnalytics:
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()
+            mock_ctx.voice_client = connected_vc()
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
@@ -3050,8 +3002,8 @@ class TestPlayAnalytics:
         """Crash recovery reconnects voice BEFORE restore_entries() replays the
         queue. Reading the depth in that window records 0 behind a
         queue about to reappear, so the read waits the restore out."""
-        mock_ctx.voice_client = _playing_vc()
-        mp = _mock_mp()
+        mock_ctx.voice_client = playing_vc()
+        mp = mock_mp()
         restored = False
 
         async def _land_the_restore(**_kw: Any) -> bool:
@@ -3069,7 +3021,7 @@ class TestPlayAnalytics:
         music_bot.queue_source = spy
         music_bot._enqueue_single = AsyncMock()
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
@@ -3082,7 +3034,7 @@ class TestPlayWhilePaused:
         with the request buried behind a paused song."""
 
     def _paused_mp(self) -> MagicMock:
-        mp = _mock_mp()
+        mp = mock_mp()
         mp.current_song = MagicMock(title="Paused Song")
         mp.interject = AsyncMock(
             return_value=InterjectOutcome(
@@ -3097,7 +3049,7 @@ class TestPlayWhilePaused:
     async def test_interjects_with_resume_paused_false(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        vc = _paused_vc()
+        vc = paused_vc()
         mock_ctx.voice_client = vc
         mp = self._paused_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -3106,7 +3058,10 @@ class TestPlayWhilePaused:
         music_bot._enqueue_single = AsyncMock()
         mock_ctx.message.add_reaction = AsyncMock()
 
-        with _no_typing(), patch.object(YTDL, "prefetch_stream", new=AsyncMock()):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_awaited_once()
@@ -3120,14 +3075,17 @@ class TestPlayWhilePaused:
         """The song was paused but comes back playing — announcing "will return
         paused" would be wrong. This is why returns_paused exists separately
         from was_paused."""
-        mock_ctx.voice_client = _paused_vc()
+        mock_ctx.voice_client = paused_vc()
         music_bot.get_mp = MagicMock(return_value=self._paused_mp())
         music_bot.queue_source = AsyncMock(
             return_value=QueueObject("https://yt.com/v=new", "New", mock_ctx.author)
         )
         mock_ctx.message.add_reaction = AsyncMock()
 
-        with _no_typing(), patch.object(YTDL, "prefetch_stream", new=AsyncMock()):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         embed = mock_ctx.send.await_args.kwargs["embed"]
@@ -3140,7 +3098,7 @@ class TestPlayWhilePaused:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Regression guard: -play on a *playing* bot still appends."""
-        mock_ctx.voice_client = _playing_vc()
+        mock_ctx.voice_client = playing_vc()
         mp = self._paused_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot.queue_source = AsyncMock(
@@ -3148,7 +3106,7 @@ class TestPlayWhilePaused:
         )
         music_bot._enqueue_single = AsyncMock()
 
-        with _no_typing(), patch("asyncio.create_task"):
+        with no_typing("src.musicbot.background_typing"), patch("asyncio.create_task"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
@@ -3159,7 +3117,7 @@ class TestPlayWhilePaused:
     ) -> None:
         """Nothing to interrupt — take the ordinary append path rather than
         building an interjection around a song that isn't there."""
-        mock_ctx.voice_client = _paused_vc()
+        mock_ctx.voice_client = paused_vc()
         mp = self._paused_mp()
         mp.current_song = None
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -3168,7 +3126,7 @@ class TestPlayWhilePaused:
         )
         music_bot._enqueue_single = AsyncMock()
 
-        with _no_typing(), patch("asyncio.create_task"):
+        with no_typing("src.musicbot.background_typing"), patch("asyncio.create_task"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
@@ -3180,7 +3138,7 @@ class TestPlayWhilePaused:
         """A -resume landing during the 1-4s extraction removes the reason to
         interject, so the resolved track is appended rather than interrupting a
         song the user just chose to keep playing."""
-        vc = _paused_vc()
+        vc = paused_vc()
         mock_ctx.voice_client = vc
         mp = self._paused_mp()
         mp.enqueue_depth = MagicMock(return_value=9)
@@ -3194,7 +3152,7 @@ class TestPlayWhilePaused:
             return None
 
         with (
-            _no_typing(),
+            no_typing("src.musicbot.background_typing"),
             patch.object(
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
             ),
@@ -3213,13 +3171,13 @@ class TestPlayWhilePaused:
     ) -> None:
         """Resolution happens before interject, so a failed lookup never stops
         the paused song."""
-        vc = _paused_vc()
+        vc = paused_vc()
         mock_ctx.voice_client = vc
         mp = self._paused_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
@@ -3233,7 +3191,7 @@ class TestPlayWhilePaused:
         """Unlike the disconnected path (whole playlist front-inserted), an
         interjection collapses to one track so the paused song's return is not
         delayed indefinitely — and says so."""
-        mock_ctx.voice_client = _paused_vc()
+        mock_ctx.voice_client = paused_vc()
         mp = self._paused_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         tracks = [
@@ -3256,7 +3214,7 @@ class TestPlayWhilePaused:
         mock_ctx.message.content = f"-play {url}"
 
         with (
-            _no_typing(),
+            no_typing("src.musicbot.background_typing"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
         ):
@@ -3286,7 +3244,7 @@ class TestPlayFrontInsertion:
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
 
         loop = asyncio.get_event_loop()
         join_task = loop.create_future()
@@ -3294,10 +3252,13 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
+            mock_ctx.voice_client = connected_vc()  # what a real join leaves
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         single_call = music_bot._enqueue_single.await_args
@@ -3316,7 +3277,7 @@ class TestPlayFrontInsertion:
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        mp = _mock_mp()
+        mp = mock_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot.cleanup = AsyncMock()
 
@@ -3325,7 +3286,7 @@ class TestPlayFrontInsertion:
         join_task.set_result(None)
 
         with (
-            _no_typing(),
+            no_typing("src.musicbot.background_typing"),
             patch(
                 "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
             ),
@@ -3347,7 +3308,7 @@ class TestPlayFrontInsertion:
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        mp = _mock_mp()
+        mp = mock_mp()
         mp.wait_for_restore = AsyncMock(return_value=False)
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot.cleanup = AsyncMock()
@@ -3358,10 +3319,13 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()
+            mock_ctx.voice_client = connected_vc()
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         music_bot._enqueue_single.assert_not_awaited()
@@ -3377,7 +3341,7 @@ class TestPlayFrontInsertion:
         writes."""
         mock_ctx.voice_client = None
         calls: list[str] = []
-        mp = _mock_mp()
+        mp = mock_mp()
         mp.repark_crashed_head = AsyncMock(side_effect=lambda: calls.append("repark"))
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -3388,7 +3352,7 @@ class TestPlayFrontInsertion:
         join_task.set_result(None)
 
         with (
-            _no_typing(),
+            no_typing("src.musicbot.background_typing"),
             patch(
                 "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
             ),
@@ -3401,15 +3365,15 @@ class TestPlayFrontInsertion:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Regression guard: a -play on a connected bot keeps append semantics."""
-        mock_ctx.voice_client = _playing_vc()
+        mock_ctx.voice_client = playing_vc()
         fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        mp = _mock_mp()
+        mp = mock_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        with _no_typing(), patch("asyncio.create_task"):
+        with no_typing("src.musicbot.background_typing"), patch("asyncio.create_task"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         single_call = music_bot._enqueue_single.await_args
@@ -3435,7 +3399,7 @@ class TestPlayFrontInsertion:
         fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         calls: list[str] = []
-        mp = _mock_mp()
+        mp = mock_mp()
 
         async def restored(**_kw: object) -> bool:
             calls.append("restore")
@@ -3454,10 +3418,13 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
+            mock_ctx.voice_client = connected_vc()  # what a real join leaves
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert calls == ["restore", "enqueue"]
@@ -3471,7 +3438,7 @@ class TestPlayFrontInsertion:
         mock_ctx.voice_client = None
         fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
-        mp = _mock_mp()
+        mp = mock_mp()
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -3482,10 +3449,13 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
+            mock_ctx.voice_client = connected_vc()  # what a real join leaves
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.defer_playback.assert_called_once()
@@ -3494,7 +3464,7 @@ class TestPlayFrontInsertion:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
-        mp = _mock_mp(qsize=3)
+        mp = mock_mp(qsize=3)
         mock_ctx.message.add_reaction = AsyncMock()
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
@@ -3514,7 +3484,7 @@ class TestPlayFrontInsertion:
         exists only to explain a restore — the 👍 plus the Now Playing message
         that follows are the whole response."""
         qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
-        mp = _mock_mp(qsize=0)
+        mp = mock_mp(qsize=0)
         mock_ctx.message.add_reaction = AsyncMock()
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
@@ -3532,7 +3502,7 @@ class TestPlayFrontInsertion:
             for i in range(3)
         ]
         source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
-        mp = _mock_mp()
+        mp = mock_mp()
         mock_ctx.message.add_reaction = AsyncMock()
 
         await music_bot._enqueue_playlist(
@@ -3564,7 +3534,7 @@ class TestPlayFrontInsertion:
         music_bot.queue_source = AsyncMock(return_value=ResolvedYoutubePlaylist(tracks))
         music_bot._enqueue_playlist = AsyncMock()
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
 
         loop = asyncio.get_event_loop()
         join_task = loop.create_future()
@@ -3572,10 +3542,13 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
-            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
+            mock_ctx.voice_client = connected_vc()  # what a real join leaves
             return join_task
 
-        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+        with (
+            no_typing("src.musicbot.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         music_bot._enqueue_single.assert_not_awaited()
@@ -3783,7 +3756,7 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
-        mp._channel = mock_ctx.channel  # invoked from the player's home channel
+        mp.home_channel = mock_ctx.channel  # invoked from the player's home channel
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3805,7 +3778,7 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
-        mp._channel = mock_ctx.channel
+        mp.home_channel = mock_ctx.channel
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3826,15 +3799,15 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
-        mp._channel = MagicMock()  # distinct from ctx.channel → distinct .id
+        mp.home_channel = MagicMock()  # distinct from ctx.channel → distinct .id
         static = discord.Embed(title="NP snapshot")
-        mp._build_now_playing_embed = MagicMock(return_value=static)
+        mp.now_playing_snapshot = MagicMock(return_value=static)
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.now)(music_bot, mock_ctx)
         mp.repin_now_playing.assert_not_awaited()
-        mp._build_now_playing_embed.assert_called_once_with(mp.current_song)
+        mp.now_playing_snapshot.assert_called_once_with(mp.current_song)
         mock_ctx.send.assert_awaited_once_with(embed=static)
 
     async def test_falls_back_when_repin_reports_no_song(
@@ -3851,7 +3824,7 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
-        mp._channel = mock_ctx.channel
+        mp.home_channel = mock_ctx.channel
         mp.play_message = None
         mp.repin_now_playing = AsyncMock(return_value=False)
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -4191,14 +4164,14 @@ class TestCommandArgumentBinding:
         """The end-to-end C1 guards: the origin -remove matches on is the whole
         line, stripped. Previously it was the first word."""
         mock_ctx.message.content = f"-play {typed}"
-        mock_ctx.voice_client = _connected_vc()
+        mock_ctx.voice_client = connected_vc()
         music_bot.queue_source = AsyncMock(
             return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
         )
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=typed)
 
         call = music_bot.queue_source.await_args
@@ -5071,7 +5044,7 @@ class TestShuffleWaitsForTheRestore:
         mp.queue_shuffle = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
 
         mp.queue_shuffle.assert_not_awaited()
@@ -5085,7 +5058,7 @@ class TestShuffleWaitsForTheRestore:
         mp.queue_shuffle = AsyncMock(return_value="Shuffled!")
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        with _no_typing():
+        with no_typing("src.musicbot.background_typing"):
             await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
 
         mp.queue_shuffle.assert_awaited_once()
@@ -5099,7 +5072,7 @@ class TestTimestampWarningReachesTheUser:
     async def test_it_rides_the_queued_song_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        mp = _mock_mp()
+        mp = mock_mp()
         mp.queue.qsize = MagicMock(return_value=3)  # something already queued
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
@@ -5117,9 +5090,9 @@ class TestTimestampWarningReachesTheUser:
         """An idle bot plays the first song immediately and sends no "Queued
         song" embed at all. Riding that embed alone would drop the warning in
         the most ordinary case there is."""
-        mp = _mock_mp()
+        mp = mock_mp()
         mp.queue.qsize = MagicMock(return_value=0)
-        mock_ctx.voice_client = _connected_vc()
+        mock_ctx.voice_client = connected_vc()
         mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 

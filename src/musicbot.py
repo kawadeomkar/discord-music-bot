@@ -34,7 +34,7 @@ from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
 )
-from src.musicplayer import MusicPlayer
+from src.musicplayer import RESTORE_WAIT_SECS, MusicPlayer
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     GuildRedisStore,
@@ -73,6 +73,7 @@ from src.ping import run_health_dashboard, send_latency_line
 from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
+    ECHO_ROW_MAX,
     EMBED_FIELD_LIMIT,
     background_typing,
     cancel_task,
@@ -178,11 +179,6 @@ HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
 
-# How long a cold-start command (-play, -resume) waits for its restore. Generous for
-# one pipelined read; bounded because the pool sets no socket_timeout, so a server
-# that accepts the connection then stalls would hang the command outright.
-RESTORE_WAIT_SECS = 5.0
-
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
@@ -191,9 +187,6 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
 # Bound on one echoed needle, which owns a field to itself. Discord renders
 # markdown in field values, so what a user typed goes through safe_label first.
 _ECHO_MAX = 200
-
-# One row of a multi-row field — ten of these share the budget one needle gets.
-_ECHO_ROW_MAX = 70
 
 
 # The most dropped positions worth spelling out; past this the list says nothing
@@ -615,7 +608,9 @@ class MusicBot(commands.Cog):
             if ctx.command is not None and ctx.command.extras.get("observation_only"):
                 return
             old_channel = (
-                self.mps[ctx.guild.id]._channel if ctx.guild.id in self.mps else None
+                self.mps[ctx.guild.id].home_channel
+                if ctx.guild.id in self.mps
+                else None
             )
             mp = self.get_mp(ctx)
             if (
@@ -863,7 +858,7 @@ class MusicBot(commands.Cog):
                 titles, analytics=analytics, origin=origin
             )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
-            shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
+            shown_titles = queue_message([safe_label(t, ECHO_ROW_MAX) for t in titles])
             await asyncio.gather(
                 send_embed(
                     ctx,
@@ -898,7 +893,7 @@ class MusicBot(commands.Cog):
                 else ""
             )
             shown_titles = queue_message(
-                [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+                [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, 10)]
             )
             await asyncio.gather(
                 send_embed(
@@ -1797,7 +1792,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
+            description = queue_message([safe_label(t, ECHO_ROW_MAX) for t in cleared])
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
@@ -1908,7 +1903,7 @@ class MusicBot(commands.Cog):
                         _field(
                             queue_message(
                                 [
-                                    _echo(_removed_label(i), _ECHO_ROW_MAX)
+                                    _echo(_removed_label(i), ECHO_ROW_MAX)
                                     # Sliced before the echo: queue_message keeps 10.
                                     for i in outcome.removed[:10]
                                 ]
@@ -1949,11 +1944,11 @@ class MusicBot(commands.Cog):
                 and (vc.is_playing() or vc.is_paused())
                 and song is not None
             ):
-                if ctx.channel.id != mp._channel.id:
+                if ctx.channel.id != mp.home_channel.id:
                     # Outside the player's home channel: the host never leaves
                     # home, so answer HERE with a static snapshot (MusicContext's
                     # channel guard keeps it unattached).
-                    await ctx.send(embed=mp._build_now_playing_embed(song))
+                    await ctx.send(embed=mp.now_playing_snapshot(song))
                     return
                 # Re-host the live block at the bottom (retiring the old host)
                 # rather than sending a snapshot that immediately goes stale.
