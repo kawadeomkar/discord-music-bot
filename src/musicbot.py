@@ -27,6 +27,7 @@ from src.config import (
 )
 from src import debug as debug_mode
 from src.commands import clear as clear_cmd
+from src.commands import jump as jump_cmd
 from src.commands import leaderboard as leaderboard_cmd
 from src.commands import now as now_cmd
 from src.commands import queue as queue_cmd
@@ -1954,13 +1955,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.jump")
     async def jump(self, ctx: commands.Context) -> None:
         try:
-            # TODO: Implement -jump or remove it from the command list.
-            # The help text advertises it while the body only replies "currently in
-            # development", so the bot promises a feature it does not have.
-            # Implementing it is a drain/rotate over GuildQueue, shaped like remove().
-            await ctx.send(
-                embed=notice_embed("currently in development", discord.Color.blue())
-            )
+            await jump_cmd.run(ctx)
         except Exception as e:
             await self._command_error(ctx, e)
 
