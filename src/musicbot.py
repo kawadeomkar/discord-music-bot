@@ -26,6 +26,12 @@ from src.config import (
     using_default_postgres_password,
 )
 from src import debug as debug_mode
+from src.commands import clear as clear_cmd
+from src.commands import jump as jump_cmd
+from src.commands import now as now_cmd
+from src.commands import queue as queue_cmd
+from src.commands import remove as remove_cmd
+from src.commands import shuffle as shuffle_cmd
 from src import analytics_card, leaderboard
 from src.guild_history import history_embeds
 from src.guild_state import Analytics
@@ -41,9 +47,7 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
-    QUERY_SOURCE_SEARCH,
     timestamp_warning,
     unquote_argument,
     SoundcloudSource,
@@ -74,7 +78,6 @@ from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
     ECHO_ROW_MAX,
-    EMBED_FIELD_LIMIT,
     background_typing,
     cancel_task,
     fmt_duration,
@@ -86,7 +89,6 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
-    truncate,
     get_logger,
 )
 
@@ -182,55 +184,6 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
-
-
-# Bound on one echoed needle, which owns a field to itself. Discord renders
-# markdown in field values, so what a user typed goes through safe_label first.
-_ECHO_MAX = 200
-
-
-# The most dropped positions worth spelling out; past this the list says nothing
-# the count above it did not.
-_MAX_SHOWN_POSITIONS = 60
-
-
-def _echo(text: str, limit: int = _ECHO_MAX) -> str:
-    """A needle safe to put in an embed — see util.safe_label."""
-    return safe_label(text, limit)
-
-
-def _removed_label(item: QueueItem) -> str:
-    """A removed queue item's name for the reply, as MusicPlayer.queue_clear
-    renders it: `YTSource` has no title, so an unresolved Spotify-playlist track
-    would otherwise show as `?`."""
-    if isinstance(item, QueueObject):
-        return item.title or "?"
-    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-
-
-def _field(value: str) -> str:
-    """An embed field value that cannot 400 the send. The callers below build from
-    lists whose length is the user's to choose, and the send happens AFTER the
-    queue has been mutated."""
-    return truncate(value, EMBED_FIELD_LIMIT)
-
-
-def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
-    """How the removal matched, for the reply's "Matched" field. An origin match
-    names which of the user's own inputs did it, since one argument can take out a
-    whole playlist."""
-    # Not wrapped in a code span: inside one Discord renders safe_label's
-    # backslashes literally, so `-remove foo_bar` comes back as `foo\_bar`.
-    shown = _echo(needle)
-    if outcome.mode is not RemoveMode.ORIGIN:
-        return shown
-    kinds = {item.query_source for item in outcome.removed if item.query_source}
-    # Only when every removed item agrees — a mixed set has no one kind to name.
-    kind = kinds.pop() if len(kinds) == 1 else ""
-    them = "them" if len(outcome.removed) > 1 else "it"
-    if kind == QUERY_SOURCE_SEARCH:
-        return f"{shown} — the search you queued {them} with"
-    return f"{shown} — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1680,26 +1633,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.shuffle")
     async def shuffle(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
-            # so running it before restore_entries() has replayed the saved queue
-            # writes an unrestored deque over it and deletes the persisted entries.
-            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                await ctx.send(
-                    embed=notice_embed(
-                        "Still loading this server's saved queue — try again in "
-                        "a moment.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            async with background_typing(ctx):
-                await ctx.send(
-                    embed=notice_embed("Please wait... shuffling", discord.Color.blue())
-                )
-                msg = await mp.queue_shuffle()
-                await ctx.message.add_reaction("🔀")
-                await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
+            await shuffle_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1770,38 +1704,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.clear")
     async def clear(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
-            # unrestored player deletes a saved queue it cannot see — including the
-            # -playnow tails _flush_played would have recorded. validate_commands
-            # only requires the AUTHOR in voice, so a cold player reaches here.
-            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                await ctx.send(
-                    embed=notice_embed(
-                        "Still loading this server's saved queue — try again in "
-                        "a moment.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            cleared = await mp.queue_clear()
-            if not cleared:
-                await ctx.send(
-                    embed=notice_embed(
-                        "The queue is already empty.", discord.Color.orange()
-                    )
-                )
-                return
-            description = queue_message([safe_label(t, ECHO_ROW_MAX) for t in cleared])
-            await asyncio.gather(
-                ctx.message.add_reaction("🗑️"),
-                send_embed(
-                    ctx,
-                    f"Queue cleared — {len(cleared)} {pluralize(len(cleared), 'song')} removed",
-                    description,
-                    discord.Color.red(),
-                ),
-            )
+            await clear_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1840,81 +1743,7 @@ class MusicBot(commands.Cog):
         self, ctx: commands.Context, *, needle: Optional[str] = None
     ) -> None:
         try:
-            if needle is None:
-                await ctx.send(
-                    embed=notice_embed(
-                        "`-remove <link or search text>` — removes every queued "
-                        "song that matches. Give it the YouTube link from the "
-                        "**Now Playing** card, or the search text or link you "
-                        "queued with; a collection link removes every track it "
-                        "added.",
-                        discord.Color.blue(),
-                    )
-                )
-                return
-            mp = self.get_mp(ctx)
-            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
-            # unrestored player deletes a saved queue it cannot see — including the
-            # -playnow tails _flush_played would have recorded. validate_commands
-            # only requires the AUTHOR in voice, so a cold player reaches here.
-            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                await ctx.send(
-                    embed=notice_embed(
-                        "Still loading this server's saved queue — try again in "
-                        "a moment.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            outcome = await mp.queue_remove(needle)
-            positions = outcome.positions
-            if not positions:
-                await send_embed(
-                    ctx,
-                    "",
-                    f"No queued songs found matching: {_echo(needle)}",
-                    discord.Color.red(),
-                )
-                return
-            count = len(positions)
-            noun = pluralize(count, "song")
-            pos_label = pluralize(count, "Position")
-            # Capped by count: one -remove of a collection link drops as many
-            # positions as the collection had, and a raw join passes the 1024-char
-            # field limit at 227 of them — a 400 for a removal that already
-            # happened.
-            shown = positions[:_MAX_SHOWN_POSITIONS]
-            pos_str = ", ".join(str(p) for p in shown)
-            if len(positions) > len(shown):
-                pos_str += f", …and {len(positions) - len(shown)} more"
-            await send_embed(
-                ctx,
-                f"Removed {count} {noun} from the queue",
-                "",
-                discord.Color.orange(),
-                fields=[
-                    ("Matched", _field(_matched_label(outcome, needle)), False),
-                    (f"{pos_label} removed", _field(pos_str), False),
-                    # Titles, like -clear reports: one argument can take out a whole
-                    # playlist, and there is no undo, so a bare count is not enough
-                    # to tell whether it took what the user meant.
-                    (
-                        "Songs",
-                        _field(
-                            queue_message(
-                                [
-                                    _echo(_removed_label(i), ECHO_ROW_MAX)
-                                    # Sliced before the echo: queue_message keeps 10.
-                                    for i in outcome.removed[:10]
-                                ]
-                            )
-                        ),
-                        False,
-                    ),
-                ],
-            )
-            await ctx.send(embed=mp.queue_embed())
-            await ctx.message.add_reaction("🗑️")
+            await remove_cmd.run(ctx, needle, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1935,37 +1764,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.now")
     async def now(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            vc = ctx.guild.voice_client if ctx.guild else None
-            song = mp.current_song
-            if (
-                vc is not None
-                and isinstance(vc, discord.VoiceClient)
-                and (vc.is_playing() or vc.is_paused())
-                and song is not None
-            ):
-                if ctx.channel.id != mp.home_channel.id:
-                    # Outside the player's home channel: the host never leaves
-                    # home, so answer HERE with a static snapshot (MusicContext's
-                    # channel guard keeps it unattached).
-                    await ctx.send(embed=mp.now_playing_snapshot(song))
-                    return
-                # Re-host the live block at the bottom (retiring the old host)
-                # rather than sending a snapshot that immediately goes stale.
-                if await mp.repin_now_playing():
-                    return
-                # Song ended between the liveness check and the repin — fall
-                # through to the static/none responses instead of silence.
-            if mp.play_message is not None:
-                # Crash-recovery window: current_song isn't live yet but a snapshot
-                # survived the restart. Static embed (no bar) until loop() starts.
-                await ctx.send(embed=mp.play_message)
-            else:
-                await ctx.send(
-                    embed=notice_embed(
-                        "No songs are currently playing.", discord.Color.orange()
-                    )
-                )
+            await now_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -2214,13 +2013,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.jump")
     async def jump(self, ctx: commands.Context) -> None:
         try:
-            # TODO: Implement -jump or remove it from the command list.
-            # The help text advertises it while the body only replies "currently in
-            # development", so the bot promises a feature it does not have.
-            # Implementing it is a drain/rotate over GuildQueue, shaped like remove().
-            await ctx.send(
-                embed=notice_embed("currently in development", discord.Color.blue())
-            )
+            await jump_cmd.run(ctx)
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -2239,8 +2032,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.queue")
     async def queue(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            await ctx.send(embed=mp.queue_embed())
+            await queue_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
