@@ -24,6 +24,7 @@ from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
 from src.guild_state import Analytics
+from src import youtube
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -32,6 +33,10 @@ from src.youtube import (
     _STREAM_CACHE_FIELDS,
     _cache_stream,
     _UNUSED_INFO_COLLECTIONS,
+    _YT_SOURCE_FRESH_SECS,
+    _YT_SOURCE_TTL,
+    _source_cache_key,
+    _source_entry_is_stale,
     _YTDL_FLAT_SEARCH_OPTS,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
@@ -2703,7 +2708,9 @@ class TestFlatYtSource:
         assert "googlevideo" not in qobj.webpage_url
         cached = await fake_redis.get("ytdl:source:ytsearch:flat song")
         assert cached is not None
-        assert orjson.loads(cached) == {
+        entry = orjson.loads(cached)
+        assert entry.pop("cached_at") == pytest.approx(time.time(), abs=60)
+        assert entry == {
             "webpage_url": "https://www.youtube.com/watch?v=abc123",
             "title": "Flat Song",
             "duration": 200,
@@ -2886,6 +2893,164 @@ class TestFlatYtSource:
 
         assert mock_extract.call_args[0][0].opts is _YTDL_STREAM_OPTS
         assert song.title == "Playable"
+
+
+class TestSourceCacheKey:
+    """A query's ytdl:source key. Case folding is what makes "Destiny" and "destiny "
+    one entry; a URL is what it must never be applied to."""
+
+    def test_a_search_folds_case_and_whitespace(self) -> None:
+        assert _source_cache_key("  Destiny ") == _source_cache_key("destiny")
+
+    def test_a_url_keeps_its_case(self) -> None:
+        """YouTube video ids are case-sensitive. Folded, `?v=aBcDeF` and `?v=AbCdEf`
+        share one entry and the second play is served the first's song for the whole
+        TTL — which is now a day."""
+        upper = _source_cache_key("https://www.youtube.com/watch?v=aBcDeF")
+        lower = _source_cache_key("https://www.youtube.com/watch?v=AbCdEf")
+        assert upper != lower
+        assert upper.endswith("v=aBcDeF")
+
+    def test_a_url_is_still_stripped(self) -> None:
+        key = _source_cache_key("  https://yt.com/v=Ab  ")
+        assert key == "ytdl:source:https://yt.com/v=Ab"
+
+
+class TestSourceCacheRevalidation:
+    """A hit older than _YT_SOURCE_FRESH_SECS is served as-is and refreshed behind
+    the reply, so a repeat play inside the day is one Redis GET."""
+
+    @staticmethod
+    def _entry(**over: Any) -> dict[str, Any]:
+        return {
+            "webpage_url": "https://www.youtube.com/watch?v=old",
+            "title": "Stale Song",
+            "duration": 120,
+            "uploader": "Chan",
+            "thumbnail": None,
+        } | over
+
+    @staticmethod
+    async def _stored(redis: aioredis.Redis, key: str) -> Any:
+        raw = await redis.get(key)
+        assert raw is not None
+        return orjson.loads(raw)
+
+    async def _hit(self, ctx: MagicMock, redis: aioredis.Redis, query: str) -> Any:
+        return await YTDL.yt_source(
+            ctx.author,
+            query,
+            redis=redis,
+            query_source="search",
+            analytics=_ANALYTICS,
+            user_input=None,
+        )
+
+    def test_an_entry_with_no_stamp_reads_as_fresh(self) -> None:
+        """Written by a build that stamped nothing — and carrying that build's one-hour
+        TTL, so it expires before staleness could matter. Read as stale, the first
+        minutes after a deploy would revalidate the whole cache."""
+        assert not _source_entry_is_stale(self._entry())
+        assert not _source_entry_is_stale("not a dict")
+
+    def test_a_fresh_stamp_reads_as_fresh_and_an_old_one_as_stale(self) -> None:
+        assert not _source_entry_is_stale(self._entry(cached_at=time.time()))
+        assert _source_entry_is_stale(
+            self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+        )
+
+    async def test_a_stale_search_hit_serves_the_entry_and_refreshes_it(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.set(
+            "ytdl:source:stale search",
+            orjson.dumps(
+                self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+            ),
+        )
+        flat = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "new1",
+                    "title": "Fresh Song",
+                    "duration": 200,
+                    "uploader": "Chan",
+                }
+            ],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=flat) as mock_extract:
+            qobj = await self._hit(mock_ctx, fake_redis, "stale search")
+            # The reply is served from the entry that was there, not the refresh.
+            assert qobj.title == "Stale Song"
+            assert mock_extract.call_count == 0
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
+
+        rewritten = await self._stored(fake_redis, "ytdl:source:stale search")
+        assert rewritten["title"] == "Fresh Song"
+        assert rewritten["webpage_url"] == "https://www.youtube.com/watch?v=new1"
+        assert rewritten["cached_at"] == pytest.approx(time.time(), abs=60)
+        assert await fake_redis.ttl("ytdl:source:stale search") == _YT_SOURCE_TTL
+
+    async def test_a_fresh_hit_refreshes_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.set(
+            "ytdl:source:fresh search",
+            orjson.dumps(self._entry(cached_at=time.time())),
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await self._hit(mock_ctx, fake_redis, "fresh search")
+        assert not youtube._SOURCE_REVALIDATIONS
+        mock_extract.assert_not_called()
+
+    async def test_a_stale_link_refreshes_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """What ages is the ranking a SEARCH resolved through. A link's mapping is
+        the link, and refreshing one would cost a full extraction to learn that."""
+        link = "https://www.youtube.com/watch?v=oldOne"
+        await fake_redis.set(
+            f"ytdl:source:{link}",
+            orjson.dumps(
+                self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await self._hit(mock_ctx, fake_redis, link)
+        assert not youtube._SOURCE_REVALIDATIONS
+        mock_extract.assert_not_called()
+
+    async def test_a_refresh_that_resolves_nothing_leaves_the_entry_alone(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A live result or one without a duration: the stale entry still plays, so
+        it outlives the attempt rather than being dropped."""
+        stale = self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+        await fake_redis.set("ytdl:source:live search", orjson.dumps(stale))
+        live = {
+            "_type": "playlist",
+            "entries": [{"id": "l1", "title": "Live", "live_status": "is_live"}],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=live):
+            await self._hit(mock_ctx, fake_redis, "live search")
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
+
+        assert await self._stored(fake_redis, "ytdl:source:live search") == stale
+
+    async def test_a_failed_refresh_does_not_escape_the_task(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The reply has already gone out from the entry this failed to refresh."""
+        await fake_redis.set(
+            "ytdl:source:boom search",
+            orjson.dumps(
+                self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract", side_effect=RuntimeError("nope")):
+            await self._hit(mock_ctx, fake_redis, "boom search")
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
 
 
 class TestWarmWorker:

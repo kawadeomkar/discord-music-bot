@@ -463,7 +463,7 @@ sequenceDiagram
     else Single track (YouTube / Spotify track / SoundCloud)
         Bot->>SP: spotify.track(id)  [if Spotify track]
         Bot->>YTDL: yt_source(requester, search, ts, redis)
-        Note over YTDL: checks ytdl:source cache first (1h TTL);<br/>on miss, a search resolves FLAT (ytdl:source only)<br/>and a link takes the unified extraction (both caches)
+        Note over YTDL: checks ytdl:source cache first (24h TTL, refreshed past 1h);<br/>on miss, a search resolves FLAT (ytdl:source only)<br/>and a link takes the unified extraction (both caches)
         YTDL-->>Redis: cache_set("ytdl:stream:<url>", data, ≤1800s)
         YTDL-->>Bot: QueueObject(webpage_url, title, ...)
         Bot->>MP: queue_put([qobj])
@@ -555,7 +555,7 @@ Every song passes through up to three phases:
 ```mermaid
 flowchart LR
     subgraph Phase1["Phase 1 — Enqueue (unified single extraction)"]
-        P1["yt_source(search)\nytdl:source cache (1h), else a FLAT\nsearch (identity only) or, for a link,\nONE full extraction (both caches)\nReturns: QueueObject"]
+        P1["yt_source(search)\nytdl:source cache (24h), else a FLAT\nsearch (identity only) or, for a link,\nONE full extraction (both caches)\nReturns: QueueObject"]
     end
 
     subgraph Phase1b["Phase 1b — Eager Prefetch (background)"]
@@ -571,7 +571,7 @@ flowchart LR
     Phase1b -->|"Redis cache populated"| Phase2
 ```
 
-**Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 1 h) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss it takes one of two paths, chosen by the caller through `ResolveMode` (see [Resolve mode](#resolve-mode)):
+**Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 24 h, see [Source-cache freshness](#source-cache-freshness)) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss it takes one of two paths, chosen by the caller through `ResolveMode` (see [Resolve mode](#resolve-mode)):
 
 - **Flat** (`flat=True`, `_YTDL_FLAT_SEARCH_OPTS`) for a search or a Spotify track under an ordinary placement: one search POST yields id, title, duration, uploader and thumbnail — enough for the card and the queue entry — and **no stream URL**, so only `ytdl:source` is written. Measured at 0.65 s against the full path's 2.46 s. An entry the mapper cannot describe as a plain song (live, upcoming, or duration-less) returns `None` and the query falls through to the full path, which produces exactly what it produced before the flat path existed — at the cost of both rounds. `ytsearch:` returns a single entry, so the full path re-fetches the same declined video: `-play lofi hip hop radio`, whose top hit is a live stream, pays ~0.65 s + ~2.46 s and two pool jobs where it used to pay one.
 - **Full** (`_YTDL_STREAM_SEARCH_OPTS`, hardcoded `process=True` — unprocessed extraction would do no format selection and leave nothing to cache) for every link, every interjection head, every **cold start** (its song plays immediately, so the stream extraction is on the path to audio either way and a flat resolve would only move the failure past the join), and every lazy entry resolving at dequeue: identity plus a selected stream URL, with `_probe_and_cache` writing the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity.
@@ -605,6 +605,22 @@ Returns a `QueueObject`.
 **`process` stays `True` on the flat path.** With `process=False` yt-dlp returns `entries` as an unconsumed `itertools.islice` and never iterates it — no search is performed at all — and `sanitize_info` reduces the islice to its `repr()`, so what crosses the process boundary is a 40-character string. `extract_flat: "in_playlist"` with `process=True` is the configuration `yt_playlist` has always run.
 
 **The flat path may write `ytdl:source`** because `_queue_object_from_flat_entry` refuses any entry without a duration, so every entry it writes carries the same five fields the full path writes. The one difference measured between the two is the duration itself: the search renderer's `lengthSeconds` can disagree with the processed value by a second (322 against 321 on one of three live queries), which the enqueue card, the queue listing and the ETA inherit — `play_history` does not: `HistoryEntry.from_song` reads `YTDL.duration_secs`, set from the stream extraction. It derives `webpage_url` from the entry's `id` rather than reading `url`: that string is the `ytdl:stream` cache key, what `-remove` matches, and part of `play_history`'s dedup tuple, so the two paths have to agree on it by construction.
+
+---
+
+### Source-cache freshness
+
+`ytdl:source` entries live for `_YT_SOURCE_TTL` (24 h) and are considered fresh for `_YT_SOURCE_FRESH_SECS` (1 h). Past that, a hit is **still served** — the reply is one Redis GET either way — and a refresh is spawned behind it. The entry is ~200 bytes, TTL'd and therefore eviction-safe under `volatile-lru`, so lengthening it trades storage for exactly the thing the play path is measured on: every repeat of a query inside a day becomes a single round trip instead of a 0.65–2.5 s resolve.
+
+**Only a search is revalidated.** What ages in a source entry is the query → video mapping YouTube's ranking decides; a link's mapping is the link. Refreshing a link would spend a full extraction (its floor — see [Resolve mode](#resolve-mode)) to relearn a `webpage_url` that cannot have changed, and the metadata it would correct is cosmetic. So `_revalidate_source` runs one flat POST, for searches only, and `yt_source` skips it for any query containing `://`.
+
+**The refresh may not raise, and may not drop the entry.** It runs in a task nobody awaits, spawned after the reply has already been served from the entry it is refreshing. A flat result the mapper declines — a live top hit, one without a duration, or no result at all — leaves the stale entry in place: it still names a playable video, which is more than the alternative. Concurrent refreshes of one query collapse in `_extract_once` under the `"flat"` profile, the same single-flight the miss path uses.
+
+**An entry with no `cached_at` reads as fresh, not stale.** It was written by the build before the stamp existed, and it carries that build's 1 h TTL, so it expires before staleness could matter. Read the other way, the first hour after a deploy would revalidate every entry in the cache once.
+
+**The key is case-folded except for a URL.** `"Destiny"` and `"destiny "` are one search and must share an entry. YouTube video ids are case-sensitive, so folding a link's key makes `?v=aBcDeF` and `?v=AbCdEf` collide — and the second play is served the first's song for a day rather than an hour, which is what makes this worth stating.
+
+---
 
 **`_extract_once` is keyed by `_inflight_key(cache_key, profile)`** — `"flat"`, `"full"` or `"stream"`. Keyed by the cache key alone, a flat and a full caller of one query would share a job whose `url` means different things to each: the watch page on a flat entry, the googlevideo CDN address on a processed one. The `"stream"` profile is shared by `prefetch_stream` and the playback loop's `_resolve_playable_stream`, which build identical requests; the key is popped before the result publishes, so the loop's re-extraction after a `DEAD` probe still gets a fresh job.
 
@@ -894,7 +910,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `analytics:png:v{n}:{guild_id}:{days}:{digest}` | Bytes | the rendered chart, keyed by a digest of the aggregate it was drawn from so a stale entry MISSES rather than pairing an old chart with fresh numbers. Raw bytes, not orjson — that would base64 it for a 33% penalty | to the next UTC midnight |
 | `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
-| `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
+| `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
 | `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
@@ -2163,7 +2179,7 @@ one real gap — the ~2.0 s first invocation in a process.
 
 ### yt-dlp three-phase pipeline
 
-The queue stores lightweight `QueueObject`s rather than fully resolved `YTDL` objects. Full stream extraction is deferred to just before playback so signed YouTube CDN URLs are as fresh as possible when FFmpeg starts. For a link, Phase 1's unified single extraction warms both the `ytdl:source` (1 h) and `ytdl:stream` caches in one yt-dlp call at enqueue time, so Phase 2 is a cache read; for a search it warms only `ytdl:source`, and the Phase 1b prefetch performs the stream extraction — as it already does for the entries that skip the unified path (playlist items, requeues). A cold search therefore costs **four** HTTP requests (the search POST; then the watch page, player API and manifest at prefetch) against the unified path's five, since `youtubetab:skip=webpage` removed the homepage fetch both paths used to open with. What doubles is the number of yt-dlp *calls*, not the traffic; time-to-audio on an empty queue is unchanged (0.65 s + 1.86 s against 2.46 s).
+The queue stores lightweight `QueueObject`s rather than fully resolved `YTDL` objects. Full stream extraction is deferred to just before playback so signed YouTube CDN URLs are as fresh as possible when FFmpeg starts. For a link, Phase 1's unified single extraction warms both the `ytdl:source` (24 h) and `ytdl:stream` caches in one yt-dlp call at enqueue time, so Phase 2 is a cache read; for a search it warms only `ytdl:source`, and the Phase 1b prefetch performs the stream extraction — as it already does for the entries that skip the unified path (playlist items, requeues). A cold search therefore costs **four** HTTP requests (the search POST; then the watch page, player API and manifest at prefetch) against the unified path's five, since `youtubetab:skip=webpage` removed the homepage fetch both paths used to open with. What doubles is the number of yt-dlp *calls*, not the traffic; time-to-audio on an empty queue is unchanged (0.65 s + 1.86 s against 2.46 s).
 
 ### Keeping `_prefetch_next_song`
 
