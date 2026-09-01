@@ -441,6 +441,13 @@ YTDL_OPTS = _YTDL_STREAM_OPTS
 _YT_SOURCE_TTL = 86400  # 24 hours
 _YT_SOURCE_FRESH_SECS = 3600  # 1 hour
 
+# Playlist entry-list cache lifetime. Short, and deliberately not the source cache's
+# day: a playlist is editable, and the entry count and order are what the callers'
+# `&index=` handling and every "Queued playlist — N songs" line are built from. It
+# buys the two cases that hurt — the same collection pasted twice, and a re-paste
+# inside the window, which at 5,547 entries is a 99s extraction.
+_YT_PLAYLIST_TTL = 900  # 15 minutes
+
 # Revalidations in flight. Module-level because the refresh outlives the command that
 # noticed the staleness — the reply has already been served from the stale entry.
 _SOURCE_REVALIDATIONS: set[asyncio.Task[Any]] = set()
@@ -569,17 +576,42 @@ class SourceIdentity:
     thumbnail: Optional[str]
 
 
-def _source_cache_value(identity: SourceIdentity) -> dict[str, Any]:
-    """One definition of the source-cache wire shape, so the flat path, the full path
-    and the revalidation cannot drift on what a hit carries."""
+def _identity_to_wire(identity: SourceIdentity) -> dict[str, Any]:
+    """One definition of a cached identity's wire shape, shared by the source cache
+    and the playlist cache so neither can drift from what reads it back."""
     return {
         "webpage_url": identity.webpage_url,
         "title": identity.title,
         "duration": identity.duration,
         "uploader": identity.uploader,
         "thumbnail": identity.thumbnail,
-        "cached_at": time.time(),
     }
+
+
+def _identity_from_wire(entry: dict[str, Any]) -> SourceIdentity:
+    """Rebuild a cached identity. Explicit `.get()`s rather than `SourceIdentity(**entry)`
+    so an entry written before a field existed still parses."""
+    return SourceIdentity(
+        webpage_url=entry.get("webpage_url", ""),
+        title=entry.get("title", ""),
+        duration=entry.get("duration"),
+        uploader=entry.get("uploader"),
+        thumbnail=entry.get("thumbnail"),
+    )
+
+
+def _source_cache_value(identity: SourceIdentity) -> dict[str, Any]:
+    """A source-cache entry: the identity plus the stamp _source_entry_is_stale reads."""
+    return {**_identity_to_wire(identity), "cached_at": time.time()}
+
+
+def _playlist_cache_key(url: str) -> str:
+    """Keyed on the playlist's `list=` id rather than the pasted URL: one collection
+    arrives as /playlist?list=X, as a watch link carrying `&index=`, and with a `&t=`
+    on it, and those must share an entry rather than fragmenting the cache per entry
+    point. A URL carrying no `list=` falls back to itself."""
+    list_id = parse_qs(urlparse(url).query).get("list", [""])[0]
+    return f"ytdl:playlist:{list_id or url}"
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -1145,6 +1177,46 @@ def _first_video_entry(data: YTDLExtractResult) -> YTDLEntry:
         if entry and entry.get("_type", None) != "playlist":
             return entry
     return data
+
+
+def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
+    """The playable entries of a flat playlist extraction, in order. Entries yt-dlp
+    could not describe are dropped HERE, before the cache, so a hit cannot resurrect
+    a deleted video the miss already refused."""
+    # Optional in the element type, not re-annotated on the loop target: yt-dlp emits
+    # a null entry for a deleted/private video, which is what the guard below skips —
+    # declaring it non-optional excluded that case.
+    entries: list[Optional[YTDLEntry]] = data.get("entries") or []
+    tracks: list[SourceIdentity] = []
+    for i, entry in enumerate(entries):
+        if not entry:
+            log.warning("Skipping null entry at playlist index %d for %s", i, url)
+            continue
+        video_id = entry.get("id")
+        if not video_id:
+            log.warning(
+                "Skipping entry at playlist index %d (title=%r) — missing video ID for %s",
+                i,
+                entry.get("title"),
+                url,
+            )
+            continue
+        # A flat entry already carries what the card shows. duration is None on a
+        # live entry; uploader falls back to channel on lockupViewModel entries.
+        raw_duration = entry.get("duration")
+        tracks.append(
+            SourceIdentity(
+                # Derived from `id`, never read from `url`: that is /shorts/{id} for a
+                # Short, a second stream-cache key and a second play_history row for
+                # one video.
+                webpage_url=f"https://www.youtube.com/watch?v={video_id}",
+                title=entry.get("title") or video_id,
+                duration=int(raw_duration) if raw_duration is not None else None,
+                uploader=entry.get("uploader") or entry.get("channel"),
+                thumbnail=entry.get("thumbnail"),
+            )
+        )
+    return tracks
 
 
 async def _revalidate_source(
@@ -1720,61 +1792,55 @@ class YTDL(discord.FFmpegOpusAudio):
         query_source: str,
         analytics: Analytics,
         user_input: str,
+        redis: Optional[aioredis.Redis] = None,
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist.
 
         query_source, analytics and user_input are REQUIRED (see yt_source).
         `analytics` is the head's — track positions are derived per kept track
         below. `user_input` is the playlist link the user pasted, carried onto every
-        track so -remove can match it."""
-        trace.get_current_span().set_attribute("ytdl.url", url)
-        data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
-        if data is None:
-            raise Exception(f"Could not fetch YouTube playlist: {url}")
-        # Optional in the element type, not re-annotated on the loop target: yt-dlp
-        # emits a null entry for a deleted/private video, which is exactly what the
-        # guard below skips — declaring it non-optional excluded that case.
-        entries: list[Optional[YTDLEntry]] = data.get("entries") or []
-        trace.get_current_span().set_attribute("ytdl.playlist_size", len(entries))
-        qobjs: list[QueueObject] = []
-        for i, entry in enumerate(entries):
-            if not entry:
-                log.warning("Skipping null entry at playlist index %d for %s", i, url)
-                continue
-            video_id = entry.get("id")
-            if not video_id:
-                log.warning(
-                    "Skipping entry at playlist index %d (title=%r) — missing video ID for %s",
-                    i,
-                    entry.get("title"),
-                    url,
-                )
-                continue
-            title = entry.get("title") or video_id
-            # Derived from `id`, never read from `url`: that is /shorts/{id} for a
-            # Short, a second stream-cache key and a second play_history row for one
-            # video.
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            # A flat entry already carries what the card shows. duration is None on a
-            # live entry; uploader falls back to channel on lockupViewModel entries.
-            raw_duration = entry.get("duration")
-            # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
-            # skipped null entries above must not leave gaps in queue_position.
-            # replace() so a field added to Analytics later is carried here.
-            qobjs.append(
-                QueueObject(
-                    video_url,
-                    title,
-                    requester,
-                    user_input=user_input,
-                    duration=int(raw_duration) if raw_duration is not None else None,
-                    uploader=entry.get("uploader") or entry.get("channel"),
-                    thumbnail=entry.get("thumbnail"),
-                    query_source=query_source,
-                    analytics=replace(
-                        analytics,
-                        queue_position=analytics.queue_position + len(qobjs),
-                    ),
-                )
+        track so -remove can match it.
+
+        Cached and single-flighted: this is the most expensive resolve in the system
+        (99s at 5,547 entries), and two users pasting one collection used to run two
+        of them. See docs/ARCHITECTURE.md#the-playlist-cache."""
+        span = trace.get_current_span()
+        span.set_attribute("ytdl.url", url)
+        cache_key = _playlist_cache_key(url)
+        cached = await cache_get(redis, cache_key)
+        span.set_attribute("ytdl.playlist_cache_hit", cached is not None)
+        if cached is not None:
+            tracks = [_identity_from_wire(entry) for entry in cached]
+        else:
+            data = await _extract_once(
+                _inflight_key(cache_key, "playlist"),
+                ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS),
             )
-        return qobjs
+            if data is None:
+                raise Exception(f"Could not fetch YouTube playlist: {url}")
+            tracks = _playlist_tracks(data, url)
+            if tracks:
+                # An empty result is not cached: a private or unavailable playlist
+                # extracts to no entries too, and a quarter hour is a long time to
+                # answer a retry with the same nothing.
+                await cache_set(
+                    redis,
+                    cache_key,
+                    [_identity_to_wire(track) for track in tracks],
+                    _YT_PLAYLIST_TTL,
+                )
+        span.set_attribute("ytdl.playlist_size", len(tracks))
+        # Positions derive from the KEPT tracks, so the entries _playlist_tracks
+        # dropped leave no gaps. replace() so a field added to Analytics is carried.
+        return [
+            _queue_object_from_identity(
+                track,
+                requester,
+                query_source=query_source,
+                analytics=replace(
+                    analytics, queue_position=analytics.queue_position + offset
+                ),
+                user_input=user_input,
+            )
+            for offset, track in enumerate(tracks)
+        ]

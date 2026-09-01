@@ -346,6 +346,7 @@ async def queue_source(
             query_source=query_source_of(source),
             analytics=analytics,
             user_input=origin,
+            redis=cog.redis,
         )
         tracks, skipped = _apply_playlist_index(tracks, source.index)
         _apply_playlist_timestamp(tracks, source)
@@ -624,6 +625,7 @@ async def _resolve_interjection_source(
             query_source=query_source_of(source),
             analytics=analytics,
             user_input=origin,
+            redis=cog.redis,
         )
         # Indexed here too: `--now` on a link copied mid-playlist starts at the
         # track the user was looking at, not the playlist's first.

@@ -34,6 +34,7 @@ from src.youtube import (
     _STREAM_CACHE_FIELDS,
     _cache_stream,
     _UNUSED_INFO_COLLECTIONS,
+    _YT_PLAYLIST_TTL,
     _YT_SOURCE_FRESH_SECS,
     _YT_SOURCE_TTL,
     _source_cache_key,
@@ -3326,6 +3327,166 @@ class TestYtPlaylistEntries:
         )
         assert qobj.duration is None
         assert qobj.title == "Song live"
+
+
+class TestPlaylistCache:
+    """The most expensive resolve in the system, cached and single-flighted. The
+    entry list is stored; the requester, analytics and user_input are per request."""
+
+    @staticmethod
+    def _entries(*ids: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": video_id,
+                "title": f"Song {video_id}",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": 100,
+                "uploader": "Chan",
+            }
+            for video_id in ids
+        ]
+
+    async def _fetch(
+        self,
+        ctx: MagicMock,
+        redis: aioredis.Redis,
+        url: str,
+        *,
+        analytics: Analytics = _ANALYTICS,
+    ) -> list[QueueObject]:
+        return await YTDL.yt_playlist(
+            url,
+            ctx.author,
+            query_source="youtube.com",
+            analytics=analytics,
+            user_input=url,
+            redis=redis,
+        )
+
+    async def test_a_second_paste_inside_the_window_is_one_redis_get(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLcache"
+        data = {"_type": "playlist", "entries": self._entries("a1", "a2")}
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            first = await self._fetch(mock_ctx, fake_redis, url)
+            second = await self._fetch(mock_ctx, fake_redis, url)
+
+        assert mock_extract.call_count == 1
+        assert [q.webpage_url for q in first] == [q.webpage_url for q in second]
+        assert [q.title for q in second] == ["Song a1", "Song a2"]
+        assert await fake_redis.ttl("ytdl:playlist:PLcache") == _YT_PLAYLIST_TTL
+
+    async def test_every_entry_point_to_one_collection_shares_the_entry(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Keyed on the pasted URL, a watch link copied mid-playlist and the
+        playlist page itself fragment the cache into an entry each."""
+        data = {"_type": "playlist", "entries": self._entries("b1")}
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            await self._fetch(
+                mock_ctx, fake_redis, "https://www.youtube.com/playlist?list=PLsame"
+            )
+            await self._fetch(
+                mock_ctx,
+                fake_redis,
+                "https://www.youtube.com/watch?v=b1&list=PLsame&index=4",
+            )
+            await self._fetch(
+                mock_ctx, fake_redis, "https://www.youtube.com/playlist?list=PLsame&t=9"
+            )
+
+        assert mock_extract.call_count == 1
+        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:PLsame"]
+
+    def test_a_url_with_no_list_id_keys_on_itself(self) -> None:
+        assert youtube._playlist_cache_key("https://sc.com/set/x") == (
+            "ytdl:playlist:https://sc.com/set/x"
+        )
+
+    async def test_two_users_pasting_one_collection_run_one_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLrace"
+        release = asyncio.Event()
+        calls = 0
+
+        async def _slow_extract(_request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return {"_type": "playlist", "entries": self._entries("c1")}
+
+        with patch("src.youtube._run_extract", new=_slow_extract):
+            both = asyncio.gather(
+                self._fetch(mock_ctx, fake_redis, url),
+                self._fetch(mock_ctx, fake_redis, url),
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            release.set()
+            first, second = await both
+
+        assert calls == 1
+        assert len(first) == len(second) == 1
+
+    async def test_the_cache_cannot_resurrect_a_skipped_entry(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A deleted video arrives as a null entry and an id-less one as a title with
+        no id. Both are dropped before the write, so the hit sees what the miss did."""
+        url = "https://www.youtube.com/playlist?list=PLskip"
+        entries: list[Any] = [
+            None,
+            *self._entries("d1"),
+            {"title": "no id here"},
+            *self._entries("d2"),
+        ]
+        data = {"_type": "playlist", "entries": entries}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            miss = await self._fetch(mock_ctx, fake_redis, url)
+            hit = await self._fetch(mock_ctx, fake_redis, url)
+
+        assert [q.webpage_url for q in miss] == [q.webpage_url for q in hit]
+        assert len(hit) == 2
+        # Positions count kept tracks, so the drops leave no gaps.
+        assert [q.analytics.queue_position for q in hit] == [0, 1]
+
+    async def test_an_empty_playlist_is_not_cached(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A private or unavailable playlist extracts to no entries too, and a
+        quarter hour is a long time to answer a retry with the same nothing."""
+        url = "https://www.youtube.com/playlist?list=PLempty"
+        with patch(
+            "src.youtube._ytdlp_extract", return_value={"_type": "playlist"}
+        ) as mock_extract:
+            assert await self._fetch(mock_ctx, fake_redis, url) == []
+            assert await self._fetch(mock_ctx, fake_redis, url) == []
+
+        assert mock_extract.call_count == 2
+        assert await fake_redis.keys("ytdl:playlist:*") == []
+
+    async def test_a_hit_carries_this_request_s_requester_and_positions(
+        self, mock_ctx: MagicMock, mock_author: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The entries are shared; who asked and where the tracks land are not."""
+        url = "https://www.youtube.com/playlist?list=PLwho"
+        data = {"_type": "playlist", "entries": self._entries("e1", "e2")}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            await self._fetch(mock_ctx, fake_redis, url)
+            second = await YTDL.yt_playlist(
+                url,
+                mock_author,
+                query_source="youtube.com",
+                analytics=replace(_ANALYTICS, queue_position=7),
+                user_input="the second paste",
+                redis=fake_redis,
+            )
+
+        assert [q.requester for q in second] == [mock_author, mock_author]
+        assert [q.analytics.queue_position for q in second] == [7, 8]
+        assert {q.user_input for q in second} == {"the second paste"}
 
 
 class TestSlimInfoReturnContract:

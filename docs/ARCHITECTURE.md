@@ -608,6 +608,22 @@ Returns a `QueueObject`.
 
 ---
 
+### The playlist cache
+
+`yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
+
+It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
+
+**Fifteen minutes, not the source cache's day.** A playlist is editable, and its entry count and order are what the callers' `&index=` handling and every "Queued playlist — N songs" line are built from. What the window has to cover is the two cases that actually hurt: the same collection pasted twice in a burst, and a re-paste soon after.
+
+**The key is the `list=` id.** One collection reaches the bot as `/playlist?list=X`, as a watch link carrying `&index=4`, and with a `&t=` on the end. Keyed on the pasted URL those are three entries and three extractions. A URL with no `list=` falls back to itself.
+
+**Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. Entries yt-dlp could not describe (a null entry for a deleted video, one with no `id`) are dropped in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps.
+
+**An empty result is not cached.** A private or unavailable playlist extracts to no entries too, and a quarter of an hour is a long time to answer a retry with the same nothing.
+
+---
+
 ### Warming the stream cache
 
 A full Phase 1 extraction yields a selected stream URL alongside the identity, and that URL is worth caching — but only once it has been **probed**, which is a network round trip bounded by `_STREAM_PROBE_TIMEOUT` (2 s). The reply needs the identity alone, so `yt_source` **starts** the probe-and-cache and returns without awaiting it (`_start_stream_warm`). Every link's `-play` gets its confirmation that much sooner.
