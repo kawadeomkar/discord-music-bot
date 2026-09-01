@@ -19,7 +19,7 @@ from src.history_archive import (
     SchemaVersionError,
     SongLeader,
 )
-from src.leaderboard import LeaderboardFlags
+from src.commands.leaderboard import LeaderboardFlags
 from src.musicbot import MusicBot
 from tests.helpers import command_callback, mocked
 
