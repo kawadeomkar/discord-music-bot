@@ -18,6 +18,7 @@ from src.commands import play as play_cmd
 from src.recovery import abandon_cold_start
 from src.guild_queue import RemoveMode, RemoveOutcome
 from src.play_placement import (
+    PLACE_TIMEOUT_SECS,
     PlaceResult,
     ResolveMode,
     Placement,
@@ -29,6 +30,7 @@ from src.play_placement import (
 )
 from src.musicplayer import (
     RESTORE_WAIT_SECS,
+    _START_WRITE_TIMEOUT,
     InterjectOutcome,
     MusicPlayer,
 )
@@ -2854,6 +2856,48 @@ class TestResolveThenPlace:
         recorded = {c.args[0]: c.args[1] for c in span.set_attribute.call_args_list}
         assert recorded["play.resolve_secs"] >= 0
         assert recorded["play.join_wait_secs"] >= 0
+
+    def test_the_place_bound_outlives_the_start_write_it_waits_behind(self) -> None:
+        """A song start holds the queue mutex for up to _START_WRITE_TIMEOUT against a
+        Redis that accepts and stalls, and every placing request in that guild waits
+        behind it. Equal bounds expire together, so the placer would report a stall at
+        the instant the mutex it wanted was about to free."""
+        assert PLACE_TIMEOUT_SECS > _START_WRITE_TIMEOUT
+
+    async def test_a_place_waiting_out_a_held_lock_lands_rather_than_stalls(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """What that margin buys, at the real bound: a request parked on the lock for
+        as long as a stalled start can hold it still places when the lock frees."""
+        mp = mock_mp()
+        holder = admit(music_bot, mock_ctx, mp)
+        waiter = admit(music_bot, mock_ctx, mp)
+        # Event-driven rather than timed: the assertion is that the waiter did not
+        # give up, and a sleep long enough to prove that would be a slow flake.
+        finish_the_put = asyncio.Event()
+
+        async def _hold() -> None:
+            async with music_bot._plays.place(holder):
+                await finish_the_put.wait()
+
+        held = asyncio.ensure_future(_hold())
+        await asyncio.sleep(0)  # the holder takes the lock first
+
+        async def _wait_and_place() -> PlaceResult:
+            async with music_bot._plays.place(waiter) as result:
+                pass
+            return result
+
+        parked = asyncio.ensure_future(_wait_and_place())
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not parked.done()  # genuinely blocked on the lock
+
+        finish_the_put.set()
+        await held
+        assert (await parked).placed
+        assert waiter.placed
+
 
 
 class TestPlacementRevalidation:

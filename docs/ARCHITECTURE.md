@@ -594,7 +594,9 @@ Returns a `QueueObject`.
 
 `ResolveMode` (`src/play_placement.py`) is how a caller says whether a resolve may stop at search metadata. `resolve_mode_for(placement)` maps `TAIL` and `NEXT` to `FLAT_OK` and `COLD_FRONT` to `FULL`; `_resolve_interjection_source` passes `FULL` explicitly, and `MusicPlayer._resolve_source` takes `yt_source`'s `flat=False` default. The function enumerates `Placement` rather than defaulting, so a member added later cannot inherit `FLAT_OK` in silence — a test asserts the mapping member by member.
 
-**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the 300 s idle timeout. Every other placement has something already playing behind it.
+**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the 300 s idle timeout.
+
+**`FLAT_OK` costs time-to-audio in exactly one case, and that is accepted.** A `TAIL` onto a connected but idle, empty-queue bot has nothing playing behind it, so its flat POST (~0.65 s) is additive on the path to audio rather than hidden behind a song: the card lands ~1.8 s sooner and the music starts ~0.3–0.6 s later. Every other `TAIL` and every `NEXT` is placed behind something already playing, where the stream extraction the prefetch runs finishes long before the slot is reached and flat is free. The idle case is not worth a fourth `Placement` — it is one distinguishable state, readable only by asking the player mid-resolve what it is doing, and the trade it loses is under a second. Do not "fix" it by reverting `TAIL` to `FULL`; that pays 1.8 s on every queued song to save 0.5 s on the empty-queue one.
 
 **It is a parameter rather than an inference, because the input cannot answer it.** Both the command path and interjection resolve through `MusicBot.queue_source`, so "a search may go flat" would have to carry the exception "unless it is an interjection head" — and `--now <words>` is a search by every test the input itself can offer. `interject()` stops the current song, so its head must be playable before anything is stopped.
 
@@ -1049,9 +1051,13 @@ channel off every other request. What that costs is exactness in an estimate —
 sibling placing in between leaves the quoted time one song short, the same ±1
 `enqueue_depth()` already carries against a queue the loop keeps moving.
 
-`PLACE_TIMEOUT_SECS` is 5s because the pool sets no `socket_timeout`, so a Redis
+`PLACE_TIMEOUT_SECS` exists because the pool sets no `socket_timeout`, so a Redis
 that accepts and then stalls has no bound of its own; it is outer to the lock, so a
-request parked behind a stalled sibling gives up on its own clock. The hold is one
+request parked behind a stalled sibling gives up on its own clock. It is 7s rather
+than 5s so that it outlives `_START_WRITE_TIMEOUT`, the 5s a song start may hold the
+queue mutex for against that same stall. Equal bounds expire together, and a placer
+waiting out a stalled start would report a stall of its own at the instant the mutex
+it wanted was about to free. The hold is one
 round trip long, so a guild bursting to `PLAY_INFLIGHT_MAX` serializes that many —
 ~40ms at the 2.4ms p50 the start transaction measures, and past ~300ms a trip the
 sixteenth request spends its whole budget waiting. That is reported as a busy queue,
