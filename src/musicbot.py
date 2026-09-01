@@ -26,10 +26,12 @@ from src.config import (
     using_default_postgres_password,
 )
 from src import debug as debug_mode
+from src.commands import clear as clear_cmd
 from src.commands import leaderboard as leaderboard_cmd
 from src.commands import queue as queue_cmd
 from src.commands import shuffle as shuffle_cmd
 from src.musicplayer import RESTORE_WAIT_SECS
+from src.util import ECHO_ROW_MAX
 from src import analytics_card
 from src.guild_history import history_embeds
 from src.guild_state import Analytics
@@ -188,10 +190,6 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
 # Bound on one echoed needle, which owns a field to itself. Discord renders
 # markdown in field values, so what a user typed goes through safe_label first.
 _ECHO_MAX = 200
-
-# One row of a multi-row field — ten of these share the budget one needle gets.
-_ECHO_ROW_MAX = 70
-
 
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
@@ -860,7 +858,7 @@ class MusicBot(commands.Cog):
                 titles, analytics=analytics, origin=origin
             )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
-            shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
+            shown_titles = queue_message([safe_label(t, ECHO_ROW_MAX) for t in titles])
             await asyncio.gather(
                 send_embed(
                     ctx,
@@ -895,7 +893,7 @@ class MusicBot(commands.Cog):
                 else ""
             )
             shown_titles = queue_message(
-                [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+                [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, 10)]
             )
             await asyncio.gather(
                 send_embed(
@@ -1753,38 +1751,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.clear")
     async def clear(self, ctx: commands.Context) -> None:
         try:
-            mp = self.get_mp(ctx)
-            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
-            # unrestored player deletes a saved queue it cannot see — including the
-            # -playnow tails _flush_played would have recorded. validate_commands
-            # only requires the AUTHOR in voice, so a cold player reaches here.
-            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                await ctx.send(
-                    embed=notice_embed(
-                        "Still loading this server's saved queue — try again in "
-                        "a moment.",
-                        discord.Color.orange(),
-                    )
-                )
-                return
-            cleared = await mp.queue_clear()
-            if not cleared:
-                await ctx.send(
-                    embed=notice_embed(
-                        "The queue is already empty.", discord.Color.orange()
-                    )
-                )
-                return
-            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
-            await asyncio.gather(
-                ctx.message.add_reaction("🗑️"),
-                send_embed(
-                    ctx,
-                    f"Queue cleared — {len(cleared)} {pluralize(len(cleared), 'song')} removed",
-                    description,
-                    discord.Color.red(),
-                ),
-            )
+            await clear_cmd.run(ctx, mp=self.get_mp(ctx))
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1886,7 +1853,7 @@ class MusicBot(commands.Cog):
                         _field(
                             queue_message(
                                 [
-                                    _echo(_removed_label(i), _ECHO_ROW_MAX)
+                                    _echo(_removed_label(i), ECHO_ROW_MAX)
                                     # Sliced before the echo: queue_message keeps 10.
                                     for i in outcome.removed[:10]
                                 ]
