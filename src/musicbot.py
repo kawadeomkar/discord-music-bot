@@ -36,6 +36,7 @@ from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import shuffle as shuffle_cmd
 from src.commands import skip as skip_cmd
+from src.commands import stop as stop_cmd
 from src.commands import volume as volume_cmd
 from src.musicplayer import RESTORE_WAIT_SECS
 from src.util import ECHO_ROW_MAX
@@ -1385,14 +1386,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.stop")
     async def stop(self, ctx: commands.Context) -> None:
         try:
-            # Don't skip before cleanup: skip fires voice_client.stop(), whose
-            # after callback (play_next.set) gives the loop a window to start the
-            # next song before it is cancelled. cleanup() cancels _player first and
-            # disconnect() stops the audio subprocess, so no skip is needed.
-            vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-            if vc is not None and ctx.guild is not None:
-                await ctx.message.add_reaction("👋")
-                await self.cleanup(ctx.guild)
+            await stop_cmd.run(ctx, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
 
