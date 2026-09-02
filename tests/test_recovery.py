@@ -19,7 +19,15 @@ from discord.ext import commands
 from redis.asyncio import Redis
 
 from src.musicbot import MusicBot
-from src.recovery import join_succeeded, restore_guild
+from src.recovery import (
+    _COUNTDOWN_BAR_LEFT,
+    _COUNTDOWN_BAR_WIDTH,
+    _countdown_bar,
+    _countdown_embed,
+    _seconds_left,
+    join_succeeded,
+    restore_guild,
+)
 from src.redis_client import GuildRedisStore
 from tests.helpers import make_mock_task, mocked, stub_create_task
 
@@ -501,7 +509,9 @@ class TestVoiceStateConsistency:
     async def test_human_rejoins_cancels_alone_timer(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """When a human joins the bot's channel while a timer is running, the timer is cancelled."""
+        """The other half of _signal_rejoin: a timer registered without a rejoin
+        event to set is cancelled outright, so the two dicts falling out of step
+        can never leave a countdown running past a rejoin."""
         self._wire_bot_user(music_bot_with_redis)
         music_bot_with_redis.mps[mock_guild.id] = MagicMock()
 
@@ -529,6 +539,44 @@ class TestVoiceStateConsistency:
 
         timer.cancel.assert_called_once()
         assert mock_guild.id not in music_bot_with_redis.voice_watchdog._timers
+
+    async def test_human_rejoins_signals_instead_of_cancelling(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """With a countdown listening, a rejoin SETS its event rather than cancelling
+        it: a cancelled task cannot edit its card to say the bot stayed. The timer
+        stays put — the countdown clears it from the dict itself, on its way out."""
+        self._wire_bot_user(music_bot_with_redis)
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+        watchdog = music_bot_with_redis.voice_watchdog
+
+        timer = make_mock_task()
+        rejoined = asyncio.Event()
+        watchdog._timers[mock_guild.id] = timer
+        watchdog._rejoins[mock_guild.id] = rejoined
+
+        human = MagicMock(spec=discord.Member)
+        human.bot = False
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [human]
+        mock_guild.voice_client = vc
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 123456789
+        member.bot = False
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = None
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = vc.channel
+
+        await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        assert rejoined.is_set()
+        timer.cancel.assert_not_called()
+        assert watchdog._timers[mock_guild.id] is timer
 
     async def test_two_rapid_leaves_produce_one_timer(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
@@ -615,23 +663,208 @@ class TestVoiceStateConsistency:
         assert mock_guild.id not in music_bot_with_redis.voice_watchdog._timers
 
 
-class TestAloneCountdownNotice:
-    async def test_notice_routes_through_send_with_np(
+class TestCountdownRendering:
+    """The pure half of the card: what a frame says, given seconds left."""
+
+    def test_seconds_left_rounds_up(self) -> None:
+        # Up, not down: a frame rendered 0.2s into the last second must still read
+        # 1, or the card sits on zero while the bot is audibly still there.
+        assert _seconds_left(deadline=10.0, now=1.2) == 9
+        assert _seconds_left(deadline=10.0, now=9.99) == 1
+
+    def test_seconds_left_floors_at_zero(self) -> None:
+        assert _seconds_left(deadline=10.0, now=10.0) == 0
+        assert _seconds_left(deadline=10.0, now=42.0) == 0
+
+    def test_frame_quotes_its_own_number(self) -> None:
+        assert "**7 seconds**" in (_countdown_embed(7, 10.0).description or "")
+
+    def test_frame_singularizes_one_second(self) -> None:
+        assert "**1 second**" in (_countdown_embed(1, 10.0).description or "")
+
+    def test_bar_drains(self) -> None:
+        full = _countdown_bar(10.0, 10.0)
+        half = _countdown_bar(5.0, 10.0)
+        empty = _countdown_bar(0.0, 10.0)
+        assert full.count(_COUNTDOWN_BAR_LEFT) == _COUNTDOWN_BAR_WIDTH
+        assert half.count(_COUNTDOWN_BAR_LEFT) == _COUNTDOWN_BAR_WIDTH // 2
+        assert empty.count(_COUNTDOWN_BAR_LEFT) == 0
+        assert len(full) == len(half) == len(empty)
+
+    def test_bar_tolerates_a_zero_window(self) -> None:
+        # ALONE_DISCONNECT_SECS is a module constant tests patch; a zero would
+        # otherwise divide by it.
+        assert _countdown_bar(0.0, 0.0).count(_COUNTDOWN_BAR_LEFT) == 0
+
+
+class TestAloneCountdownCard:
+    """The live card: one plain send, then an edit per tick, then a final frame."""
+
+    @staticmethod
+    def _make_vc(members: list[MagicMock]) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = members
+        return vc
+
+    @staticmethod
+    def _bot_only() -> list[MagicMock]:
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        return [bot_member]
+
+    @staticmethod
+    def _setup_mp(
+        music_bot: MusicBot, mock_guild: MagicMock
+    ) -> tuple[MagicMock, MagicMock]:
+        """A player whose home channel hands back an editable card. (player, card)."""
+        card = MagicMock(spec=discord.Message)
+        card.edit = AsyncMock()
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.send = AsyncMock(return_value=card)
+        mp = MagicMock()
+        mp.home_channel = channel
+        mp.repin_now_playing = AsyncMock()
+        music_bot.mps[mock_guild.id] = mp
+        return mp, card
+
+    @staticmethod
+    def _titles(card: MagicMock) -> list[str]:
+        return [c.kwargs["embed"].title for c in card.edit.await_args_list]
+
+    async def test_card_is_a_plain_send_and_never_the_np_host(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """The countdown notice can fire mid-song — it must go through
-        mp.send_with_np so it can't bury the NP host message."""
-        mp = MagicMock()
-        mp.send_with_np = AsyncMock()
-        music_bot.mps[mock_guild.id] = mp
-        mock_guild.voice_client = None  # post-sleep check: nothing to disconnect
+        """send_with_np would adopt this message as the Now Playing host, and the
+        progress tick rebuilds a host from its cached send-time embeds — which would
+        undo every countdown frame. Same reason -ping and -debug send plainly."""
+        mp, _ = self._setup_mp(music_bot, mock_guild)
+        mock_guild.voice_client = None
 
-        with patch("asyncio.sleep", new=AsyncMock()):
-            await music_bot.voice_watchdog._countdown(mock_guild)
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
 
-        mp.send_with_np.assert_awaited_once()
-        embed = mp.send_with_np.call_args.kwargs["embed"]
-        assert "disconnect" in embed.description
+        mp.home_channel.send.assert_awaited_once()
+        mp.send_with_np.assert_not_called()
+
+    async def test_card_is_edited_repeatedly_while_it_waits(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The point of the feature: the card moves on its own. Only the cadence is
+        asserted here — what a frame SAYS is pinned by TestCountdownRendering, which
+        needs no clock."""
+        _, card = self._setup_mp(music_bot, mock_guild)
+        mock_guild.voice_client = self._make_vc(self._bot_only())
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.3),
+            patch("src.recovery._COUNTDOWN_TICK_SECS", 0.02),
+            patch.object(music_bot, "cleanup", new=AsyncMock()),
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        # Deliberately loose: the tick is real time, and a loaded runner delivers
+        # fewer frames without the behaviour being wrong.
+        assert card.edit.await_count >= 3
+
+    async def test_last_frame_reports_the_disconnect(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        _, card = self._setup_mp(music_bot, mock_guild)
+        mock_guild.voice_client = self._make_vc(self._bot_only())
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0),
+            patch.object(music_bot, "cleanup", new=AsyncMock()),
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        assert self._titles(card)[-1] == "Disconnected from voice channel"
+
+    async def test_last_frame_reports_a_rejoin_and_repins_the_np_block(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A frozen "disconnect in 1 second" would read as a bot that left. The card
+        has to say it stayed — and the Now Playing block it buried goes back to the
+        bottom of the channel."""
+        mp, card = self._setup_mp(music_bot, mock_guild)
+        human = MagicMock(spec=discord.Member)
+        human.bot = False
+        mock_guild.voice_client = self._make_vc([human])
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0),
+            patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup,
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        assert self._titles(card)[-1] == "Someone rejoined"
+        mp.repin_now_playing.assert_awaited_once()
+        mock_cleanup.assert_not_awaited()
+
+    async def test_rejoin_event_ends_the_countdown_early(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The event is what makes the card prompt; the membership re-check is what
+        actually holds the disconnect back."""
+        mp, card = self._setup_mp(music_bot, mock_guild)
+        human = MagicMock(spec=discord.Member)
+        human.bot = False
+        mock_guild.voice_client = self._make_vc([human])
+        rejoined = asyncio.Event()
+
+        with (
+            # Long enough that finishing at all proves the event cut it short.
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 60.0),
+            patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup,
+        ):
+            task = asyncio.create_task(
+                music_bot.voice_watchdog._countdown(mock_guild, rejoined)
+            )
+            await asyncio.sleep(0.02)
+            rejoined.set()
+            async with asyncio.timeout(5):
+                await task
+
+        assert self._titles(card)[-1] == "Someone rejoined"
+        mock_cleanup.assert_not_awaited()
+        mp.repin_now_playing.assert_awaited_once()
+
+    async def test_deleted_card_stops_the_edits_but_not_the_disconnect(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        _, card = self._setup_mp(music_bot, mock_guild)
+        card.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
+        mock_guild.voice_client = self._make_vc(self._bot_only())
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.3),
+            patch("src.recovery._COUNTDOWN_TICK_SECS", 0.02),
+            patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup,
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        assert card.edit.await_count == 1  # the loop stops spending edits on it
+        mock_cleanup.assert_awaited_once_with(mock_guild)
+
+    async def test_failing_edits_do_not_stop_the_disconnect(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Anything but a deleted message keeps the card: a stalled countdown card
+        must not strand the bot in an empty channel."""
+        _, card = self._setup_mp(music_bot, mock_guild)
+        card.edit = AsyncMock(side_effect=discord.HTTPException(MagicMock(), "boom"))
+        mock_guild.voice_client = self._make_vc(self._bot_only())
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.3),
+            patch("src.recovery._COUNTDOWN_TICK_SECS", 0.02),
+            patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup,
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        assert card.edit.await_count > 1
+        mock_cleanup.assert_awaited_once_with(mock_guild)
 
 
 class TestAloneCountdown:
@@ -645,58 +878,71 @@ class TestAloneCountdown:
         text_channel = MagicMock(spec=discord.TextChannel)
         text_channel.send = AsyncMock()
         mp = MagicMock()
-        mp._channel = text_channel
+        mp.home_channel = text_channel
+        mp.repin_now_playing = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
         return text_channel
 
     async def test_calls_cleanup_when_still_alone(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """After the sleep, if no humans remain, cleanup is called."""
+        """Once the clock runs out, if no humans remain, cleanup is called."""
         self._setup_mp(music_bot, mock_guild)
 
         bot_member = MagicMock(spec=discord.Member)
         bot_member.bot = True
         mock_guild.voice_client = self._make_vc([bot_member])
 
-        with patch("asyncio.sleep", new=AsyncMock()):
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
 
         mock_cleanup.assert_awaited_once_with(mock_guild)
 
     async def test_skips_cleanup_when_user_rejoined(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """After the sleep, if a human is present, cleanup is not called."""
+        """Once the clock runs out, if a human is present, cleanup is not called."""
         self._setup_mp(music_bot, mock_guild)
 
         human = MagicMock(spec=discord.Member)
         human.bot = False
         mock_guild.voice_client = self._make_vc([human])
 
-        with patch("asyncio.sleep", new=AsyncMock()):
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
 
         mock_cleanup.assert_not_awaited()
 
-    async def test_cancelled_before_sleep_skips_cleanup(
+    async def test_cancellation_mid_countdown_skips_cleanup(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """CancelledError raised at sleep does not call cleanup."""
+        """Teardown cancels the task; it must not disconnect on the way out."""
         self._setup_mp(music_bot, mock_guild)
 
-        with patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
-            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        mock_guild.voice_client = self._make_vc([bot_member])
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 60.0),
+            patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup,
+        ):
+            task = asyncio.create_task(
+                music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+            )
+            await asyncio.sleep(0.02)
+            task.cancel()
+            async with asyncio.timeout(5):
+                await task
 
         mock_cleanup.assert_not_awaited()
 
     async def test_send_failure_does_not_abort_countdown(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """A failed text_channel.send is swallowed; the countdown still fires cleanup."""
+        """A failed card send is swallowed; the countdown still fires cleanup."""
         text_channel = self._setup_mp(music_bot, mock_guild)
         text_channel.send = AsyncMock(
             side_effect=discord.HTTPException(MagicMock(), "forbidden")
@@ -706,42 +952,120 @@ class TestAloneCountdown:
         bot_member.bot = True
         mock_guild.voice_client = self._make_vc([bot_member])
 
-        with patch("asyncio.sleep", new=AsyncMock()):
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        mock_cleanup.assert_awaited_once_with(mock_guild)
+
+    async def test_no_player_still_disconnects(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """No player means no channel to post a card in — the disconnect is not
+        conditional on the card."""
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        mock_guild.voice_client = self._make_vc([bot_member])
+
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
 
         mock_cleanup.assert_awaited_once_with(mock_guild)
 
     async def test_skips_cleanup_when_voice_client_gone(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """If the voice client is None when the countdown wakes, cleanup is not called."""
+        """If the voice client is None when the countdown ends, cleanup is not called."""
         self._setup_mp(music_bot, mock_guild)
 
-        mock_guild.voice_client = None  # bot already disconnected mid-sleep
+        mock_guild.voice_client = None  # bot already disconnected mid-countdown
 
-        with patch("asyncio.sleep", new=AsyncMock()):
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
 
         mock_cleanup.assert_not_awaited()
 
-    async def test_timer_removed_from_dict_on_completion(
+    async def test_timer_and_event_removed_on_completion(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """The timer entry is removed in the finally block regardless of outcome."""
+        """The finally block clears both dicts regardless of outcome."""
         self._setup_mp(music_bot, mock_guild)
-        music_bot.voice_watchdog._timers[mock_guild.id] = MagicMock()  # sentinel
+        watchdog = music_bot.voice_watchdog
+        rejoined = asyncio.Event()
+        watchdog._rejoins[mock_guild.id] = rejoined
 
         bot_member = MagicMock(spec=discord.Member)
         bot_member.bot = True
         mock_guild.voice_client = self._make_vc([bot_member])
 
-        with patch("asyncio.sleep", new=AsyncMock()):
-            with patch.object(music_bot, "cleanup", new=AsyncMock()):
-                await music_bot.voice_watchdog._countdown(mock_guild)
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0),
+            patch.object(music_bot, "cleanup", new=AsyncMock()),
+        ):
+            task = asyncio.create_task(watchdog._countdown(mock_guild, rejoined))
+            watchdog._timers[mock_guild.id] = task
+            async with asyncio.timeout(5):
+                await task
 
-        assert mock_guild.id not in music_bot.voice_watchdog._timers
+        assert mock_guild.id not in watchdog._timers
+        assert mock_guild.id not in watchdog._rejoins
+
+    async def test_finishing_countdown_leaves_a_replacement_alone(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A restart registers the replacement before the old task processes its
+        cancellation. An unguarded pop in the finally would drop the NEW countdown
+        out of both dicts, leaving it running with no way to stop it — so a rejoin
+        could no longer prevent the disconnect."""
+        self._setup_mp(music_bot, mock_guild)
+        watchdog = music_bot.voice_watchdog
+        mock_guild.voice_client = None  # nothing to disconnect; ends immediately
+
+        with patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0):
+            old = asyncio.create_task(watchdog._countdown(mock_guild, asyncio.Event()))
+            replacement_timer = make_mock_task()
+            replacement_event = asyncio.Event()
+            watchdog._timers[mock_guild.id] = replacement_timer
+            watchdog._rejoins[mock_guild.id] = replacement_event
+            async with asyncio.timeout(5):
+                await old
+
+        assert watchdog._timers[mock_guild.id] is replacement_timer
+        assert watchdog._rejoins[mock_guild.id] is replacement_event
+
+
+class TestAloneCountdownFailsSafe:
+    """The countdown is the only thing that ends an empty voice session, so nothing
+    inside it may raise out or leave the guild silently un-disconnected."""
+
+    async def test_unexpected_error_is_logged_not_raised(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        vc.channel.members = [bot_member]
+        mock_guild.voice_client = vc
+
+        with (
+            patch("src.recovery.ALONE_DISCONNECT_SECS", 0.0),
+            patch.object(
+                music_bot, "cleanup", new=AsyncMock(side_effect=RuntimeError("boom"))
+            ),
+            patch("src.recovery.log") as mock_log,
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, asyncio.Event())
+
+        mock_log.error.assert_called_once()
+
+    async def test_repin_skipped_when_the_player_is_already_gone(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """cleanup() can pop the player between the final frame and the repin."""
+        await music_bot.voice_watchdog._repin_now_playing(mock_guild)  # no raise
 
 
 class TestJoinSucceeded:

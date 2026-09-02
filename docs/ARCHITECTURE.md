@@ -690,7 +690,8 @@ Mechanics:
 - **A `-play` whose song lands at the queue head answers with the block alone.** The block's `next_up` card and the `-play` confirmation share one renderer (`_queue_entry_description`), so for that entry they are the same card — the command re-hosts the live block via `repin_now_playing()` instead of sending a second copy. Dedicated, not a response host: a response host with no own embeds strip-edits to a blank message when it retires.
 - **Retiring the old host**: a *dedicated* NP message (sent by `_send_now_playing` with nothing else) is deleted; a *command-response* host is strip-edited back to its own embeds. All mutations of an old host (progress-tick edits, retires) go through `_np_edit_lock` so a strip/delete is always the final write.
 - **Pointer-first, synchronous adoption** (`_adopt_np_host`): the host pointer swap happens atomically on the event loop before any awaits, so no progress tick can edit a message that is about to be retired.
-- **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
+- **`send_with_np()`**: for bot-initiated messages (loop errors, notices) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live, unless it is a message an edit loop owns.
+- **A message an edit loop owns is never the host**, and there are three: `-ping`, `-debug` and the alone-disconnect countdown card. A host is re-rendered from its *cached* send-time own embeds on every progress tick, so hosting one that another writer keeps rewriting would undo that writer's frames once every `NOW_PLAYING_UPDATE_INTERVAL_SECS`. All three send plainly, carry no block, and leave the current host in place above them until something adopts a new one. The countdown pays that burial back when it ends on the staying path (`repin_now_playing()`); its leaving path retires the host inside `cleanup()` anyway.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
 - Discord's 10-embed cap is checked defensively at attach time (worst case here is 3).
@@ -1573,7 +1574,7 @@ timed something. Adding a segment reaches every embed at once:
 |---|---|
 | `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs; the only seam with elapsed-ms |
 | `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
-| `restore_guild` (recovery.py) | the channels-deleted notice, which has no player to decorate it |
+| `_decorate` (recovery.py) | the channels-deleted notice and the alone-disconnect countdown card — neither has a player to decorate it. The card passes the span captured at its first send and reuses it for every frame, so its footer names one request instead of a new trace per tick |
 | `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so no decoration seam reaches them. Takes `DebugSettings.footer()` — the string form, which omits the environment and the trace because both cards print those themselves |
 
 Rules each seam encodes:
