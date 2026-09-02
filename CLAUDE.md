@@ -245,9 +245,11 @@ just down / restart / logs / ps
 just test-image-rebuild    # required after changing pyproject.toml/poetry.lock
 ```
 
-`DOCKER=1 just check` (prefix must come BEFORE the recipe) runs any of
-fmt/fmt-check/lint/types/test/check inside the test image — no local Python/Poetry/Node
-needed. `src/`, `tests/`, `pyproject.toml` are bind-mounted; formatting runs as your uid.
+fmt/fmt-check/lint/types/test/check run **inside the test image by default** — no local
+Python/Poetry/Node needed. `src/`, `tests/`, `pyproject.toml` are bind-mounted;
+formatting runs as your uid. `DOCKER=0 just check` (prefix must come BEFORE the recipe)
+opts back out to the local venv, which is what CI's lint/test jobs, `build_common.sh`'s
+deploy gate and the pre-push hooks pin so they keep mirroring CI.
 
 Run the bot locally: `./setup_env.sh` (or `just setup`), then
 `docker compose up -d redis` — or, to run with the archive,
