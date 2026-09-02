@@ -12,6 +12,7 @@ import pytest
 from discord.ext import commands
 from opentelemetry import trace
 
+from src import config
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.main import MusicBotApp, MusicContext
@@ -28,7 +29,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
     cog.voice_watchdog = VoiceWatchdog(cog)
@@ -68,7 +69,7 @@ def live_mp(
     mock_bot.get_cog = MagicMock(return_value=music_bot_cog)
     mp = MagicMock()
     mp.current_song = MagicMock()
-    mp._channel = mock_channel  # same channel object the ctx sends to
+    mp.home_channel = mock_channel  # same channel object the ctx sends to
     mp.np_embed_block.return_value = [
         discord.Embed(title="NP"),
         discord.Embed(title="Up next"),
@@ -208,7 +209,7 @@ class TestMusicContextVanillaFallthrough:
         self, mctx: MusicContext, live_mp: MagicMock
     ) -> None:
         other_channel = MagicMock(spec=discord.TextChannel)
-        live_mp._channel = other_channel  # distinct MagicMock → distinct .id
+        live_mp.home_channel = other_channel  # distinct MagicMock → distinct .id
         await self._assert_vanilla(mctx, live_mp)
 
 
@@ -303,7 +304,7 @@ class TestDebugDecoration:
         own.set_footer(text="top 10 · last 30 days")
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)
-        assert (own.footer.text or "").startswith("top 10 · last 30 days · 🐞")
+        assert (own.footer.text or "").startswith("top 10 · last 30 days\n🐞")
 
     async def test_shard_id_is_reported(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
@@ -329,13 +330,32 @@ class TestDebugDecoration:
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
     ) -> None:
         """A send outside any command has no _active_spans entry. It still gets a
-        footer — the shard is knowable — but nothing is fabricated."""
+        footer — the environment and the shard are knowable — but nothing is
+        fabricated."""
         self._enable(music_bot_cog, mocked(mctx.guild).id)
         mocked(mctx.guild).shard_id = 0
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)
-        assert own.footer.text == "🐞 shard 0"
+        assert own.footer.text == f"🐞 {config.ENVIRONMENT} · shard 0"
+
+    async def test_the_environment_leads_the_footer(
+        self,
+        mctx: MusicContext,
+        live_mp: MagicMock,
+        music_bot_cog: MusicBot,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """It says which deployment everything after it describes, so it goes first.
+        Read at send time, never captured: main() infers it from the git branch after
+        this module is imported, so a module-level copy would say `development` on
+        every card in production."""
+        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        own = discord.Embed(title="Queue")
+        with _parent_send(MagicMock(spec=discord.Message)):
+            await mctx.send(embed=own)
+        assert (own.footer.text or "").startswith("🐞 production ·")
 
     async def test_elapsed_is_measured_at_each_send(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
@@ -355,7 +375,7 @@ class TestDebugDecoration:
             await mctx.send(embed=second)
         assert "ms" in (first.footer.text or "")
         elapsed = [
-            int((e.footer.text or "").split(" ms")[0].split("🐞 ")[1])
+            int((e.footer.text or "").split(" ms")[0].split(" ")[-1])
             for e in (first, second)
         ]
         assert 500 <= elapsed[0] <= elapsed[1]

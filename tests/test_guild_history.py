@@ -390,7 +390,7 @@ class TestRecentIsRedisOnly:
 class TestRecentWindowIsTheCap:
     """The arithmetic the Redis-only read path rests on: push_history trims to
     HISTORY_CACHE_LIMIT, get_history reads that whole window, and
-    musicbot.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
+    guild_history.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
     three and -history silently starts losing depth.
     """
 
@@ -410,7 +410,7 @@ class TestRecentWindowIsTheCap:
         # Imported here rather than at module scope: this is the one assertion
         # in this file that reaches into the command layer, and it is asserting
         # a relationship between two constants, not exercising a command.
-        from src.musicbot import HISTORY_MAX_LIMIT
+        from src.commands.history import HISTORY_MAX_LIMIT
 
         assert HISTORY_MAX_LIMIT == HISTORY_CACHE_LIMIT
 

@@ -582,7 +582,7 @@ flowchart LR
 
 ### Playback Loop
 
-`MusicPlayer.loop()` runs as a long-lived asyncio task. It first awaits `bot.wait_until_ready()` and `_restore_complete` (so crash-restore finishes populating the queue before the first dequeue). Each iteration is wrapped in a `player.loop.iteration` span and carries a `claim_outstanding` flag so the exception handler can release a claim no other path settled.
+`MusicPlayer.loop()` runs as a long-lived asyncio task. It first awaits `bot.wait_until_ready()` and `_restore_complete` (so crash-restore finishes populating the queue before the first dequeue). Each iteration is wrapped in a `player.loop.iteration` span — rooted, so a song is a trace — and carries a `claim_outstanding` flag so the exception handler can release a claim no other path settled.
 
 ```mermaid
 flowchart TD
@@ -987,6 +987,8 @@ Configured in `src/telemetry.py`; `setup_telemetry()` is the first call in `main
 Span conventions worth knowing:
 - Every command invocation gets a `command.{name}` span opened in `cog_before_invoke` and closed in `cog_after_invoke` (error path ends it early).
 - `player.loop.iteration` spans deliberately stay open for the full song duration (3–5 min typically) — this is expected, not a leak.
+- A song's span **links** to the extraction that minted its stream URL. `_cache_stream` stamps its own `traceparent` onto the `ytdl:stream:` entry, so the link reaches whichever of the three produced it: the enqueue-time warm (a child of the `-play` that queued the song, so this is also the link back to that command), the one-ahead prefetch in the previous song's trace, or nothing at all when the URL was extracted in band — that work is already in this trace, and a self-link is noise. A LINK, never a parent, for the reason the rooting exists.
+- `player.loop.iteration` is a ROOT span (`context=Context()`), so **one song is one trace**: its resolve, its stream extraction, the prefetch it launches for the next song, and every log line the loop emits while it plays. The loop task inherits the context of whatever created the player — a `-play` or `guild.restore` — so an inherited parent files every song a guild ever plays under that one command, in a trace that never ends. The id is what the Now Playing card and the playback-error notice both print.
 - The alone-countdown span covers only the post-sleep decision so it doesn't sit open for 10 s.
 - Error embeds include a `trace: {trace_id}` footer (`util.trace_footer`) for cross-referencing user reports with Tempo.
 - `shutdown_telemetry()` force-flushes on close, run in an executor because it can block up to 30 s.
@@ -1561,22 +1563,42 @@ request (`debug_footer()`). The trace id is what makes it useful: it is already 
 join key for every log line and span, so pasting one out of Discord finds the exact
 request in Loki/Tempo.
 
-"Every embed" is sent from three places, so three seams apply it:
+"Every embed" is sent from four places, so four seams apply it — all through the one
+`DebugSettings.decorate()`, which owns the enabled check, the strip fallback and the
+shard and runtime figures; `debug_footer` supplies the environment itself. A seam
+passes only what it alone knows: the span to name, and elapsed-ms where a command
+timed something. Adding a segment reaches every embed at once:
 
 | Seam | Covers |
 |---|---|
-| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs |
+| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs; the only seam with elapsed-ms |
 | `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
-| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so neither seam above reaches them |
+| `restore_guild` (recovery.py) | the channels-deleted notice, which has no player to decorate it |
+| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so no decoration seam reaches them. Takes `DebugSettings.footer()` — the string form, which omits the environment and the trace because both cards print those themselves |
 
 Rules each seam encodes:
 
 - **The block decorates at build time, not at the attach site**, so every render —
   command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
   produces one, and the tick refreshes the metrics alongside the bar.
-- **The block carries no trace id.** It re-renders under the command span when a
-  response attaches it and under the playback span on the next tick, so a trace id
-  there would alternate on a single message. One-shot notices do carry theirs.
+- **The environment leads the suffix**, because it says which deployment everything
+  after it describes. `debug_footer` reads `config.ENVIRONMENT` itself rather than
+  taking it as an argument — it is a property of the process, so a caller able to
+  supply it is a caller able to name the wrong one — and reads it late, since `main()`
+  may infer it from the git branch long after the module is imported. The two
+  dashboards suppress it with `skip_environment`, the way they already suppress the
+  trace, because both cards open their own footer with `environment: <name>`.
+- **The block carries the PLAYING SONG's trace id**, captured once into
+  `MusicPlayer._playback_span` when that song starts and read by both block render
+  sites. Read from the ambient span instead it would alternate on a single message —
+  the command's when a response attaches the block, the loop's on the next tick.
+  It advances with the song rather than with the loop iteration, so a resolve that
+  failed leaves the previous song's tail naming its own trace. The song-end finalize
+  captures the span at spawn, beside `song`/`message`/`own_embeds` and for the same
+  reason: it awaits `_np_edit_lock`, which a debounced edit can hold across a PATCH,
+  so a span read at edit time can already name the song that replaced this one.
+  One-shot notices carry the ambient span's id, which is that same trace when the
+  player raised it.
 - **A host's cached own embeds are never re-decorated.** Their elapsed-ms records the
   request that sent them, so a command response that became the host before a toggle
   keeps the footer it was sent with until a new host replaces it.
@@ -1585,9 +1607,25 @@ Rules each seam encodes:
   differs, so a per-tick-varying footer would edit the board until its deadline.
 - **`-debug` gates the runtime segment on `operator`.** That card withholds its
   Runtime block from a non-owner and says so in the same embed.
-- **Decoration replaces rather than appends**, and removes a stale suffix when there
-  is nothing to show. `play_message` is built once per song, decorated in place, and
-  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle.
+- **Decoration replaces rather than appends.** `play_message` is built once per song,
+  decorated in place, and re-sent by `-now`, so it outlives both a re-send and a
+  mid-song toggle. The mark is the boundary it replaces from, wherever in the footer
+  it sits. Every decorated embed gets a suffix — the environment alone is always worth
+  showing — so removing one is `strip_debug_footers`' job, on the debug-off side.
+- **The suffix starts a line of its own** whenever the embed already carries a footer,
+  through `util.join_footer`, so every place that writes one joins identically. Inline it continues
+  that footer, and Discord wraps the run at the card's width — mid-segment, so the two
+  read as one paragraph. The break is written only when there is a base to separate
+  from, comes off with the suffix when a `--disable` strips it, and survives a
+  near-limit footer because the clip falls on the base.
+- **The suffix itself is two lines**: where the request ran (environment, elapsed-ms,
+  shard, and the sampler's cpu/mem/lag), then what it counted (tasks, pool workers,
+  and the trace id). `debug_footer` writes that break for the same reason the one
+  above exists — left to Discord the wrap lands mid-segment, and a 32-hex trace id
+  makes it certain on any card. Only the first line carries the mark, since
+  `_strip_debug_suffix` cuts from there and a second one would strand the counts.
+  A line absent leaves no break behind: a card with no snapshot and no span is one
+  line, and the dashboards' string form is one line plus its counts.
 
 `RuntimeSampler` feeds the runtime segments on the NP tick's cadence
 (`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is

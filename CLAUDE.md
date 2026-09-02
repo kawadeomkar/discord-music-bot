@@ -98,7 +98,7 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    never creates the group, and a mis-shaped key is inert — downgraded to a startup
    warning by the leftover-outbox probe.)
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces eight pairs and one name — it is a dep of `check` and CI also runs it as
+   enforces eight pairs, one name and one list — it is a dep of `check` and CI also runs it as
    its own step, deliberately: Dependabot's `pip` and `pre-commit` ecosystems open
    SEPARATE PRs that each move one half, and those PRs are validated by CI and never
    by a local `check`.
@@ -122,6 +122,10 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    Dockerfile names it twice, so a count lets a typo in either hide behind the other.
    Poetry IGNORES an unknown extra, so drift builds green and ships an image whose
    charts are silently absent. See `docs/ARCHITECTURE.md#the-charts-extra`.
+   The **list** is the pre-push gate: `check`'s dependency list ↔ the five
+   `entry: just <recipe>` pre-push hooks in `.pre-commit-config.yaml`, the same
+   recipes in the same order. Drift runs one way and reports green — a step added to
+   `check` alone simply stops running on push.
    **Four pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
@@ -261,14 +265,22 @@ Compose requires `.env`.
 ```
 src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
-├── musicbot.py       # MusicBot cog — every command, per-guild player registry (mps), crash-recovery entry
+├── musicbot.py       # MusicBot cog — command REGISTRATION and one try/except each;
+│                     # per-guild player registry (mps), the discord.py hooks, crash-recovery entry
 ├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP host, ETA, interject
 ├── guild_queue.py    # GuildQueue — one deque + cursor, the mirror writer, bulk-mutation mutex
-├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres)
+├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres) and its embeds; the command body is commands/history.py
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
-├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), and the alone-in-channel leave watchdog
+├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), the alone-in-channel leave watchdog, and the two cold-start helpers -play and -resume share
+├── commands/         # ONE MODULE PER COMMAND — commands/<command>.py, each exposing
+│                     # run(). The cog holds registration and one try/except; every
+│                     # body is here. _common.py holds the restore guard three of the
+│                     # queue commands share. A command with a domain module (history,
+│                     # leaderboard, debug, ping, analytics) keeps only its entry point
+│                     # here and imports the machinery
+├── play_pipeline.py  # the machinery behind -play/-playnow: resolve, place, interject
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
-│                     # the command itself stays on the cog)
+│                     # the command body is commands/leaderboard.py)
 ├── analytics_card.py # -analytics, everything but the command and the figure. Pure half:
 │                     # --days allowlist, both cache codecs, the embed — every
 │                     # human-authored string renders HERE, never in the image. IO half:
@@ -289,7 +301,7 @@ src/
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
 ├── dashboard.py      # optimistic-send + live-edit driver shared by -ping and -debug
 ├── ping.py           # -ping health dashboard: probes + render (sequencing is dashboard.py)
-├── debug.py          # -debug snapshot + debug-mode toggle parsing; OBSERVATION-ONLY by rule
+├── debug.py          # -debug snapshot machinery and DebugSettings; OBSERVATION-ONLY by rule
 │                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
 ├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus, tunables
@@ -297,7 +309,8 @@ src/
 
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
-tests/                # one test_<module>.py per src module + conftest.py (seams) + helpers.py
+tests/                # one test_<module>.py per src module, commands/ mirroring src/commands/,
+                      # + conftest.py (seams) + helpers.py
                       # test_pg_integration.py / test_redis_integration.py are the opt-in tiers
 justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh compose them
 Dockerfile            # 3 stages: builder (deps) → test (adds test+lint groups) → runtime (ffmpeg, no poetry)
@@ -590,7 +603,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
-| `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
+| `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata, plus a `traceparent` naming the extraction that minted the URL — the only record of where a serving URL came from, and what the playback span links back to |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
@@ -706,7 +719,7 @@ tearing down while any hold is outstanding — every hold is released by an `asy
 raise or not, so it cannot park forever.
 
 **Six** call sites wait on the restore before touching the queue, bounded by
-`RESTORE_WAIT_SECS` (musicbot.py): `-play` (warm and cold), `-resume`, `-shuffle`,
+`RESTORE_WAIT_SECS` (musicplayer.py): `-play` (warm and cold), `-resume`, `-shuffle`,
 `-clear` and `-remove`. The pool sets `socket_connect_timeout` but no `socket_timeout`,
 so a Redis that accepts the connection and then stalls would hang the command outright.
 The two cold-start sites must not **insert** against an unread snapshot — `-play`
@@ -895,7 +908,11 @@ when in a span, and command context (`guild_id`, `user_id`, `command`) bound in
 closes it, `cog_command_error` records onto it). `_DiscordGatewayFilter` drops
 discord.py-internal HTTP spans. Redis and aiohttp are auto-instrumented. Spans embed
 their `trace_id` in error-embed footers (`trace_footer`) so a user report can be joined
-to a trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env-tunable)
+to a trace. **`player.loop.iteration` is a ROOT span**, so one song is one trace — the
+loop task inherits the context that created the player, and an inherited parent files
+every song a guild ever plays under one `-play`. Its id is captured into
+`MusicPlayer._playback_span` at the song's start and printed on the Now Playing card
+and the playback-error notice, which is why both name the same trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env-tunable)
 probing Discord/Redis/Spotify/Postgres/OTEL and reporting bot/yt-dlp/ffmpeg
 versions; `max_concurrency(1, guild)`.
 
@@ -983,10 +1000,16 @@ touch Discord; a caller with no Redis write to make passes an empty body.
 
 ## Testing
 
-- Layout: one `tests/test_<module>.py` per src module (`test_leaderboard.py` also owns
+- Layout: one `tests/test_<module>.py` per src module. A command's tests live with its
+  BODY, and drive it through the cog's wrapper — the wrapper resolves the player and
+  owns the try/except, so a body that raises and a body that reports are different
+  behaviours and only the pair is the command. `tests/commands/test_<command>.py`
+  mirrors `src/commands/`, and needs its `__init__.py`: `tests/` is a package, so a
+  subdirectory without one collides with a same-named file above it.
+  (`test_leaderboard.py` also owns
   the cog command that drives it, since splitting the renderer's tests from the
   command's would make a reader check two files to learn what one board looks like;
-  `test_debug.py` likewise owns `MusicBot._debug_suffix` and the `-debug` card's
+  `test_debug.py` likewise owns `MusicBot.debug_suffix` and the `-debug` card's
   end-to-end assertions, for the same reason — what the footer says and what puts it
   there are one behavior), plus `conftest.py` (shared fixtures/seams),
   `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` is
@@ -1042,13 +1065,17 @@ touch Discord; a caller with no Redis write to make passes an empty body.
 - Run `just check` before pushing (the pre-push hook runs it). It is the contract for
   CI's lint and test jobs but NOT the whole pipeline: `just ci` adds the container job
   and both integration tiers; the runtime-image build and pip-audit run only in CI.
-  `check` is a plain dependency list of six — `fmt-justfile pins fmt-check lint types
-  test` — run in order, so it stops at the first failure. The four cheap ones cost
-  ~1.3s combined, which is what lets the pre-push hook give them a status line each
-  (pre-commit renders one line per hook, runs hooks sequentially, and buffers a hook's
-  output until it exits, so line count is hook count). CI invokes `lint`/`types`/`test`
-  individually rather than calling `check`, so its jobs fail independently of this
-  ordering.
+  `check` is a plain dependency list of five — `fmt-justfile pins fmt-check lint
+  check-heavy` — whose first four run in order and stop at the first failure.
+  `check-heavy` is the exception: it runs `types` and `test` concurrently and reports
+  both outcomes, so a pyright failure no longer hides what pytest would have said.
+  The four cheap ones cost ~1.3s combined, which is what lets the pre-push hook give
+  them a status line each (pre-commit renders one line per hook, runs hooks
+  sequentially, and buffers a hook's output until it exits, so line count is hook
+  count); fusing exactly the two slow ones is what keeps that affordable. The five
+  pre-push hooks mirror those five dependencies in order and `just pins` asserts it.
+  CI invokes `lint`/`types`/`test` individually rather than calling `check`, so its
+  jobs fail independently of this ordering.
 - Warnings are errors (see golden rule 11). `ENVIRONMENT` is read from the environment
   alone at import (default `development`), so collection runs no git subprocess and a
   detached worktree needs nothing set.
@@ -1056,8 +1083,13 @@ touch Discord; a caller with no Redis write to make passes an empty body.
 ## CI/CD and deployment
 
 `ci.yml` jobs: **resolve-env** (environment name + semver-validated version from
-pyproject — single source for image and release tags) → **lint** (justfile fmt/parse,
-pin agreement, ruff, pyright) and **test** (coverage + PR comment) and **container-test**
+pyproject — single source for image and release tags) → **version-bump** (pull
+requests only: that version must be strictly above the base branch TIP's, compared as
+major.minor.patch, so every merge moves it. Nothing else enforces the per-PR bump —
+`release` treats an unchanged version as the ordinary no-op. It is deliberately absent
+from `build`'s `needs`: a job `if`-skipped on push would skip `build` with it, and it
+blocks a merge only once branch protection lists it as required) → **lint**
+(justfile fmt/parse, pin agreement, ruff, pyright) and **test** (coverage + PR comment) and **container-test**
 (suite inside the test image; deliberately runs with a read-only token — it executes PR
 code) and **pg-integration** (the `pg` tier against a postgres service container) and
 **redis-integration** (the `redis` tier against a redis service container) — both real
@@ -1101,7 +1133,7 @@ duplicated.
 | `POSTGRES_STATEMENT_CACHE` | `100` | asyncpg `statement_cache_size`; set `0` behind a statement-rewriting pooler |
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
 | `ENVIRONMENT` | `development` | `main()` infers `production`/the branch slug from git when unset and a repo is present; set explicitly in CI/Docker |
-| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every embed the bot sends with a trace/timing/runtime footer. Three seams apply it, because "every embed" is sent from three places: `MusicContext.send` (command responses), `MusicPlayer._decorate_for_debug` (the NP block at every render site — refreshed on each progress tick — plus the player's own notices), and a pre-rendered `debug_suffix` threaded into the two live dashboards. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
+| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every embed the bot sends with a trace/timing/runtime footer. Four seams apply it, because "every embed" is sent from four places: `MusicContext.send` (command responses), `MusicPlayer._decorate_for_debug` (the NP block at every render site — refreshed on each progress tick — plus the player's own notices), `restore_guild` (the channels-deleted notice, which has no player), and a pre-rendered `debug_suffix` threaded into the two live dashboards. Every seam routes through `DebugSettings.decorate()`, which owns the enabled check, the strip fallback, the shard and the sampler's runtime figures; the environment leading the suffix is read by `debug_footer` itself, since it is a property of the process rather than of the request. A seam passes only the span it names and, for command responses, elapsed-ms. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
 | `DEBUG_PROMETHEUS_URL` | — | Prometheus query API `-debug` reads the **postgres container's** CPU/memory from (the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL). Compose sets `http://localhost:9090`; the series come from the `otelcol-metrics` `docker_stats` receiver, selected by `container_name="discord-postgres"`. **That collector is behind the `metrics` compose profile**, so on a default `up` it does not run and the cpu/mem rows render `n/a (no metrics source)` even though the URL is set and Prometheus answers — set `COMPOSE_PROFILES=metrics` (or `docker compose --profile metrics up -d`) as well. Unset URL → the same `n/a`. Only those two rows depend on it: the block's load/throughput/mem-signal rows are native SQL over the archive's own pool and render regardless. The container name is a hand-checked cross-file pin (see golden rule 6) |
 | `PROMETHEUS_HOST_PORT` | `9090` | host-side published port for the metrics stack's Prometheus, loopback-bound. Also the port `DEBUG_PROMETHEUS_URL` defaults to — the two are written separately in compose (golden rule 6c) |
 | `GIT_SHA` | — | the deploy tag, baked into the runtime image as an `ENV` (and a label). The ENV is the one the process can read, which is what lets `-debug` report the commit it is running; outside a container `-debug` shells out to `git rev-parse` instead |
@@ -1131,7 +1163,7 @@ duplicated.
 | musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but nothing WRITES it: `set_timezone` has no caller in `src/` and the `-options` command it was built for does not exist, so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a write path, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
-| musicbot.py `jump` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
+| commands/jump.py `run` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
 | guild_state.py `from_crashed_state` | FIXME | A crash-recovered song is a resume in everything but the flag. A song that WAS a `-playnow` tail now round-trips `is_resume` correctly (`from_song` carries it), but a song merely interrupted mid-play comes back with `ts` set and `is_resume` false, so it announces "Starting song at N seconds" rather than resuming. Synthesizing the flag from `ts > 0` would also move the queue display and the `-playnow` wording, so it wants its own change |
 
 ## Recipes for common changes
@@ -1139,9 +1171,22 @@ duplicated.
 **Add a command**: method on `MusicBot` with `@commands.command(name=..., aliases=...,
 brief=..., usage=..., help=..., extras={"category": ..., "examples": [...], "note": ...})`;
 add `@commands.before_invoke(validate_commands)` if it needs the author in voice; open a
-span with `@_tracer.start_as_current_span("bot.<name>")`; body in try/except →
-`_command_error`; every reply an embed; list it in help.py's `CATEGORY_COMMANDS`; tests
-in tests/test_musicbot.py.
+span with `@_tracer.start_as_current_span("bot.<name>")`; every reply an embed; list it
+in help.py's `CATEGORY_COMMANDS`; tests in tests/test_musicbot.py.
+
+**The body belongs in the command's own module, not on the cog.** The cog keeps only
+what discord.py owns — registration, converters, checks, cooldowns — and one
+`try: await <module>.run(...) except Exception as e: await self._command_error(...)`.
+`run()` takes `ctx`, the flags, and whatever the cog RESOLVES for it (`redis`,
+`archive`, a `MusicPlayer` from `get_mp`), so the module never reaches back into
+`MusicBot` and has no import edge to musicbot.py — or the COG itself, under a
+`TYPE_CHECKING` guard, for the two things only it can do: reach the player registry,
+and run another command through discord.py. **`run()` must not swallow**: the
+`except` has to be the caller's, because `_command_error` logs with `exc_info=True`
+and that only captures the live traceback from inside the handler. **Every command is
+on this pattern**; musicbot.py holds no command logic at all. musicbot.py imports each
+module as `<command>_cmd` — the bare name would be the module inside the like-named
+cog method, which reads as the method and is not.
 
 **Add a persisted per-guild state field**: constant in `StateField` → field with default
 on `GuildStateData` + `from_redis` → the write-path method on `GuildRedisStore` (or

@@ -4,7 +4,10 @@ Two halves of one question — when does the bot join a voice channel, and when
 does it leave one. restore_guild() is the join side (crash recovery, documented
 in docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the
 10s alone-disconnect countdown). on_voice_state_update's bot-was-ejected arm is
-the third case and routes straight to cog.cleanup().
+the third case and routes straight to cog.cleanup(). The two cold-start helpers at
+the bottom are the fourth: what -play and -resume do about a join that did not
+produce a usable voice client. They live here rather than with either command
+because BOTH read them, and the two checks must never diverge.
 
 Both take the MusicBot cog as an explicit parameter, the way MusicPlayer does.
 
@@ -12,13 +15,14 @@ Do not rename the `guild.restore` span — Tempo queries match on it.
 """
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Optional
 
 import discord
+from discord.ext import commands
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
-from src import debug as debug_mode
 from src.musicplayer import MusicPlayer
 from src.redis_client import GuildRedisStore
 from src.telemetry import get_tracer
@@ -109,13 +113,9 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
                     discord.Color.orange(),
                 )
                 # No player exists on this path, so the cog decorates directly.
-                if cog.debug_settings.enabled(guild.id):
-                    debug_mode.decorate_embeds(
-                        [notice],
-                        span=trace.get_current_span(),
-                        shard_id=guild.shard_id,
-                        runtime=cog.debug_settings.snapshot,
-                    )
+                cog.debug_settings.decorate(
+                    [notice], guild, span=trace.get_current_span()
+                )
                 try:
                     await notify_channel.send(embed=notice)
                 except Exception as notify_err:
@@ -310,3 +310,43 @@ class VoiceWatchdog:
             log.error(f"alone countdown error in guild {guild.id}: {e}", exc_info=True)
         finally:
             self._timers.pop(guild.id, None)
+
+
+def join_succeeded(ctx: commands.Context) -> bool:
+    """Did the join a cold-start command just ran leave a USABLE voice client?
+
+    is_connected(), not just the type: discord.py registers the client on the guild
+    BEFORE the handshake completes, and vc.play() on a still-connecting one raises
+    once per restored song. join also swallows its own failures, so a failed one
+    arrives here as an absent client rather than an exception. Shared by -play and
+    -resume — the two checks must never diverge, since a type-only check is exactly
+    the bug this guards.
+    """
+    vc = ctx.voice_client
+    return isinstance(vc, discord.VoiceClient) and vc.is_connected()
+
+
+async def abandon_cold_start(
+    cog: MusicBot, ctx: commands.Context, mp: MusicPlayer
+) -> None:
+    """Drop the player a cold-start command (`-play`, `-resume`) was about to
+    hand a voice connection to.
+
+    defer_playback opens the gate as it unwinds whether or not the join worked,
+    and a loop waking with no voice client fails its `vc` assertion once per
+    restored song — draining the in-memory queue while Redis keeps every entry.
+    Tearing down first makes that gate-open land on a cancelled loop, which is inert.
+
+    The re-park FOLLOWS cleanup(): dropping the player is what loses a
+    crash-recovered head, and clear_connection() HDELs the fields it writes.
+
+    Skipped entirely while another command holds the gate — it is mid-join on this
+    same player and owns the teardown call.
+    """
+    if mp.playback_holds > 1:  # this command's own hold, plus someone else's
+        return
+    if ctx.guild is not None:
+        with contextlib.suppress(Exception):
+            await cog.cleanup(ctx.guild)
+    with contextlib.suppress(Exception):
+        await mp.repark_crashed_head()

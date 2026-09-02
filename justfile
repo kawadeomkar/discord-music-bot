@@ -427,6 +427,31 @@ pins:
         fi
     done
 
+    # `check`'s dependency list and the pre-push hooks are the same five recipes in the
+    # same order, written twice. Drift is silent and runs one way: a step added to
+    # `check` alone stops running on push while the gate still reports green.
+    check_deps="$(sed -n 's/^check: //p' justfile)"
+    hook_deps="$(awk '
+        function flush() {
+            if (entry ~ /^just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
+                sub(/^just /, "", entry)
+                out = out (out == "" ? "" : " ") entry
+            }
+            entry = ""; stages = ""
+        }
+        /^ *- id:/ { flush(); next }
+        /^ *entry:/ { entry = $0; sub(/^ *entry: */, "", entry); next }
+        /^ *stages:/ { stages = $0; next }
+        END { flush(); print out }
+    ' .pre-commit-config.yaml)"
+    if [ -z "$check_deps" ] || [ "$check_deps" != "$hook_deps" ]; then
+        echo "pre-push gate drift: the hooks do not mirror \`check\`'s dependencies" >&2
+        echo "  justfile  check: [$check_deps]" >&2
+        echo "  pre-push hooks: [$hook_deps]" >&2
+        echo "  A step named in only one of them runs in only one of them." >&2
+        fail=1
+    fi
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing
@@ -442,10 +467,99 @@ pins:
 # imports. Dropping it was intentional, not an oversight; this note exists because
 # the diff that dropped it did not say so.
 #
+# The two slow checks, and the only pair worth overlapping: pyright runs inside
+# pytest's wall clock. Fusing exactly these leaves the other four as separately named
+# pre-push hooks — pre-commit renders one status line per hook and runs hooks
+# sequentially, so every extra line costs the concurrency it breaks.
+HEAVY := "types test"
+
+# Run pyright and pytest concurrently, reporting both outcomes
+#
+# No fail-fast: both tasks always run and both are always reported, so one red check
+# never hides what the other would have said.
+#
+# Each task's output is captured and replayed grouped. Sharing one stdout interleaves
+# them, landing a concurrent tool's diagnostics inside pytest's progress output. Only
+# the status lines go out live, one printf each so they stay line-atomic.
+#
+# The `_tools` guards are sequential dependencies so they resolve before the fan-out.
+# Child `just` processes cannot de-duplicate them, and under DOCKER=1 that leaves two
+# children racing `test-image-rebuild` on the same tag.
+[doc('Run pyright and pytest concurrently, reporting both outcomes')]
+[group('check')]
+check-heavy: (_tools 'pyright') (_tools 'pytest')
+    #!/usr/bin/env bash
+    # No `-e`: a failing task must not abort the recipe before the rest are reaped.
+    set -uo pipefail
+
+    JUST=({{ quote(just_executable()) }} --justfile {{ quote(justfile()) }})
+    read -ra names <<< "{{ HEAVY }}"
+
+    # A terminal gets the status lines live and a recap after the diagnostics. Under
+    # pre-commit stdout is a pipe replayed whole when the hook exits, so the streamed
+    # lines are already the recap. tty gates the colour for the same reason.
+    if [ -t 1 ]; then tty=1; else tty=0; fi
+    if [ "$tty" = 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        red=$'\033[31m'; green=$'\033[32m'; bold=$'\033[1m'; off=$'\033[0m'
+    else
+        red=''; green=''; bold=''; off=''
+    fi
+
+    log_dir="$(mktemp -d)"
+    trap 'rm -rf "$log_dir"' EXIT
+
+    # Flush left: pre-commit prints a hook's captured output as out.strip(), which eats
+    # the leading whitespace of the first line only, shifting it out of line with the rest.
+    status_line() {  # name rc secs
+        if [ "$2" = 0 ]; then
+            printf '%s✓%s %-14s %4ss\n' "$green" "$off" "$1" "$3"
+        else
+            printf '%s✗%s %-14s %4ss  (exit %s)\n' "$red" "$off" "$1" "$3" "$2"
+        fi
+    }
+
+    for n in "${names[@]}"; do
+        {
+            start=$SECONDS
+            "${JUST[@]}" "$n" > "$log_dir/$n.out" 2>&1
+            rc=$?
+            secs=$((SECONDS - start))
+            printf '%s\n' "$rc" > "$log_dir/$n.rc"
+            printf '%s\n' "$secs" > "$log_dir/$n.t"
+            status_line "$n" "$rc" "$secs"
+        } &
+    done
+    wait
+
+    # Failing output, grouped and in HEAVY order rather than completion order, so a
+    # given failure lands in the same place regardless of how the run interleaved.
+    fail=0
+    for n in "${names[@]}"; do
+        rc="$(cat "$log_dir/$n.rc")"
+        [ "$rc" = 0 ] && continue
+        fail=1
+        printf '\n%s%s── %s failed (exit %s) %s%s\n' "$bold" "$red" "$n" "$rc" "──" "$off"
+        cat "$log_dir/$n.out"
+    done
+
+    # Recap only on a failing terminal run: the live lines have scrolled past the
+    # diagnostics by then. Off a terminal they are still directly above.
+    if [ "$fail" != 0 ] && [ "$tty" = 1 ]; then
+        printf '\n'
+        for n in "${names[@]}"; do
+            status_line "$n" "$(cat "$log_dir/$n.rc")" "$(cat "$log_dir/$n.t")"
+        done
+    fi
+    exit "$fail"
+
+# A plain dependency list: the one definition of the gate, readable by `just --dump
+# --dump-format json`, and named hook-for-hook by the pre-push config. `check-heavy` is
+# the only entry hiding recipes, and `just --list` still shows them.
+#
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc("What CI's lint and test jobs run — run this before pushing")]
 [group('check')]
-check: fmt-justfile pins fmt-check lint types test
+check: fmt-justfile pins fmt-check lint check-heavy
 
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
