@@ -427,6 +427,31 @@ pins:
         fi
     done
 
+    # `check`'s dependency list and the pre-push hooks are the same five recipes in the
+    # same order, written twice. Drift is silent and runs one way: a step added to
+    # `check` alone stops running on push while the gate still reports green.
+    check_deps="$(sed -n 's/^check: //p' justfile)"
+    hook_deps="$(awk '
+        function flush() {
+            if (entry ~ /^just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
+                sub(/^just /, "", entry)
+                out = out (out == "" ? "" : " ") entry
+            }
+            entry = ""; stages = ""
+        }
+        /^ *- id:/ { flush(); next }
+        /^ *entry:/ { entry = $0; sub(/^ *entry: */, "", entry); next }
+        /^ *stages:/ { stages = $0; next }
+        END { flush(); print out }
+    ' .pre-commit-config.yaml)"
+    if [ -z "$check_deps" ] || [ "$check_deps" != "$hook_deps" ]; then
+        echo "pre-push gate drift: the hooks do not mirror \`check\`'s dependencies" >&2
+        echo "  justfile  check: [$check_deps]" >&2
+        echo "  pre-push hooks: [$hook_deps]" >&2
+        echo "  A step named in only one of them runs in only one of them." >&2
+        fail=1
+    fi
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing
