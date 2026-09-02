@@ -442,38 +442,25 @@ pins:
 # imports. Dropping it was intentional, not an oversight; this note exists because
 # the diff that dropped it did not say so.
 #
-# The only two checks worth overlapping, and the pair is chosen from measurement, not
-# symmetry: pyright's ~8s fits entirely inside pytest's ~26s, while the other four cost
-# ~1.3s COMBINED. Fusing exactly these two — rather than parallelising all six — is what
-# lets the pre-push hook name the other four separately. pre-commit renders one status
-# line per HOOK and runs hooks strictly sequentially, so each extra line costs whatever
-# concurrency it breaks; at ~1.3s the fast four are worth far more as four named lines
-# than as overlap. Splitting this pair too would buy a sixth line for ~8s, which is not.
-#
-# Sequential total ~36s; this arrangement ~27s, which is pytest's solo time plus the
-# fast four. pytest is the floor — nothing here beats it without xdist.
+# The two slow checks, and the only pair worth overlapping: pyright runs inside
+# pytest's wall clock. Fusing exactly these leaves the other four as separately named
+# pre-push hooks — pre-commit renders one status line per hook and runs hooks
+# sequentially, so every extra line costs the concurrency it breaks.
 HEAVY := "types test"
 
-# Run pyright and pytest concurrently (~26s), reporting BOTH outcomes
+# Run pyright and pytest concurrently, reporting both outcomes
 #
-# Deliberately WITHOUT fail-fast, reversing what the sequential form did: a pyright
-# failure used to hide whatever pytest would have said, so a fix-push cycle discovered
-# the failures one at a time. Both always run, both are always reported, and the cost is
-# that a pyright failure at 8s still waits out pytest.
+# No fail-fast: both tasks always run and both are always reported, so one red check
+# never hides what the other would have said.
 #
-# Not `[parallel]`, which would express this and was tried first. It shares one stdout
-# across the dependencies, and pytest writes progress continuously for 26s, so a
-# concurrent tool's diagnostics land INSIDE them — an observed run spliced a pyright
-# error between two of pytest's dots, where nobody would ever read it. Each task's
-# output is captured and replayed grouped for that reason. The status lines are the only
-# thing written live, one printf each so they stay line-atomic.
+# Each task's output is captured and replayed grouped. Sharing one stdout interleaves
+# them, landing a concurrent tool's diagnostics inside pytest's progress output. Only
+# the status lines go out live, one printf each so they stay line-atomic.
 #
-# The `_tools` guards are ordinary sequential dependencies so they resolve BEFORE the
-# fan-out. Under `[parallel]` just de-duplicates them by (recipe, arguments) and they run
-# once; a fan-out into child `just` processes cannot, and under DOCKER=1 that means two
-# children racing `test-image-rebuild` on the same tag. Resolving them up front leaves
-# the children with a warm image and nothing to build.
-[doc('Run pyright and pytest concurrently (~26s), reporting BOTH outcomes')]
+# The `_tools` guards are sequential dependencies so they resolve before the fan-out.
+# Child `just` processes cannot de-duplicate them, and under DOCKER=1 that leaves two
+# children racing `test-image-rebuild` on the same tag.
+[doc('Run pyright and pytest concurrently, reporting both outcomes')]
 [group('check')]
 check-heavy: (_tools 'pyright') (_tools 'pytest')
     #!/usr/bin/env bash
@@ -484,10 +471,8 @@ check-heavy: (_tools 'pyright') (_tools 'pytest')
     read -ra names <<< "{{ HEAVY }}"
 
     # A terminal gets the status lines live and a recap after the diagnostics. Under
-    # pre-commit stdout is a pipe whose whole contents are replayed at once when the
-    # hook exits, so "live" means nothing and the two would simply print the same six
-    # lines twice; there, the streamed lines ARE the recap. tty also gates the colour,
-    # since a recap full of literal \033[32m is worse than an uncoloured one.
+    # pre-commit stdout is a pipe replayed whole when the hook exits, so the streamed
+    # lines are already the recap. tty gates the colour for the same reason.
     if [ -t 1 ]; then tty=1; else tty=0; fi
     if [ "$tty" = 1 ] && [ -z "${NO_COLOR:-}" ]; then
         red=$'\033[31m'; green=$'\033[32m'; bold=$'\033[1m'; off=$'\033[0m'
@@ -498,10 +483,8 @@ check-heavy: (_tools 'pyright') (_tools 'pytest')
     log_dir="$(mktemp -d)"
     trap 'rm -rf "$log_dir"' EXIT
 
-    # Flush left, no indent, and that is not a style choice: pre-commit prints a hook's
-    # captured output as out.strip(), which eats the leading whitespace of the FIRST
-    # line only — an indented recap arrived with its first row shifted two columns out
-    # of line with the other five.
+    # Flush left: pre-commit prints a hook's captured output as out.strip(), which eats
+    # the leading whitespace of the first line only, shifting it out of line with the rest.
     status_line() {  # name rc secs
         if [ "$2" = 0 ]; then
             printf '%s✓%s %-14s %4ss\n' "$green" "$off" "$1" "$3"
@@ -524,7 +507,7 @@ check-heavy: (_tools 'pyright') (_tools 'pytest')
     wait
 
     # Failing output, grouped and in HEAVY order rather than completion order, so a
-    # given failure is always in the same place regardless of how the run interleaved.
+    # given failure lands in the same place regardless of how the run interleaved.
     fail=0
     for n in "${names[@]}"; do
         rc="$(cat "$log_dir/$n.rc")"
@@ -535,8 +518,7 @@ check-heavy: (_tools 'pyright') (_tools 'pytest')
     done
 
     # Recap only on a failing terminal run: the live lines have scrolled past the
-    # diagnostics by now. On a green run they already said everything this would, and
-    # off a terminal they are still on screen directly above.
+    # diagnostics by then. Off a terminal they are still directly above.
     if [ "$fail" != 0 ] && [ "$tty" = 1 ]; then
         printf '\n'
         for n in "${names[@]}"; do
@@ -545,13 +527,9 @@ check-heavy: (_tools 'pyright') (_tools 'pytest')
     fi
     exit "$fail"
 
-# Still a plain dependency list, and that is worth protecting: it is the one place the
-# gate is defined, `just --dump --dump-format json` can read it, and the pre-push hook
-# names these same five so a reader can diff the two by eye. Only `check-heavy` hides
-# anything, and it hides exactly two recipes that `just --list` still shows.
-#
-# The fast four run sequentially ahead of the pair on purpose — see HEAVY above. They
-# cost ~1.3s together, which is the price of four separately-named pre-push status lines.
+# A plain dependency list: the one definition of the gate, readable by `just --dump
+# --dump-format json`, and named hook-for-hook by the pre-push config. `check-heavy` is
+# the only entry hiding recipes, and `just --list` still shows them.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc("What CI's lint and test jobs run — run this before pushing")]
