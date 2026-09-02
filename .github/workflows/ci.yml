@@ -149,6 +149,12 @@ jobs:
   lint:
     name: Lint & Type Check
     runs-on: ubuntu-latest
+    env:
+      # This job is the NATIVE mirror — setup-python-env below installs Python and the
+      # steps run against .venv — so pin DOCKER=0 explicitly rather than inheriting the
+      # justfile's default. Under DOCKER=1 every `just lint`/`just types` step would
+      # build and run the test image, duplicating the container-test job.
+      DOCKER: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -218,6 +224,11 @@ jobs:
     needs: resolve-env
     env:
       ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
+      # See the lint job: pin the checks native. Doubly required here — under DOCKER=1
+      # `just test-report` writes pytest.xml/coverage.xml inside the container at /app
+      # (not mounted), so the coverage-comment step below would find no junitxml or
+      # coverage on the host and silently report nothing.
+      DOCKER: "0"
     permissions:
       contents: write
       pull-requests: write

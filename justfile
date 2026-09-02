@@ -430,11 +430,15 @@ pins:
     # `check`'s dependency list and the pre-push hooks are the same five recipes in the
     # same order, written twice. Drift is silent and runs one way: a step added to
     # `check` alone stops running on push while the gate still reports green.
+    #
+    # The optional `env DOCKER=0 ` prefix is the hooks' native pin. Matched rather than
+    # ignored: an entry that misspells it is a hook running in a container the gate did
+    # not ask for, so it must fail here.
     check_deps="$(sed -n 's/^check: //p' justfile)"
     hook_deps="$(awk '
         function flush() {
-            if (entry ~ /^just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
-                sub(/^just /, "", entry)
+            if (entry ~ /^(env DOCKER=0 )?just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
+                sub(/^(env DOCKER=0 )?just /, "", entry)
                 out = out (out == "" ? "" : " ") entry
             }
             entry = ""; stages = ""
