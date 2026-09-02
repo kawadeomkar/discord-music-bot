@@ -19,7 +19,7 @@ from opentelemetry.trace import StatusCode
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import fmt_duration, get_logger
+from src.util import current_traceparent, fmt_duration, get_logger
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -139,9 +139,14 @@ class YTDLVideoMetadata(TypedDict, total=False):
 class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
     """A single video's fields, once yt_source() has unwrapped "entries". Only
     url/webpage_url are guaranteed — any other field may be absent per
-    extractor/client. Mirrors _STREAM_CACHE_FIELDS field-for-field; required keys go in
-    _YTDLVideoInfoRequired, descriptive ones in YTDLVideoMetadata.
+    extractor/client. Mirrors _STREAM_CACHE_FIELDS field-for-field, plus the one key
+    below that no extraction produces; required keys go in _YTDLVideoInfoRequired,
+    descriptive ones in YTDLVideoMetadata.
     """
+
+    # Stamped by _cache_stream, never by yt-dlp: the trace of the extraction that
+    # minted this URL. Absent on a fresh extraction.
+    traceparent: str
 
 
 class YTDLEntry(YTDLVideoMetadata, total=False):
@@ -627,7 +632,13 @@ async def _cache_stream(
     own — used for a URL that could not be confirmed."""
     # Absent keys are dropped, not written as None: `{"title": None}` would contradict
     # YTDLVideoInfo, which types title as str and treats absent fields as *missing*.
-    stripped = {k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None}
+    stripped: dict[str, Any] = {
+        k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None
+    }
+    # The span here is the extraction that minted the URL; the song that plays it
+    # links back. See docs/ARCHITECTURE.md#observability.
+    if traceparent := current_traceparent():
+        stripped["traceparent"] = traceparent
     ttl = _stream_url_ttl(data.get("url", ""))
     if ttl:
         if max_ttl is not None:
