@@ -23,8 +23,10 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   song plays, and caches them in Redis
 - **Live Now Playing card** — an embed with a live-updating progress bar that stays
   pinned to the bottom of the channel, re-attaching itself beneath every bot response
-- **`-playnow` interjection** — interrupt the current song with another one; the
+- **`-play --now` interjection** — interrupt the current song with another one; the
   interrupted song resumes afterward from the exact position it left off
+- **`-play --next` queue jump** — put a song (or a whole playlist) at the front of the
+  queue without interrupting what is playing
 - **Crash recovery** — queue, current song (with playback position), volume, and
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
@@ -55,8 +57,7 @@ details, aliases, and examples.
 
 | Command | Aliases | Description |
 |---|---|---|
-| `-play <url\|search>` | `p`, `sing` | Queue a song and start playing |
-| `-playnow <url\|search>` | `pn` | Play immediately; the interrupted song resumes after |
+| `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything |
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
@@ -469,6 +470,8 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `ENVIRONMENT` | | `development`; inferred from the git branch (`main` → `production`) when unset and a repo is present | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
+| `PLAY_INFLIGHT_MAX` | | `16` | Per-server ceiling on `-play` requests admitted at once; past it a request is declined. One admitted request is one coroutine, one open span and one typing keepalive, so this bounds memory — pool time is `PLAY_RESOLVE_CONCURRENCY` below. Floored at 1 |
+| `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
@@ -482,6 +485,55 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.29.0 and 2.30.0
+
+**`-playnow` and its `pn` alias are gone.** They are replaced by a flag on `-play`:
+
+```
+-p --now never gonna give you up
+```
+
+The behaviour is unchanged — the interrupted song still returns from the exact position
+it left off at, and interjections still stack. Only the spelling moved, and the flag must
+be the **first** word so a `--now` inside a search term stays part of the search.
+
+`-pn` now answers with nothing, the way any unknown command does. Two things changed
+alongside it:
+
+- An interjection is no longer exempt from the "bot is already being used in channel X"
+  rule. Queueing into a session running elsewhere still works; **stopping** what that
+  channel is hearing now requires being in it.
+- `-play` requests sent while another is still being looked up are looked up alongside
+  it and land as each one is ready, so a `--now` sent behind a long playlist interrupts as
+  soon as its own song resolves. `-clear`, `-stop` and `-remove` drop requests still being
+  looked up and say so. Two ceilings apply, and they bound different things: a server may
+  have 16 requests waiting at once (`PLAY_INFLIGHT_MAX`) and past that one is declined,
+  while only 2 of them hold a yt-dlp worker (`PLAY_RESOLVE_CONCURRENCY`) — the rest wait
+  their turn rather than being refused, so one server's paste burst cannot delay the
+  extractions another server's playback is waiting on.
+
+**`-play` takes a `--next` flag**, which queues a song at the front without
+interrupting what is playing:
+
+```
+-p --next never gonna give you up
+```
+
+Like `--now`, it must be the **first** word, and it is subject to the "bot is already
+being used in channel X" rule — cutting to the front of a queue is queue control, the
+same as `-skip` or `-shuffle`.
+
+**A playlist is no longer collapsed to its first track.** `-p --now <playlist>` used to
+play track 1 and discard the rest; it now plays track 1 immediately and queues the whole
+playlist behind it. The song it interrupted therefore does not return until the last
+track — on a long playlist, in practice, never. If that was not what you wanted,
+`-remove <the same link>` takes the queued tracks back out in one command; the one already
+playing is not queued any more, so it needs `-skip`.
+
+The same is true of plain `-play <playlist>` while a song is **paused** — that has always
+interrupted the paused song, and now brings the whole playlist with it rather than one
+track.
 
 ## Upgrading to 2.5.0
 
@@ -890,7 +942,7 @@ src/
 ├── main.py            # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool
 ├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
 ├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
-├── guild_queue.py     # GuildQueue — owns the three queue representations
+├── guild_queue.py     # GuildQueue — one deque + a cursor, and the Redis mirror
 ├── guild_history.py   # GuildHistory — play history: capped Redis list + cache
 ├── guild_state.py     # Redis schema: frozen value objects + field constants
 ├── redis_client.py    # connection pool, GuildRedisStore, cache helpers

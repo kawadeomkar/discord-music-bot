@@ -6,8 +6,8 @@ player down when that join produces no usable client.
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Union
-from collections.abc import AsyncGenerator
+import time
+from typing import TYPE_CHECKING, Optional, Union
 
 import discord
 from discord.ext import commands
@@ -19,14 +19,19 @@ from src.musicplayer import MusicPlayer
 from src.play_placement import (
     NEXT_FLAG,
     NOW_FLAG,
+    PlaceStalled,
     Placement,
     PlayArgs,
     PlayMode,
+    PlayRequest,
     split_play_args,
 )
-from src.musicplayer import DEPTH_RESTORE_WAIT_SECS, RESTORE_WAIT_SECS
+from src.musicplayer import RESTORE_WAIT_SECS
 from src.recovery import abandon_cold_start, join_succeeded
 from src.sources import (
+    SoundcloudSource,
+    SpotifySource,
+    YTSource,
     parse_input,
     timestamp_warning,
     unquote_argument,
@@ -36,6 +41,7 @@ from src.util import (
     get_logger,
     notice_embed,
 )
+from src.commands._common import echo
 from src.youtube import QueueObject
 
 # The stage functions are reached through the MODULE, never from-imported: a
@@ -76,33 +82,25 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
     # Consume-rest, so a multi-word search arrives whole — it is what -remove
     # matches on. The strip covers callers that bypass discord.py's parser.
     args = split_play_args(url.strip())
-    async with play_bucket(cog, ctx, args.mode):
-        await _run_placed(ctx, args, cog=cog)
-
-
-@contextlib.asynccontextmanager
-async def play_bucket(
-    cog: MusicBot, ctx: commands.Context, mode: PlayMode
-) -> AsyncGenerator[None]:
-    """One -play in flight per guild PER PLACEMENT, declining rather than
-    queueing: a -play resolving a large playlist holds its bucket for the whole
-    flat extraction (99.3s measured on 5,547 tracks), and a `-p --now` must not
-    wait behind it. Not max_concurrency — prepare() acquires before the flag is
-    parsed; MaxConcurrencyReached is raised by hand so the wording does not fork."""
-    key = (ctx.guild.id if ctx.guild else 0, mode)
-    if key in cog._play_inflight:
-        raise commands.MaxConcurrencyReached(1, commands.BucketType.guild)
-    # No await between the check and the claim, so the pair is atomic on one
-    # event loop and two invocations in the same tick cannot both pass.
-    cog._play_inflight.add(key)
+    # Bound here, not after the resolve: every failure path hands this exact
+    # player to abandon_cold_start, and a get_mp() after its cleanup() would
+    # start a fresh one. cog_before_invoke already created it.
+    req = cog._plays.register(ctx, query=args.query, mp=cog.get_mp(ctx), mode=args.mode)
     try:
-        yield
+        await _run_placed(ctx, args, req, cog=cog)
+    except PlaceStalled as stall:
+        # The interject route only: _resolve_and_place reports its own, and
+        # there is no gate hold to unwind here and nothing to abandon.
+        await ctx.send(embed=_place_stalled_notice(before_the_put=stall.before_the_put))
     finally:
-        cog._play_inflight.discard(key)
+        cog._plays.retire(req)
 
 
-async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -> None:
-    """The body behind -play, taking the argument already split."""
+async def _run_placed(
+    ctx: commands.Context, args: PlayArgs, req: PlayRequest, *, cog: MusicBot
+) -> None:
+    """The body behind -play, taking the argument already split and the request
+    the registry admitted."""
     trace.get_current_span().set_attribute("play.mode", args.mode.value)
     # ONE rebind, so every `origin=url` below is the query with the flag off:
     # a leaked flag persists a user_input -remove cannot match. read_rest hands
@@ -127,9 +125,9 @@ async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -
             )
             return
 
-        # Bound before the join: every failure path hands this exact player
-        # to abandon_cold_start, and a later get_mp() would build a new one.
-        mp = cog.get_mp(ctx)
+        # The player the registry admitted this request against, so every
+        # failure path below tears down the one abandon_cold_start was given.
+        mp = req.mp
         vc = ctx.voice_client
         # A narrowed Optional: VoiceProtocol carries neither is_playing nor
         # is_paused, so a bool would leave vc unnarrowed at both use sites.
@@ -144,7 +142,7 @@ async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -
         # can change.
         if live_vc is not None:
             if args.mode is PlayMode.NOW:
-                return await _interject(ctx, url, mp, live_vc, cog=cog)
+                return await _interject(ctx, url, mp, live_vc, req, cog=cog)
             if live_vc.is_paused() and args.mode is not PlayMode.NEXT:
                 # Paused -> interject: appending would bury the request behind
                 # a paused song. The interrupted song returns PLAYING. `--next`
@@ -154,6 +152,7 @@ async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -
                     url,
                     mp,
                     live_vc,
+                    req,
                     cog=cog,
                     resume_paused=False,
                     require_paused=True,
@@ -161,113 +160,131 @@ async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -
 
         source = parse_input(url)
 
-        qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
-        async with contextlib.AsyncExitStack() as stack:
-            # Not connected: this song jumps ahead of any queue restored from
-            # Redis. The flag decides the analytics shortcut and the join
-            # dance; the insert position is `placement`.
-            cold_start = not ctx.voice_client
-            if cold_start:
-                placement = Placement.COLD_FRONT
-            elif args.mode is not PlayMode.NORMAL:
-                # Both flags: `--now` reaches here only when there was
-                # nothing to interrupt — connected, no song live — and the
-                # interruption is the only part of it that needs one. That
-                # state lasts the length of every resolve.
-                placement = Placement.NEXT
-            else:
-                placement = Placement.TAIL
-            # Ask-time analytics, read ONCE at dispatch: the command
-            # message's snowflake time, so the wait covers gateway
-            # delivery and the resolve below. Cold => depth 0, the
-            # cold-start song plays ahead of the restored queue.
-            if cold_start:
-                position = 0
-            elif placement is Placement.NEXT:
-                # No restore wait for the depth here — this number does not
-                # come from the queue at all, so a queue still replaying
-                # cannot make it wrong.
-                position = play_pipeline.front_insert_depth(mp)
-            else:
-                # Wait out any in-flight restore: the queue stays empty
-                # until restore_entries() replays it, so a -play in the
-                # crash-recovery window would read 0 behind a queue about
-                # to reappear. Already set in the common case.
-                await mp.wait_for_restore(timeout=DEPTH_RESTORE_WAIT_SECS)
-                position = mp.enqueue_depth()
-            analytics = Analytics(
-                queued_at=ctx.message.created_at.timestamp(),
-                queue_position=position,
+        notice = await _resolve_and_place(ctx, args, req, mp, source, url, cog=cog)
+        if notice is not None:
+            await ctx.send(embed=notice)
+
+
+async def _resolve_and_place(
+    ctx: commands.Context,
+    args: PlayArgs,
+    req: PlayRequest,
+    mp: MusicPlayer,
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+    url: str,
+    *,
+    cog: MusicBot,
+) -> Optional[discord.Embed]:
+    """Resolve, then insert under the place lock. Returns the notice for a
+    request that did not insert, or None. Returned rather than sent: on the cold
+    path a teardown decision (abandon_cold_start reads the hold count) must not
+    be followed by an await before the gate hold is released."""
+    qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
+    async with contextlib.AsyncExitStack() as stack:
+        # Not connected: this song jumps ahead of any queue restored from Redis.
+        # The flag decides the analytics shortcut and the join dance; the insert
+        # position is `placement`. A running join counts as cold — discord.py
+        # registers the client BEFORE the handshake completes (join_succeeded).
+        in_flight_join = cog._plays.join_in_flight(req.guild_id)
+        cold_start = not ctx.voice_client or in_flight_join
+        if cold_start:
+            placement = Placement.COLD_FRONT
+        elif args.mode is not PlayMode.NORMAL:
+            # Both flags: `--now` reaches here only with nothing to interrupt,
+            # and that state lasts the length of every resolve.
+            placement = Placement.NEXT
+        else:
+            placement = Placement.TAIL
+        # The message's snowflake time, so the wait covers gateway delivery.
+        # The depth is minted at the insert, under the place lock.
+        analytics = Analytics(
+            queued_at=ctx.message.created_at.timestamp(), queue_position=0
+        )
+        resolve_started = time.monotonic()
+        if cold_start:
+            # Hold the gate across the join, which opens it the moment the
+            # handshake lands — before queue_source has finished extracting.
+            # Released on exiting the stack, after the front insertion.
+            await stack.enter_async_context(mp.defer_playback())
+            # One join per guild, concurrent with this resolve: voice
+            # handshake and yt-dlp extraction have no data dependency.
+            join, owns_join = cog._plays.cold_join(
+                req,
+                joiner=lambda: ctx.invoke(cog.join),
+                tracked=cog._restore_tasks,
             )
-            if cold_start:
-                # Hold the gate across the join below: join opens it the
-                # moment the handshake lands, which would start the
-                # restored head while queue_source is still extracting.
-                # Released on exiting the stack, after the front insertion.
-                await stack.enter_async_context(mp.defer_playback())
-                # Concurrent with queue_source: both are pure I/O (voice
-                # handshake vs yt-dlp extraction) with no data dependency.
-                # Awaiting join_task after queue_source guarantees the voice
-                # client is ready before queue_put fires.
-                join_task = asyncio.create_task(ctx.invoke(cog.join))
-                try:
+            try:
+                async with cog._plays.resolve_slot(req):
                     qobj = await play_pipeline.queue_source(
                         ctx, source, analytics=analytics, origin=url, cog=cog
                     )
-                    await join_task
-                except BaseException:
-                    if not join_task.done():
-                        join_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await join_task
-                    # Full cleanup, not just disconnect: cog_before_invoke
-                    # already started a MusicPlayer's loop(), which would
-                    # zombie for up to 300s on queue.get() with
-                    # clear_connection() never firing — spurious crash
-                    # recovery on restart.
-                    await abandon_cold_start(cog, ctx, mp)
-                    raise
-                # Inserting onto a join that produced no usable client hands
-                # the loop a song it can only raise on.
-                if not join_succeeded(ctx):
-                    await abandon_cold_start(cog, ctx, mp)
-                    return
-            else:
+            except BaseException:
+                # Alone on this cold start (the hold count is this command's),
+                # cancel the join before the teardown, or join() rebuilds the
+                # player it then finds missing. Another holder owns the join.
+                if mp.playback_holds == 1 and not join.done():
+                    join.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await join
+                # Full cleanup: cog_before_invoke already started a loop() that
+                # would otherwise zombie for 300s on queue.get() and leave
+                # clear_connection() unfired — spurious crash recovery.
+                await abandon_cold_start(cog, ctx, mp)
+                raise
+            with contextlib.suppress(Exception):
+                # The join task runs on the CREATOR's context, so a waiter's
+                # trace has to say the join was somebody else's.
+                if not owns_join:
+                    trace.get_current_span().set_attribute("play.join_shared", True)
+                await asyncio.shield(join)
+            # Inserting onto a join that produced no usable client hands the
+            # loop a song it can only raise on.
+            if not join_succeeded(ctx):
+                # join() swallows its own error, so this span and this line are
+                # the only record of the drop. Synchronous through the return.
+                trace.get_current_span().set_attribute("play.dropped_by", "join_failed")
+                log.warning(f"Cold-start join left no voice client: {url}")
+                await abandon_cold_start(cog, ctx, mp)
+                # The creator was told by join() itself. Returned, not sent: no
+                # await may land between the teardown decision and the release.
+                return None if owns_join else _join_failed_notice(url)
+        else:
+            async with cog._plays.resolve_slot(req):
                 qobj = await play_pipeline.queue_source(
                     ctx, source, analytics=analytics, origin=url, cog=cog
                 )
+        trace.get_current_span().set_attribute(
+            "play.resolve_secs", round(time.monotonic() - resolve_started, 3)
+        )
 
-            log.info(f"Voice client: {ctx.voice_client}")
+        log.info(f"Voice client: {ctx.voice_client}")
 
-            if placement is not Placement.TAIL:
-                # put_front LPUSHes the mirror while restore_entries replays
-                # already-listed entries in memory only, so inserting against
-                # an unread snapshot double-queues this song. Every front
-                # insert: connected-and-idle during crash recovery is the
-                # window. Bounded, since the pool sets no socket_timeout.
-                if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                    # Cold start ONLY: abandon_cold_start cancels the
-                    # player's tasks and disconnects it, which on a warm
-                    # player would stop the music over a Redis blink.
-                    if cold_start:
-                        await abandon_cold_start(cog, ctx, mp)
-                    await ctx.send(
-                        embed=notice_embed(
-                            "Couldn't reach this server's saved queue, so "
-                            "your song wasn't queued — try again in a "
-                            "moment.",
-                            discord.Color.red(),
-                        )
-                    )
-                    return
+        # Every placement waits: put_front LPUSHes the list restore_entries
+        # replays in memory, so inserting first double-queues this song, and a
+        # put() before the replay lands this song ahead of entries Redis lists
+        # behind it. Bounded, since the pool sets no socket_timeout.
+        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+            # Cold start ONLY: abandon_cold_start cancels the player's tasks
+            # and disconnects it, which on a warm player would stop the music
+            # over a Redis blink.
+            if cold_start:
+                await abandon_cold_start(cog, ctx, mp)
+                return _restore_unreachable_notice()
+            return notice_embed(
+                "Still loading this server's saved queue — try again in a moment.",
+                discord.Color.orange(),
+            )
 
+        try:
             if isinstance(qobj, QueueObject):
                 await play_pipeline.enqueue_single(
                     ctx,
                     qobj,
                     mp,
+                    req,
                     placement=placement,
                     warning=timestamp_warning(source),
+                    cog=cog,
                 )
             else:
                 await play_pipeline.enqueue_playlist(
@@ -275,11 +292,68 @@ async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -
                     source,
                     qobj,
                     mp,
+                    req,
                     placement=placement,
                     analytics=analytics,
                     origin=url,
                     cog=cog,
                 )
+        except PlaceStalled as stall:
+            if cold_start and not _cold_start_left_something_playable(ctx, mp):
+                await abandon_cold_start(cog, ctx, mp)
+            return _place_stalled_notice(before_the_put=stall.before_the_put)
+        if cold_start and not req.placed:
+            # Refused at the lock after the join put the bot in the channel:
+            # tear down like the other exits, or it sits in an empty channel
+            # until the 300s idle — unless the channel has music to play
+            # (_cold_start_left_something_playable).
+            if not _cold_start_left_something_playable(ctx, mp):
+                await abandon_cold_start(cog, ctx, mp)
+            return None
+    return None
+
+
+def _cold_start_left_something_playable(ctx: commands.Context, mp: MusicPlayer) -> bool:
+    """Whether a cold start refused AFTER its join should leave the session up:
+    with the connection up and the queue not empty, the songs are a sibling's
+    or a restored queue's, and a teardown would disconnect a working session.
+    Synchronous, so the caller decides before its gate release."""
+    return join_succeeded(ctx) and mp.queue.display_size() > 0
+
+
+def _join_failed_notice(query: str) -> discord.Embed:
+    """A waiting request's own report of a failed cold-start join: join() reports
+    only into the context of the request that created it."""
+    return notice_embed(
+        f"Couldn't join the voice channel, so your song wasn't queued: {echo(query)}",
+        discord.Color.red(),
+    )
+
+
+def _restore_unreachable_notice() -> discord.Embed:
+    """The cold-start restore read never landed, so nothing was inserted."""
+    return notice_embed(
+        "Couldn't reach this server's saved queue, so your song wasn't queued — "
+        "try again in a moment.",
+        discord.Color.red(),
+    )
+
+
+def _place_stalled_notice(*, before_the_put: bool) -> discord.Embed:
+    """What a stalled placement may claim. Waiting for the lock nothing was written
+    and the song is honestly absent; inside the put the deque is appended before the
+    mirror write, so the song may be queued and a "try again" would duplicate it."""
+    if before_the_put:
+        return notice_embed(
+            "This server's queue is busy right now, so your song wasn't queued — "
+            "try again in a moment.",
+            discord.Color.red(),
+        )
+    return notice_embed(
+        "This server's queue is busy right now, so your song may not have been "
+        "queued — check `-queue` before trying again.",
+        discord.Color.red(),
+    )
 
 
 async def _interject(
@@ -287,6 +361,7 @@ async def _interject(
     url: str,
     mp: MusicPlayer,
     vc: discord.VoiceClient,
+    req: PlayRequest,
     *,
     cog: MusicBot,
     resume_paused: bool = True,
@@ -301,9 +376,14 @@ async def _interject(
             url,
             mp,
             vc,
+            req,
             resume_paused=resume_paused,
             require_paused=require_paused,
             cog=cog,
         )
+    except PlaceStalled:
+        # A stall is not a failed interjection: run() reports it as a busy queue,
+        # and wrapping it here would title that "Failed to play song now".
+        raise
     except Exception as e:
         raise InterjectionFailed(e) from e

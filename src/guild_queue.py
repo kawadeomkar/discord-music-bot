@@ -98,6 +98,14 @@ def _normalize(s: str) -> str:
     return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
 
+def matches_origin(needle: str, origin: str) -> bool:
+    """Whether one `-remove` argument matches an input by ORIGIN — what the user
+    typed — under the queue's own fold. Also applied to the `-play` requests still
+    resolving, whose query is that origin before any queue item carries it."""
+    needle = needle.strip().strip("<>")
+    return bool(needle) and _normalize(origin) == _normalize(needle)
+
+
 def remove_matcher(needle: str) -> RemoveMatcher:
     """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
     first, then what the user typed. An origin match takes out every item sharing

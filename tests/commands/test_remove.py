@@ -6,7 +6,8 @@ import discord
 
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.musicbot import MusicBot
-from src.commands.remove import _echo, _removed_label
+from src.commands._common import echo
+from src.commands.remove import _removed_label
 from src.sources import YTSource
 from src.util import EMBED_FIELD_LIMIT
 from src.youtube import QueueObject
@@ -32,7 +33,7 @@ class TestEchoIsSafeInAnEmbed:
         `](` pair survives to pick a link's label and destination. Escaping alone
         does not cover it — brackets are not in escape_markdown's set."""
         attack = "[Free Discord Nitro](https://evil.example/phish)"
-        out = _echo(attack)
+        out = echo(attack)
         assert "[" not in out and "]" not in out
 
     def test_markdown_riding_behind_a_url_is_neutralized(self) -> None:
@@ -40,7 +41,7 @@ class TestEchoIsSafeInAnEmbed:
         URL through UNTOUCHED — so an attack prefixed with a bare link reaches the
         embed verbatim unless safe_label overrides that default."""
         attack = "https://x.com/`[FREE NITRO](https://evil.example/phish)"
-        out = _echo(attack)
+        out = echo(attack)
         assert "[" not in out and "]" not in out
         assert "`" not in out
 
@@ -49,7 +50,7 @@ class TestEchoIsSafeInAnEmbed:
         neutralized outright: escape_markdown's URL exemption covers the WHOLE
         token, so emphasis after a scheme renders styled unless the flag is off.
         Pinned separately because the masked-link tests above pass either way."""
-        out = _echo("https://x.com/**bold**_em_")
+        out = echo("https://x.com/**bold**_em_")
         assert "\\*\\*" in out
         assert "\\_" in out
 
@@ -57,24 +58,24 @@ class TestEchoIsSafeInAnEmbed:
         """Two call sites wrap this in a code span, and Discord gives a backslash
         NO meaning inside one — so an ESCAPED backtick still closes the span and
         renders everything after it. The backtick has to go, not be escaped."""
-        out = _echo("foo` **bold** `bar")
+        out = echo("foo` **bold** `bar")
         assert "`" not in out
         assert "\\*\\*" in out
 
     def test_control_characters_cannot_end_the_line_early(self) -> None:
         """A control character truncates the rendered line, hiding whatever the
         needle put after it."""
-        assert _echo("a\x00b\x1fc\x7fd") == "a b c d"
+        assert echo("a\x00b\x1fc\x7fd") == "a b c d"
 
     def test_the_echo_is_bounded_well_inside_the_field_cap(self) -> None:
         """Discord 400s the whole send past 1024 chars in a field value, and
         escaping can double the length. The removal has already committed by then,
         so the user sees "Command failed" for a removal that happened. `*`, not
         `x`: escaping leaves `x` alone and would not exercise the doubling."""
-        assert len(_echo("*" * 5000)) <= 1024
+        assert len(echo("*" * 5000)) <= 1024
 
     def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
-        assert _echo("never gonna give you up") == "never gonna give you up"
+        assert echo("never gonna give you up") == "never gonna give you up"
 
 
 class TestRemovedLabelNamesEveryItemType:

@@ -1,37 +1,36 @@
 """`-remove` — drop queued songs matching what the user typed, and
 say which ones went."""
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import discord
 from discord.ext import commands
 
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, matches_origin
 from src.musicplayer import MusicPlayer
+from src.play_placement import play_key
 from src.sources import QUERY_SOURCE_SEARCH
 from src.util import (
-    ECHO_MAX,
     ECHO_ROW_MAX,
     EMBED_FIELD_LIMIT,
     notice_embed,
     pluralize,
     queue_message,
-    safe_label,
     send_embed,
     truncate,
 )
 from src.youtube import QueueObject
-from src.commands._common import await_restore
+from src.commands._common import await_restore, dropped_request_field, echo
+
+if TYPE_CHECKING:
+    # A runtime import would close the cycle (musicbot imports this module); the cog
+    # is only named in annotations. Same guard recovery.py and musicplayer.py use.
+    from src.musicbot import MusicBot
 
 
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
 _MAX_SHOWN_POSITIONS = 60
-
-
-def _echo(text: str, limit: int = ECHO_MAX) -> str:
-    """A needle safe to put in an embed — see util.safe_label."""
-    return safe_label(text, limit)
 
 
 def _removed_label(item: QueueItem) -> str:
@@ -56,7 +55,7 @@ def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
     whole playlist."""
     # Not wrapped in a code span: inside one Discord renders safe_label's
     # backslashes literally, so `-remove foo_bar` comes back as `foo\_bar`.
-    shown = _echo(needle)
+    shown = echo(needle)
     if outcome.mode is not RemoveMode.ORIGIN:
         return shown
     kinds = {item.query_source for item in outcome.removed if item.query_source}
@@ -68,7 +67,9 @@ def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
     return f"{shown} — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
-async def run(ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer) -> None:
+async def run(
+    ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer, cog: MusicBot
+) -> None:
     """`-remove` — drop every queued song matching a link or the text it was queued
     with, then report the positions that went and the queue that is left."""
     if needle is None:
@@ -85,14 +86,26 @@ async def run(ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer) 
         return
     if not await await_restore(ctx, mp):
         return
+    # A -remove during a resolve is routine (a resolve can run 99s). Matched
+    # the way the queue matches — a link literally, text case-folded — so
+    # the same argument takes out the pending request and the queued song.
+    dropped = cog._plays.inflight(
+        play_key(ctx), "remove", lambda r: matches_origin(needle, r.query)
+    )
     outcome = await mp.queue_remove(needle)
     positions = outcome.positions
     if not positions:
         await send_embed(
             ctx,
             "",
-            f"No queued songs found matching: {_echo(needle)}",
-            discord.Color.red(),
+            (
+                f"No queued songs found matching: {echo(needle)}"
+                if not dropped
+                else f"Nothing queued matched {echo(needle)} yet — "
+                "it was still being looked up."
+            ),
+            discord.Color.red() if not dropped else discord.Color.orange(),
+            fields=dropped_request_field(dropped),
         )
         return
     count = len(positions)
@@ -122,7 +135,7 @@ async def run(ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer) 
                 _field(
                     queue_message(
                         [
-                            _echo(_removed_label(i), ECHO_ROW_MAX)
+                            echo(_removed_label(i), ECHO_ROW_MAX)
                             # Sliced before the echo: queue_message keeps 10.
                             for i in outcome.removed[:10]
                         ]

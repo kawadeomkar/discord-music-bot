@@ -67,7 +67,7 @@ class TestResumeCommand:
     ) -> None:
         """Silence was the old answer on every no-op branch; a reply has to say
         why nothing happened."""
-        mock_ctx.voice_client = playing_vc()
+        mock_ctx.voice_client = playing_vc(mock_ctx)
         mp = MagicMock()
         mp.resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -145,7 +145,7 @@ class TestResumeCommand:
         async def fake_invoke(*_a: Any, **_kw: Any) -> None:
             if calls is not None:
                 calls.append("join")
-            mock_ctx.voice_client = paused_vc()
+            mock_ctx.voice_client = paused_vc(mock_ctx)
 
         return AsyncMock(side_effect=fake_invoke)
 

@@ -10,11 +10,13 @@ from src import play_pipeline
 from src.guild_state import Analytics
 from src.config import SpotifyStatus
 from src.musicbot import MusicBot, SpotifyDisabledError
+from src.play_placement import Placement
 from src.play_pipeline import (
     EmptyPlaylistError,
     PlaylistIndexError,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
+    _rebase_positions,
 )
 from src.sources import (
     SpotifySource,
@@ -27,7 +29,11 @@ from src.sources import (
 )
 from src.youtube import QueueObject
 from tests.helpers import (
+    admit,
+    command_callback,
     connected_vc,
+    in_authors_channel,
+    no_typing,
     mock_mp,
     queue_object,
 )
@@ -111,6 +117,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedYoutubePlaylist(tracks=qobjs),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -140,6 +147,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedYoutubePlaylist(tracks=qobjs, skipped=3),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -165,6 +173,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedYoutubePlaylist(tracks=qobjs),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -189,6 +198,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedYoutubePlaylist(tracks=qobjs),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -214,6 +224,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedYoutubePlaylist(tracks=qobjs),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -237,6 +248,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedSpotifyPlaylist(titles=titles),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -258,6 +270,7 @@ class TestEnqueuePlaylist:
             source,
             ResolvedSpotifyPlaylist(titles=titles),
             mp,
+            admit(music_bot, mock_ctx, mp),
             analytics=_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
@@ -273,8 +286,7 @@ class TestEnqueueSingle:
     def _playing_mp(head: Any = None) -> MagicMock:
         """A player with a song live and `head` at the queue front. The default
         head is a fresh Mock, i.e. NOT the song being queued."""
-        mp = MagicMock()
-        mp.queue.qsize.return_value = 0
+        mp = mock_mp(qsize=0)
         mp.queue.peek_next = MagicMock(
             return_value=head if head is not None else MagicMock()
         )
@@ -288,12 +300,20 @@ class TestEnqueueSingle:
         """The block's "Up next" card and the confirmation render the same body, so
         a song that lands at the head would be described twice in one message. The
         live block is re-hosted instead and no confirmation is sent."""
-        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client = in_authors_channel(
+            MagicMock(spec=discord.VoiceClient), mock_ctx
+        )
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
         mp = self._playing_mp(head=qobj)
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            cog=music_bot,
+        )
 
         mp.repin_now_playing.assert_awaited_once()
         mp.build_queued_song_embed.assert_not_called()
@@ -302,12 +322,20 @@ class TestEnqueueSingle:
     async def test_sends_confirmation_when_something_is_already_queued(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client = in_authors_channel(
+            MagicMock(spec=discord.VoiceClient), mock_ctx
+        )
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
         mp = self._playing_mp()  # head is some other song
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            cog=music_bot,
+        )
 
         mp.repin_now_playing.assert_not_awaited()
         mp.build_queued_song_embed.assert_called_once_with(qobj, note="", warning=None)
@@ -321,13 +349,21 @@ class TestEnqueueSingle:
     ) -> None:
         """repin_now_playing() answers False when the song ended mid-send — it
         already disposed of its message, so the confirmation is the honest reply."""
-        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client = in_authors_channel(
+            MagicMock(spec=discord.VoiceClient), mock_ctx
+        )
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
         mp = self._playing_mp(head=qobj)
         mp.repin_now_playing = AsyncMock(return_value=False)
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            cog=music_bot,
+        )
 
         mp.repin_now_playing.assert_awaited_once()
         assert (
@@ -339,12 +375,21 @@ class TestEnqueueSingle:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """The re-hosted block has no description of its own to carry the warning."""
-        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client = in_authors_channel(
+            MagicMock(spec=discord.VoiceClient), mock_ctx
+        )
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
         mp = self._playing_mp(head=qobj)
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp, warning="watch out")
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            warning="watch out",
+            cog=music_bot,
+        )
 
         mp.repin_now_playing.assert_awaited_once()
         assert "watch out" in mock_ctx.send.await_args.kwargs["embed"].description
@@ -352,12 +397,21 @@ class TestEnqueueSingle:
     async def test_warning_rides_the_confirmation_when_one_is_sent(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client = in_authors_channel(
+            MagicMock(spec=discord.VoiceClient), mock_ctx
+        )
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
         mp = self._playing_mp()
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp, warning="watch out")
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            warning="watch out",
+            cog=music_bot,
+        )
 
         mp.build_queued_song_embed.assert_called_once_with(
             qobj, note="", warning="watch out"
@@ -369,7 +423,9 @@ class TestEnqueueSingle:
         """The reply's shape depends on the put having landed, so the put is
         awaited ahead of it rather than gathered with it. Read against a queue
         whose head only appears once queue_put has run."""
-        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client = in_authors_channel(
+            MagicMock(spec=discord.VoiceClient), mock_ctx
+        )
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
         mp = self._playing_mp(head=None)
@@ -380,7 +436,13 @@ class TestEnqueueSingle:
 
         mp.queue_put = AsyncMock(side_effect=_put)
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            cog=music_bot,
+        )
 
         mp.repin_now_playing.assert_awaited_once()
 
@@ -394,7 +456,13 @@ class TestEnqueueSingle:
         mp.queue.qsize.return_value = 0
         mp.queue_put = AsyncMock()
 
-        await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            cog=music_bot,
+        )
 
         mp.build_queued_song_embed.assert_not_called()
         mp.repin_now_playing.assert_not_called()
@@ -414,7 +482,12 @@ class TestTimestampWarningReachesTheUser:
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         await play_pipeline.enqueue_single(
-            mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            warning=timestamp_warning(self._bad_ts_source()),
+            cog=music_bot,
         )
 
         # The card is the player's to build now; the cog's job is handing the
@@ -429,17 +502,52 @@ class TestTimestampWarningReachesTheUser:
         the most ordinary case there is."""
         mp = mock_mp()
         mp.queue.qsize = MagicMock(return_value=0)
-        mock_ctx.voice_client = connected_vc()
+        mock_ctx.voice_client = connected_vc(mock_ctx)
         mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         await play_pipeline.enqueue_single(
-            mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            warning=timestamp_warning(self._bad_ts_source()),
+            cog=music_bot,
         )
 
         mp.build_queued_song_embed.assert_not_called()
         sent = [c.kwargs["embed"] for c in mock_ctx.send.await_args_list]
         assert any("bogus" in (e.description or "") for e in sent)
+
+    @pytest.mark.parametrize(
+        "placement", [Placement.COLD_FRONT, Placement.NEXT], ids=lambda p: p.name
+    )
+    async def test_it_rides_the_flag_confirmations_too(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, placement: Placement
+    ) -> None:
+        """ "Every exit sends it either way" is the contract, and the flag legs
+        build their own embeds. `-p --next <link>?t=bogus` would otherwise lose the
+        only word the user gets that the timestamp was ignored."""
+        mp = mock_mp()
+        mp.queue.qsize = MagicMock(return_value=3)
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            placement=placement,
+            warning=timestamp_warning(self._bad_ts_source()),
+            cog=music_bot,
+        )
+
+        said = " ".join(
+            (c.kwargs["embed"].description or "")
+            for c in mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        )
+        assert "bogus" in said
 
 
 class TestQuerySourceClassification:
@@ -1080,3 +1188,97 @@ class TestInterjectionCollectionHandling:
         assert head is tracks[3]
         assert head.analytics.queue_position == 0
         assert [queue_object(item).analytics.queue_position for item in rest] == [1, 2]
+
+
+class TestPlaylistPositionsAreMintedAtTheInsert:
+    """A playlist's queue_position is the slot each track actually takes. Minted
+    at resolve it is the depth the queue had 1-99s earlier, and it rides to
+    Postgres unchallenged."""
+
+    def _wire(self, music_bot: MusicBot, mock_ctx: MagicMock, depth: int) -> MagicMock:
+        mp = mock_mp()
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mp.enqueue_depth = MagicMock(return_value=depth)
+        return mp
+
+    @pytest.mark.parametrize("depth", [0, 4])
+    async def test_a_youtube_playlist_lands_on_the_depth_at_the_insert(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, depth: int
+    ) -> None:
+        mp = self._wire(music_bot, mock_ctx, depth)
+        tracks = [
+            QueueObject(
+                f"https://yt.com/v={n}",
+                f"T{n}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1.0, queue_position=n),
+            )
+            for n in range(3)
+        ]
+        play_pipeline.queue_source = AsyncMock(
+            return_value=ResolvedYoutubePlaylist(tracks=tracks, skipped=0)
+        )
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://yt.com/playlist?list=x"
+            )
+
+        queued = mp.queue_put.await_args.args[0]
+        assert [q.analytics.queue_position for q in queued] == [
+            depth,
+            depth + 1,
+            depth + 2,
+        ]
+
+    async def test_a_head_that_moved_during_the_wait_is_rebased_under_the_lock(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The provisional mint happens outside the lock, so another request can
+        place before this one's turn. The depth read UNDER the lock is the slot the
+        collection actually takes; the one minted against is stale."""
+        mp = self._wire(music_bot, mock_ctx, 0)
+        calls = {"n": 0}
+
+        def _depth() -> int:
+            calls["n"] += 1
+            return 4 if calls["n"] == 1 else 9  # a sibling placed in between
+
+        mp.enqueue_depth = MagicMock(side_effect=_depth)
+        tracks = [
+            QueueObject(
+                f"https://yt.com/v={n}",
+                f"T{n}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1.0, queue_position=n),
+            )
+            for n in range(3)
+        ]
+        play_pipeline.queue_source = AsyncMock(
+            return_value=ResolvedYoutubePlaylist(tracks=tracks, skipped=0)
+        )
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://yt.com/playlist?list=x"
+            )
+
+        queued = mp.queue_put.await_args.args[0]
+        assert [q.analytics.queue_position for q in queued] == [9, 10, 11]
+
+    async def test_the_rebase_is_skipped_when_the_head_has_not_moved(self) -> None:
+        """The O(N) pass is one dataclass copy per track — milliseconds of
+        synchronous event-loop time at 5,000 of them, and under the place lock
+        every sibling -play waits it out. Minting before the lock and re-basing
+        under it makes the common case free."""
+        tracks = [
+            QueueObject(
+                f"https://yt.com/v={n}", f"T{n}", MagicMock(), analytics=_ANALYTICS
+            )
+            for n in range(3)
+        ]
+
+        assert _rebase_positions(tracks, 7, 7) is tracks  # same list, no copies
+
+        moved = _rebase_positions(tracks, 7, 9)
+        assert moved is not tracks
+        assert [q.analytics.queue_position for q in moved] == [9, 10, 11]
