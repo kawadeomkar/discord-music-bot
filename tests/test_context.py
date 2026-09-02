@@ -12,6 +12,7 @@ import pytest
 from discord.ext import commands
 from opentelemetry import trace
 
+from src import config
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.main import MusicBotApp, MusicContext
@@ -303,7 +304,7 @@ class TestDebugDecoration:
         own.set_footer(text="top 10 · last 30 days")
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)
-        assert (own.footer.text or "").startswith("top 10 · last 30 days · 🐞")
+        assert (own.footer.text or "").startswith("top 10 · last 30 days\n🐞")
 
     async def test_shard_id_is_reported(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
@@ -329,13 +330,32 @@ class TestDebugDecoration:
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
     ) -> None:
         """A send outside any command has no _active_spans entry. It still gets a
-        footer — the shard is knowable — but nothing is fabricated."""
+        footer — the environment and the shard are knowable — but nothing is
+        fabricated."""
         self._enable(music_bot_cog, mocked(mctx.guild).id)
         mocked(mctx.guild).shard_id = 0
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)
-        assert own.footer.text == "🐞 shard 0"
+        assert own.footer.text == f"🐞 {config.ENVIRONMENT} · shard 0"
+
+    async def test_the_environment_leads_the_footer(
+        self,
+        mctx: MusicContext,
+        live_mp: MagicMock,
+        music_bot_cog: MusicBot,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """It says which deployment everything after it describes, so it goes first.
+        Read at send time, never captured: main() infers it from the git branch after
+        this module is imported, so a module-level copy would say `development` on
+        every card in production."""
+        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        own = discord.Embed(title="Queue")
+        with _parent_send(MagicMock(spec=discord.Message)):
+            await mctx.send(embed=own)
+        assert (own.footer.text or "").startswith("🐞 production ·")
 
     async def test_elapsed_is_measured_at_each_send(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
@@ -355,7 +375,7 @@ class TestDebugDecoration:
             await mctx.send(embed=second)
         assert "ms" in (first.footer.text or "")
         elapsed = [
-            int((e.footer.text or "").split(" ms")[0].split("🐞 ")[1])
+            int((e.footer.text or "").split(" ms")[0].split(" ")[-1])
             for e in (first, second)
         ]
         assert 500 <= elapsed[0] <= elapsed[1]

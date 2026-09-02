@@ -14,14 +14,6 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from src import config
 from src.config import spotify_enabled
 
-# Reaches yt_dlp transitively (src.debug -> src.ping -> yt_dlp.version), and the
-# console script imports THIS module at module scope — so the yt-dlp pool's
-# spawn/forkserver bootstrap re-imports it too, measured at ~+500ms per bootstrap.
-# Kept because it is paid once at forkserver bootstrap on the deploy target (Linux),
-# happens inside the fire-and-forget prewarm() rather than on the loop, and is
-# arguably the point: prewarm()'s promise is that the first -play does not absorb
-# yt-dlp import latency, which was only half true before.
-from src.debug import decorate_embeds, strip_debug_footers
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
@@ -118,10 +110,10 @@ class MusicContext(commands.Context):
         return message
 
     def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
-        """Add the debug footer to this response's own embeds while the guild has
-        debug mode on. The NP block is decorated by the player instead, at build
-        time, so the progress tick cannot re-render it back to bare.
-        See docs/ARCHITECTURE.md#debug-footer-seams."""
+        """Add the debug footer to this response's own embeds. The NP block is
+        decorated by the player instead, at build time, so the progress tick cannot
+        re-render it back to bare. Elapsed-ms times the phase of the command that is
+        answering. See docs/ARCHITECTURE.md#debug-footer-seams."""
         cog = self._music_cog()
         if cog is None:
             return
@@ -132,23 +124,16 @@ class MusicContext(commands.Context):
         ]
         if not own:
             return
-        guild_id = self.guild.id if self.guild else None
-        if not cog.debug_settings.enabled(guild_id):
-            # Strip rather than return: a cached embed built while debug mode was
-            # on must lose its suffix once it is off.
-            strip_debug_footers(own)
-            return
         # Keyed by id(ctx), and this IS the ctx. Absent for a send outside any
         # command, which just means no elapsed time and no span to name.
         active = cog._active_spans.get(id(self))
-        decorate_embeds(
+        cog.debug_settings.decorate(
             own,
+            self.guild,
             span=active.span if active is not None else None,
             elapsed_ms=(time.monotonic() - active.started) * 1000
             if active is not None
             else None,
-            shard_id=self.guild.shard_id if self.guild else None,
-            runtime=cog.debug_settings.snapshot,
         )
 
     def _music_cog(self) -> Optional[MusicBot]:
