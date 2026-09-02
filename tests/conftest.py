@@ -1,5 +1,6 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import functools
 import os
 import re
 import sys
@@ -41,8 +42,8 @@ from tests.mock_spec_cache import install as install_mock_spec_cache
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplcache")
 
 # At import, before any test module is collected, so module-level mocks are
-# covered too. Makes every `Mock(spec=...)` in the suite cheap without the call
-# sites having to opt in. See tests/mock_spec_cache.py.
+# covered too. See tests/mock_spec_cache.py and
+# docs/ARCHITECTURE.md#the-mock-spec-cache.
 install_mock_spec_cache()
 
 
@@ -120,6 +121,11 @@ async def close_shared_http_sessions(
     created: list[tuple[Any, Any]] = []
     original = spotify_mod.Spotify._session_or_create
 
+    # wraps() so the spec cache sees through it: this is autouse, so Spotify is
+    # monkeypatched for every test, and the cog fixtures below snapshot the class
+    # while it is. unwrap() reaching `original` keeps that snapshot honest even if
+    # the two ever differ in async-ness (tests/mock_spec_cache.py).
+    @functools.wraps(original)
     def tracked(self: Any) -> Any:
         session = original(self)
         if not any(s is session for _, s in created):

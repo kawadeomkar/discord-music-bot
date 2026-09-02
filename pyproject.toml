@@ -215,7 +215,7 @@ ignore = ["ANN401"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-addopts = "--cov=src --cov-report=term-missing"
+addopts = "--cov=src --cov=tests.mock_spec_cache --cov-report=term-missing"
 # Per-test deadline. Generous relative to the whole suite (~50s for 1400+ tests)
 # because it exists to convert HANGS into failures, not to police slow tests —
 # and it has to leave room for the pg tier's container startup. See the
@@ -252,7 +252,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 branch = true
-source = ["src"]
+source = ["src", "tests/mock_spec_cache.py"]
 
 [tool.coverage.report]
 fail_under = 80

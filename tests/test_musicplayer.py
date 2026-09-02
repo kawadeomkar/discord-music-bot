@@ -3,6 +3,7 @@
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
+import functools
 import dataclasses
 import datetime
 import logging
@@ -52,6 +53,18 @@ from src.sources import YTSource
 from src.util import cancel_task, current_traceparent, fmt_duration, trace_id_of
 from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
+
+
+@functools.wraps(MusicPlayer.loop)
+def _sync_loop_stub(self: Any) -> None:
+    """Stand in for MusicPlayer.loop without producing a coroutine.
+
+    A real coroutine handed to a MagicMock create_task is never awaited, and the
+    finalizer surfaces as an unraisable warning in a later test. wraps() keeps
+    the stub transparent to inspect.unwrap, so loop() stays in _spec_asyncs while
+    it is patched in and the spec cache's snapshot stays true
+    (tests/mock_spec_cache.py).
+    """
 
 
 @pytest.fixture(autouse=True)
@@ -2977,12 +2990,9 @@ class TestPlaybackGate:
         resuming from the head with no extra call site."""
         mock_guild.voice_client = MagicMock(spec=discord.VoiceClient)
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
-        # Stub loop() at the class: a real coroutine handed to a MagicMock
-        # create_task is never awaited, and the "coroutine was never awaited"
-        # finalizer surfaces as an unraisable warning in a later test.
         with (
             patch.object(mock_bot, "loop", MagicMock()),
-            patch.object(MusicPlayer, "loop", MagicMock()),
+            patch.object(MusicPlayer, "loop", _sync_loop_stub),
         ):
             mp.start()
         assert mp._playback_gate.is_set()
@@ -2998,7 +3008,7 @@ class TestPlaybackGate:
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
         with (
             patch.object(mock_bot, "loop", MagicMock()),
-            patch.object(MusicPlayer, "loop", MagicMock()),
+            patch.object(MusicPlayer, "loop", _sync_loop_stub),
         ):
             mp.start()
         assert not mp._playback_gate.is_set()

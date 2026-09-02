@@ -11,6 +11,7 @@ must not lose.
 
 import asyncio
 import dataclasses
+import functools
 import json
 import os
 import subprocess
@@ -31,6 +32,14 @@ import discord
 import pytest
 
 from tests import mock_spec_cache
+
+# These exercise the patch itself, so they have nothing to assert once it is
+# switched off. Skipping keeps `MOCK_SPEC_CACHE_DISABLE=1 just test` a clean run,
+# which is the point of having the switch.
+pytestmark = pytest.mark.skipif(
+    mock_spec_cache._DISABLED,
+    reason="MOCK_SPEC_CACHE_DISABLE=1 — the patch under test is not installed",
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -216,12 +225,12 @@ class TestSpecSemanticsPreserved:
 
 
 class TestMagicMethodsMatchTheSpec:
-    """The defect this module was written to fix.
+    """A mock's magic methods must be the ones its spec allows.
 
-    The `spec_mock` helper it replaces injected `_mock_methods` behind mock's back
-    and never ran `_mock_set_magics()`, leaving all 79 magic methods installed
-    instead of the 11 `discord.Guild` allows. Operations the real class forbids
-    then succeeded silently against the mock.
+    Writing `_mock_methods` without also running `_mock_set_magics()` leaves all
+    79 installed instead of the 11 `discord.Guild` permits, and operations the
+    real class forbids then succeed silently. Seeding in `MagicMixin.__init__`
+    is what keeps the two in step here.
     """
 
     @pytest.mark.parametrize("factory", FACTORIES)
@@ -450,6 +459,58 @@ class TestSignatureGuard:
             mock_spec_cache._capture(mock_spec_cache._cached_add_spec)
 
 
+class TestInstallGuards:
+    """install() only makes spec'd mocks cheaper, so an interpreter it cannot
+    vouch for has to cost the speedup rather than the run."""
+
+    def test_declines_an_unverified_interpreter(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(mock_spec_cache, "_installed", False)
+        monkeypatch.setattr(mock_spec_cache, "_VERIFIED_BELOW", (3, 0))
+        before = NonCallableMock._mock_add_spec
+
+        mock_spec_cache.install()
+
+        assert NonCallableMock._mock_add_spec is before
+        assert "not installed" in capsys.readouterr().err
+        assert mock_spec_cache._installed is False
+
+    def test_declines_when_switched_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mock_spec_cache, "_installed", False)
+        monkeypatch.setattr(mock_spec_cache, "_DISABLED", True)
+        before = NonCallableMock._mock_add_spec
+
+        mock_spec_cache.install()
+
+        assert NonCallableMock._mock_add_spec is before
+        assert mock_spec_cache._installed is False
+
+    def test_accepts_the_current_defaults(self) -> None:
+        mock_spec_cache._assert_defaults(
+            mock_spec_cache._ORIG_ADD_SPEC,
+            {"_spec_as_instance": False, "_eat_self": False},
+        )
+
+    def test_rejects_a_flipped_default(self) -> None:
+        """`mock_add_spec()` passes two arguments and lets these default, so a
+        flip changes what that path means with every name and kind unmoved."""
+
+        def defaults_moved(
+            self: Any,
+            spec: Any,
+            spec_set: Any,
+            _spec_as_instance: bool = True,
+            _eat_self: bool = False,
+        ) -> None: ...
+
+        with pytest.raises(RuntimeError, match="now defaults"):
+            mock_spec_cache._assert_defaults(
+                defaults_moved,
+                {"_spec_as_instance": False, "_eat_self": False},
+            )
+
+
 class TestSpecSetIndependence:
     """The cache key holds neither `spec_set` nor its effect, because upstream
     reads it only to store it. `_recompute` probes both arms so a release where
@@ -608,6 +669,23 @@ class TestDriftDetection:
         MagicMock(spec=MusicContext)
 
         assert mock_spec_cache.check_for_drift() == []
+
+    def test_a_wrapped_stand_in_is_not_drift(self, isolated_cache: None) -> None:
+        """The idiom the suite's own class-level patches use. `_spec_asyncs` is
+        derived after `inspect.unwrap`, so a wraps()-decorated stand-in leaves the
+        payload where it was and the entry stays true while it is patched in."""
+
+        class Probe:
+            async def handler(self) -> None: ...
+
+        MagicMock(spec=Probe)
+
+        @functools.wraps(Probe.handler)
+        def stand_in(self: Any) -> None: ...
+
+        with patch.object(Probe, "handler", stand_in):
+            assert mock_spec_cache.check_for_drift() == []
+            assert "handler" in MagicMock(spec=Probe).__dict__["_spec_asyncs"]
 
     def test_a_reverted_mutation_is_invisible_here(self, isolated_cache: None) -> None:
         """The bound on this check, asserted so it stays a known one.

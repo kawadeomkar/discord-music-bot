@@ -905,6 +905,7 @@ src/
 tests/                 # one test_*.py per src/ module, plus:
 ├── conftest.py        # shared fixtures
 ├── helpers.py         # test-only builders
+├── mock_spec_cache.py # memoizes unittest.mock spec introspection
 └── test_context.py    # Discord context doubles
 
 docs/                  # architecture reference + design docs

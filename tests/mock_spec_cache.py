@@ -1,30 +1,16 @@
 """Memoize `unittest.mock`'s spec introspection for the whole test suite.
 
-`MagicMock(spec=discord.Guild)` costs ~1.0ms, and the suite builds ~4700 spec'd
-mocks per run. Almost all of that is `NonCallableMock._mock_add_spec`
-(`unittest/mock.py`), which walks `dir(spec)` — 221 entries for `discord.Guild` —
-calling `inspect.getattr_static`, `inspect.unwrap` and `iscoroutinefunction` on
-every attribute:
+Nearly all of a spec'd mock's cost is `NonCallableMock._mock_add_spec`
+(`unittest/mock.py`), which walks `dir(spec)` calling `inspect.getattr_static`,
+`inspect.unwrap` and `iscoroutinefunction` on every attribute. The result depends
+only on `(spec, _spec_as_instance, _eat_self)`, so it is cached here and replayed
+into each new mock; the suite reuses a couple of dozen spec classes, so nearly
+every build is a hit.
 
-    spec_list = dir(spec)
-    for attr in spec_list:
-        static_attr = inspect.getattr_static(spec, attr, None)
-        unwrapped_attr = inspect.unwrap(static_attr)
-        if iscoroutinefunction(unwrapped_attr):
-            _spec_asyncs.append(attr)
-
-The result depends only on `(spec, _spec_as_instance, _eat_self)`, so it is
-cached here and replayed into each new mock. The whole suite uses 14 distinct
-spec classes, so the cache hits ~99.9% of the time.
-
-Why patch `unittest.mock` rather than offer a `spec_mock(cls)` helper for tests
-to call: a helper only speeds up the call sites that remember to use it, and it
-has to reproduce by hand everything mock does *after* the introspection. Roughly
-half of this suite's spec'd mocks are built by `_get_child_mock` and
-`create_autospec`, which have no call site to edit at all. Patching the one
-expensive function leaves every downstream step — magic-method setup, `__new__`
-base selection, child-mock creation, `spec_set` enforcement — running exactly as
-upstream wrote it. See docs/SPEC_MOCK_PLAN.md for the measurements.
+Patching the one expensive function leaves every downstream step — magic-method
+setup, `__new__` base selection, child-mock creation, `spec_set` enforcement —
+running as upstream wrote it, and reaches `_get_child_mock`, which has no call
+site to edit. See docs/ARCHITECTURE.md#the-mock-spec-cache.
 
 Two functions are replaced:
 
@@ -38,9 +24,8 @@ Two functions are replaced:
     that method once before `_mock_add_spec` has run — when `_mock_methods` is
     still `None`, so it installs all 79 magic methods — and once after, which
     deletes the 68 the spec forbids. Seeding lets the first call compute the
-    correct 11 immediately, so nothing is installed only to be removed. This is
-    what makes a *correct* cache cheaper than the naive one it replaces: a spec'd
-    mock now costs less than a bare `MagicMock()`.
+    correct 11 immediately, so nothing is installed only to be removed. That is
+    what puts a spec'd mock below the cost of a bare `MagicMock()`.
 
 **A spec class must not be mutated once it has been used as a spec.** The cache
 answers from the snapshot it took the first time it saw the class, so a
@@ -62,6 +47,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
 from collections.abc import Callable, MutableMapping
 from typing import Any
 from unittest.mock import MagicMixin, NonCallableMock
@@ -113,6 +99,15 @@ _ORIGINS: MutableMapping[type, dict[tuple[bool, bool], str]] = WeakKeyDictionary
 # used. The session-end check cannot see a mutation that is reverted before it
 # runs; this can, because it looks at the moment the cache answers.
 _STRICT = os.environ.get("MOCK_SPEC_CACHE_STRICT", "") not in ("", "0")
+
+# Skip the patch entirely. Behaviour is identical either way, so this is the
+# supported way to rule the cache out while debugging a suspect mock.
+_DISABLED = os.environ.get("MOCK_SPEC_CACHE_DISABLE", "") not in ("", "0")
+
+# The interpreters whose `unittest.mock` internals this module has been read
+# against. A newer one is not refused, but it is not patched either: the guards
+# below cover the shapes it reads, not the behaviour it assumes.
+_VERIFIED_BELOW = (3, 15)
 
 # Everything `_mock_add_spec` writes. Asserted on every miss so that a CPython
 # release which starts writing a sixth key fails loudly instead of having it
@@ -382,18 +377,38 @@ def _assert_signature(
         )
 
 
+def _assert_defaults(func: Callable[..., Any], expected: dict[str, Any]) -> None:
+    """Check the defaults `_cached_add_spec` re-declares rather than forwards.
+
+    `mock_add_spec()` reaches `_mock_add_spec` with two arguments and lets the
+    rest default, so a flipped default there changes what that path means while
+    every name and kind still matches.
+    """
+    params = inspect.signature(func).parameters
+    actual = {name: params[name].default for name in expected if name in params}
+    if actual != expected:
+        raise RuntimeError(
+            f"unittest.mock.{func.__qualname__} now defaults {actual}, expected "
+            f"{expected}. tests/mock_spec_cache.py re-declares these and must be "
+            f"updated for this Python version before the suite can be trusted."
+        )
+
+
 _POS_OR_KW = inspect.Parameter.POSITIONAL_OR_KEYWORD
 _POS_ONLY = inspect.Parameter.POSITIONAL_ONLY
 _VAR_POS = inspect.Parameter.VAR_POSITIONAL
 _VAR_KW = inspect.Parameter.VAR_KEYWORD
 
 
-def install() -> None:
-    """Patch `unittest.mock` in this process. Idempotent."""
-    global _installed
-    if _installed:
-        return
-
+def _assert_supported() -> None:
+    """Everything that must hold before the patch is safe to install."""
+    if sys.version_info[:2] >= _VERIFIED_BELOW:
+        raise RuntimeError(
+            f"Python {sys.version_info.major}.{sys.version_info.minor} is newer "
+            f"than the {_VERIFIED_BELOW[0]}.{_VERIFIED_BELOW[1] - 1} this module "
+            "was read against; re-verify it against unittest.mock and raise "
+            "_VERIFIED_BELOW"
+        )
     _assert_signature(
         _ORIG_ADD_SPEC,
         (
@@ -404,10 +419,30 @@ def install() -> None:
             ("_eat_self", _POS_OR_KW),
         ),
     )
+    _assert_defaults(_ORIG_ADD_SPEC, {"_spec_as_instance": False, "_eat_self": False})
     _assert_signature(
         _ORIG_MAGIC_INIT,
         (("self", _POS_ONLY), ("args", _VAR_POS), ("kw", _VAR_KW)),
     )
+
+
+def install() -> None:
+    """Patch `unittest.mock` in this process. Idempotent.
+
+    Declines rather than raises when the interpreter is unverified or a guard
+    fails: this only makes spec'd mocks cheaper, so an unpatched run is slower
+    and still correct, and taking the whole suite down with it would cost more
+    than it protects. `warnings.warn` is unavailable here — the suite runs with
+    filterwarnings=error — so the notice goes to stderr.
+    """
+    global _installed
+    if _installed or _DISABLED:
+        return
+    try:
+        _assert_supported()
+    except RuntimeError as exc:
+        print(f"mock spec cache not installed: {exc}", file=sys.stderr)
+        return
 
     NonCallableMock._mock_add_spec = _cached_add_spec
     # Keeping `/` on `_seeded_magic_init` matches upstream, which uses it so that

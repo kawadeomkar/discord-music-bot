@@ -310,7 +310,7 @@ src/
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
 tests/                # one test_<module>.py per src module, commands/ mirroring src/commands/,
-                      # + conftest.py (seams) + helpers.py
+                      # + conftest.py (seams) + helpers.py + mock_spec_cache.py
                       # test_pg_integration.py / test_redis_integration.py are the opt-in tiers
 justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh compose them
 Dockerfile            # 3 stages: builder (deps) → test (adds test+lint groups) → runtime (ffmpeg, no poetry)
@@ -1031,7 +1031,12 @@ touch Discord; a caller with no Redis write to make passes an empty body.
   existing assertions encode it. Disabled-mode behavior is covered by explicit tests
   that monkeypatch the flag per case — which wins over the fixture (same MonkeyPatch
   instance, later call). Don't "fix" the fixture to match the ship default.
-- Redis in tests is `fakeredis`; Discord objects are `MagicMock(spec=...)` doubles.
+- Redis in tests is `fakeredis`; Discord objects are `MagicMock(spec=...)` doubles,
+  built through the spec cache `tests/conftest.py` installs at import — so **a spec
+  class must not be mutated once it has been used as a spec** (`functools.wraps` on
+  the replacement keeps a class-level patch payload-neutral). It is the one file
+  outside `src/` the coverage gate measures. See
+  `docs/ARCHITECTURE.md#the-mock-spec-cache`.
   **fakeredis executes every stream command the outbox uses and gets five of them
   wrong**, all in the safe-looking direction (green tests, broken production): the
   `xtrim(approximate=True)` default trims exactly here and nothing on a real small
