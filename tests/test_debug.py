@@ -26,7 +26,7 @@ from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
 from src.musicbot import MusicBot as MusicBotCog
-from src.util import FOOTER_LIMIT, spawn_background
+from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, spawn_background
 from src.guild_queue import QueueObject
 from tests.helpers import command_callback, seed_queue
 from src.musicplayer import MusicPlayer
@@ -2123,7 +2123,7 @@ class TestFooterRuntimeSegment:
             elapsed_ms=412, shard_id=0, runtime=self._snapshot(), skip_environment=True
         )
         assert footer == (
-            "🐞 412 ms · shard 0 · cpu 12% · mem 88% · lag 2.1 ms · tasks 87 · pool 4"
+            "🐞 412 ms · shard 0 · cpu 12% · mem 88% · lag 2.1 ms\ntasks 87 · pool 4"
         )
 
     def test_missing_rates_are_omitted_not_zeroed(self) -> None:
@@ -2141,6 +2141,54 @@ class TestFooterRuntimeSegment:
             debug.debug_footer(elapsed_ms=1, shard_id=0, skip_environment=True)
             == "🐞 1 ms · shard 0"
         )
+
+
+class TestTheSuffixBreaksItsOwnLines:
+    """Where the request ran, then what it counted. Discord wraps at the card's
+    width, so a suffix that does not break itself breaks mid-segment."""
+
+    def _span(self) -> trace_api.Span:
+        return trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+
+    def _snapshot(self) -> debug.RuntimeSnapshot:
+        return debug.RuntimeSnapshot(
+            cpu_percent=1.0, mem_percent=6.0, lag_ms=1.4, tasks=9, pool_workers=4
+        )
+
+    def test_the_counts_and_the_trace_share_the_second_line(self) -> None:
+        where, counts = debug.debug_footer(
+            span=self._span(), shard_id=0, runtime=self._snapshot()
+        ).split(FOOTER_SUFFIX_SEP)
+        assert where.endswith("lag 1.4 ms")
+        assert counts.startswith("tasks 9 · pool 4 · trace ")
+
+    def test_the_trace_alone_still_takes_the_second_line(self) -> None:
+        """The 32-hex id is what makes the break certain, so it is on the counts
+        side whether or not the sampler has produced a snapshot to join it."""
+        assert (
+            debug.debug_footer(span=self._span(), shard_id=0)
+            .split(FOOTER_SUFFIX_SEP)[1]
+            .startswith("trace ")
+        )
+
+    def test_no_break_is_written_with_nothing_to_put_after_it(self) -> None:
+        assert FOOTER_SUFFIX_SEP not in debug.debug_footer(shard_id=0)
+
+    def test_the_mark_leads_the_first_line_only(self) -> None:
+        """_strip_debug_suffix cuts from the mark, so a second one on the counts
+        line would leave that line behind on a --disable."""
+        footer = debug.debug_footer(
+            span=self._span(), shard_id=0, runtime=self._snapshot()
+        )
+        assert footer.count(debug._DEBUG_MARK) == 1
+        assert debug._strip_debug_suffix(f"base{FOOTER_SUFFIX_SEP}{footer}") == "base"
 
 
 class TestContainerMetrics:

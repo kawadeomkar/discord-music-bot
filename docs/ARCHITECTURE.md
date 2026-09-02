@@ -1618,6 +1618,14 @@ Rules each seam encodes:
   read as one paragraph. The break is written only when there is a base to separate
   from, comes off with the suffix when a `--disable` strips it, and survives a
   near-limit footer because the clip falls on the base.
+- **The suffix itself is two lines**: where the request ran (environment, elapsed-ms,
+  shard, and the sampler's cpu/mem/lag), then what it counted (tasks, pool workers,
+  and the trace id). `debug_footer` writes that break for the same reason the one
+  above exists — left to Discord the wrap lands mid-segment, and a 32-hex trace id
+  makes it certain on any card. Only the first line carries the mark, since
+  `_strip_debug_suffix` cuts from there and a second one would strand the counts.
+  A line absent leaves no break behind: a card with no snapshot and no span is one
+  line, and the dashboards' string form is one line plus its counts.
 
 `RuntimeSampler` feeds the runtime segments on the NP tick's cadence
 (`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is

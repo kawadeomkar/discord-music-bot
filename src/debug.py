@@ -210,27 +210,33 @@ def debug_footer(
     absent case: a send outside any command has no elapsed time, a DM has no shard,
     an unsampled span has no trace id, and the runtime segment is absent until the
     sampler's first tick.
+
+    Two lines: where the request ran, then what it counted. The break is written
+    here rather than left to Discord, which wraps at the card's width and so lands
+    mid-segment — the 32-hex trace id makes that certain on any card.
     """
-    parts: list[str] = []
+    where: list[str] = []
+    counts: list[str] = []
     if not skip_environment:
-        parts.append(config.ENVIRONMENT)
+        where.append(config.ENVIRONMENT)
     if elapsed_ms is not None:
-        parts.append(f"{round(elapsed_ms)} ms")
+        where.append(f"{round(elapsed_ms)} ms")
     if shard_id is not None:
-        parts.append(f"shard {shard_id}")
+        where.append(f"shard {shard_id}")
     if runtime is not None:
         if runtime.cpu_percent is not None:
-            parts.append(f"cpu {runtime.cpu_percent:.0f}%")
+            where.append(f"cpu {runtime.cpu_percent:.0f}%")
         if runtime.mem_percent is not None:
-            parts.append(f"mem {runtime.mem_percent:.0f}%")
-        parts.append(f"lag {runtime.lag_ms:.1f} ms")
-        parts.append(f"tasks {runtime.tasks}")
-        parts.append(f"pool {runtime.pool_workers}")
+            where.append(f"mem {runtime.mem_percent:.0f}%")
+        where.append(f"lag {runtime.lag_ms:.1f} ms")
+        counts.append(f"tasks {runtime.tasks}")
+        counts.append(f"pool {runtime.pool_workers}")
     if not skip_trace and span is not None and (trace_id := trace_id_of(span)):
-        parts.append(f"trace {trace_id}")
-    if not parts:
+        counts.append(f"trace {trace_id}")
+    lines = [" · ".join(line) for line in (where, counts) if line]
+    if not lines:
         return ""
-    return f"{_DEBUG_MARK} " + " · ".join(parts)
+    return f"{_DEBUG_MARK} " + FOOTER_SUFFIX_SEP.join(lines)
 
 
 def _strip_debug_suffix(text: str) -> str:
