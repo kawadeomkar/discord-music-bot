@@ -213,7 +213,7 @@ just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment cons
 just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~35s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
-just container-test # build test image, run suite inside it       ~1min
+just container-test # build test image, run suite inside it (spec cache OFF) ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
 # Test selection (args forward to pytest). ANY argument means a subset run, so
@@ -1035,7 +1035,11 @@ touch Discord; a caller with no Redis write to make passes an empty body.
   built through the spec cache `tests/conftest.py` installs at import — so **a spec
   class must not be mutated once it has been used as a spec** (`functools.wraps` on
   the replacement keeps a class-level patch payload-neutral). It is the one file
-  outside `src/` the coverage gate measures. See
+  outside `src/` the coverage gate measures. **The container tier runs with the cache
+  OFF** (`MOCK_SPEC_CACHE_DISABLE=1` in the Dockerfile's test stage), so
+  `container-test` is a reference run against stock `unittest.mock` and the two tiers
+  disagree if the cache ever answers what upstream would not; the cache's own tests
+  skip themselves there and run in the venv tier. See
   `docs/ARCHITECTURE.md#the-mock-spec-cache`.
   **fakeredis executes every stream command the outbox uses and gets five of them
   wrong**, all in the safe-looking direction (green tests, broken production): the
@@ -1095,7 +1099,8 @@ major.minor.patch, so every merge moves it. Nothing else enforces the per-PR bum
 from `build`'s `needs`: a job `if`-skipped on push would skip `build` with it, and it
 blocks a merge only once branch protection lists it as required) → **lint**
 (justfile fmt/parse, pin agreement, ruff, pyright) and **test** (coverage + PR comment) and **container-test**
-(suite inside the test image; deliberately runs with a read-only token — it executes PR
+(suite inside the test image, with the mock spec cache OFF so it is the reference run
+against stock `unittest.mock`; deliberately runs with a read-only token — it executes PR
 code) and **pg-integration** (the `pg` tier against a postgres service container) and
 **redis-integration** (the `redis` tier against a redis service container) — both real
 merge gates, `build` needs them → **build** (runtime stage; on branches it only validates the build; on main it
