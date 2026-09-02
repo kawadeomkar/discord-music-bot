@@ -381,7 +381,10 @@ class TestLeaderboardCommand:
     ) -> None:
         archive = _fake_archive(_board([_requester(1)]))
         music_bot.history_archive = archive
-        with patch("src.musicbot.time.time", return_value=1_000_000.0):
+        # The module the BODY resolves the name in. Patching it anywhere else
+        # happens to work -- attribute assignment mutates the one shared time
+        # module -- so a wrong target here passes without constraining anything.
+        with patch("src.commands.leaderboard.time.time", return_value=1_000_000.0):
             await command_callback(MusicBot.leaderboard)(
                 music_bot, mock_ctx, flags=_lb_flags(days=30)
             )
