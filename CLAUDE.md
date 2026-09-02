@@ -98,7 +98,7 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    never creates the group, and a mis-shaped key is inert — downgraded to a startup
    warning by the leftover-outbox probe.)
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces eight pairs and one name — it is a dep of `check` and CI also runs it as
+   enforces eight pairs, one name and one list — it is a dep of `check` and CI also runs it as
    its own step, deliberately: Dependabot's `pip` and `pre-commit` ecosystems open
    SEPARATE PRs that each move one half, and those PRs are validated by CI and never
    by a local `check`.
@@ -122,6 +122,10 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    Dockerfile names it twice, so a count lets a typo in either hide behind the other.
    Poetry IGNORES an unknown extra, so drift builds green and ships an image whose
    charts are silently absent. See `docs/ARCHITECTURE.md#the-charts-extra`.
+   The **list** is the pre-push gate: `check`'s dependency list ↔ the five
+   `entry: just <recipe>` pre-push hooks in `.pre-commit-config.yaml`, the same
+   recipes in the same order. Drift runs one way and reports green — a step added to
+   `check` alone simply stops running on push.
    **Four pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
@@ -1061,13 +1065,17 @@ touch Discord; a caller with no Redis write to make passes an empty body.
 - Run `just check` before pushing (the pre-push hook runs it). It is the contract for
   CI's lint and test jobs but NOT the whole pipeline: `just ci` adds the container job
   and both integration tiers; the runtime-image build and pip-audit run only in CI.
-  `check` is a plain dependency list of six — `fmt-justfile pins fmt-check lint types
-  test` — run in order, so it stops at the first failure. The four cheap ones cost
-  ~1.3s combined, which is what lets the pre-push hook give them a status line each
-  (pre-commit renders one line per hook, runs hooks sequentially, and buffers a hook's
-  output until it exits, so line count is hook count). CI invokes `lint`/`types`/`test`
-  individually rather than calling `check`, so its jobs fail independently of this
-  ordering.
+  `check` is a plain dependency list of five — `fmt-justfile pins fmt-check lint
+  check-heavy` — whose first four run in order and stop at the first failure.
+  `check-heavy` is the exception: it runs `types` and `test` concurrently and reports
+  both outcomes, so a pyright failure no longer hides what pytest would have said.
+  The four cheap ones cost ~1.3s combined, which is what lets the pre-push hook give
+  them a status line each (pre-commit renders one line per hook, runs hooks
+  sequentially, and buffers a hook's output until it exits, so line count is hook
+  count); fusing exactly the two slow ones is what keeps that affordable. The five
+  pre-push hooks mirror those five dependencies in order and `just pins` asserts it.
+  CI invokes `lint`/`types`/`test` individually rather than calling `check`, so its
+  jobs fail independently of this ordering.
 - Warnings are errors (see golden rule 11). `ENVIRONMENT` is read from the environment
   alone at import (default `development`), so collection runs no git subprocess and a
   detached worktree needs nothing set.

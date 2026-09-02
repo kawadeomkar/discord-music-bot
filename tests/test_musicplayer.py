@@ -2473,8 +2473,11 @@ class TestBuildNowPlayingEmbed:
         mock_song.start_offset = 60
         mock_song.elapsed_secs = 30.0
         embed = music_player._build_now_playing_embed(mock_song)
-        assert fmt_duration(90) in described(embed)
-        assert fmt_duration(30) not in described(embed)
+        # Scoped to the bar line for the same reason as the position-override
+        # test: "0:30" is a substring of "10:30 PM PST".
+        bar_line = next(line for line in described(embed).splitlines() if "🔘" in line)
+        assert fmt_duration(90) in bar_line
+        assert fmt_duration(30) not in bar_line
 
 
 class TestBuildPauseConfirmationEmbed:
@@ -5682,8 +5685,11 @@ class TestFinalizeNowPlaying:
 
         message.edit.assert_awaited_once()
         embed = message.edit.call_args.kwargs["embeds"][0]
-        assert fmt_duration(210) in embed.description
-        assert fmt_duration(184) not in embed.description
+        # Scoped to the bar line: the description also carries "Estimated finish:
+        # <wall clock>", and "3:04" is a substring of "3:04 AM PDT".
+        bar_line = next(line for line in described(embed).splitlines() if "🔘" in line)
+        assert fmt_duration(210) in bar_line
+        assert fmt_duration(184) not in bar_line
 
     async def test_noop_when_duration_unknown(
         self, music_player: MusicPlayer, mock_song: MagicMock
