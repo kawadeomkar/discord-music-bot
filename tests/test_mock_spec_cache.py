@@ -24,6 +24,7 @@ from unittest.mock import (
     NonCallableMagicMock,
     NonCallableMock,
     create_autospec,
+    patch,
 )
 
 import discord
@@ -449,6 +450,87 @@ class TestSignatureGuard:
             mock_spec_cache._capture(mock_spec_cache._cached_add_spec)
 
 
+class TestSpecSetIndependence:
+    """The cache key holds neither `spec_set` nor its effect, because upstream
+    reads it only to store it. `_recompute` probes both arms so a release where
+    that stops being true fails instead of serving one arm's answer for both."""
+
+    def test_both_spec_set_arms_share_one_entry(self, isolated_cache: None) -> None:
+        class Probe:
+            alpha = 1
+
+        strict = MagicMock(spec_set=Probe)
+        loose = MagicMock(spec=Probe)
+
+        # Upstream normalises spec_set to a bool before it reaches the field,
+        # so the two arms differ here while sharing one introspection.
+        assert strict.__dict__["_spec_set"] is True
+        assert loose.__dict__["_spec_set"] is None
+        assert len(mock_spec_cache._CACHE[Probe]) == 1
+
+    def test_rejects_a_payload_that_depends_on_spec_set(
+        self, monkeypatch: pytest.MonkeyPatch, isolated_cache: None
+    ) -> None:
+        """A conditional write is the shape a single-point probe would miss: the
+        old probe only ever passed spec_set=False, so an upstream branch keyed on
+        it was never observed, never replayed, and still ran on the delegated
+        path."""
+        original = mock_spec_cache._ORIG_ADD_SPEC
+
+        def asyncs_depend_on_spec_set(
+            self: Any,
+            spec: Any,
+            spec_set: Any,
+            _spec_as_instance: bool = False,
+            _eat_self: bool = False,
+        ) -> None:
+            original(self, spec, spec_set, _spec_as_instance, _eat_self)
+            if spec_set:
+                self.__dict__["_spec_asyncs"] = ["alpha"]
+
+        monkeypatch.setattr(
+            mock_spec_cache, "_ORIG_ADD_SPEC", asyncs_depend_on_spec_set
+        )
+
+        class Probe:
+            alpha = 1
+
+        with pytest.raises(RuntimeError, match="spec_set"):
+            mock_spec_cache._recompute(Probe, False, True)
+
+
+class TestStrictMode:
+    """MOCK_SPEC_CACHE_STRICT re-checks each entry where it is served, which is
+    the only point that sees a mutation reverted before the session ends."""
+
+    def test_raises_at_the_mock_that_reads_the_stale_entry(
+        self, monkeypatch: pytest.MonkeyPatch, isolated_cache: None
+    ) -> None:
+        class Probe:
+            async def handler(self) -> None: ...
+
+        MagicMock(spec=Probe)  # fills the entry from the clean class
+        monkeypatch.setattr(mock_spec_cache, "_STRICT", True)
+
+        with patch.object(Probe, "handler", MagicMock()):
+            with pytest.raises(AssertionError, match="served stale data") as exc:
+                MagicMock(spec=Probe)
+
+        assert "handler (on Probe)" in str(exc.value)
+        assert "test_raises_at_the_mock_that_reads_the_stale_entry" in str(exc.value)
+
+    def test_stays_quiet_while_the_cache_is_true(
+        self, monkeypatch: pytest.MonkeyPatch, isolated_cache: None
+    ) -> None:
+        class Probe:
+            alpha = 1
+
+        monkeypatch.setattr(mock_spec_cache, "_STRICT", True)
+
+        MagicMock(spec=Probe)
+        MagicMock(spec=Probe)  # served from cache, verified, no raise
+
+
 class TestDriftDetection:
     """The cache is keyed on class identity but its payload is derived from the
     class's mutable state. `check_for_drift()` is what converts that from a
@@ -468,7 +550,7 @@ class TestDriftDetection:
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
         assert "Probe" in drift[0]
-        assert "_mock_methods: gained ['beta']" in drift[0]
+        assert "_mock_methods: gained ['beta (on Probe)']" in drift[0]
 
     def test_a_removed_attribute_is_reported(self, isolated_cache: None) -> None:
         class Probe:
@@ -480,7 +562,7 @@ class TestDriftDetection:
 
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
-        assert "_mock_methods: lost ['beta']" in drift[0]
+        assert "_mock_methods: lost ['beta (on ?)']" in drift[0]
 
     def test_a_sync_method_swapped_for_an_async_one_is_reported(
         self, isolated_cache: None
@@ -500,7 +582,7 @@ class TestDriftDetection:
 
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
-        assert "_spec_asyncs: gained ['handler']" in drift[0]
+        assert "_spec_asyncs: gained ['handler (on Probe)']" in drift[0]
 
     def test_a_changed_signature_is_reported(self, isolated_cache: None) -> None:
         class Probe:
@@ -526,6 +608,63 @@ class TestDriftDetection:
         MagicMock(spec=MusicContext)
 
         assert mock_spec_cache.check_for_drift() == []
+
+    def test_a_reverted_mutation_is_invisible_here(self, isolated_cache: None) -> None:
+        """The bound on this check, asserted so it stays a known one.
+
+        It compares against the class as it stands now, so a `patch.object` that
+        has already exited leaves nothing to differ — even though every mock
+        built inside the block came from the pre-mutation snapshot. Strict mode
+        below is what covers this ordering."""
+
+        class Probe:
+            async def handler(self) -> None: ...
+
+        MagicMock(spec=Probe)  # fills the entry from the clean class
+        with patch.object(Probe, "handler", MagicMock()):
+            served = MagicMock(spec=Probe)
+            assert "handler" in served.__dict__["_spec_asyncs"]
+            assert mock_spec_cache._recompute(Probe, False, True)[2] == ()
+
+        assert mock_spec_cache.check_for_drift() == []
+
+    def test_drift_names_the_class_that_supplies_the_attribute(
+        self, isolated_cache: None
+    ) -> None:
+        """The entry is keyed on the spec, but the mutation is often on a base.
+        A line naming only the spec sends the reader grepping for a patch of the
+        subclass that was never written."""
+
+        class Base:
+            def handler(self) -> None: ...
+
+        class Derived(Base): ...
+
+        MagicMock(spec=Derived)
+
+        async def handler(self: Any) -> None: ...
+
+        Base.handler = handler  # pyright: ignore[reportAttributeAccessIssue]
+
+        drift = mock_spec_cache.check_for_drift()
+        assert len(drift) == 1
+        assert "Derived" in drift[0]
+        assert "handler (on Base)" in drift[0]
+
+    def test_drift_names_the_test_that_filled_the_entry(
+        self, isolated_cache: None
+    ) -> None:
+        """Bounds the search: everything between that test and the mutation."""
+
+        class Probe:
+            alpha = 1
+
+        MagicMock(spec=Probe)
+        Probe.beta = 2  # pyright: ignore[reportAttributeAccessIssue]
+
+        drift = mock_spec_cache.check_for_drift()
+        assert len(drift) == 1
+        assert "test_drift_names_the_test_that_filled_the_entry" in drift[0]
 
     def test_the_check_does_not_itself_touch_the_cache(self) -> None:
         MagicMock(spec=discord.Guild)

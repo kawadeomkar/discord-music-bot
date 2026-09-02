@@ -46,8 +46,11 @@ Two functions are replaced:
 answers from the snapshot it took the first time it saw the class, so a
 `patch.object`/`monkeypatch.setattr` on a spec class makes every later mock of it
 silently wrong — and, because the entry outlives the `with` block, wrong for the
-rest of the process. `check_for_drift()` turns that into a named failure at the
-end of the session; `tests/conftest.py` is what calls it.
+rest of the process. `check_for_drift()` reports an entry whose class still
+differs when the session ends; `tests/conftest.py` is what calls it. A mutation
+reverted before then leaves nothing to compare against, so it is invisible there:
+`MOCK_SPEC_CACHE_STRICT=1` re-checks each entry where it is served and raises at
+that mock instead.
 
 This reads private `unittest.mock` internals, so `install()` asserts the two
 signatures it depends on and `_recompute()` asserts the exact set of `__dict__`
@@ -58,6 +61,7 @@ subprocess check against an unpatched interpreter.
 from __future__ import annotations
 
 import inspect
+import os
 from collections.abc import Callable, MutableMapping
 from typing import Any
 from unittest.mock import MagicMixin, NonCallableMock
@@ -100,6 +104,16 @@ _FIELDS = ("_spec_signature", "_mock_methods", "_spec_asyncs")
 # class per parametrized case does not pin every one of them for the session.
 _CACHE: MutableMapping[type, dict[tuple[bool, bool], _Payload]] = WeakKeyDictionary()
 
+# Which test filled each entry, so a drift line can bound the search that follows
+# it. Kept beside `_CACHE` rather than in the payload: this is read only when
+# something has already gone wrong, and a str cannot pin the weak key.
+_ORIGINS: MutableMapping[type, dict[tuple[bool, bool], str]] = WeakKeyDictionary()
+
+# Recheck every served entry against a fresh introspection and raise where it is
+# used. The session-end check cannot see a mutation that is reverted before it
+# runs; this can, because it looks at the moment the cache answers.
+_STRICT = os.environ.get("MOCK_SPEC_CACHE_STRICT", "") not in ("", "0")
+
 # Everything `_mock_add_spec` writes. Asserted on every miss so that a CPython
 # release which starts writing a sixth key fails loudly instead of having it
 # silently dropped on the cached path while the delegated path still sets it.
@@ -111,31 +125,49 @@ _installed = False
 
 
 def _recompute(spec: type, spec_as_instance: bool, eat_self: bool) -> _Payload:
-    """Run the real introspection for `spec`, bypassing the cache."""
-    # A bare instance is enough: `_mock_add_spec` only writes to `self.__dict__`.
-    probe = NonCallableMock.__new__(NonCallableMock)
-    _ORIG_ADD_SPEC(probe, spec, False, spec_as_instance, eat_self)
-    d = probe.__dict__
+    """Run the real introspection for `spec`, bypassing the cache.
 
-    if d.keys() != _EXPECTED_KEYS:
-        raise RuntimeError(
-            f"unittest.mock._mock_add_spec now writes {sorted(d)}, expected "
-            f"{sorted(_EXPECTED_KEYS)}. tests/mock_spec_cache.py replays a fixed "
-            "set of fields and must be updated for this Python version before the "
-            "suite can be trusted."
-        )
-    if d["_spec_class"] is not spec:
-        raise RuntimeError(
-            f"unittest.mock._mock_add_spec set _spec_class to {d['_spec_class']!r} "
-            f"for the class spec {spec!r}. tests/mock_spec_cache.py relies on "
-            "these being the same object and must be updated."
+    Probes both `spec_set` values because the cache key holds neither: the
+    payload is only allowed to depend on `(spec, _spec_as_instance, _eat_self)`,
+    and a release where `spec_set` reaches the introspection has to fail here
+    rather than serve one arm's answer for both.
+    """
+    seen: list[_Payload] = []
+    for spec_set in (False, True):
+        # A bare instance is enough: `_mock_add_spec` only writes to `self.__dict__`.
+        probe = NonCallableMock.__new__(NonCallableMock)
+        _ORIG_ADD_SPEC(probe, spec, spec_set, spec_as_instance, eat_self)
+        d = probe.__dict__
+
+        if d.keys() != _EXPECTED_KEYS:
+            raise RuntimeError(
+                f"unittest.mock._mock_add_spec now writes {sorted(d)}, expected "
+                f"{sorted(_EXPECTED_KEYS)}. tests/mock_spec_cache.py replays a fixed "
+                "set of fields and must be updated for this Python version before the "
+                "suite can be trusted."
+            )
+        if d["_spec_class"] is not spec:
+            raise RuntimeError(
+                f"unittest.mock._mock_add_spec set _spec_class to {d['_spec_class']!r} "
+                f"for the class spec {spec!r}. tests/mock_spec_cache.py relies on "
+                "these being the same object and must be updated."
+            )
+
+        seen.append(
+            (
+                d["_spec_signature"],
+                tuple(d["_mock_methods"]),
+                tuple(d["_spec_asyncs"]),
+            )
         )
 
-    return (
-        d["_spec_signature"],
-        tuple(d["_mock_methods"]),
-        tuple(d["_spec_asyncs"]),
-    )
+    if _comparable(seen[0]) != _comparable(seen[1]):
+        raise RuntimeError(
+            f"unittest.mock._mock_add_spec now derives different introspection for "
+            f"spec_set=False and spec_set=True on {spec!r}. tests/mock_spec_cache.py "
+            "keys the cache on neither and must be updated for this Python version."
+        )
+    return seen[0]
 
 
 def _payload(spec: type, spec_as_instance: bool, eat_self: bool) -> _Payload:
@@ -152,6 +184,9 @@ def _payload(spec: type, spec_as_instance: bool, eat_self: bool) -> _Payload:
 
     computed = _recompute(spec, spec_as_instance, eat_self)
     by_variant[variant] = computed
+    _ORIGINS.setdefault(spec, {})[variant] = os.environ.get(
+        "PYTEST_CURRENT_TEST", "collection"
+    )
     return computed
 
 
@@ -178,7 +213,10 @@ def _cached_add_spec(
         _ORIG_ADD_SPEC(self, spec, spec_set, _spec_as_instance, _eat_self)
         return
 
-    signature, methods, asyncs = _payload(spec, _spec_as_instance, _eat_self)
+    cached = _payload(spec, _spec_as_instance, _eat_self)
+    if _STRICT:
+        _verify_now(spec, _spec_as_instance, _eat_self, cached)
+    signature, methods, asyncs = cached
     d = self.__dict__
     # Both taken from the live arguments rather than the cache: `_spec_class` is
     # `spec` by construction (asserted in `_recompute`), and the same class can be
@@ -221,11 +259,28 @@ def _seeded_magic_init(self: MagicMixin, /, *args: Any, **kw: Any) -> None:
     _ORIG_MAGIC_INIT(self, *args, **kw)
 
 
-def _describe(field: str, cached: Any, fresh: Any) -> str:
-    """One human-readable line explaining how a cached field went stale."""
+def _owner(spec: type, attr: str) -> str:
+    """Which class in the MRO supplies `attr`, or "?" once nothing does."""
+    for klass in spec.__mro__:
+        if attr in vars(klass):
+            return klass.__name__
+    return "?"
+
+
+def _describe(spec: type, field: str, cached: Any, fresh: Any) -> str:
+    """One human-readable line explaining how a cached field went stale.
+
+    Each attribute carries the class that supplies it. The entry is keyed on the
+    spec, but the mutation is often on a base, and a line naming only the spec
+    sends the reader grepping for a patch of the subclass that does not exist.
+    """
     if isinstance(cached, tuple) and isinstance(fresh, tuple):
-        gained = sorted(set(fresh) - set(cached))
-        lost = sorted(set(cached) - set(fresh))
+
+        def _named(names: list[str]) -> list[str]:
+            return [f"{n} (on {_owner(spec, n)})" for n in names]
+
+        gained = _named(sorted(set(fresh) - set(cached)))
+        lost = _named(sorted(set(cached) - set(fresh)))
         changes = []
         if gained:
             changes.append(f"gained {gained}")
@@ -258,29 +313,53 @@ def check_for_drift() -> list[str]:
     resolves, and a method swapped between sync and async flips `_spec_asyncs`
     the wrong way. All of it is silent, and under `-n 8` it is worker-dependent.
 
-    Recomputing the whole cache costs one `dir()` walk per entry (~15ms for a
-    full run), so the session can simply check at the end that it was never
-    lied to. Returns an empty list when the cache is still true.
+    Recomputing the whole cache costs one `dir()` walk per entry, so the session
+    can check at the end that it was never lied to. It compares against the class
+    as it stands then, so it sees a mutation that is still in force and not one
+    that has been reverted — `MOCK_SPEC_CACHE_STRICT=1` covers the second.
+    Returns an empty list when the cache is still true.
     """
     problems: list[str] = []
     # list(): a weak cache can drop entries mid-iteration if a GC runs.
     for spec, by_variant in list(_CACHE.items()):
-        for (spec_as_instance, eat_self), cached in list(by_variant.items()):
-            fresh = _recompute(spec, spec_as_instance, eat_self)
-            old, new = _comparable(cached), _comparable(fresh)
-            if old == new:
-                continue
-            diffs = "; ".join(
-                _describe(field, a, b)
-                for field, a, b in zip(_FIELDS, old, new)
-                if a != b
-            )
-            problems.append(
-                f"{spec.__module__}.{spec.__qualname__} "
-                f"(_spec_as_instance={spec_as_instance}, _eat_self={eat_self}): "
-                f"{diffs}"
-            )
+        for variant, cached in list(by_variant.items()):
+            problem = _diff(spec, variant, cached)
+            if problem is not None:
+                problems.append(problem)
     return problems
+
+
+def _diff(spec: type, variant: tuple[bool, bool], cached: _Payload) -> str | None:
+    """One drift line for a single entry, or None when it still matches."""
+    spec_as_instance, eat_self = variant
+    fresh = _recompute(spec, spec_as_instance, eat_self)
+    old, new = _comparable(cached), _comparable(fresh)
+    if old == new:
+        return None
+    diffs = "; ".join(
+        _describe(spec, field, a, b) for field, a, b in zip(_FIELDS, old, new) if a != b
+    )
+    origin = _ORIGINS.get(spec, {}).get(variant, "an unrecorded point")
+    return (
+        f"{spec.__module__}.{spec.__qualname__} "
+        f"(_spec_as_instance={spec_as_instance}, _eat_self={eat_self}): "
+        f"{diffs} [entry first cached during {origin}]"
+    )
+
+
+def _verify_now(
+    spec: type, spec_as_instance: bool, eat_self: bool, cached: _Payload
+) -> None:
+    """Raise where a stale entry is served, naming the test that is reading it."""
+    problem = _diff(spec, (spec_as_instance, eat_self), cached)
+    if problem is None:
+        return
+    here = os.environ.get("PYTEST_CURRENT_TEST", "an unrecorded point")
+    raise AssertionError(
+        f"mock spec cache served stale data for {spec!r} during {here}. "
+        f"The spec class was mutated after this entry was cached, so this mock "
+        f"does not match the class it specs.\n  {problem}"
+    )
 
 
 def _assert_signature(

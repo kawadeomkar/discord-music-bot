@@ -146,18 +146,18 @@ async def close_shared_http_sessions(
 
 @pytest.fixture(autouse=True, scope="session")
 def fail_on_stale_mock_spec_cache() -> Iterator[None]:
-    """Fail the run if a spec class was mutated after its first spec'd mock.
+    """Fail the run if a spec class is still mutated at the end of the session.
 
     The cache snapshots `dir(spec)` the first time it sees a class and answers
-    from that snapshot for the rest of the process. A `patch.object` or
-    `monkeypatch.setattr` on a spec class therefore poisons every later mock of
-    it — and keeps poisoning them after the `with` block restores the class,
-    because nothing invalidates the entry. The failure is silent (a mock that is
-    subtly wrong, not one that raises) and under `-n 8` it depends on which
-    worker happened to run the mutating test.
+    from that snapshot for the rest of the process, so a `patch.object` or
+    `monkeypatch.setattr` on a spec class poisons every later mock of it. The
+    failure is silent — a mock that is subtly wrong, not one that raises.
 
-    Recomputing every entry costs one `dir()` walk each, ~15ms for a full run.
-    See `check_for_drift` in tests/mock_spec_cache.py.
+    This compares each entry against its class as it stands now, which catches a
+    mutation that outlived the run and not one already reverted. Set
+    MOCK_SPEC_CACHE_STRICT=1 to check where each entry is served instead; that
+    covers the reverted case and names the test holding the patch, at the cost of
+    the cache's speedup. See `check_for_drift` in tests/mock_spec_cache.py.
     """
     yield
     drift = check_for_drift()
