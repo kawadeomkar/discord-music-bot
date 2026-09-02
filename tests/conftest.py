@@ -13,6 +13,8 @@ import aiohttp
 import discord
 import fakeredis
 import pytest
+
+from src import play_pipeline
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -26,7 +28,7 @@ from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
-from tests.helpers import noop_ffmpeg_init, tier_enabled
+from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
 
 # Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
 # is first imported, so a per-test setenv would lose the race with whichever test
@@ -355,7 +357,12 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
     bot.history_drainer = MagicMock()
-    # No create_task mock needed — MusicPlayer.start() is never called in tests
+    # start() IS reached now: a command wrapper resolves its player as an argument,
+    # so get_mp() runs on every path including the early returns a body used to take
+    # before it. Without this the loop() coroutine is created, never scheduled by the
+    # mock, and finalized by the GC — a "never awaited" warning that filterwarnings
+    # turns into a failure on whichever test the collection lands in.
+    bot.loop.create_task = stub_create_task()
     return bot
 
 
@@ -489,7 +496,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.spotify = MagicMock(spec=Spotify)
     cog.spotify.client_id = "cid"
     cog.spotify.client_secret = "secret"
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     # None, not a mock: this fixture builds the cog without __init__, so an unset
     # attribute raises AttributeError rather than returning None. Tests that care
@@ -537,7 +544,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.spotify = MagicMock(spec=Spotify)
     cog.spotify.client_id = "cid"
     cog.spotify.client_secret = "secret"
-    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
     # None, not a mock, and set explicitly: this fixture builds the cog without
     # __init__, and _debug_inputs reads history_archive — left unset it would be an
@@ -553,3 +560,20 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
     return cog
+
+
+_PLAY_STAGES = ("queue_source", "enqueue_single", "enqueue_playlist")
+
+
+@pytest.fixture(autouse=True)
+def _restore_play_stages() -> Iterator[None]:
+    """Put the pipeline's stage functions back after a test stubs them.
+
+    They are module globals, so an assignment outlives the test that made it and the
+    next one runs against the previous one's mock. Here rather than in one test file
+    because -play, -playnow and the pipeline's own tests all stub them.
+    """
+    saved = {name: getattr(play_pipeline, name) for name in _PLAY_STAGES}
+    yield
+    for name, fn in saved.items():
+        setattr(play_pipeline, name, fn)

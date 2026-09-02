@@ -273,7 +273,9 @@ class TestPingCommand:
         redis_spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
 
         with (
-            patch("src.musicbot.send_latency_line", new=AsyncMock()) as latency_line,
+            patch(
+                "src.commands.join.send_latency_line", new=AsyncMock()
+            ) as latency_line,
             patch("src.ping.probe_redis", new=redis_spy),
         ):
             await command_callback(MusicBot.join)(music_bot, mock_ctx)
@@ -286,7 +288,7 @@ class TestPingReportsSpotifySource:
     """End-to-end: the Spotify row reports the *source's* startup state — never
     configured, configured-but-rejected, or live — so a user can see why Spotify
     links are declined without reading the logs. probe_spotify is left unpatched
-    here: the cog's _spotify_status is what is under test."""
+    here: the cog's spotify_status is what is under test."""
 
     def _patch_everything_but_spotify(self) -> Any:
         async def _make(res: ProbeResult) -> ProbeResult:
@@ -316,7 +318,7 @@ class TestPingReportsSpotifySource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         latency = await self._run(music_bot, mock_ctx)
         assert "Spotify API" in latency
         assert "n/a (not configured)" in latency
@@ -326,7 +328,7 @@ class TestPingReportsSpotifySource:
     ) -> None:
         """The startup probe found the credentials invalid: the row is red and
         names the cause rather than reporting a generic outage."""
-        music_bot._spotify_status = SpotifyStatus.INVALID
+        music_bot.spotify_status = SpotifyStatus.INVALID
         latency = await self._run(music_bot, mock_ctx)
         assert "down (credentials rejected)" in latency
 
@@ -334,7 +336,7 @@ class TestPingReportsSpotifySource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mocked(music_bot.spotify).http_call = AsyncMock(return_value={"x": 1})
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         latency = await self._run(music_bot, mock_ctx)
         assert "ms" in latency
         assert "rejected" not in latency and "not configured" not in latency
@@ -434,7 +436,8 @@ class TestDebugFooterOnTheBoard:
         )
         footer = embed.footer.text or ""
         assert footer.startswith("environment:")
-        assert footer.endswith("🐞 shard 0 · cpu 9%")
+        assert footer.endswith("\n🐞 shard 0 · cpu 9%")
+        assert "environment:" in footer.split("\n")[0]
 
     def test_no_suffix_leaves_the_footer_alone(self) -> None:
         embed = render_ping_embed(

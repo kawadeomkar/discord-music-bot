@@ -7,7 +7,10 @@ from collections.abc import AsyncGenerator, Coroutine
 import discord
 import structlog
 from discord.ext import commands
-from opentelemetry.trace import Span, StatusCode
+from opentelemetry.trace import Span, SpanContext, StatusCode, get_current_span
+from opentelemetry.trace.propagation.tracecontext import (
+    TraceContextTextMapPropagator,
+)
 
 
 def queue_message(songs: list[str]) -> str:
@@ -30,6 +33,32 @@ def trace_footer(span: Span) -> Optional[str]:
     """Return an embed-footer string identifying the current trace, or None if untraced."""
     trace_id = trace_id_of(span)
     return f"trace: {trace_id}" if trace_id else None
+
+
+_TRACE_PROPAGATOR: Final = TraceContextTextMapPropagator()
+
+
+def current_traceparent() -> str:
+    """The current span as a W3C traceparent, or "" when nothing is being traced.
+
+    The is_valid check is here because inject() skips only a context that equals
+    INVALID_SPAN_CONTEXT."""
+    if not get_current_span().get_span_context().is_valid:
+        return ""
+    carrier: dict[str, str] = {}
+    _TRACE_PROPAGATOR.inject(carrier)
+    return carrier.get("traceparent", "")
+
+
+def traceparent_context(traceparent: str) -> Optional[SpanContext]:
+    """The span a traceparent names, for Span.add_link(). None when the value is
+    absent or unparseable: extract() answers an invalid span rather than raising."""
+    if not traceparent:
+        return None
+    span_ctx = get_current_span(
+        _TRACE_PROPAGATOR.extract({"traceparent": traceparent})
+    ).get_span_context()
+    return span_ctx if span_ctx.is_valid else None
 
 
 async def cancel_task(task: Optional[asyncio.Task]) -> None:
@@ -174,6 +203,10 @@ FOOTER_LIMIT = 2048
 # after the command has already mutated state.
 EMBED_FIELD_LIMIT = 1024
 
+# One row of a multi-row field — ten of these share the budget one echoed needle
+# gets. Passed to safe_label wherever a list of user-supplied titles is rendered.
+ECHO_ROW_MAX = 70
+
 
 # Control characters end a rendered embed line early, hiding whatever follows.
 # Flattened rather than escaped — they have no visible form.
@@ -208,6 +241,26 @@ def truncate(text: str, limit: int) -> str:
 def truncate_embed_title(title: str) -> str:
     """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
     return truncate(title, EMBED_TITLE_LIMIT)
+
+
+# Debug mode's suffix starts a line of its own rather than continuing the embed's
+# own footer. See docs/ARCHITECTURE.md#debug-footer-seams.
+FOOTER_SUFFIX_SEP = "\n"
+
+
+def join_footer(base: str, suffix: str) -> str:
+    """`base` and `suffix` as one footer, the suffix on a line of its own. The break
+    is written only where there are two lines to separate.
+
+    The clip falls on the base, and a suffix leaving no room drops it whole:
+    truncate() to a limit of zero returns an ellipsis on a nearly complete string.
+    """
+    if not (base and suffix):
+        return truncate(suffix or base, FOOTER_LIMIT)
+    room = FOOTER_LIMIT - len(suffix) - len(FOOTER_SUFFIX_SEP)
+    if room <= 0:
+        return truncate(suffix, FOOTER_LIMIT)
+    return f"{truncate(base, room)}{FOOTER_SUFFIX_SEP}{suffix}"
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

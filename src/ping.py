@@ -53,6 +53,7 @@ from src.spotify import Spotify
 from src.util import (
     FOOTER_LIMIT,
     get_logger,
+    join_footer,
     send_embed,
     trace_footer,
     truncate,
@@ -160,7 +161,7 @@ async def probe_spotify(
     spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
 ) -> ProbeResult:
     """Spotify's row: the *source's* usability, not just reachability. `status` (from
-    MusicBot._spotify_status' startup probe) separates "configured but rejected" from
+    MusicBot.spotify_status' startup probe) separates "configured but rejected" from
     "reachable but slow" without spending a doomed API call; it defaults to enabled so a
     caller with no status still gets the plain reachability probe.
     """
@@ -415,9 +416,7 @@ def render_ping_embed(
         footer += " · probing…"
     if (tf := trace_footer(span)) is not None:
         footer += f" · {tf}"
-    if debug_suffix:
-        footer += f" · {debug_suffix}"
-    embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
+    embed.set_footer(text=join_footer(footer, debug_suffix or ""))
     return embed
 
 
@@ -517,7 +516,7 @@ async def run_health_dashboard(
     # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
     # Defaulted, unlike `archive`: None here is a real state (debug mode off, what
-    # MusicBot._debug_suffix returns) rather than an unknown, and forgetting it
+    # MusicBot.debug_suffix returns) rather than an unknown, and forgetting it
     # costs a footer, not a wrong health answer.
     debug_suffix: Optional[str] = None,
 ) -> None:

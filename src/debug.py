@@ -41,10 +41,11 @@ from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth, read_guild_configs
 from src.util import (
-    FOOTER_LIMIT,
+    FOOTER_SUFFIX_SEP,
     cancel_task,
     fmt_duration,
     get_logger,
+    join_footer,
     trace_footer,
     trace_id_of,
     truncate,
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
     from src.history_archive import ArchiveStats
+
+    # A runtime import would close the cycle (musicbot imports this module); the cog
+    # is only named in annotations. Same guard recovery.py and musicplayer.py use.
     from src.musicplayer import MusicPlayer
     from src.ytdlp_pool import PoolState
 
@@ -127,8 +131,8 @@ _OPERATOR_NOTICE = (
     "only. Run `-ping` for dependency health."
 )
 
-# Discord's hard cap on an embed field value; FOOTER_LIMIT is its footer sibling,
-# imported from util.py above.
+# Discord's hard cap on an embed field value; util.py's FOOTER_LIMIT is its footer
+# sibling.
 _FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
@@ -196,44 +200,53 @@ def debug_footer(
     elapsed_ms: Optional[float] = None,
     shard_id: Optional[int] = None,
     runtime: Optional[RuntimeSnapshot] = None,
+    skip_environment: bool = False,
     skip_trace: bool = False,
 ) -> str:
     """The debug suffix, or "" when nothing is known worth showing.
 
-    Every part is optional because every part has an absent case: a send outside
-    any command has no elapsed time, a DM has no shard, an unsampled span has no
-    trace id, and the runtime segment is absent until the sampler's first tick.
+    The environment leads and comes from config — it is a property of the process,
+    not of the request. Every other part is optional because every other part has an
+    absent case: a send outside any command has no elapsed time, a DM has no shard,
+    an unsampled span has no trace id, and the runtime segment is absent until the
+    sampler's first tick.
+
+    Two lines: where the request ran, then what it counted. The break is written
+    here rather than left to Discord, which wraps at the card's width and so lands
+    mid-segment — the 32-hex trace id makes that certain on any card.
     """
-    parts: list[str] = []
+    where: list[str] = []
+    counts: list[str] = []
+    if not skip_environment:
+        where.append(config.ENVIRONMENT)
     if elapsed_ms is not None:
-        parts.append(f"{round(elapsed_ms)} ms")
+        where.append(f"{round(elapsed_ms)} ms")
     if shard_id is not None:
-        parts.append(f"shard {shard_id}")
+        where.append(f"shard {shard_id}")
     if runtime is not None:
         if runtime.cpu_percent is not None:
-            parts.append(f"cpu {runtime.cpu_percent:.0f}%")
+            where.append(f"cpu {runtime.cpu_percent:.0f}%")
         if runtime.mem_percent is not None:
-            parts.append(f"mem {runtime.mem_percent:.0f}%")
-        parts.append(f"lag {runtime.lag_ms:.1f} ms")
-        parts.append(f"tasks {runtime.tasks}")
-        parts.append(f"pool {runtime.pool_workers}")
+            where.append(f"mem {runtime.mem_percent:.0f}%")
+        where.append(f"lag {runtime.lag_ms:.1f} ms")
+        counts.append(f"tasks {runtime.tasks}")
+        counts.append(f"pool {runtime.pool_workers}")
     if not skip_trace and span is not None and (trace_id := trace_id_of(span)):
-        parts.append(f"trace {trace_id}")
-    if not parts:
+        counts.append(f"trace {trace_id}")
+    lines = [" · ".join(line) for line in (where, counts) if line]
+    if not lines:
         return ""
-    return f"{_DEBUG_MARK} " + " · ".join(parts)
+    return f"{_DEBUG_MARK} " + FOOTER_SUFFIX_SEP.join(lines)
 
 
 def _strip_debug_suffix(text: str) -> str:
-    """`text` with any previous debug suffix removed. The first mark is the boundary:
-    no bot-authored footer contains one, so everything from there on is ours —
-    including a doubled suffix written by the pre-idempotency code."""
-    idx = text.find(f" · {_DEBUG_MARK} ")
-    if idx != -1:
-        return text[:idx]
-    if text.startswith(f"{_DEBUG_MARK} "):
-        return ""
-    return text
+    """`text` with any previous debug suffix removed, including the line break before
+    it. The first mark is the boundary — no bot-authored footer contains one, asserted
+    over src/ below — so a doubled suffix heals in one pass."""
+    idx = text.find(_DEBUG_MARK)
+    if idx == -1:
+        return text
+    return text[:idx].removesuffix(FOOTER_SUFFIX_SEP)
 
 
 def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
@@ -260,8 +273,10 @@ def decorate_embeds(
 ) -> None:
     """Write the debug footer onto each embed, in place, replacing a previous suffix
     rather than appending after it. That is what keeps a cached embed sent more than
-    once (`play_message`, re-served by -now) from growing a footer per send. With
-    nothing to show it removes a stale suffix instead of leaving it.
+    once (`play_message`, re-served by -now) from growing a footer per send.
+
+    Every embed reaching here gets a suffix — the environment alone is always worth
+    showing. strip_debug_footers is the removal path.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
@@ -276,22 +291,12 @@ def decorate_embeds(
             # previous suffix must not suppress the fresh one replacing it.
             skip_trace="trace:" in base or "trace " in base,
         )
-        if not suffix and base == existing:
-            continue  # nothing to add, nothing stale to replace
         _write_footer(embed, base, suffix)
 
 
 def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
-    """Join `base` and `suffix` into the footer, clipping the base if the pair does
-    not fit. Clipping the join instead would cut the ` · 🐞 ` boundary off the end,
-    after which _strip_debug_suffix never finds it again and the embed stops
-    accepting a suffix for good.
-    """
-    if base and suffix:
-        # 3 for the " · " separator.
-        text = f"{truncate(base, max(0, FOOTER_LIMIT - len(suffix) - 3))} · {suffix}"
-    else:
-        text = truncate(suffix or base, FOOTER_LIMIT)
+    """Write `base` and `suffix` as the footer, the suffix on its own line."""
+    text = join_footer(base, suffix)
     embed.set_footer(
         text=text or None,
         # Discord rejects an icon with no text, so it goes with the text.
@@ -1774,9 +1779,7 @@ def render_snapshot_embed(
     footer = f"environment: {config.ENVIRONMENT}"
     if (tf := trace_footer(trace.get_current_span())) is not None:
         footer += f" \u00b7 {tf}"
-    if inputs.debug_suffix:
-        footer += f" \u00b7 {inputs.debug_suffix}"
-    embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
+    embed.set_footer(text=join_footer(footer, inputs.debug_suffix or ""))
     return embed
 
 
@@ -1975,12 +1978,40 @@ class DebugSettings:
             debug_footer(
                 shard_id=guild.shard_id if guild else None,
                 runtime=self.snapshot if host_metrics else None,
-                # Both cards already print `trace: <id>` themselves, and the same id
-                # twice reads as two traces. Inert while no span is passed; kept so
-                # adding one later cannot silently double it.
+                # Both cards print `environment: <name>` and `trace: <id>` in their
+                # own footer, and twice in one line reads as two. The trace flag is
+                # inert while no span is passed, and kept so adding one cannot double
+                # it.
+                skip_environment=True,
                 skip_trace=True,
             )
             or None
+        )
+
+    def decorate(
+        self,
+        embeds: Sequence[discord.Embed],
+        guild: Optional[discord.Guild],
+        *,
+        span: Optional[trace.Span] = None,
+        elapsed_ms: Optional[float] = None,
+    ) -> None:
+        """Put debug mode's footer on `embeds`, or take a stale one off. The single
+        entry point for every embed the bot sends: a seam passes only the span it
+        names and, for a command response, its elapsed time.
+
+        Off is a STRIP, not a skip: `play_message` and a host's cached embeds outlive
+        a mid-song `--disable`. See docs/ARCHITECTURE.md#debug-footer-seams.
+        """
+        if not self.enabled(guild.id if guild else None):
+            strip_debug_footers(embeds)
+            return
+        decorate_embeds(
+            embeds,
+            span=span,
+            elapsed_ms=elapsed_ms,
+            shard_id=guild.shard_id if guild else None,
+            runtime=self.snapshot,
         )
 
     # ── Mutations ─────────────────────────────────────────────────────────────
