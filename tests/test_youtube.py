@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import discord
 import orjson
+from opentelemetry import trace as trace_api
 import pytest
 from redis.asyncio import Redis
 from yarl import URL
@@ -29,6 +30,7 @@ from src.youtube import (
     QueueObject,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
+    _cache_stream,
     _UNUSED_INFO_COLLECTIONS,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
@@ -2201,6 +2203,50 @@ class TestSlimInfoReturnContract:
         restored = pickle.loads(pickle.dumps(slim))
         assert restored["url"] == slim["url"]
         assert restored["webpage_url"] == slim["webpage_url"]
+
+    async def test_the_cache_entry_records_the_extraction_that_wrote_it(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Whatever span reaches _cache_stream IS the extraction that minted the URL,
+        so the entry carries its traceparent — the enqueue-time warm, the one-ahead
+        prefetch, or an in-band resolve. That stamp is the only record of where a URL
+        came from once it is serving from cache."""
+        from src.util import traceparent_context
+
+        expire = int(time.time()) + 3600
+        data = cast(
+            Any,
+            {"url": f"https://cdn/v?expire={expire}", "webpage_url": "https://yt/v=1"},
+        )
+        span = trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+        with trace_api.use_span(span, end_on_exit=False):
+            assert await _cache_stream(fake_redis, "ytdl:stream:x", data)
+
+        cached = orjson.loads(cast(Any, await fake_redis.get("ytdl:stream:x")))
+        ctx = traceparent_context(cached["traceparent"])
+        assert ctx is not None
+        assert ctx.trace_id == 0x4BF92F3577B34DA6A3CE929D0E0E4736
+
+    async def test_an_untraced_write_leaves_the_entry_unstamped(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """A cache write outside any span — and every entry written before this
+        field existed. The reader treats an absent key as "nothing to link"."""
+        expire = int(time.time()) + 3600
+        data = cast(
+            Any,
+            {"url": f"https://cdn/v?expire={expire}", "webpage_url": "https://yt/v=2"},
+        )
+        assert await _cache_stream(fake_redis, "ytdl:stream:y", data)
+        cached = orjson.loads(cast(Any, await fake_redis.get("ytdl:stream:y")))
+        assert "traceparent" not in cached
 
     def test_slimmed_info_keeps_every_field_callers_read(self) -> None:
         """No consumed field is lost to slimming. _STREAM_CACHE_FIELDS is the exhaustive
