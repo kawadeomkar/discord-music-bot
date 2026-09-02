@@ -40,7 +40,10 @@ set positional-arguments
 set lazy
 
 IMAGE := "discord-music-bot"
-DOCKER := env('DOCKER', '0')
+# Defaults to 1: recipes run inside the test image so a contributor needs only Docker
+# and just. Pass DOCKER=0 to run natively against the local venv (faster, needs the
+# Python toolchain). See the header note below for which recipes honour this.
+DOCKER := env('DOCKER', '1')
 REPO := justfile_directory()
 
 # Call the venv's binaries directly rather than `poetry run`: poetry re-resolves the
@@ -55,15 +58,22 @@ REPO := justfile_directory()
 # from any subdirectory.
 VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } else { REPO / ".venv/bin" }
 
-# ── Where the tools run: local venv (default) or the test image (DOCKER=1) ────
+# ── Where the tools run: the test image (default) or a local venv (DOCKER=0) ──
 #
-#   just check            native, fast — needs Python, Poetry and the venv
-#   DOCKER=1 just check   same checks inside the image — needs only Docker and just
+#   just check            inside the test image — needs only Docker and just
+#   DOCKER=0 just check   same checks native, fast — needs Python, Poetry and the venv
 #
-# DOCKER=1 exists so the project can be handed to someone with no Python toolchain.
-# The checks are the same commands either way; only the interpreter they run under
-# differs. Note the override must PRECEDE the recipe (`DOCKER=1 just check`, not
-# `just check DOCKER=1` — that is a "recipe not found" error).
+# Docker is the DEFAULT so the project can be handed to someone with no Python
+# toolchain: the checks run with only Docker and just installed. Pass DOCKER=0 to run
+# natively against the local venv instead. The checks are the same commands either
+# way; only the interpreter they run under differs. Note the override must PRECEDE the
+# recipe (`DOCKER=0 just check`, not `just check DOCKER=0` — that is a "recipe not
+# found" error).
+#
+# Automated callers that must mirror CI pin DOCKER=0 so they stay native like CI
+# itself: ci.yml's lint/test jobs, build_common.sh's deploy gate, and all five pre-push
+# hooks. Flip the default here and those pins are what keep them from silently moving
+# into Docker.
 #
 # Mount src/ and tests/ as SUBDIRECTORIES, never the repo root. The image keeps its
 # virtualenv at /app/.venv and puts it on PATH, so mounting over /app would shadow the
@@ -120,8 +130,8 @@ PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { quote(VENV_BIN / 'p
 default:
     @{{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
     @echo ""
-    @echo "Prefix DOCKER=1 to run fmt/lint/types/test inside the test image instead"
-    @echo "of a local venv — requires only Docker and just, no Python or Poetry."
+    @echo "fmt/lint/types/test run inside the test image by DEFAULT (needs only Docker"
+    @echo "and just, no Python or Poetry). Prefix DOCKER=0 to run against a local venv."
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
