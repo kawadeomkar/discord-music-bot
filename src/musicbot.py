@@ -293,12 +293,12 @@ class MusicBot(commands.Cog):
         trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         if mp is None:
             return
+        # Before any await, so the loop's iteration end cannot land in the window.
+        # Nothing else records this song: it left the queue at start, and
+        # clear_connection() drops the parked copy.
+        pending_history = mp.claim_current_song_for_history()
         await self._plays.retire_player(guild.id, mp)
         log.info("going to cleanup/disconnect")
-        # Claim the song being abandoned mid-play, before any await so the loop
-        # cannot slip its iteration end into the window. Nothing else records it: it
-        # left the queue at start, and clear_connection() drops the parked copy.
-        pending_history = mp.claim_current_song_for_history()
         try:
             # Cancel tasks before disconnecting so the loop cannot wake and start
             # the next song between voice_client.stop() and cancellation.
@@ -620,9 +620,9 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # Not max_concurrency: requests resolve concurrently and serialize only at
-    # the place lock, and the in-flight cap is raised inside the body because the
-    # decorator acquires before the argument is parsed.
+    # Not max_concurrency: the decorator acquires before the argument is parsed.
+    # The inflight cap is raised inside the body, before its except, so it reaches
+    # cog_command_error rather than rendering as "Failed to queue song".
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:

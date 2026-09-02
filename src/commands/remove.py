@@ -86,9 +86,8 @@ async def run(
         return
     if not await await_restore(ctx, mp):
         return
-    # A -remove during a resolve is routine (a resolve can run 99s). Matched
-    # the way the queue matches — a link literally, text case-folded — so
-    # the same argument takes out the pending request and the queued song.
+    # Matched the way the queue matches — a link literally, text case-folded
+    # — so one argument takes out the pending request and the queued song.
     dropped = cog._plays.inflight(
         play_key(ctx), "remove", lambda r: matches_origin(needle, r.query)
     )

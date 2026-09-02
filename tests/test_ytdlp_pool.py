@@ -26,6 +26,7 @@ from src.ytdlp_pool import (
     PoolClosedError,
     RemoteCallError,
     YtdlpPool,
+    _call_with_context,
     _picklable_call,
     _warmup_noop,
     _worker_init,
@@ -234,7 +235,11 @@ class TestPrewarm:
 
         assert executor.submit.call_count == 3
         for call in executor.submit.call_args_list:
-            assert call.args[0] is _warmup_noop
+            # Through the picklable-error net, like every run() submission: a warm
+            # that raises a yt-dlp error would otherwise fail to unpickle in the
+            # parent's result thread and brick the pool.
+            assert call.args[0] is _call_with_context
+            assert call.args[2] is _warmup_noop
 
     def test_prewarm_submits_the_warm_up_the_caller_supplies(self) -> None:
         """Lifecycle is all this module owns — what a worker warms is the caller's,
@@ -251,7 +256,8 @@ class TestPrewarm:
 
         assert executor.submit.call_count == 2
         for call in executor.submit.call_args_list:
-            assert call.args[0] is warm
+            assert call.args[0] is _call_with_context
+            assert call.args[2] is warm
 
     def test_prewarm_after_shutdown_raises(self) -> None:
         """The closed gate covers every entry point, not just run()."""
@@ -870,7 +876,11 @@ class TestPrewarmCallable:
         with patch.object(pool, "_acquire", return_value=executor):
             pool.prewarm()
         assert executor.submit.call_count == 2
-        assert executor.submit.call_args[0][0] is _warmup_noop
+        # Submitted through _call_with_context, so the warm callable is its third
+        # argument: a yt-dlp exception raised in the worker has to be flattened on
+        # the way back or it fails to unpickle and bricks the pool.
+        assert executor.submit.call_args[0][0] is _call_with_context
+        assert executor.submit.call_args[0][2] is _warmup_noop
 
     def test_a_supplied_callable_is_submitted_once_per_worker(self) -> None:
         def _warm() -> None: ...
@@ -879,7 +889,7 @@ class TestPrewarmCallable:
         executor = MagicMock(spec=ProcessPoolExecutor)
         with patch.object(pool, "_acquire", return_value=executor):
             pool.prewarm(_warm)
-        assert [c[0][0] for c in executor.submit.call_args_list] == [_warm] * 3
+        assert [c[0][2] for c in executor.submit.call_args_list] == [_warm] * 3
 
     def test_a_thread_pool_seam_submits_nothing(self) -> None:
         """The test seam is thread-backed, so there is no process to warm — and

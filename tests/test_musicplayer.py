@@ -412,6 +412,22 @@ class TestQueuePutNext:
     def _titles(mp: MusicPlayer) -> list[str]:
         return [queue_object(item).title for item in mp.queue.display_items()]
 
+    async def test_it_warms_the_songs_stream_by_default(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """`--next` already warms: prefetch defaults to True and queue_put_front
+        spawns one prefetch_stream per QueueObject it inserts. For a song whose
+        metadata was resolved without a stream URL, this warm IS the extraction —
+        so anything added elsewhere to "warm the next song" would be a second
+        concurrent extraction of it, not a missing one."""
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put_next(queue_obj)
+            await asyncio.sleep(0)
+        mock_pf.assert_awaited_once()
+        assert mock_pf.call_args[0][0] == queue_obj
+
     async def test_it_lands_ahead_of_a_running_prefetchs_claim(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
@@ -6589,7 +6605,7 @@ class TestQueueEntryCard:
     def test_renders_resume_offset(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """A parked -playnow tail says where it resumes. The row carried this
+        """A parked interjection tail says where it resumes. The row carried this
         before the cards shared a format; losing it would be silent."""
         item = QueueObject(
             "https://yt.com/v=1", "Song 1", mock_author, duration=300, ts=83
@@ -10354,6 +10370,11 @@ class TestNeutralizePrefetch:
         await music_player._neutralize_prefetch()
 
         assert music_player._prefetch_task is None
+        # Handed off, not run inline: this path is reached under the caller's place
+        # lock, and cleanup() blocks on the FFmpeg subprocess.
+        assert music_player._background_tasks, "the reap ran on the caller's stack"
+        live_song.cleanup.assert_not_called()
+        await asyncio.gather(*list(music_player._background_tasks))
         live_song.cleanup.assert_called_once()
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
@@ -12185,3 +12206,171 @@ class TestQueueLinesCannotForgeALink:
         now, walk = music_player._queue_eta_seed()
         line, _ = music_player._format_queue_line(item, 1, now, walk)
         assert "[" not in line and "](" not in line
+
+
+class TestRetiredFlag:
+    """place()'s verdict ① reads MusicPlayer.retired; cleanup() is its only
+    producer. Both halves were only ever driven through MagicMocks."""
+
+    async def test_mark_retired_flips_the_flag(self, music_player: MusicPlayer) -> None:
+        assert not music_player.retired
+        music_player.mark_retired()
+        assert music_player.retired
+
+    async def test_the_stamp_is_idempotent(self, music_player: MusicPlayer) -> None:
+        """cleanup() stamps once, and retire_player stamps again on its own timeout
+        path — a second stamp must not unset the first."""
+        music_player.mark_retired()
+        music_player.mark_retired()
+        assert music_player.retired
+
+
+class TestEnqueueWarmBound:
+    """The enqueue-time stream warm shares the pool with in-band resolves."""
+
+    async def test_a_warm_holds_a_pool_slot_for_its_extraction(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """One warm spawns per enqueued song, so a paste burst is N of them at once
+        against a four-worker pool. Without the slot they queue ahead of the in-band
+        resolve another guild's playback loop is parked on — dead air over there."""
+        sem = asyncio.Semaphore(1)
+        held: list[bool] = []
+
+        async def _prefetch(_item: Any, *, redis: Any) -> None:
+            held.append(sem.locked())
+
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        with (
+            patch("src.musicplayer.prefetch_warm_slot", return_value=sem),
+            patch.object(YTDL, "prefetch_stream", new=_prefetch),
+        ):
+            await music_player._warm_stream(qobj)
+
+        assert held == [True], "the extraction ran outside the bound"
+        assert not sem.locked(), "the slot outlived the warm"
+
+    async def test_an_enqueue_warms_through_the_bound(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The wiring, not the bound: queue_put spawning YTDL.prefetch_stream
+        directly would leave the semaphore in place and bypassed."""
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        warmed: list[Any] = []
+        warm = AsyncMock(side_effect=lambda item: warmed.append(item))
+
+        with patch.object(MusicPlayer, "_warm_stream", new=warm):
+            await music_player.queue_put(qobj)
+            await asyncio.sleep(0)
+
+        assert warmed == [qobj]
+
+
+class TestACutShortInterjectionDoesNotDoubleRecord:
+    """put_front mutates the deque synchronously and awaits the mirror after, so a
+    cancellation there (the caller's 5s place bound against a stalled Redis) can
+    leave the resume tail queued for a song that was never stopped."""
+
+    async def test_a_landed_tail_keeps_the_history_marker(
+        self,
+        music_player: MusicPlayer,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        """Disarmed over a tail that DID land, the song is recorded twice — once at
+        its own end and once when the tail finishes."""
+        music_player.current_song = live_song
+        assert music_player.store is not None
+
+        async def _cancelled(*_a: Any, **_k: Any) -> bool:
+            raise asyncio.CancelledError
+
+        music_player.store.push_queue_front = _cancelled
+
+        with pytest.raises(asyncio.CancelledError):
+            await music_player.interject(interject_obj, mock_vc)
+
+        tails = [
+            queue_object(i)
+            for i in music_player.queue.display_items()
+            if queue_object(i).is_resume
+        ]
+        assert len(tails) == 1, "the tail landed on the deque before the await"
+        assert music_player._skip_history_for is live_song
+        assert music_player._pending_resume_tail is tails[0]
+
+
+class TestTheSkipNoticeShowsSafeText:
+    """ExtractionError.user_message is the only yt-dlp text safe to render; the raw
+    message carries its bug-report boilerplate and --cookies-from-browser advice."""
+
+    async def test_an_extraction_failure_renders_its_user_message(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        boom = ExtractionError(
+            "ERROR: [youtube] abc: Sign in to confirm your age; please report this "
+            "issue on https://github.com/yt-dlp/yt-dlp/issues"
+        )
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+
+        with patch.object(YTDL, "yt_stream", new=AsyncMock(side_effect=boom)):
+            assert await music_player._stream_source(qobj) is None
+
+        failure = music_player._last_stream_error
+        assert failure is not None
+        assert failure.detail == boom.user_message
+        assert "yt-dlp/issues" not in failure.detail
+
+
+class TestQueuePutNextClearsAClaimThatArrivedLate:
+    """put_front inserts AT the cursor, i.e. behind any open claim — so a prefetch
+    that appeared while the first cancel settled would land the --next song second,
+    which is the one thing queue_put_next exists to prevent."""
+
+    async def test_a_prefetch_spawned_during_the_cancel_is_neutralized_too(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        calls: list[int] = []
+
+        async def _neutralize(_self: Any) -> None:
+            calls.append(1)
+            # First call: loop() nulled the slot and started the next song's
+            # prefetch while this cancel settled. Second: nothing left.
+            music_player._prefetch_task = (
+                cast(Any, MagicMock()) if len(calls) == 1 else None
+            )
+
+        with (
+            patch.object(MusicPlayer, "_neutralize_prefetch", new=_neutralize),
+            patch.object(MusicPlayer, "queue_put_front", new=AsyncMock()),
+        ):
+            await music_player.queue_put_next(
+                QueueObject("https://yt.com/v=1", "Next", mock_author)
+            )
+
+        assert len(calls) == 2
+        assert music_player._prefetch_task is None
+
+    async def test_the_ordinary_case_neutralizes_once(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Bounded at one retry — a loop would spin on a guild whose loop keeps
+        spawning, and the second window is one song boundary wide."""
+        calls: list[int] = []
+
+        async def _neutralize(_self: Any) -> None:
+            calls.append(1)
+            music_player._prefetch_task = None
+
+        with (
+            patch.object(MusicPlayer, "_neutralize_prefetch", new=_neutralize),
+            patch.object(MusicPlayer, "queue_put_front", new=AsyncMock()),
+        ):
+            await music_player.queue_put_next(
+                QueueObject("https://yt.com/v=1", "Next", mock_author)
+            )
+
+        assert len(calls) == 1

@@ -21,7 +21,7 @@ from discord.ext import commands
 from src.guild_queue import QueueItem
 from src.guild_state import Analytics
 from src.musicplayer import InterjectOutcome, MusicPlayer
-from src.play_placement import Placement, PlayRequest
+from src.play_placement import Placement, PlayRequest, ResolveMode
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -242,8 +242,10 @@ def _rebase_positions(
 
 
 def _head_depth(mp: MusicPlayer, placement: Placement) -> int:
-    """`queue_position` for the first song an insert adds, read at the insert:
-    the slot it actually takes. A cold start plays ahead of everything."""
+    """`queue_position` for the first song an insert adds, read at the insert: the
+    slot it actually takes. A cold start takes 0 — it plays ahead of everything at the
+    moment it lands, and concurrent cold starts each record 0 and each are right, the
+    same drift enqueue_depth() carries against a queue the loop keeps moving."""
     if placement is Placement.COLD_FRONT:
         return 0
     if placement is Placement.NEXT:
@@ -311,6 +313,7 @@ async def queue_source(
     *,
     analytics: Analytics,
     origin: str,
+    mode: ResolveMode,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
     """Resolve a parsed URL/search source into something enqueueable: a
@@ -320,7 +323,11 @@ async def queue_source(
     `analytics` is the command's ask-time head value, minted at dispatch;
     playlist tracks derive their per-track positions from it. `origin` is the
     raw command argument, carried onto every resulting item — for a collection
-    the link, not the per-track search its expansion generated."""
+    the link, not the per-track search its expansion generated.
+
+    `mode` is required and has no default: interjection resolves through this
+    same helper, so "a search may go flat" cannot be decided from the input
+    shape — only the caller knows whether the song must be playable on arrival."""
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
@@ -355,6 +362,11 @@ async def queue_source(
             search = source.url
         else:
             assert_never(source)
+        # Only a search has a cheap mode; a link pays the watch page either way.
+        flat = mode is ResolveMode.FLAT_OK and (
+            isinstance(source, SpotifySource)
+            or (isinstance(source, YTSource) and source.ytsearch is not None)
+        )
         return await YTDL.yt_source(
             ctx.author,
             search,
@@ -363,6 +375,7 @@ async def queue_source(
             query_source=query_source_of(source),
             analytics=analytics,
             user_input=origin,
+            flat=flat,
         )
 
 
@@ -383,9 +396,8 @@ async def enqueue_playlist(
     Spotify playlists arrive as titles needing YouTube search, YouTube playlists
     pre-resolved. Positions are minted at the insert: `analytics` carries the
     ask time and its depth is replaced by the one the head takes."""
-    # A playlist front-inserts in full, in order, under either flag. NEXT uses
-    # queue_put_next: the loop's prefetch holds a claim a plain front-insert
-    # lands behind. COLD_FRONT has no prefetch — the gate is shut.
+    # A playlist front-inserts in full, in order, under either flag. NEXT goes
+    # through queue_put_next, for the claim the loop's prefetch holds.
     enqueue = {
         Placement.TAIL: mp.queue_put,
         Placement.COLD_FRONT: mp.queue_put_front,
@@ -499,16 +511,20 @@ async def enqueue_single(
     )
     should_show_queued = False
     if placement is Placement.COLD_FRONT:
-        # A restored queue is non-empty but sits BEHIND this song, so the resume
-        # notice replaces the confirmation; built while the queue holds only the
-        # restored entries.
-        resume_notice = mp.build_resume_notice_embed(qobj)
+        # The resume notice calls what sits behind this song "the previous
+        # session", true only while the queue holds restored entries alone. A
+        # sibling cold start that already placed put its own song in there.
+        sibling_landed = cog._plays.sibling_placed(req)
+        resume_notice = None if sibling_landed else mp.build_resume_notice_embed(qobj)
         if resume_notice is not None:
             embeds.append(resume_notice)
+        elif sibling_landed:
+            # Every cold start in a burst but the first joins a queue that is
+            # partly its own, so it gets the ordinary slot confirmation.
+            should_show_queued = True
     elif placement is Placement.NEXT:
-        # No "Est. playing at": the ETA walk seeds from the current song's
-        # FULL duration as a proxy for what is left of it, which is badly
-        # wrong for the very next slot. It names the song it waits behind.
+        # No ETA: the walk seeds from the current song's FULL duration, which is
+        # badly wrong one slot out. The note names the song it waits behind.
         embeds.append(playing_next_embed(ctx, qobj, note=plays_after_note(mp, vc)))
     else:
         # A note is the only word the user gets about tracks queued behind
@@ -524,6 +540,11 @@ async def enqueue_single(
         # warning needs its own message.
     if warning_embed is not None:
         embeds.append(warning_embed)
+    if placement is Placement.NEXT:
+        # Outside the lock: this cancel can wait out a whole yt-dlp extraction
+        # (an executor call is not interruptible), and every sibling -play in the
+        # guild spends its place bound waiting on the lock.
+        await mp.settle_prefetch()
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             depth = _head_depth(mp, placement)
@@ -549,10 +570,9 @@ async def enqueue_single(
         await cog._report_dropped(req, verdict)
         return
     if should_show_queued:
-        # After the put, off the lock, so the card carries the slot the song
-        # took. When this song IS the head, the block's "Up next" card is the
-        # same card; re-host the live block instead — dedicated, since a
-        # response host with no own embeds strip-edits to a blank message.
+        # After the put, off the lock, so the card names the slot taken. At the
+        # head the NP block's "Up next" IS this card: re-host the live one,
+        # dedicated — a response host with no own embeds strip-edits to blank.
         if mp.queue.peek_next() is qobj and await mp.repin_now_playing():
             # What the card would have carried: the note and the warning.
             said = "\n\n".join(text for text in (note, warning) if text)
@@ -586,9 +606,8 @@ async def _resolve_interjection_source(
         if not titles:
             raise EmptyPlaylistError()
         yts = spotify_playlist_to_ytsearch(titles, analytics=analytics, origin=origin)
-        # Only the head is resolved — it has to be playable to interrupt with.
-        # The rest stay lazy searches resolved at dequeue, so a 100-track album
-        # does not pay 100 searches up front.
+        # The head takes the full path — it has to be playable to interrupt
+        # with. The rest stay lazy searches, resolved at dequeue.
         head = await YTDL.yt_source(
             ctx.author,
             yts[0].ytsearch or "",
@@ -619,7 +638,16 @@ async def _resolve_interjection_source(
                 )
             )
         return tracks[0], list(tracks[1:])
-    qobj = await queue_source(ctx, source, analytics=analytics, origin=origin, cog=cog)
+    # FULL, not the placement default: interject() stops the current song, so this
+    # head has to be playable before anything is stopped.
+    qobj = await queue_source(
+        ctx,
+        source,
+        analytics=analytics,
+        origin=origin,
+        mode=ResolveMode.FULL,
+        cog=cog,
+    )
     assert isinstance(qobj, QueueObject)
     return qobj, []
 
@@ -657,14 +685,15 @@ async def interject_flow(
     # The head only: `interjected` is attribution, which song cut the line.
     qobj.interjected = True
 
-    # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts
-    # seconds of yt-dlp dead air between the interrupt and the new song. Awaited,
-    # not spawned — the current song plays through the wait. No-op without Redis;
-    # also back-fills duration/thumbnail for the embeds below.
-    #
-    # The head only: warming N tracks would be N concurrent extractions
-    # minting URLs that expire before playback reaches them.
-    await YTDL.prefetch_stream(qobj, redis=cog.redis)
+    # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
+    # the interrupt and the new song, and the current song plays through the wait.
+    # A gate, not a hint — this flow stops what is playing, so a head that could
+    # not be extracted must not get that far. Also back-fills the embed fields.
+    if not await YTDL.prefetch_stream(qobj, redis=cog.redis):
+        raise RuntimeError(
+            "Could not get a playable stream for that song, so the current "
+            "song was left alone."
+        )
 
     # Before the lock: the neutralize can wait on a prefetch pinned in the
     # yt-dlp executor, which under _place would hold the guild's lock.
@@ -684,17 +713,15 @@ async def interject_flow(
                 qobj, vc, resume_paused=resume_paused, follow_on=follow_on
             )
             if outcome is None:
-                # The song ended during the resolve. Insert qobj directly, at
-                # the front — the user asked for "now" and this window can be
-                # seconds long. It interrupted nothing, so the marker comes off.
+                # The song ended during the resolve, so this interrupted nothing:
+                # the marker comes off and the song front-inserts instead.
                 qobj.interjected = False
                 # interject() also returns None when the loop moved on to a
                 # DIFFERENT song, which this insert waits behind: depth 1.
                 qobj.analytics = replace(
                     qobj.analytics, queue_position=front_insert_depth(mp)
                 )
-                # queue_put_next: the embed promises "next", and the loop's
-                # prefetch holds a claim a bare front-insert would land behind.
+                # queue_put_next, for the claim the loop's prefetch holds.
                 # prefetch=False — the stream URL was warmed above.
                 await mp.queue_put_next([qobj, *follow_on], prefetch=False)
     if not verdict.placed:

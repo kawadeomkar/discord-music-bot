@@ -31,9 +31,8 @@ async def run(ctx: commands.Context, *, cog: MusicBot) -> None:
     if vc is not None and ctx.guild is not None:
         await ctx.message.add_reaction("👋")
         await cog.cleanup(ctx.guild)
-    # After the teardown, with no await between, so no request places into
-    # a player that no longer exists. Unconditional: a cold-start -play may
-    # be resolving before there is a client to find.
+    # After the teardown with no await between, so nothing places into a
+    # player that is gone. Unconditional — a cold start has no client yet.
     dropped = cog._plays.inflight(play_key(ctx), "stop")
     if dropped:
         await send_embed(

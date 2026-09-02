@@ -2924,7 +2924,7 @@ class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
 
         async with gq.commit_dequeue(generation) as committed:
             assert committed
-            # -playnow, scheduled into the window the hold has to close.
+            # an interjection, scheduled into the window the hold has to close.
             racer = asyncio.create_task(gq.put_front([interjected]))
             await asyncio.sleep(0)
             assert not racer.done(), (
@@ -3032,3 +3032,118 @@ class TestItemLabelNamesEveryItemType:
     def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
         item = YTSource(url="https://yt.com/v=2", process=True)
         assert item_label(item) == "https://yt.com/v=2"
+
+
+class TestASwallowedAppendMarksTheMirrorStale:
+    """The append legs are @_guild_op-wrapped, so a Redis failure there neither
+    raises nor returns anything the caller can read. The _mirror_write guard sees
+    only cancellations; a swallowed RPUSH is the far more common way this mirror
+    goes short, and unmarked it never repairs: the next put appends onto a list
+    already missing an entry, and the next dequeue LPOPs a song it did not
+    dequeue — a restart then restores a queue offset by that many songs."""
+
+    async def test_a_swallowed_rpush_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.push_queue = _refused
+        await gq.put([_qobj(1, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_swallowed_batch_push_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.push_queue_batch = _refused
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)], batch=True)
+
+        assert gq.mirror_dirty
+
+    async def test_one_refused_push_of_several_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Per-entry RPUSHes: the mirror is wrong if ANY of them was swallowed."""
+        original = store.push_queue
+        calls = 0
+
+        async def _second_fails(entry: Any) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return False
+            return await original(entry)
+
+        store.push_queue = _second_fails
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_swallowed_front_push_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Worse than the tail case: the in-memory legs end up ahead of Redis at the
+        HEAD, so the next commit-time LPOP retires another song's entry."""
+
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.push_queue_front = _refused
+        await gq.put_front([_qobj(1, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_push_that_landed_leaves_it_clean(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The flag means the list is KNOWN to differ — a rebuild on every enqueue
+        is what setting it unconditionally would cost."""
+        await gq.put([_qobj(1, mock_author)])
+
+        assert not gq.mirror_dirty
+
+    async def test_a_swallowed_delete_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The DELETE leg reads a landed bool already, but nothing drove it: a
+        -clear whose DELETE was swallowed leaves the old list in Redis, the next
+        -play RPUSHes onto it, and the next restore hands the guild back the queue
+        it cleared."""
+        await gq.put([_qobj(1, mock_author)])
+        assert not gq.mirror_dirty
+
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.delete_queue = _refused
+        await gq.clear()
+
+        assert gq.mirror_dirty
+
+
+class TestACutShortLremMarksTheMirrorStale:
+    """The LREM shortcut was the one mirror write outside _mirror_write(): a
+    cancellation there leaves the deque short by N and the list short by fewer,
+    with nothing to tell the next enqueue that appending preserves the difference."""
+
+    async def test_a_cancelled_lrem_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        # Enough survivors that the LREM shortcut is taken at all: one dropped
+        # entry may not exceed one in five (_LREM_MAX_SHARE).
+        await gq.put([_qobj(i, mock_author) for i in range(8)])
+        assert not gq.mirror_dirty
+
+        async def _cancelled(*_a: Any, **_k: Any) -> int:
+            raise asyncio.CancelledError
+
+        store.remove_queue_entries = _cancelled
+
+        with pytest.raises(asyncio.CancelledError):
+            await gq.remove(remove_matcher("https://yt.com/v=1"))
+
+        assert gq.mirror_dirty

@@ -57,6 +57,7 @@ from src.util import (
 )
 from src.youtube import (
     YTDL,
+    ExtractionError,
     NpHostRef,
     QueueObject,
     invalidate_stream_cache,
@@ -1152,9 +1153,7 @@ class MusicPlayer:
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                    self._spawn_background(self._warm_stream(item))
 
     async def _warm_stream(self, item: QueueObject) -> None:
         """One enqueue-time stream warm, under the process-wide background bound.
@@ -1927,7 +1926,7 @@ class MusicPlayer:
                     thumbnail=current.thumbnail,
                     is_resume=True,
                     # The tail is the same play, so a song that was itself a
-                    # -play --now comes back saying so — the span attribute below
+                    # interjection comes back saying so — the span attribute below
                     # reads it at every level of a stack.
                     interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
@@ -1968,13 +1967,14 @@ class MusicPlayer:
         try:
             await self.queue.put_front(items)
         except BaseException:
-            # Cancelled here (the caller's place bound) there is no tail, and an
-            # armed marker would eat the interrupted song's history entry. Identity-
-            # checked, so a marker a later interjection replaced is left alone.
-            if self._skip_history_for is current:
-                self._skip_history_for = None
-            if self._pending_resume_tail is resume:
-                self._pending_resume_tail = None
+            # put_front mutates the deque synchronously and awaits the mirror after,
+            # so a cancellation here can leave the tail queued — disarming over one
+            # that landed records the song twice. Identity-checked against `resume`.
+            if resume is None or not self.queue.holds(resume):
+                if self._skip_history_for is current:
+                    self._skip_history_for = None
+                if self._pending_resume_tail is resume:
+                    self._pending_resume_tail = None
             raise
 
         # Only if the song we measured is still playing: if the loop moved on, the
@@ -2058,7 +2058,10 @@ class MusicPlayer:
             np_host_ref=song.np_host_ref,
         )
         self.queue.requeue_front(rebuilt)
-        song.cleanup()
+        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
+        # communicate(), and this runs under the caller's place lock. loop() keeps
+        # its twin call off its own mutex for the same reason.
+        self._spawn_background(asyncio.to_thread(song.cleanup))
 
     async def _announce_start_offset(self, song: YTDL) -> None:
         """One-line notice for a song starting partway in (a `?t=` link). Sent from
@@ -2105,6 +2108,8 @@ class MusicPlayer:
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
+        # Full resolve (yt_source's default): a lazy entry resolving here is about to
+        # play, so the stream URL this extraction yields is wanted immediately.
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
                 self._require_requester(),
@@ -2131,8 +2136,15 @@ class MusicPlayer:
         except Exception as e:
             ctx = trace.get_current_span().get_span_context()
             trace_id = format(ctx.trace_id, "032x") if ctx.is_valid else "unavailable"
+            # yt-dlp's raw text carries its bug-report boilerplate and its
+            # --cookies-from-browser advice, neither of which means anything here.
             self._last_stream_error = StreamFailure(
-                detail=f"{type(e).__name__}: {e}", trace_id=trace_id
+                detail=(
+                    e.user_message
+                    if isinstance(e, ExtractionError)
+                    else f"{type(e).__name__}: {e}"
+                ),
+                trace_id=trace_id,
             )
             log.error(
                 f"Error processing song: {type(e).__name__}: {e} [trace_id={trace_id}]",

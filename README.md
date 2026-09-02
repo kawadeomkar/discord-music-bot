@@ -486,7 +486,37 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
-## Upgrading to 2.29.0 and 2.30.0
+## Upgrading to 2.31.0
+
+**`-play <search>` answers in about half a second instead of two and a half.** A search —
+typed words, or a Spotify track link, which resolves to one — is now answered from the
+search response itself: title, length, uploader and artwork, with no stream URL. The
+stream is extracted by the background prefetch that already ran for every queued song, so
+nothing new happens on the network per play; measured against the same queries, the
+**lookup** went from ~2.5s to ~0.6s. That is the lookup, not the whole reply: a `-play`
+that has to join a voice channel first still waits for the handshake, and the card lands
+after it. Pasted links, `-play --now`, playlists, and a `-play` that finds the bot
+disconnected are unchanged — the last of those still resolves in full, because its song
+plays immediately and a failure there would leave the bot sitting in an empty channel.
+
+A search no longer selects a format at enqueue, so a video that cannot actually be
+played — age-gated, region-blocked, members-only — now queues successfully and fails
+when its turn comes, with a red "Failed to load the next song, skipping." card, instead
+of failing the `-play` outright. The queue carries on to the next song.
+
+**Several `-play`s sent at an idle bot play in reverse order.** Each one finds no voice
+client, so each takes the front of the queue: paste three and they play third, second,
+first. Send them one at a time, or use `-play --next` once the first is playing.
+
+**One behaviour genuinely changes.** Because a search no longer selects a format at
+enqueue time, a video that cannot be played — private, geo-blocked, age-gated, or with no
+usable audio — is no longer caught by the command. It queues successfully and fails at its
+turn, as a notice in the channel and a gap in playback, the way playlist tracks always
+have. A bad *link* still fails the command with nothing queued.
+
+Nothing to configure, no data touched, and no migration: rolling back is only a redeploy.
+
+## Upgrading to 2.31.x
 
 **`-playnow` and its `pn` alias are gone.** They are replaced by a flag on `-play`:
 
@@ -942,6 +972,7 @@ src/
 ├── main.py            # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool
 ├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
 ├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
+├── play_placement.py  # -play's flag grammar, its voice gate, and PlayRegistry
 ├── guild_queue.py     # GuildQueue — one deque + a cursor, and the Redis mirror
 ├── guild_history.py   # GuildHistory — play history: capped Redis list + cache
 ├── guild_state.py     # Redis schema: frozen value objects + field constants

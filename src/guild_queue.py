@@ -725,7 +725,9 @@ class GuildQueue:
             dropped = [_to_entry(s) for s in removed if is_persisted(s)]
             dropped_blobs = [entry.to_redis() for entry in dropped]
             if not self._claimed_blobs(dropped_blobs):
-                if await self._store.remove_queue_entries(dropped) == len(dropped):
+                with self._mirror_write():
+                    lremmed = await self._store.remove_queue_entries(dropped)
+                if lremmed == len(dropped):
                     return
                 log.warning(
                     f"queue mirror diverged from memory in guild {self._guild.id}; "
