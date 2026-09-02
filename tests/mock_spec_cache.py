@@ -43,8 +43,7 @@ keys it replays. tests/test_mock_spec_cache.py holds the parity net, including a
 subprocess check against an unpatched interpreter.
 """
 
-from __future__ import annotations
-
+import functools
 import inspect
 import os
 import sys
@@ -52,6 +51,28 @@ from collections.abc import Callable, MutableMapping
 from typing import Any
 from unittest.mock import MagicMixin, NonCallableMock
 from weakref import WeakKeyDictionary
+
+
+# Set on both replacements. `_capture` tests for it rather than for __module__
+# alone, which functools.wraps copies from the function it wraps.
+_PATCH_MARKER = "_mock_spec_cache_patch"
+
+
+def _replaces[F: Callable[..., Any]](original: Callable[..., Any]) -> Callable[[F], F]:
+    """Keep `original`'s identity on a replacement, and mark it as ours.
+
+    Installing a bare function would rewrite `MagicMock.__init__`'s __qualname__,
+    __module__ and signature process-wide, which `_get_signature_object` reads
+    when a mock class is itself used as a spec. Type-preserving, so the two
+    assignments in `install()` are still checked against typeshed.
+    """
+
+    def decorate(func: F) -> F:
+        functools.wraps(original)(func)
+        setattr(func, _PATCH_MARKER, True)
+        return func
+
+    return decorate
 
 
 def _capture(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -65,7 +86,7 @@ def _capture(func: Callable[..., Any]) -> Callable[..., Any]:
     call itself, i.e. a `RecursionError` rather than the loud failure this module
     promises everywhere else.
     """
-    if func.__module__ != "unittest.mock":
+    if getattr(func, _PATCH_MARKER, False) or func.__module__ != "unittest.mock":
         raise RuntimeError(
             f"unittest.mock.{func.__qualname__} is already patched by "
             f"{func.__module__!r}. tests/mock_spec_cache.py has been imported "
@@ -80,8 +101,10 @@ _ORIG_MAGIC_INIT = _capture(MagicMixin.__init__)
 
 # (spec_signature, mock_methods, spec_asyncs). `_spec_class` is deliberately NOT
 # stored: on this path `spec` is a class, so upstream sets `_spec_class = spec`,
-# and keeping a copy in the value would strongly reference the key and defeat the
-# WeakKeyDictionary below. `_spec_set` is likewise taken from the live argument.
+# and keeping a copy in the value would reference the key from every entry.
+# `_spec_set` is likewise taken from the live argument. The stored signature can
+# still reach a class through a self-referential annotation or default, which
+# pins that one entry — bounded by spec-class count, not by mock count.
 _Payload = tuple[inspect.Signature | None, tuple[str, ...], tuple[str, ...]]
 _FIELDS = ("_spec_signature", "_mock_methods", "_spec_asyncs")
 
@@ -167,6 +190,10 @@ def _recompute(spec: type, spec_as_instance: bool, eat_self: bool) -> _Payload:
 
 def _payload(spec: type, spec_as_instance: bool, eat_self: bool) -> _Payload:
     """Return the introspection result for `spec`, computing it at most once."""
+    # Unsynchronized on purpose: mocks are built from discord.py's audio thread
+    # as well as the loop, and the read-modify-write below can interleave. A lost
+    # race discards one dict and recomputes, which costs a `dir()` walk and can
+    # never serve a wrong payload.
     by_variant = _CACHE.get(spec)
     if by_variant is None:
         by_variant = {}
@@ -194,9 +221,16 @@ def _is_cacheable(spec: object) -> bool:
     per-instance class stays alive as long as its mock does, which for a
     module-scoped fixture is the whole session.
     """
-    return isinstance(spec, type) and not issubclass(spec, NonCallableMock)
+    if not isinstance(spec, type) or issubclass(spec, NonCallableMock):
+        return False
+    # `_CACHE` looks entries up by __hash__/__eq__, which a metaclass may define.
+    # Two classes that compare equal would then share one entry, and the second
+    # would be served the first's methods with nothing able to report it.
+    meta = type(spec)
+    return meta.__eq__ is type.__eq__ and meta.__hash__ is type.__hash__
 
 
+@_replaces(_ORIG_ADD_SPEC)
 def _cached_add_spec(
     self: NonCallableMock,
     spec: Any,
@@ -240,6 +274,7 @@ def _resolve_init_spec(args: tuple[Any, ...], kw: dict[str, Any]) -> Any:
     return args[0] if len(args) == 1 else None
 
 
+@_replaces(_ORIG_MAGIC_INIT)
 def _seeded_magic_init(self: MagicMixin, /, *args: Any, **kw: Any) -> None:
     spec = _resolve_init_spec(args, kw)
     if _is_cacheable(spec):
@@ -274,14 +309,14 @@ def _describe(spec: type, field: str, cached: Any, fresh: Any) -> str:
         def _named(names: list[str]) -> list[str]:
             return [f"{n} (on {_owner(spec, n)})" for n in names]
 
-        gained = _named(sorted(set(fresh) - set(cached)))
-        lost = _named(sorted(set(cached) - set(fresh)))
+        missing = _named(sorted(set(fresh) - set(cached)))
+        stale = _named(sorted(set(cached) - set(fresh)))
         changes = []
-        if gained:
-            changes.append(f"gained {gained}")
-        if lost:
-            changes.append(f"lost {lost}")
-        return f"{field}: {' and '.join(changes) or 'reordered'}"
+        if missing:
+            changes.append(f"cache is missing {missing}")
+        if stale:
+            changes.append(f"cache still has {stale}")
+        return f"{field}: {' and '.join(changes) or 'cache has a different order'}"
     return f"{field}: cached {cached!r}, now {fresh!r}"
 
 
@@ -327,7 +362,16 @@ def check_for_drift() -> list[str]:
 def _diff(spec: type, variant: tuple[bool, bool], cached: _Payload) -> str | None:
     """One drift line for a single entry, or None when it still matches."""
     spec_as_instance, eat_self = variant
-    fresh = _recompute(spec, spec_as_instance, eat_self)
+    label = (
+        f"{spec.__module__}.{spec.__qualname__} "
+        f"(_spec_as_instance={spec_as_instance}, _eat_self={eat_self})"
+    )
+    try:
+        fresh = _recompute(spec, spec_as_instance, eat_self)
+    except Exception as exc:
+        # Reported, not raised: `_recompute` fails hard on an unexpected upstream
+        # shape, and letting that out of the loop hides every other entry.
+        return f"{label}: could not be rechecked: {exc}"
     old, new = _comparable(cached), _comparable(fresh)
     if old == new:
         return None
@@ -335,11 +379,7 @@ def _diff(spec: type, variant: tuple[bool, bool], cached: _Payload) -> str | Non
         _describe(spec, field, a, b) for field, a, b in zip(_FIELDS, old, new) if a != b
     )
     origin = _ORIGINS.get(spec, {}).get(variant, "an unrecorded point")
-    return (
-        f"{spec.__module__}.{spec.__qualname__} "
-        f"(_spec_as_instance={spec_as_instance}, _eat_self={eat_self}): "
-        f"{diffs} [entry first cached during {origin}]"
-    )
+    return f"{label}: {diffs} [entry first cached during {origin}]"
 
 
 def _verify_now(
@@ -362,9 +402,8 @@ def _assert_signature(
 ) -> None:
     """Check a patched function's parameter names *and* kinds.
 
-    Kinds matter: `_seeded_magic_init` keeps the positional-only marker upstream
-    uses so that `MagicMock(self=...)` configures an attribute rather than
-    colliding with the receiver. A name-only check would not notice it moving.
+    Kinds, because a positional-only marker moving would leave every name intact
+    — see the `/` on `_seeded_magic_init` in `install()`.
     """
     actual = tuple(
         (p.name, p.kind) for p in inspect.signature(func).parameters.values()

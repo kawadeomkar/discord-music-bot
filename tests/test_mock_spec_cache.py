@@ -87,6 +87,19 @@ def _snapshot(mock: Any) -> dict[str, Any]:
     }
 
 
+def drift_for(cls: type) -> list[str]:
+    """Drift lines for `cls` alone.
+
+    `check_for_drift()` scans the whole process cache, so asserting it is empty
+    makes a test fail for a class some earlier test mutated — in the middle of
+    the run, naming something unrelated.
+    """
+    prefix = f"{cls.__module__}.{cls.__qualname__} "
+    return [
+        line for line in mock_spec_cache.check_for_drift() if line.startswith(prefix)
+    ]
+
+
 def _child_names(cls: type) -> list[str]:
     """Three deterministic child-attribute names for `cls`."""
     return [name for name in sorted(dir(cls)) if not name.startswith("_")][:3]
@@ -173,7 +186,7 @@ class TestUnpatchedParity:
             # Pin PYTHONPATH rather than inheriting: an ambient entry can shadow
             # the `tests` package and make the child snapshot the wrong code.
             env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
-            timeout=120,
+            timeout=60,
         )
         assert proc.returncode == 0, f"unpatched child failed:\n{proc.stderr}"
 
@@ -363,10 +376,9 @@ class TestSignatureGuard:
             )
 
     def test_rejects_a_changed_parameter_kind(self) -> None:
-        """Names alone are not enough. `_seeded_magic_init` keeps upstream's
-        positional-only `self` so that `MagicMock(self=...)` configures an
-        attribute instead of colliding with the receiver; if upstream dropped
-        the marker the names would still match."""
+        """Dropping upstream's positional-only marker leaves every name intact,
+        so a name-only check would pass it. See `install()` for what the `/` on
+        `_seeded_magic_init` buys."""
 
         def positional_or_keyword(self: Any, *args: Any, **kw: Any) -> None: ...
 
@@ -417,7 +429,11 @@ class TestSignatureGuard:
             _eat_self: bool = False,
         ) -> None:
             original(self, spec, spec_set, _spec_as_instance, _eat_self)
-            self.__dict__["_spec_hints"] = {}
+            # Scoped to the probe: `_ORIG_ADD_SPEC` is what every delegated mock
+            # goes through, so an unconditional impostor would mis-build any mock
+            # built while this test runs.
+            if spec is EatSelfProbe:
+                self.__dict__["_spec_hints"] = {}
 
         monkeypatch.setattr(mock_spec_cache, "_ORIG_ADD_SPEC", writes_an_extra_key)
 
@@ -441,7 +457,8 @@ class TestSignatureGuard:
             _eat_self: bool = False,
         ) -> None:
             original(self, spec, spec_set, _spec_as_instance, _eat_self)
-            self.__dict__["_spec_class"] = object
+            if spec is EatSelfProbe:  # scoped, as above
+                self.__dict__["_spec_class"] = object
 
         monkeypatch.setattr(
             mock_spec_cache, "_ORIG_ADD_SPEC", sets_a_different_spec_class
@@ -599,7 +616,7 @@ class TestDriftDetection:
 
     def test_a_clean_cache_reports_nothing(self) -> None:
         MagicMock(spec=discord.Guild)
-        assert mock_spec_cache.check_for_drift() == []
+        assert drift_for(discord.Guild) == []
 
     def test_an_added_attribute_is_reported(self, isolated_cache: None) -> None:
         class Probe:
@@ -611,7 +628,7 @@ class TestDriftDetection:
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
         assert "Probe" in drift[0]
-        assert "_mock_methods: gained ['beta (on Probe)']" in drift[0]
+        assert "_mock_methods: cache is missing ['beta (on Probe)']" in drift[0]
 
     def test_a_removed_attribute_is_reported(self, isolated_cache: None) -> None:
         class Probe:
@@ -623,7 +640,7 @@ class TestDriftDetection:
 
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
-        assert "_mock_methods: lost ['beta (on ?)']" in drift[0]
+        assert "_mock_methods: cache still has ['beta (on ?)']" in drift[0]
 
     def test_a_sync_method_swapped_for_an_async_one_is_reported(
         self, isolated_cache: None
@@ -643,7 +660,7 @@ class TestDriftDetection:
 
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
-        assert "_spec_asyncs: gained ['handler (on Probe)']" in drift[0]
+        assert "_spec_asyncs: cache is missing ['handler (on Probe)']" in drift[0]
 
     def test_a_changed_signature_is_reported(self, isolated_cache: None) -> None:
         class Probe:
@@ -668,7 +685,7 @@ class TestDriftDetection:
 
         MagicMock(spec=MusicContext)
 
-        assert mock_spec_cache.check_for_drift() == []
+        assert drift_for(MusicContext) == []
 
     def test_a_wrapped_stand_in_is_not_drift(self, isolated_cache: None) -> None:
         """The idiom the suite's own class-level patches use. `_spec_asyncs` is
@@ -684,7 +701,7 @@ class TestDriftDetection:
         def stand_in(self: Any) -> None: ...
 
         with patch.object(Probe, "handler", stand_in):
-            assert mock_spec_cache.check_for_drift() == []
+            assert drift_for(Probe) == []
             assert "handler" in MagicMock(spec=Probe).__dict__["_spec_asyncs"]
 
     def test_a_reverted_mutation_is_invisible_here(self, isolated_cache: None) -> None:
@@ -704,7 +721,7 @@ class TestDriftDetection:
             assert "handler" in served.__dict__["_spec_asyncs"]
             assert mock_spec_cache._recompute(Probe, False, True)[2] == ()
 
-        assert mock_spec_cache.check_for_drift() == []
+        assert drift_for(Probe) == []
 
     def test_drift_names_the_class_that_supplies_the_attribute(
         self, isolated_cache: None
@@ -743,6 +760,31 @@ class TestDriftDetection:
         drift = mock_spec_cache.check_for_drift()
         assert len(drift) == 1
         assert "test_drift_names_the_test_that_filled_the_entry" in drift[0]
+
+    def test_each_field_is_reported_under_its_own_name(
+        self, isolated_cache: None
+    ) -> None:
+        """`_describe` zips `_FIELDS` against the payload tuple, so a reordering
+        of either mislabels every drift line while the diff itself stays right."""
+
+        class Probe:
+            def __init__(self, alpha: int = 1) -> None: ...
+            def handler(self) -> None: ...
+
+        MagicMock(spec=Probe)
+
+        async def handler(self: Any) -> None: ...
+
+        def __init__(self: Any, alpha: int = 1, beta: int = 2) -> None: ...
+
+        Probe.handler = handler  # pyright: ignore[reportAttributeAccessIssue]
+        Probe.__init__ = __init__
+        Probe.gamma = 3  # pyright: ignore[reportAttributeAccessIssue]
+
+        line = drift_for(Probe)[0]
+        assert "_spec_signature: cached" in line
+        assert "_mock_methods: cache is missing ['gamma (on Probe)']" in line
+        assert "_spec_asyncs: cache is missing ['handler (on Probe)']" in line
 
     def test_the_check_does_not_itself_touch_the_cache(self) -> None:
         MagicMock(spec=discord.Guild)
