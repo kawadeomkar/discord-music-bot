@@ -78,6 +78,12 @@ coverage.xml
 # runner before the recipe existed.
 pytest.xml
 pytest-coverage.txt
+# Raw OTLP export payloads captured while debugging a trace. They carry real guild,
+# user, channel and message snowflakes, so one reaching a commit publishes them for
+# good -- enqueue.json did, and was rewritten back out.
+enqueue.json
+*.otlp.json
+
 # Written by security.yml's `poetry export`. Same reasoning: reproducing the audit
 # locally used to leave an untracked file behind.
 requirements-audit.txt

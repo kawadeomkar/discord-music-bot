@@ -47,7 +47,7 @@ jobs:
       # Needed only for the version step below — the env-name step reads context,
       # not the tree. Cheap enough that a second facts-only job to avoid it would
       # cost more than it saves.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute environment name
         id: env_name
@@ -83,11 +83,74 @@ jobs:
           echo "Resolved version $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  version-bump:
+    name: Version Bump
+    runs-on: ubuntu-latest
+    needs: resolve-env
+    # Pull requests only. The rule is about what a merge does to main's version, so
+    # on a push it has already happened and there is nothing left to fix on that
+    # commit — the release job's "already released, nothing to do" is the no-bump
+    # outcome there. `github.base_ref` is set for no other event.
+    if: github.event_name == 'pull_request'
+    steps:
+      # Depth 1, and the tree is never read: the base branch's pyproject.toml is
+      # fetched as a blob below and the head's version arrives as a resolve-env
+      # output. The checkout is only what gives that fetch a repository to land in.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Version bumps the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BASE_FILE: ${{ runner.temp }}/base-pyproject.toml
+          # resolve-env's number, not a second extraction — it is semver-validated
+          # there, and on a pull_request that job read the MERGE ref, so this is the
+          # version main would carry after the merge rather than the branch's own.
+          HEAD_VERSION: ${{ needs.resolve-env.outputs.version }}
+        # Compared against the base branch's CURRENT tip, not the PR's merge base:
+        # the property that has to hold is "higher than what main has now". A PR that
+        # was green before main moved past it therefore goes red on its next run,
+        # which is the intended signal — two PRs may not claim one version.
+        run: |
+          git fetch --depth=1 origin "$BASE_REF"
+          git show FETCH_HEAD:pyproject.toml > "$BASE_FILE"
+          python3 <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+
+          # The leading triple is the whole comparison: a bump has to move major,
+          # minor or patch, so an equal triple is not one whatever suffix follows it.
+          def release(version: str, where: str) -> tuple[int, ...]:
+              match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+              if match is None:
+                  print(f"::error::{where} version '{version}' has no major.minor.patch")
+                  sys.exit(1)
+              return tuple(int(part) for part in match.groups())
+
+          base_ref = os.environ["BASE_REF"]
+          head = os.environ["HEAD_VERSION"]
+          with open(os.environ["BASE_FILE"], "rb") as fh:
+              base = tomllib.load(fh)["tool"]["poetry"]["version"]
+
+          # Annotations on stdout: workflow commands are read from there, and a
+          # `file=` one hangs the message on pyproject.toml in the PR's Files tab.
+          if release(head, "this branch's") <= release(base, f"{base_ref}'s"):
+              print(
+                  f"::error file=pyproject.toml::version {head} does not bump "
+                  f"{base_ref}'s {base} — every PR raises major, minor or patch"
+              )
+              sys.exit(1)
+          print(f"pyproject version {base} -> {head}")
+          PY
+
   lint:
     name: Lint & Type Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-python-env
         with:
@@ -121,6 +184,15 @@ jobs:
       - name: version pins agree
         run: .venv/bin/just pins
 
+      # The tracked JSON — the 2354-line Grafana dashboard — is parsed by nothing
+      # else here, and a truncated one first fails at Grafana's provisioning step
+      # inside a container. `.pre-commit-config.yaml`'s check-json covers it for a
+      # clone with hooks installed; this is the enforcement copy, same split ruff
+      # already has. stdlib json, like resolve-env's tomllib: nothing to install,
+      # and `-t` names the file that failed.
+      - name: JSON files parse
+        run: git ls-files -z '*.json' | xargs -0 -r -t -I{} python3 -m json.tool {} /dev/null
+
       - name: ruff format --check
         run: .venv/bin/just fmt-check
 
@@ -150,7 +222,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-python-env
         with:
@@ -181,7 +253,7 @@ jobs:
       # either: it does not bump branch refs, only tags and SHAs. Bump deliberately.
       - name: Coverage comment
         id: coverage_comment
-        uses: MishaKav/pytest-coverage-comment@fd9adbdca9fdfbe2b9bfa44a7340e6a83346ce6c # v1.10.0
+        uses: MishaKav/pytest-coverage-comment@d46d9d594f3e1d11008ed19939deb7a139b18751 # v1.11.1
         with:
           pytest-coverage-path: ./pytest-coverage.txt
           junitxml-path: ./pytest.xml
@@ -237,7 +309,7 @@ jobs:
           --health-timeout 3s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-python-env
         with:
@@ -285,7 +357,7 @@ jobs:
           --health-timeout 3s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup-python-env
         with:
@@ -309,7 +381,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: resolve-env
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -365,7 +437,7 @@ jobs:
     # warmed, and is testable from a PR at all (workflow_run always executes the
     # DEFAULT branch's copy of the workflow file).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -375,7 +447,7 @@ jobs:
       # GITHUB_TOKEN cannot be granted packages: write.
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -414,8 +486,12 @@ jobs:
           # runs on main, where the resolved name and the Dockerfile's runtime
           # default are both "production" — but relying on two independent
           # defaults agreeing is not a property worth depending on.
+          # GIT_SHA is baked in as an ENV (and an OCI revision label) so the running
+          # bot can report its own commit. github.sha is the commit this job checked
+          # out — the same one metadata-action's `type=sha` tags the image with.
           build-args: |
             ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+            GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Dead config removed: `cache-to` only ever wrote `type=gha`, so
@@ -427,6 +503,45 @@ jobs:
           # scope=runtime pairs with container-test's scope=test: this job builds the
           # runtime target, that one builds test, and sharing the default scope meant
           # each overwrote the other's export between runs.
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
+
+      # The same commit, without the charts extra. Published as a parallel `-slim` tag
+      # family rather than replacing anything: the archive ships OFF, so most
+      # deployments can never reach -analytics and pay 230MB for it, but an operator
+      # who does enable it must not be silently downgraded by a tag they already use.
+      - name: Extract metadata (slim)
+        id: meta-slim
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # onlatest so `latest` becomes `latest-slim` too, rather than colliding with
+          # the full image's moving tag.
+          flavor: suffix=-slim,onlatest=true
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve-env.outputs.version }},enable={{is_default_branch}}
+
+      - name: Build slim runtime image (push only from main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: ${{ env.PUBLISH }}
+          # CHART_EXTRAS= is EMPTY on purpose and is the entire slim mechanism — it
+          # overrides the Dockerfile ARG's charts-included default. Deleting the
+          # trailing `=` would pass the arg through from the environment instead,
+          # which is unset here, and buildx would fall back to that same default:
+          # a second identical image under a -slim name.
+          build-args: |
+            ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+            GIT_SHA=${{ github.sha }}
+            CHART_EXTRAS=
+          tags: ${{ steps.meta-slim.outputs.tags }}
+          labels: ${{ steps.meta-slim.outputs.labels }}
+          # Same scope as the full build: the two share every layer up to the poetry
+          # install, so a separate scope would re-export all of them.
           cache-from: type=gha,scope=runtime
           cache-to: type=gha,mode=max,scope=runtime
 

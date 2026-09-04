@@ -1,12 +1,24 @@
+import math
 import os
 import subprocess
-import warnings
 from enum import Enum
 from typing import Final, Optional
 from urllib.parse import unquote, urlsplit
 
+# The deploy environment, tagged onto every log line and OTel resource. Read
+# from the environment alone, so importing this module runs no subprocess and
+# needs no git repo. main() may replace it before setup_telemetry() — read it as
+# `config.ENVIRONMENT`, never `from src.config import ENVIRONMENT`, or the value
+# binds before that.
+ENVIRONMENT: str = os.environ.get("ENVIRONMENT") or "development"
 
-def _git_branch() -> str:
+
+def infer_environment_from_git() -> Optional[str]:
+    """Best-effort deploy-environment name from the current git branch.
+
+    None when the branch cannot be determined: no repo, no git binary, or a
+    detached HEAD, which `git rev-parse --abbrev-ref HEAD` reports as "HEAD" and
+    which is the normal state of a worktree. Never raises."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -14,46 +26,96 @@ def _git_branch() -> str:
             text=True,
             timeout=2,
         )
-        branch = result.stdout.strip()
-        if result.returncode == 0 and branch and branch != "HEAD":
-            return branch
     except Exception:
-        pass
-    # TODO: A detached HEAD turns this advisory warning into a hard test failure.
-    # `git rev-parse --abbrev-ref HEAD` prints "HEAD" when detached (including every
-    # `git worktree add --detach`), and pyproject's `filterwarnings = ["error", ...]`
-    # promotes this RuntimeWarning to an import-time exception, killing the suite at
-    # collection with an error about git branch detection rather than anything about
-    # the tests. CI escapes only because ci.yml sets ENVIRONMENT explicitly.
-    # Fix: skip the warning when the checkout is legitimately detached, or default
-    # ENVIRONMENT for the test session in tests/conftest.py.
-    warnings.warn(
-        "Could not detect git branch; defaulting ENVIRONMENT to 'development'",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    return "development"
-
-
-def _parse() -> str:
-    raw = os.environ.get("ENVIRONMENT")
-    if raw is not None:
-        return raw
-    branch = _git_branch()
+        return None
+    branch = result.stdout.strip()
+    if result.returncode != 0 or not branch or branch == "HEAD":
+        return None
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
-ENVIRONMENT: str = _parse()
+# Touched by a loop-resident task so the container HEALTHCHECK can tell a wedged
+# event loop from a healthy one. Unset — the default outside Docker — skips the
+# task; nothing reads the file there.
+LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
+LIVENESS_INTERVAL_SECS: float = float(os.environ.get("LIVENESS_INTERVAL_SECS", "15.0"))
 
 NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
 
+
+def _float_env(name: str, default: float, *, minimum: float) -> float:
+    """Parse a float knob from the environment, or raise a named error.
+
+    Same empty-reads-as-unset rule as _int_env below, and the same reason for raising
+    at import time. Non-finite is refused separately from the floor because `float()`
+    accepts "inf" and "nan" happily and both defeat the dashboard driver in ways a
+    minimum would not catch: `inf` makes the deadline never expire, so the command
+    holds its max_concurrency slot forever and every later run in that guild answers
+    "already running". A tick of 0 is the other half — it turns the driver's timed
+    wait into a hot spin, measured at 0.6 CPU-seconds per wall-second on the loop
+    that also carries voice heartbeats.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number; got {raw!r}") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number; got {raw!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    return value
+
+
+# Floor for every live-dashboard knob. Small enough to stay a tuning knob rather than
+# a policy, large enough that the driver's wait is always a real suspension.
+_MIN_DASHBOARD_SECS: Final[float] = 0.05
+
 # -ping's live-edit loop tunables. Constants, not call-time reads: the dashboard
 # reads them every tick. Here rather than in ping.py so this module stays the one
 # place that answers "what does the bot read from the environment?".
-PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
-PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
+PING_TICK_SECS: float = _float_env("PING_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
+PING_DEADLINE_SECS: float = _float_env(
+    "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
+)
+
+# The same two knobs for -debug's live-edit loop (src/dashboard.py drives both).
+# A longer deadline than -ping's: these collectors do strictly more work per block
+# — the Postgres probe brackets a 2s sampling window between two stats queries,
+# plus a Prometheus round trip, against -ping's single reachability probe — and a
+# block that misses the deadline renders "timed out" rather than being retried,
+# so cutting it short loses real data. Keep the deadline comfortably above the
+# ~2.2s floor that window gives the Postgres block, or it times out every time.
+DEBUG_TICK_SECS: float = _float_env("DEBUG_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
+DEBUG_DEADLINE_SECS: float = _float_env(
+    "DEBUG_DEADLINE_SECS", 8.0, minimum=_MIN_DASHBOARD_SECS
+)
+
+# How long -analytics waits for its chart before sending the card without one. Sized
+# for the cold path, which dominates. Expiring is silent — the card still sends — so
+# the deadline's job is bounding a wedged worker holding the guild's concurrency
+# slot. It bounds the CALLER: a ProcessPoolExecutor cannot cancel a running call.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+ANALYTICS_RENDER_DEADLINE_SECS: float = _float_env(
+    "ANALYTICS_RENDER_DEADLINE_SECS", 20.0, minimum=_MIN_DASHBOARD_SECS
+)
+
+
+# Floor for the playback heartbeat. Higher than the dashboard floor because each
+# tick is a Redis write per PLAYING guild rather than a local timer: at 0.05 that
+# is 20 HSET+EXPIRE round trips a second per guild, all of it AOF-appended.
+_MIN_HEARTBEAT_SECS: Final[float] = 0.5
+
+# How often a playing guild records its playback position. Bounds the worst-case
+# recovery error: a crash resumes at the last heartbeat, so at most this many
+# seconds replay. Separate knob from the progress bar — that cadence is display.
+HEARTBEAT_INTERVAL_SECS: float = _float_env(
+    "HEARTBEAT_INTERVAL_SECS", 3.0, minimum=_MIN_HEARTBEAT_SECS
+)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -91,8 +153,8 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # entries a drainer is holding, ACKing them first (see _enforce_cap) — so size it
 # well above BATCH_SIZE x peak burst, not just above steady-state depth.
 #
-# Sizing: ~420 bytes on the wire, ~487 stored (MEMORY USAGE against
-# redis:7-alpine at 100k stream entries), so 256mb holds roughly 525k un-archived
+# Sizing: ~520 bytes on the wire, ~625 stored (MEMORY USAGE against
+# redis:7-alpine at 50k stream entries), so 256mb holds roughly 429k un-archived
 # plays. Redis 8 stores the same payload in ~424 bytes; measure on your major.
 HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 
@@ -103,24 +165,14 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
 
-def history_archive_enabled() -> bool:
-    """True when the operator has opted in to the Postgres history archive.
-
-    The consent gate for long-term storage. Enabled: POSTGRES_URL required at
-    startup, every play XADDed to history:outbox, the drainer moving it into
-    play_history forever. Disabled — the default — none of that exists; Redis
-    behavior is identical either way. Read at call time (once per song at most).
+def _parse_bool_env(name: str) -> bool:
+    """Parse a boolean knob, or raise naming it. Unset and empty read as False.
 
     Parsing is STRICT because of the failure direction: a lenient
-    anything-but-true-is-False rule turns a typo (`HISTORY_ARCHIVE_ENABLED=on`)
-    into an operator who believes they enabled archiving while every play goes
-    unrecorded. Unset and empty read as False — collection must be a choice.
-
-    setup_hook must call this before any other consumer: the next reader is
-    @_guild_op-wrapped push_history, where a garbage value becomes one warning per
-    song instead of a startup abort.
+    anything-but-true-is-False rule turns a typo (`=on`) into an operator who
+    believes they flipped the switch while nothing changed.
     """
-    raw = os.environ.get("HISTORY_ARCHIVE_ENABLED")
+    raw = os.environ.get(name)
     value = (raw or "").strip().lower()
     if not value:
         return False
@@ -129,9 +181,66 @@ def history_archive_enabled() -> bool:
     if value in ("false", "0", "no"):
         return False
     raise ValueError(
-        f"HISTORY_ARCHIVE_ENABLED must be one of true/false, 1/0, or yes/no "
+        f"{name} must be one of true/false, 1/0, or yes/no "
         f"(case-insensitive); got {raw!r}"
     )
+
+
+def history_archive_enabled() -> bool:
+    """True when the operator has opted in to the Postgres history archive.
+
+    The consent gate for long-term storage. Enabled: POSTGRES_URL required at
+    startup, every play XADDed to history:outbox, the drainer moving it into
+    play_history forever. Disabled — the default — none of that exists; Redis
+    behavior is identical either way. Read at call time (once per song at most).
+
+    Parsing is STRICT (see _parse_bool_env) because of the failure direction: a
+    typo (`HISTORY_ARCHIVE_ENABLED=on`) would otherwise leave an operator
+    believing they enabled archiving while every play goes unrecorded. Unset and
+    empty read as False — collection must be a choice.
+
+    setup_hook must call this before any other consumer: the next reader is
+    @_guild_op-wrapped push_history, where a garbage value becomes one warning per
+    song instead of a startup abort.
+    """
+    return _parse_bool_env("HISTORY_ARCHIVE_ENABLED")
+
+
+def debug_mode_default() -> bool:
+    """The process-wide default for debug mode — what a guild gets before anyone
+    runs `-debug --enable`.
+
+    Debug mode is observation-only: it decorates every embed the bot sends with
+    trace/timing/runtime metadata — the live Now Playing card included — and
+    nothing else, so this is safe to leave on. Read ONCE, by
+    MusicBot.__init__, which is what makes a garbage value abort startup inside
+    load_extension.
+
+    This is the default for a guild that has never chosen, and only for as long as
+    it has not: `-debug --enable/--disable` persists to guild:{id}:config and WINS
+    over this value from then on, across restarts. Changing this env var moves every
+    guild that never chose and none that did.
+
+    Parsed by the same strict table as history_archive_enabled — unset and empty
+    are False, and a typo raises rather than silently reading as off — so there is
+    one boolean grammar in this file rather than two.
+    """
+    return _parse_bool_env("DEBUG_MODE")
+
+
+def debug_prometheus_url() -> Optional[str]:
+    """Base URL of a Prometheus that holds this deployment's container metrics, or
+    None (the default) to leave the feature off.
+
+    -debug's Postgres block reads container CPU/memory from here, because the bot
+    cannot see another container's cgroup and Postgres reports no OS metrics over
+    SQL. Compose supplies it once otel-lgtm's Prometheus port is published; unset,
+    the row degrades to `n/a (no metrics source)` and nothing else changes.
+
+    Read at call time, like postgres_url, and `or None` collapses unset and
+    exported-but-empty into one absent case.
+    """
+    return (os.environ.get("DEBUG_PROMETHEUS_URL") or "").strip() or None
 
 
 def postgres_url() -> Optional[str]:

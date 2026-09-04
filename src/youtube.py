@@ -2,7 +2,8 @@ import copy
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -15,9 +16,10 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import fmt_duration, get_logger, notice_embed
+from src.util import current_traceparent, fmt_duration, get_logger
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -137,9 +139,14 @@ class YTDLVideoMetadata(TypedDict, total=False):
 class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
     """A single video's fields, once yt_source() has unwrapped "entries". Only
     url/webpage_url are guaranteed — any other field may be absent per
-    extractor/client. Mirrors _STREAM_CACHE_FIELDS field-for-field; required keys go in
-    _YTDLVideoInfoRequired, descriptive ones in YTDLVideoMetadata.
+    extractor/client. Mirrors _STREAM_CACHE_FIELDS field-for-field, plus the one key
+    below that no extraction produces; required keys go in _YTDLVideoInfoRequired,
+    descriptive ones in YTDLVideoMetadata.
     """
+
+    # Stamped by _cache_stream, never by yt-dlp: the trace of the extraction that
+    # minted this URL. Absent on a fresh extraction.
+    traceparent: str
 
 
 class YTDLEntry(YTDLVideoMetadata, total=False):
@@ -199,14 +206,14 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
-    for field in _UNUSED_INFO_COLLECTIONS:
-        info.pop(field, None)
+    for key in _UNUSED_INFO_COLLECTIONS:
+        info.pop(key, None)
     entries = info.get("entries")
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, dict):
-                for field in _UNUSED_INFO_COLLECTIONS:
-                    entry.pop(field, None)
+                for key in _UNUSED_INFO_COLLECTIONS:
+                    entry.pop(key, None)
     # cast, not a bare annotation: the checker cannot verify yt-dlp's untyped dict
     # conforms, and `grep cast(` is how those assertions are audited.
     return cast(YTDLExtractResult, info)
@@ -284,20 +291,14 @@ _YTDLP_LOGGER = _YtdlpLogger()
 
 # Client strategy. Relevant when bumping yt-dlp.
 #
-# android_vr is primary: it needs no PO token and serves audio-only formats. yt-dlp
-# resolves `default` by JS-runtime availability, so shipping Deno (yt-dlp's `deno`
-# extra, landing where yt-dlp looks first) plus yt-dlp-ejs turns ('android_vr',) into
-# ('android_vr', 'web_safari') and makes the fallback's signature/n challenges solvable.
-# web_safari serves *muxed* formats only (HLS 91-96, https 18) — the `/best` leg picks
-# one and ffmpeg's -vn drops the video. The bgutil-pot-provider sidecar mints PO tokens
-# via the bgutil-ytdlp-pot-provider plugin, whose pyproject pin must move in lockstep
-# with that compose image tag.
+# We pick NO client: `default` is yt-dlp's own list, and tracking it is the point —
+# upstream moves it when YouTube breaks a client. Names here are what `default`
+# resolved to, not configuration: RE-VERIFY ON EVERY BUMP. Today, `visionos,web`.
 #
-# Degradation ladder — every rung lands on a previously-working configuration:
-#   android_vr healthy → audio-only (e.g. 251/opus)
-#   android_vr out     → web_safari muxed audio; WARNING via _record_serving_format
-#   sidecar down       → plugin warns; web_safari works until POT enforcement lands
-#   Deno broken        → yt-dlp reverts to the JS-less default (android_vr only)
+# visionos carries playback (no PO token, no JS player, audio-only opus). The deno +
+# yt-dlp-ejs extras and the bgutil sidecar exist only to keep `web` usable as a
+# fallback: yt-dlp drops `web` without a JS runtime, and its formats are withheld
+# without a GVS token. The bgutil pin tracks the compose image tag by hand.
 # Revoked URLs are separate: _resolve_playable_stream()'s probe-and-re-extract.
 # See docs/ARCHITECTURE.md#yt-dlp-client-strategy.
 #
@@ -353,10 +354,14 @@ _YTDL_STREAM_SEARCH_OPTS = {
 # Used by yt_playlist: entry metadata for every video in a playlist without
 # extracting each one's stream URL. noplaylist=False overrides the base option so
 # yt-dlp processes the full playlist, not just the first video.
+# extract_flat is "in_playlist", not True: a pasted watch?v=…&list=… URL resolves
+# to a url_result pointing at the playlist, and True stops there — yielding a
+# _type="url" with no entries, so the playlist queued nothing. "in_playlist"
+# resolves that one hop and still leaves the entries inside the playlist flat.
 _YTDL_PLAYLIST_OPTS = {
     **_YTDL_BASE_OPTS,
     "noplaylist": False,
-    "extract_flat": True,
+    "extract_flat": "in_playlist",
 }
 
 # Legacy alias kept so any external callers that imported YTDL_OPTS still work.
@@ -371,9 +376,28 @@ _YT_SOURCE_TTL = 3600  # 1 hour
 # replayed: re-extracting costs seconds, serving a revoked URL costs the song.
 _STREAM_URL_MAX_TTL = 1800  # 30 minutes
 
-# Cap on the pre-playback URL probe: generous enough for a slow CDN, short enough
-# never to add a noticeable pause before a song starts.
-_STREAM_PROBE_TIMEOUT = 5.0  # seconds
+# Cap on the pre-playback URL probe. Short because a resolve can pay it TWICE (cached
+# entry, then the URL that replaces it) and exceeding it costs a cache entry rather
+# than only a verdict. An unconfirmed URL still plays, so firing early is cheap.
+_STREAM_PROBE_TIMEOUT = float(os.environ.get("STREAM_PROBE_TIMEOUT_SECS", "2.0"))
+
+# Consecutive UNCONFIRMED verdicts before the probe itself, rather than the URLs, is
+# treated as the fault. Its failure modes (blocked egress, DNS, a stalled loop) are
+# process-wide, so past this the cached-entry drop is suppressed and cached URLs are
+# served as-is.
+_UNCONFIRMED_STREAK_LIMIT = 3
+
+# Ceiling on how long an UNCONFIRMED URL may be cached. It is cached at all because
+# probe failures are process-wide: declining the write would stop anything repopulating
+# the cache and put every song through a fresh extraction. This bounds a wrong entry.
+_UNCONFIRMED_STREAM_TTL = 120  # 2 minutes
+
+# Fresh extractions one resolve may spend. A re-mint returns the same CDN host and the
+# same format, so it cures a revoked signature and nothing else: a url that probes dead
+# seconds after minting is refused for a reason an identical call cannot vary, and
+# yt-dlp has already retried the player API internally (`extractor_retries`). The
+# cached-entry drop is deliberately NOT charged against this.
+_MAX_STREAM_EXTRACTIONS = 1
 
 # Fields to persist in the stream URL cache — strips ephemeral/large fields.
 _STREAM_CACHE_FIELDS = frozenset(
@@ -403,9 +427,8 @@ _STREAM_CACHE_FIELDS = frozenset(
 )
 
 
-# format_ids already warned about — once per format per process, so a real
-# android_vr outage doesn't warn on every song. Optional[str] because an info-dict
-# can omit format_id; that case gets its own dedupe slot rather than being dropped.
+# Once per format per process, so a real outage doesn't warn on every song.
+# Optional[str] because an info-dict can omit format_id — that gets its own slot.
 _DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
 
 
@@ -413,9 +436,10 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
     """Record the shape of the format a song will play from. yt-dlp strips per-format
     client attribution (`__yt_dlp_client`) before formats leave the extractor, so the
     format shape is the signal instead: audio-only (vcodec "none") is healthy, while
-    muxed or HLS means android_vr degraded (yt-dlp#16150) or web_safari took over — one
-    warning, since playback continues and nothing else surfaces it. A missing vcodec
-    (pre-upgrade cache entries) counts as healthy.
+    muxed or HLS means the audio-only primary stopped serving and a fallback took over
+    — one warning, since playback continues and nothing else surfaces it. A missing
+    vcodec (pre-upgrade cache entries) counts as healthy. Phrased by SHAPE, never by
+    client name, so it survives yt-dlp changing what `default` resolves to.
     """
     span = trace.get_current_span()
     format_id = data.get("format_id")
@@ -428,8 +452,7 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
         log.warning(
             f"songs are being served a muxed A/V format "
             f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
-            "primary audio-only path (android_vr) is degraded and the player is "
-            "on the fallback ladder"
+            "audio-only primary is degraded and the player is on the fallback ladder"
         )
 
 
@@ -439,10 +462,10 @@ def _stream_cache_key(webpage_url: str) -> str:
 
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
     """How long a stream URL may be cached, or None when it isn't worth caching.
-    `expire` advertises a 6-hour window but YouTube revokes long before it (observed: a
-    403 within the hour with five hours still claimed), so _STREAM_URL_MAX_TTL is what
-    bounds this in practice. `expire` is a query param on https formats but a path
-    segment (`/expire/<epoch>/`) on the HLS manifests web_safari serves; missing either
+    `expire` advertises a 6-hour window but YouTube revokes long before it, so
+    _STREAM_URL_MAX_TTL is what bounds this in practice. `expire` is a query param on
+    https formats but a path
+    segment (`/expire/<epoch>/`) on the HLS manifests the muxed rung serves; missing either
     leaves that rung re-extracting 3-5s on every play, so both forms are read.
     """
     try:
@@ -459,37 +482,167 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
         return None
 
 
-async def _stream_url_playable(stream_url: str) -> bool:
-    """True when YouTube will actually serve this stream URL to ffmpeg right now. A
-    revoked URL makes ffmpeg 403 and exit, which discord.py cannot tell from a song that
-    simply ended — silence, nothing logged. So probe exactly as ffmpeg opens it: a plain
-    GET, no Range. A revoked URL still answers 206 to a *ranged* GET and googlevideo
-    rejects HEAD, so either would report a dead URL as healthy. The body is never read.
+class StreamProbe(Enum):
+    """What a pre-playback probe learned about a stream URL. UNCONFIRMED must stay
+    distinct: as DEAD it fails songs over a blocked probe, as PLAYABLE the URL is
+    cached unverified and one unreachable CDN edge takes a song out for the full TTL.
+    """
+
+    PLAYABLE = "playable"
+    DEAD = "dead"
+    UNCONFIRMED = "unconfirmed"
+
+
+# Consecutive UNCONFIRMED verdicts, process-wide. Reset by any probe that actually
+# reached the host — a single completed probe proves the path works.
+_unconfirmed_streak = 0
+
+
+def probe_path_looks_broken() -> bool:
+    """True once enough probes in a row failed to complete that the probe, rather than
+    the URLs, is the thing in doubt. Callers use this to stop acting on UNCONFIRMED."""
+    return _unconfirmed_streak >= _UNCONFIRMED_STREAK_LIMIT
+
+
+def _record_probe_outcome(probe: StreamProbe) -> StreamProbe:
+    global _unconfirmed_streak
+    if probe is StreamProbe.UNCONFIRMED:
+        _unconfirmed_streak += 1
+        if _unconfirmed_streak == _UNCONFIRMED_STREAK_LIMIT:
+            log.warning(
+                f"{_unconfirmed_streak} stream probes in a row did not complete — "
+                "treating the probe path as unhealthy and trusting cached URLs until "
+                "one succeeds"
+            )
+    else:
+        _unconfirmed_streak = 0
+    return probe
+
+
+# One session for every stream probe. The probe closes each connection rather
+# than pooling it, so this saves the connector and SSL-context construction a
+# per-call session paid — not a handshake. See docs/ARCHITECTURE.md#stream-probe-session
+_probe_session: Optional[aiohttp.ClientSession] = None
+# One-shot, like MusicBotApp.close()'s own _teardown_started: the playback loop
+# outlives close_probe_session() by up to the 30s span flush, and rebuilding on
+# a call from there would strand a session nothing closes.
+_probe_session_closed = False
+
+
+class ProbeSessionClosed(RuntimeError):
+    """Raised when a probe is attempted after the session is closed for good."""
+
+
+def _get_probe_session() -> aiohttp.ClientSession:
+    """The process's probe session, created on first use so it binds to the
+    running loop. DummyCookieJar is load-bearing, not tidiness: a status-line
+    probe never needs a cookie, and `-play <any url>` reaches this session, so a
+    real jar lets one guild set a `Domain=com` cookie that is then replayed to
+    googlevideo for every guild until restart. Rebuilt if closed from outside,
+    but never after close_probe_session(). Safe to call twice."""
+    global _probe_session
+    if _probe_session_closed:
+        raise ProbeSessionClosed("stream-probe session is closed")
+    if _probe_session is None or _probe_session.closed:
+        _probe_session = aiohttp.ClientSession(
+            # limit=0: one connector now serves every guild, and the default 100
+            # would queue the 101st probe against its own 2s budget and report a
+            # healthy URL as UNCONFIRMED. Costs nothing — the probe never pools.
+            connector=aiohttp.TCPConnector(limit=0),
+            timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT),
+            cookie_jar=aiohttp.DummyCookieJar(),
+        )
+    return _probe_session
+
+
+async def close_probe_session() -> None:
+    """Release the probe session for good. Called from MusicBotApp.close();
+    safe to call twice. Errors propagate — the call site guards this step, like
+    every other step in close()."""
+    global _probe_session, _probe_session_closed
+    _probe_session_closed = True
+    session, _probe_session = _probe_session, None
+    if session is not None and not session.closed:
+        await session.close()
+
+
+async def _probe_stream_url(stream_url: str) -> StreamProbe:
+    """What YouTube will do with this stream URL right now. A revoked URL makes ffmpeg
+    403 and exit, which discord.py cannot tell from a song that simply ended — silence,
+    nothing logged. So probe exactly as ffmpeg opens it: a plain GET, no Range. A revoked
+    URL still answers 206 to a *ranged* GET and googlevideo rejects HEAD, so either would
+    report a dead URL as healthy. The body is never read.
+
+    A probe that never completed says nothing about the URL, hence UNCONFIRMED rather
+    than DEAD — the caller still plays it and lets ffmpeg judge.
     """
     if not stream_url:
-        return False
+        return StreamProbe.DEAD
     try:
-        timeout = aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(stream_url) as response:
-                return response.status < 400
+        session = _get_probe_session()
+        # read_bufsize=0 + close(), not release(): only the status line matters,
+        # and aiohttp otherwise fills its StreamReader from the moment headers land
+        # until the transport is paused — audio we pay for and discard. Nothing is
+        # lost: an unread body means the connection could not be pooled anyway.
+        async with session.get(stream_url, read_bufsize=0) as response:
+            # Only a definite client-side refusal is DEAD. 429 and 5xx say "not
+            # right now" exactly as a timeout does, and routing them to DEAD would
+            # delete the cache entry and refuse a song ffmpeg's own -reconnect
+            # would very likely have played.
+            status = response.status
+            response.close()
+            if status < 400:
+                return _record_probe_outcome(StreamProbe.PLAYABLE)
+            if status == 429 or status >= 500:
+                log.warning(
+                    f"stream URL probe got HTTP {status}, treating as "
+                    "unconfirmed rather than revoked"
+                )
+                return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+            return _record_probe_outcome(StreamProbe.DEAD)
+    except ProbeSessionClosed:
+        # Shutdown, not a defect: the loop can reach here while close() waits on
+        # the span flush. Nothing to judge and nothing to cache.
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
+        # State the fact only — the three call sites have three different policies,
+        # and each logs its own.
+        log.warning(f"stream URL probe did not complete: {e}")
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
     except Exception as e:
-        # A probe that never completed is evidence about the network, not the URL:
-        # assume playable and let ffmpeg judge.
-        log.warning(f"stream URL probe failed, assuming playable: {e}")
-        return True
+        # Anything outside the network set is a bug in this function, not evidence
+        # about the URL. Still UNCONFIRMED, because no probe defect may cost a song
+        # — but ERROR, or a dead session reads as a flaky CDN forever.
+        log.error(
+            f"stream URL probe failed unexpectedly: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
 
 
 async def _cache_stream(
-    redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
+    redis: Optional[aioredis.Redis],
+    cache_key: str,
+    data: YTDLVideoInfo,
+    *,
+    max_ttl: Optional[int] = None,
 ) -> bool:
-    """Persist a stream URL already probed and found playable. True when an entry was
-    written, False when the URL isn't worth caching (no usable expiry)."""
+    """Persist a probed stream URL. True when an entry was written, False when the URL
+    isn't worth caching (no usable expiry). `max_ttl` caps the lifetime below the URL's
+    own — used for a URL that could not be confirmed."""
     # Absent keys are dropped, not written as None: `{"title": None}` would contradict
     # YTDLVideoInfo, which types title as str and treats absent fields as *missing*.
-    stripped = {k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None}
+    stripped: dict[str, Any] = {
+        k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None
+    }
+    # The span here is the extraction that minted the URL; the song that plays it
+    # links back. See docs/ARCHITECTURE.md#observability.
+    if traceparent := current_traceparent():
+        stripped["traceparent"] = traceparent
     ttl = _stream_url_ttl(data.get("url", ""))
     if ttl:
+        if max_ttl is not None:
+            ttl = min(ttl, max_ttl)
         await cache_set(redis, cache_key, stripped, ttl)
         return True
     return False
@@ -499,25 +652,53 @@ async def _probe_and_cache(
     redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
 ) -> bool:
     """Success-path post-processing for a full stream extraction: record the serving
-    format, probe the URL, cache it when playable. True when an entry was written.
-    Shared by prefetch_stream and yt_source so both write identical entries; only a
-    proven-playable URL earns one, since caching a revoked URL hands yt_stream a dead
-    one."""
+    format, probe the URL, cache it. True when an entry was written. Shared by
+    prefetch_stream and yt_source so both write identical entries.
+
+    A DEAD URL is never cached. An UNCONFIRMED one is, for _UNCONFIRMED_STREAM_TTL
+    only: probe failures are process-wide, so declining the write would stop anything
+    repopulating the cache and put every play through a fresh extraction."""
+    span = trace.get_current_span()
     _record_serving_format(data)
     if _stream_url_ttl(data.get("url", "")) is None:
         # Uncacheable (no usable expiry — e.g. SoundCloud): probing would spend a
         # network round only for _cache_stream to decline the write anyway.
         return False
-    if await _stream_url_playable(data.get("url", "")):
+    probe = await _probe_stream_url(data.get("url", ""))
+    span.set_attribute("ytdl.stream_probe", probe.value)
+    if probe is StreamProbe.PLAYABLE:
         return await _cache_stream(redis, cache_key, data)
+    if probe is StreamProbe.UNCONFIRMED:
+        log.warning(
+            "could not confirm a freshly extracted stream URL — caching it for "
+            f"{_UNCONFIRMED_STREAM_TTL}s only"
+        )
+        return await _cache_stream(
+            redis, cache_key, data, max_ttl=_UNCONFIRMED_STREAM_TTL
+        )
     return False
 
 
 async def invalidate_stream_cache(
     redis: Optional[aioredis.Redis], webpage_url: str
-) -> None:
-    """Drop a song's cached stream URL so the next play re-extracts a fresh one."""
-    await cache_del(redis, _stream_cache_key(webpage_url))
+) -> bool:
+    """Drop a song's cached stream URL so the next play re-extracts a fresh one.
+    Returns whether an entry existed to drop."""
+    return await cache_del(redis, _stream_cache_key(webpage_url))
+
+
+@dataclass(frozen=True, slots=True)
+class NpHostRef:
+    """The live Now Playing host an interrupted fragment left behind, so the
+    fragment's resume tail can dispose of that frozen card when it starts.
+
+    Runtime only — a live Message cannot be serialized, and own_embeds cannot be
+    reconstructed from ids, so the wire fields alone can never strip-edit a
+    retirement (see MusicPlayer._retire_np_host)."""
+
+    message: discord.Message
+    own_embeds: list[discord.Embed]
+    dedicated: bool
 
 
 @dataclass
@@ -537,25 +718,38 @@ class QueueObject:
     # so the loop must skip its redis_pop_for(). Read via guild_queue.is_persisted().
     persisted: bool = True
     # ── -playnow interjection flags ──
-    # Queued via -playnow. A later -playnow REPLACES a playing interjection (no
-    # resume entry is built for it) instead of stacking.
+    # Queued via -playnow. Attribution only — interjections stack, so nothing reads
+    # this except the span attribute.
     interjected: bool = False
-    # The rebuilt tail of an interrupted song (ts = interrupt position). Drives
-    # notice wording and suppresses yt_stream's "Starting song at Xs" — the loop
-    # announces "Resuming…" when the entry actually starts.
+    # The rebuilt tail of an interrupted song (ts = interrupt position). Drives which
+    # notice the loop's start path sends: "Resuming…" for these, "Starting song at
+    # Xs" for an ordinary ?t= entry.
     is_resume: bool = False
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
-    # ── Enqueue stamps, written once by MusicPlayer and carried thereafter ──
-    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
-    # stamped", which is what makes stamping idempotent across re-queues.
-    queued_at: float = 0.0
-    # Songs ahead of it then, counting the one playing (0 = played immediately).
-    queue_position: int = 0
+    # ── Ask-time analytics, set at construction and carried thereafter ──
+    # queued_at + queue_position in one frozen container (guild_state.Analytics).
+    # yt_source/yt_playlist REQUIRE it, so a QueueObject leaves them complete;
+    # the default exists for rehydration and the carry sites, which always pass
+    # a real value explicitly.
+    analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for — "search", or the host of the pasted link.
     # Classified by src.sources at parse time and carried from there; "" = unknown.
     query_source: str = ""
+    # Unix epoch when the audio started, stamped by the loop at vc.play(). A resume
+    # tail INHERITS it, so every fragment of one play records the same start;
+    # 0.0 = not played yet, which makes the stamp idempotent across fragments.
+    played_at: float = 0.0
+    # ── The Now Playing card the interrupted fragment left frozen ──
+    # Set on a resume tail at the fragment's iteration end (see MusicPlayer's
+    # _pending_resume_tail) and consumed when the tail starts. The ids survive a
+    # restart; the ref does not, and only the ref can strip-edit a response host.
+    # 0/0/False = nothing to clean up.
+    np_message_id: int = 0
+    np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
+    np_dedicated: bool = False  # a pure NP message (deletable) vs a response
+    np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
 
 
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
@@ -592,9 +786,15 @@ class YTDL(discord.FFmpegOpusAudio):
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
-        queued_at: float = 0.0,
-        queue_position: int = 0,
+        analytics: Analytics = ANALYTICS_ZERO,
         query_source: str = "",
+        user_input: Optional[str] = None,
+        persisted: bool = True,
+        played_at: float = 0.0,
+        np_message_id: int = 0,
+        np_channel_id: int = 0,
+        np_dedicated: bool = False,
+        np_host_ref: Optional[NpHostRef] = None,
     ) -> None:
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -608,11 +808,26 @@ class YTDL(discord.FFmpegOpusAudio):
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
-        # Enqueue stamps carried from the QueueObject so the history entry this
-        # song produces records where it started, not when it played.
-        self.queued_at: float = queued_at
-        self.queue_position: int = queue_position
+        # Ask-time analytics carried from the QueueObject so the history entry
+        # this song produces records where it started, not when it played.
+        self.analytics: Analytics = analytics
         self.query_source: str = query_source
+        # What the user typed, carried so -remove still matches a song that has
+        # become a playing one — a -playnow resume tail is rebuilt from here.
+        self.user_input: Optional[str] = user_input
+        # Whether this song's entry is still on the Redis list (QueueObject.persisted):
+        # read by the loop to decide whether settling its claim LPOPs. A crash-
+        # recovered head that came back True would retire an entry never its own.
+        self.persisted: bool = persisted
+        # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
+        # which inherits the interrupted song's start (see QueueObject.played_at).
+        self.played_at: float = played_at
+        # The previous fragment's frozen NP card, carried so the loop can dispose
+        # of it once this one is up (see QueueObject's fields).
+        self.np_message_id: int = np_message_id
+        self.np_channel_id: int = np_channel_id
+        self.np_dedicated: bool = np_dedicated
+        self.np_host_ref: Optional[NpHostRef] = np_host_ref
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -723,12 +938,23 @@ class YTDL(discord.FFmpegOpusAudio):
         cls,
         qo: QueueObject,
         redis: Optional[aioredis.Redis],
+        *,
+        allow_reextract: bool = True,
     ) -> YTDLVideoInfo:
         """Resolve a song to stream data whose URL YouTube will actually serve. Every URL
         is probed first, because a revoked one fails in the worst way: ffmpeg 403s and
         exits, discord.py reports a completed song, and the player advances in silence
         with nothing logged. A revoked URL is dropped from the cache and re-extracted
         once; once is enough.
+
+        UNCONFIRMED is not DEAD: the URL still plays (ffmpeg is the judge) and is
+        cached only briefly. A cached one is dropped and re-extracted for a freshly
+        signed URL on the same edge and format, which cures an early revocation. That
+        drop is FREE, never charged against _MAX_STREAM_EXTRACTIONS.
+
+        Two brakes stop it becoming self-inflicted load: once the probe path looks
+        broken process-wide the cached URL is served untouched, and
+        `allow_reextract=False` (the background prefetch) declines to re-extract.
         """
         span = trace.get_current_span()
         cache_key = _stream_cache_key(qo.webpage_url)
@@ -736,9 +962,12 @@ class YTDL(discord.FFmpegOpusAudio):
         data: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
         span.set_attribute("ytdl.cache_hit", data is not None)
 
-        for attempt in range(2):
+        extractions = 0
+        while True:
             extracted_fresh = False
             if data is None:
+                if extractions >= _MAX_STREAM_EXTRACTIONS:
+                    break
                 # Single-video cast, as in prefetch_stream.
                 data = cast(
                     Optional[YTDLVideoInfo],
@@ -746,18 +975,54 @@ class YTDL(discord.FFmpegOpusAudio):
                         ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
                     ),
                 )
+                extractions += 1
                 span.set_attribute("ytdl.extracted_fresh", True)
                 if data is None:
                     raise RuntimeError("Could not extract stream data")
                 extracted_fresh = True
 
-            if await _stream_url_playable(data.get("url", "")):
+            probe = await _probe_stream_url(data.get("url", ""))
+            span.set_attribute("ytdl.stream_probe", probe.value)
+
+            if probe is StreamProbe.PLAYABLE:
                 _record_serving_format(data)
                 if extracted_fresh:
                     await _cache_stream(redis, cache_key, data)
                 return data
 
-            span.set_attribute("ytdl.stream_url_revoked", True)
+            if probe is StreamProbe.UNCONFIRMED:
+                if extracted_fresh:
+                    # Nowhere better to go: play it and cache it briefly, so the next
+                    # play is not forced through the same extraction.
+                    _record_serving_format(data)
+                    await _cache_stream(
+                        redis, cache_key, data, max_ttl=_UNCONFIRMED_STREAM_TTL
+                    )
+                    return data
+                if probe_path_looks_broken() or not allow_reextract:
+                    # The probe, not the URL, is what is in doubt — or a caller that
+                    # must not block on an extraction. Serve what we have.
+                    log.warning(
+                        f"serving the cached stream URL for {qo.webpage_url} unverified "
+                        f"(probe unhealthy={probe_path_looks_broken()}, "
+                        f"reextract_allowed={allow_reextract})"
+                    )
+                    _record_serving_format(data)
+                    return data
+                log.warning(
+                    f"could not confirm the cached stream URL for {qo.webpage_url} "
+                    "— dropping it from the cache and re-extracting"
+                )
+                await cache_del(redis, cache_key)
+                data = None
+                continue
+
+            if probe is not StreamProbe.DEAD:
+                # Deliberately loud: the enum makes the last branch a catch-all, so a
+                # fourth member would silently inherit "YouTube revoked this URL",
+                # deleting cache entries with no type error and no failing test.
+                raise AssertionError(f"unhandled stream probe verdict: {probe}")
+
             if not extracted_fresh:
                 # Only a cached URL has an entry to drop — a fresh one is cached
                 # exclusively on probe success, above.
@@ -766,15 +1031,15 @@ class YTDL(discord.FFmpegOpusAudio):
                     "— dropping it from the cache and re-extracting"
                 )
                 await cache_del(redis, cache_key)
-            elif attempt == 0:
+            elif extractions < _MAX_STREAM_EXTRACTIONS:
                 log.warning(
                     f"freshly extracted stream URL for {qo.webpage_url} probed "
-                    "dead — re-extracting once"
+                    "dead — re-extracting with the budget that remains"
                 )
             else:
                 log.warning(
                     f"freshly extracted stream URL for {qo.webpage_url} probed "
-                    "dead again — giving up"
+                    "dead — giving up"
                 )
             data = None
 
@@ -791,25 +1056,28 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         volume: float = 1.0,
         redis: Optional[aioredis.Redis] = None,
-    ) -> "YTDL":
+        allow_reextract: bool = True,
+    ) -> YTDL:
         """Resolve a queued song to a playable YTDL source, using the Redis
-        stream-URL cache if present and extracting fresh via yt-dlp otherwise."""
+        stream-URL cache if present and extracting fresh via yt-dlp otherwise.
+
+        `allow_reextract=False` keeps an unconfirmable cached URL rather than dropping
+        and re-extracting it — for the background prefetch, whose cancellation is what
+        every bulk mutation waits on, and which must not put an uninterruptible
+        executor job in that path."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
 
-        data = await cls._resolve_playable_stream(qo, redis)
+        data = await cls._resolve_playable_stream(
+            qo, redis, allow_reextract=allow_reextract
+        )
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
-            # Resume entries skip this construction-time notice: prefetch builds
-            # them while the interjected song still plays, so it would fire at the
-            # wrong moment — the loop announces "Resuming…" at actual start.
-            if not qo.is_resume:
-                await channel.send(
-                    embed=notice_embed(
-                        f"Starting song at {qo.ts} seconds", discord.Color.blue()
-                    )
-                )
+            # No user notice here. This runs at CONSTRUCTION, which prefetch does
+            # while the previous song is still playing, so announcing "Starting song
+            # at Xs" from here fired at the wrong moment. MusicPlayer's start path
+            # announces it — alongside "Resuming…", which was already moved there.
         if volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 
@@ -824,9 +1092,15 @@ class YTDL(discord.FFmpegOpusAudio):
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
-            queued_at=qo.queued_at,
-            queue_position=qo.queue_position,
+            analytics=qo.analytics,
             query_source=qo.query_source,
+            user_input=qo.user_input,
+            persisted=qo.persisted,
+            played_at=qo.played_at,
+            np_message_id=qo.np_message_id,
+            np_channel_id=qo.np_channel_id,
+            np_dedicated=qo.np_dedicated,
+            np_host_ref=qo.np_host_ref,
         )
 
     @classmethod
@@ -836,12 +1110,25 @@ class YTDL(discord.FFmpegOpusAudio):
         requester: Union[discord.User, discord.Member],
         search: str,
         *,
+        query_source: str,
+        analytics: Analytics,
+        user_input: Optional[str],
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject via yt-dlp, using the
-        Redis source cache if present."""
+        Redis source cache if present.
+
+        query_source, analytics and user_input are REQUIRED so the QueueObject
+        leaves here complete — a default would let a new call site forget them and
+        write a plausible zero, permanently indistinguishable from a real value.
+
+        user_input is what the user typed; None falls back to `search`, which is the
+        same string only for a direct -play of one song. For an expanded collection
+        `search` is a title this code generated, so the fallback would lose the album
+        link -remove matches on."""
+        origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
         # Normalised so "Destiny" and "destiny " both hit. ts is excluded — a
         # per-request playback offset, not part of the video identity.
@@ -859,10 +1146,12 @@ class YTDL(discord.FFmpegOpusAudio):
                     cached["title"],
                     requester,
                     ts=ts,
-                    user_input=search,
+                    user_input=origin,
                     duration=cached.get("duration"),
                     uploader=cached.get("uploader"),
                     thumbnail=cached.get("thumbnail"),
+                    query_source=query_source,
+                    analytics=analytics,
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
@@ -958,10 +1247,12 @@ class YTDL(discord.FFmpegOpusAudio):
             title,
             requester,
             ts=ts,
-            user_input=search,
+            user_input=origin,
             duration=duration,
             uploader=uploader,
             thumbnail=thumbnail,
+            query_source=query_source,
+            analytics=analytics,
         )
 
     @staticmethod
@@ -969,8 +1260,17 @@ class YTDL(discord.FFmpegOpusAudio):
     async def yt_playlist(
         url: str,
         requester: Union[discord.User, discord.Member],
+        *,
+        query_source: str,
+        analytics: Analytics,
+        user_input: str,
     ) -> list[QueueObject]:
-        """Fetch flat entry metadata for every video in a YouTube playlist."""
+        """Fetch flat entry metadata for every video in a YouTube playlist.
+
+        query_source, analytics and user_input are REQUIRED (see yt_source).
+        `analytics` is the head's — track positions are derived per kept track
+        below. `user_input` is the playlist link the user pasted, carried onto every
+        track so -remove can match it."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
@@ -998,5 +1298,20 @@ class YTDL(discord.FFmpegOpusAudio):
             video_url = (
                 entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             )
-            qobjs.append(QueueObject(video_url, title, requester))
+            # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
+            # skipped null entries above must not leave gaps in queue_position.
+            # replace() so a field added to Analytics later is carried here.
+            qobjs.append(
+                QueueObject(
+                    video_url,
+                    title,
+                    requester,
+                    user_input=user_input,
+                    query_source=query_source,
+                    analytics=replace(
+                        analytics,
+                        queue_position=analytics.queue_position + len(qobjs),
+                    ),
+                )
+            )
         return qobjs

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Concatenate, Optional, ParamSpec, TypeVar, cast
+from typing import Any, Concatenate, Final, Optional, ParamSpec, TypeVar, cast
 
 import orjson
 import redis.asyncio as aioredis
@@ -14,11 +15,14 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.exceptions import WatchError
 from redis.asyncio.retry import Retry
 from redis.typing import EncodableT, FieldT
 
 from src import config
 from src.guild_state import (
+    ConfigField,
+    GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
@@ -30,6 +34,7 @@ from src.guild_state import (
     parse_history_entry,
     parse_queue_entry,
     serialize_history_entry,
+    valid_timezone,
 )
 from src.util import get_logger
 
@@ -39,6 +44,10 @@ GUILD_QUEUE_KEY = "guild:{guild_id}:queue"
 GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
+# Durable per-guild preferences. Deliberately NOT one of the TTL-managed keys
+# above: a setting that expires after a day idle is a setting that reverts for
+# reasons the user cannot see. See GuildConfig and _pipe_expire_all.
+GUILD_CONFIG_KEY = "guild:{guild_id}:config"
 # Global (not per-guild) write-ahead buffer for the Postgres history archive:
 # entries from all guilds interleave (each carries its guild_id on the wire),
 # XADDed alongside the display list and drained oldest-first by
@@ -67,12 +76,12 @@ OUTBOX_FIELD = b"e"
 GUILD_TTL = 86400
 # The retention cap, the display cap and the -history ceiling at once — the same
 # number on purpose. push_history LTRIMs the list to this on every write and
-# PERSISTs it, and musicbot.HISTORY_MAX_LIMIT is pinned to this constant, so the
+# PERSISTs it, and guild_history.HISTORY_MAX_LIMIT is pinned to this constant, so the
 # command can never ask for more slots than the window holds. "Slots", not "plays":
 # the equality leaves no headroom, so anything that costs a slot without yielding a
 # renderable play shortens the answer by one — a corrupt entry (get_history drops
 # it) or a duplicate (recent() dedups it; retry_on_error re-sends a non-idempotent
-# LPUSH after the server applied EXEC). Raising it costs ~487 B per entry per guild
+# LPUSH after the server applied EXEC). Raising it costs ~625 B per entry per guild
 # in all three roles at once, permanently, since nothing expires it.
 # See docs/ARCHITECTURE.md#history-read-path.
 HISTORY_CACHE_LIMIT = 50
@@ -80,6 +89,12 @@ HISTORY_CACHE_LIMIT = 50
 # Transient per-song fields and the playback-position fields, cleared together on
 # song end / disconnect. Shared so clear_song_end_state() and clear_connection()
 # can't drift by hand-editing one and forgetting the other.
+# ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
+# since, so `just up <older-sha>` leaves them in the hash and from_crashed_state can
+# read a value belonging to a song that finished under the old build — a stale
+# _user_input makes `-remove <album link>` take out an unrelated recovered song.
+# Rewritten on every song start, so the exposure is one restore read. Name the
+# field's horizon in its commit when adding to this list.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
@@ -87,14 +102,20 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_UPLOADER,
     StateField.CURRENT_SONG_REQUESTER_ID,
     StateField.CURRENT_SONG_INTERJECTED,
+    StateField.CURRENT_SONG_IS_RESUME,
+    StateField.CURRENT_SONG_START_PAUSED,
     StateField.CURRENT_SONG_QUEUED_AT,
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
+    StateField.CURRENT_SONG_USER_INPUT,
+    StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
     StateField.TOTAL_PAUSE_SECONDS,
     StateField.PAUSE_START_EPOCH,
+    StateField.LAST_POSITION_SECS,
+    StateField.LAST_HEARTBEAT_EPOCH,
 )
 
 
@@ -105,6 +126,17 @@ def _hset_mapping(mapping: dict[str, str]) -> Mapping[FieldT, EncodableT]:
     Mapping[FieldT, EncodableT] even though str is a member of FieldT. A variance
     workaround only — it widens nothing at runtime."""
     return cast(Mapping[FieldT, EncodableT], mapping)
+
+
+def _fmt_position(secs: float) -> str:
+    """Encode a playback position for LAST_POSITION_SECS. The one definition, so
+    the seed and the heartbeat cannot drift.
+
+    position_secs accumulates 20ms frames, so repr renders 13.5% of values with a
+    float-error tail ('153.42000000000002'). Milliseconds are already far finer
+    than the reader, which truncates to whole seconds.
+    """
+    return f"{max(0.0, secs):.3f}"
 
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -182,14 +214,18 @@ async def cache_set(
         log.warning(f"cache_set failed [{key}]: {e}")
 
 
-async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
-    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> bool:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors.
+
+    Returns whether an entry was actually removed, so a caller can report what happened
+    rather than announce a deletion that did not occur. False on a no-op or an error."""
     if redis is None:
-        return
+        return False
     try:
-        await redis.delete(key)
+        return bool(await redis.delete(key))
     except Exception as e:
         log.warning(f"cache_del failed [{key}]: {e}")
+        return False
 
 
 # ── Spotify auth token cache ──────────────────────────────────────────────────
@@ -238,6 +274,47 @@ async def spotify_token_get_with_ttl(
         return val.decode(), int(ttl)
     except Exception as e:
         log.warning(f"spotify_token_get_with_ttl failed: {e}")
+        return None
+
+
+# ── -analytics rendered chart cache ───────────────────────────────────────────
+# Raw bytes, not cache_get/cache_set: those orjson-encode, which would base64 a PNG.
+# The pool is decode_responses=False, so redis.get() already hands back bytes.
+#
+# Never-raise, like every cache helper here. Both keys are TTL'd, so they are
+# volatile-lru candidates and rule 12's non-evictable keys are untouched. A ~86 KiB
+# PNG is large enough to evict other TTL'd keys, which the closed key space — four
+# windows per guild per day — is what bounds.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+
+
+async def analytics_png_set(
+    redis: Optional[aioredis.Redis], key: str, png: bytes, ttl: int
+) -> None:
+    """Store a rendered chart. No-ops when redis is None, when the TTL is not
+    positive (the aggregate straddled a midnight, so it does not cover the day it
+    would be served for), or on any Redis error."""
+    if redis is None or ttl <= 0:
+        return
+    try:
+        await redis.set(key, png, ex=ttl)
+    except Exception as e:
+        log.warning(f"analytics_png_set failed [{key}]: {e}")
+
+
+async def analytics_png_get(
+    redis: Optional[aioredis.Redis], key: str
+) -> Optional[bytes]:
+    """The cached chart, or None on miss/error. The key carries a digest of the
+    aggregate it was rendered FROM, so a stale entry simply misses rather than
+    pairing a chart from one hour with numbers from another."""
+    if redis is None:
+        return None
+    try:
+        value = await redis.get(key)
+        return value if isinstance(value, bytes) else None
+    except Exception as e:
+        log.warning(f"analytics_png_get failed [{key}]: {e}")
         return None
 
 
@@ -564,6 +641,54 @@ async def reclaim_outbox_stale(
     return len(seen_claimed), len(seen_purged)
 
 
+# ── Multi-guild config reads ─────────────────────────────────────────────────
+
+# Commands per pipeline. Bounded so one enormous bot cannot buffer every guild's
+# reply into a single response; the exact value is not load-bearing.
+_CONFIG_READ_BATCH: Final[int] = 250
+
+
+async def read_guild_configs(
+    redis: aioredis.Redis, guild_ids: Sequence[int]
+) -> dict[int, GuildConfig]:
+    """Read many guilds' stored configs, batched onto pipelines.
+
+    Returns an entry ONLY for a guild whose read actually happened. **A guild
+    missing from the result means "could not read", which is not the same as the
+    all-unset GuildConfig an absent hash yields** — a caller that caches this must
+    not treat the two alike, or a Redis blink reads as every guild un-choosing
+    everything it ever chose. This is the same distinction get_recovery_gate draws
+    with its Optional return, and the reason this cannot be a loop over
+    GuildRedisStore.get_config: that method deliberately collapses failure into the
+    zero value, which is right for one guild picking a default and wrong for a
+    hydration pass that would otherwise DELETE known-good entries.
+
+    One pipelined command per guild rather than one awaited HGETALL each: the
+    connection pool is capped and RAISES rather than queueing once its connections
+    are in use, so a plain per-guild fan-out silently fails every guild past the
+    cap. Failure is reported by omission per batch — this is not the class's
+    swallow-everything contract, it is "the caller needs to know which reads
+    happened", which is exactly what the return shape encodes.
+    """
+    configs: dict[int, GuildConfig] = {}
+    ids = list(guild_ids)
+    for start in range(0, len(ids), _CONFIG_READ_BATCH):
+        batch = ids[start : start + _CONFIG_READ_BATCH]
+        try:
+            # transaction=False: these are independent reads across guilds with
+            # nothing to make atomic, so MULTI would only add a round trip.
+            pipe = redis.pipeline(transaction=False)
+            for guild_id in batch:
+                pipe.hgetall(GUILD_CONFIG_KEY.format(guild_id=guild_id))
+            replies = await pipe.execute()
+        except Exception as e:  # noqa: BLE001 — reported by omission, see above
+            log.warning(f"config read failed for {len(batch)} guilds: {e}")
+            continue
+        for guild_id, raw in zip(batch, replies):
+            configs[guild_id] = GuildConfig.from_redis(cast(dict[bytes, bytes], raw))
+    return configs
+
+
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
 
 _P = ParamSpec("_P")
@@ -574,8 +699,8 @@ def _guild_op(
     default: Any = None,
     default_factory: Optional[Callable[[], Any]] = None,
 ) -> Callable[
-    [Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]]],
-    Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]],
+    [Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]]],
+    Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]],
 ]:
     """Enforce GuildRedisStore's 'log, never raise' contract in one place.
 
@@ -593,11 +718,11 @@ def _guild_op(
     """
 
     def decorator(
-        func: Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]],
-    ) -> Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]]:
+        func: Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]],
+    ) -> Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]]:
         @wraps(func)
         async def wrapper(
-            self: "GuildRedisStore", *args: _P.args, **kwargs: _P.kwargs
+            self: GuildRedisStore, *args: _P.args, **kwargs: _P.kwargs
         ) -> _R:
             try:
                 return await func(self, *args, **kwargs)
@@ -618,6 +743,10 @@ class GuildRedisStore:
     def __init__(self, redis: aioredis.Redis, guild_id: int) -> None:
         self.redis = redis
         self.guild_id = guild_id
+        # Set by acquire_recovery_lock, consumed by release_recovery_lock — the
+        # acquire/release scope is one store object, which is what restore_guild
+        # builds per attempt. A release from a different one finds None and declines.
+        self._recovery_lock_token: Optional[str] = None
 
     # Key helpers
 
@@ -633,11 +762,16 @@ class GuildRedisStore:
     def now_playing_key(self) -> str:
         return GUILD_NOW_PLAYING_KEY.format(guild_id=self.guild_id)
 
+    def config_key(self) -> str:
+        return GUILD_CONFIG_KEY.format(guild_id=self.guild_id)
+
     def _pipe_expire_all(self, pipe: Pipeline) -> None:
         """Queue expire commands for the TTL-managed guild keys onto an existing
-        pipeline. The history key is absent: push_history PERSISTs it and bounds it
-        by length instead, and -history reads that list and nothing else, so a TTL
-        added here answers a guild that has played hundreds of songs with silence."""
+        pipeline. Two keys are absent, both on purpose. History: push_history
+        PERSISTs it and bounds it by length instead, and -history reads that list
+        and nothing else, so a TTL added here answers a guild that has played
+        hundreds of songs with silence. Config: it holds choices, and a choice that
+        expires is a choice the user never gets told was undone."""
         pipe.expire(self.queue_key(), GUILD_TTL)
         pipe.expire(self.state_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
@@ -689,12 +823,15 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes with no ack, so a crash after this loses the
-        # song from Redis. Accepted — the in-memory asyncio.Queue is the source of
-        # truth; at-least-once would need a stream and an XACK.
+        # song from Redis. Accepted — GuildQueue's in-memory deque is the source
+        # of truth; at-least-once would need a stream and an XACK.
         await self.redis.lpop(self.queue_key())
 
     def _now_playing_state_mapping(
-        self, current: SongQueueEntry, play_start_epoch: float
+        self,
+        current: SongQueueEntry,
+        play_start_epoch: float,
+        start_offset: float = 0.0,
     ) -> dict[str, str]:
         """The current_song_* state fields ARE a parked queue entry — one signature
         enforcing the identity SongQueueEntry.from_song()/from_crashed_state()
@@ -710,94 +847,185 @@ class GuildRedisStore:
                 str(current.requester_id) if current.requester_id else ""
             ),
             StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
+            StateField.CURRENT_SONG_IS_RESUME: ("1" if current.is_resume else ""),
+            StateField.CURRENT_SONG_START_PAUSED: ("1" if current.start_paused else ""),
             StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
+            StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
+            StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
+            # Seeded so a position always exists before the first tick: without
+            # it a crash inside that interval, or a re-crashed recovered song,
+            # resumes at 0:00 rather than at its -ss offset.
+            StateField.LAST_POSITION_SECS: _fmt_position(start_offset),
+            StateField.LAST_HEARTBEAT_EPOCH: str(play_start_epoch + start_offset),
         }
 
-    @_guild_op(default=None)
+    def _start_song_pipeline(
+        self,
+        current: SongQueueEntry,
+        play_start_epoch: float,
+        now_playing: Optional[NowPlayingData],
+        start_offset: float,
+    ) -> Pipeline:
+        """The state and snapshot legs every song start writes, in one
+        MULTI; the caller adds its queue leg and executes. `now_playing` rides
+        the same transaction, so a crash can never leave state pointing at song
+        B while the snapshot still shows song A."""
+        mapping = self._now_playing_state_mapping(
+            current, play_start_epoch, start_offset
+        )
+        pipe = self.redis.pipeline(transaction=True)
+        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
+        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
+        pipe.expire(self.state_key(), GUILD_TTL)
+        if now_playing is not None:
+            pipe.hset(
+                self.now_playing_key(),
+                mapping=_hset_mapping(now_playing.to_redis_mapping()),
+            )
+            pipe.expire(self.now_playing_key(), GUILD_TTL)
+        return pipe
+
+    @_guild_op(default=False)
     async def pop_queue_and_start_song(
         self,
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
-    ) -> None:
+        start_offset: float = 0.0,
+    ) -> bool:
         """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
         MULTI/EXEC leaves the song in one of two consistent states — still queued
         with current_song_url empty, or dequeued with all now-playing fields set —
-        closing the crash window where it was absent from both. `now_playing` rides
-        the same transaction, so a crash can never leave state pointing at song B
-        while the snapshot still shows song A.
-        """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
-        pipe = self.redis.pipeline(transaction=True)
-        pipe.lpop(self.queue_key())
-        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
-        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
-        pipe.expire(self.state_key(), GUILD_TTL)
-        if now_playing is not None:
-            pipe.hset(
-                self.now_playing_key(),
-                mapping=_hset_mapping(now_playing.to_redis_mapping()),
-            )
-            pipe.expire(self.now_playing_key(), GUILD_TTL)
-        await pipe.execute()
+        closing the crash window where it was absent from both.
 
-    @_guild_op(default=None)
+        Returns whether the transaction landed, and THE CALLER MUST CHECK: the
+        in-memory settle already happened, so a swallowed failure leaves the list
+        holding an entry memory does not (GuildQueue.note_mirror_write).
+        """
+        pipe = self._start_song_pipeline(
+            current, play_start_epoch, now_playing, start_offset
+        )
+        pipe.lpop(self.queue_key())
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def rebuild_queue_and_start_song(
+        self,
+        current: SongQueueEntry,
+        entries: Sequence[QueueEntry],
+        play_start_epoch: float,
+        now_playing: Optional[NowPlayingData] = None,
+        start_offset: float = 0.0,
+    ) -> bool:
+        """pop_queue_and_start_song with the list REPLACED by `entries` instead of
+        LPOPed — for a mirror the caller knows is stale, where an LPOP would
+        retire the wrong entry. DELETE + RPUSH ride the same MULTI as the state
+        fields, so either the song is parked over a correct list or nothing
+        changed. Returns whether it landed.
+        """
+        pipe = self._start_song_pipeline(
+            current, play_start_epoch, now_playing, start_offset
+        )
+        pipe.delete(self.queue_key())
+        if entries:
+            pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
+            pipe.expire(self.queue_key(), GUILD_TTL)
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
     async def set_current_song_state(
         self,
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
-    ) -> None:
+        start_offset: float = 0.0,
+    ) -> bool:
         """pop_queue_and_start_song without the LPOP, in one transaction — for
         restarting a crash-recovered "current song" that was never RPUSHed to the
-        queue list.
+        queue list. Returns whether it landed.
         """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
-        pipe = self.redis.pipeline(transaction=True)
-        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
-        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
-        pipe.expire(self.state_key(), GUILD_TTL)
-        if now_playing is not None:
-            pipe.hset(
-                self.now_playing_key(),
-                mapping=_hset_mapping(now_playing.to_redis_mapping()),
-            )
-            pipe.expire(self.now_playing_key(), GUILD_TTL)
+        pipe = self._start_song_pipeline(
+            current, play_start_epoch, now_playing, start_offset
+        )
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def delete_queue(self) -> None:
-        """DELETE the queue key."""
+    @_guild_op(default=False)
+    async def delete_queue(self) -> bool:
+        """DELETE the queue key. Returns whether it landed."""
         await self.redis.delete(self.queue_key())
+        return True
 
-    @_guild_op(default=None)
-    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> None:
-        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window race."""
+    @_guild_op(default=False)
+    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> bool:
+        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window
+        race. Returns whether it landed."""
         pipe = self.redis.pipeline(transaction=True)
         pipe.delete(self.queue_key())
         pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
         pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
+        return True
+
+    @_guild_op(default=0)
+    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
+        """LREM the given entries out of the queue list, leaving the rest in place.
+        Returns HOW MANY were actually removed — the caller must check it.
+
+        The alternative to rebuild_queue for a small removal: LREM touches only what
+        goes, while a rebuild rewrites the whole list whatever it drops (one host,
+        redis:7-alpine, depth 1000: 0.96 ms for one entry against ~5.7 ms to
+        rebuild — indicative, not a budget; nothing checks it). Far enough up the
+        per-LREM scans overtake it, and GuildQueue owns that threshold.
+
+        Matching is by exact serialized bytes, which is an assumption about the rest
+        of the codebase rather than about Redis: a queued object mutated after its
+        entry was written no longer serializes to what is stored, and the LREM then
+        silently matches nothing. Hence the count — a short return means the mirror
+        and memory have diverged and only a rebuild can be trusted. A Redis failure
+        returns 0 through @_guild_op and takes the same path.
+
+        Counted per distinct serialization, never LREM ... 0: two enqueues of one
+        song usually differ on the wire (queue_position, queued_at), but when they
+        do not, removing "all matching" would take out a copy still queued.
+        """
+        counts: dict[bytes, int] = {}
+        for entry in entries:
+            blob = entry.to_redis()
+            counts[blob] = counts.get(blob, 0) + 1
+        pipe = self.redis.pipeline(transaction=True)
+        for blob, count in counts.items():
+            # redis-py's stub types `value` as str; its encoder takes bytes, which
+            # is what every other write on this key passes (decode_responses=False).
+            pipe.lrem(self.queue_key(), count, blob)  # pyright: ignore[reportArgumentType]
+        pipe.expire(self.queue_key(), GUILD_TTL)
+        replies = await pipe.execute()
+        return sum(cast(list[int], replies[:-1]))  # the last reply is the EXPIRE
 
     # History operations
 
     # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
-    # Two kinds of key carry no TTL, so under `maxmemory-policy volatile-lru` they are
-    # never eviction candidates: guild:{id}:history and HISTORY_OUTBOX_KEY. Once they fill
+    # Three kinds of key carry no TTL, so under `maxmemory-policy volatile-lru` they are
+    # never eviction candidates: guild:{id}:history, guild:{id}:config and
+    # HISTORY_OUTBOX_KEY. Once they fill
     # maxmemory with no TTL-bearing key left to evict, Redis rejects every write with
     # OOM — state, queue and cache alike — and each store method swallows it and logs, so
     # persistence degrades silently rather than crashing.
     #
     # Only the OUTBOX can get there BY GROWING: the history lists are bounded at
     # HISTORY_CACHE_LIMIT entries per guild, trimmed on every write, so their total scales
-    # with guild count (~24 KB each), not with runtime. The outbox is near-empty whenever
-    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~547
-    # resident bytes per play — 256mb holds ~491k. That figure is a step, not the wire
+    # with guild count (~24 KB each), not with runtime. Config is the same shape and far
+    # smaller — a fixed handful of fields per guild, tens of bytes, written only by an
+    # explicit command and deleted on guild removal. The outbox is near-empty whenever
+    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~625
+    # resident bytes per play — 256mb holds ~429k. That figure is a step, not the wire
     # size: see HistoryOutboxDrainer.CAP_PAGE for the listpack-node cliff behind it, which
     # a field of 18 bytes can move. HISTORY_OUTBOX_MAX is the opt-in bound; dropping entries there is
     # real data loss, since a capped list leaves no second copy. A Redis memory/eviction
@@ -911,9 +1139,23 @@ class GuildRedisStore:
             pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
         await pipe.execute()
 
+    @_guild_op(default=None)
+    async def history_ttl(self) -> Optional[int]:
+        """This guild's history list TTL, in redis's own vocabulary: -1 is no
+        expiry (the invariant golden rule 12 protects) and -2 is no such key.
+
+        Exists for -debug's check row, which asserts the PERSIST that push_history
+        applies on every write. On the SWALLOWING side of the split — None means
+        Redis did not answer, and the row renders unknown rather than failing.
+        """
+        return int(await self.redis.ttl(self.history_key()))
+
     @_guild_op(default_factory=list)
     async def get_history(self) -> list[HistoryEntry]:
-        """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
+        """Return up to HISTORY_CACHE_LIMIT history entries, most recently
+        RECORDED first — which is song-end order, not played_at order, since
+        played_at is when a song started and an interrupted one is recorded after
+        everything that cut in front of it. GuildHistory.recent sorts.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
         raw = await self.redis.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
         return [e for e in map(parse_history_entry, raw) if e is not None]
@@ -951,7 +1193,13 @@ class GuildRedisStore:
 
     @_guild_op(default=None)
     async def on_pause(self, epoch: float) -> None:
-        """Record the epoch when the voice client was paused."""
+        """Record the epoch when the voice client was paused.
+
+        LEGACY. Feeds only _legacy_wall_clock_position_at now — MusicPlayer.pause
+        records the exact position through heartbeat(). Drop this, on_resume, and
+        the three wall-clock StateFields together one release after the heartbeat
+        ships.
+        """
         pipe = self.redis.pipeline()
         pipe.hset(self.state_key(), StateField.PAUSE_START_EPOCH, str(epoch))
         await self._exec_with_state_ttl(pipe)
@@ -960,6 +1208,10 @@ class GuildRedisStore:
     async def on_resume(self, resume_epoch: float) -> None:
         """Accumulate elapsed pause time into total_pause_seconds, clear
         pause_start_epoch.
+
+        LEGACY, like on_pause: the accumulated total feeds only
+        _legacy_wall_clock_position_at, and goes with it one release after the
+        heartbeat ships.
 
         Non-atomic read-modify-write, so it assumes one writer per guild (true
         today). Under multi-process sharding this must become a Lua script or a
@@ -1003,7 +1255,7 @@ class GuildRedisStore:
 
         Zero-value GuildStateData when the hash is missing/empty, None when the read
         itself failed — so callers can tell "nothing stored" from "Redis
-        unavailable" (see _restore_guild). Pure read: does not refresh TTL;
+        unavailable" (see recovery.restore_guild). Pure read: does not refresh TTL;
         refresh_ttl() at the end of _restore_state() covers the recovery window.
         """
         # Same decode_responses=False invariant as get_now_playing() above.
@@ -1013,7 +1265,7 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
         """State hash + pending-queue *length* in one pipeline — the lightweight
-        connection/restorable gate for `_restore_guild`.
+        connection/restorable gate for `recovery.restore_guild`.
 
         Transfers no queue contents, now-playing or history: a -stopped guild keeps
         a possibly-long queue by design, and gating on LLEN keeps that payload off
@@ -1044,7 +1296,11 @@ class GuildRedisStore:
         pipe.lrange(self.queue_key(), 0, -1)
         pipe.hgetall(self.now_playing_key())
         pipe.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
-        raw_state, raw_queue, raw_np, raw_history = await pipe.execute()
+        # Config rides along rather than costing restore a second round trip: the
+        # guild's stored volume is needed at exactly this moment, and the
+        # all-or-nothing contract above should cover it too.
+        pipe.hgetall(self.config_key())
+        raw_state, raw_queue, raw_np, raw_history, raw_config = await pipe.execute()
         entries = tuple(
             entry
             for entry in (parse_queue_entry(item) for item in raw_queue)
@@ -1060,14 +1316,132 @@ class GuildRedisStore:
             queue=entries,
             now_playing=NowPlayingData.from_redis(raw_np),
             history=history,
+            config=GuildConfig.from_redis(raw_config),
         )
 
-    @_guild_op(default=None)
-    async def set_volume(self, volume: float) -> None:
-        """Persist the guild volume setting."""
+    @_guild_op(default=False)
+    async def set_volume(self, volume: float) -> bool:
+        """Persist the guild volume setting. True when it actually landed.
+
+        guild:{id}:config is the source of truth — the state hash expires in 24h, so
+        a choice stored there reset any guild that went a day without playing.
+
+        The legacy state field is written TOO, and deliberately NOT deleted, for one
+        release. Deleting it made a rollback silently reset every migrated guild to
+        100%: `just up <older-sha>` is a supported operation here, the older build
+        reads only StateField.VOLUME, and after a migration it would find the field
+        gone — with no log line and no user-visible cause. Dual-writing keeps a fresh
+        value on both sides, so a roll back or forward is a no-op in either
+        direction. Drop this leg, StateField.VOLUME and GuildStateData.volume
+        together in the release after every deployment understands :config.
+        """
+        # Encoded by GuildConfig.to_redis, never by hand: a single-field config
+        # serializes to exactly that field, so the wire format for volume lives in
+        # one place and the setter cannot drift from what from_redis expects.
+        mapping = GuildConfig(volume=volume).to_redis()
         pipe = self.redis.pipeline()
-        pipe.hset(self.state_key(), StateField.VOLUME, str(volume))
+        pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
+        pipe.persist(self.config_key())
+        pipe.hset(self.state_key(), StateField.VOLUME, mapping[ConfigField.VOLUME])
+        # The legacy write can CREATE the state hash on a guild whose 24h TTL has
+        # already lapsed, and a state key created without an EXPIRE never expires
+        # again. _exec_with_state_ttl appends that EXPIRE after the writes.
         await self._exec_with_state_ttl(pipe)
+        return True
+
+    @_guild_op(default=False)
+    async def migrate_volume(self, volume: float) -> bool:
+        """Seed :config's volume from the legacy state field, never overwriting.
+
+        HSETNX, not HSET. Restore reads its snapshot and writes this back after an
+        arbitrary number of awaits, so a `-volume` landing inside that window would
+        otherwise be overwritten by the older stored value — durably, and while the
+        user is being told the new one took. Seeding is all a migration ever needs:
+        if a concurrent command already wrote a value there, there is nothing left
+        to migrate and the no-op is the correct outcome.
+        """
+        mapping = GuildConfig(volume=volume).to_redis()
+        pipe = self.redis.pipeline()
+        pipe.hsetnx(self.config_key(), ConfigField.VOLUME, mapping[ConfigField.VOLUME])
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
+
+    # Durable per-guild config
+
+    @_guild_op(default_factory=GuildConfig)
+    async def get_config(self) -> GuildConfig:
+        """This guild's stored preferences; all-unset when nothing is stored OR when
+        Redis is unreachable.
+
+        Those two are deliberately the same answer. Every field is Optional and
+        "unset" means "follow the host default", so a Redis outage degrades to the
+        host's configuration rather than to an arbitrary one — the same direction
+        the rest of this class fails in.
+        """
+        raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.config_key()))
+        return GuildConfig.from_redis(raw)
+
+    @_guild_op(default=False)
+    async def set_debug_mode(self, enabled: bool) -> bool:
+        """Persist this guild's debug-mode choice. True when it actually landed.
+
+        The return value is load-bearing rather than decorative: @_guild_op turns a
+        Redis failure into `False` here, and the command uses that to tell the user
+        the setting applies to this process only. Claiming a durable change that did
+        not persist is worse than reporting the degradation.
+
+        PERSIST because this key must never be an eviction candidate under
+        volatile-lru: an evicted config is a guild's setting silently reverting with
+        no log line and no error. Bounded by guild count, not by runtime — a handful
+        of bytes each — so it does not carry the outbox's OOM risk (see the ISSUE
+        above push_history).
+        """
+        pipe = self.redis.pipeline()
+        pipe.hset(
+            self.config_key(),
+            mapping=_hset_mapping(GuildConfig(debug_mode=enabled).to_redis()),
+        )
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def set_timezone(self, name: str) -> bool:
+        """Persist the IANA zone this guild renders ETAs in. True when it landed.
+
+        Stores the name as given rather than a resolved ZoneInfo — see
+        GuildConfig.tzinfo for why resolution is deferred to read time. No caller
+        yet by design: this is the write half of the planned `-options key value`
+        command, and shipping it with the field keeps the schema, the store and the
+        tests in one change rather than three.
+
+        Validated here because this will be the FIRST user-typed string to reach
+        guild:{id}:config — a key that is PERSISTed, excluded from every TTL path
+        and non-evictable by design. An unusable name stored here fails silently:
+        the write succeeds, the command reports success, and the guild's ETAs stay
+        on the default forever. `-options` should still call valid_timezone itself
+        so it can tell the user WHY; False here cannot say whether the name was bad
+        or Redis was down.
+        """
+        if not valid_timezone(name):
+            log.warning(f"[guild:{self.guild_id}] refusing unusable timezone {name!r}")
+            return False
+        pipe = self.redis.pipeline()
+        pipe.hset(
+            self.config_key(),
+            mapping=_hset_mapping(GuildConfig(timezone=name).to_redis()),
+        )
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def clear_config(self) -> bool:
+        """Drop this guild's stored preferences — used when the bot leaves it, so a
+        departed guild stops occupying a key that nothing will ever expire."""
+        await self.redis.delete(self.config_key())
+        return True
 
     # TTL management
 
@@ -1114,8 +1488,39 @@ class GuildRedisStore:
         pipe.delete(self.now_playing_key())
         await pipe.execute()
 
-    # Recovery lock (distributed, for rolling-restart safety)
+    @_guild_op(default=None)
+    async def heartbeat(self, position_secs: float, epoch: float) -> None:
+        """Record where the audio is, so recovery never has to infer it.
 
+        Two commands in one round trip, once per HEARTBEAT_INTERVAL_SECS per
+        PLAYING guild — 0.33/s at the default. Small in absolute terms but ~40x the
+        per-song transactions, and every one is an AOF append: ~230 B each, so a
+        thousand simultaneous listeners is ~0.3 GiB/day. Writes the legacy fields'
+        successor without removing them (see StateField) — a rollback must still
+        read this.
+
+        transaction=False unlike the other state writers: HSET then EXPIRE on one
+        key needs no atomicity, and at this frequency the MULTI/EXEC pair is a
+        measured 12% of the latency and 14% of the bytes for nothing.
+        """
+        pipe = self.redis.pipeline(transaction=False)
+        pipe.hset(
+            self.state_key(),
+            mapping=_hset_mapping(
+                {
+                    StateField.LAST_POSITION_SECS: _fmt_position(position_secs),
+                    StateField.LAST_HEARTBEAT_EPOCH: str(epoch),
+                }
+            ),
+        )
+        await self._exec_with_state_ttl(pipe)
+
+    # Recovery lock — one restore_guild per guild at a time
+
+    # Must outlast the guarded section: _restore_guild's voice connect is capped at
+    # 30s TOTAL (one wait_for wraps discord.py's whole retry loop), plus a few Redis
+    # reads. Expiry is safe — release compares before deleting — so the only cost of
+    # an early one is duplicate work, against a dead holder blocking recovery this long.
     _RECOVERY_LOCK_TTL = 60  # seconds
 
     def _recovery_lock_key(self) -> str:
@@ -1123,12 +1528,52 @@ class GuildRedisStore:
 
     @_guild_op(default=False)
     async def acquire_recovery_lock(self) -> bool:
-        """SET NX EX — True if this instance won the lock, False if another holds it."""
+        """SET NX EX — True if this store won the lock, False if it is already held.
+
+        The value is a per-acquisition random token, so the release below can prove
+        the lock it deletes is still the one this store acquired.
+        """
+        token = secrets.token_hex(16)
         result = await self.redis.set(
-            self._recovery_lock_key(), "1", nx=True, ex=self._RECOVERY_LOCK_TTL
+            self._recovery_lock_key(), token, nx=True, ex=self._RECOVERY_LOCK_TTL
         )
-        return result is True
+        if result is True:
+            self._recovery_lock_token = token
+            return True
+        return False
 
     @_guild_op(default=None)
     async def release_recovery_lock(self) -> None:
-        await self.redis.delete(self._recovery_lock_key())
+        """Delete the lock only if this store still owns it (compare-and-delete).
+
+        A lock that can expire must never be deleted blind: a holder whose lock
+        expired mid-recovery would DEL the lock its successor now owns, admitting a
+        third restore and the double-restore the lock exists to prevent.
+
+        WATCH/MULTI, not a Lua CAS — EXEC aborts if the value changed after WATCH,
+        and fakeredis has no Lua interpreter, so this path stays covered by real
+        tests rather than mocks. Do not "simplify" it to EVAL.
+
+        The compare is against bytes: the pool is decode_responses=False.
+        """
+        token = self._recovery_lock_token
+        if token is None:
+            # Never held it (or a different store object acquired it) — deleting
+            # would be exactly the foreign-lock delete this method exists to stop.
+            return
+        self._recovery_lock_token = None
+        key = self._recovery_lock_key()
+        async with self.redis.pipeline() as pipe:
+            try:
+                await pipe.watch(key)
+                if await pipe.get(key) != token.encode():
+                    # Expired, or already re-acquired by someone else. Not ours
+                    # to delete; leave it alone and let its owner or its TTL end it.
+                    await pipe.unwatch()
+                    return
+                pipe.multi()
+                pipe.delete(key)
+                await pipe.execute()
+            except WatchError:
+                # Changed hands between the read and EXEC — same conclusion.
+                pass

@@ -1,5 +1,5 @@
-"""Tests for src/config.py — the Spotify toggle, the Postgres knobs, and the
-default-credential detector."""
+"""Tests for src/config.py — the Spotify toggle, environment resolution, the
+Postgres knobs, and the default-credential detector."""
 
 import importlib
 import os
@@ -9,15 +9,22 @@ import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
+from typing import Any
 
 import pytest
 
+from unittest.mock import MagicMock
+
 import src.config
+from src import config
 from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
+    _float_env,
     _int_env,
+    debug_mode_default,
+    debug_prometheus_url,
     history_archive_enabled,
     postgres_url,
     spotify_enabled,
@@ -82,6 +89,120 @@ class TestSpotifyConfigConstants:
 
     def test_status_has_three_distinct_states(self) -> None:
         assert {s.value for s in SpotifyStatus} == {"disabled", "invalid", "enabled"}
+
+
+class TestEnvironmentResolution:
+    """ENVIRONMENT must be a plain env-var read — no subprocess at import."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_config_module(self) -> Iterator[None]:
+        """These tests reload src.config, which rebinds a module-level constant
+        for the whole session. Put it back so later tests (and any module that
+        late-binds config.ENVIRONMENT) see the original value."""
+        import importlib
+
+        original = config.ENVIRONMENT
+        yield
+        importlib.reload(config)
+        config.ENVIRONMENT = original
+
+    def test_importing_config_runs_no_subprocess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The actual regression: a production process must not depend on a git
+        binary and a repo, and the old import-time call raised a RuntimeWarning
+        that `filterwarnings = ["error"]` turned into a collection failure in
+        any detached worktree."""
+        import importlib
+        import subprocess
+
+        calls: list[Any] = []
+
+        def _boom(*args: Any, **kwargs: Any) -> None:
+            calls.append(args)
+            raise AssertionError("config imported must not shell out")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        importlib.reload(config)
+        assert calls == []
+        assert config.ENVIRONMENT == "development"
+
+    def test_env_var_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import importlib
+
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        importlib.reload(config)
+        assert config.ENVIRONMENT == "production"
+
+    def test_empty_env_var_falls_back_to_development(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty string is a misconfiguration, not a valid environment name
+        — it would render as `environment: ` in -ping and in every log line."""
+        import importlib
+
+        monkeypatch.setenv("ENVIRONMENT", "")
+        importlib.reload(config)
+        assert config.ENVIRONMENT == "development"
+
+
+class TestInferEnvironmentFromGit:
+    """Dev-only convenience, called from main() and never at import."""
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, stdout: str, rc: int = 0) -> Any:
+        import subprocess
+
+        result = MagicMock()
+        result.stdout = stdout
+        result.returncode = rc
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: result)
+        return config.infer_environment_from_git()
+
+    def test_main_branch_is_production(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run(monkeypatch, "main\n") == "production"
+
+    def test_feature_branch_slashes_become_dashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert self._run(monkeypatch, "task/some-feature\n") == "task-some-feature"
+
+    def test_long_branch_name_is_truncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert len(self._run(monkeypatch, "x" * 200)) == 50
+
+    def test_detached_head_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`git rev-parse --abbrev-ref HEAD` prints "HEAD" when detached — a
+        normal state for a worktree, and previously the trigger for the warning
+        that killed the suite."""
+        assert self._run(monkeypatch, "HEAD\n") is None
+
+    def test_non_zero_exit_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run(monkeypatch, "", rc=128) is None
+
+    def test_empty_output_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run(monkeypatch, "  \n") is None
+
+    def test_missing_git_binary_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess
+
+        def _missing(*a: Any, **k: Any) -> None:
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(subprocess, "run", _missing)
+        assert config.infer_environment_from_git() is None
+
+    def test_timeout_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess
+
+        def _slow(*a: Any, **k: Any) -> None:
+            raise subprocess.TimeoutExpired(cmd="git", timeout=2)
+
+        monkeypatch.setattr(subprocess, "run", _slow)
+        assert config.infer_environment_from_git() is None
 
 
 class TestPostgresUrl:
@@ -168,6 +289,42 @@ class TestHistoryArchiveEnabled:
         assert history_archive_enabled() is True
 
 
+class TestDebugModeDefault:
+    """The process-wide default behind debug mode. Shares history_archive_enabled's
+    strict grammar, so the failure direction is the same: a typo raises rather than
+    reading as off and leaving an operator waiting for footers that never come."""
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", "  true  "])
+    def test_truthy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no"])
+    def test_falsy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_unset_or_empty_is_false(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DEBUG_MODE", raising=False)
+        assert debug_mode_default() is False
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is False
+
+    @pytest.mark.parametrize("raw", ["on", "enabled", "y", "2"])
+    def test_garbage_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The message must name DEBUG_MODE: MusicBot.__init__ is the only reader,
+        so this surfaces as a load_extension failure at startup, where the variable
+        name is the whole diagnosis."""
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        with pytest.raises(ValueError, match="DEBUG_MODE"):
+            debug_mode_default()
+
+
 class TestIntEnv:
     """The parser behind both archive tunables.
 
@@ -212,6 +369,55 @@ class TestIntEnv:
         monkeypatch.setenv("KNOB", raw)
         with pytest.raises(ValueError, match="KNOB must be an integer"):
             _int_env("KNOB", 0)
+
+
+class TestFloatEnv:
+    """The parser behind the four live-dashboard knobs. Same import-time constraints
+    as _int_env, plus two failure shapes int() cannot express."""
+
+    def test_unset_returns_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KNOB", raising=False)
+        assert _float_env("KNOB", 1.5, minimum=0.05) == 1.5
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        assert _float_env("KNOB", 1.5, minimum=0.05) == 1.5
+
+    def test_parses_a_set_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KNOB", "2.5")
+        assert _float_env("KNOB", 1.0, minimum=0.05) == 2.5
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "0.001"])
+    def test_below_the_floor_is_refused(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tick of 0 makes the dashboard's timed wait return instantly forever —
+        a hot loop for the whole deadline, on the loop carrying voice heartbeats."""
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be >= 0.05"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
+    def test_non_finite_is_refused(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """float() accepts all of these. A deadline of inf never expires, so the
+        command holds its max_concurrency slot forever and every later run in that
+        guild answers "already running" — a floor alone would not catch it."""
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be a finite number"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+    @pytest.mark.parametrize("raw", ["abc", "1.0s", "half"])
+    def test_malformed_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be a number"):
+            _float_env("KNOB", 1.0, minimum=0.05)
 
 
 class TestArchiveTunables:
@@ -386,6 +592,23 @@ def _service_block(name: str) -> str:
     return match.group(1)
 
 
+def _building_services() -> dict[str, str]:
+    """name → block, for every top-level service that declares a `build:`. Named
+    rather than listed so a fourth build block has to satisfy the same contract
+    as the three that exist."""
+    # Scoped to the `services:` mapping: the top-level `volumes:` names sit at the
+    # same indent and would otherwise be looked up as services and not found.
+    section = re.search(
+        r"^services:\n(.*?)(?=^\S|\Z)", _compose_directives(), re.S | re.M
+    )
+    assert section is not None, "docker-compose.yml has no services: mapping"
+    blocks = {
+        name: _service_block(name)
+        for name in re.findall(r"^  (\S+):$", section.group(1), re.M)
+    }
+    return {n: b for n, b in blocks.items() if re.search(r"^    build:$", b, re.M)}
+
+
 class TestComposeArchiveProfile:
     """The deployment half of the opt-in archive: postgres and db-migrate exist in
     the model only while the `archive` profile is active, so a token-only
@@ -421,13 +644,102 @@ class TestComposeArchiveProfile:
         assert 'profiles: ["ops"]' in backfill
         assert "archive" not in backfill
 
-    def test_just_down_activates_the_archive_profile(self) -> None:
-        """`docker compose down` with the profile inactive removes only un-profiled
-        containers and leaves a running postgres behind, so the justfile recipe
-        must pass --profile archive. Greps the justfile — the same
-        cannot-import-a-shell-script reasoning as the preflight test below."""
+    # `just down` must pass --profile archive or it leaves a running postgres
+    # behind; that is pinned by the exact-string assertion in
+    # TestComposeMetricsProfile::test_just_down_also_stops_it below, which covers
+    # both profiles of the one `down` recipe. A second, weaker copy lived here.
+
+
+class TestComposeMetricsProfile:
+    """The docker-socket sidecar is opt-in for the same reason the archive tier is:
+    `:ro` restricts the socket INODE, not the Docker API, so anything holding it can
+    create a privileged container. That is not a cost to add to every deploy."""
+
+    def test_otelcol_metrics_is_profiled(self) -> None:
+        assert 'profiles: ["metrics"]' in _service_block("otelcol-metrics")
+
+    def test_it_is_the_only_service_mounting_the_docker_socket(self) -> None:
+        """If a second service ever mounts it, this profile stops being the gate
+        and the reasoning above quietly becomes false."""
+        directives = _compose_directives()
+        mounts = [ln for ln in directives.splitlines() if "docker.sock" in ln]
+        assert len(mounts) == 1, mounts
+
+    def test_just_down_also_stops_it(self) -> None:
+        """A `down` that leaves the socket-mounted container running is the one
+        that matters most to get right."""
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
-        assert "docker compose --profile archive down" in justfile
+        assert "--profile archive --profile metrics down" in justfile
+
+
+class TestComposeBakesTheCommit:
+    """`-debug` reports the commit it is running by reading the GIT_SHA ENV baked
+    into the image — the OCI label the Dockerfile also stamps is invisible from
+    inside a container. compose's build blocks passed no `args:` at all, so
+    anything built through compose answered `unknown` while wearing a SHA tag."""
+
+    def test_every_service_that_builds_passes_the_commit(self) -> None:
+        """The three build blocks tag ONE image name, so `docker compose build`
+        builds that name three times and the last write wins: a block missing the
+        arg silently retags the bot's image from a GIT_SHA-less build."""
+        building = _building_services()
+        # Non-empty guard: a helper that matched nothing passes the loop.
+        assert len(building) >= 3, building
+        for name, block in building.items():
+            assert "image: discord-music-bot:" in block, name
+            assert "GIT_SHA: ${GIT_SHA:-unknown}" in block, name
+
+    def test_the_fallback_is_readable_rather_than_empty_or_mandatory(self) -> None:
+        """A bare `${GIT_SHA}` bakes an empty string, which -debug renders as a
+        blank commit; `:?` would fail `up` for everyone who builds outside the
+        deploy scripts. The image TAG's own `:-latest` is a different question —
+        a tag has to name something pullable."""
+        fallbacks = set(
+            re.findall(r"GIT_SHA: \$\{GIT_SHA([^}]*)\}", _compose_directives())
+        )
+        assert fallbacks == {":-unknown"}
+
+    def test_the_deploy_script_bakes_the_same_fallback(self) -> None:
+        """compose and build_common.sh are two independent paths onto one image
+        name, and neither can read the other's default. Drift means the same
+        unbuilt-from-a-deploy image reports two different things."""
+        preflight = (
+            Path(__file__).resolve().parent.parent / "build_common.sh"
+        ).read_text()
+        assert 'GIT_SHA="${GIT_SHA:-unknown}"' in preflight
+
+
+class TestComposeDebugPrometheusUrl:
+    """A VALUED `environment:` entry beats env_file AND the process environment, so
+    a bare literal here would silently override the .env setting .env.example tells
+    operators to use. That is how the knob shipped inert."""
+
+    def test_the_url_is_interpolated_not_hardcoded(self) -> None:
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${DEBUG_PROMETHEUS_URL" in line, line
+
+    def test_it_defaults_rather_than_requiring_the_variable(self) -> None:
+        """`:-` not `:?`: unset must degrade that one -debug row to `n/a`, never
+        fail the whole `up`."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert ":-" in line and ":?" not in line
+
+    def test_the_published_port_is_a_variable_and_loopback_only(self) -> None:
+        """9090 is exactly the port an already-installed local Prometheus owns, and
+        a collision fails the entire `up` — same reasoning as POSTGRES_HOST_PORT."""
+        lgtm = _service_block("otel-lgtm")
+        line = next(ln for ln in lgtm.splitlines() if ":9090" in ln)
+        assert "127.0.0.1:" in line
+        assert "${PROMETHEUS_HOST_PORT" in line
+
+    def test_the_default_url_follows_the_published_port(self) -> None:
+        """Two knobs that must agree: moving the port without moving the URL points
+        the bot at a port nothing listens on."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${PROMETHEUS_HOST_PORT:-9090}" in line
 
 
 class TestComposeMatchesTheDefault:
@@ -817,3 +1129,22 @@ class TestSetupEnvTightensTheEnvFile:
         # Narrowing only: go-rwx clears bits and never sets them, so an operator
         # who chose 400 keeps 400.
         assert self._run(0o400, tmp_path) == 0o400
+
+
+class TestDebugPrometheusUrl:
+    """The opt-in knob behind -debug's container-metrics row. Unset is the
+    feature being off, not a misconfiguration."""
+
+    def test_unset_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DEBUG_PROMETHEUS_URL", raising=False)
+        assert debug_prometheus_url() is None
+
+    def test_empty_reads_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The bare `KEY=` shape .env models elsewhere, and compose interpolates
+        an unset variable to exactly that."""
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", "   ")
+        assert debug_prometheus_url() is None
+
+    def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
+        assert debug_prometheus_url() == "http://localhost:9090"

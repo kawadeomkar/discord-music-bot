@@ -22,6 +22,10 @@ SAFE-LOOKING direction — green unit tests, broken production:
        live entries alone, so a drained stream forgets its last ID and reissues
        one the group already delivered; real Redis keeps last_id independently
 
+A seventh divergence is not about streams at all and is asserted here too:
+fakeredis has no CONNECTION POOL, so a per-guild fan-out looks perfect against
+it and loses every guild past `max_connections` on a real server, silently.
+
 Rows 1, 3 and 4 are undetectable without a real server; rows 2 and 6 are
 asserted here so the unit tier's workarounds stay honest about what they work
 around. Row 6 is patched into the fake — see _patch_xadd_monotonic_ids in
@@ -36,6 +40,7 @@ Isolation: there is no throwaway-database-per-test equivalent to the pg tier's
 assumes it owns the server it is pointed at.
 """
 
+import asyncio
 import os
 import warnings
 from collections.abc import AsyncIterator, Iterator
@@ -46,7 +51,7 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import HistoryEntry
+from src.guild_state import HistoryEntry, SongQueueEntry
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
@@ -59,6 +64,7 @@ from src.redis_client import (
     outbox_depth,
     outbox_pending_below,
     outbox_pending_count,
+    read_guild_configs,
     read_outbox_new,
     read_outbox_pending,
     reclaim_outbox_stale,
@@ -626,6 +632,64 @@ class TestOutboxKeyIsNonEvictable:
         assert await redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
 
+class TestConfigReadsSurviveTheConnectionCap:
+    """The divergence this tier exists for. fakeredis has no connection pool, so a
+    per-guild fan-out looks perfect there and fails on a real server the moment a
+    bot passes `max_connections` guilds — silently, because @_guild_op turns the
+    pool's error into an all-unset config that reads as "this guild never chose"."""
+
+    @staticmethod
+    async def _client(redis_url: str) -> tuple[aioredis.Redis, Any]:
+        pool = aioredis.ConnectionPool.from_url(
+            redis_url, max_connections=20, decode_responses=False
+        )
+        return aioredis.Redis(connection_pool=pool), pool
+
+    async def test_the_naive_per_guild_fanout_really_does_lose_guilds(
+        self, redis_url: str
+    ) -> None:
+        """The bug, pinned. Not hypothetical and not a timing artefact: the pool
+        RAISES `MaxConnectionsError` rather than queueing (that is
+        BlockingConnectionPool), and the raise happens before `call_with_retry`, so
+        the configured retry never applies. Exactly `max_connections` survive."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            naive = await asyncio.gather(
+                *(GuildRedisStore(client, g).get_config() for g in ids)
+            )
+
+            assert sum(c.debug_mode is True for c in naive) == 20
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+    async def test_read_guild_configs_resolves_every_guild(
+        self, redis_url: str
+    ) -> None:
+        """And the fix, against the same server and the same cap."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            configs = await read_guild_configs(client, ids)
+
+            assert sorted(configs) == ids
+            assert all(c.debug_mode is True for c in configs.values())
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+
 class TestHistoryWritePathAgainstARealServer:
     """Real-server coverage for the push path: LPUSH+LTRIM+PERSIST+conditional
     XADD, plus an OOM recovery. The unit tier's LTRIM assertions run against
@@ -714,3 +778,252 @@ class TestRefPolicyIsNotAvailableYet:
             await redis.execute_command(
                 "XTRIM", HISTORY_OUTBOX_KEY, "MINID", ids[1], "ACKED"
             )
+
+
+class TestDebugBlockFieldNames:
+    """The INFO fields -debug's Redis block and check rows read, against a real
+    server.
+
+    This is divergence 7 for the list above, and the worst-shaped one: fakeredis
+    does not implement INFO AT ALL — it raises ResponseError("unknown command") —
+    so the unit tier can only exercise the block against a dict this repo wrote
+    itself. A field renamed or misspelled renders "unknown"/"?" forever and every
+    unit test still passes, because they assert against our own fixture.
+    """
+
+    async def test_every_field_the_block_reads_exists(
+        self, redis: aioredis.Redis
+    ) -> None:
+        info = cast(dict[str, Any], await redis.info())
+        for field in (
+            "used_cpu_sys",
+            "used_cpu_user",
+            "used_memory",
+            "maxmemory",
+            "maxmemory_policy",
+            "mem_fragmentation_ratio",
+            "connected_clients",
+            "instantaneous_ops_per_sec",
+            "keyspace_hits",
+            "keyspace_misses",
+            "evicted_keys",
+            "rdb_last_bgsave_status",
+            # The AOF half of the persistence check. Absent here it defaults to
+            # "unknown", which the check treats as HEALTHY — so a rename makes the
+            # row permanently inert rather than red, and the compose Redis runs AOF.
+            "aof_last_write_status",
+        ):
+            assert field in info, f"INFO has no {field!r} — the debug row is dead"
+
+    async def test_keyspace_shape_is_a_per_db_mapping(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """`persistent = DBSIZE - expires` depends on this shape; a flat key would
+        silently make every key look persistent."""
+        await redis.set("persistent-key", b"1")
+        await redis.set("expiring-key", b"1", ex=60)
+        info = cast(dict[str, Any], await redis.info())
+        db = info["db0"]
+        assert isinstance(db, dict)
+        assert db["keys"] == 2
+        assert db["expires"] == 1
+        assert await redis.dbsize() - db["expires"] == 1
+
+    async def test_cpu_counters_are_cumulative_floats(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The block computes a RATE from two reads, which requires these to be
+        monotonically increasing seconds rather than an instantaneous gauge."""
+        first = cast(dict[str, Any], await redis.info())
+        for _ in range(500):
+            await redis.set("churn", b"1")
+        second = cast(dict[str, Any], await redis.info())
+        before = first["used_cpu_sys"] + first["used_cpu_user"]
+        after = second["used_cpu_sys"] + second["used_cpu_user"]
+        assert isinstance(after, float)
+        assert after >= before
+
+    async def test_history_ttl_reports_the_persist_invariant(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """-debug's check row asserts push_history's unconditional PERSIST. -1 is
+        no expiry, -2 is no such key — a guild that has played nothing."""
+        store = GuildRedisStore(redis, 424242)
+        assert await store.history_ttl() == -2
+        await redis.rpush(store.history_key(), b"{}")
+        assert await store.history_ttl() == -1
+        await redis.expire(store.history_key(), 3600)
+        assert 0 < cast(int, await store.history_ttl()) <= 3600
+
+
+class TestLremRemovalPath:
+    """`remove_queue_entries` — the write a small `-remove` takes instead of
+    rewriting the whole list. fakeredis answers LREM, so the unit tier covers the
+    shape; what it cannot vouch for is the semantics this depends on against a
+    real server, and getting either wrong corrupts a persisted queue silently."""
+
+    @staticmethod
+    def _entry(n: int) -> SongQueueEntry:
+        return SongQueueEntry(
+            webpage_url=f"https://yt.com/v={n}", title=f"Song {n}", requester_id=n
+        )
+
+    async def test_a_positive_count_removes_from_the_head_only(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """LREM's count sign picks a direction, and the queue is head-ordered: a
+        negative count would take the LAST copy of a duplicate, leaving the one
+        the user is about to hear and dropping the one further back."""
+        store = GuildRedisStore(redis, guild_id=1)
+        await store.rebuild_queue(
+            [self._entry(1), self._entry(2), self._entry(1), self._entry(3)]
+        )
+
+        await store.remove_queue_entries([self._entry(1)])
+
+        items = await redis.lrange(store.queue_key(), 0, -1)
+        assert items == [
+            self._entry(2).to_redis(),
+            self._entry(1).to_redis(),
+            self._entry(3).to_redis(),
+        ]
+
+    async def test_bytes_values_match_what_rpush_wrote(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The pool is decode_responses=False, so entries go in as bytes and LREM
+        must compare against the same bytes. redis-py's stub types `value` as str
+        — the one place this file's suppression is checked against a real server."""
+        store = GuildRedisStore(redis, guild_id=2)
+        await store.rebuild_queue([self._entry(n) for n in range(1, 4)])
+
+        await store.remove_queue_entries([self._entry(2)])
+
+        items = await redis.lrange(store.queue_key(), 0, -1)
+        assert items == [self._entry(1).to_redis(), self._entry(3).to_redis()]
+
+    async def test_a_missing_entry_is_a_no_op_not_an_error(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The in-flight head is on the list but never removed, and a
+        crash-recovered item is on neither. Both make "remove this" reach an entry
+        that is not there, which must leave the rest alone rather than raise."""
+        store = GuildRedisStore(redis, guild_id=3)
+        await store.rebuild_queue([self._entry(1), self._entry(2)])
+
+        assert await store.remove_queue_entries([self._entry(99)]) == 0
+
+        items = await redis.lrange(store.queue_key(), 0, -1)
+        assert items == [self._entry(1).to_redis(), self._entry(2).to_redis()]
+
+    async def test_the_count_is_the_lrems_alone(self, redis: aioredis.Redis) -> None:
+        """What GuildQueue compares against len(dropped) to decide whether the
+        mirror still matches memory. A real server answers the pipeline's trailing
+        EXPIRE with 1, so counting it would mask exactly the short LREM the caller
+        is watching for."""
+        store = GuildRedisStore(redis, guild_id=6)
+        await store.rebuild_queue([self._entry(n) for n in range(1, 4)])
+
+        assert await store.remove_queue_entries([self._entry(1), self._entry(2)]) == 2
+        assert await store.remove_queue_entries([self._entry(3), self._entry(99)]) == 1
+
+    async def test_the_ttl_is_refreshed_like_every_other_queue_write(
+        self, redis: aioredis.Redis
+    ) -> None:
+        store = GuildRedisStore(redis, guild_id=4)
+        await store.rebuild_queue([self._entry(1), self._entry(2)])
+        await redis.persist(store.queue_key())
+
+        await store.remove_queue_entries([self._entry(1)])
+
+        assert cast(int, await redis.ttl(store.queue_key())) > 0
+
+    async def test_emptying_the_list_by_lrem_leaves_no_key(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """Redis drops a list key when its last element goes, so the EXPIRE that
+        follows lands on nothing. GuildQueue takes the DELETE path here instead —
+        this pins what the store would do if it ever did not."""
+        store = GuildRedisStore(redis, guild_id=5)
+        await store.rebuild_queue([self._entry(1)])
+
+        await store.remove_queue_entries([self._entry(1)])
+
+        assert await redis.exists(store.queue_key()) == 0
+
+
+class TestRecoveryLockCompareAndDelete:
+    """`release_recovery_lock` — WATCH/MULTI compare-and-delete against a real
+    server. This is the tier the WATCH-over-Lua choice was made for: fakeredis
+    accepts the commands, but only a real server settles whether a WATCH is
+    actually invalidated by a write from another connection, which is the entire
+    guarantee. Deleting a lease this store no longer owns admits a second
+    restore of the same guild."""
+
+    async def test_release_deletes_only_the_lease_this_store_acquired(
+        self, redis: aioredis.Redis
+    ) -> None:
+        first = GuildRedisStore(redis, guild_id=7)
+        assert await first.acquire_recovery_lock() is True
+
+        # The lease elapses mid-restore and the next attempt takes it.
+        await redis.delete(first._recovery_lock_key())
+        second = GuildRedisStore(redis, guild_id=7)
+        assert await second.acquire_recovery_lock() is True
+        token = second._recovery_lock_token
+        assert token is not None
+
+        await first.release_recovery_lock()  # the late release
+
+        assert await redis.get(first._recovery_lock_key()) == token.encode()
+
+    async def test_exec_aborts_when_the_key_changes_hands_after_the_watch(
+        self,
+        redis: aioredis.Redis,
+        redis_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The window the compare alone cannot close: the value still matches at
+        GET and is stolen before EXEC. WATCH is per-CONNECTION, so the steal has
+        to come from a second client — a same-connection write would not
+        invalidate anything and would prove nothing."""
+        store = GuildRedisStore(redis, guild_id=8)
+        assert await store.acquire_recovery_lock() is True
+        key = store._recovery_lock_key()
+
+        thief = aioredis.Redis.from_url(redis_url, decode_responses=False)
+        real_pipeline = redis.pipeline
+
+        class _StealAfterGet:
+            """Pipeline wrapper that lets a second client take the key between
+            this pipeline's GET and its EXEC."""
+
+            def __init__(self, pipe: Any) -> None:
+                self._pipe = pipe
+
+            async def __aenter__(self) -> _StealAfterGet:
+                await self._pipe.__aenter__()
+                return self
+
+            async def __aexit__(self, *exc: Any) -> Any:
+                return await self._pipe.__aexit__(*exc)
+
+            async def get(self, name: Any) -> Any:
+                value = await self._pipe.get(name)
+                await thief.set(key, b"the-next-attempts-token", ex=60)
+                return value
+
+            def __getattr__(self, attr: str) -> Any:
+                return getattr(self._pipe, attr)
+
+        try:
+            monkeypatch.setattr(
+                redis,
+                "pipeline",
+                lambda *a, **k: _StealAfterGet(real_pipeline(*a, **k)),
+            )
+            await store.release_recovery_lock()  # must not raise
+
+            assert await redis.get(key) == b"the-next-attempts-token"
+        finally:
+            await thief.aclose()

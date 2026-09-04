@@ -3,8 +3,9 @@
 import ast
 import inspect
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Optional, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
 import pytest
@@ -16,8 +17,11 @@ from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.exceptions import WatchError
 
+import src.redis_client as redis_client
 from src.guild_state import (
+    GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
@@ -27,6 +31,8 @@ from src.guild_state import (
 )
 from tests.helpers import mocked
 from src.redis_client import (
+    analytics_png_get,
+    analytics_png_set,
     GUILD_TTL,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_GROUP,
@@ -364,8 +370,12 @@ class TestDeleteQueue:
         items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert items == []
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.delete_queue()  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        """GuildQueue clears its stale-mirror flag only on a DELETE that landed."""
+        assert await store.delete_queue() is True
+        assert await broken_store.delete_queue() is False  # swallowed, not raised
 
 
 class TestRebuildQueue:
@@ -384,8 +394,76 @@ class TestRebuildQueue:
         ttl = await fake_redis.ttl(store.queue_key())
         assert ttl > 0
 
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        """GuildQueue clears its stale-mirror flag only on a rebuild that landed."""
+        assert await store.rebuild_queue([_entry(1)]) is True
+        assert await broken_store.rebuild_queue([_entry(1)]) is False  # swallowed
+
+
+class TestRemoveQueueEntries:
+    """The LREM path GuildQueue takes for a small removal instead of rewriting
+    the whole list. See tests/test_redis_integration.py for the real server —
+    fakeredis is not authoritative about LREM."""
+
+    async def test_removes_only_the_named_entries(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.rebuild_queue([_entry(n) for n in range(1, 5)])
+        await store.remove_queue_entries([_entry(2), _entry(4)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(1).to_redis(), _entry(3).to_redis()]
+
+    async def test_order_of_the_survivors_is_untouched(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The whole licence for LREM over a rebuild: it leaves the rest where
+        they were, so the queue a user is looking at does not reshuffle."""
+        await store.rebuild_queue([_entry(n) for n in range(1, 7)])
+        await store.remove_queue_entries([_entry(1), _entry(6)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(n).to_redis() for n in (2, 3, 4, 5)]
+
+    async def test_a_duplicate_is_removed_once_per_copy_taken(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """LREM ... 0 would remove every identical entry. Two enqueues of one song
+        usually differ on the wire, but when they do not, removing "all matching"
+        takes out a copy still queued."""
+        await store.rebuild_queue([_entry(1), _entry(1), _entry(1)])
+        await store.remove_queue_entries([_entry(1)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(1).to_redis(), _entry(1).to_redis()]
+
+    async def test_refreshes_the_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The queue key is TTL'd like every other guild key, and a removal is a
+        write — leaving it to age off its old expiry would expire a live queue."""
+        await store.rebuild_queue([_entry(1), _entry(2)])
+        await fake_redis.persist(store.queue_key())
+        await store.remove_queue_entries([_entry(1)])
+        assert await fake_redis.ttl(store.queue_key()) > 0
+
+    async def test_returns_how_many_were_removed(self, store: GuildRedisStore) -> None:
+        """Exactly the LREM counts — the pipeline's trailing EXPIRE reply is a 1
+        of its own, and summing it in would report a phantom removal."""
+        await store.rebuild_queue([_entry(n) for n in range(1, 5)])
+        assert await store.remove_queue_entries([_entry(2), _entry(4)]) == 2
+
+    async def test_returns_short_when_the_mirror_no_longer_holds_them(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The count is GuildQueue's only signal that the mirror and memory
+        disagree: LREM raises nothing when what it was told to drop is absent."""
+        await store.rebuild_queue([_entry(1)])
+        assert await store.remove_queue_entries([_entry(1), _entry(2)]) == 1
+
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.rebuild_queue([_entry(1)])  # must not raise
+        # 0 rather than None: it cannot match what the caller asked for, so a
+        # failed LREM routes it to the rebuild like any other short count.
+        assert await broken_store.remove_queue_entries([_entry(1)]) == 0
 
 
 # ── History operations ────────────────────────────────────────────────────────
@@ -443,6 +521,33 @@ class TestPushHistory:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.push_history(_hentry(1))  # must not raise
+
+
+class TestHistoryTtl:
+    """The read behind -debug's PERSIST check row. Redis's own vocabulary: -1 is
+    no expiry, -2 is no such key."""
+
+    async def test_absent_key(self, store: GuildRedisStore) -> None:
+        assert await store.history_ttl() == -2
+
+    async def test_persisted_key_reports_no_expiry(
+        self, store: GuildRedisStore
+    ) -> None:
+        await store.push_history(_hentry(1))
+        assert await store.history_ttl() == -1
+
+    async def test_reports_a_ttl_that_should_not_be_there(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.push_history(_hentry(1))
+        await fake_redis.expire(store.history_key(), 3600)
+        assert await store.history_ttl() == 3600
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        """On the @_guild_op side of golden rule 5's split: None means Redis did
+        not answer, which the check row renders as unknown rather than as a
+        violation of the invariant."""
+        assert await broken_store.history_ttl() is None
 
 
 class TestPushHistoryOutbox:
@@ -898,7 +1003,7 @@ class TestOutboxDrainHelpers:
             async def execute(self) -> Any:
                 raise boom
 
-            async def __aenter__(self) -> "_DeadPipeline":
+            async def __aenter__(self) -> _DeadPipeline:
                 return self
 
             async def __aexit__(self, *exc: Any) -> None:
@@ -1520,22 +1625,239 @@ class TestGuildOpDefaults:
 
 
 class TestSetVolume:
-    async def test_writes_volume_to_hash(
+    async def test_writes_volume_to_the_config_key(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
+        assert await store.set_volume(0.75) is True
+        config = await fake_redis.hgetall(store.config_key())
+        assert config[b"volume"] == b"0.75"
+
+    async def test_the_volume_never_expires(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """It used to live in the 24h state hash, so a guild that went a day without
+        playing came back at 100% with nothing to explain why."""
+        await store.set_volume(1.0)
+        assert await fake_redis.ttl(store.config_key()) == -1
+        await store.refresh_ttl()
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_the_legacy_state_field_is_kept_fresh_not_deleted(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A rollback to a build that reads only :state must still find the current
+        value. Deleting the field made `just up <older-sha>` silently reset every
+        migrated guild to 100% — no log line, no user-visible cause."""
+        await fake_redis.hset(store.state_key(), "volume", "0.10")
         await store.set_volume(0.75)
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"volume"] == b"0.75"
 
-    async def test_sets_ttl_on_state_key(
+    async def test_the_legacy_write_cannot_leave_the_state_key_immortal(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await store.set_volume(1.0)
-        ttl = await fake_redis.ttl(store.state_key())
-        assert ttl > 0
+        """The legacy write can CREATE the state hash on a guild whose 24h TTL has
+        lapsed, and a state key created without an EXPIRE never expires again — a
+        permanently non-evictable key that golden rule 12 does not sanction."""
+        assert await fake_redis.exists(store.state_key()) == 0
+        await store.set_volume(0.5)
+        assert await fake_redis.ttl(store.state_key()) > 0
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.set_volume(0.5)  # must not raise
+        assert await broken_store.set_volume(0.5) is False  # must not raise
+
+
+class TestSetTimezone:
+    """Write half of the planned `-options timezone`. No command calls it yet, so
+    these are the only thing holding its contract."""
+
+    async def test_a_real_zone_is_stored(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        assert await store.set_timezone("Europe/London") is True
+        assert (await fake_redis.hgetall(store.config_key()))[b"timezone"] == (
+            b"Europe/London"
+        )
+
+    async def test_the_write_clears_an_expiry_it_finds(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """PERSIST, like every config write. Seeded with a TTL first on purpose:
+        asserting `ttl == -1` on a key nothing ever expires passes whether or not
+        the PERSIST is there, so it would pin nothing. A real expiry can be left by
+        an older build or a hand-edit, and under volatile-lru it makes the key an
+        eviction candidate — a setting silently reverting with no log line."""
+        await fake_redis.hset(store.config_key(), "debug_mode", "1")
+        await fake_redis.expire(store.config_key(), 60)
+        assert await fake_redis.ttl(store.config_key()) > 0
+
+        assert await store.set_timezone("Europe/London") is True
+
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    @pytest.mark.parametrize(
+        "name", ["Mars/Olympus", "", "../../../etc/passwd", "zone.tab", "x" * 200]
+    )
+    async def test_an_unusable_name_is_refused_rather_than_stored(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis, name: str
+    ) -> None:
+        """This is the first user-typed string that will reach guild:{id}:config —
+        PERSISTed, excluded from every TTL path, non-evictable. Storing a bad one
+        fails silently: the write succeeds, the command says so, and the guild's
+        ETAs stay on the default forever."""
+        assert await store.set_timezone(name) is False
+        assert await fake_redis.hgetall(store.config_key()) == {}
+
+    async def test_a_refusal_does_not_disturb_an_existing_choice(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.set_timezone("Europe/London")
+        assert await store.set_timezone("Mars/Olympus") is False
+        assert (await fake_redis.hgetall(store.config_key()))[b"timezone"] == (
+            b"Europe/London"
+        )
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        assert await broken_store.set_timezone("UTC") is False  # must not raise
+
+
+class TestConfigWritesUseTheSchemaEncoder:
+    """Every config setter encodes through GuildConfig.to_redis rather than by
+    hand, so the wire format lives in one place and a setter cannot drift from what
+    from_redis expects. Asserted by round-tripping through the real parser."""
+
+    async def test_each_setter_round_trips_through_from_redis(
+        self, store: GuildRedisStore
+    ) -> None:
+        await store.set_debug_mode(False)
+        await store.set_volume(0.25)
+        await store.set_timezone("Europe/London")
+
+        config = await store.get_config()
+
+        # False, not None: an explicit opt-out must survive the round trip.
+        assert config.debug_mode is False
+        assert config.volume == 0.25
+        assert config.timezone == "Europe/London"
+
+    async def test_a_setter_writes_only_its_own_field(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """to_redis omits unset fields, which is what makes per-field setters safe:
+        a setter that wrote a whole config would clobber the other two with the
+        defaults of whatever it happened to construct."""
+        await store.set_debug_mode(True)
+        assert set(await fake_redis.hgetall(store.config_key())) == {b"debug_mode"}
+
+
+class TestReadGuildConfigs:
+    """The multi-guild read hydration uses. Its contract is the return SHAPE: a
+    guild is present only if its read happened."""
+
+    async def test_reads_every_guild_across_batch_boundaries(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain per-guild fan-out silently failed every guild past the pool's
+        connection cap, so this batches. The batch loop's boundaries are the part
+        that can drop a guild."""
+        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        ids = list(range(1, 8))  # 7 guilds over batches of 2 — last batch partial
+        for guild_id in ids:
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
+
+        configs = await redis_client.read_guild_configs(fake_redis, ids)
+
+        assert sorted(configs) == ids
+        assert all(c.debug_mode is True for c in configs.values())
+
+    async def test_the_work_is_actually_batched(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """fakeredis has no connection cap, so the reason for batching is invisible
+        here — this pins the shape instead. One pipeline per batch, never one
+        awaited command per guild: the real pool RAISES rather than queueing once
+        its connections are in use, so a per-guild fan-out fails every guild past
+        the cap. tests/test_redis_integration.py proves that against a real server.
+        """
+        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        real = fake_redis.pipeline
+        with patch.object(fake_redis, "pipeline", side_effect=real) as pipe:
+            await redis_client.read_guild_configs(fake_redis, list(range(5)))
+        assert pipe.call_count == 3  # ceil(5 / 2)
+
+    async def test_a_guild_with_nothing_stored_is_present_and_all_unset(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Present-but-unset is a real answer: "this guild never chose"."""
+        configs = await redis_client.read_guild_configs(fake_redis, [99])
+        assert configs[99] == GuildConfig()
+
+    async def test_a_failed_read_is_reported_by_OMISSION_not_a_zero_value(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """The distinction the whole function exists for. Handing back an all-unset
+        GuildConfig would be indistinguishable from "never chose", and the caller
+        caches that — which is how a Redis blink came to DELETE stored settings."""
+        with patch.object(fake_redis, "pipeline", side_effect=RuntimeError("down")):
+            configs = await redis_client.read_guild_configs(fake_redis, [1, 2])
+        assert configs == {}
+
+    async def test_one_failed_batch_does_not_lose_the_others(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        for guild_id in (1, 2, 3, 4):
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
+        real = fake_redis.pipeline
+        calls = {"n": 0}
+
+        def flaky(*args: object, **kwargs: object) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("down")
+            return real(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        with patch.object(fake_redis, "pipeline", side_effect=flaky):
+            configs = await redis_client.read_guild_configs(fake_redis, [1, 2, 3, 4])
+
+        assert sorted(configs) == [3, 4]
+
+    async def test_no_guilds_issues_no_commands(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        with patch.object(fake_redis, "pipeline", side_effect=AssertionError) as pipe:
+            assert await redis_client.read_guild_configs(fake_redis, []) == {}
+        pipe.assert_not_called()
+
+
+class TestMigrateVolume:
+    """Seeding config from the legacy field, which must never overwrite."""
+
+    async def test_seeds_config_when_nothing_is_stored(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        assert await store.migrate_volume(0.30) is True
+        assert (await fake_redis.hgetall(store.config_key()))[b"volume"] == b"0.3"
+
+    async def test_never_overwrites_a_value_already_there(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The whole reason this is HSETNX. Restore reads its snapshot and writes it
+        back an arbitrary number of awaits later, so a -volume that landed in that
+        window would otherwise be destroyed by the older value — durably, while the
+        user is being told the new one took."""
+        await store.set_volume(0.50)
+        assert await store.migrate_volume(0.30) is True
+        assert (await fake_redis.hgetall(store.config_key()))[b"volume"] == b"0.5"
+
+    async def test_the_seeded_volume_never_expires(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.migrate_volume(0.30)
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        assert await broken_store.migrate_volume(0.5) is False  # must not raise
 
 
 class TestGetGuildState:
@@ -1557,7 +1879,7 @@ class TestGetGuildState:
         self, broken_store: GuildRedisStore
     ) -> None:
         # None (read failed) must be distinguishable from GuildStateData()
-        # (nothing stored) — _restore_guild relies on this to avoid silently
+        # (nothing stored) — restore_guild() relies on this to avoid silently
         # skipping recovery during a Redis outage.
         result = await broken_store.get_guild_state()
         assert result is None
@@ -1890,18 +2212,121 @@ class TestRecoveryLock:
         result = await broken_store.acquire_recovery_lock()
         assert result is False
 
-    async def test_release_deletes_lock_key(
+    async def test_release_deletes_a_lock_this_store_acquired(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await fake_redis.set(store._recovery_lock_key(), "1", nx=True, ex=60)
+        assert await store.acquire_recovery_lock() is True
         await store.release_recovery_lock()
-        val = await fake_redis.get(store._recovery_lock_key())
-        assert val is None
+        assert await fake_redis.get(store._recovery_lock_key()) is None
+
+    async def test_acquire_stores_a_unique_token_per_acquisition(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.acquire_recovery_lock()
+        first = store._recovery_lock_token
+        assert first is not None
+        assert await fake_redis.get(store._recovery_lock_key()) == first.encode()
+
+        await store.release_recovery_lock()
+        await store.acquire_recovery_lock()
+        assert store._recovery_lock_token != first
+
+    async def test_release_does_not_delete_a_lock_another_acquirer_holds(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Attempt #1 acquires; its lease expires mid-recovery; #2 acquires; #1
+        finishes and releases. #1 must NOT delete #2's lock — that would let a #3
+        acquire while #2 is still restoring, which is the double restore the lock
+        exists to prevent. Both are restore_guild tasks, not separate processes."""
+        store_a = store
+        assert await store_a.acquire_recovery_lock() is True
+
+        # A's lock expires and B takes it (simulated: overwrite with B's value).
+        await fake_redis.delete(store_a._recovery_lock_key())
+        store_b = GuildRedisStore(fake_redis, guild_id=store_a.guild_id)
+        assert await store_b.acquire_recovery_lock() is True
+        b_token = store_b._recovery_lock_token
+        assert b_token is not None
+
+        await store_a.release_recovery_lock()  # A finishes, late
+
+        assert await fake_redis.get(store_a._recovery_lock_key()) == b_token.encode()
+        # ...and B can still release its own lock afterwards.
+        await store_b.release_recovery_lock()
+        assert await fake_redis.get(store_a._recovery_lock_key()) is None
+
+    async def test_release_without_acquire_is_a_noop(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A store that never won the lock has no business deleting it — that is
+        the cross-instance delete, just arriving by a different route."""
+        other = GuildRedisStore(fake_redis, guild_id=store.guild_id)
+        assert await other.acquire_recovery_lock() is True
+
+        await store.release_recovery_lock()  # never acquired
+
+        assert await fake_redis.get(store._recovery_lock_key()) is not None
+
+    async def test_release_is_idempotent(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The token is consumed on release, so a second release cannot delete a
+        lock a later acquirer has since taken."""
+        assert await store.acquire_recovery_lock() is True
+        await store.release_recovery_lock()
+
+        later = GuildRedisStore(fake_redis, guild_id=store.guild_id)
+        assert await later.acquire_recovery_lock() is True
+
+        await store.release_recovery_lock()  # second release from the old owner
+
+        assert await fake_redis.get(store._recovery_lock_key()) is not None
+
+    async def test_release_tolerates_a_lock_that_simply_expired(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        assert await store.acquire_recovery_lock() is True
+        await fake_redis.delete(store._recovery_lock_key())  # TTL elapsed
+        await store.release_recovery_lock()  # must not raise
+
+    async def test_release_leaves_the_key_when_exec_aborts(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The compare passed but the key changed hands before EXEC, so the
+        transaction aborts and the delete never lands. Driven here by raising
+        WatchError directly: whether fakeredis invalidates a WATCH across
+        connections is not something to rely on — the real-server proof of this
+        path is in the redis tier."""
+        assert await store.acquire_recovery_lock() is True
+        token = store._recovery_lock_token
+        assert token is not None
+
+        real_pipeline = fake_redis.pipeline
+
+        def _aborting_pipeline(*args: Any, **kwargs: Any) -> Any:
+            pipe = real_pipeline(*args, **kwargs)
+            pipe.execute = AsyncMock(side_effect=WatchError("changed hands"))
+            return pipe
+
+        with patch.object(fake_redis, "pipeline", _aborting_pipeline):
+            await store.release_recovery_lock()  # must not raise
+
+        assert await fake_redis.get(store._recovery_lock_key()) == token.encode()
 
     async def test_release_swallows_redis_error(
         self, broken_store: GuildRedisStore
     ) -> None:
+        # Set the token directly: broken_store's acquire raises, so it would
+        # otherwise return early and never reach the code under test.
+        broken_store._recovery_lock_token = "deadbeef"
         await broken_store.release_recovery_lock()  # must not raise
+
+    async def test_ttl_outlasts_the_voice_connect_cap(
+        self, store: GuildRedisStore
+    ) -> None:
+        """_restore_guild's connect(timeout=30.0) caps the whole retry loop, and a
+        few Redis reads follow it. The TTL must clear that with room to spare."""
+        assert store._RECOVERY_LOCK_TTL >= 60
 
     async def test_lock_key_includes_guild_id(self, store: GuildRedisStore) -> None:
         assert "123456789" in store._recovery_lock_key()
@@ -2003,9 +2428,23 @@ class TestPopQueueAndStartSong:
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         await fake_redis.rpush(store.queue_key(), b"first", b"second")
-        await store.pop_queue_and_start_song(_current(), 1000.0)
+        assert await store.pop_queue_and_start_song(_current(), 1000.0) is True
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"second"]
+
+    async def test_a_swallowed_failure_reports_that_the_lpop_did_not_land(
+        self,
+    ) -> None:
+        """@_guild_op logs and returns the default, so this return value is the
+        caller's ONLY signal. Defaulted to True it reads as success, the loop skips
+        its resync, and the mirror keeps an entry memory already dropped — the next
+        start retires the wrong one and a crash inside the drift records a song
+        twice."""
+        bad_redis = MagicMock()
+        bad_redis.pipeline = MagicMock(side_effect=ConnectionError("down"))
+        bad_store = GuildRedisStore(cast(aioredis.Redis, bad_redis), guild_id=1)
+
+        assert await bad_store.pop_queue_and_start_song(_current(), 1000.0) is False
 
     async def test_writes_now_playing_fields_atomically(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -2110,6 +2549,38 @@ class TestPopQueueAndStartSong:
         assert state[b"current_song_query_source"] == b"spotify.com"
         restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
         assert restored.current_song_query_source == "spotify.com"
+
+    async def test_parks_the_user_input(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The playing song's queue entry is LPOPed by this very transaction, so
+        # from here on the hash is the only copy of what the user typed — and
+        # -remove <collection link> is the advertised undo for a flagged -play.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(user_input="https://open.spotify.com/playlist/abc"), 1000.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert (
+            restored.current_song_user_input == "https://open.spotify.com/playlist/abc"
+        )
+
+    async def test_parks_the_played_at(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The LPOP in this very transaction destroys the song's queue-list entry,
+        # so from here until song end the hash holds the only copy of when the
+        # play started. It rides the same MULTI, leaving no window where the song
+        # is playing and its start is unrecorded — and it is NOT play_start_epoch,
+        # which is backdated by the -ss offset.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(played_at=1752530000.5), 990.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_played_at"] == b"1752530000.5"
+        assert state[b"play_start_epoch"] == b"990.0"
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert restored.current_song_played_at == 1752530000.5
 
     async def test_sets_ttl_on_state(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -2223,8 +2694,57 @@ class TestSetCurrentSongState:
         await store.set_current_song_state(_current(), 1000.0)
         assert await fake_redis.exists(store.now_playing_key()) == 0
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.set_current_song_state(_current(), 1000.0)  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        assert await store.set_current_song_state(_current(), 1000.0) is True
+        assert await broken_store.set_current_song_state(_current(), 1000.0) is False
+
+
+class TestRebuildQueueAndStartSong:
+    """pop_queue_and_start_song with the list REPLACED rather than LPOPed — the
+    start over a mirror the queue knows is stale, where an LPOP would retire
+    the wrong entry. One MULTI: the song is parked over a correct list, or
+    nothing changed."""
+
+    async def test_replaces_the_list_and_parks_the_song_together(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), b"stale-head", b"old")
+        assert (
+            await store.rebuild_queue_and_start_song(
+                _current("https://yt.com/v=1", "Test Song"),
+                [_entry(2), _entry(3)],
+                1000.5,
+            )
+            is True
+        )
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(2).to_redis(), _entry(3).to_redis()]
+        assert await fake_redis.ttl(store.queue_key()) > 0
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_url"] == b"https://yt.com/v=1"
+        assert state[b"play_start_epoch"] == b"1000.5"
+
+    async def test_nothing_queued_deletes_the_list(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Empty means DELETE, never skip: a stale head left standing is restored
+        and replayed on the next restart."""
+        await fake_redis.rpush(store.queue_key(), b"stale-head")
+        assert await store.rebuild_queue_and_start_song(_current(), [], 1000.0)
+        assert await fake_redis.exists(store.queue_key()) == 0
+        assert await fake_redis.hget(store.state_key(), "current_song_url") == b"url"
+
+    async def test_a_swallowed_failure_reports_that_nothing_landed(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        assert (
+            await broken_store.rebuild_queue_and_start_song(
+                _current(), [_entry(1)], 1000.0
+            )
+            is False
+        )
 
 
 # ── Now-playing operations ────────────────────────────────────────────────────
@@ -2392,3 +2912,207 @@ class TestClearSongEndState:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.clear_song_end_state()  # must not raise
+
+
+class TestHeartbeat:
+    async def test_the_write_is_not_wrapped_in_a_transaction(
+        self, store: GuildRedisStore
+    ) -> None:
+        """HSET then EXPIRE on one key needs no atomicity, and unlike every other
+        state writer this runs once every few seconds per PLAYING guild — the
+        MULTI/EXEC pair measured 12% of the latency and 14% of the bytes for nothing.
+        """
+        spy = MagicMock(wraps=store.redis.pipeline)
+        with patch.object(store.redis, "pipeline", spy):
+            await store.heartbeat(1.0, 2.0)
+        assert spy.call_args.kwargs.get("transaction") is False
+
+    async def test_writes_both_position_fields(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.heartbeat(42.5, 1700000000.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert raw[b"last_position_secs"] == b"42.500"
+        assert raw[b"last_heartbeat_epoch"] == b"1700000000.0"
+
+    async def test_the_position_is_written_without_a_float_error_tail(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """position_secs accumulates 20ms frames, so repr renders 13.5% of values
+        as '153.42000000000002'. The reader truncates to whole seconds, so the tail
+        is noise on every write."""
+        await store.heartbeat(7671 * 0.02, 1700000000.0)  # 153.42000000000002
+
+        raw = await fake_redis.hgetall(store.state_key())
+        assert raw[b"last_position_secs"] == b"153.420"
+
+    async def test_refreshes_the_state_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Otherwise a long song on an otherwise-idle guild could let the state
+        key expire mid-playback."""
+        await fake_redis.hset(store.state_key(), b"x", b"1")
+        await fake_redis.expire(store.state_key(), 5)
+        await store.heartbeat(1.0, 2.0)
+        assert await fake_redis.ttl(store.state_key()) > 5
+
+    async def test_negative_position_is_floored(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.heartbeat(-3.0, 1.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert float(raw[b"last_position_secs"]) == 0.0
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        await broken_store.heartbeat(1.0, 2.0)  # must not raise
+
+    async def test_start_transaction_seeds_the_heartbeat_from_start_offset(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Closes the window before the first tick — and makes a crash-recovered
+        song that crashes again immediately resume at its -ss offset, not 0:00."""
+        await store.pop_queue_and_start_song(_entry(1), 1000.0, start_offset=30.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert float(raw[b"last_position_secs"]) == 30.0
+
+    async def test_start_transaction_seeds_zero_without_an_offset(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.pop_queue_and_start_song(_entry(1), 1000.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert float(raw[b"last_position_secs"]) == 0.0
+
+    async def test_clear_song_end_state_wipes_the_heartbeat(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A stale position outliving its song would be read as the next
+        crash's resume point."""
+        await store.heartbeat(42.0, 1.0)
+        await store.clear_song_end_state()
+        raw = await fake_redis.hgetall(store.state_key())
+        assert b"last_position_secs" not in raw
+        assert b"last_heartbeat_epoch" not in raw
+
+
+class TestGuildConfigStore:
+    """The durable half of the per-guild debug toggle."""
+
+    async def test_a_stored_choice_survives_a_round_trip(self, fake_redis: Any) -> None:
+        store = GuildRedisStore(fake_redis, 42)
+        assert await store.set_debug_mode(True) is True
+        assert (await store.get_config()).debug_mode is True
+        assert await store.set_debug_mode(False) is True
+        assert (await store.get_config()).debug_mode is False
+
+    async def test_a_guild_that_never_chose_reads_unset(self, fake_redis: Any) -> None:
+        """Not False. Unset means "follow the host default", which is what lets
+        DEBUG_MODE still move a guild that has no opinion."""
+        assert (await GuildRedisStore(fake_redis, 7).get_config()).debug_mode is None
+
+    async def test_the_config_key_carries_no_ttl(self, fake_redis: Any) -> None:
+        """Under volatile-lru only TTL-bearing keys are eviction candidates, so an
+        expiring config is a setting that reverts with no log line and no error."""
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_a_ttl_refresh_does_not_reach_the_config_key(
+        self, fake_redis: Any
+    ) -> None:
+        """refresh_ttl sweeps the runtime keys. Config must not be swept in with
+        them — that is the whole reason it is not a field on guild:{id}:state."""
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        await store.refresh_ttl()
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_a_write_failure_is_reported_rather_than_swallowed(
+        self, fake_redis: Any
+    ) -> None:
+        """@_guild_op turns the raise into False, and the command turns that False
+        into "this applies until restart" instead of claiming a durable change."""
+        store = GuildRedisStore(fake_redis, 42)
+        with patch.object(
+            fake_redis, "pipeline", side_effect=RuntimeError("redis down")
+        ):
+            assert await store.set_debug_mode(True) is False
+
+    async def test_an_unreachable_redis_reads_as_unset(self, fake_redis: Any) -> None:
+        """Degrades to the host default rather than to an arbitrary one."""
+        store = GuildRedisStore(fake_redis, 42)
+        with patch.object(
+            fake_redis, "hgetall", side_effect=RuntimeError("redis down")
+        ):
+            assert (await store.get_config()).debug_mode is None
+
+    async def test_a_timezone_round_trips(self, fake_redis: Any) -> None:
+        store = GuildRedisStore(fake_redis, 42)
+        assert await store.set_timezone("Europe/London") is True
+        config = await store.get_config()
+        assert config.timezone == "Europe/London"
+        assert config.tzinfo() == ZoneInfo("Europe/London")
+
+    async def test_the_timezone_never_expires(self, fake_redis: Any) -> None:
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_timezone("Europe/London")
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_settings_do_not_clobber_each_other(self, fake_redis: Any) -> None:
+        """Three fields, one hash: each write is an HSET of its own field, so
+        setting a timezone must not drop the guild's debug choice or volume."""
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        await store.set_volume(0.4)
+        await store.set_timezone("Europe/London")
+        config = await store.get_config()
+        assert config.debug_mode is True
+        assert config.volume == 0.4
+        assert config.timezone == "Europe/London"
+
+    async def test_clearing_removes_the_key(self, fake_redis: Any) -> None:
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        assert await store.clear_config() is True
+        assert await fake_redis.exists(store.config_key()) == 0
+
+
+class TestAnalyticsPngCache:
+    """Raw bytes in and out. Deliberately not cache_get/cache_set: those
+    orjson-encode, which would base64 a PNG for a 33% penalty."""
+
+    async def test_round_trip_preserves_the_bytes_exactly(
+        self, fake_redis: Redis
+    ) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:abc", png, 60)
+        assert await analytics_png_get(fake_redis, "analytics:png:v1:1:30:abc") == png
+
+    async def test_a_miss_is_none_not_an_error(self, fake_redis: Redis) -> None:
+        assert await analytics_png_get(fake_redis, "analytics:png:v1:1:30:nope") is None
+
+    async def test_a_non_positive_ttl_writes_nothing(self, fake_redis: Redis) -> None:
+        """A non-positive TTL means the aggregate straddled a midnight, so it does
+        not cover the day it would be served for. Writing it with no expiry at all
+        would also put an unbounded key in a volatile-lru store."""
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:stale", b"x", 0)
+        assert (
+            await analytics_png_get(fake_redis, "analytics:png:v1:1:30:stale") is None
+        )
+
+    async def test_the_entry_carries_a_ttl(self, fake_redis: Redis) -> None:
+        """It must stay an eviction CANDIDATE — golden rule 12's non-evictable keys
+        are the outbox, the history lists and the per-guild config, and a persistent
+        chart blob has no business joining them."""
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:ttl", b"x", 120)
+        assert 0 < await fake_redis.ttl("analytics:png:v1:1:30:ttl") <= 120
+
+    async def test_neither_helper_raises_when_redis_is_none(self) -> None:
+        await analytics_png_set(None, "k", b"x", 60)
+        assert await analytics_png_get(None, "k") is None
+
+    async def test_neither_helper_raises_when_redis_fails(self) -> None:
+        broken = MagicMock()
+        broken.set = AsyncMock(side_effect=ConnectionError("down"))
+        broken.get = AsyncMock(side_effect=ConnectionError("down"))
+        await analytics_png_set(broken, "k", b"x", 60)
+        assert await analytics_png_get(broken, "k") is None

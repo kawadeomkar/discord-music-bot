@@ -23,9 +23,28 @@ COPY pyproject.toml poetry.lock ./
 
 # BuildKit cache mounts: reuse pip/poetry download cache across builds.
 # Critical for yt-dlp (large, frequent updates) and pynacl (C extension compile).
+# CHART_EXTRAS selects the image SHAPE, and defaults to the full one so an
+# unqualified build is unchanged. Empty builds the `-slim` variant: no matplotlib and
+# no transitive tree (133MB), which a deployment with the archive disabled can never
+# reach. See docs/ARCHITECTURE.md#the-charts-extra.
+ARG CHART_EXTRAS=--extras=charts
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --only=main --no-root
+    poetry install --only=main $CHART_EXTRAS --no-root
+
+# Bytecode-compile the venv. Poetry leaves site-packages as .py only, and the runtime
+# stage runs as uid 10001 against a root-owned /app/.venv — so the interpreter cannot
+# write __pycache__ and RE-COMPILES every module on every import, in every process, for
+# the life of the container. Measured in this image (median of 7, page cache warm):
+#
+#     import src.main    3747ms -> 1670ms
+#     import matplotlib  2485ms -> 1300ms
+#
+# Paid on bot startup, by the forkserver and by every worker. `|| true` for the few
+# dependencies shipping unparseable vendored sources; `test -d` guards the GLOB, which
+# `|| true` would otherwise swallow if a base-image bump moved the path.
+RUN test -d /app/.venv/lib/python*/site-packages \
+ && (python -m compileall -q -j 0 /app/.venv/lib/python*/site-packages || true)
 
 # ── Test stage ────────────────────────────────────────────────────────────────
 # Inherits the builder venv and adds test deps (pytest, fakeredis, pytest-cov)
@@ -47,9 +66,14 @@ FROM builder AS test
 # the build is the point — the assumption is then re-examined rather than silently lost.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --only=main,test,lint --no-root \
+    poetry install --only=main,test,lint --extras=charts --no-root \
  && test -d /app/.venv/lib/python*/site-packages/nodejs_wheel/include \
  && rm -rf /app/.venv/lib/python*/site-packages/nodejs_wheel/include
+
+# The test group's own packages, for the same reason as the builder stage above: the
+# container tier imports pytest, fakeredis and matplotlib on every run.
+RUN test -d /app/.venv/lib/python*/site-packages \
+ && (python -m compileall -q -j 0 /app/.venv/lib/python*/site-packages || true)
 
 COPY src/ ./src/
 COPY tests/ ./tests/
@@ -79,10 +103,15 @@ COPY deploy_docker.sh build_docker.sh ./
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
 # the host uid (needed so ruff's rewrites come out host-owned, not root-owned).
+# MPLCONFIGDIR is there for the same reason: an unwritable one makes matplotlib
+# fall back to a temp dir and warn on every import. Its three sites — here, the
+# runtime stage and tests/conftest.py — hold DIFFERENT paths and are hand-checked on
+# the property that each is writable by the uid running there (CLAUDE.md rule 6d).
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
     ENVIRONMENT="${ENVIRONMENT}" \
-    RUFF_CACHE_DIR=/tmp/ruff-cache
+    RUFF_CACHE_DIR=/tmp/ruff-cache \
+    MPLCONFIGDIR=/tmp/mplcache
 
 CMD ["python", "-m", "pytest", "--tb=short", "-q"]
 
@@ -100,15 +129,60 @@ COPY --from=builder /app/.venv /app/.venv
 
 # Copy source last — most frequently changed, should be the last layer.
 COPY src/ ./src/
+# The app's own modules. Unlike the venv above this is NOT a measured win --
+# `import src.main` is the same before and after, within noise, because third-party
+# module execution dominates and src is 27 files. It is here so the image is
+# self-contained: /app/src stays root-owned while the process runs as uid 10001, so
+# src/__pycache__ can never be written at runtime, and without this step the layout
+# would depend on whether a build host happened to leak one.
+RUN python -m compileall -q -j 0 /app/src
 COPY pyproject.toml ./
 # Required by the compose `db-migrate` one-shot, which runs `python -m
 # src.db_migrate` out of THIS image so the runner and the schema it applies can
 # never be different versions.
 COPY migrations/ ./migrations/
 
+# Non-root: ffmpeg and the venv need no privilege. The uid/gid are fixed rather
+# than distro-assigned so volume ownership survives rebuilds and base-image bumps.
+# HOME is set below because yt-dlp derives its cache directory from it, and
+# docker-compose.yml mounts ytdlp-cache at that path.
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
+ && mkdir -p /home/app/.cache/yt-dlp /home/app/.cache/matplotlib \
+ && chown -R app:app /home/app
+# Numeric, not `app`: kubelet checks runAsNonRoot against the image's USER and
+# cannot resolve a name, failing the pod with "image has non-numeric user".
+USER 10001:10001
+
 ARG ENVIRONMENT=production
+# The commit this image was built from. GIT_SHA existed only as an image TAG, so a
+# running bot could not report its own commit — `just up <sha>` deploys by tag and
+# the process never saw it. Both forms are needed: the LABEL is the OCI-standard
+# annotation external tooling reads, but labels are invisible from inside the
+# container, so -debug reads the ENV. Dirty builds pass `<sha>-dirty.<digest>`
+# through unchanged, so the bot reports exactly the tag that was deployed.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
-    ENVIRONMENT="${ENVIRONMENT}"
+    HOME="/home/app" \
+    ENVIRONMENT="${ENVIRONMENT}" \
+    GIT_SHA="${GIT_SHA}" \
+    MPLCONFIGDIR="/home/app/.cache/matplotlib" \
+    LIVENESS_FILE="/tmp/bot-alive"
+
+# `restart: always` only covers the process exiting; a wedged event loop leaves
+# the container up while it answers nothing. The bot touches LIVENESS_FILE from a
+# loop-resident task, so a stale mtime means the loop stopped turning. Not a
+# dependency probe: a Redis blip must not mark the bot dead.
+#
+# This REPORTS, it does not act. The engine takes no action on an unhealthy
+# container — only Swarm, Kubernetes or an autoheal sidecar restarts one — so
+# under plain compose the effect is a status `docker ps` and monitoring can see.
+#
+# start-period covers login and extension load. interval x retries marks it
+# unhealthy after ~90s, above the 15s touch cadence.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 
 CMD ["python", "-m", "src.main"]

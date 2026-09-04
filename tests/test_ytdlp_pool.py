@@ -638,7 +638,10 @@ class TestWorkerInit:
         ):
             _worker_init()  # must not raise
 
-        assert "yt-dlp worker logging setup failed" in capsys.readouterr().err
+        # Not "yt-dlp worker": this is the one message that bypasses the structured
+        # pipeline (what failed IS the logging setup), so it is printed by both pools
+        # and naming one of them there is how a chart failure reads as an extraction.
+        assert "worker logging setup failed" in capsys.readouterr().err
 
     def test_warmup_noop_returns_nothing(self) -> None:
         assert _warmup_noop() is None
@@ -794,3 +797,81 @@ class TestDefaults:
         pool = YtdlpPool()
         assert not pool.is_closed
         assert pool._executor is None
+
+
+class TestPoolNaming:
+    """The `name=` parameter. Only the strings are yt-dlp-specific; everything the
+    class does is generic, which is what lets src.chart_pool reuse it rather than
+    fork ~300 lines of lifecycle. Without the parameter a chart-render failure reads
+    as an extraction failure in Loki, which is where an operator looks first."""
+
+    def test_the_default_still_says_yt_dlp(self) -> None:
+        pool = YtdlpPool(max_workers=1)
+        pool.shutdown(wait=False)
+        with pytest.raises(PoolClosedError, match="yt-dlp extraction"):
+            pool._acquire()
+
+    def test_a_named_pool_says_its_own_name_when_closed(self) -> None:
+        pool = YtdlpPool(max_workers=1, name="chart render")
+        pool.shutdown(wait=False)
+        with pytest.raises(PoolClosedError, match="chart render"):
+            pool._acquire()
+
+    async def test_the_break_heal_warning_names_the_pool(self) -> None:
+        """The log line an operator greps after a worker is OOM-killed. Two pools now
+        emit it, and the message is the only thing distinguishing them."""
+        pool = YtdlpPool(
+            max_workers=1,
+            executor_factory=lambda: ThreadPoolExecutor(max_workers=1),
+            name="chart render",
+        )
+        calls = {"n": 0}
+
+        def _break_once() -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise BrokenProcessPool("worker died")
+            return "ok"
+
+        with patch("src.ytdlp_pool.log") as log:
+            assert await pool.run(_break_once) == "ok"
+        pool.shutdown(wait=False)
+        warning = log.warning.call_args[0][0]
+        assert "chart render" in warning
+        assert "yt-dlp" not in warning
+
+
+class TestPrewarmCallable:
+    """prewarm() takes the callable because the default no-op only warms what a worker
+    pays on the way UP. For yt-dlp that is the whole cost — the extractor rides the
+    entry module the forkserver already holds. The chart pool's dominant cost is
+    matplotlib, which nothing imports until a render runs."""
+
+    def test_the_default_is_still_the_no_op(self) -> None:
+        pool = YtdlpPool(max_workers=2, executor_factory=lambda: MagicMock())
+        executor = MagicMock(spec=ProcessPoolExecutor)
+        with patch.object(pool, "_acquire", return_value=executor):
+            pool.prewarm()
+        assert executor.submit.call_count == 2
+        assert executor.submit.call_args[0][0] is _warmup_noop
+
+    def test_a_supplied_callable_is_submitted_once_per_worker(self) -> None:
+        def _warm() -> None: ...
+
+        pool = YtdlpPool(max_workers=3, executor_factory=lambda: MagicMock())
+        executor = MagicMock(spec=ProcessPoolExecutor)
+        with patch.object(pool, "_acquire", return_value=executor):
+            pool.prewarm(_warm)
+        assert [c[0][0] for c in executor.submit.call_args_list] == [_warm] * 3
+
+    def test_a_thread_pool_seam_submits_nothing(self) -> None:
+        """The test seam is thread-backed, so there is no process to warm — and
+        submitting a real matplotlib import there would pay ~1.3s inside the suite."""
+        pool = YtdlpPool(
+            max_workers=1, executor_factory=lambda: ThreadPoolExecutor(max_workers=1)
+        )
+        executor = pool._acquire()
+        with patch.object(executor, "submit") as submit:
+            pool.prewarm(lambda: None)
+        submit.assert_not_called()
+        pool.shutdown(wait=False)

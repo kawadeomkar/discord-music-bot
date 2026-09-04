@@ -128,7 +128,7 @@ default:
 # Create the venv with main + test + lint + dev dependencies
 [group('setup')]
 install:
-    poetry install --with test,lint,dev
+    poetry install --with test,lint,dev --extras charts
 
 # Install the git hooks (ruff on commit, `just check` on push)
 [group('setup')]
@@ -233,7 +233,12 @@ lint: (_tools 'ruff')
 types: (_tools 'pyright')
     {{ PYRIGHT }}
 
-# Run the test suite with coverage (~13s); extra pytest flags may be appended
+# Run the test suite (~13s); coverage gates the no-args run, subset runs skip it
+#
+# fail_under is a PROJECT floor, so it answers a whole-suite run or nothing: one file
+# measures ~26% of src/ and fails a green run. No args is the whole suite; test-report
+# sets COVERAGE_GATE because its args are reporting flags, not a selection. The tiers
+# reach the same conclusion by passing --no-cov outright.
 #
 # Shebang + "$@" rather than a plain line + {{ ARGS }}, because {{ ARGS }} flattens to
 # one space-joined string: `just test -k "spotify or youtube"` reached pytest as
@@ -241,12 +246,16 @@ types: (_tools 'pyright')
 # body costs on macOS is noise against a 13s suite. See `set positional-arguments`.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
-[doc('Run the test suite with coverage (~13s); extra pytest flags may be appended')]
+[doc('Run the test suite (~13s); coverage gates the no-args run, subset runs skip it')]
 [group('check')]
 test *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
-    {{ PYTEST }} --tb=short -q "$@"
+    if [ $# -eq 0 ] || [ "${COVERAGE_GATE:-0}" = "1" ]; then
+        {{ PYTEST }} --tb=short -q "$@"
+    else
+        {{ PYTEST }} --tb=short -q --no-cov "$@"
+    fi
 
 # The real-Postgres tier, excluded from `test` by its `pg` marker.
 #
@@ -311,6 +320,31 @@ pins:
         fail=1
     fi
 
+    # The extra's NAME, in the one place that defines it and the three that select it.
+    # A typo in a selector is silent in the worst direction: poetry ignores an unknown
+    # extra, so the build succeeds and ships an image whose charts are simply missing —
+    # indistinguishable from the slim variant, and visible only as a chartless card.
+    # Each SITE is asserted separately: the Dockerfile names the extra twice, so a
+    # count would let a typo in either one hide behind the other.
+    want_extra="$(sed -n 's/^\([a-z]*\) = \["matplotlib"\]$/\1/p' pyproject.toml)"
+    if [ -z "$want_extra" ]; then
+        echo "charts extra: no [tool.poetry.extras] entry defining matplotlib" >&2
+        fail=1
+    else
+        check_extra() {  # <description> <file> <regex>
+            grep -qE -- "$3" "$2" || {
+                echo "charts extra drift: pyproject defines [$want_extra] but $1 does not name it" >&2
+                fail=1
+            }
+        }
+        check_extra "the Dockerfile ARG default" Dockerfile \
+            "^ARG CHART_EXTRAS=--extras=$want_extra\$"
+        check_extra "the Dockerfile test stage" Dockerfile \
+            "poetry install --only=main,test,lint --extras=$want_extra "
+        check_extra "just install" justfile \
+            "poetry install --with test,lint,dev --extras $want_extra\$"
+    fi
+
     just_image="$(sed -n 's/^IMAGE := "\(.*\)"$/\1/p' justfile)"
     sh_image="$(sed -n 's/^IMAGE_NAME="\(.*\)"$/\1/p' build_common.sh)"
     if [ -z "$just_image" ] || [ "$just_image" != "$sh_image" ]; then
@@ -367,6 +401,57 @@ pins:
         fail=1
     fi
 
+    # -debug selects the Postgres container's Prometheus series by container_name.
+    # A rename in compose does not fail anything: the query simply matches no series
+    # and the cpu/mem row renders "n/a (no metrics source)" forever, which reads as
+    # "no metrics stack" rather than "wrong name". Anchored to the postgres service
+    # so another service's container_name cannot satisfy it.
+    py_pgname="$(sed -n 's/^_POSTGRES_CONTAINER = "\(.*\)"$/\1/p' src/debug.py)"
+    compose_pgname="$(awk '/^  postgres:/{f=1} f && /container_name:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$py_pgname" ] || [ "$py_pgname" != "$compose_pgname" ]; then
+        echo "postgres container name drift: src/debug.py=[$py_pgname] docker-compose.yml=[$compose_pgname]" >&2
+        echo "  -debug's Postgres cpu/mem row selects on this label." >&2
+        fail=1
+    fi
+
+    # Both tracked docs quote the yt-dlp version, and a reader trusts those copies
+    # when deciding whether the client strategy described there still applies.
+    # Nothing else compares them: Dependabot moves pyproject and poetry.lock in a PR
+    # that touches neither file and stays green, and main has carried a stale one.
+    want_ytdlp="$(sed -n 's/^yt-dlp = { version = "\([^"]*\)".*$/\1/p' pyproject.toml)"
+    for doc in CLAUDE.md docs/ARCHITECTURE.md; do
+        if ! grep -qF "$want_ytdlp" "$doc"; then
+            echo "yt-dlp pin drift: pyproject.toml=[$want_ytdlp] not found in $doc" >&2
+            echo "  That file describes the client strategy for a version it no longer names." >&2
+            fail=1
+        fi
+    done
+
+    # `check`'s dependency list and the pre-push hooks are the same five recipes in the
+    # same order, written twice. Drift is silent and runs one way: a step added to
+    # `check` alone stops running on push while the gate still reports green.
+    check_deps="$(sed -n 's/^check: //p' justfile)"
+    hook_deps="$(awk '
+        function flush() {
+            if (entry ~ /^just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
+                sub(/^just /, "", entry)
+                out = out (out == "" ? "" : " ") entry
+            }
+            entry = ""; stages = ""
+        }
+        /^ *- id:/ { flush(); next }
+        /^ *entry:/ { entry = $0; sub(/^ *entry: */, "", entry); next }
+        /^ *stages:/ { stages = $0; next }
+        END { flush(); print out }
+    ' .pre-commit-config.yaml)"
+    if [ -z "$check_deps" ] || [ "$check_deps" != "$hook_deps" ]; then
+        echo "pre-push gate drift: the hooks do not mirror \`check\`'s dependencies" >&2
+        echo "  justfile  check: [$check_deps]" >&2
+        echo "  pre-push hooks: [$hook_deps]" >&2
+        echo "  A step named in only one of them runs in only one of them." >&2
+        fail=1
+    fi
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing
@@ -382,16 +467,110 @@ pins:
 # imports. Dropping it was intentional, not an oversight; this note exists because
 # the diff that dropped it did not say so.
 #
+# The two slow checks, and the only pair worth overlapping: pyright runs inside
+# pytest's wall clock. Fusing exactly these leaves the other four as separately named
+# pre-push hooks — pre-commit renders one status line per hook and runs hooks
+# sequentially, so every extra line costs the concurrency it breaks.
+HEAVY := "types test"
+
+# Run pyright and pytest concurrently, reporting both outcomes
+#
+# No fail-fast: both tasks always run and both are always reported, so one red check
+# never hides what the other would have said.
+#
+# Each task's output is captured and replayed grouped. Sharing one stdout interleaves
+# them, landing a concurrent tool's diagnostics inside pytest's progress output. Only
+# the status lines go out live, one printf each so they stay line-atomic.
+#
+# The `_tools` guards are sequential dependencies so they resolve before the fan-out.
+# Child `just` processes cannot de-duplicate them, and under DOCKER=1 that leaves two
+# children racing `test-image-rebuild` on the same tag.
+[doc('Run pyright and pytest concurrently, reporting both outcomes')]
+[group('check')]
+check-heavy: (_tools 'pyright') (_tools 'pytest')
+    #!/usr/bin/env bash
+    # No `-e`: a failing task must not abort the recipe before the rest are reaped.
+    set -uo pipefail
+
+    JUST=({{ quote(just_executable()) }} --justfile {{ quote(justfile()) }})
+    read -ra names <<< "{{ HEAVY }}"
+
+    # A terminal gets the status lines live and a recap after the diagnostics. Under
+    # pre-commit stdout is a pipe replayed whole when the hook exits, so the streamed
+    # lines are already the recap. tty gates the colour for the same reason.
+    if [ -t 1 ]; then tty=1; else tty=0; fi
+    if [ "$tty" = 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        red=$'\033[31m'; green=$'\033[32m'; bold=$'\033[1m'; off=$'\033[0m'
+    else
+        red=''; green=''; bold=''; off=''
+    fi
+
+    log_dir="$(mktemp -d)"
+    trap 'rm -rf "$log_dir"' EXIT
+
+    # Flush left: pre-commit prints a hook's captured output as out.strip(), which eats
+    # the leading whitespace of the first line only, shifting it out of line with the rest.
+    status_line() {  # name rc secs
+        if [ "$2" = 0 ]; then
+            printf '%s✓%s %-14s %4ss\n' "$green" "$off" "$1" "$3"
+        else
+            printf '%s✗%s %-14s %4ss  (exit %s)\n' "$red" "$off" "$1" "$3" "$2"
+        fi
+    }
+
+    for n in "${names[@]}"; do
+        {
+            start=$SECONDS
+            "${JUST[@]}" "$n" > "$log_dir/$n.out" 2>&1
+            rc=$?
+            secs=$((SECONDS - start))
+            printf '%s\n' "$rc" > "$log_dir/$n.rc"
+            printf '%s\n' "$secs" > "$log_dir/$n.t"
+            status_line "$n" "$rc" "$secs"
+        } &
+    done
+    wait
+
+    # Failing output, grouped and in HEAVY order rather than completion order, so a
+    # given failure lands in the same place regardless of how the run interleaved.
+    fail=0
+    for n in "${names[@]}"; do
+        rc="$(cat "$log_dir/$n.rc")"
+        [ "$rc" = 0 ] && continue
+        fail=1
+        printf '\n%s%s── %s failed (exit %s) %s%s\n' "$bold" "$red" "$n" "$rc" "──" "$off"
+        cat "$log_dir/$n.out"
+    done
+
+    # Recap only on a failing terminal run: the live lines have scrolled past the
+    # diagnostics by then. Off a terminal they are still directly above.
+    if [ "$fail" != 0 ] && [ "$tty" = 1 ]; then
+        printf '\n'
+        for n in "${names[@]}"; do
+            status_line "$n" "$(cat "$log_dir/$n.rc")" "$(cat "$log_dir/$n.t")"
+        done
+    fi
+    exit "$fail"
+
+# A plain dependency list: the one definition of the gate, readable by `just --dump
+# --dump-format json`, and named hook-for-hook by the pre-push config. `check-heavy` is
+# the only entry hiding recipes, and `just --list` still shows them.
+#
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc("What CI's lint and test jobs run — run this before pushing")]
 [group('check')]
-check: fmt-justfile pins fmt-check lint types test
+check: fmt-justfile pins fmt-check lint check-heavy
 
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
 # a second definition of the gate — only reporting flags differ, and they never affect
-# pass/fail. `set -o pipefail` lives here rather than in the workflow so it cannot be
-# forgotten; without it, `tee` would mask a failing suite.
+# pass/fail. COVERAGE_GATE says so: without it `test` reads these reporting flags as a
+# selection and drops the gate on the one job that exists to enforce it. That miss is
+# loud rather than silent — --cov-report against --no-cov raises CovDisabledWarning and
+# filterwarnings=error fails on it — but do not rely on that alone.
+#
+# `set -o pipefail` lives here rather than in the workflow so it cannot be forgotten;
+# without it, `tee` would mask a failing suite.
 #
 # Under DOCKER=1 only pytest-coverage.txt survives: tee runs on the host, but the xml
 # and junit files are written inside the container relative to /app, which is not
@@ -406,7 +585,7 @@ check: fmt-justfile pins fmt-check lint types test
 test-report *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} test \
+    COVERAGE_GATE=1 {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} test \
         --cov-report=xml --junitxml=pytest.xml "$@" | tee pytest-coverage.txt
 
 # Mirrors CI's container-test job. Its value is proving the IMAGE runs (a runtime stage
@@ -797,7 +976,15 @@ image:
     # inside an argument does not trip `set -e` (the caller's status is what counts),
     # so a git failure would have built and tagged `discord-music-bot:`.
     tag="$(git_sha_tag)"
+    # Exported, not just tagged: the same string is baked into the image as
+    # GIT_SHA so the running bot can report the commit it was built from
+    # (build_docker.sh already exports it; this path did not).
+    export GIT_SHA="$tag"
     build_runtime_image "{{ IMAGE }}:latest" "{{ IMAGE }}:$tag"
+    # The slim shape, same commit. CHART_EXTRAS is set-but-empty here (see
+    # build_common.sh); the two builds share every layer up to the poetry install,
+    # so the second is the dependency resolve and nothing else.
+    CHART_EXTRAS= build_runtime_image "{{ IMAGE }}:latest-slim" "{{ IMAGE }}:$tag-slim"
 
 # Deploy an already-built image; pass a git sha to roll back
 [group('deploy')]
@@ -817,7 +1004,10 @@ down:
     # just-disabled-the-archive case where the operator most expects the
     # database to stop. Activating a profile whose services have no containers
     # is a no-op, so the always-disabled case is unaffected.
-    docker compose --profile archive down
+    #
+    # `metrics` is here for the same reason: it gates the docker-socket sidecar,
+    # and a `down` that leaves THAT running is the one to get right.
+    docker compose --profile archive --profile metrics down
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text

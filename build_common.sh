@@ -177,7 +177,17 @@ build_runtime_image() {
     # verified: 3.2 aborts with "tag_args[@]: unbound variable", 5.3 is fine. No
     # current caller passes zero tags, but the header advertises this as variadic for
     # the unmerged k8s branch, so a zero-arg call is a supported shape.
+    # GIT_SHA is the caller's to set (build_docker.sh exports it, `just image`
+    # exports the tag it computed) for the same explicit-propagation reason as
+    # ENVIRONMENT. Defaulted here rather than left unset so a caller that forgets
+    # bakes a readable "unknown" instead of an empty string.
+    # CHART_EXTRAS rides the environment rather than a positional, so the three-name
+    # contract above still holds. ${x+...} tests SET, not non-empty, which is the whole
+    # mechanism: `CHART_EXTRAS=` (empty, set) builds the slim variant, and leaving it
+    # unset defers to the Dockerfile's charts-included default.
     docker build --build-arg ENVIRONMENT="$ENVIRONMENT" \
+        --build-arg GIT_SHA="${GIT_SHA:-unknown}" \
+        ${CHART_EXTRAS+--build-arg CHART_EXTRAS="$CHART_EXTRAS"} \
         ${tag_args[@]+"${tag_args[@]}"} --target runtime -f Dockerfile .
 }
 

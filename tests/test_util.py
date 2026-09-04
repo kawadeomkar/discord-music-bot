@@ -1,15 +1,24 @@
-"""Tests for src/util.py — queue formatting and logging utilities."""
+"""Tests for src/util.py — queue formatting, the typing indicator, and logging
+utilities."""
 
-from typing import Any
+import asyncio
+import contextlib
 import logging
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from opentelemetry import trace as trace_api
 
-from src.guild_state import HistoryEntry
 from src.util import (
+    FOOTER_LIMIT,
+    current_traceparent,
+    traceparent_context,
+    _typing_keepalive,
+    background_typing,
     fmt_duration,
     get_logger,
-    history_embeds,
+    join_footer,
     pluralize,
     queue_message,
 )
@@ -63,6 +72,29 @@ class TestQueueMessage:
         result = queue_message(songs)
         assert "song15" not in result
         assert "song20" not in result
+
+    def test_ten_long_titles_stay_inside_the_field_cap(self) -> None:
+        # Ten 100-char titles composed to 1040 — past Discord's 1024 field cap,
+        # which 400s the WHOLE send. For -remove that arrives after the songs are
+        # gone from memory and Redis, so the user is told a destructive command
+        # failed when it succeeded, with nothing to undo it.
+        result = queue_message(["t" * 100 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.endswith("...")
+
+    def test_a_length_overflow_still_names_what_it_can(self) -> None:
+        # Dropped for length, not for count: some entries still render, and the
+        # trailing mark says the list was cut.
+        result = queue_message(["x" * 200 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.startswith("1: ")
+        assert result.endswith("...")
+
+    def test_one_oversized_title_is_truncated_not_dropped(self) -> None:
+        # An empty field would say nothing at all about what was taken.
+        result = queue_message(["y" * 5000])
+        assert 0 < len(result) <= 1024
+        assert result.startswith("1: ")
 
 
 class TestGetLogger:
@@ -171,83 +203,268 @@ class TestFmtDuration:
         assert fmt_duration(61) == "1:01"
 
 
-def _rich_entry(**overrides: Any) -> HistoryEntry:
-    fields: dict = dict(
-        title="Rich Song",
-        webpage_url="https://yt.com/v=rich",
-        duration_secs=242,
-        played_secs=225,
-        requester_id=42,
-        requester_name="Omkar",
-        thumbnail="https://i.ytimg.com/t.jpg",
-        uploader="Chan",
-        played_at=1752530000.0,
-    )
-    fields.update(overrides)
-    return HistoryEntry(**fields)
+class TestTraceparentRoundTrip:
+    """How a span context crosses the stream cache and comes back as a link."""
 
-
-class TestHistoryEmbeds:
-    def test_layout_title_url_then_info_line(self) -> None:
-        # numbered title; webpage_url on its own line beneath it;
-        # played/duration · requester · absolute timestamp on one line below.
-        [embed] = history_embeds([_rich_entry()])
-        assert embed.title == "1. Rich Song"
-        assert embed.description is not None
-        assert embed.description.splitlines() == [
-            "https://yt.com/v=rich",
-            "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>",
-        ]
-
-    def test_numbering_follows_given_order(self) -> None:
-        embeds = history_embeds([_rich_entry(), _rich_entry(title="Second")])
-        assert embeds[0].title == "1. Rich Song"
-        assert embeds[1].title == "2. Second"
-
-    def test_thumbnail_set_when_present(self) -> None:
-        [embed] = history_embeds([_rich_entry()])
-        assert embed.thumbnail.url == "https://i.ytimg.com/t.jpg"
-
-    def test_no_thumbnail_when_absent(self) -> None:
-        [embed] = history_embeds([_rich_entry(thumbnail="")])
-        assert embed.thumbnail.url is None
-
-    def test_requester_mention_survives_member_departure(self) -> None:
-        # The raw <@id> mention needs no member cache to render.
-        [embed] = history_embeds([_rich_entry(requester_id=999)])
-        assert embed.description is not None
-        assert "<@999>" in embed.description
-
-    def test_requester_name_fallback_when_id_unknown(self) -> None:
-        [embed] = history_embeds(
-            [_rich_entry(requester_id=0, requester_name="SomeUser")]
+    @staticmethod
+    def _span(trace_id: int) -> trace_api.NonRecordingSpan:
+        return trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=trace_id,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
         )
-        assert embed.description is not None
-        assert "requested by SomeUser" in embed.description
 
-    def test_timestamp_omitted_when_played_at_unknown(self) -> None:
-        # played_at == 0 means unknown; <t:0:f> would render "1 January 1970".
-        [embed] = history_embeds([_rich_entry(played_at=0.0)])
-        assert embed.description is not None
-        assert "<t:" not in embed.description
-        assert embed.description.splitlines() == [
-            "https://yt.com/v=rich",
-            "3:45 / 4:02 · requested by <@42>",
-        ]
+    def test_it_round_trips_a_span(self) -> None:
+        trace_id = 0x4BF92F3577B34DA6A3CE929D0E0E4736
+        with trace_api.use_span(self._span(trace_id), end_on_exit=False):
+            carried = current_traceparent()
+        assert carried.startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        ctx = traceparent_context(carried)
+        assert ctx is not None and ctx.trace_id == trace_id
+        # is_remote marks it as arriving from elsewhere, which a link's context is.
+        assert ctx.is_remote
 
-    def test_over_length_title_truncated_to_discord_limit(self) -> None:
-        # Discord rejects any embed title > 256 chars, failing the whole send.
-        [embed] = history_embeds([_rich_entry(title="x" * 300)])
-        assert embed.title is not None
-        assert len(embed.title) == 256
-        assert embed.title.endswith("…")
+    def test_no_span_carries_nothing(self) -> None:
+        """Reachable: prewarm, a cache write outside any command, the whole suite."""
+        assert current_traceparent() == ""
 
-    def test_title_at_limit_not_truncated(self) -> None:
-        # "1. " (3) + 253 = 256 exactly — must pass through untouched.
-        [embed] = history_embeds([_rich_entry(title="y" * 253)])
-        assert embed.title == "1. " + "y" * 253
-        assert embed.title is not None
-        assert "…" not in embed.title
+    def test_an_absent_or_broken_value_is_no_link(self) -> None:
+        """A pre-feature cache entry has no traceparent, and a truncated one must
+        not raise on the playback path — both are simply "nothing to link"."""
+        assert traceparent_context("") is None
+        assert traceparent_context("not-a-traceparent") is None
+        assert traceparent_context("00-" + "0" * 32 + "-" + "0" * 16 + "-01") is None
 
-    def test_empty_input(self) -> None:
-        assert history_embeds([]) == []
+
+class TestJoinFooter:
+    """The one definition of how an embed's own footer and debug mode's suffix share
+    a footer. Three seams write one (both decoration seams and the two dashboards),
+    and a seam that joined them differently would put the mark somewhere else."""
+
+    def test_the_suffix_takes_its_own_line(self) -> None:
+        assert join_footer("environment: test", "\U0001f41e shard 0") == (
+            "environment: test\n\U0001f41e shard 0"
+        )
+
+    def test_a_lone_suffix_is_the_whole_footer(self) -> None:
+        assert join_footer("", "\U0001f41e shard 0") == "\U0001f41e shard 0"
+
+    def test_a_lone_base_is_returned_unjoined(self) -> None:
+        assert join_footer("environment: test", "") == "environment: test"
+
+    def test_two_empty_sides_stay_empty(self) -> None:
+        assert join_footer("", "") == ""
+
+    def test_the_clip_falls_on_the_base(self) -> None:
+        """Clipping the join instead would take the break and the head of the suffix,
+        putting both footers back on one line."""
+        suffix = "\U0001f41e shard 0"
+        text = join_footer("B" * FOOTER_LIMIT, suffix)
+        assert len(text) == FOOTER_LIMIT
+        assert text.endswith(f"\n{suffix}")
+        assert text.startswith("BB")
+
+    def test_a_suffix_with_no_room_left_drops_the_base(self) -> None:
+        """truncate() to a limit of zero returns an ellipsis on a nearly whole string,
+        so clamping the width alone would return a footer over the limit."""
+        text = join_footer("B" * 400, "S" * FOOTER_LIMIT)
+        assert len(text) == FOOTER_LIMIT
+        assert "B" not in text
+
+
+class TestBackgroundTyping:
+    """Typing indicator must never delay the command body."""
+
+    async def test_body_runs_while_first_typing_post_is_in_flight(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        post_started = asyncio.Event()
+        release_post = asyncio.Event()
+
+        async def slow_post() -> None:
+            post_started.set()
+            await release_post.wait()
+
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(side_effect=slow_post)
+
+        async with background_typing(mock_ctx):
+            # The body is executing while the POST is still blocked — the ~500ms
+            # first POST no longer serializes ahead of the work.
+            await asyncio.wait_for(post_started.wait(), timeout=1)
+            assert not release_post.is_set()
+
+    async def test_cancel_during_first_post_never_enters_typing_cm(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Exiting while the first POST is in flight must not leak the keepalive:
+        the CM never entered, so __aexit__ is never called (the AttributeError
+        hazard of driving __aenter__/__aexit__ manually cannot occur)."""
+        post_started = asyncio.Event()
+
+        async def hung_post() -> None:
+            post_started.set()
+            await asyncio.sleep(3600)
+
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(side_effect=hung_post)
+
+        async with background_typing(mock_ctx):
+            await asyncio.wait_for(post_started.wait(), timeout=1)
+        await asyncio.sleep(0)  # let the cancelled keepalive task unwind
+        mock_ctx.typing.return_value.__aexit__.assert_not_awaited()
+
+    async def test_typing_cm_exited_after_body_completes(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        exited = asyncio.Event()
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            side_effect=lambda *a: exited.set()
+        )
+        entered = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            side_effect=lambda: entered.set()
+        )
+
+        async with background_typing(mock_ctx):
+            await asyncio.wait_for(entered.wait(), timeout=1)
+        # Cancellation unwinds through the async with → indicator dropped promptly.
+        await asyncio.wait_for(exited.wait(), timeout=1)
+        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
+
+    async def test_typing_failure_never_surfaces_into_command_body(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
+
+        async with background_typing(mock_ctx):
+            await asyncio.sleep(0)  # let the keepalive task hit the failure
+            await asyncio.sleep(0)
+        # No exception propagates; the command body is unaffected.
+
+    async def test_body_exception_still_cancels_keepalive(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        entered = asyncio.Event()
+        exited = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            side_effect=lambda: entered.set()
+        )
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            side_effect=lambda *a: exited.set()
+        )
+
+        with pytest.raises(ValueError):
+            async with background_typing(mock_ctx):
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                raise ValueError("command body blew up")
+        await asyncio.wait_for(exited.wait(), timeout=1)
+
+
+class TestTypingKeepaliveCancellation:
+    """_typing_keepalive must catch Exception only and let CancelledError propagate.
+
+    Statement coverage cannot see the distinction — one `except` line serves both
+    arms, so a handler that also swallows CancelledError reports as covered while
+    completing the task *normally*. These assert `task.cancelled()`, the only
+    observable that separates the two; `done()` is true either way."""
+
+    async def test_cancelled_keepalive_ends_cancelled_not_completed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """cancel() must leave the task cancelled, not just done(). Swallowing
+        CancelledError makes cooperative cancellation a lie: task.cancelled() is
+        False, and a cancellation aimed at an enclosing scope stops here."""
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await asyncio.sleep(0)  # let it reach the sleep(3600)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled(), (
+            "keepalive completed normally instead of ending cancelled — "
+            "the handler is swallowing CancelledError"
+        )
+        # done() alone cannot tell the two apart; that is why it is not the assert.
+        assert task.done()
+
+    async def test_cancellation_still_exits_the_typing_cm(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Letting CancelledError propagate must not skip Typing.__aexit__ — the
+        `async with` unwind is what drops the indicator, and skipping it leaves the
+        bot apparently typing forever after every command."""
+        exited = asyncio.Event()
+        entered = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            return_value=None, side_effect=lambda: entered.set()
+        )
+        # return_value=None is required for any cancellation assert through this
+        # CM: an __aexit__ returning a truthy value suppresses the exception being
+        # unwound, so a bare AsyncMock() eats the CancelledError and fails the assert
+        # below for an unrelated reason. Real Typing.__aexit__ returns None.
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            return_value=None, side_effect=lambda *a: exited.set()
+        )
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        await asyncio.wait_for(exited.wait(), timeout=1)
+        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
+        assert task.cancelled()
+
+    async def test_cosmetic_typing_failure_is_still_swallowed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The Exception arm must survive: typing failures stay invisible."""
+        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await task  # must not raise
+
+        assert task.done() and not task.cancelled()
+        assert task.exception() is None
+
+    async def test_base_exception_is_not_swallowed(self, mock_ctx: MagicMock) -> None:
+        """Only Exception is cosmetic; a BaseException must propagate — CancelledError
+        is one, so this pins the general rule. A custom subclass rather than
+        SystemExit: asyncio re-raises SystemExit/KeyboardInterrupt into the loop,
+        escaping pytest.raises for reasons unrelated to this handler."""
+
+        class Shutdown(BaseException):
+            pass
+
+        mock_ctx.typing.side_effect = Shutdown("shutting down")
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        with pytest.raises(Shutdown):
+            await task
+
+    async def test_background_typing_leaves_its_keepalive_cancelled(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """End-to-end: the task background_typing() spawns and cancels on exit
+        must settle as cancelled. background_typing does not await it, so this
+        is the only place the contract is observable from outside."""
+        spawned: list[asyncio.Task[Any]] = []
+        real_create_task = asyncio.create_task
+
+        def capture(coro: Any, **kw: Any) -> asyncio.Task[Any]:
+            task = real_create_task(coro, **kw)
+            spawned.append(task)
+            return task
+
+        with patch("src.util.asyncio.create_task", side_effect=capture):
+            async with background_typing(mock_ctx):
+                await asyncio.sleep(0)
+
+        assert len(spawned) == 1
+        keepalive = spawned[0]
+        with contextlib.suppress(asyncio.CancelledError):
+            await keepalive
+        assert keepalive.cancelled()

@@ -5,10 +5,18 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 from redis.asyncio import Redis
 
-from src.spotify import Spotify, SpotifyAuthError
+from src.spotify import (
+    _HTTP_TIMEOUT,
+    _MAX_RETRY_AFTER_SECS,
+    Spotify,
+    SpotifyAuthError,
+    SpotifyRateLimitError,
+    SpotifyRequestError,
+)
 
 
 @pytest.fixture
@@ -16,13 +24,35 @@ def mock_auth_response() -> dict[str, Any]:
     return {"access_token": "test_access_token_xyz", "expires_in": 3600}
 
 
+def _request_cm(resp: Any) -> MagicMock:
+    """Stand in for aiohttp's _RequestContextManager.
+
+    Releases on __aexit__, as ClientResponse.__aexit__ does — which is what makes
+    `async with` equivalent to a hand-rolled release, and what lets a test assert
+    the body was drained without knowing which of the two the code used.
+    """
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=resp)
+
+    async def _exit(*_: Any) -> bool:
+        await resp.release()
+        return False
+
+    cm.__aexit__ = AsyncMock(side_effect=_exit)
+    return cm
+
+
 def _make_mock_session(resp: AsyncMock) -> MagicMock:
     """Return a session mock wired to return resp from .post() and .request()."""
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=None)
-    session.post = AsyncMock(return_value=resp)
-    session.request = AsyncMock(return_value=resp)
+    session.post = MagicMock(return_value=_request_cm(resp))
+    session.request = MagicMock(return_value=_request_cm(resp))
+    # A bare MagicMock attribute is truthy, which reads as an already-closed
+    # session and makes _session_or_create rebuild on every call.
+    session.closed = False
+    session.close = AsyncMock()
     return session
 
 
@@ -152,7 +182,7 @@ class TestSpotifyRefreshToken:
         await sp._refresh_token()
 
         assert sp.auth_token == "test_access_token_xyz"
-        mock_session.post.assert_awaited_once()
+        mock_session.post.assert_called_once()
 
     async def test_use_cache_false_bypasses_redis_and_hits_api(
         self,
@@ -172,11 +202,35 @@ class TestSpotifyRefreshToken:
         await spotify._refresh_token(use_cache=False)
 
         assert spotify.auth_token == "test_access_token_xyz"  # fresh, not cached
-        mock_session.post.assert_awaited_once()
+        mock_session.post.assert_called_once()
 
-    def test_str_returns_auth_token(self, spotify: Spotify) -> None:
-        spotify.auth_token = "my_token"
-        assert str(spotify) == "my_token"
+    def test_str_never_exposes_the_bearer_token(self, spotify: Spotify) -> None:
+        """Both dunders, since an exception repr reaches __repr__, not __str__."""
+        spotify.auth_token = "super_secret_bearer_token"
+        assert "super_secret_bearer_token" not in str(spotify)
+        assert "super_secret_bearer_token" not in repr(spotify)
+        assert "super_secret_bearer_token" not in f"{spotify}"
+        assert "super_secret_bearer_token" not in f"{spotify!r}"
+
+    def test_str_reports_token_presence_without_the_value(
+        self, spotify: Spotify
+    ) -> None:
+        spotify.auth_token = ""
+        assert "token=unset" in str(spotify)
+        spotify.auth_token = "anything"
+        assert "token=set" in str(spotify)
+
+    def test_str_identifies_the_client_without_the_secret(
+        self, spotify: Spotify
+    ) -> None:
+        """A truncated client_id tells two configs apart; the secret never renders."""
+        assert "test_i" in str(spotify)
+        assert spotify.client_secret is not None
+        assert spotify.client_secret not in str(spotify)
+
+    def test_str_handles_missing_client_id(self, spotify: Spotify) -> None:
+        spotify.client_id = None
+        assert "unset" in str(spotify)  # must not raise on None
 
 
 def _make_split_session(post_resp: AsyncMock, request_resp: AsyncMock) -> MagicMock:
@@ -185,8 +239,8 @@ def _make_split_session(post_resp: AsyncMock, request_resp: AsyncMock) -> MagicM
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=None)
-    session.post = AsyncMock(return_value=post_resp)
-    session.request = AsyncMock(return_value=request_resp)
+    session.post = MagicMock(return_value=_request_cm(post_resp))
+    session.request = MagicMock(return_value=_request_cm(request_resp))
     return session
 
 
@@ -221,7 +275,7 @@ class TestSpotifyValidate:
 
         await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")  # must not raise
 
-        session.request.assert_awaited_once()
+        session.request.assert_called_once()
 
     async def test_validate_raises_auth_error_on_rejected_grant(
         self, spotify: Spotify
@@ -235,7 +289,23 @@ class TestSpotifyValidate:
         with pytest.raises(SpotifyAuthError) as exc:
             await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
         assert exc.value.status == 400
-        session.request.assert_not_awaited()  # never got to the track call
+        session.request.assert_not_called()  # never got to the track call
+
+    async def test_a_rejected_grant_releases_the_body(self, spotify: Spotify) -> None:
+        """The grant shares the client's session now, so raising on a non-2xx with
+        the body unread holds that pooled connection until the response is
+        collected. http_call drains before its raises; this path must too. Spec'd,
+        because release() exists on a bare AsyncMock whether or not it is called."""
+        resp = MagicMock(spec=aiohttp.ClientResponse)
+        resp.status = 400
+        resp.release = AsyncMock()
+        session = _make_mock_session(resp)
+        spotify._session_factory = lambda **kw: session
+
+        with pytest.raises(SpotifyAuthError):
+            await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
+
+        resp.release.assert_awaited_once()
 
     async def test_validate_raises_auth_error_on_track_401(
         self, spotify: Spotify
@@ -413,6 +483,123 @@ class TestSpotifyHttpCall:
         assert "Authorization" in call_kwargs["headers"]
         assert call_kwargs["headers"]["Authorization"] == "Bearer valid_token"
 
+    async def test_http_call_raises_typed_request_error(self, spotify: Spotify) -> None:
+        """A 404 is about the link, not the credentials — so it must not be the
+        exception that disables the Spotify source."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = AsyncMock()
+        mock_response.status = 404
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_response)
+
+        with pytest.raises(SpotifyRequestError) as excinfo:
+            await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
+        assert excinfo.value.status == 404
+        assert not isinstance(excinfo.value, SpotifyAuthError)
+        assert "may be private" in excinfo.value.user_message
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [(404, SpotifyRequestError), (401, SpotifyAuthError)],
+    )
+    async def test_http_call_releases_the_body_before_raising(
+        self, spotify: Spotify, status: int, expected: type[Exception]
+    ) -> None:
+        """The session outlives the call now, so an unread body holds its pooled
+        connection out of circulation until the response is collected. Both raise
+        arms must drain. Spec'd, because `release()` exists on a bare AsyncMock
+        whether or not it is ever called — which is what made this untestable."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = MagicMock(spec=aiohttp.ClientResponse)
+        mock_response.status = status
+        mock_response.release = AsyncMock()
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_response)
+
+        with pytest.raises(expected):
+            await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
+
+        mock_response.release.assert_awaited_once()
+
+    async def test_http_call_bounds_the_request_timeout(self, spotify: Spotify) -> None:
+        """aiohttp's 300s default held a command for five minutes on a hung
+        request; the factory must receive an explicit ceiling."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={})
+        seen: list[Any] = []
+
+        def factory(**kw: Any) -> MagicMock:
+            seen.append(kw.get("timeout"))
+            return _make_mock_session(mock_response)
+
+        spotify._session_factory = factory
+        await spotify.http_call("https://api.spotify.com/v1/tracks/xyz")
+
+        assert seen == [_HTTP_TIMEOUT]
+        assert _HTTP_TIMEOUT.total == 30
+
+    async def test_http_call_retries_429_then_succeeds(self, spotify: Spotify) -> None:
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "0"}
+        ok = AsyncMock()
+        ok.status = 200
+        ok.json = AsyncMock(return_value={"data": "ok"})
+        responses = [limited, ok]
+        # One session serves every attempt, so the retry is driven off .request().
+        session = _make_mock_session(ok)
+        session.request = MagicMock(
+            side_effect=lambda *a, **kw: _request_cm(responses.pop(0))
+        )
+        spotify._session_factory = lambda **kw: session
+
+        assert await spotify.http_call("https://api.spotify.com/v1/x") == {"data": "ok"}
+        assert responses == []
+
+    async def test_http_call_raises_rate_limit_after_retries(
+        self, spotify: Spotify
+    ) -> None:
+        """Its copy says "wait", not "try again": a re-run re-issues every request
+        that earned the 429."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "0"}
+        spotify._session_factory = lambda **kw: _make_mock_session(limited)
+
+        with pytest.raises(SpotifyRateLimitError) as excinfo:
+            await spotify.http_call("https://api.spotify.com/v1/x")
+        assert "rate-limiting" in excinfo.value.user_message
+        assert "try again in about 0s" not in excinfo.value.user_message.lower()
+
+    async def test_retry_after_caps_and_tolerates_garbage(
+        self, spotify: Spotify
+    ) -> None:
+        """A malformed header falls back to backoff rather than being read as
+        zero, and an hour-long one is capped rather than honoured."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "not-a-number"}
+        spotify._session_factory = lambda **kw: _make_mock_session(limited)
+
+        slept: list[float] = []
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock(side_effect=slept.append)),
+            pytest.raises(SpotifyRateLimitError),
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/x")
+
+        assert slept == [1.0, 2.0, 4.0]  # exponential, header ignored
+        assert all(s <= _MAX_RETRY_AFTER_SECS for s in slept)
+
     async def test_http_call_refreshes_expired_token(self, spotify: Spotify) -> None:
         spotify.token_expiry = time.time() - 1  # force expiry
 
@@ -555,3 +742,104 @@ class TestSpotifyAlbums:
             await spotify.albums(["zid", "aid"])
         cached = await fake_redis.get("spotify:album:aid,zid")
         assert cached is not None
+
+
+class TestSharedSession:
+    """One session per client, kept for the life of the process. http_call
+    reads each response to EOF, so its connections return to the pool."""
+
+    async def test_session_is_reused_across_calls(self, spotify: Spotify) -> None:
+        factory_calls = 0
+        resp = AsyncMock()
+        resp.status = 200
+        session = _make_mock_session(resp)
+
+        def _factory(**kw: Any) -> Any:
+            nonlocal factory_calls
+            factory_calls += 1
+            return session
+
+        spotify._session_factory = _factory
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+
+        await spotify.http_call("https://api.spotify.com/v1/tracks/a")
+        await spotify.http_call("https://api.spotify.com/v1/tracks/b")
+
+        assert factory_calls == 1
+        assert session.request.call_count == 2
+
+    async def test_session_is_created_lazily(self, spotify: Spotify) -> None:
+        """A deployment with Spotify configured but never used must not open a
+        connector. Asserts the factory was never called: `_session is None` also
+        passes if __init__ built one and something cleared the handle after."""
+        calls = 0
+
+        def _factory(**kw: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return _make_mock_session(AsyncMock())
+
+        spotify._session_factory = _factory
+        assert calls == 0
+        assert spotify._session is None
+
+        spotify._session_or_create()
+        assert calls == 1
+
+    async def test_aclose_closes_and_clears(self, spotify: Spotify) -> None:
+        session = _make_mock_session(AsyncMock())
+        session.close = AsyncMock()
+        spotify._session_factory = lambda **kw: session
+        spotify._session_or_create()
+
+        await spotify.aclose()
+
+        session.close.assert_awaited_once()
+        assert spotify._session is None
+
+    async def test_aclose_without_a_session_is_a_noop(self, spotify: Spotify) -> None:
+        await spotify.aclose()  # must not raise
+
+    async def test_aclose_clears_the_handle_before_a_failing_close(
+        self, spotify: Spotify
+    ) -> None:
+        """A socket already gone must not strand the reference. aclose() lets the
+        error out — cog_unload guards each step, so swallowing here would only
+        hide which one failed — but the handle is cleared first, so the failure
+        cannot leave a half-closed session reachable."""
+        session = _make_mock_session(AsyncMock())
+        session.close = AsyncMock(side_effect=OSError("already gone"))
+        spotify._session_factory = lambda **kw: session
+        spotify._session_or_create()
+
+        with pytest.raises(OSError):
+            await spotify.aclose()
+        assert spotify._session is None
+
+    async def test_a_session_closed_from_outside_is_replaced(
+        self, spotify: Spotify
+    ) -> None:
+        """Only aclose() latches the client shut. Anything else that closes the
+        session — the suite's own per-test cleanup is the live example — must get a
+        replacement, not a corpse that raises `Session is closed` on every call."""
+        first = _make_mock_session(AsyncMock())
+        second = _make_mock_session(AsyncMock())
+        sessions = [first, second]
+        spotify._session_factory = lambda **kw: sessions.pop(0)
+
+        assert spotify._session_or_create() is first
+        first.closed = True
+
+        assert spotify._session_or_create() is second
+
+    async def test_a_call_after_aclose_is_refused(self, spotify: Spotify) -> None:
+        """A command in flight when the cog unloads must not quietly build a
+        replacement session: nothing closes it, and the process is on its way out."""
+        session = _make_mock_session(AsyncMock())
+        spotify._session_factory = lambda **kw: session
+        spotify._session_or_create()
+        await spotify.aclose()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            spotify._session_or_create()

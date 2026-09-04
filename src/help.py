@@ -28,12 +28,13 @@ CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
         "now",
         "history",
         "leaderboard",
+        "analytics",
         "shuffle",
         "remove",
         "clear",
         "jump",
     ),
-    "Utility": ("help", "join", "ping"),
+    "Utility": ("help", "join", "ping", "debug"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"
@@ -51,7 +52,8 @@ _FENCE = "```"
 
 SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
-    "A `?t=` / `?ts=` timestamp starts the song at that offset.\n"
+    "A `?t=` / `?ts=` timestamp starts the song at that offset, and a playlist "
+    "link's `&index=` starts the queue at that position.\n"
     "**Spotify** — track and playlist links. Each title is matched to its "
     "YouTube audio, so a playlist may take a moment to queue.\n"
     "**SoundCloud** — track links."
@@ -65,7 +67,7 @@ TIPS = (
     "• The **Now Playing** card re-anchors itself to the bottom of the channel "
     "so its live progress bar is never buried by other messages.\n"
     "• Queue, history and volume are saved per server and restored if the bot "
-    "restarts mid-song.\n"
+    "restarts mid-song — or when `-resume` brings it back after a `-stop`.\n"
     "• A volume change applies from the **next** song onwards."
 )
 

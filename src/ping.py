@@ -1,9 +1,12 @@
-"""The `-ping` health dashboard: dependency probes, rendering, live-edit loop.
+"""The `-ping` health dashboard: dependency probes and rendering.
 
-One feature, one module — the sections below are separated by rules, not files. The
-probes are deliberately not shared with a healthz endpoint: healthz must stay a dumb
-liveness probe, or a Redis blip becomes a pod restart loop. src/musicbot.py holds only
-the command registration and delegates in here.
+The SEQUENCING is not here. Sending a skeleton immediately and editing it as probes
+land is `src/dashboard.py`, shared with `-debug`; this module supplies the probes,
+the rows and the four callbacks that driver calls back into. What stays together
+here is one feature's probes and its rendering, separated by rules rather than
+files. The probes are deliberately not shared with a healthz endpoint: healthz must
+stay a dumb liveness probe, or a Redis blip becomes a pod restart loop.
+src/musicbot.py holds only the command registration and delegates in here.
 """
 
 import asyncio
@@ -12,12 +15,12 @@ import platform
 import subprocess
 import time
 import tomllib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
 from importlib import metadata
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
 import discord
@@ -31,12 +34,15 @@ from opentelemetry.trace import Span
 from yt_dlp.version import __version__ as _YTDLP_VERSION
 
 from src import telemetry
+from src.dashboard import run_live_dashboard
 
-# Live-edit loop tunables (see run_health_dashboard), env-overridable. Defined in
-# config.py so there is one answer to "what does this bot read from the environment?".
+# Live-edit tunables for the shared driver (src/dashboard.py), env-overridable.
+# TICK is a CEILING on how long it waits before re-rendering, not a cadence: the
+# loop wakes on the first probe to finish. Defined in config.py so there is one
+# answer to "what does this bot read from the environment?".
+from src import config
 from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
-    ENVIRONMENT,
     PING_DEADLINE_SECS,
     PING_TICK_SECS,
     SpotifyStatus,
@@ -44,7 +50,14 @@ from src.config import (
     using_default_postgres_password,
 )
 from src.spotify import Spotify
-from src.util import get_logger, latency_color, send_embed, trace_footer
+from src.util import (
+    FOOTER_LIMIT,
+    get_logger,
+    join_footer,
+    send_embed,
+    trace_footer,
+    truncate,
+)
 
 log = get_logger(__name__)
 
@@ -148,7 +161,7 @@ async def probe_spotify(
     spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
 ) -> ProbeResult:
     """Spotify's row: the *source's* usability, not just reachability. `status` (from
-    MusicBot._spotify_status' startup probe) separates "configured but rejected" from
+    MusicBot.spotify_status' startup probe) separates "configured but rejected" from
     "reachable but slow" without spending a doomed API call; it defaults to enabled so a
     caller with no status still gets the plain reachability probe.
     """
@@ -199,7 +212,14 @@ async def probe_otel() -> ProbeResult:
     # hostname=None and silently probes localhost. Prepend "//" so we hit the real one.
     raw = telemetry._OTLP_ENDPOINT
     parsed = urlparse(raw if "://" in raw else f"//{raw}")
-    host, port = parsed.hostname or "localhost", parsed.port or 4317
+    # .port is a LAZY property: urlparse accepts "host:99999" and "host:4317 " and only
+    # raises on dereference. Reading it outside a guard let a stray character in .env
+    # raise out of the probe, through _settle, and out of the dashboard driver BEFORE
+    # the skeleton send — so a typo cost the whole board rather than one row.
+    try:
+        host, port = parsed.hostname or "localhost", parsed.port or 4317
+    except ValueError:
+        return ProbeResult("OTEL collector", ProbeState.FAILED)
 
     async def _do() -> None:
         # gRPC OTLP has no cheap app-level ping, so a TCP connect proves only that the
@@ -288,7 +308,7 @@ async def collect_versions() -> dict[str, str]:
 
 # One band table drives both the status dot and the embed accent, so a green dot can't
 # appear under a yellow accent. These bands (≤100/≤200) differ on purpose from
-# util.latency_color's (≤50/≤100/≤200), which backs send_latency_line — don't swap them.
+# latency_color's (≤50/≤100/≤200) below, which backs send_latency_line — don't swap them.
 _LATENCY_BANDS: tuple[tuple[float, str, int], ...] = (
     (100, "🟢", 0x44FF44),
     (200, "🟡", 0xFFD000),
@@ -351,10 +371,15 @@ def render_ping_embed(
     versions: dict[str, str],
     discord_ms: float,
     span: Span,
+    *,
+    debug_suffix: Optional[str] = None,
 ) -> discord.Embed:
     """Build the live health embed from the current probe results + versions. Accent:
     any down/failed → red; else any still-pending → blurple; else the worst OK latency's
-    band colour (same bands as the dots)."""
+    band colour (same bands as the dots).
+
+    `debug_suffix` is debug mode's footer, pre-rendered by the cog and constant for
+    the invocation — see run_health_dashboard."""
     # nan latency means the gateway ws is reconnecting — show down (red) rather
     # than a bogus number.
     disc = (
@@ -386,16 +411,18 @@ def render_ping_embed(
     embed.add_field(
         name="Versions", value="```\n" + "\n".join(ver_lines) + "\n```", inline=False
     )
-    footer = f"environment: {ENVIRONMENT}"
+    footer = f"environment: {config.ENVIRONMENT}"
     if any(r.state is ProbeState.PENDING for r in rows):
         footer += " · probing…"
     if (tf := trace_footer(span)) is not None:
         footer += f" · {tf}"
-    embed.set_footer(text=footer)
+    embed.set_footer(text=join_footer(footer, debug_suffix or ""))
     return embed
 
 
-def default_password_embed() -> Optional[discord.Embed]:
+def default_password_embed(
+    *, debug_suffix: Optional[str] = None
+) -> Optional[discord.Embed]:
     """A standing warning that the Postgres password is still the compose default, or
     None when it is not.
 
@@ -442,32 +469,26 @@ def default_password_embed() -> Optional[discord.Embed]:
         ),
         inline=False,
     )
+    if debug_suffix:
+        embed.set_footer(text=truncate(debug_suffix, FOOTER_LIMIT))
     return embed
-
-
-def _ping_embed_changed(new: discord.Embed, old: discord.Embed) -> bool:
-    """True when a re-render actually differs. Only the two field values, the
-    colour and the footer move, and to_dict() captures all of them."""
-    return new.to_dict() != old.to_dict()
-
-
-async def _safe_edit(
-    message: discord.Message, embeds: list[discord.Embed]
-) -> Optional[discord.Embed]:
-    """Edit a message, tolerating a host the user deleted mid-loop (mirrors
-    musicplayer._progress_updater). Returns the HEALTH embed on success — the caller
-    diffs against that one alone — or None if the message is gone. Takes the full embed
-    list because the warning rides along on every edit; dropping it would flicker."""
-    try:
-        await message.edit(embeds=embeds)
-        return embeds[-1]
-    except discord.NotFound:
-        return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 3 · COMMAND BODIES — what src/musicbot.py's cog delegates to
 # ════════════════════════════════════════════════════════════════════════════
+
+
+def latency_color(ms: float) -> discord.Color:
+    """The accent for send_latency_line's one-line reply. Four bands, deliberately
+    NOT _LATENCY_BANDS' three — see the comment there before reconciling them."""
+    if ms <= 50:
+        return discord.Color(0x44FF44)
+    if ms <= 100:
+        return discord.Color(0xFFD000)
+    if ms <= 200:
+        return discord.Color(0xFF6600)
+    return discord.Color(0x990000)
 
 
 async def send_latency_line(ctx: commands.Context, bot_latency: float) -> None:
@@ -494,46 +515,44 @@ async def run_health_dashboard(
     # for the same reason — a default of None would let a new caller silently render an
     # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
+    # Defaulted, unlike `archive`: None here is a real state (debug mode off, what
+    # MusicBot.debug_suffix returns) rather than an unknown, and forgetting it
+    # costs a footer, not a wrong health answer.
+    debug_suffix: Optional[str] = None,
 ) -> None:
     """Optimistic-send + live-edit health dashboard: sends a skeleton embed immediately,
     then edits in place each tick as probes return, with a hard deadline failing any
     straggler. Runs inside the caller's span and lets exceptions propagate — the command
     owns the user-facing error reply.
+
+    The sequencing lives in src/dashboard.py, shared with -debug; what stays here is
+    what a row IS and how the board is drawn.
+
+    `debug_suffix` is debug mode's footer, rendered once by the cog and constant for
+    the loop. The driver only edits when the render differs, so a suffix carrying
+    elapsed-ms would differ every tick and edit the board until the deadline — which
+    is why the cog omits elapsed rather than measuring it.
     """
     span = trace.get_current_span()
-    loop = asyncio.get_running_loop()
-    tasks: dict[str, asyncio.Task[ProbeResult]] = {}
+    discord_ms = bot_latency * 1000
+    probes: dict[str, Callable[[], Coroutine[Any, Any, ProbeResult]]] = {
+        "Redis": lambda: probe_redis(redis),
+        "Spotify API": lambda: probe_spotify(spotify, spotify_status),
+        "Postgres": lambda: probe_postgres(archive),
+        "OTEL collector": lambda: probe_otel(),
+    }
+    results = {label: ProbeResult(label, ProbeState.PENDING) for label in probes}
+    versions: dict[str, str] = {}
+    warning: Optional[discord.Embed] = None
 
-    def _drain() -> bool:
-        """Fold every finished probe into `results`; True if a row moved. Only
-        genuinely-completed tasks are done() here, so .result() never re-raises."""
-        changed = False
-        for label in [lbl for lbl in pending if tasks[lbl].done()]:
-            results[label] = tasks[label].result()
-            pending.discard(label)
-            changed = True
-        return changed
-
-    try:
-        # 1. launch inside try so `finally` cancels them wherever a later await raises.
-        #    create_task copies the otel context, so probe spans nest under bot.ping.
-        tasks = {
-            "Redis": asyncio.create_task(probe_redis(redis)),
-            "Spotify API": asyncio.create_task(probe_spotify(spotify, spotify_status)),
-            "Postgres": asyncio.create_task(probe_postgres(archive)),
-            "OTEL collector": asyncio.create_task(probe_otel()),
-        }
-        results = {label: ProbeResult(label, ProbeState.PENDING) for label in tasks}
-        pending = set(tasks)
-
-        # 2. instant data + skeleton. collect_versions()'s executor hop lets the
-        #    immediate NA/OFF probes complete; pre-drain so no row flashes "pending…".
+    async def _prepare() -> None:
+        """Instant data, on the driver's pre-send step. collect_versions()'s executor
+        hop is also what lets the immediate NA/OFF probes complete before the skeleton
+        renders, so their rows never flash "pending…"."""
+        nonlocal versions, warning
         versions = await collect_versions()
-        _drain()
-        discord_ms = bot_latency * 1000
-        last = render_ping_embed(results, versions, discord_ms, span)
-        # Computed once: it is static, so it cannot make _ping_embed_changed see a
-        # difference that is not there.
+        # Computed once: it is static, so it cannot make the driver's change-check see
+        # a difference that is not there.
         #
         # OWNER only. -ping has no permission gate, so this advisory — which names the
         # credential and confirms this host runs on it — would otherwise reach every
@@ -550,52 +569,63 @@ async def run_health_dashboard(
         # network round trip ahead of the skeleton send this function promises is
         # immediate, and PING_DEADLINE_SECS does not bound it (that clock starts after
         # the send). Ask the cheap, local question first.
-        warning = default_password_embed()
-        if warning is not None and not await ctx.bot.is_owner(ctx.author):
-            warning = None
-        message = await ctx.channel.send(  # bypass NP host
-            embeds=[e for e in (warning, last) if e is not None]
+        #
+        # Fails CLOSED. is_owner() RAISES on a 5xx rather than returning False, and
+        # _prepare now runs inside the dashboard driver BEFORE the skeleton send with
+        # exceptions propagating by design — so an unguarded call turns a transient
+        # Discord API failure into "-ping produced no board at all". Suppressing the
+        # advisory is the safe direction; the startup ERROR still names the problem.
+        warning = default_password_embed(debug_suffix=debug_suffix)
+        if warning is not None:
+            try:
+                is_owner = await ctx.bot.is_owner(ctx.author)
+            except Exception as e:  # noqa: BLE001 — an unknown owner is not an owner
+                log.warning(f"ping owner check failed: {type(e).__name__}: {e}")
+                is_owner = False
+            if not is_owner:
+                warning = None
+
+    def _render() -> list[discord.Embed]:
+        embed = render_ping_embed(
+            results, versions, discord_ms, span, debug_suffix=debug_suffix
         )
+        return [e for e in (warning, embed) if e is not None]
 
-        # 3. Live-edit loop: tick, drain, edit-on-change; exit early when done.
-        deadline = loop.time() + PING_DEADLINE_SECS
-        while pending and (remaining := deadline - loop.time()) > 0:
-            await asyncio.sleep(min(PING_TICK_SECS, remaining))
-            if _drain():
-                embed = render_ping_embed(results, versions, discord_ms, span)
-                if _ping_embed_changed(embed, last):
-                    edited = await _safe_edit(
-                        message, [e for e in (warning, embed) if e is not None]
-                    )
-                    last = edited or last
-
-        # 4. deadline: fail only what is STILL pending. Re-check done() first — a
-        #    probe can finish during step 3's final edit await, and flipping it to
-        #    FAILED unconditionally would report a healthy dep as red.
-        if pending:
-            for label in pending:
-                if tasks[label].done():
-                    results[label] = tasks[label].result()
-                else:
-                    tasks[label].cancel()
-                    results[label] = ProbeResult(label, ProbeState.FAILED)
-            await _safe_edit(
-                message,
-                [
-                    e
-                    for e in (
-                        warning,
-                        render_ping_embed(results, versions, discord_ms, span),
-                    )
-                    if e is not None
-                ],
+    def _settle(label: str, outcome: ProbeResult | Exception) -> None:
+        # _timed guards the probe BODY, not everything a probe does: probe_otel parses
+        # a URL before it. The driver hands the failure over already resolved rather
+        # than as a task to unwrap, so this cannot re-raise into the driver's own task
+        # and take the board down before it is even sent.
+        if isinstance(outcome, Exception):
+            log.warning(
+                "ping probe raised outside its guard", probe=label, error=str(outcome)
             )
+            results[label] = ProbeResult(label, ProbeState.FAILED)
+        else:
+            results[label] = outcome
 
-        for r in results.values():  # self-documenting trace
-            span.set_attribute(f"ping.{r.label}.state", r.state.name.lower())
-            if r.latency_ms is not None:
-                span.set_attribute(f"ping.{r.label}.latency_ms", round(r.latency_ms, 2))
-    finally:
-        for t in tasks.values():  # never leak a probe task
-            if not t.done():
-                t.cancel()
+    def _abandon(label: str) -> None:
+        results[label] = ProbeResult(label, ProbeState.FAILED)
+
+    await run_live_dashboard(
+        ctx,
+        probes=probes,
+        settle=_settle,
+        abandon=_abandon,
+        render=_render,
+        prepare=_prepare,
+        tick_secs=PING_TICK_SECS,
+        deadline_secs=PING_DEADLINE_SECS,
+    )
+
+    for r in results.values():  # self-documenting trace
+        # PENDING is documented as transient, and it survives to here only when the
+        # driver returned early because the message was deleted mid-loop — it cancels
+        # the stragglers rather than settling them. Recording it would put a state
+        # that means "not yet" permanently in a trace, where it reads as a probe that
+        # never answered. Skip those rows; the ones that did answer still land.
+        if r.state is ProbeState.PENDING:
+            continue
+        span.set_attribute(f"ping.{r.label}.state", r.state.name.lower())
+        if r.latency_ms is not None:
+            span.set_attribute(f"ping.{r.label}.latency_ms", round(r.latency_ms, 2))

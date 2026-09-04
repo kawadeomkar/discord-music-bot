@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Iterator
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -13,7 +13,9 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from src.main import EXTENSIONS, MusicBotApp
+from src import config
+from src.main import EXTENSIONS, MusicBotApp, intents
+from src.musicbot import MusicBot
 from src.redis_client import HISTORY_OUTBOX_KEY
 from tests.helpers import mocked
 
@@ -24,9 +26,10 @@ def app() -> MusicBotApp:
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
-    # history_archive / history_drainer are deliberately left UNSET: __new__
-    # bypasses __init__ and setup_hook is what assigns them, so unset is exactly
-    # the pre-setup_hook state close()'s getattr guard exists to survive.
+    # history_archive / history_drainer / _liveness_task are deliberately left
+    # UNSET: __new__ bypasses __init__ and setup_hook is what assigns them, so
+    # unset is exactly the pre-setup_hook state close()'s getattr guard exists
+    # to survive.
     # BotBase stores cogs in a name-mangled private dict; initialize it so the
     # property works. Set via setattr: the mangled name is deliberately not part
     # of BotBase's declared surface, so it is invisible to the type checker.
@@ -722,6 +725,74 @@ class TestClose:
             await app.close()
         assert youtube.ytdlp_pool.is_closed
 
+    async def test_closes_the_stream_probe_session(self, app: MusicBotApp) -> None:
+        """The probe session lives for the life of the process, so close() is the
+        only thing that releases it. Asserts the real module global rather than a
+        mock call: the conftest fixture closes sessions after every test, so a
+        close() that stopped calling it would otherwise leave the suite green."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        app._redis_pool = None
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await app.close()
+
+        assert session.closed
+        assert youtube._probe_session is None
+
+    async def test_a_failing_probe_session_close_does_not_skip_telemetry(
+        self, app: MusicBotApp
+    ) -> None:
+        """close_probe_session() no longer swallows its own errors, so the call
+        site is the only guard — and if it were missing, a socket already gone
+        would cost the span flush, the record of the failed shutdown."""
+        app._redis_pool = None
+        with patch(
+            "src.youtube.close_probe_session",
+            new=AsyncMock(side_effect=OSError("already gone")),
+        ):
+            with patch("src.telemetry.shutdown_telemetry") as shutdown:
+                with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+                    await app.close()  # must not raise
+
+        shutdown.assert_called_once()
+
+    async def test_a_failing_chart_pool_close_does_not_cost_the_span_flush(
+        self, app: MusicBotApp
+    ) -> None:
+        """Every step in close() is individually guarded because a hung Postgres once
+        made archive.close() raise, and _teardown_started short-circuits the retry —
+        so every step after the raiser was skipped for good. The chart pool sits
+        between the yt-dlp pool and the probe session; a raise here would cost the
+        span flush, which is the record of the failed shutdown."""
+        app._redis_pool = None
+        with (
+            patch(
+                "src.chart_pool.chart_pool.aclose",
+                new=AsyncMock(side_effect=RuntimeError("join wedged")),
+            ),
+            patch("src.telemetry.shutdown_telemetry") as shutdown,
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()  # must not raise
+
+        shutdown.assert_called_once()
+
+    async def test_the_chart_pool_is_closed_on_the_way_down(
+        self, app: MusicBotApp
+    ) -> None:
+        """It is never spawned on a bot that never ran -analytics, in which case this
+        only flips the closed flag — but an unclosed one that WAS spawned leaves a
+        worker to the 61s atexit join aclose() exists to bound."""
+        app._redis_pool = None
+        with (
+            patch("src.chart_pool.chart_pool.aclose", new=AsyncMock()) as aclose,
+            patch("src.telemetry.shutdown_telemetry"),
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()
+        aclose.assert_awaited_once()
+
 
 class TestHelpFlag:
     """`--help` anywhere in a command message diverts to that command's help
@@ -764,6 +835,69 @@ class TestHelpFlag:
         mock_super.assert_awaited_once_with(ctx)
         ctx.send_help.assert_not_awaited()
 
+    async def test_the_help_path_borrows_a_span(
+        self, app: MusicBotApp, music_bot: MusicBot
+    ) -> None:
+        """MusicContext.send reads cog._active_spans[id(ctx)] for the trace id and
+        elapsed time. This path skips dispatch, so cog_before_invoke never opens
+        one."""
+        ctx = self._ctx("-play --help")
+        seen: dict[str, object] = {}
+
+        async def _capture(_command: object) -> None:
+            seen["active"] = music_bot._active_spans.get(id(ctx))
+
+        ctx.send_help = AsyncMock(side_effect=_capture)
+        with patch.object(app, "get_cog", return_value=music_bot):
+            await app.invoke(ctx)
+
+        assert seen["active"] is not None
+        assert music_bot._active_spans == {}  # and closed on the way out
+
+    async def test_the_bare_help_command_borrows_one_too(
+        self, app: MusicBotApp, music_bot: MusicBot
+    ) -> None:
+        """`-help` dispatches normally, but discord.py owns it rather than the cog,
+        so the hooks never fire."""
+        ctx = self._ctx("-help")
+        ctx.command.cog = None
+        seen: dict[str, object] = {}
+
+        async def _invoke(_ctx: object) -> None:
+            seen["active"] = music_bot._active_spans.get(id(ctx))
+
+        with (
+            patch.object(app, "get_cog", return_value=music_bot),
+            patch.object(
+                commands.AutoShardedBot, "invoke", new=AsyncMock(side_effect=_invoke)
+            ),
+        ):
+            await app.invoke(ctx)
+
+        assert seen["active"] is not None
+        assert music_bot._active_spans == {}
+
+    async def test_an_ordinary_command_is_left_to_the_cog_hooks(
+        self, app: MusicBotApp, music_bot: MusicBot
+    ) -> None:
+        """Double-opening would leak: cog_before_invoke writes the same key and
+        cog_after_invoke pops it once."""
+        ctx = self._ctx("-play lofi")
+        seen: dict[str, object] = {}
+
+        async def _invoke(_ctx: object) -> None:
+            seen["active"] = music_bot._active_spans.get(id(ctx))
+
+        with (
+            patch.object(app, "get_cog", return_value=music_bot),
+            patch.object(
+                commands.AutoShardedBot, "invoke", new=AsyncMock(side_effect=_invoke)
+            ),
+        ):
+            await app.invoke(ctx)
+
+        assert seen["active"] is None
+
     async def test_unknown_command_falls_through(self, app: MusicBotApp) -> None:
         """`-bogus --help` must keep raising CommandNotFound downstream, not
         try to render help for a command that doesn't exist."""
@@ -774,6 +908,65 @@ class TestHelpFlag:
             await app.invoke(ctx)
         mock_super.assert_awaited_once_with(ctx)
         ctx.send_help.assert_not_awaited()
+
+
+class TestCommandNotFound:
+    """Unknown commands are dropped without a log line; everything else keeps
+    discord.py's handling. The prefix is a bare `-` with strip_after_prefix, so a
+    markdown bullet ("- milk") dispatches CommandNotFound for `milk`, which the
+    default handler logs at ERROR with a traceback."""
+
+    def _ctx(self, invoked_with: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.invoked_with = invoked_with
+        return ctx
+
+    async def test_unknown_command_is_dropped(self, app: MusicBotApp) -> None:
+        with patch.object(
+            commands.AutoShardedBot, "on_command_error", new=AsyncMock()
+        ) as mock_super:
+            await app.on_command_error(
+                self._ctx("milk"),
+                commands.CommandNotFound('Command "milk" is not found'),
+            )
+        mock_super.assert_not_awaited()
+
+    async def test_every_other_error_is_delegated(self, app: MusicBotApp) -> None:
+        """The guard is one isinstance, not a blanket swallow: anything else must
+        reach the default, whose command/cog checks are what stop
+        MusicBot.cog_command_error's errors being logged a second time."""
+        ctx = self._ctx("play")
+        error = commands.CheckFailure("nope")
+        with patch.object(
+            commands.AutoShardedBot, "on_command_error", new=AsyncMock()
+        ) as mock_super:
+            await app.on_command_error(ctx, error)
+        mock_super.assert_awaited_once_with(ctx, error)
+
+    async def test_the_logged_token_is_bounded(self, app: MusicBotApp) -> None:
+        """invoked_with is one whitespace-free token and nothing caps its length —
+        a 2,000-character dash-prefixed message must not log whole."""
+        with (
+            patch.object(commands.AutoShardedBot, "on_command_error", new=AsyncMock()),
+            patch("src.main.log") as mock_log,
+        ):
+            await app.on_command_error(
+                self._ctx("x" * 2000), commands.CommandNotFound("...")
+            )
+        logged = mock_log.debug.call_args.args[0]
+        # The cap itself, not a bound loose enough to survive widening it.
+        assert "x" * 32 in logged
+        assert "x" * 33 not in logged
+
+    @pytest.mark.parametrize("token", ["milk", "pn", "playnow", "paly"])
+    async def test_no_token_earns_a_reply(self, app: MusicBotApp, token: str) -> None:
+        """Dropping is silent for the user too — no token gets a did-you-mean. A
+        reply here is reachable from ordinary chat: with strip_after_prefix, a
+        bullet reading "- pn" lands in exactly this branch."""
+        ctx = self._ctx(token)
+        with patch.object(commands.AutoShardedBot, "on_command_error", new=AsyncMock()):
+            await app.on_command_error(ctx, commands.CommandNotFound("..."))
+        ctx.send.assert_not_called()
 
 
 class TestOnReady:
@@ -805,3 +998,243 @@ class TestOnReady:
         await app.on_ready()
         call_kwargs = mocked(app.change_presence).call_args[1]
         assert call_kwargs["status"] == discord.Status.online
+
+
+class TestLivenessHeartbeat:
+    """`restart: always` only sees the process exit, so a wedged event loop
+    stays "up" while answering nothing. The touch is what makes that visible to
+    the container HEALTHCHECK."""
+
+    async def test_touches_the_file_on_each_tick(
+        self, app: MusicBotApp, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "bot-alive"
+        monkeypatch.setattr(config, "LIVENESS_FILE", str(target))
+
+        async def _sleep(_s: Any) -> None:
+            raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await app._liveness_heartbeat()
+
+        assert target.exists()
+
+    async def test_unwritable_path_does_not_kill_the_bot(
+        self, app: MusicBotApp, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unwritable path degrades to no liveness signal; the healthcheck
+        fails on its own rather than the process dying over a touch."""
+        monkeypatch.setattr(
+            config, "LIVENESS_FILE", str(tmp_path / "nonexistent-dir" / "f")
+        )
+
+        async def _sleep(_s: Any) -> None:
+            raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await app._liveness_heartbeat()  # must not raise OSError
+
+    async def test_setup_hook_skips_the_task_when_unconfigured(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset outside Docker; nothing reads the file there. Driven through
+        the disabled arm so this stays a liveness test rather than a second
+        assertion about the archive's Postgres requirement."""
+        monkeypatch.setattr(config, "LIVENESS_FILE", "")
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert getattr(app, "_liveness_task", None) is None
+
+    async def test_close_cancels_the_task(self, app: MusicBotApp) -> None:
+        async def _forever() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_forever())
+        app._liveness_task = task
+        app._redis_pool = None
+        with (
+            patch("src.telemetry.shutdown_telemetry"),
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()
+        assert task.cancelled() or task.cancelling()
+        assert app._liveness_task is None
+
+
+class TestIntents:
+    """The declared gateway contract. Each assertion matches code that stops
+    working if the flag is dropped, and none of it fails anywhere but at
+    runtime, against Discord."""
+
+    def test_only_the_needed_intents_are_requested(self) -> None:
+        assert {f for f, v in intents if v} == {
+            "guilds",
+            "voice_states",
+            "guild_messages",
+            "dm_messages",
+            "message_content",
+            "members",
+        }
+
+    def test_presences_is_not_requested(self) -> None:
+        """Privileged, and blocks verification past 100 guilds. Sending our own
+        presence through change_presence() needs no intent, so nothing here
+        wants it."""
+        assert intents.presences is False
+
+    def test_message_events_are_received(self) -> None:
+        """message_content alone is NOT enough: without guild_messages the
+        events never arrive and no prefix command works at all."""
+        assert intents.guild_messages is True
+        assert intents.message_content is True
+
+    def test_dm_messages_are_received(self) -> None:
+        """-help renders a DM-safe embed and -debug has a reply written for the
+        no-guild case (test_debug.py: "-debug is DM-reachable"). Dropping this
+        leaves both unreachable in production with every test still green."""
+        assert intents.dm_messages is True
+
+
+class TestChartPoolWarm:
+    """setup_hook warms the chart worker so the first -analytics does not pay
+    matplotlib's import in front of a user — but only where the command is reachable."""
+
+    async def test_the_chart_pool_is_warmed_when_the_archive_is_on(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        with (
+            patch("src.chart_pool.warm") as warm,
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+        ):
+            await app.setup_hook()
+        warm.assert_called_once()
+
+    async def test_a_default_deployment_never_spawns_a_chart_worker(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """-analytics is archive-gated, so a bot with the archive off can never reach
+        that pool. Paying ~60MB for it would be pure waste, and the archive is OFF by
+        default — this is the narrowing that makes warming affordable at all."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        with (
+            patch("src.chart_pool.warm") as warm,
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_report_archive_disabled", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+        ):
+            await app.setup_hook()
+        warm.assert_not_called()
+
+    async def test_the_chart_pool_is_warmed_after_the_ytdlp_pool(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order is load-bearing: yt-dlp's prewarm is what brings the forkserver up and
+        pays the entry-module import in it, so warming after costs a ~21ms fork rather
+        than repeating ~1.7s of imports."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        order: list[str] = []
+        with (
+            patch("src.chart_pool.warm", side_effect=lambda: order.append("chart")),
+            patch(
+                "src.youtube.ytdlp_pool.prewarm",
+                side_effect=lambda *a, **k: order.append("ytdlp"),
+            ),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+        ):
+            await app.setup_hook()
+        assert order == ["ytdlp", "chart"]
+
+    async def test_slim_image_with_the_archive_on_warns_at_startup(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The slim image pairs a working -analytics with no chart. Nothing else says
+        so at startup: warm() returns silently and the only other signal is a
+        per-invocation line, so the operator sees a chartless card and reads it as a
+        render failure."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        with (
+            patch("src.chart_pool.chart_available", return_value=False),
+            patch("src.chart_pool.warm"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+            patch("src.main.log.warning") as warn,
+        ):
+            await app.setup_hook()
+        assert any("matplotlib is not installed" in str(c) for c in warn.call_args_list)
+
+    async def test_a_full_image_warns_about_nothing(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pairing above is the ONLY thing that warning describes — firing it on a
+        normal deployment would train the operator to ignore it."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u:p@h:5432/d")
+        with (
+            patch("src.chart_pool.chart_available", return_value=True),
+            patch("src.chart_pool.warm"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.create_redis_pool"),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+            patch("src.main.log.warning") as warn,
+        ):
+            await app.setup_hook()
+        assert not any("matplotlib" in str(c) for c in warn.call_args_list), (
+            warn.call_args_list
+        )
+
+
+class TestChartPoolWarmCallable:
+    def test_warm_does_nothing_without_matplotlib(self) -> None:
+        """No worker is spawned to discover the import will fail — that would leave a
+        ~60MB process resident for nothing."""
+        import src.chart_pool as cp
+
+        with (
+            patch.object(cp, "chart_available", return_value=False),
+            patch.object(cp.chart_pool, "prewarm") as prewarm,
+        ):
+            cp.warm()
+        prewarm.assert_not_called()
+
+    def test_warm_submits_the_matplotlib_importing_callable(self) -> None:
+        """The default no-op would spawn the worker and warm nothing that matters:
+        matplotlib is imported inside render_dashboard, so a no-op never touches it."""
+        import src.chart_pool as cp
+
+        with (
+            patch.object(cp, "chart_available", return_value=True),
+            patch.object(cp.chart_pool, "prewarm") as prewarm,
+        ):
+            cp.warm()
+        prewarm.assert_called_once_with(cp._warm_worker)
+
+    def test_the_warm_callable_is_importable_by_qualified_name(self) -> None:
+        """It is pickled to the worker by name, so it must be module-level — a closure
+        or a local would fail at submit time, on the startup path."""
+        import pickle
+
+        import src.chart_pool as cp
+
+        assert pickle.loads(pickle.dumps(cp._warm_worker)) is cp._warm_worker

@@ -1,5 +1,8 @@
 import asyncio
+import contextlib
 import os
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
@@ -9,7 +12,8 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src import config
-from src.config import ENVIRONMENT, spotify_enabled
+from src.config import spotify_enabled
+
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
@@ -25,12 +29,41 @@ from src.util import get_logger
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
+    from src.musicbot import MusicBot
     from src.musicplayer import MusicPlayer
 
 log = get_logger(__name__)
 
-intents = discord.Intents.all()
-intents.message_content = True
+
+def _build_intents() -> discord.Intents:
+    """The gateway events this bot subscribes to.
+
+    `presences` is deliberately absent: it is privileged — which blocks bot
+    verification past 100 guilds — and nothing here reads a presence update.
+    `change_presence()` SENDS our own and needs no intent for it.
+    """
+    intents = discord.Intents.none()
+    # Guild/channel/voice-client cache. Everything else assumes it.
+    intents.guilds = True
+    # on_voice_state_update, plus the VoiceChannel.members behind the
+    # alone-in-channel disconnect timer.
+    intents.voice_states = True
+    # Prefix commands dispatch from on_message, so the events have to arrive at
+    # all — message_content alone does not deliver them.
+    intents.guild_messages = True
+    # -help renders in a DM and -debug answers one; both are pinned by tests.
+    intents.dm_messages = True
+    # Privileged. Without it every message arrives with empty content and no
+    # command ever matches.
+    intents.message_content = True
+    # Privileged. guild.get_member() rehydrates a queue entry's requester and
+    # backs VoiceChannel.members; the event-driven cache alone goes patchy
+    # across a restart.
+    intents.members = True
+    return intents
+
+
+intents = _build_intents()
 EXTENSIONS = ("src.musicbot",)
 
 
@@ -38,11 +71,18 @@ class MusicContext(commands.Context):
     """Context whose send() keeps the Now Playing block at the bottom of the channel:
     responses lead with the NP block, then their own embeds, and the previous host is
     retired (deleted if dedicated, strip-edited otherwise). Attaching at send time
-    keeps the response and the block one atomic message."""
+    keeps the response and the block one atomic message.
+
+    It is also where debug mode's footer is applied — the one choke point through
+    which every command response passes."""
 
     async def send(
         self, content: Optional[str] = None, **kwargs: Any
     ) -> discord.Message:
+        # Ahead of the NP branch, so both send paths carry it. Decoration MUTATES
+        # the caller's embeds rather than reshaping kwargs, which is what lets the
+        # early return below stay a verbatim pass-through.
+        self._decorate_for_debug(kwargs)
         mp = self._np_player()
         if mp is None:
             return await super().send(content, **kwargs)
@@ -69,21 +109,52 @@ class MusicContext(commands.Context):
             mp._adopt_np_host_if_current(message, own, song)
         return message
 
-    def _np_player(self) -> Optional["MusicPlayer"]:
+    def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
+        """Add the debug footer to this response's own embeds. The NP block is
+        decorated by the player instead, at build time, so the progress tick cannot
+        re-render it back to bare. Elapsed-ms times the phase of the command that is
+        answering. See docs/ARCHITECTURE.md#debug-footer-seams."""
+        cog = self._music_cog()
+        if cog is None:
+            return
+        own = [
+            e
+            for e in (kwargs.get("embed"), *(kwargs.get("embeds") or ()))
+            if e is not None
+        ]
+        if not own:
+            return
+        # Keyed by id(ctx), and this IS the ctx. Absent for a send outside any
+        # command, which just means no elapsed time and no span to name.
+        active = cog._active_spans.get(id(self))
+        cog.debug_settings.decorate(
+            own,
+            self.guild,
+            span=active.span if active is not None else None,
+            elapsed_ms=(time.monotonic() - active.started) * 1000
+            if active is not None
+            else None,
+        )
+
+    def _music_cog(self) -> Optional[MusicBot]:
+        from src.musicbot import MusicBot
+
+        cog = self.bot.get_cog("MusicBot")
+        return cog if isinstance(cog, MusicBot) else None
+
+    def _np_player(self) -> Optional[MusicPlayer]:
         """The guild's MusicPlayer, only when attaching is appropriate: guild message,
         MusicBot cog loaded, player exists, a song is live, and this channel is the
         player's home channel (the host never leaves it)."""
-        from src.musicbot import MusicBot
-
         if self.guild is None:
             return None
-        cog = self.bot.get_cog("MusicBot")
-        if not isinstance(cog, MusicBot):
+        cog = self._music_cog()
+        if cog is None:
             return None
         mp = cog.mps.get(self.guild.id)
         if mp is None or mp.current_song is None:
             return None
-        if self.channel.id != mp._channel.id:
+        if self.channel.id != mp.home_channel.id:
             return None
         return mp
 
@@ -104,6 +175,7 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
+        self._liveness_task: Optional[asyncio.Task] = None
         # Postgres play-history archive + its outbox drainer, built in setup_hook while
         # HISTORY_ARCHIVE_ENABLED (the opt-in consent gate for long-term storage). None
         # is the disabled shape — the default — and every consumer handles it:
@@ -114,12 +186,34 @@ class MusicBotApp(commands.AutoShardedBot):
         # discord.py or a signal handler calls close().
         self._teardown_started = False
 
+    async def _liveness_heartbeat(self) -> None:
+        """Touch LIVENESS_FILE on a fixed cadence for the container HEALTHCHECK.
+
+        Answers one question: is the event loop still turning. A wedged loop
+        stops touching the file and the healthcheck fails on the stale mtime.
+        Probing Redis or Discord here would report the bot dead over a
+        dependency blip, so this stays dependency-free.
+        """
+        path = Path(config.LIVENESS_FILE)
+        while True:
+            try:
+                path.touch()
+            except OSError as e:
+                # An unwritable path degrades to no liveness signal; the
+                # healthcheck then fails on its own rather than the bot dying here.
+                log.warning(f"Liveness touch failed for {path}: {e}")
+            await asyncio.sleep(config.LIVENESS_INTERVAL_SECS)
+
     async def setup_hook(self) -> None:
         # The archive flag is read first, before anything else can consume it: the
         # parser raises on garbage and the next reader would be push_history, which is
         # @_guild_op-wrapped and would swallow that ValueError into one warning per
         # song. Startup is the only place the signal can be loud.
         archive_enabled = config.history_archive_enabled()
+        # Ahead of the pool and the extensions so the file exists early in the
+        # HEALTHCHECK's start-period, and after the flag read, which stays first.
+        if config.LIVENESS_FILE:
+            self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
         if archive_enabled:
@@ -133,8 +227,31 @@ class MusicBotApp(commands.AutoShardedBot):
         from src.youtube import ytdlp_pool
 
         ytdlp_pool.prewarm()
+        # Then the chart worker, only when the archive is on. After the line above,
+        # which brings the forkserver up, so this fork is cheap. Fire-and-forget; the
+        # matplotlib import happens in the worker.
+        if archive_enabled:
+            from src.chart_pool import chart_available, warm as warm_chart_pool
 
-    async def _setup_history_archive(self, redis: "aioredis.Redis") -> None:
+            if not chart_available():
+                # The slim image with the archive ON. -analytics still answers — the
+                # numbers are the card, the chart is an attachment — so this is a
+                # warning, not a raise. Said HERE because the only other signal is a
+                # per-invocation log line, and a card arriving without its chart is
+                # indistinguishable from a render that failed.
+                log.warning(
+                    "matplotlib is not installed, so -analytics will answer without "
+                    "its chart — deploy the image tag without the -slim suffix"
+                )
+            try:
+                warm_chart_pool()
+            except Exception as e:
+                # Guarded like every optional participant in close(): warm() builds
+                # a Queue, a listener thread and an executor, and a raise here would
+                # abort startup over an optional feature.
+                log.warning(f"chart pool warm failed: {e}")
+
+    async def _setup_history_archive(self, redis: aioredis.Redis) -> None:
         """The enabled arm: required DSN, default-password advisory, outbox consumer
         group, archive + drainer. The operator opted in, so a bot that cannot deliver
         the archive must say so loudly. `redis` is a parameter rather than a self.redis
@@ -276,20 +393,51 @@ class MusicBotApp(commands.AutoShardedBot):
         return await super().get_context(origin, cls=cls)
 
     async def invoke(self, ctx: commands.Context, /) -> None:
+        command = ctx.command
         # `--help` ANYWHERE in the raw message short-circuits to that command's help
         # embed, before checks, the cog's voice gate and argument parsing — so `-play
         # --help` answers from outside a voice channel instead of searching for it.
-        if ctx.command is not None and "--help" in ctx.message.content:
-            await ctx.send_help(ctx.command)
+        short_circuit = command is not None and "--help" in ctx.message.content
+        # Neither help path reaches cog_before_invoke — the short-circuit skips
+        # dispatch, and discord.py owns the help command — so both borrow a span
+        # from the cog. See MusicBot.traced_help.
+        if short_circuit or (command is not None and command.cog is None):
+            from src.musicbot import MusicBot
+
+            cog = self.get_cog("MusicBot")
+            span = (
+                cog.traced_help(ctx)
+                if isinstance(cog, MusicBot)
+                else contextlib.nullcontext()
+            )
+            async with span:
+                if short_circuit and command is not None:
+                    await ctx.send_help(command)
+                else:
+                    await super().invoke(ctx)
             return
         await super().invoke(ctx)
+
+    async def on_command_error(
+        self, ctx: commands.Context, error: commands.CommandError, /
+    ) -> None:
+        """Drop unknown commands; hand every other error back to discord.py. The
+        prefix is a bare `-` with strip_after_prefix, so a markdown bullet ("- milk")
+        dispatches the command `milk`, which the default handler logs at ERROR with
+        a traceback. super() still declines to log a command its cog handles."""
+        if isinstance(error, commands.CommandNotFound):
+            # Bounded: invoked_with is one whitespace-free token, and nothing caps
+            # how long that token is.
+            log.debug(f"Unknown command: {str(ctx.invoked_with)[:32]!r}")
+            return
+        await super().on_command_error(ctx, error)
 
     async def on_ready(self) -> None:
         activity = discord.Game(name="music", type=3)
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
             log.info(f"Bot: {self.user.name} # {self.user.id}")
-        log.info(f"Environment: {ENVIRONMENT}")
+        log.info(f"Environment: {config.ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
         # FIXME: this line is labelled "Bot commands:" but logs the `voice_states`
@@ -307,6 +455,13 @@ class MusicBotApp(commands.AutoShardedBot):
             await super().close()
             return
         self._teardown_started = True
+        # getattr for the same reason as the rest: a close() from run()'s finally
+        # can land before __init__ finished. First in the sequence so a slow
+        # teardown stops reporting itself alive.
+        liveness = getattr(self, "_liveness_task", None)
+        if liveness is not None:
+            liveness.cancel()
+            self._liveness_task = None
         # Two ordering constraints, on different pairs, so they compose:
         #   drainer before archive and Redis — its final drain reads the outbox and
         #     writes Postgres, so both have to still be alive for it.
@@ -353,7 +508,8 @@ class MusicBotApp(commands.AutoShardedBot):
         loop = asyncio.get_running_loop()
         # Awaited directly rather than via the executor below — only aclose() knows
         # which half blocks; it owns its off-loop join and bounds the wait.
-        from src.youtube import ytdlp_pool
+        from src.chart_pool import chart_pool
+        from src.youtube import close_probe_session, ytdlp_pool
 
         try:
             await ytdlp_pool.aclose()
@@ -362,6 +518,20 @@ class MusicBotApp(commands.AutoShardedBot):
             # timeout, so this arm is for the unexpected — which would otherwise cost
             # the span flush below, the record of the failed shutdown.
             log.warning(f"yt-dlp pool shutdown failed: {e}")
+        try:
+            # Never spawned on a bot that never ran -analytics, in which case this
+            # only flips the closed flag. Guarded like every step around it: a raise
+            # here would cost the span flush below, the record of the failed shutdown.
+            await chart_pool.aclose()
+        except Exception as e:
+            log.warning(f"chart pool shutdown failed: {e}")
+        try:
+            await close_probe_session()
+        except Exception as e:
+            log.warning(f"stream-probe session shutdown failed: {e}")
+        # Exception, not BaseException, in every guard above: a second Ctrl-C
+        # raises KeyboardInterrupt through them and abandons the rest of this
+        # sequence, which is what a second Ctrl-C is asking for.
         # shutdown_telemetry has no async form and blocks up to 30s flushing spans,
         # so it needs the executor hop.
         from src.telemetry import shutdown_telemetry
@@ -370,6 +540,14 @@ class MusicBotApp(commands.AutoShardedBot):
 
 
 def main() -> None:
+    # Dev convenience: with ENVIRONMENT unset, name it after the current git
+    # branch. An entrypoint is where running a subprocess belongs. Must precede
+    # setup_telemetry(), which stamps the value onto the OTel resource.
+    if not os.environ.get("ENVIRONMENT"):
+        inferred = config.infer_environment_from_git()
+        if inferred is not None:
+            config.ENVIRONMENT = inferred
+
     from src.telemetry import setup_telemetry
 
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves

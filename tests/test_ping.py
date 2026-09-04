@@ -14,12 +14,14 @@ from opentelemetry import trace
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from src import ping, telemetry
+from src import dashboard, ping, telemetry
+from src.debug import RuntimeSnapshot
 from src.config import SpotifyStatus
 from src.ping import (
     ProbeResult,
     ProbeState,
     default_password_embed,
+    latency_color,
     render_ping_embed,
 )
 from src.musicbot import MusicBot
@@ -102,6 +104,30 @@ class TestPingCommand:
         mock_ctx.channel.send.assert_awaited_once()
         assert "embeds" in mock_ctx.channel.send.call_args.kwargs
         mock_ctx.send.assert_not_awaited()
+
+    async def test_a_probe_that_raises_costs_its_row_not_the_whole_board(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """_timed guards a probe's BODY, not everything a probe does — probe_otel
+        parses a URL first. A settle callback runs on the driver's own task, so an
+        unguarded raise there took the board down before it was ever sent.
+        """
+        message = _ping_message(mock_ctx)
+
+        async def exploding() -> ping.ProbeResult:
+            raise ValueError("port could not be cast")
+
+        with (
+            _patch_probes(redis=_probe(ProbeState.OK, 1.0)),
+            patch("src.ping.probe_otel", exploding),
+        ):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        mock_ctx.channel.send.assert_awaited_once()  # the board still exists
+        call = message.edit.await_args or mock_ctx.channel.send.await_args
+        rendered = str(_health_embed(call).to_dict())
+        assert "OTEL collector" in rendered
+        assert ProbeState.FAILED.value in rendered
 
     async def test_all_resolved_settles_in_the_send_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -247,7 +273,9 @@ class TestPingCommand:
         redis_spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
 
         with (
-            patch("src.musicbot.send_latency_line", new=AsyncMock()) as latency_line,
+            patch(
+                "src.commands.join.send_latency_line", new=AsyncMock()
+            ) as latency_line,
             patch("src.ping.probe_redis", new=redis_spy),
         ):
             await command_callback(MusicBot.join)(music_bot, mock_ctx)
@@ -260,7 +288,7 @@ class TestPingReportsSpotifySource:
     """End-to-end: the Spotify row reports the *source's* startup state — never
     configured, configured-but-rejected, or live — so a user can see why Spotify
     links are declined without reading the logs. probe_spotify is left unpatched
-    here: the cog's _spotify_status is what is under test."""
+    here: the cog's spotify_status is what is under test."""
 
     def _patch_everything_but_spotify(self) -> Any:
         async def _make(res: ProbeResult) -> ProbeResult:
@@ -290,7 +318,7 @@ class TestPingReportsSpotifySource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot.spotify_status = SpotifyStatus.DISABLED
         latency = await self._run(music_bot, mock_ctx)
         assert "Spotify API" in latency
         assert "n/a (not configured)" in latency
@@ -300,7 +328,7 @@ class TestPingReportsSpotifySource:
     ) -> None:
         """The startup probe found the credentials invalid: the row is red and
         names the cause rather than reporting a generic outage."""
-        music_bot._spotify_status = SpotifyStatus.INVALID
+        music_bot.spotify_status = SpotifyStatus.INVALID
         latency = await self._run(music_bot, mock_ctx)
         assert "down (credentials rejected)" in latency
 
@@ -308,7 +336,7 @@ class TestPingReportsSpotifySource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mocked(music_bot.spotify).http_call = AsyncMock(return_value={"x": 1})
-        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot.spotify_status = SpotifyStatus.ENABLED
         latency = await self._run(music_bot, mock_ctx)
         assert "ms" in latency
         assert "rejected" not in latency and "not configured" not in latency
@@ -388,6 +416,94 @@ class TestPingReportsPostgres:
         music_bot.history_archive = None
         row = await self._run(music_bot, mock_ctx)
         assert "off (archive disabled)" in row
+
+
+class TestDebugFooterOnTheBoard:
+    """-ping bypasses both decoration seams — it replies through channel.send and
+    then edits — so the cog pre-renders a suffix and threads it in."""
+
+    @staticmethod
+    def _versions() -> dict[str, str]:
+        return dict.fromkeys(["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x")
+
+    def test_the_suffix_lands_after_the_environment_line(self) -> None:
+        embed = render_ping_embed(
+            {"Redis": _probe(ProbeState.OK, 1.0)},
+            self._versions(),
+            42.0,
+            trace.get_current_span(),
+            debug_suffix="🐞 shard 0 · cpu 9%",
+        )
+        footer = embed.footer.text or ""
+        assert footer.startswith("environment:")
+        assert footer.endswith("\n🐞 shard 0 · cpu 9%")
+        assert "environment:" in footer.split("\n")[0]
+
+    def test_no_suffix_leaves_the_footer_alone(self) -> None:
+        embed = render_ping_embed(
+            {"Redis": _probe(ProbeState.OK, 1.0)},
+            self._versions(),
+            42.0,
+            trace.get_current_span(),
+        )
+        assert "🐞" not in (embed.footer.text or "")
+
+    def test_the_password_advisory_carries_it_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It has no footer of its own, and rides in front of the card on the same
+        message."""
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        embed = default_password_embed(debug_suffix="🐞 shard 0")
+        assert embed is not None
+        assert embed.footer.text == "🐞 shard 0"
+
+    async def test_the_command_decorates_when_the_guild_enabled_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.debug_settings._overrides[mocked(mock_ctx.guild).id] = True
+        mocked(mock_ctx.guild).shard_id = 2
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        footer = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
+        assert "🐞" in footer and "shard 2" in footer
+
+    async def test_the_suffix_never_changes_across_edits(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The driver only edits when the render differs, so changing the snapshot
+        mid-flight must not reach an in-progress board's footer."""
+        music_bot.debug_settings._overrides[mocked(mock_ctx.guild).id] = True
+        message = _ping_message(mock_ctx)
+        gate: asyncio.Event = asyncio.Event()
+
+        async def _slow() -> ProbeResult:
+            await gate.wait()
+            return _probe(ProbeState.OK, 5.0)
+
+        with (
+            _patch_probes(redis=_probe(ProbeState.OK, 2.0)),
+            patch("src.ping.probe_otel", _slow),
+        ):
+            task = asyncio.create_task(
+                command_callback(MusicBot.ping)(music_bot, mock_ctx)
+            )
+            await _until(lambda: mock_ctx.channel.send.await_args is not None)
+            first = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
+            # A live sampler tick between the skeleton and the final edit.
+            music_bot.debug_settings._sampler._snapshot = RuntimeSnapshot(
+                cpu_percent=99.0, mem_percent=1.0, lag_ms=1.0, tasks=1, pool_workers=1
+            )
+            gate.set()
+            await task
+
+        last = _health_embed(message.edit.await_args).footer.text or ""
+        assert "🐞" in first
+        assert last.split("🐞")[1] == first.split("🐞")[1]
+        assert "cpu 99%" not in last
 
 
 class TestDownReasonRendering:
@@ -570,6 +686,26 @@ class TestProbeOtel:
         monkeypatch.setattr(telemetry, "_tracer_provider", None)
         r = await ping.probe_otel()
         assert r.state is ProbeState.OFF
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "grpc://collector:4317 ",  # a trailing space in .env
+            "http://collector:99999",  # out of range
+        ],
+    )
+    async def test_an_unparseable_port_fails_the_row_not_the_board(
+        self, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ) -> None:
+        """urlparse().port is LAZY — it accepts these and raises on dereference. That
+        read sits outside _timed, so before the guard a stray character in .env raised
+        through _settle and out of the dashboard driver BEFORE the skeleton send, and
+        -ping answered with a bare error embed and no board at all.
+        """
+        monkeypatch.setattr(telemetry, "_tracer_provider", object())
+        monkeypatch.setattr(telemetry, "_OTLP_ENDPOINT", endpoint)
+        r = await ping.probe_otel()
+        assert r.state is ProbeState.FAILED
 
     async def test_reachable_is_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(telemetry, "_tracer_provider", object())
@@ -872,27 +1008,16 @@ class TestDefaultPasswordWarningReachesTheWire:
         assert len(embeds) == 2
         assert "Default database password" in (embeds[0].title or "")
 
-    async def test_safe_edit_returns_the_health_card_not_the_advisory(self) -> None:
-        """_safe_edit's return feeds the change-diffing loop, so it must be the
-        HEALTH card — the only embed that moves. Returning embeds[0] diffs against
-        the STATIC advisory and edits every tick. Asserted directly: the dashboard
-        reaches this line only when a probe resolves late, so a whole-command test
-        of it passes for the wrong reason whenever the probes are fast."""
-        message = MagicMock(spec=discord.Message)
-        message.edit = AsyncMock()
+    async def test_the_advisory_rides_along_on_every_edit(self) -> None:
+        """The advisory is static and the health card moves, so the driver diffs the
+        whole embed LIST. Dropping the advisory from an edit would make it flicker;
+        diffing only the card would edit every tick for no change. Both live in
+        tests/test_dashboard.py now — this asserts the pairing survives the seam."""
         warning = discord.Embed(title="⚠️ Default database password in use")
         health = discord.Embed(title="Health")
-
-        returned = await ping._safe_edit(message, [warning, health])
-
-        assert returned is health
-
-    async def test_safe_edit_returns_none_when_the_host_is_gone(self) -> None:
-        # The other arm: a user deleting the dashboard message mid-loop must not
-        # take the command down with it.
-        message = MagicMock(spec=discord.Message)
-        message.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
-        assert await ping._safe_edit(message, [discord.Embed(title="x")]) is None
+        assert not dashboard.embeds_changed([warning, health], [warning, health])
+        moved = discord.Embed(title="Health", description="redis 3 ms")
+        assert dashboard.embeds_changed([warning, moved], [warning, health])
 
 
 class TestTheAdvisoryIsForTheOperator:
@@ -974,3 +1099,26 @@ class TestTheAdvisoryIsForTheOperator:
 
         mock_ctx.bot.is_owner.assert_not_awaited()
         assert len(mock_ctx.channel.send.await_args.kwargs["embeds"]) == 1
+
+
+class TestLatencyColor:
+    def test_excellent_latency_is_green(self) -> None:
+        assert latency_color(30).value == 0x44FF44
+
+    def test_boundary_50ms_is_green(self) -> None:
+        assert latency_color(50).value == 0x44FF44
+
+    def test_good_latency_is_yellow(self) -> None:
+        assert latency_color(75).value == 0xFFD000
+
+    def test_boundary_100ms_is_yellow(self) -> None:
+        assert latency_color(100).value == 0xFFD000
+
+    def test_acceptable_latency_is_orange(self) -> None:
+        assert latency_color(150).value == 0xFF6600
+
+    def test_boundary_200ms_is_orange(self) -> None:
+        assert latency_color(200).value == 0xFF6600
+
+    def test_poor_latency_is_red(self) -> None:
+        assert latency_color(300).value == 0x990000

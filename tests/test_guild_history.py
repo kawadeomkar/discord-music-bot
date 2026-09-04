@@ -16,7 +16,7 @@ from typing import Any, cast
 from redis.asyncio import Redis
 import pytest
 
-from src.guild_history import GuildHistory
+from src.guild_history import GuildHistory, history_embeds
 from src.guild_state import HistoryEntry
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
@@ -177,6 +177,33 @@ class TestRestore:
 
 
 class TestRecent:
+    async def test_a_stacked_interruption_is_reordered_by_played_at(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The persisted leg is in RECORD order, which is song-end order — and
+        since played_at became the song's START, an interrupted song is recorded
+        after everything that cut in front of it. So the leg's own head can hold
+        the earliest played_at, and the sort in recent() is what stops -history
+        rendering in end order under a "newest first" promise.
+
+        Shaped like a real -playnow stack: A starts, B and C cut in and finish
+        first, A resumes and finishes last."""
+        a, b, c = (
+            _entry(1, played_at=1000.0),
+            _entry(2, played_at=1100.0),
+            _entry(3, played_at=1200.0),
+        )
+        for entry in (b, c, a):  # record order: A ends last despite starting first
+            await store.push_history(entry)
+        h = _history(store)
+
+        assert [e.played_at for e in await store.get_history()] == [
+            1000.0,  # A at the head of the persisted leg — the earliest start
+            1200.0,
+            1100.0,
+        ]
+        assert await h.recent(3) == [c, b, a]  # …but the read is newest-first
+
     async def test_newest_first_selection(self) -> None:
         h = _history(None)
         h.restore([_entry(3), _entry(2), _entry(1)])  # newest-first input
@@ -363,7 +390,7 @@ class TestRecentIsRedisOnly:
 class TestRecentWindowIsTheCap:
     """The arithmetic the Redis-only read path rests on: push_history trims to
     HISTORY_CACHE_LIMIT, get_history reads that whole window, and
-    musicbot.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
+    guild_history.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
     three and -history silently starts losing depth.
     """
 
@@ -383,7 +410,7 @@ class TestRecentWindowIsTheCap:
         # Imported here rather than at module scope: this is the one assertion
         # in this file that reaches into the command layer, and it is asserting
         # a relationship between two constants, not exercising a command.
-        from src.musicbot import HISTORY_MAX_LIMIT
+        from src.commands.history import HISTORY_MAX_LIMIT
 
         assert HISTORY_MAX_LIMIT == HISTORY_CACHE_LIMIT
 
@@ -425,3 +452,85 @@ class TestSequenceProtocol:
 
     def test_empty_is_falsy(self) -> None:
         assert not _history(None)
+
+
+def _rich_entry(**overrides: Any) -> HistoryEntry:
+    fields: dict = dict(
+        title="Rich Song",
+        webpage_url="https://yt.com/v=rich",
+        duration_secs=242,
+        played_secs=225,
+        requester_id=42,
+        requester_name="Omkar",
+        thumbnail="https://i.ytimg.com/t.jpg",
+        uploader="Chan",
+        played_at=1752530000.0,
+    )
+    fields.update(overrides)
+    return HistoryEntry(**fields)
+
+
+class TestHistoryEmbeds:
+    def test_layout_title_url_then_info_line(self) -> None:
+        # numbered title; webpage_url on its own line beneath it;
+        # played/duration · requester · absolute timestamp on one line below.
+        [embed] = history_embeds([_rich_entry()])
+        assert embed.title == "1. Rich Song"
+        assert embed.description is not None
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=rich",
+            "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>",
+        ]
+
+    def test_numbering_follows_given_order(self) -> None:
+        embeds = history_embeds([_rich_entry(), _rich_entry(title="Second")])
+        assert embeds[0].title == "1. Rich Song"
+        assert embeds[1].title == "2. Second"
+
+    def test_thumbnail_set_when_present(self) -> None:
+        [embed] = history_embeds([_rich_entry()])
+        assert embed.thumbnail.url == "https://i.ytimg.com/t.jpg"
+
+    def test_no_thumbnail_when_absent(self) -> None:
+        [embed] = history_embeds([_rich_entry(thumbnail="")])
+        assert embed.thumbnail.url is None
+
+    def test_requester_mention_survives_member_departure(self) -> None:
+        # The raw <@id> mention needs no member cache to render.
+        [embed] = history_embeds([_rich_entry(requester_id=999)])
+        assert embed.description is not None
+        assert "<@999>" in embed.description
+
+    def test_requester_name_fallback_when_id_unknown(self) -> None:
+        [embed] = history_embeds(
+            [_rich_entry(requester_id=0, requester_name="SomeUser")]
+        )
+        assert embed.description is not None
+        assert "requested by SomeUser" in embed.description
+
+    def test_timestamp_omitted_when_played_at_unknown(self) -> None:
+        # played_at == 0 means unknown; <t:0:f> would render "1 January 1970".
+        [embed] = history_embeds([_rich_entry(played_at=0.0)])
+        assert embed.description is not None
+        assert "<t:" not in embed.description
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=rich",
+            "3:45 / 4:02 · requested by <@42>",
+        ]
+
+    def test_over_length_title_truncated_to_discord_limit(self) -> None:
+        # Discord rejects any embed title > 256 chars, failing the whole send.
+        [embed] = history_embeds([_rich_entry(title="x" * 300)])
+        assert embed.title is not None
+        assert len(embed.title) == 256
+        assert embed.title.endswith("…")
+
+    def test_title_at_limit_not_truncated(self) -> None:
+        # "1. " (3) + 253 = 256 exactly — must pass through untouched.
+        [embed] = history_embeds([_rich_entry(title="y" * 253)])
+        assert embed.title == "1. " + "y" * 253
+        assert embed.title is not None
+        assert "…" not in embed.title
+
+    def test_empty_input(self) -> None:
+        assert history_embeds([]) == []

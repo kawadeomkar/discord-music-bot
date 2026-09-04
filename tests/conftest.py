@@ -1,24 +1,42 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import fakeredis
 import pytest
+
+from src import play_pipeline
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
+import src.spotify as spotify_mod
+import src.youtube as youtube_mod
 from src.config import SpotifyStatus
+from src.debug import DebugSettings
 from src.musicbot import MusicBot
+from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from tests.helpers import noop_ffmpeg_init, tier_enabled
+from src.youtube import close_probe_session
+from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
+
+# Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
+# is first imported, so a per-test setenv would lose the race with whichever test
+# imports it first. An unwritable config dir makes it fall back to a temp directory
+# and warn per process; on a fresh checkout the first render also builds a font cache
+# here, which is what would otherwise look like `just test` hanging. Third copy of
+# this path — Dockerfile's test and runtime stages hold the other two (rule 6).
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplcache")
 
 
 def pytest_collection_modifyitems(
@@ -63,6 +81,63 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def reset_probe_streak() -> Iterator[None]:
+    """Zero the process-wide unconfirmed-probe streak between tests.
+
+    The streak is deliberately module-global (the condition it detects is
+    process-wide), so without this one test's unconfirmed probes change how the NEXT
+    test's cached URL is handled — order-dependent and silent.
+    """
+    import src.youtube as youtube
+
+    youtube._unconfirmed_streak = 0
+    yield
+    youtube._unconfirmed_streak = 0
+
+
+@pytest.fixture(autouse=True)
+async def close_shared_http_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[None]:
+    """Close the process-lifetime HTTP sessions after every test.
+
+    Production closes them in MusicBotApp.close() and the cog's unload; nothing
+    calls those here, and a surviving ClientSession fails an unrelated later test
+    through aiohttp's __del__ ResourceWarning. Wrapping _session_or_create covers
+    a Spotify instance built inside a test body.
+    """
+    # close_probe_session() latches the module closed for good, which is right for
+    # a process that exits after it and wrong for a suite that keeps going.
+    monkeypatch.setattr(youtube_mod, "_probe_session_closed", False)
+
+    created: list[tuple[Any, Any]] = []
+    original = spotify_mod.Spotify._session_or_create
+
+    def tracked(self: Any) -> Any:
+        session = original(self)
+        if not any(s is session for _, s in created):
+            created.append((self, session))
+        return session
+
+    monkeypatch.setattr(spotify_mod.Spotify, "_session_or_create", tracked)
+
+    yield
+
+    try:
+        for owner, session in created:
+            # Only real sessions: a test-injected factory usually returns a mock,
+            # whose close() is not awaitable.
+            if isinstance(session, aiohttp.ClientSession) and not session.closed:
+                await session.close()
+            # Clear the handle too. _session_or_create refuses to rebuild after
+            # aclose() and hands back whatever is stored otherwise, so an instance
+            # outliving its test would otherwise be holding a closed session.
+            owner._session = None
+    finally:
+        await close_probe_session()
+
+
+@pytest.fixture(autouse=True)
 def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Run yt-dlp extraction on an in-process ThreadPoolExecutor.
 
@@ -90,6 +165,39 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def use_thread_chart_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Render -analytics charts on an in-process ThreadPoolExecutor.
+
+    Sibling of use_thread_ytdlp_pool, and autouse for the same reason rather than by
+    convention: that fixture patches exactly ONE name (youtube.ytdlp_pool), so a
+    second module-level pool gets no protection at all and any test reaching the
+    command body would spawn a real worker — ~150ms of spawn plus ~1s of src.main
+    re-import, x8 under xdist, and green the whole time.
+
+    Patches src.chart_pool.chart_pool: the same name main.py closes and debug.py
+    reads, both of which resolve it per call precisely so this fixture is seen. The
+    real process boundary is covered by tests/test_chart_pool.py's
+    TestRealWorkerProcess, which spawns a real worker and renders through it; the
+    pickle round-trip covers the arguments that cross.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import src.chart_pool as chart_pool_mod
+    from src.ytdlp_pool import YtdlpPool
+
+    pool = YtdlpPool(
+        max_workers=1,
+        executor_factory=lambda: ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="chart-test"
+        ),
+        name="chart render",
+    )
+    monkeypatch.setattr(chart_pool_mod, "chart_pool", pool)
+    yield
+    pool.shutdown(wait=False)
+
+
+@pytest.fixture(autouse=True)
 def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin the env the suite asserts against, whatever shell it runs in.
 
@@ -102,8 +210,14 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     drainer wiring) and hundreds of assertions encode it. Don't change this to
     the ship default — disabled-mode tests monkeypatch the flag per case and win
     over this fixture (same MonkeyPatch instance, later call).
+
+    DEBUG_MODE is scrubbed rather than pinned, because here the ship default is
+    the one hundreds of embed assertions encode: with it on, every embed the bot
+    sends grows a debug footer — command responses, the Now Playing block at every
+    render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
@@ -161,6 +275,12 @@ def mock_author() -> MagicMock:
     member.mention = "<@222222222222222222>"
     member.voice = MagicMock()
     member.voice.channel = MagicMock(spec=discord.VoiceChannel)
+    # Set explicitly, not left to the spec. `spec=discord.Member` auto-mocks
+    # guild_permissions, so every attribute on it answers with a TRUTHY MagicMock —
+    # a permission check would pass here even if the code had deleted it. A test
+    # that means "denied" has to say so by setting this False.
+    member.guild_permissions = MagicMock(spec=discord.Permissions)
+    member.guild_permissions.manage_guild = True
     return member
 
 
@@ -178,6 +298,10 @@ def mock_message(mock_author: MagicMock, mock_channel: MagicMock) -> MagicMock:
     message.channel = mock_channel
     message.content = "-play test song"
     message.add_reaction = AsyncMock()
+    # A real tz-aware datetime, as discord.py derives from the message snowflake:
+    # the enqueue paths take queued_at from here, and it lands in a timestamptz
+    # column via HistoryEntry's epoch clamp, which raises on a MagicMock.
+    message.created_at = datetime(2026, 7, 14, 20, 33, 20, tzinfo=timezone.utc)
     return message
 
 
@@ -194,6 +318,12 @@ def mock_ctx(
     ctx.channel = mock_channel
     ctx.message = mock_message
     ctx.cog = MagicMock()
+    # Explicit for the same reason as ctx.command.extras below: MusicPlayer takes
+    # this mock as its cog, and a bare MagicMock's debug_settings.enabled() is
+    # truthy, so every player-built embed in the suite would decorate with a Mock
+    # runtime.
+    ctx.cog.debug_settings.enabled = MagicMock(return_value=False)
+    ctx.cog.debug_settings.snapshot = None
     ctx.send = AsyncMock()
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
@@ -203,6 +333,12 @@ def mock_ctx(
     # -ping's default-password advisory). AsyncMock is required — a bare
     # MagicMock attribute is unawaitable and every such command dies with TypeError.
     ctx.bot.is_owner = AsyncMock(return_value=True)
+    # Explicit, for the same reason mock_author pins guild_permissions: a bare
+    # MagicMock answers `.extras.get("anything")` with a truthy mock, so every
+    # command would look like it carried every flag. cog_before_invoke reads
+    # `extras["observation_only"]` to decide whether to skip get_mp(), and an
+    # auto-mock there silently exempts the whole suite.
+    ctx.command.extras = {}
     return ctx
 
 
@@ -221,7 +357,12 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
     bot.history_drainer = MagicMock()
-    # No create_task mock needed — MusicPlayer.start() is never called in tests
+    # start() IS reached now: a command wrapper resolves its player as an argument,
+    # so get_mp() runs on every path including the early returns a body used to take
+    # before it. Without this the loop() coroutine is created, never scheduled by the
+    # mock, and finalized by the GC — a "never awaited" warning that filterwarnings
+    # turns into a failure on whichever test the collection lands in.
+    bot.loop.create_task = stub_create_task()
     return bot
 
 
@@ -304,7 +445,7 @@ def ytdl_instance(
     import discord as d
     from src.youtube import YTDL, YTDLVideoInfo
 
-    def _make(data: Optional[dict] = None) -> Any:
+    def _make(data: Optional[dict] = None, **carried: Any) -> Any:
         default_data = {
             "url": "https://r2.googlevideo.com/stream?expire=9999999999",
             "webpage_url": "https://www.youtube.com/watch?v=test",
@@ -333,6 +474,10 @@ def ytdl_instance(
                 # construction; the cast is the info-dict shape assertion.
                 data=cast(YTDLVideoInfo, default_data),
                 requester=mock_author,
+                # Carried QueueObject fields, so a test can drive the paths that
+                # read them back off a REAL YTDL rather than a mock that invents
+                # whatever attribute it is asked for.
+                **carried,
             )
 
     return _make
@@ -347,14 +492,92 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
-    cog.spotify = MagicMock()
-    cog._spotify_status = SpotifyStatus.ENABLED
+    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
+    # rejects an attribute Spotify does not have, which is how a renamed method
+    # gets caught here rather than passing against a mock that invents it. spec
+    # covers the class, so the credentials __init__ assigns are set by hand —
+    # -ping reads them to tell "unconfigured" from "configured and rejected".
+    cog.spotify = MagicMock(spec=Spotify)
+    cog.spotify.client_id = "cid"
+    cog.spotify.client_secret = "secret"
+    cog.spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
-    # None, not a mock: MusicBot declares __slots__, so an unset slot raises
-    # AttributeError rather than returning None. Tests that care about the
-    # Postgres row set their own archive (see TestPingReportsPostgres).
+    # None, not a mock: this fixture builds the cog without __init__, so an unset
+    # attribute raises AttributeError rather than returning None. Tests that care
+    # about the Postgres row set their own archive (see TestPingReportsPostgres).
     cog.history_archive = None
     cog._active_spans = {}
-    cog._alone_timers = {}
+    cog.voice_watchdog = VoiceWatchdog(cog)
     cog._restore_tasks = set()
+    # Off, matching the ship default and the DEBUG_MODE scrub above: with debug
+    # mode on, every embed grows a footer and the suite's embed assertions would be
+    # asserting against decorated output everywhere. The mock cog used by player
+    # tests is pinned separately, in mock_ctx — same hazard, different object.
+    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
+    # fixture that listed them would drift the moment one is added.
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
     return cog
+
+
+# ── Cog fixtures with a live fakeredis ────────────────────────────────────────
+# In conftest rather than test_musicbot.py because test_recovery.py drives the same
+# cog: restore_guild takes it as a parameter, so both files need one built the same
+# way. Divergent copies would let a recovery test pass against a cog shape the
+# command tests no longer use.
+
+
+@pytest.fixture
+async def fake_redis_bot() -> AsyncIterator[Redis]:
+    server = fakeredis.FakeServer()
+    client = fakeredis.aioredis.FakeRedis(server=server, decode_responses=False)
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
+def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot:
+    cog = MusicBot.__new__(MusicBot)
+    cog.bot = mock_bot
+    cog.mps = {}
+    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
+    # rejects an attribute Spotify does not have, which is how a renamed method
+    # gets caught here rather than passing against a mock that invents it. spec
+    # covers the class, so the credentials __init__ assigns are set by hand —
+    # -ping reads them to tell "unconfigured" from "configured and rejected".
+    cog.spotify = MagicMock(spec=Spotify)
+    cog.spotify.client_id = "cid"
+    cog.spotify.client_secret = "secret"
+    cog.spotify_status = SpotifyStatus.ENABLED
+    cog.redis = fake_redis_bot
+    # None, not a mock, and set explicitly: this fixture builds the cog without
+    # __init__, and _debug_inputs reads history_archive — left unset it would be an
+    # AttributeError, and left a MagicMock it would fake an archive that is absent.
+    cog.history_archive = None
+    cog._active_spans = {}
+    cog.voice_watchdog = VoiceWatchdog(cog)
+    cog._restore_tasks = set()
+    # Debug state, same shape __init__ builds. The cog reads these on every send and
+    # now persists them, so a fixture without them tests a bot that cannot start.
+    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
+    # fixture that listed them would drift the moment one is added.
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
+    return cog
+
+
+_PLAY_STAGES = ("queue_source", "enqueue_single", "enqueue_playlist")
+
+
+@pytest.fixture(autouse=True)
+def _restore_play_stages() -> Iterator[None]:
+    """Put the pipeline's stage functions back after a test stubs them.
+
+    They are module globals, so an assignment outlives the test that made it and the
+    next one runs against the previous one's mock. Here rather than in one test file
+    because -play, -playnow and the pipeline's own tests all stub them.
+    """
+    saved = {name: getattr(play_pipeline, name) for name in _PLAY_STAGES}
+    yield
+    for name, fn in saved.items():
+        setattr(play_pipeline, name, fn)

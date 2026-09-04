@@ -39,7 +39,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
 - **Rich `-help`** — a custom man-page-style help command with aliases, examples,
   and per-command notes
-- **Resilient YouTube extraction** — PO-token sidecar support makes `web_safari` a
+- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback client a
   working fallback client when the primary client is throttled or blocked
 - **Observability** — OpenTelemetry tracing and structured logging (structlog), with a
   bundled Grafana LGTM stack in Docker Compose
@@ -71,7 +71,8 @@ details, aliases, and examples.
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
 | `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
 | `-leaderboard [--days N]` | `lb`, `top` | Top 10 listeners and top 10 songs by listening time, each song labelled with how it was asked for (Spotify, search, a pasted host) — needs the [play-history archive](#operating-the-play-history-archive) |
-| `-shuffle` | — | Randomly reorder the queue (needs 3+ queued songs) |
+| `-analytics [--days N]` | `an` | A six-panel chart of this server's listening — plays per day by source, when it listens, listening time, how much of each song gets played, song lengths and queue wait — plus top listeners, artists and songs. `--days` is one of 7, 30, 90, 365; the window covers COMPLETE UTC days, so today is not included — needs the [play-history archive](#operating-the-play-history-archive) |
+| `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
 | `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
@@ -82,6 +83,7 @@ details, aliases, and examples.
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
+| `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer on every embed the bot sends there, the live Now Playing card included, carrying the trace id, timing and the bot process's runtime load — and need **Manage Server** |
 | `-help [command]` | — | Full command manual |
 
 ### Supported inputs
@@ -91,6 +93,7 @@ https://www.youtube.com/watch?v=VIDEO_ID
 https://www.youtube.com/watch?v=VIDEO_ID&t=90    # start at timestamp
 https://youtu.be/VIDEO_ID?t=90
 https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
+https://www.youtube.com/watch?v=ID&list=LIST_ID&index=4  # playlist from #4 on
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
 https://soundcloud.com/artist/track
@@ -183,7 +186,7 @@ runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
 2. Under **Bot**, enable the **Message Content Intent** and **Server Members Intent**
 3. Under **OAuth2 → URL Generator**, select the `bot` scope with these permissions:
    - **Voice**: Connect, Speak
-   - **Text**: Send Messages, Embed Links, Add Reactions, Read Message History
+   - **Text**: Send Messages, Embed Links, Attach Files, Add Reactions, Read Message History
 4. Invite the bot to your server with the generated URL
 
 ### 2. Install and configure
@@ -216,11 +219,13 @@ data volume, and a silently-changed value would lock the bot out of its own data
 
 `poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
 and `dev` groups are optional, so running the bot does not pull in pyright and its
-bundled Node runtime.
+bundled Node runtime. It also leaves out the `charts` extra — matplotlib and its
+tree, 133 MB — which only `-analytics` needs; add `--extras charts` to run that
+command from a local checkout.
 
-Contributors should use `just install`, which adds those three groups. `just check`
-requires them; the error "ruff not found … run 'just install' first" means they are
-missing.
+Contributors should use `just install`, which adds those three groups and the extra.
+`just check` requires them; the error "ruff not found … run 'just install' first"
+means they are missing.
 
 Every recipe below uses the project's virtualenv. With pyenv-virtualenv (this
 project ships a `.python-version`), `poetry install` installs into that environment
@@ -315,7 +320,7 @@ just test --maxfail=1              # stop at the first failure
 
 | Recipe | Does |
 |---|---|
-| `just image` | Build the runtime image as `:latest` and `:<git-sha>` — no test gate |
+| `just image` | Build the runtime image as `:latest` and `:<git-sha>`, plus the `-slim` pair without the chart renderer — no test gate |
 
 `just image` has no test gate; the gate lives in the pipeline
 (`./build_docker.sh`). Use `just image` when you want the artifact and have already
@@ -384,7 +389,7 @@ The Compose stack runs the bot plus its supporting services:
 | `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: on the `archive` profile, which the deploy tooling activates when `HISTORY_ARCHIVE_ENABLED=true` |
 | `db-migrate` | One-shot schema migration for the archive — same `archive` profile. Every deploy runs it before recreating the bot, and `docker compose up` runs it too; re-running applies nothing |
 | `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `just db-backfill-docker` |
-| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works; optional — the bot degrades gracefully without it |
+| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so yt-dlp's fallback client works; optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
 ```bash
@@ -461,12 +466,19 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
 | `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg prepared-statement cache size per connection. **Set to `0` behind PgBouncer in transaction-pooling mode** — prepared statements are per-connection state, and transaction pooling hands each transaction a different backend |
 | `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox — meaningful only while the archive is enabled (disabled, the outbox is never written). `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. A drop here is unrecoverable: the Redis history list is capped at 50 entries per guild, so anything older that the cap discards existed only in the outbox. See [Operating the play-history archive](#operating-the-play-history-archive) |
-| `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
+| `ENVIRONMENT` | | `development`; inferred from the git branch (`main` → `production`) when unset and a repo is present | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
+| `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
 | `PING_DEADLINE_SECS` | | `3.0` | `-ping` health dashboard: how long a probe may run before the row is marked failed |
+| `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-debug --enable`/`--disable` persists to Redis and wins over this value from then on, across restarts. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
+| `DEBUG_PROMETHEUS_URL` | | — (Compose sets `http://localhost:9090`) | Where `-debug` reads the Postgres container's CPU/memory from — the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL. The series come from the `otelcol-metrics` sidecar, which is **opt-in via the `metrics` Compose profile** because it mounts the Docker socket, so on a default `up` that one row reads `n/a (no metrics source)` even though this URL is set and Prometheus answers. Unset, the same row and nothing else changes |
+| `PROMETHEUS_HOST_PORT` | | `9090` | Host port the metrics stack's Prometheus publishes on (loopback only). Read by Compose, never by the bot; `DEBUG_PROMETHEUS_URL`'s default follows it. Change it when something on this machine already owns 9090 — a collision fails the whole `docker compose up`, not just the metrics row |
+| `DEBUG_TICK_SECS` | | `1.0` | `-debug` snapshot: a ceiling on how long the card can be stale, not a polling interval — the loop wakes as soon as a block is ready |
+| `DEBUG_DEADLINE_SECS` | | `8.0` | `-debug` snapshot: how long a block may collect before it renders `timed out`. Longer than `-ping`'s because each block does strictly more work (a Postgres stats query, a Prometheus round trip) and a straggler is not retried |
+| `ANALYTICS_RENDER_DEADLINE_SECS` | | `20.0` | `-analytics`: how long to wait for the chart before sending the card without one. Sized for the COLD path, which dominates. Expiry is **silent** — the card still sends, just without its chart — so raise this rather than lower it if charts go missing |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
