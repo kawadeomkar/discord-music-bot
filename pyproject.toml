@@ -27,7 +27,7 @@ davey = "^0.1.5"
 yt-dlp = { version = "2026.8.18.122307.dev0", extras = ["default", "deno"], allow-prereleases = true }
 # Exact pin: the pip plugin and the bgutil-pot-provider sidecar image in
 # docker-compose.yml are released in lockstep — bump both together.
-bgutil-ytdlp-pot-provider = "1.3.1"
+bgutil-ytdlp-pot-provider = "1.3.2"
 async-timeout = "^5.0.1"
 discord-py = "2.7.1"
 redis = ">=8.1.0"
