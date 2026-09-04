@@ -36,8 +36,8 @@ import random
 import re
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Sequence
-from dataclasses import dataclass
 from itertools import islice
+from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
 from typing import Optional, Union
 
@@ -229,19 +229,18 @@ class GuildQueue:
         return item
 
     def requeue_front(self, item: QueueItem) -> None:
-        """Give a claim back: the consumer abandoned the item without playing it
-        (prefetch cancellation), so the cursor steps back and the item is pending
-        again. The mirror never moved.
+        """Give a claim back: the cursor steps back and the item is pending again;
+        the mirror never moved. `item` may be the RESOLVED form of what was claimed
+        and replaces it, so a later rebuild serializes the resolved entry.
 
-        `item` may be the RESOLVED form of what was claimed (YTSource →
-        QueueObject), so the slot is rewritten onto it: a later rebuild serializes
-        from the deque, and a stale YTSource there would persist a search over an
-        entry that had already resolved."""
+        It writes index 0 because that is the only claimed slot there is: the
+        prefetch's requeue always lands before loop() can take a second claim, so
+        _cursor is never above 1 here and index 0 IS _cursor."""
         # Guarded like every other cursor decrement: unguarded, _cursor == 0 goes
         # negative and _items[-1] = item clobbers the TAIL.
         if self._cursor > 0:
             self._cursor -= 1
-            self._items[self._cursor] = item
+            self._items[0] = item
         self._sync_wake()
 
     def empty(self) -> bool:
@@ -442,19 +441,16 @@ class GuildQueue:
         *,
         requester_fallback: Union[discord.Member, discord.User, None],
     ) -> bool:
-        """Re-queue the crash-recovered "current song".
-
-        APPENDS, and is the front only because its one caller (_restore_state)
-        runs it on an empty deque and calls restore_entries() after.
-        In memory only: the entry is persisted=False — its LPOP already
-        committed, so it is not on the Redis list and the loop must not LPOP for it
-        (see redis_pop_for). requester_fallback (guild.me or guild.owner) covers a
-        persisted requester ID that no longer resolves; False when nobody does, and
-        the caller still owns clearing the crashed-song state."""
+        """Re-queue the crash-recovered "current song" at the front of the line, in
+        memory only: persisted=False, since its LPOP already committed and the loop
+        must not LPOP for it (see redis_pop_for). Inserted at the cursor, so the
+        claimed items stay a prefix. requester_fallback covers a requester ID that
+        no longer resolves; False when nobody does, and the caller still clears the
+        crashed-song state."""
         item = self._rehydrate(entry, requester_fallback=requester_fallback)
         if item is None:
             return False
-        self._items.append(item)
+        self._items.insert(self._cursor, item)
         self._sync_wake()
         return True
 

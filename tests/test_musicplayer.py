@@ -2473,8 +2473,11 @@ class TestBuildNowPlayingEmbed:
         mock_song.start_offset = 60
         mock_song.elapsed_secs = 30.0
         embed = music_player._build_now_playing_embed(mock_song)
-        assert fmt_duration(90) in described(embed)
-        assert fmt_duration(30) not in described(embed)
+        # Scoped to the bar line for the same reason as the position-override
+        # test: "0:30" is a substring of "10:30 PM PST".
+        bar_line = next(line for line in described(embed).splitlines() if "🔘" in line)
+        assert fmt_duration(90) in bar_line
+        assert fmt_duration(30) not in bar_line
 
 
 class TestBuildPauseConfirmationEmbed:
@@ -5682,8 +5685,11 @@ class TestFinalizeNowPlaying:
 
         message.edit.assert_awaited_once()
         embed = message.edit.call_args.kwargs["embeds"][0]
-        assert fmt_duration(210) in embed.description
-        assert fmt_duration(184) not in embed.description
+        # Scoped to the bar line: the description also carries "Estimated finish:
+        # <wall clock>", and "3:04" is a substring of "3:04 AM PDT".
+        bar_line = next(line for line in described(embed).splitlines() if "🔘" in line)
+        assert fmt_duration(210) in bar_line
+        assert fmt_duration(184) not in bar_line
 
     async def test_noop_when_duration_unknown(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -10005,24 +10011,37 @@ class TestNeutralizePrefetch:
         assert rebuilt.webpage_url == live_song.webpage_url
         assert rebuilt.title == live_song.title
 
-    async def test_completed_task_rebuild_keeps_origin_and_persistence(
-        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    async def test_the_rebuild_reads_a_real_ytdl(
+        self,
+        music_player: MusicPlayer,
+        ytdl_instance: Callable[..., Any],
+        mock_author: MagicMock,
     ) -> None:
-        """The rebuild is one of two places a playing song becomes a queue object
-        again. `user_input` is what -remove matches on, so dropping it leaves the
-        neutralized track the one entry its own collection link cannot take back
-        out. `persisted` decides whether the dequeue LPOPs: defaulted to True on a
-        crash-recovered head it writes an entry into the mirror that was never on
-        the list, and every later LPOP then retires the wrong one."""
+        """Drives the rebuild off a REAL YTDL, not a MagicMock. Every field it
+        reads must exist on YTDL; one that does not raises AttributeError here
+        rather than in production, where the claim is already stranded. `persisted`
+        reached main missing, and a mock invented it as a truthy Mock."""
         original = QueueObject("https://yt.com/v=next", "Next Song", mock_author)
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
-        live_song.cleanup = MagicMock()
-        live_song.user_input = "https://open.spotify.com/playlist/abc"
-        live_song.persisted = False
 
-        async def _done() -> MagicMock:
-            return live_song
+        song = ytdl_instance(
+            None,
+            user_input="https://open.spotify.com/playlist/abc",
+            persisted=False,
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            query_source="spotify.com",
+            played_at=1234.5,
+            np_message_id=77,
+            np_channel_id=88,
+            np_dedicated=True,
+        )
+        song.cleanup = MagicMock()
+
+        async def _done() -> Any:
+            return song
 
         task = asyncio.create_task(_done())
         await task
@@ -10032,8 +10051,31 @@ class TestNeutralizePrefetch:
 
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
-        assert rebuilt.user_input == "https://open.spotify.com/playlist/abc"
-        assert rebuilt.persisted is False
+        # Asserted together so a field dropped from the rebuild fails here rather
+        # than needing to be noticed.
+        assert (
+            rebuilt.user_input,
+            rebuilt.persisted,
+            rebuilt.interjected,
+            rebuilt.is_resume,
+            rebuilt.start_paused,
+            rebuilt.query_source,
+            rebuilt.played_at,
+            rebuilt.np_message_id,
+            rebuilt.np_channel_id,
+            rebuilt.np_dedicated,
+        ) == (
+            "https://open.spotify.com/playlist/abc",
+            False,
+            True,
+            True,
+            True,
+            "spotify.com",
+            1234.5,
+            77,
+            88,
+            True,
+        )
 
     async def test_completed_task_rebuild_keeps_offset_and_playnow_flags(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
