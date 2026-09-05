@@ -253,7 +253,7 @@ jobs:
       # either: it does not bump branch refs, only tags and SHAs. Bump deliberately.
       - name: Coverage comment
         id: coverage_comment
-        uses: MishaKav/pytest-coverage-comment@d46d9d594f3e1d11008ed19939deb7a139b18751 # v1.11.1
+        uses: MishaKav/pytest-coverage-comment@1fcf8a5d3ce4e9315837759203b3b7512f333e81 # v1.12.1
         with:
           pytest-coverage-path: ./pytest-coverage.txt
           junitxml-path: ./pytest.xml
