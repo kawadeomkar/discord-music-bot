@@ -1085,7 +1085,9 @@ touch Discord; a caller with no Redis write to make passes an empty body.
 `ci.yml` jobs: **resolve-env** (environment name + semver-validated version from
 pyproject — single source for image and release tags) → **version-bump** (pull
 requests only: that version must be strictly above the base branch TIP's, compared as
-major.minor.patch, so every merge moves it. Nothing else enforces the per-PR bump —
+major.minor.patch, so every merge moves it. A PR opened by `dependabot[bot]` is exempt
+and the job reports success anyway — Dependabot does not set the project version, so the
+rule could only ever fail it. Nothing else enforces the per-PR bump —
 `release` treats an unchanged version as the ordinary no-op. It is deliberately absent
 from `build`'s `needs`: a job `if`-skipped on push would skip `build` with it, and it
 blocks a merge only once branch protection lists it as required) → **lint**
