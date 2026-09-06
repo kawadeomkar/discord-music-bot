@@ -1,16 +1,9 @@
 """`-pause` — hold the song where it is and post the exact position."""
 
-from typing import TYPE_CHECKING
-
 import discord
 from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
-
-if TYPE_CHECKING:
-    # A runtime import would close the cycle (musicbot imports this module); the cog
-    # is only named in annotations. Same guard recovery.py and musicplayer.py use.
-    pass
 
 
 async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
