@@ -13,7 +13,11 @@ import redis.asyncio as aioredis
 from src import play_pipeline
 from src.guild_state import Analytics
 from src.musicbot import MusicBot
-from src.musicplayer import RESTORE_WAIT_SECS, InterjectOutcome, MusicPlayer
+from src.musicplayer import (
+    DEPTH_RESTORE_WAIT_SECS,
+    InterjectOutcome,
+    MusicPlayer,
+)
 from src.play_pipeline import (
     ResolvedYoutubePlaylist,
 )
@@ -649,14 +653,15 @@ class TestPlayFrontInsertion:
         single_call = play_pipeline.enqueue_single.await_args
         assert single_call is not None
         assert single_call.kwargs["front"] is False
-        # No playback hold on the warm path — the gate is already open. It DOES
-        # wait on the restore, on the SAME bound as every other queue-mutating
-        # command: enqueueing ahead of entries restore_entries has not replayed
-        # yet misaligns every later LPOP, so this is not just an analytics read.
+        # No playback hold on the warm path — the gate is already open. The
+        # restore wait here is the SHORT one: it guards the ask-time depth, which
+        # reads 0 against a queue that has not been replayed yet, and a timeout
+        # costs an approximate analytics field rather than the command.
         mp.defer_playback.assert_not_called()
         assert (
             mp.wait_for_restore.await_args is not None
-            and mp.wait_for_restore.await_args.kwargs["timeout"] == RESTORE_WAIT_SECS
+            and mp.wait_for_restore.await_args.kwargs["timeout"]
+            == DEPTH_RESTORE_WAIT_SECS
         )
 
     async def test_cold_path_waits_for_restore_before_enqueueing(

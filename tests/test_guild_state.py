@@ -2,6 +2,7 @@
 
 import dataclasses
 import logging
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -1364,6 +1365,44 @@ class TestHistoryEntryFromQueueObject:
             HistoryEntry.from_queue_object(_played_tail())  # pyright: ignore[reportCallIssue]
 
 
+class TestSongQueueEntryFromSong:
+    """The write half of the closed loop from_song → HSET state → crash →
+    from_crashed_state → re-queue. Driven off a REAL YTDL so a field the class
+    does not carry raises here rather than at the start transaction."""
+
+    def test_every_parked_field_leaves_the_song(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
+        # Asserted together: a field dropped here is parked as its zero value and
+        # comes back wrong from a crash, silently and only for crashed plays.
+        song = ytdl_instance(
+            None,
+            user_input="https://open.spotify.com/playlist/abc",
+            query_source="spotify.com",
+            interjected=True,
+            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+            played_at=1752530111.0,
+        )
+
+        entry = SongQueueEntry.from_song(song)
+
+        assert (
+            entry.user_input,
+            entry.query_source,
+            entry.interjected,
+            entry.queued_at,
+            entry.queue_position,
+            entry.played_at,
+        ) == (
+            "https://open.spotify.com/playlist/abc",
+            "spotify.com",
+            True,
+            1752530000.5,
+            4,
+            1752530111.0,
+        )
+
+
 class TestCrashedSongRoundTrip:
     """from_song -> the state hash -> from_crashed_state is a closed loop, and a
     field missing from EITHER end is lost silently and only after a crash. Pinned
@@ -1551,6 +1590,28 @@ class TestFromCrashedState:
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.played_at == 0.0
+
+    def test_user_input_survives_crash(self) -> None:
+        # The playing song's queue entry was LPOPed at start, so this hash is the
+        # only at-rest copy of what the user typed. Losing it leaves `-remove
+        # <collection link>` taking out every track of the collection EXCEPT the
+        # one that was playing — the undo the -play flags advertise, minus a song.
+        state = GuildStateData(
+            current_song_url="https://x",
+            current_song_title="T",
+            current_song_user_input="https://open.spotify.com/playlist/abc",
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert entry.user_input == "https://open.spotify.com/playlist/abc"
+
+    def test_user_input_absent_is_none_not_empty(self) -> None:
+        # A hash written by a build that predates the field. None means "unknown";
+        # "" would be a needle that remove_matcher could compare against.
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=None)
+        assert entry is not None
+        assert entry.user_input is None
 
 
 class TestGuildPlaybackSnapshot:
