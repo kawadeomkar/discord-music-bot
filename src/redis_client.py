@@ -838,8 +838,8 @@ class GuildRedisStore:
 
     # History operations
 
-    # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes. Three
-    # kinds of key carry no TTL (guild:{id}:history, guild:{id}:config,
+    # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
+    # Three kinds of key carry no TTL (guild:{id}:history, guild:{id}:config,
     # HISTORY_OUTBOX_KEY), so under volatile-lru they are never evicted; once
     # they fill maxmemory Redis rejects every write with OOM, and each store
     # method swallows it, so persistence degrades silently. Only the OUTBOX can
@@ -1182,9 +1182,10 @@ class GuildRedisStore:
             StateField.VOICE_CHANNEL_ID,
             StateField.TEXT_CHANNEL_ID,
             *_TRANSIENT_SONG_FIELDS,
-            # HACK: last_author_id is dead schema, scrubbed only to clean hashes
-            # left by older builds (hence the bare literal). Safe to delete once
-            # no pre-migration hash can be live — one release, given the 24h TTL.
+            # HACK: last_author_id is dead schema still scrubbed on every disconnect.
+            # Only cleans hashes left by older builds (hence the bare literal). Safe
+            # to delete once no pre-migration hash can be live — one release, given
+            # the 24h TTL.
             "last_author_id",
             *_PLAYBACK_POSITION_FIELDS,
         )
