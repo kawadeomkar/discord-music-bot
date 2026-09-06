@@ -13,24 +13,21 @@ from opentelemetry.trace.propagation.tracecontext import (
 )
 
 
-# Discord's embed field-value cap; it rejects the WHOLE send past it. The -remove
-# reply lands after the songs are gone, so a rejected send reports a false failure.
+# Discord's embed field-value cap; it rejects the WHOLE send past it.
 _FIELD_VALUE_MAX = 1024
 _TRUNCATION_MARK = "..."
 
 
 def queue_message(songs: list[str]) -> str:
-    """Numbered song list for an embed field, bounded by count AND by length: ten
-    100-char titles compose to 1040. Either overflow ends in the same trailing
-    mark; the count is in the embed's title."""
+    """Numbered song list for an embed field, bounded by count AND by length
+    (ten 100-char titles compose to 1040). Either overflow ends in the mark."""
     lines: list[str] = []
     used = 0
     budget = _FIELD_VALUE_MAX - len(_TRUNCATION_MARK) - 1
     for i, song in enumerate(songs[:10]):
         line = f"{i + 1}: {song}"
         if used + len(line) > budget:
-            # A single line over budget is truncated, not dropped: an empty
-            # field would say nothing about what was taken.
+            # A single line over budget is truncated, not dropped.
             if not lines:
                 lines.append(line[:budget])
             break
@@ -42,9 +39,8 @@ def queue_message(songs: list[str]) -> str:
 
 
 def trace_id_of(span: Span) -> str:
-    """The span's trace id as 32 hex chars, or "" when the span is not recording. Empty
-    string rather than None: every consumer stores this in a column or log field that is
-    text, so an absent trace and an unset one should not be two cases downstream."""
+    """The span's trace id as 32 hex chars, or "" when not recording — every
+    consumer stores it in a text column or log field."""
     span_ctx = span.get_span_context()
     return format(span_ctx.trace_id, "032x") if span_ctx.is_valid else ""
 
@@ -60,9 +56,7 @@ _TRACE_PROPAGATOR: Final = TraceContextTextMapPropagator()
 
 def current_traceparent() -> str:
     """The current span as a W3C traceparent, or "" when nothing is being traced.
-
-    The is_valid check is here because inject() skips only a context that equals
-    INVALID_SPAN_CONTEXT."""
+    inject() skips only a context equal to INVALID_SPAN_CONTEXT, hence the check."""
     if not get_current_span().get_span_context().is_valid:
         return ""
     carrier: dict[str, str] = {}
@@ -102,19 +96,16 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
     try:
         async with ctx.typing():
             await asyncio.sleep(3600)  # held open until cancelled
-    # Exception only, not CancelledError: background_typing() cancels this on the way
-    # out, and letting that propagate is what marks the task genuinely cancelled
-    # rather than completed. Swallowing it would stop a shutdown at this frame.
+    # Exception only: background_typing() cancels this, and swallowing the
+    # CancelledError would mark the task completed and stall a shutdown here.
     except Exception:
         pass  # cosmetic — never let typing failures surface
 
 
 @contextlib.asynccontextmanager
 async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
-    """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
-    the command body starts immediately, and the keepalive is cancelled when the body
-    finishes. The whole CM lives inside the task — never enter/exit Typing manually
-    across tasks."""
+    """Non-blocking ctx.typing(): the POST runs in a background task so the body
+    starts immediately. The whole Typing CM lives inside that task."""
     task = asyncio.create_task(_typing_keepalive(ctx))
     try:
         yield
@@ -123,10 +114,8 @@ async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
 
 
 def refund_cooldown(ctx: commands.Context) -> None:
-    """Hand back the cooldown discord.py charged in prepare().
-
-    `Context.command` is Optional, but inside a command's own body it never is —
-    the guard is for the type checker, not for a case that happens."""
+    """Hand back the cooldown discord.py charged in prepare(). The guard is for
+    the checker: inside a command body `ctx.command` is never None."""
     if ctx.command is not None:
         ctx.command.reset_cooldown(ctx)
 
@@ -143,10 +132,9 @@ def notice_embed(
     *,
     title: Optional[str] = None,
 ) -> discord.Embed:
-    """Turn a plain status string ("Shuffled!", validation errors) into an embed. Every
-    command response must be an embed: MusicContext.send prepends the Now Playing block,
-    and a bare `content` string would render as loose text above it. send_embed is the
-    pair for anything needing a title/description split."""
+    """A plain status string as an embed. Every command response must be one:
+    MusicContext.send prepends the Now Playing block, and a bare `content`
+    string would render as loose text above it."""
     return discord.Embed(title=title, description=message, color=color)
 
 
@@ -172,12 +160,9 @@ async def send_embed(
 def first_sendable_channel(
     guild: discord.Guild,
 ) -> Optional[discord.TextChannel]:
-    """A text channel in `guild` the bot may post in — the system channel when it
-    qualifies, else the first that does. For notices with no channel of their own,
-    e.g. telling a guild that the channels it was playing in were deleted.
-
-    None when the bot is not in the guild's member cache or can post nowhere; the
-    caller stays silent rather than raising, since these messages are advisory."""
+    """A text channel the bot may post in — the system channel when it qualifies,
+    else the first that does. None when the bot is not in the member cache or
+    can post nowhere; callers stay silent, these notices are advisory."""
     if guild.me is None:
         return None
     if (
@@ -210,41 +195,27 @@ def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
     return plural if plural is not None else singular + "s"
 
 
-# Discord's hard embed-title limit. An over-length title 400s the whole send(),
-# silently no-opping -history or failing the now-playing send/edit.
+# Discord's hard limits: an over-length title, footer or field value 400s the
+# whole send(). The field cap matters most for lists a user can grow (removed
+# songs), where the 400 lands after the command has already mutated state.
 EMBED_TITLE_LIMIT = 256
-
-# The same, for footer text. Lives here, not in debug.py: ping.py writes footers too
-# and debug.py already imports ping.py, so importing it back closes a hard cycle.
 FOOTER_LIMIT = 2048
-
-# The same again, for a field VALUE. A field built from a list the user can grow
-# (removed songs, dropped positions) has no natural ceiling, and the 400 lands
-# after the command has already mutated state.
 EMBED_FIELD_LIMIT = 1024
 
-# One row of a multi-row field — ten of these share the budget one echoed needle
-# gets. Passed to safe_label wherever a list of user-supplied titles is rendered.
+# One row of a multi-row field of user-supplied titles; ten share one field.
 ECHO_ROW_MAX = 70
 
 
-# Control characters end a rendered embed line early, hiding whatever follows.
-# Flattened rather than escaped — they have no visible form.
+# Control characters end a rendered embed line early; they have no visible form.
 _LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def safe_label(text: str, limit: int) -> str:
-    """Attacker-influenceable text — a user's search term, a yt-dlp title, an
-    uploader name — rendered into an embed without being able to style it or
-    forge a link.
-
-    Three neutralizations before the escape, because `escape_markdown` covers none
-    of them: `[`/`]` are not in its set and are what picks a masked link's label; a
-    backtick closes any code span the caller wrapped this in; and `ignore_links`
-    defaults to TRUE, passing a whole http(s) token through untouched.
-
-    Cap BEFORE escaping: cutting after can split an escape pair and leave a
-    trailing backslash that eats the next character."""
+    """Attacker-influenceable text (a search term, a yt-dlp title) rendered into
+    an embed without styling it or forging a link. Three neutralizations
+    `escape_markdown` lacks: `[`/`]` pick a masked link's label, a backtick
+    closes the caller's code span, and `ignore_links` defaults to True. Cap
+    BEFORE escaping: cutting after can split an escape pair."""
     flattened = _LABEL_UNSAFE.sub(" ", text)
     clipped = truncate(flattened, limit)
     neutralized = clipped.replace("[", "(").replace("]", ")").replace("`", "'")
@@ -263,18 +234,14 @@ def truncate_embed_title(title: str) -> str:
     return truncate(title, EMBED_TITLE_LIMIT)
 
 
-# Debug mode's suffix starts a line of its own rather than continuing the embed's
-# own footer. See docs/ARCHITECTURE.md#debug-footer-seams.
+# Debug mode's suffix starts a line of its own. See docs/ARCHITECTURE.md#debug-footer-seams.
 FOOTER_SUFFIX_SEP = "\n"
 
 
 def join_footer(base: str, suffix: str) -> str:
-    """`base` and `suffix` as one footer, the suffix on a line of its own. The break
-    is written only where there are two lines to separate.
-
-    The clip falls on the base, and a suffix leaving no room drops it whole:
-    truncate() to a limit of zero returns an ellipsis on a nearly complete string.
-    """
+    """`base` and `suffix` as one footer, the suffix on a line of its own. The
+    clip falls on the base; a suffix leaving no room drops the base whole
+    (truncate() to a limit of zero would return a lone ellipsis)."""
     if not (base and suffix):
         return truncate(suffix or base, FOOTER_LIMIT)
     room = FOOTER_LIMIT - len(suffix) - len(FOOTER_SUFFIX_SEP)

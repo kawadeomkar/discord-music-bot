@@ -1,5 +1,4 @@
-"""`-remove` — drop queued songs matching what the user typed, and
-say which ones went."""
+"""`-remove` — drop queued songs matching what the user typed, and say which went."""
 
 from typing import Optional
 
@@ -23,13 +22,10 @@ from src.youtube import QueueObject
 from src.commands._common import await_restore
 
 
-# Bound on one echoed needle, which owns a field to itself. Discord renders
-# markdown in field values, so what a user typed goes through safe_label first.
+# Bound on one echoed needle, which owns a field to itself.
 _ECHO_MAX = 200
 
-
-# The most dropped positions worth spelling out; past this the list says nothing
-# the count above it did not.
+# The most dropped positions worth spelling out.
 _MAX_SHOWN_POSITIONS = 60
 
 
@@ -40,31 +36,27 @@ def _echo(text: str, limit: int = _ECHO_MAX) -> str:
 
 def _removed_label(item: QueueItem) -> str:
     """A removed queue item's name for the reply, as MusicPlayer.queue_clear
-    renders it: `YTSource` has no title, so an unresolved Spotify-playlist track
-    would otherwise show as `?`."""
+    renders it: `YTSource` has no title."""
     if isinstance(item, QueueObject):
         return item.title or "?"
     return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
 def _field(value: str) -> str:
-    """An embed field value that cannot 400 the send. The callers below build from
-    lists whose length is the user's to choose, and the send happens AFTER the
+    """An embed field value that cannot 400 the send, which happens AFTER the
     queue has been mutated."""
     return truncate(value, EMBED_FIELD_LIMIT)
 
 
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
-    """How the removal matched, for the reply's "Matched" field. An origin match
-    names which of the user's own inputs did it, since one argument can take out a
-    whole playlist."""
-    # Not wrapped in a code span: inside one Discord renders safe_label's
-    # backslashes literally, so `-remove foo_bar` comes back as `foo\_bar`.
+    """How the removal matched, for the reply's "Matched" field. An origin
+    match names which of the user's inputs did it."""
+    # Not a code span: inside one Discord renders safe_label's backslashes literally.
     shown = _echo(needle)
     if outcome.mode is not RemoveMode.ORIGIN:
         return shown
     kinds = {item.query_source for item in outcome.removed if item.query_source}
-    # Only when every removed item agrees — a mixed set has no one kind to name.
+    # Only when every removed item agrees.
     kind = kinds.pop() if len(kinds) == 1 else ""
     them = "them" if len(outcome.removed) > 1 else "it"
     if kind == QUERY_SOURCE_SEARCH:
@@ -73,8 +65,8 @@ def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
 
 
 async def run(ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer) -> None:
-    """`-remove` — drop every queued song matching a link or the text it was queued
-    with, then report the positions that went and the queue that is left."""
+    """`-remove` — drop every queued song matching a link or the text it was
+    queued with, then report what went and the queue that is left."""
     if needle is None:
         await ctx.send(
             embed=notice_embed(
@@ -102,10 +94,8 @@ async def run(ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer) 
     count = len(positions)
     noun = pluralize(count, "song")
     pos_label = pluralize(count, "Position")
-    # Capped by count: one -remove of a collection link drops as many
-    # positions as the collection had, and a raw join passes the 1024-char
-    # field limit at 227 of them — a 400 for a removal that already
-    # happened.
+    # A collection link drops as many positions as it had; a raw join passes
+    # the field limit at 227 of them.
     shown = positions[:_MAX_SHOWN_POSITIONS]
     pos_str = ", ".join(str(p) for p in shown)
     if len(positions) > len(shown):
@@ -118,9 +108,8 @@ async def run(ctx: commands.Context, needle: Optional[str], *, mp: MusicPlayer) 
         fields=[
             ("Matched", _field(_matched_label(outcome, needle)), False),
             (f"{pos_label} removed", _field(pos_str), False),
-            # Titles, like -clear reports: one argument can take out a whole
-            # playlist, and there is no undo, so a bare count is not enough
-            # to tell whether it took what the user meant.
+            # Titles, like -clear: there is no undo, so a bare count cannot
+            # tell whether it took what the user meant.
             (
                 "Songs",
                 _field(

@@ -6,15 +6,8 @@ from typing import TYPE_CHECKING, Optional
 import discord
 from discord.ext import commands
 
-from src.redis_client import (
-    cache_get,
-    cache_set,
-)
-from src.util import (
-    background_typing,
-    notice_embed,
-    refund_cooldown,
-)
+from src.redis_client import cache_get, cache_set
+from src.util import background_typing, notice_embed, refund_cooldown
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
@@ -50,17 +43,10 @@ async def run(
     redis: Optional[aioredis.Redis],
     tasks: set[asyncio.Task],
 ) -> None:
-    """The whole of `-analytics`, minus the error handling the cog keeps.
-
-    The cog resolves what discord.py owns — the flags, the archive, the Redis
-    handle — and hands them over; nothing here reaches back into MusicBot. Raising
-    is the contract: the caller's `except` renders the card's failure copy.
-    """
-    # Locals: ctx.guild is a property, so narrowing it would not survive the awaits
-    # below.
+    """The whole of `-analytics`, minus the error handling the cog keeps."""
+    # A local: ctx.guild is a property, so its narrowing would not survive an await.
     guild = ctx.guild
-    # The cooldown is charged in prepare(), before the body, and protects
-    # Postgres. The three refusals below never reach it, so each refunds.
+    # The cooldown protects Postgres; the three refusals below never reach it.
     if guild is None:
         refund_cooldown(ctx)
         await ctx.send(
@@ -82,15 +68,12 @@ async def run(
         return
     days = resolve_days(flags.days)
     if days is None:
-        # Before the cache and before the archive: an unlisted window must
-        # not reach Postgres and must not take a read slot, which is the
-        # whole point of the allowlist.
+        # Before the cache and the archive: an unlisted window must not take a read slot.
         refund_cooldown(ctx)
         await ctx.send(embed=notice_embed(invalid_days_notice(), discord.Color.red()))
         return
     key = cache_key(guild.id, days)
-    # Typing spans the query and the render: an aggregate hit with a PNG
-    # miss still waits on the worker.
+    # Typing spans the query and the render.
     async with background_typing(ctx):
         metrics = from_cache(await cache_get(redis, key))
         if metrics is None:
@@ -100,8 +83,7 @@ async def run(
                 span.set_attribute("analytics.plays", metrics.plays)
             ttl = cache_ttl_secs(metrics)
             if ttl > 0:
-                # Non-positive means the day turned while the query ran, so
-                # the aggregate does not cover the day it would be served for.
+                # Non-positive: the day turned while the query ran.
                 await cache_set(redis, key, to_cache(metrics), ttl)
         if metrics.is_empty:
             await ctx.send(
@@ -111,7 +93,6 @@ async def run(
                 )
             )
             return
-        # Rendered after the archive call returns: the semaphore and the
-        # connection are released by then.
+        # After the archive call returns, so its slot and connection are released.
         png = await render_chart(ctx, metrics, redis=redis, tasks=tasks)
     await send_card(ctx, metrics, png, guild)

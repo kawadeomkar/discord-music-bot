@@ -4,10 +4,7 @@ import discord
 from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
-from src.util import (
-    background_typing,
-    notice_embed,
-)
+from src.util import background_typing, notice_embed
 from src.commands._common import await_restore
 
 
