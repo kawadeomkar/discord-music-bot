@@ -45,6 +45,7 @@ from src.history_archive import (
     Leaderboard,
     PostgresHistoryArchive,
     RequesterLeader,
+    SchemaDriftError,
     SchemaVersionError,
     SongLeader,
     _entry_to_row,
@@ -2162,6 +2163,133 @@ class TestSchemaVersionGuard:
         assert "ahead of this build" in caplog.text
 
 
+def _shape_rows(columns: dict[str, set[str]], indexes: set[str]) -> Any:
+    """A conn double answering the two catalog queries _assert_schema_shape
+    makes, keyed on which SQL it is handed."""
+
+    async def fetch(sql: str, *args: Any) -> list[dict[str, str]]:
+        if "information_schema.columns" in sql:
+            return [
+                {"table_name": table, "column_name": column}
+                for table, names in columns.items()
+                for column in sorted(names)
+            ]
+        assert "pg_indexes" in sql
+        return [{"indexname": name} for name in sorted(indexes)]
+
+    conn = MagicMock()
+    conn.fetch = fetch
+    return conn
+
+
+def _full_shape() -> tuple[dict[str, set[str]], set[str]]:
+    from src.history_archive import _REQUIRED_COLUMNS, _REQUIRED_INDEXES
+
+    return (
+        {table: set(names) for table, names in _REQUIRED_COLUMNS.items()},
+        set(_REQUIRED_INDEXES),
+    )
+
+
+class TestSchemaShapeGuard:
+    """The check behind the version check: migrate() skips a ledgered version
+    without reading the file, so a database can claim version N while missing
+    what this build writes. Left to the insert path that is one
+    UndefinedColumnError per play, dead-lettered; here it is one loud error."""
+
+    async def test_the_migrated_shape_passes(self) -> None:
+        columns, indexes = _full_shape()
+        await PostgresHistoryArchive._assert_schema_shape(_shape_rows(columns, indexes))
+
+    async def test_a_superset_passes(self) -> None:
+        # The rollback case: a database newer than the build has more, never less.
+        columns, indexes = _full_shape()
+        columns["play_history"].add("a_future_column")
+        columns["some_other_table"] = {"x"}
+        indexes.add("play_history_future_idx")
+        await PostgresHistoryArchive._assert_schema_shape(_shape_rows(columns, indexes))
+
+    async def test_a_missing_column_is_named_and_raised(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        columns, indexes = _full_shape()
+        columns["play_history"].discard("query_source")
+        columns["play_history_rejected"].discard("payload")
+        with pytest.raises(SchemaDriftError) as exc:
+            await PostgresHistoryArchive._assert_schema_shape(
+                _shape_rows(columns, indexes)
+            )
+        assert "play_history.query_source" in str(exc.value)
+        assert "play_history_rejected.payload" in str(exc.value)
+        # The remedy is spelled out: re-running migrate() cannot repair this.
+        assert "re-running it will not repair" in str(exc.value)
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    async def test_a_missing_index_is_named_and_raised(self) -> None:
+        columns, indexes = _full_shape()
+        indexes.discard("play_history_recent")
+        with pytest.raises(SchemaDriftError, match="index play_history_recent"):
+            await PostgresHistoryArchive._assert_schema_shape(
+                _shape_rows(columns, indexes)
+            )
+
+    async def test_a_missing_table_reports_every_column(self) -> None:
+        columns, indexes = _full_shape()
+        del columns["play_history_rejected"]
+        with pytest.raises(SchemaDriftError) as exc:
+            await PostgresHistoryArchive._assert_schema_shape(
+                _shape_rows(columns, indexes)
+            )
+        assert "play_history_rejected.guild_id" in str(exc.value)
+        assert "play_history_rejected.payload" in str(exc.value)
+
+    def test_drift_is_a_schema_version_error(self) -> None:
+        # Every handler that treats SchemaVersionError as "operator action,
+        # not an outage" (the -leaderboard and -analytics notices) covers it.
+        assert issubclass(SchemaDriftError, SchemaVersionError)
+
+    async def test_ensure_runs_version_then_shape(self) -> None:
+        # Version first: an unmigrated database has no tables to describe, and
+        # the remedy to name there is `just db-migrate`.
+        order: list[str] = []
+
+        async def version(conn: Any) -> None:
+            order.append("version")
+
+        async def shape(conn: Any) -> None:
+            order.append("shape")
+
+        with (
+            patch.object(PostgresHistoryArchive, "_assert_schema_version", version),
+            patch.object(PostgresHistoryArchive, "_assert_schema_shape", shape),
+        ):
+            await PostgresHistoryArchive._verify_schema(MagicMock())
+        assert order == ["version", "shape"]
+
+    def test_the_required_columns_are_exactly_what_the_sql_names(self) -> None:
+        # The constant and the statements are two spellings of one column set;
+        # a column added to _INSERT_SQL but not here goes unverified.
+        import re
+
+        from src.history_archive import _REJECT_SQL, _REQUIRED_COLUMNS
+
+        def named(sql: str, table: str) -> set[str]:
+            match = re.search(rf"INSERT INTO {table} \(([^)]*)\)", sql)
+            assert match is not None
+            return {c.strip() for c in match.group(1).split(",")}
+
+        assert named(_INSERT_SQL, "play_history") == _REQUIRED_COLUMNS["play_history"]
+        assert (
+            named(_REJECT_SQL, "play_history_rejected")
+            == (_REQUIRED_COLUMNS["play_history_rejected"])
+        )
+        recent = re.search(r"SELECT (.*?)\nFROM play_history", _RECENT_SQL, re.S)
+        assert recent is not None
+        assert {c.strip() for c in recent.group(1).split(",")} == (
+            _REQUIRED_COLUMNS["play_history"]
+        )
+
+
 class TestDrainerLoopInvariants:
     """Two properties whose docstrings state them plainly and whose removal
     every existing test survived."""
@@ -2460,7 +2588,7 @@ class TestEnsureCloseRace:
 
         with (
             patch("src.history_archive.asyncpg.create_pool", gated_create_pool),
-            patch.object(PostgresHistoryArchive, "_assert_schema_version", AsyncMock()),
+            patch.object(PostgresHistoryArchive, "_verify_schema", AsyncMock()),
         ):
             ensuring = asyncio.create_task(archive._ensure())
             await asyncio.sleep(0)  # let _ensure reach the gated create_pool
@@ -2500,7 +2628,7 @@ class TestEnsureCloseRace:
                 "src.history_archive.asyncpg.create_pool",
                 AsyncMock(return_value=pool),
             ) as create,
-            patch.object(PostgresHistoryArchive, "_assert_schema_version", AsyncMock()),
+            patch.object(PostgresHistoryArchive, "_verify_schema", AsyncMock()),
         ):
             a, b = await asyncio.gather(archive._ensure(), archive._ensure())
         assert a is b is pool

@@ -360,6 +360,53 @@ WEEKLY_BUCKET_MIN_DAYS: Final[int] = 365
 
 _SCHEMA_VERSION_SQL = "SELECT max(version) FROM schema_migrations"
 
+# The shape check behind the version check. migrate() skips a version already in
+# the ledger without reading the file, so a database can claim the version while
+# lacking what this build writes and reads; asked at connect time so drift is one
+# loud SchemaDriftError rather than a dead-letter per play. Supersets pass — a
+# newer database is the rollback case.
+_SCHEMA_COLUMNS_SQL = """
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE table_schema = current_schema()
+  AND table_name IN ('play_history', 'play_history_rejected')
+"""
+_SCHEMA_INDEXES_SQL = """
+SELECT indexname FROM pg_indexes
+WHERE schemaname = current_schema() AND tablename = 'play_history'
+"""
+# Exactly the columns _INSERT_SQL/_RECENT_SQL and _REJECT_SQL name; a test holds
+# the SQL and these together.
+_REQUIRED_COLUMNS: Final[dict[str, frozenset[str]]] = {
+    "play_history": frozenset(
+        {
+            "guild_id",
+            "title",
+            "webpage_url",
+            "duration_secs",
+            "played_secs",
+            "requester_id",
+            "requester_name",
+            "thumbnail",
+            "uploader",
+            "played_at",
+            "message_id",
+            "channel_id",
+            "queued_at",
+            "queue_position",
+            "query_source",
+        }
+    ),
+    "play_history_rejected": frozenset(
+        {"guild_id", "error_type", "error_detail", "trace_id", "payload"}
+    ),
+}
+# play_history_dedup is the ON CONFLICT target — without it every duplicate
+# delivery raises UniqueViolationError, which _POISON deliberately excludes.
+_REQUIRED_INDEXES: Final[frozenset[str]] = frozenset(
+    {"play_history_dedup", "play_history_recent"}
+)
+
 # Cap on the asyncpg message in play_history_rejected.error_detail: enough for
 # the SQLSTATE and the offending value, short enough not to bloat an empty table.
 _REJECT_DETAIL_MAX = 2000
@@ -756,6 +803,13 @@ class SchemaVersionError(RuntimeError):
     """
 
 
+class SchemaDriftError(SchemaVersionError):
+    """The ledger claims the version this build needs but the tables lack
+    columns or indexes it writes and reads. A subclass so every handler that
+    treats SchemaVersionError as "operator action, not an outage" covers it.
+    """
+
+
 class PostgresHistoryArchive:
     """asyncpg-backed archive. All methods raise on failure — callers own the
     error policy (the drainer backs off, the backfill counts the guild failed)."""
@@ -821,7 +875,7 @@ class PostgresHistoryArchive:
                 pool = await self._create_pool()
                 try:
                     async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
-                        await self._assert_schema_version(conn)
+                        await self._verify_schema(conn)
                     if self._closed:  # close() ran during our awaits
                         raise RuntimeError("PostgresHistoryArchive is closed")
                 except BaseException:
@@ -832,6 +886,44 @@ class PostgresHistoryArchive:
                     raise
                 self._pool = pool
         return self._pool
+
+    @classmethod
+    async def _verify_schema(cls, conn: Any) -> None:
+        """Version first, shape second: an unmigrated database has no tables to
+        describe, and its remedy (`just db-migrate`) is the one to name."""
+        await cls._assert_schema_version(conn)
+        await cls._assert_schema_shape(conn)
+
+    @staticmethod
+    async def _assert_schema_shape(conn: Any) -> None:
+        """Verify the tables carry every column and index this build uses.
+
+        Two catalog reads. Missing pieces are logged at ERROR and raised as
+        SchemaDriftError, so the drainer backs off loudly on one error instead
+        of dead-lettering every play through UndefinedColumnError. Extra columns
+        and indexes pass: a database newer than the build is the rollback case.
+        """
+        columns: dict[str, set[str]] = {}
+        for row in await conn.fetch(_SCHEMA_COLUMNS_SQL):
+            columns.setdefault(row["table_name"], set()).add(row["column_name"])
+        indexes = {row["indexname"] for row in await conn.fetch(_SCHEMA_INDEXES_SQL)}
+        missing = [
+            f"{table}.{column}"
+            for table, required in _REQUIRED_COLUMNS.items()
+            for column in sorted(required - columns.get(table, set()))
+        ]
+        missing += [f"index {name}" for name in sorted(_REQUIRED_INDEXES - indexes)]
+        if not missing:
+            return
+        message = (
+            f"play_history schema is at version {EXPECTED_SCHEMA_VERSION} in "
+            f"schema_migrations but is missing {', '.join(missing)}. migrate() "
+            f"skips a version already in the ledger, so re-running it will not "
+            f"repair this: apply the missing DDL from migrations/ by hand, or "
+            f"recreate the database and run `just db-migrate`."
+        )
+        log.error(message)
+        raise SchemaDriftError(message)
 
     @staticmethod
     async def _assert_schema_version(conn: Any) -> None:

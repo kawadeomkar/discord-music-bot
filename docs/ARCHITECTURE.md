@@ -1151,6 +1151,19 @@ CHECK violation or a `DataError`, both named in `_POISON`; anything else is genu
 transient and redelivers forever rather than being dropped. A growing outbox is the
 visible symptom, and `HISTORY_OUTBOX_MAX` plus the depth gauge are what page on it.
 
+**Connect-time verification covers shape as well as version.** `migrate()` skips a
+version already in `schema_migrations` without reading the file, so a database can
+carry the ledger row for version *N* while lacking a column or index that version
+defines — a table created by an older DDL and then "migrated", or an operator's `DROP`.
+The version check alone passes that database, and the failure then lands on the insert
+path: one `UndefinedColumnError` per play, dead-lettered into `play_history_rejected` at
+play rate, or for a lost `play_history_dedup` a `UniqueViolationError` on every
+redelivery that `_POISON` deliberately excludes, so the drain wedges. `_ensure` therefore
+also reads `information_schema.columns` and `pg_indexes` once per pool build and raises
+`SchemaDriftError` (a `SchemaVersionError`, so every "operator action, not an outage"
+handler covers it) naming each missing piece. Supersets pass — a newer database is the
+rollback case — and the message says why re-running `just db-migrate` cannot repair it.
+
 Two operational hazards the stream transport introduces. `DEL history:outbox` — the
 remedy the upgrade note asks operators to perform — also destroys the consumer group,
 after which every read fails identically forever; `_read_batch` therefore heals

@@ -42,6 +42,7 @@ from src.history_archive import (
     _RECENT_SQL,
     HistoryOutboxDrainer,
     PostgresHistoryArchive,
+    SchemaDriftError,
     SchemaVersionError,
 )
 from src.redis_client import (
@@ -382,6 +383,39 @@ class TestMigrations:
                 await conn.execute(
                     "SET LOCAL statement_timeout = '50ms'; SELECT pg_sleep(1)"
                 )
+
+    @pytest.mark.parametrize(
+        ("ddl", "missing"),
+        [
+            (
+                "ALTER TABLE play_history DROP COLUMN query_source",
+                "play_history.query_source",
+            ),
+            ("DROP INDEX play_history_recent", "index play_history_recent"),
+            ("DROP INDEX play_history_dedup", "index play_history_dedup"),
+            ("DROP TABLE play_history_rejected", "play_history_rejected.payload"),
+        ],
+    )
+    async def test_archive_refuses_a_drifted_database(
+        self, pg_dsn: str, ddl: str, missing: str
+    ) -> None:
+        """The ledger says version N and the version check passes; the table
+        does not match. Before the shape check this surfaced as one
+        UndefinedColumnError per play, dead-lettered into play_history_rejected
+        at play rate (or, for a lost dedup index, a UniqueViolationError the
+        drainer retries forever)."""
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await conn.execute(ddl)
+        finally:
+            await conn.close()
+        archive = PostgresHistoryArchive(pg_dsn)
+        try:
+            with pytest.raises(SchemaDriftError, match=missing):
+                await archive.insert_batch([_entry(1)])
+            assert archive._pool is None  # nothing half-open is kept
+        finally:
+            await archive.close()
 
     async def test_ensure_is_idempotent(self, archive: PostgresHistoryArchive) -> None:
         # Double-checked lock: the second call reuses the pool.
