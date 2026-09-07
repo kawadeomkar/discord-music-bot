@@ -731,20 +731,154 @@ class TestParseQueueEntryCorrupt:
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
 
-    def test_a_malformed_optional_field_keeps_the_song(self) -> None:
-        """Only the REQUIRED keys drop an entry. The optional ones are read with a
-        default and no coercion, so garbage in one survives the parse — deliberate:
-        losing a queued song over a cosmetic field would be the worse failure.
-
-        np_message_id is the field where that tolerance has teeth, since it feeds a
-        message delete(); the guard for it lives at that call
-        (MusicPlayer._dispose_previous_np_card), not here."""
-        entry = parse_queue_entry(
-            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
-            b'"requester_id":42,"np_message_id":{"nested":"object"}}'
-        )
+    def test_a_malformed_optional_field_keeps_the_song(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Only the REQUIRED keys drop an entry. An optional field of the wrong
+        shape falls back to its default with a warning, so garbage in one never
+        costs a queued song AND never passes through: np_message_id feeds a
+        message delete(), and the default 0 is what "no card" reads as."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            entry = parse_queue_entry(
+                b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
+                b'"requester_id":42,"np_message_id":{"nested":"object"}}'
+            )
         assert isinstance(entry, SongQueueEntry)
         assert entry.webpage_url == "https://yt.com/v=1"  # the song survives
+        assert entry.np_message_id == 0
+        assert "np_message_id" in caplog.text and "malformed" in caplog.text
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'{"type":"qobj","webpage_url":42,"title":"T","requester_id":1}',
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":null,"requester_id":1}',
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T","requester_id":"42"}',
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T","requester_id":-1}',
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T","requester_id":true}',
+            b'["type","qobj"]',
+        ],
+        ids=[
+            "url-not-str",
+            "title-null",
+            "requester-str",
+            "requester-negative",
+            "requester-bool",
+            "not-an-object",
+        ],
+    )
+    def test_a_malformed_required_field_drops_the_entry(
+        self, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert parse_queue_entry(raw) is None
+        assert "corrupt queue entry" in caplog.text
+
+    def test_a_null_requester_is_the_crashed_head_and_parses(self) -> None:
+        entry = parse_queue_entry(
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
+            b'"requester_id":null}'
+        )
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.requester_id is None
+
+    @pytest.mark.parametrize(
+        ("ts_json", "expected"),
+        [
+            (b'"0 -i /etc/passwd"', None),  # a string can never reach `-ss`
+            (b"-5", None),
+            (b"true", None),
+            (b"30.0", 30),  # float-rounded write, the one legacy shape
+            (b"30.5", None),
+            (b"[30]", None),
+            (b"30", 30),
+        ],
+    )
+    def test_ts_reaches_ffmpeg_only_as_a_non_negative_int(
+        self, ts_json: bytes, expected: int | None
+    ) -> None:
+        """`ts` is interpolated into the ffmpeg `-ss` argument string, so it is
+        the field where an untyped pass-through has teeth. Anything but a
+        non-negative integer degrades to "no seek"."""
+        entry = parse_queue_entry(
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
+            b'"requester_id":1,"ts":' + ts_json + b"}"
+        )
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.ts == expected
+
+    def test_every_optional_song_field_is_coerced(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One hostile value per optional field; each lands on its default and
+        the song still parses with its identity intact."""
+        raw = orjson.dumps(
+            {
+                "type": "qobj",
+                "webpage_url": "https://yt.com/v=1",
+                "title": "T",
+                "requester_id": 1,
+                "user_input": ["not", "a", "string"],
+                "duration": "240",
+                "uploader": 7,
+                "thumbnail": {"url": "x"},
+                "persisted": "yes",
+                "interjected": 1,
+                "is_resume": "true",
+                "start_paused": 0,
+                "queued_at": "now",
+                "queue_position": -3,
+                "query_source": 12,
+                "played_at": [1.0],
+                "np_message_id": "123",
+                "np_channel_id": 1.5,
+                "np_dedicated": "no",
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            entry = parse_queue_entry(raw)
+        assert entry == SongQueueEntry(
+            webpage_url="https://yt.com/v=1", title="T", requester_id=1
+        )
+        assert caplog.text.count("malformed") == 15
+
+    def test_integral_floats_are_accepted_as_ints(self) -> None:
+        entry = parse_queue_entry(
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
+            b'"requester_id":222222222222222222.0,"duration":240.0,'
+            b'"np_message_id":5.0,"queue_position":2.0}'
+        )
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.duration == 240 and entry.np_message_id == 5
+        assert entry.queue_position == 2
+
+    def test_search_entry_fields_are_coerced(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        raw = orjson.dumps(
+            {
+                "type": "ytsource",
+                "ytsearch": 5,
+                "url": ["x"],
+                "process": "true",
+                "ts": "10",
+                "user_input": 1,
+                "queued_at": "x",
+                "queue_position": "1",
+                "query_source": None,
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            entry = parse_queue_entry(raw)
+        assert entry == SearchQueueEntry()
+        assert "malformed" in caplog.text
+
+    def test_search_entry_process_none_is_legal(self) -> None:
+        entry = parse_queue_entry(
+            b'{"type":"ytsource","ytsearch":"ytsearch:x","process":null,"ts":null}'
+        )
+        assert isinstance(entry, SearchQueueEntry)
+        assert entry.process is None and entry.ts is None
 
 
 def _history_entry(**overrides: Any) -> HistoryEntry:

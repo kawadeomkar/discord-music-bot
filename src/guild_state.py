@@ -15,7 +15,7 @@ import re
 from zoneinfo import ZoneInfo, available_timezones
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Final, Self, Union
+from typing import TYPE_CHECKING, Any, Final, Self, Union, cast
 
 import orjson
 
@@ -726,43 +726,131 @@ QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 
 # `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
 # narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
+def _wire_malformed(key: str, value: object) -> None:
+    log.warning(
+        f"guild_state: queue entry field {key!r} malformed "
+        f"({type(value).__name__}); using the default"
+    )
+
+
+def _wire_str(d: dict[str, Any], key: str) -> str:
+    """A REQUIRED text field: anything but a str drops the entry."""
+    value = d.get(key)
+    if not isinstance(value, str):
+        raise TypeError(f"{key}: expected str, got {type(value).__name__}")
+    return value
+
+
+def _wire_opt_str(d: dict[str, Any], key: str) -> str | None:
+    value = d.get(key)
+    if value is None or isinstance(value, str):
+        return value
+    _wire_malformed(key, value)
+    return None
+
+
+def _wire_int(value: object) -> int | None:
+    """A non-negative integer, or None for any other shape. bool is refused
+    even though it subclasses int; an integral float is accepted because a
+    float-rounded write is the one legacy shape known to exist."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (math.isfinite(value) and value.is_integer()):
+            return None
+        value = int(value)
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _wire_opt_int(d: dict[str, Any], key: str, default: int | None) -> int | None:
+    value = d.get(key)
+    if value is None:
+        return default
+    parsed = _wire_int(value)
+    if parsed is None:
+        _wire_malformed(key, value)
+        return default
+    return parsed
+
+
+def _wire_float(d: dict[str, Any], key: str) -> float:
+    value = d.get(key)
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        parsed = float(value)
+        if math.isfinite(parsed):
+            return parsed
+    _wire_malformed(key, value)
+    return 0.0
+
+
+def _wire_bool(d: dict[str, Any], key: str, default: bool) -> bool:
+    value = d.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    _wire_malformed(key, value)
+    return default
+
+
 def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
     """Deserialize one queue-list entry; "type" discriminates searches from
-    songs. Corrupt entries return None with a warning, so the rest of the queue
-    survives."""
+    songs. Every field is type-checked on the way in: a malformed REQUIRED
+    field (url, title, requester) drops the entry with a warning, so the rest
+    of the queue survives; a malformed optional one falls back to its default
+    with a warning, so the song survives and nothing unchecked reaches the
+    ffmpeg `-ss` argument or a message delete."""
     try:
         d = orjson.loads(data)
+        if not isinstance(d, dict):
+            raise TypeError(f"expected an object, got {type(d).__name__}")
+        d = cast(dict[str, Any], d)
         if d.get(QueueEntryField.TYPE) == _ENTRY_TYPE_SEARCH:
+            process = d.get(QueueEntryField.PROCESS)
+            if process is not None and not isinstance(process, bool):
+                _wire_malformed(QueueEntryField.PROCESS, process)
+                process = None
             return SearchQueueEntry(
-                ytsearch=d.get(QueueEntryField.YTSEARCH),
-                url=d.get(QueueEntryField.URL),
-                process=d.get(QueueEntryField.PROCESS),
-                ts=d.get(QueueEntryField.TS),
-                user_input=d.get(QueueEntryField.USER_INPUT),
-                queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
-                queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-                query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+                ytsearch=_wire_opt_str(d, QueueEntryField.YTSEARCH),
+                url=_wire_opt_str(d, QueueEntryField.URL),
+                process=process,
+                ts=_wire_opt_int(d, QueueEntryField.TS, None),
+                user_input=_wire_opt_str(d, QueueEntryField.USER_INPUT),
+                queued_at=_wire_float(d, QueueEntryField.QUEUED_AT),
+                queue_position=_wire_opt_int(d, QueueEntryField.QUEUE_POSITION, 0) or 0,
+                query_source=_wire_opt_str(d, QueueEntryField.QUERY_SOURCE) or "",
+            )
+        # None is legal (the crashed head carries no requester); garbage is not.
+        requester_raw = d.get(QueueEntryField.REQUESTER_ID)
+        requester_id = None if requester_raw is None else _wire_int(requester_raw)
+        if requester_raw is not None and requester_id is None:
+            raise TypeError(
+                f"requester_id: expected int, got {type(requester_raw).__name__}"
             )
         return SongQueueEntry(
-            webpage_url=d[QueueEntryField.WEBPAGE_URL],
-            title=d[QueueEntryField.TITLE],
-            requester_id=d[QueueEntryField.REQUESTER_ID],
-            ts=d.get(QueueEntryField.TS),
-            user_input=d.get(QueueEntryField.USER_INPUT),
-            duration=d.get(QueueEntryField.DURATION),
-            uploader=d.get(QueueEntryField.UPLOADER),
-            thumbnail=d.get(QueueEntryField.THUMBNAIL),
-            persisted=d.get(QueueEntryField.PERSISTED, True),
-            interjected=d.get(QueueEntryField.INTERJECTED, False),
-            is_resume=d.get(QueueEntryField.IS_RESUME, False),
-            start_paused=d.get(QueueEntryField.START_PAUSED, False),
-            queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
-            queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-            query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
-            played_at=d.get(QueueEntryField.PLAYED_AT, 0.0),
-            np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
-            np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),
-            np_dedicated=d.get(QueueEntryField.NP_DEDICATED, False),
+            webpage_url=_wire_str(d, QueueEntryField.WEBPAGE_URL),
+            title=_wire_str(d, QueueEntryField.TITLE),
+            requester_id=requester_id,
+            ts=_wire_opt_int(d, QueueEntryField.TS, None),
+            user_input=_wire_opt_str(d, QueueEntryField.USER_INPUT),
+            duration=_wire_opt_int(d, QueueEntryField.DURATION, None),
+            uploader=_wire_opt_str(d, QueueEntryField.UPLOADER),
+            thumbnail=_wire_opt_str(d, QueueEntryField.THUMBNAIL),
+            persisted=_wire_bool(d, QueueEntryField.PERSISTED, True),
+            interjected=_wire_bool(d, QueueEntryField.INTERJECTED, False),
+            is_resume=_wire_bool(d, QueueEntryField.IS_RESUME, False),
+            start_paused=_wire_bool(d, QueueEntryField.START_PAUSED, False),
+            queued_at=_wire_float(d, QueueEntryField.QUEUED_AT),
+            queue_position=_wire_opt_int(d, QueueEntryField.QUEUE_POSITION, 0) or 0,
+            query_source=_wire_opt_str(d, QueueEntryField.QUERY_SOURCE) or "",
+            played_at=_wire_float(d, QueueEntryField.PLAYED_AT),
+            np_message_id=_wire_opt_int(d, QueueEntryField.NP_MESSAGE_ID, 0) or 0,
+            np_channel_id=_wire_opt_int(d, QueueEntryField.NP_CHANNEL_ID, 0) or 0,
+            np_dedicated=_wire_bool(d, QueueEntryField.NP_DEDICATED, False),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt queue entry dropped: {e}")
