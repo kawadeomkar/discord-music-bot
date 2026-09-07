@@ -474,6 +474,9 @@ class TestParseTimestamp:
             "-5",
             "1.5s",
             "s30",
+            # str.isdigit() is True for these and int() refuses them.
+            "²",
+            "①",
         ],
     )
     def test_invalid_forms_return_none(self, raw: str) -> None:

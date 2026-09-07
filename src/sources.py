@@ -26,7 +26,8 @@ def parse_timestamp(raw: str) -> Optional[int]:
     raw = raw.strip().lower()
     if not raw:
         return None
-    if raw.isdigit():
+    # isdecimal, not isdigit: "²" is a digit int() refuses.
+    if raw.isdecimal():
         return int(raw)
     match = _HMS_RE.fullmatch(raw)
     # An all-optional pattern also matches the empty string, so require a group.
