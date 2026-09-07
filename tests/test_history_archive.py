@@ -1091,12 +1091,65 @@ class TestRejectionIsolation:
     async def test_a_direct_call_without_wire_bytes_still_records(self) -> None:
         # The fallback arm: a caller holding only an entry (a test, or any
         # future producer that never went through Redis) must still be able to
-        # park it rather than lose it to a TypeError.
-        archive = PostgresHistoryArchive("postgresql://unused")
+        # park it rather than lose it to a TypeError — the payload is the entry
+        # re-serialized.
         entry = _entry(1)
-        # No server, so the insert fails and the terminal handler logs — which
-        # is the point: it reaches the insert at all, with a payload.
+        conn = MagicMock()
+        conn.execute = AsyncMock()
+        archive = PostgresHistoryArchive("postgresql://unused")
+        pool = MagicMock()
+        acquired = MagicMock()
+        acquired.__aenter__ = AsyncMock(return_value=conn)
+        acquired.__aexit__ = AsyncMock(return_value=None)
+        pool.acquire = MagicMock(return_value=acquired)
+        archive._pool = pool
+
         await archive.record_rejection(entry, RuntimeError("refused"))
+
+        assert conn.execute.await_args is not None
+        assert conn.execute.await_args.args[-1] == serialize_history_entry(entry)
+
+    async def test_a_reject_insert_that_cannot_reach_postgres_leaves_the_entry(
+        self, fake_redis: Redis
+    ) -> None:
+        """The outage window between the failed insert and the reject insert.
+        record_rejection raising is what keeps _isolate from settling: the
+        poison entry and everything behind it stay pending, while entries
+        already settled stay settled, and the next cycle picks the batch back
+        up once record_rejection can land."""
+
+        class DroppedArchive(PoisonArchive):
+            def __init__(self) -> None:
+                super().__init__({"Song 2"})
+                self.drop_rejections = True
+
+            async def record_rejection(
+                self,
+                entry: HistoryEntry,
+                error: BaseException,
+                trace_id: str = "",
+                wire: Optional[bytes] = None,
+            ) -> None:
+                if self.drop_rejections:
+                    raise OSError("connection reset")
+                await super().record_rejection(entry, error, trace_id, wire)
+
+        archive = DroppedArchive()
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await _push(fake_redis, 1, 2, 3)
+
+        with pytest.raises(OSError):
+            await drainer._drain_once()
+        # Song 1 was inserted and settled; Song 2 and Song 3 are still owed.
+        assert [e.title for e in archive.inserted] == ["Song 1"]
+        assert archive.rejections == []
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
+
+        archive.drop_rejections = False
+        assert await drainer._drain_once() == 2
+        assert [e.title for e, _ in archive.rejections] == ["Song 2"]
+        assert [e.title for e in archive.inserted] == ["Song 1", "Song 3"]
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_rejection_logs_the_offending_entry(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
@@ -2535,13 +2588,17 @@ class TestRecordRejection:
 
         assert len(conn.execute.await_args.args[3]) == 2000
 
-    async def test_a_failing_reject_insert_logs_and_does_not_raise(
+    async def test_a_refused_reject_row_logs_and_does_not_raise(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # TERMINAL by design: a rejects table that can fail into a retry loop is
-        # worse than no rejects table. The caller is already handling one error.
+        # TERMINAL for a refusal of the reject row itself: a rejects table that
+        # can fail into a retry loop is worse than no rejects table, and a retry
+        # of a refused row cannot succeed. The caller is already handling one
+        # error.
         conn = MagicMock()
-        conn.execute = AsyncMock(side_effect=OSError("connection reset"))
+        conn.execute = AsyncMock(
+            side_effect=asyncpg.exceptions.DataError("invalid byte sequence")
+        )
         archive = self._archive_with_conn(conn)
 
         await archive.record_rejection(_entry(1), ValueError("original"))
@@ -2552,15 +2609,29 @@ class TestRecordRejection:
         # silently.
         assert "Song 1" in caplog.text
 
-    async def test_a_closed_archive_does_not_raise_either(
+    async def test_a_transport_failure_on_the_reject_insert_propagates(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # close() is terminal, and -ping's health probe can race shutdown, so
-        # _ensure() raising must not escape onto an error path.
+        # A Postgres that dropped between the failed insert and the reject
+        # insert is an outage, not a refusal. Swallowed, _isolate would ack the
+        # entry and the play would reach no table with only a log line to show
+        # for it; raised, the entry stays on the outbox and redelivers.
+        conn = MagicMock()
+        conn.execute = AsyncMock(side_effect=OSError("connection reset"))
+        archive = self._archive_with_conn(conn)
+
+        with pytest.raises(OSError):
+            await archive.record_rejection(_entry(1), ValueError("original"))
+        assert "unrecordable" not in caplog.text
+
+    async def test_a_closed_archive_raises_so_the_entry_is_not_settled(self) -> None:
+        # close() is terminal; a rejection that arrives after it (shutdown's
+        # final drain losing the race) cannot be recorded, and the entry must
+        # stay on the outbox for the next start rather than be acked.
         archive = PostgresHistoryArchive("postgresql://nope:1/nope")
         await archive.close()
-        await archive.record_rejection(_entry(1), ValueError("original"))
-        assert "unrecordable" in caplog.text
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive.record_rejection(_entry(1), ValueError("original"))
 
 
 class TestPoisonClassification:

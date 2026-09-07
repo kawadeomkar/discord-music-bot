@@ -973,11 +973,13 @@ class PostgresHistoryArchive:
         trace_id: str = "",
         wire: Optional[bytes] = None,
     ) -> None:
-        """Park one refused play in play_history_rejected. Best-effort and
-        TERMINAL: never retries, never recurses — a rejects table that can fail
-        into a retry loop is worse than none, so a failed insert goes to the log
-        and the caller moves on. Only reachable on a REJECTION, which means the
-        server is up; an outage leaves the entry on the outbox to redeliver.
+        """Park one refused play in play_history_rejected. TERMINAL for a
+        refusal of the reject row itself (_POISON): never retries, never
+        recurses — a rejects table that can fail into a retry loop is worse than
+        none, so that insert goes to the log and the caller moves on. Anything
+        else — a dropped connection, a closed archive — propagates, so _isolate
+        leaves the entry on the outbox to redeliver instead of settling a play
+        that reached no table.
 
         error_detail is text and asyncpg messages echo the offending value, so it
         is NUL-scrubbed and capped: the same poison this table exists to record
@@ -1004,7 +1006,7 @@ class PostgresHistoryArchive:
                     trace_id,
                     payload,
                 )
-        except Exception as e:
+        except _POISON as e:
             log.error(
                 f"play rejected AND unrecordable ({type(e).__name__}: {e}); "
                 f"payload={payload!r}"
@@ -1525,9 +1527,10 @@ class HistoryOutboxDrainer:
           settling only what parsed leaves it delivered-and-unacked forever — the
           wedge this path exists to prevent.
 
-        A transient error raises out of here, leaving the current entry and the
-        rest to redeliver; duplicate rejection rows are prevented by _REJECT_SQL's
-        ON CONFLICT, not by exclusivity.
+        A transient error raises out of here — from the insert or from
+        record_rejection — leaving the current entry and the rest to redeliver;
+        duplicate rejection rows are prevented by _REJECT_SQL's ON CONFLICT, not
+        by exclusivity.
         """
         rejected = 0
         trace_id = trace_id_of(trace.get_current_span())
