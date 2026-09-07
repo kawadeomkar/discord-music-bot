@@ -2124,6 +2124,13 @@ class TestProcessBoundaryContract:
         restored = pickle.loads(pickle.dumps(opts))
         assert restored.keys() == opts.keys(), f"{name} profile lost keys"
 
+    def test_playlist_extraction_stops_at_the_queue_cap(self) -> None:
+        """Entries past QUEUE_MAX_ENTRIES could never be queued, so the flat
+        extraction is cut there rather than resolving thousands of rows to drop."""
+        from src import config
+
+        assert _YTDL_PLAYLIST_OPTS["playlistend"] == config.QUEUE_MAX_ENTRIES
+
     def test_extract_worker_is_picklable_by_reference(self) -> None:
         """_ytdlp_extract is pickled by qualified name, not by value — so it must stay
         a module-level function. `is` rather than `==`: pickle resolves the name on the

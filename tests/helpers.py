@@ -85,6 +85,19 @@ def stub_create_task(return_value: Optional[Any] = None) -> MagicMock:
     return MagicMock(side_effect=_impl)
 
 
+def admit_all() -> AsyncMock:
+    """A queue_put/queue_put_front stand-in that admits every item, answering
+    with the EnqueueOutcome the pipeline reads its confirmation wording from."""
+    from src import config
+    from src.musicplayer import EnqueueOutcome
+
+    async def _put(obj: Any, *, prefetch: bool = True) -> EnqueueOutcome:
+        items = list(obj) if isinstance(obj, (list, tuple)) else [obj]
+        return EnqueueOutcome(items, refused=0, limit=config.QUEUE_MAX_ENTRIES)
+
+    return AsyncMock(side_effect=_put)
+
+
 def make_mock_task() -> MagicMock:
     """A MagicMock resembling a running asyncio.Task, for cancellation asserts."""
     task = MagicMock(spec=asyncio.Task)
@@ -185,8 +198,8 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     # raises TypeError there rather than answering.
     mp.playback_holds = 1  # the hold this command itself takes
     mp.repark_crashed_head = AsyncMock()
-    mp.queue_put_front = AsyncMock()
-    mp.queue_put = AsyncMock()
+    mp.queue_put_front = admit_all()
+    mp.queue_put = admit_all()
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in
     # Analytics.queue_position and rides to Postgres through HistoryEntry's

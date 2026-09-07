@@ -124,6 +124,12 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 # PgBouncer, where each transaction lands on a backend that never saw the handle.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
+# Ceiling on a guild's queue, in entries, counting the in-flight head. A -play
+# that would cross it queues what fits and says so; a playlist extraction is
+# cut at the same number (yt-dlp `playlistend`), so a 10,000-entry link never
+# resolves 10,000 rows only to drop them here.
+QUEUE_MAX_ENTRIES: int = _int_env("QUEUE_MAX_ENTRIES", 500, minimum=1)
+
 
 def _parse_bool_env(name: str) -> bool:
     """Strict boolean knob: unset and empty are False, a typo (`=on`) raises

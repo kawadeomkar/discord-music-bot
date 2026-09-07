@@ -10,6 +10,7 @@ from src import play_pipeline
 from src.guild_state import Analytics
 from src.config import SpotifyStatus
 from src.musicbot import MusicBot, SpotifyDisabledError
+from src.musicplayer import EnqueueOutcome
 from src.play_pipeline import (
     EmptyPlaylistError,
     PlaylistIndexError,
@@ -27,6 +28,7 @@ from src.sources import (
 )
 from src.youtube import QueueObject
 from tests.helpers import (
+    admit_all,
     connected_vc,
     mock_mp,
 )
@@ -85,7 +87,7 @@ class TestEnqueuePlaylist:
     @staticmethod
     def _make_enqueue_mp(mock_ctx: MagicMock) -> MagicMock:
         mp = MagicMock()
-        mp.queue_put = AsyncMock()
+        mp.queue_put = admit_all()
         mock_ctx.message.add_reaction = AsyncMock()
         return mp
 
@@ -270,7 +272,7 @@ class TestEnqueueSingle:
         mp.queue.peek_next = MagicMock(
             return_value=head if head is not None else MagicMock()
         )
-        mp.queue_put = AsyncMock()
+        mp.queue_put = admit_all()
         mp.repin_now_playing = AsyncMock(return_value=True)
         return mp
 
@@ -365,8 +367,9 @@ class TestEnqueueSingle:
         mp = self._playing_mp(head=None)
         mp.queue.peek_next = MagicMock(return_value=None)
 
-        async def _put(_: Any) -> None:
+        async def _put(item: Any) -> EnqueueOutcome:
             mp.queue.peek_next = MagicMock(return_value=qobj)
+            return EnqueueOutcome([item])
 
         mp.queue_put = AsyncMock(side_effect=_put)
 
@@ -382,7 +385,7 @@ class TestEnqueueSingle:
 
         mp = MagicMock()
         mp.queue.qsize.return_value = 0
-        mp.queue_put = AsyncMock()
+        mp.queue_put = admit_all()
 
         await play_pipeline.enqueue_single(mock_ctx, qobj, mp)
 
@@ -1006,3 +1009,109 @@ class TestSpotifyDisabled:
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
         )
+
+
+class TestQueueCapReporting:
+    """The pipeline reads the EnqueueOutcome the player answers with: a batch the
+    cap cut short says so in the confirmation, and one it refused entirely gets a
+    notice and no thumbs-up."""
+
+    @staticmethod
+    def _capped(admit: int, limit: int = 5) -> AsyncMock:
+        async def _put(obj: Any, *, prefetch: bool = True) -> EnqueueOutcome:
+            items = list(obj) if isinstance(obj, (list, tuple)) else [obj]
+            return EnqueueOutcome(
+                items[:admit], refused=len(items) - min(admit, len(items)), limit=limit
+            )
+
+        return AsyncMock(side_effect=_put)
+
+    @staticmethod
+    def _yt_playlist(mock_ctx: MagicMock, n: int) -> tuple[Any, Any]:
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+        )
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_ctx.author)
+            for i in range(n)
+        ]
+        return source, ResolvedYoutubePlaylist(tracks)
+
+    async def test_a_truncated_playlist_names_both_counts(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        source, resolved = self._yt_playlist(mock_ctx, 8)
+        mp = MagicMock()
+        mp.queue_put = self._capped(admit=3)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch("src.play_pipeline.send_embed", new=AsyncMock()) as send_embed:
+            await play_pipeline.enqueue_playlist(
+                mock_ctx, source, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN
+            )
+
+        title, description = send_embed.await_args.args[1:3]
+        assert title == "Queued playlist — 3 of 8 songs"
+        assert "Queued **3** of **8** — the queue is full at 5 songs" in description
+        # Only what was admitted is echoed back.
+        assert "Song 2" in description and "Song 3" not in description
+        mock_ctx.message.add_reaction.assert_awaited_once_with("👍")
+
+    async def test_a_refused_playlist_gets_a_notice_and_no_reaction(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        source, resolved = self._yt_playlist(mock_ctx, 2)
+        mp = MagicMock()
+        mp.queue_put = self._capped(admit=0)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch("src.play_pipeline.send_embed", new=AsyncMock()) as send_embed:
+            await play_pipeline.enqueue_playlist(
+                mock_ctx, source, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN
+            )
+
+        send_embed.assert_not_awaited()
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "queue is full" in embed.description
+        assert "**5**" in embed.description
+        mock_ctx.message.add_reaction.assert_not_awaited()
+
+    async def test_a_spotify_playlist_reports_the_cap_too(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(id="pl", type=SpotifyType.PLAYLIST)
+        resolved = ResolvedSpotifyPlaylist([f"Track {i}" for i in range(4)])
+        mp = MagicMock()
+        mp.queue_put = self._capped(admit=1)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch("src.play_pipeline.send_embed", new=AsyncMock()) as send_embed:
+            await play_pipeline.enqueue_playlist(
+                mock_ctx, source, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN
+            )
+
+        description = send_embed.await_args.args[2]
+        assert "Queued **1** of **4**" in description
+        assert "Track 0" in description and "Track 1" not in description
+
+    @pytest.mark.parametrize("front", [False, True])
+    async def test_a_refused_single_gets_a_notice(
+        self, mock_ctx: MagicMock, front: bool
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 5
+        mp.queue_put = self._capped(admit=0)
+        mp.queue_put_front = self._capped(admit=0)
+        mp.build_resume_notice_embed = MagicMock(return_value=None)
+        mock_ctx.message.add_reaction = AsyncMock()
+        mock_ctx.voice_client = None
+
+        await play_pipeline.enqueue_single(mock_ctx, qobj, mp, front=front)
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "queue is full" in embed.description
+        mp.build_queued_song_embed.assert_not_called()
+        mock_ctx.message.add_reaction.assert_not_awaited()

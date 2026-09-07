@@ -18,7 +18,7 @@ import discord
 from discord.ext import commands
 
 from src.guild_state import Analytics
-from src.musicplayer import MusicPlayer
+from src.musicplayer import EnqueueOutcome, MusicPlayer
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -209,6 +209,24 @@ async def queue_source(
     )
 
 
+def _queue_full_notice(outcome: EnqueueOutcome) -> discord.Embed:
+    return notice_embed(
+        f"The queue is full — it holds at most **{outcome.limit}** songs. "
+        "Skip or remove something first.",
+        discord.Color.orange(),
+    )
+
+
+def _cap_line(outcome: EnqueueOutcome, requested: int) -> str:
+    """The confirmation's note when the cap cut a batch short; "" otherwise."""
+    if not outcome.refused:
+        return ""
+    return (
+        f"\n\n⚠️ Queued **{len(outcome.queued)}** of **{requested}** — the queue "
+        f"is full at {outcome.limit} songs."
+    )
+
+
 @_tracer.start_as_current_span("bot.enqueue_playlist")
 async def enqueue_playlist(
     ctx: commands.Context,
@@ -232,15 +250,22 @@ async def enqueue_playlist(
             titles, analytics=analytics, origin=origin
         )
         log.info(f"ytsearch qobjs: {qobjs_yt}")
-        shown_titles = queue_message([safe_label(t, ECHO_ROW_MAX) for t in titles])
+        # Ahead of the reply: its wording depends on how much the cap admitted.
+        outcome = await enqueue(qobjs_yt, prefetch=False)
+        if not outcome.queued:
+            await ctx.send(embed=_queue_full_notice(outcome))
+            return
+        shown_titles = queue_message(
+            [safe_label(t, ECHO_ROW_MAX) for t in titles[: len(outcome.queued)]]
+        )
         await asyncio.gather(
             send_embed(
                 ctx,
                 "Queued playlist",
-                f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}{warning_line}",
+                f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
+                f"{_cap_line(outcome, len(titles))}{warning_line}",
                 discord.Color.blue(),
             ),
-            enqueue(qobjs_yt, prefetch=False),
             ctx.message.add_reaction("👍"),
         )
     else:
@@ -254,6 +279,11 @@ async def enqueue_playlist(
         tracks = qobj.tracks
         count = len(tracks)
         log.info(f"yt playlist track count: {count}")
+        outcome = await enqueue(tracks, prefetch=False)
+        if not outcome.queued:
+            await ctx.send(embed=_queue_full_notice(outcome))
+            return
+        queued = len(outcome.queued)
         # Stated: only the `index=` in the user's own URL explains fewer songs.
         skipped_line = (
             f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
@@ -262,17 +292,22 @@ async def enqueue_playlist(
             else ""
         )
         shown_titles = queue_message(
-            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, 10)]
+            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(outcome.queued, 10)]
+        )
+        title = (
+            f"Queued playlist — {queued} of {count} {pluralize(count, 'song')}"
+            if outcome.refused
+            else f"Queued playlist — {count} {pluralize(count, 'song')}"
         )
         await asyncio.gather(
             send_embed(
                 ctx,
-                f"Queued playlist — {count} {pluralize(count, 'song')}",
+                title,
                 f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
-                f"{skipped_line}\n{shown_titles}{warning_line}",
+                f"{skipped_line}\n{shown_titles}{_cap_line(outcome, count)}"
+                f"{warning_line}",
                 discord.Color.blue(),
             ),
-            enqueue(tracks, prefetch=False),
             ctx.message.add_reaction("👍"),
         )
 
@@ -296,10 +331,11 @@ async def enqueue_single(
         # names the song starting now (the gate is shut, so no NP block does).
         # Built before the insert, while the queue holds only restored entries.
         resume_notice = mp.build_resume_notice_embed(qobj)
-        coros: list[Coroutine[Any, Any, Any]] = [
-            mp.queue_put_front(qobj),
-            ctx.message.add_reaction("👍"),
-        ]
+        outcome = await mp.queue_put_front(qobj)
+        if not outcome.queued:
+            await ctx.send(embed=_queue_full_notice(outcome))
+            return
+        coros: list[Coroutine[Any, Any, Any]] = [ctx.message.add_reaction("👍")]
         if resume_notice is not None:
             coros.append(ctx.send(embed=resume_notice))
         if warning is not None:
@@ -313,7 +349,11 @@ async def enqueue_single(
     )
     # Awaited ahead of the reply: its shape depends on whether this song became
     # the queue head, which the put decides.
-    await asyncio.gather(mp.queue_put(qobj), ctx.message.add_reaction("👍"))
+    outcome = await mp.queue_put(qobj)
+    if not outcome.queued:
+        await ctx.send(embed=_queue_full_notice(outcome))
+        return
+    await ctx.message.add_reaction("👍")
     log.info(f"play qsize: {mp.queue.qsize()}")
 
     if should_show_queued:
@@ -453,7 +493,10 @@ async def interject_flow(
             queue_position=1 if mp.current_song is not None else 0,
         )
         # prefetch=False: the stream URL was warmed above.
-        await mp.queue_put_front(qobj, prefetch=False)
+        outcome = await mp.queue_put_front(qobj, prefetch=False)
+        if not outcome.queued:
+            await ctx.send(embed=_queue_full_notice(outcome))
+            return
         await asyncio.gather(
             send_embed(
                 ctx,

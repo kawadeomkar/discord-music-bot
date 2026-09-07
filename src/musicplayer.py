@@ -215,6 +215,17 @@ class InterjectOutcome:
 
 
 @dataclass(frozen=True)
+class EnqueueOutcome:
+    """What queue_put()/queue_put_front() admitted. `refused` counts the items
+    the depth cap turned away — the tail of the batch, in order — and `limit` is
+    the cap they hit, so the confirmation can say both."""
+
+    queued: list[QueueItem]
+    refused: int = 0
+    limit: int = 0
+
+
+@dataclass(frozen=True)
 class StreamFailure:
     """Why a song's stream failed to resolve, captured at the failure point so the
     skip notice can name the cause and the trace carrying the full exception."""
@@ -1122,36 +1133,60 @@ class MusicPlayer:
             depth += 1
         return depth
 
+    def _admit(self, items: list[QueueItem]) -> tuple[list[QueueItem], int]:
+        """Split a batch at the room left under QUEUE_MAX_ENTRIES: (admitted,
+        refused). Read outside the queue mutex — -play is serialized per guild
+        and the cap bounds spam rather than guarding an invariant, so a racing
+        interjection's fallback insert may overshoot by its own batch."""
+        room = max(0, config.QUEUE_MAX_ENTRIES - self.queue.display_size())
+        admitted = items[:room]
+        refused = len(items) - len(admitted)
+        if refused:
+            log.info(
+                f"queue cap refused {refused} of {len(items)} entries in guild "
+                f"{self._guild.id} (limit {config.QUEUE_MAX_ENTRIES})"
+            )
+        return admitted, refused
+
+    def _spawn_prefetches(self, items: Sequence[QueueItem]) -> None:
+        if self.store is None:
+            return
+        for item in items:
+            if isinstance(item, QueueObject):
+                self._spawn_background(
+                    YTDL.prefetch_stream(item, redis=self.store.redis)
+                )
+
     async def queue_put(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
-        """Enqueue and, optionally, kick off stream prefetch. prefetch=False for bulk
-        playlist enqueues: the mirror is written in one batch round-trip and no
-        per-item tasks spawn, since N concurrent prefetches saturate the pool and
-        mint stream URLs that expire before playback reaches them.
-        _prefetch_next_song covers one-ahead prefetch as songs play."""
+    ) -> EnqueueOutcome:
+        """Enqueue what fits under the cap and, optionally, kick off stream
+        prefetch. prefetch=False for bulk playlist enqueues: the mirror is written
+        in one batch round-trip and no per-item tasks spawn, since N concurrent
+        prefetches saturate the pool and mint stream URLs that expire before
+        playback reaches them. _prefetch_next_song covers one-ahead prefetch as
+        songs play."""
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
         else:
             items = list(obj)
-        items = await self.queue.put(items, batch=not prefetch)
-        if prefetch and self.store is not None:
-            for item in items:
-                if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+        admitted, refused = self._admit(items)
+        if admitted:
+            admitted = await self.queue.put(admitted, batch=not prefetch)
+            if prefetch:
+                self._spawn_prefetches(admitted)
+        return EnqueueOutcome(admitted, refused=refused, limit=config.QUEUE_MAX_ENTRIES)
 
     async def queue_put_front(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+    ) -> EnqueueOutcome:
         """Insert at the front of the queue, then optionally prefetch. Same contract
         as queue_put(), used when -play runs on a disconnected bot with a persisted
         queue: the requested song plays now, the persisted entries resume behind it.
@@ -1162,13 +1197,12 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        items = await self.queue.put_front(items)
-        if prefetch and self.store is not None:
-            for item in items:
-                if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+        admitted, refused = self._admit(items)
+        if admitted:
+            admitted = await self.queue.put_front(admitted)
+            if prefetch:
+                self._spawn_prefetches(admitted)
+        return EnqueueOutcome(admitted, refused=refused, limit=config.QUEUE_MAX_ENTRIES)
 
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()

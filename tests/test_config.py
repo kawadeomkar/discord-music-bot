@@ -453,6 +453,8 @@ class TestArchiveTunables:
             ("HISTORY_OUTBOX_MAX", 0, "5000", 5000),
             # Matches asyncpg's own default; 0 is the PgBouncer setting.
             ("POSTGRES_STATEMENT_CACHE", 100, "0", 0),
+            # A member can queue this many before -play answers "full".
+            ("QUEUE_MAX_ENTRIES", 500, "50", 50),
         ],
     )
     def test_default_and_override(
@@ -467,6 +469,14 @@ class TestArchiveTunables:
         assert getattr(self._reload(monkeypatch), name) == default
         monkeypatch.setenv(name, override)
         assert getattr(self._reload(monkeypatch), name) == expected
+
+    def test_a_zero_queue_cap_fails_at_import(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """0 would refuse every -play while the bot reports healthy."""
+        monkeypatch.setenv("QUEUE_MAX_ENTRIES", "0")
+        with pytest.raises(ValueError, match="QUEUE_MAX_ENTRIES must be >= 1"):
+            self._reload(monkeypatch)
 
     def test_a_negative_cap_fails_at_import(
         self, monkeypatch: pytest.MonkeyPatch

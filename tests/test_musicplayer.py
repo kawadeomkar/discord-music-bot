@@ -3182,6 +3182,98 @@ class TestPlaybackGate:
         assert await music_player.wait_for_restore(timeout=1) is True
 
 
+class TestQueueCap:
+    """QUEUE_MAX_ENTRIES bounds a guild's queue at both insert paths. A batch is
+    cut at the room left and the outcome says how much was refused; a full queue
+    admits nothing and touches neither leg."""
+
+    @pytest.fixture(autouse=True)
+    def _small_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("src.musicplayer.config.QUEUE_MAX_ENTRIES", 3)
+
+    @staticmethod
+    def _songs(author: MagicMock, n: int, prefix: str = "v") -> list[QueueObject]:
+        return [
+            QueueObject(f"https://yt.com/{prefix}={i}", f"{prefix} {i}", author)
+            for i in range(n)
+        ]
+
+    async def test_a_batch_is_cut_at_the_room_left(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        await music_player.queue_put(self._songs(mock_author, 1, "old"))
+        outcome = await music_player.queue_put(
+            self._songs(mock_author, 5), prefetch=False
+        )
+
+        assert [q.title for q in outcome.queued] == ["v 0", "v 1"]
+        assert outcome.refused == 3
+        assert outcome.limit == 3
+        assert music_player.queue.display_size() == 3
+
+    async def test_a_full_queue_admits_nothing(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        assert music_player.store is not None
+        await music_player.queue_put(self._songs(mock_author, 3, "old"))
+        before = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+
+        outcome = await music_player.queue_put(self._songs(mock_author, 2))
+
+        assert outcome.queued == [] and outcome.refused == 2
+        assert music_player.queue.display_size() == 3
+        # Neither leg moved: the mirror is byte-identical.
+        assert await fake_redis.lrange(music_player.store.queue_key(), 0, -1) == before
+
+    async def test_the_in_flight_head_counts_against_the_cap(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """display_size(), not qsize(): a claimed head is still ahead of an arrival."""
+        await music_player.queue_put(self._songs(mock_author, 3, "old"))
+        await music_player.queue.get()  # claim the head, leaving 2 pending
+
+        outcome = await music_player.queue_put(self._songs(mock_author, 1))
+        assert outcome.refused == 1
+
+    async def test_front_insert_is_capped_the_same_way(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        await music_player.queue_put(self._songs(mock_author, 2, "old"))
+        outcome = await music_player.queue_put_front(
+            self._songs(mock_author, 3), prefetch=False
+        )
+
+        assert [q.title for q in outcome.queued] == ["v 0"]
+        assert outcome.refused == 2
+        assert [queue_object(i).title for i in music_player.queue.display_items()] == [
+            "v 0",
+            "old 0",
+            "old 1",
+        ]
+
+    async def test_prefetch_is_spawned_only_for_admitted_items(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        songs = self._songs(mock_author, 5)
+        with patch("src.musicplayer.YTDL.prefetch_stream", new=AsyncMock()) as prefetch:
+            outcome = await music_player.queue_put(songs)
+            await asyncio.sleep(0)
+
+        assert len(outcome.queued) == 3
+        prefetched = [c.args[0] for c in prefetch.await_args_list]
+        assert [id(q) for q in prefetched] == [id(q) for q in songs[:3]]
+
+    async def test_an_uncapped_put_reports_nothing_refused(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        outcome = await music_player.queue_put(queue_obj)
+        assert outcome.queued == [queue_obj]
+        assert outcome.refused == 0
+
+
 class TestQueuePutFront:
     """MusicPlayer.queue_put_front — the -play-on-a-disconnected-bot path
     . The list branch is the playlist case,

@@ -16,6 +16,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src import config
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
@@ -313,6 +314,8 @@ _YTDL_PLAYLIST_OPTS = {
     **_YTDL_BASE_OPTS,
     "noplaylist": False,
     "extract_flat": "in_playlist",
+    # The queue cap: entries past it could never be queued.
+    "playlistend": config.QUEUE_MAX_ENTRIES,
 }
 
 # Alias kept for external callers.

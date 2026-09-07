@@ -11,6 +11,7 @@ from src.musicbot import MusicBot
 from src.musicplayer import InterjectOutcome
 from src.youtube import QueueObject
 from tests.helpers import (
+    admit_all,
     command_callback,
 )
 
@@ -203,7 +204,7 @@ class TestPlaynow:
         enqueue every track right after the first-track-only notice. The user still
         gets a confirmation embed."""
         live_mp.interject = AsyncMock(return_value=None)
-        live_mp.queue_put_front = AsyncMock()
+        live_mp.queue_put_front = admit_all()
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         mock_ctx.invoke = AsyncMock()
