@@ -53,7 +53,7 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
                     cog=cog,
                 )
 
-        source = parse_input(url, ctx.message.content)
+        source = parse_input(url)
 
         qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
         async with contextlib.AsyncExitStack() as stack:

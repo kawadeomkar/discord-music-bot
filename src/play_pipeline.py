@@ -420,7 +420,7 @@ async def interject_flow(
     `-play` interjects only because the song is paused, so a `-resume` landing
     during the 1–4s extraction removes the reason and the track is appended.
     """
-    source = parse_input(url, ctx.message.content)
+    source = parse_input(url)
     qobj = await _resolve_playnow_source(ctx, source, origin=url, cog=cog)
     qobj.interjected = True
 
