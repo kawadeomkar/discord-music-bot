@@ -1,6 +1,7 @@
 """Tests for src/musicbot.py — voice permission validation, queue source dispatch, and latency color."""
 
 import asyncio
+import logging
 import inspect
 from typing import Any, Optional, cast
 from collections.abc import Iterator
@@ -694,6 +695,41 @@ class TestMaxConcurrencyNotice:
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "already running" in embed.description
         assert "ping" in embed.description
+
+    async def test_any_other_parse_failure_gets_the_usage(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A converter refusing its input is a UserInputError with no arm of its
+        own — the body never ran, so without this the member got silence."""
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "volume"
+        mock_ctx.command.signature = "<0-100>"
+        mock_ctx.prefix = "-"
+        await music_bot.cog_command_error(
+            mock_ctx, commands.BadArgument('Converting to "int" failed for "loud".')
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Couldn't read that" in embed.description
+        assert "`-volume <0-100>`" in embed.description
+
+    async def test_an_escaped_invoke_error_is_logged(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Every body has its own try/except, so a CommandInvokeError here means
+        _command_error itself failed; recording it on the span alone hides it."""
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "play"
+        original = RuntimeError("send failed")
+        with caplog.at_level(logging.ERROR):
+            await music_bot.cog_command_error(
+                mock_ctx, commands.CommandInvokeError(original)
+            )
+        assert "play raised outside its handler" in caplog.text
+        assert "RuntimeError: send failed" in caplog.text
+        mock_ctx.send.assert_not_awaited()
 
     async def test_a_dm_refusal_says_so(
         self, music_bot: MusicBot, mock_ctx: MagicMock

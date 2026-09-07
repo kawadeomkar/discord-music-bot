@@ -410,9 +410,8 @@ class MusicBot(commands.Cog):
             active.span.set_status(StatusCode.ERROR, str(error))
 
         # validate_commands sends its own message before raising CommandError.
+        usage = self._usage(ctx)
         if isinstance(error, commands.MissingRequiredArgument):
-            cmd = ctx.command
-            usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
             await ctx.send(
                 embed=notice_embed(
                     f"Missing argument: `{error.param.name}`."
@@ -423,6 +422,25 @@ class MusicBot(commands.Cog):
         elif isinstance(error, commands.FlagError):
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
+            )
+        elif isinstance(error, commands.UserInputError):
+            # Every other parse failure (a bad converter, too many arguments):
+            # the body never ran, so nothing else answers.
+            await ctx.send(
+                embed=notice_embed(
+                    f"Couldn't read that: {error}"
+                    + (f"\nUsage: {usage}" if usage else ""),
+                    discord.Color.red(),
+                )
+            )
+        elif isinstance(error, commands.CommandInvokeError):
+            # Every body owns its try/except, so reaching here means the failure
+            # escaped _command_error itself; the span alone would hide it.
+            cmd = ctx.command.name if ctx.command else "command"
+            log.error(
+                f"{cmd} raised outside its handler: "
+                f"{type(error.original).__name__}: {error.original}",
+                exc_info=error.original,
             )
         elif isinstance(error, commands.CommandOnCooldown):
             await ctx.send(
@@ -446,6 +464,14 @@ class MusicBot(commands.Cog):
                     discord.Color.orange(),
                 )
             )
+
+    @staticmethod
+    def _usage(ctx: commands.Context) -> str:
+        """`-name <signature>` as inline code, or "" without a command."""
+        cmd = ctx.command
+        if cmd is None:
+            return ""
+        return f"`{ctx.prefix}{cmd.name} {cmd.signature}`".replace(" `", "`")
 
     async def validate_commands(self, ctx: commands.Context) -> None:
         """before_invoke hook: rejects the command with a user-facing message
