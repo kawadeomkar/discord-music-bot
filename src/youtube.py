@@ -292,11 +292,17 @@ _YTDL_BASE_OPTS = {
 # -vn discards the picture, and plain `best` would stream ~120 MB of 1080p per
 # song where 360p (itag 18 / HLS 93) carries the same mp4a audio. Bare `best` is
 # the last rung, for videos with nothing ≤360p.
+# playlist_items caps what a collection URL extracts: `noplaylist` applies only
+# to a watch URL carrying `list=`, so a channel tab, a search-results page or a
+# SoundCloud profile otherwise extracts every entry in full for the one that
+# yt_source keeps. `ytsearch:` returns one result and is unaffected.
+# See docs/ARCHITECTURE.md#extraction-bounds.
 _YTDL_STREAM_OPTS = {
     **_YTDL_BASE_OPTS,
     "format": "bestaudio/best[height<=360]/best",
     "check_formats": False,
     "retries": 10,
+    "playlist_items": "1",
 }
 
 # yt_source's unified extraction: one stream-opts call returns identity AND a

@@ -609,6 +609,37 @@ class TestUrlAnchoring:
         assert with_scheme("https://a.b/c") == "https://a.b/c"
 
 
+class TestSearchPrefixes:
+    """yt-dlp's `<key>search(all|N):` grammar typed by a user is text to search
+    for. `all` and N would otherwise extract that many results in full."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("ytsearchall:a.b/c", "ytsearch:a.b/c"),
+            ("ytsearch5:cats", "ytsearch:cats"),
+            ("scsearch3:lofi beats", "ytsearch:lofi beats"),
+            ("ytsearch:cats", "ytsearch:cats"),
+            ("YTSEARCHALL: shouting", "ytsearch:shouting"),
+        ],
+    )
+    def test_prefix_is_stripped_and_the_rest_searched(
+        self, text: str, expected: str
+    ) -> None:
+        result = parse_input(text)
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == expected
+        assert result.url is None
+
+    @pytest.mark.parametrize("text", ["research: the song", "scsearch: lofi"])
+    def test_other_search_words_are_untouched(self, text: str) -> None:
+        """Only the ytsearch key is stripped bare; another key's bare form is
+        inert behind the `ytsearch:` wrapper, so the words are searched as typed."""
+        result = parse_input(text)
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == f"ytsearch:{text}"
+
+
 class TestNormalizeQueryHost:
     @pytest.mark.parametrize(
         "raw,expected",

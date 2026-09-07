@@ -451,6 +451,15 @@ class TestYTDLOpts:
     def test_noplaylist_is_true(self) -> None:
         assert YTDL_OPTS["noplaylist"] is True
 
+    def test_single_song_extraction_is_bounded_to_one_entry(self) -> None:
+        """noplaylist covers only a watch URL with `list=`; a channel tab or a
+        search-results page is a playlist to yt-dlp and would extract every entry
+        in full for the one yt_source keeps. Both single-song profiles carry the
+        cap; the playlist profile must NOT, or -play <playlist> queues one song."""
+        assert _YTDL_STREAM_OPTS["playlist_items"] == "1"
+        assert _YTDL_STREAM_SEARCH_OPTS["playlist_items"] == "1"
+        assert "playlist_items" not in _YTDL_PLAYLIST_OPTS
+
     def test_source_address_is_ipv4_any(self) -> None:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 

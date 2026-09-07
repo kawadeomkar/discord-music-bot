@@ -52,6 +52,15 @@ def with_scheme(url: str) -> str:
     return f"https://{url}"
 
 
+# yt-dlp's search-prefix grammar (`ytsearch:`, `ytsearchall:`, `scsearch5:`).
+# Typed by a user it is text to search for, never an instruction to yt-dlp:
+# `all` and N extract that many results in full. Only the ytsearch key is
+# matched bare, so "research: x" stays a search for those words.
+_SEARCH_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(?:ytsearch(?:all|\d+)?|[a-z]+search(?:all|\d+)):", re.IGNORECASE
+)
+
+
 def parse_timestamp(raw: str) -> Optional[int]:
     """Seconds from a YouTube `t`/`ts` value (bare seconds or the colon-free
     HMS form), or None. Never raises: an unparseable timestamp must degrade to
@@ -380,7 +389,8 @@ def parse_input(user_input: str) -> Union[SpotifySource, YTSource, SoundcloudSou
             return parse_url(text)
         except ValueError:
             pass
-    ytsearch = text
+    # A yt-dlp search prefix is stripped: the remainder is what the user meant.
+    ytsearch = _SEARCH_PREFIX_RE.sub("", text, count=1).strip()
     return YTSource(
         ytsearch=f"ytsearch:{ytsearch}",
         process=True,
