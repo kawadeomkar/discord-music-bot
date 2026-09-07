@@ -225,6 +225,28 @@ class YtdlpPool:
         except Exception as e:
             log.debug(f"discarding broken {self._name} pool raised: {e}")
 
+    def reset(self, reason: str) -> None:
+        """Discard the live executor and terminate its workers; the next run()
+        spawns fresh ones. For a call the caller has given up on: an executor
+        cannot cancel running work, so on a one-worker pool a hung call holds
+        the only slot for the life of the process. No-op when nothing is
+        spawned or the pool is closed."""
+        with self._lock:
+            if self._closed or self._executor is None:
+                return
+            executor, self._executor = self._executor, None
+            generation = self._generation
+        log.warning(
+            f"{self._name} pool #{generation} reset ({reason}) — terminating its "
+            "workers; the next call spawns fresh ones"
+        )
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+            if isinstance(executor, ProcessPoolExecutor):
+                executor.terminate_workers()
+        except Exception as e:
+            log.debug(f"discarding reset {self._name} pool raised: {e}")
+
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """Run `fn(*args)` in the pool, healing a broken pool once (a worker
         killed by OOM breaks the executor permanently); a second failure

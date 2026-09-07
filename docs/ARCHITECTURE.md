@@ -340,7 +340,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `POSTGRES_URL` | No | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). Unset → the entire Postgres tier is off (no outbox writes, no drainer, pre-Postgres read behavior) |
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
-| `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
+| `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER: a `ProcessPoolExecutor` cannot cancel a running call, so the abandoned render is left to finish into the cache for one more span of this length, after which the chart pool is reset and its worker terminated (see [Analytics rendering](#analytics-rendering)) |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC endpoint (default `http://localhost:4317`) |
 | `OTEL_SDK_DISABLED` | No | `true` disables telemetry entirely (tests set this) |
@@ -1949,6 +1949,20 @@ only when the argument is not MISSING, so both NP edit sites passing neither
 `attachments=` nor `files=` is what preserves the file — pinned by a test. If the
 re-send case ever does fail, dropping `set_image` for a bare attachment is the known
 fallback and costs only the layout.
+
+**An abandoned render is given one grace period, then its worker is killed.** The
+caller's deadline bounds the caller only — `ProcessPoolExecutor` cannot cancel a running
+call — so `render_chart` hands the still-running task to `cache_late_render`, which lets
+a slow render finish into the PNG cache (a pool at capacity could otherwise never fill
+it: every caller would time out on work that kept completing unseen). That watcher is
+itself bounded by `LATE_RENDER_GRACE_SECS`, the same span again. A render still running
+after both is a hung worker, and on a `max_workers=1` pool it holds the only slot, so
+every later `-analytics` in every guild would queue behind it for the life of the
+process. The watcher cancels the render task first — `YtdlpPool.run()` heals a
+`BrokenProcessPool` by resubmitting once, and killing the worker under a live call would
+trigger exactly that resubmission — then calls `YtdlpPool.reset()`, which drops the
+executor and `terminate_workers()`. The next render spawns a fresh worker and pays the
+cold path once.
 
 **The live-dashboard pattern was considered and declined.** `-ping` and `-debug` send a
 skeleton and edit it as probes land; applying that here does not fit, and the reasons

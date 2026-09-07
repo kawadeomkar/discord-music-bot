@@ -525,6 +525,23 @@ class TestAnalyticsCommand:
         await command_callback(MusicBot.analytics)(music_bot, mock_ctx, flags=_flags())
         mock_ctx.command.reset_cooldown.assert_called_once_with(mock_ctx)
 
+    async def test_a_failed_query_hands_the_slot_back_too(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """archive.analytics() raising — a read deadline, a schema error — reaches
+        the cog's handler as an error embed. The guild's cooldown slot goes back
+        with it: nothing was produced to rate-limit, and holding it refuses the
+        retry for 30s over a query that failed."""
+        archive = _fake_archive(_metrics())
+        archive.analytics = AsyncMock(side_effect=TimeoutError("read deadline"))
+        music_bot.history_archive = archive
+        mock_ctx.command.reset_cooldown = MagicMock()
+        await command_callback(MusicBot.analytics)(music_bot, mock_ctx, flags=_flags())
+        mock_ctx.command.reset_cooldown.assert_called_once_with(mock_ctx)
+        # The cog rendered the failure; the body did not swallow it.
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert embed.color == discord.Color.red()
+
     async def test_a_listed_window_renders_the_card(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -1022,6 +1039,53 @@ class TestPngCache:
                 await task
         assert setter.await_args is not None
         assert setter.await_args.args[2] == b"\x89PNGlate"
+
+    async def test_a_render_that_never_returns_resets_the_chart_pool(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The late-render watcher is bounded too. A worker that is still running
+        a full grace period after the caller's deadline is hung, and on a
+        one-worker pool it holds the only slot, so every later -analytics would
+        queue behind it forever. The render task is cancelled first — so run()'s
+        heal-once retry cannot resubmit the same call onto the fresh pool — and
+        the pool is reset, which terminates the worker."""
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def _hang(*_a: object, **_k: object) -> bytes:
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return b""
+
+        setter = AsyncMock()
+        music_bot.history_archive = _fake_archive(
+            _metrics(today_start_epoch=time.time())
+        )
+        with (
+            patch("src.chart_pool.chart_pool.run", _hang),
+            patch.object(chart_pool.chart_pool, "reset") as reset,
+            patch("src.analytics_card.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
+            patch("src.analytics_card.LATE_RENDER_GRACE_SECS", 0.01),
+            patch("src.analytics_card.analytics_png_get", AsyncMock(return_value=None)),
+            patch("src.analytics_card.analytics_png_set", setter),
+        ):
+            await command_callback(MusicBot.analytics)(
+                music_bot, mock_ctx, flags=_flags()
+            )
+            assert "file" not in mock_ctx.send.call_args[1]
+            for task in list(music_bot._restore_tasks):
+                await task
+        assert started.is_set()
+        assert cancelled.is_set()
+        reset.assert_called_once()
+        assert "hung" in reset.call_args.args[0]
+        setter.assert_not_awaited()
+        assert "resetting the chart pool" in caplog.text
+        assert any(r.levelname == "WARNING" for r in caplog.records)
 
     async def test_the_render_runs_inside_the_typing_indicator(
         self, music_bot: MusicBot, mock_ctx: MagicMock

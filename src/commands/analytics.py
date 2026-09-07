@@ -79,7 +79,13 @@ async def run(
         if metrics is None:
             with _tracer.start_as_current_span("analytics.query") as span:
                 span.set_attribute("analytics.days", days)
-                metrics = await archive.analytics(guild.id, days=days, top_n=TOP_N)
+                try:
+                    metrics = await archive.analytics(guild.id, days=days, top_n=TOP_N)
+                except Exception:
+                    # A query that failed produced nothing to rate-limit; the
+                    # cog's handler renders the error, the guild keeps its slot.
+                    refund_cooldown(ctx)
+                    raise
                 span.set_attribute("analytics.plays", metrics.plays)
             ttl = cache_ttl_secs(metrics)
             if ttl > 0:

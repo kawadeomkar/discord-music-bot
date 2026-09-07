@@ -58,6 +58,12 @@ if TYPE_CHECKING:
 
 
 log = get_logger(__name__)
+
+# How much longer cache_late_render waits for a render its caller abandoned
+# before treating it as hung and resetting the chart pool. The same span again:
+# the deadline already covers the cold path with room, so twice it is a hang.
+# See docs/ARCHITECTURE.md#analytics-rendering.
+LATE_RENDER_GRACE_SECS: Final[float] = ANALYTICS_RENDER_DEADLINE_SECS
 _tracer = trace.get_tracer(__name__)
 
 # The four windows -analytics answers, and the whole of its key space. A closed key
@@ -440,7 +446,8 @@ async def render_chart(
             )
             if not done:
                 # A ProcessPoolExecutor cannot cancel a running call, so the
-                # worker finishes regardless — it finishes into the cache.
+                # worker finishes regardless — it finishes into the cache, or
+                # cache_late_render frees the slot it is holding.
                 # See docs/ARCHITECTURE.md#analytics-rendering.
                 span.set_attribute("png.timed_out", True)
                 spawn_background(
@@ -469,13 +476,29 @@ async def cache_late_render(
     *,
     redis: Optional[aioredis.Redis],
 ) -> None:
-    """Store a chart whose caller already gave up on it.
+    """Store a chart whose caller already gave up on it, or free the worker.
+
+    Bounded by LATE_RENDER_GRACE_SECS. A render still not back after the
+    caller's deadline plus the grace is a hung worker, and on a one-worker pool
+    it holds the only slot, so every later -analytics queues behind it forever:
+    the render task is cancelled FIRST (so run()'s heal-once retry cannot
+    resubmit the same call) and the pool is reset, which terminates the worker.
 
     The TTL is recomputed here rather than captured: a render that overran the
     deadline may have crossed midnight, and cache_ttl_secs returns non-positive
     for exactly that, which skips the write."""
+    done, _ = await asyncio.wait({render}, timeout=LATE_RENDER_GRACE_SECS)
+    if not done:
+        log.warning(
+            f"analytics chart render still running "
+            f"{ANALYTICS_RENDER_DEADLINE_SECS + LATE_RENDER_GRACE_SECS:.0f}s after "
+            f"submission — treating the worker as hung and resetting the chart pool"
+        )
+        render.cancel()
+        chart_pool_mod.chart_pool.reset("analytics render hung")
+        return
     try:
-        png = await render
+        png = render.result()
     except Exception as e:
         log.warning(f"late analytics render failed: {type(e).__name__}: {e}")
         return

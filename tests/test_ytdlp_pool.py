@@ -348,6 +348,64 @@ class TestReplace:
         assert pool._executor is None
 
 
+class TestReset:
+    """The public discard for a call the caller gave up on: an executor cannot
+    cancel running work, so a hung one-worker pool otherwise holds its only slot
+    for the life of the process."""
+
+    def test_reset_discards_the_executor_and_the_next_acquire_rebuilds(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pool = YtdlpPool(executor_factory=_thread_pool_factory(), name="chart render")
+        try:
+            first = pool._acquire()
+            pool.reset("render hung")
+            assert pool.state.spawned is False
+            second = pool._acquire()
+            assert second is not first
+            assert pool.state.generation == 2
+            assert "chart render pool #1 reset (render hung)" in caplog.text
+            assert any(r.levelname == "WARNING" for r in caplog.records)
+        finally:
+            pool.shutdown(wait=False)
+
+    def test_reset_terminates_a_process_pools_workers(self) -> None:
+        # shutdown(wait=False) alone leaves a hung worker running its call until
+        # the process exits; terminate_workers() is what frees the slot.
+        executor = MagicMock(spec=ProcessPoolExecutor)
+        pool = YtdlpPool(executor_factory=lambda: executor)
+        pool._acquire()
+        pool.reset("hung")
+        executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        executor.terminate_workers.assert_called_once_with()
+
+    def test_reset_is_a_noop_when_nothing_was_spawned(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pool = YtdlpPool(executor_factory=_thread_pool_factory())
+        pool.reset("nothing to do")
+        assert pool.state.spawned is False
+        assert pool.state.generation == 0
+        assert "reset" not in caplog.text
+
+    def test_reset_after_shutdown_does_not_resurrect(self) -> None:
+        pool = YtdlpPool(executor_factory=_thread_pool_factory())
+        pool._acquire()
+        pool.shutdown(wait=False)
+        pool.reset("late")
+        assert pool.is_closed
+        with pytest.raises(PoolClosedError):
+            pool._acquire()
+
+    def test_reset_swallows_a_failing_shutdown(self) -> None:
+        executor = MagicMock(spec=Executor)
+        executor.shutdown.side_effect = OSError("already gone")
+        pool = YtdlpPool(executor_factory=lambda: executor)
+        pool._acquire()
+        pool.reset("hung")  # must not raise
+        assert pool._executor is None
+
+
 class TestShutdown:
     def test_shutdown_joins_and_marks_closed(self) -> None:
         executor = MagicMock(spec=Executor)
