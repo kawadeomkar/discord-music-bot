@@ -1188,19 +1188,29 @@ class TestLeaderboard:
     async def test_windowed_board_names_a_song_by_its_newest_title(
         self, archive: PostgresHistoryArchive
     ) -> None:
-        # The LATERAL that picks the title deliberately does NOT carry the cutoff:
-        # the totals are about the window, but the title is the song's current
-        # name. A play outside the window still supplies it.
+        """The LATERAL that picks the title carries the window's cutoff, like the
+        aggregate it resolves — so play_history_recent serves it — and that never
+        changes the answer: every in-window play is newer than every play outside
+        it, so the newest in-window play is the song's newest play. Three
+        titles, so the window edge falls between two of them: a cutoff that
+        excludes the oldest still shows the newest, and one that excludes the
+        newest excludes the song from the board rather than showing an older
+        title for it."""
         await archive.insert_batch(
             [
                 _play(url="u/1", title="Old Title", played_at=1000.0),
+                _play(url="u/1", title="Middle Title", played_at=5000.0),
                 _play(url="u/1", title="Renamed", played_at=9000.0),
             ]
         )
-        (song,) = (await archive.leaderboard(42, 10, since_epoch=8000.0)).songs
-        assert song.title == "Renamed"
         (song,) = (await archive.leaderboard(42, 10, since_epoch=500.0)).songs
-        assert song.title == "Renamed"
+        assert (song.title, song.plays) == ("Renamed", 3)
+        (song,) = (await archive.leaderboard(42, 10, since_epoch=4000.0)).songs
+        assert (song.title, song.plays) == ("Renamed", 2)
+        (song,) = (await archive.leaderboard(42, 10, since_epoch=8000.0)).songs
+        assert (song.title, song.plays) == ("Renamed", 1)
+        # Past the newest play the song is not a winner, so no leg runs for it.
+        assert (await archive.leaderboard(42, 10, since_epoch=9500.0)).songs == ()
 
     async def test_newest_requester_name_wins(
         self, archive: PostgresHistoryArchive

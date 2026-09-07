@@ -1132,9 +1132,13 @@ history for one that ranks on old plays alone. That worst case measured 111 ms a
 rows — still 8× better than the ordered-aggregate form. A
 `(guild_id, webpage_url, played_at DESC, id DESC)` index would turn the walk into an
 exact seek, at write amplification on an append-only table the drainer writes to
-continuously; not worth it at these numbers. The leg deliberately carries no cutoff:
-the totals are about the window, the title is the song's current name, so a play
-outside the window still supplies it (pinned by `test_windowed_board_names_a_song_by_its_newest_title`).
+continuously; not worth it at these numbers. The leg carries the same `played_at >= $3`
+cutoff as the aggregate, so the index range it walks is the window rather than the
+guild's whole history. That changes the cost, never the answer: a winner has at least
+one play inside the window, and every in-window play is newer than every play outside
+it, so the newest in-window play *is* the song's newest play — the title shown is its
+current name either way, and a window that excludes a song entirely excludes it from the
+board before the leg runs (pinned by `test_windowed_board_names_a_song_by_its_newest_title`).
 
 **Three bounds, because this is the pool's only user-triggered traffic.** `max_concurrency(1, guild)`
 serializes per guild; a 60 s Redis cache (`leaderboard:v{n}:{guild_id}:{days}:{top_n}`) collapses
