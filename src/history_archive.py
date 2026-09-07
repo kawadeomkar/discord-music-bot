@@ -2,33 +2,31 @@
 Postgres play-history archive — the durable long-term home for every played song.
 
 - HistoryArchive — the protocol the drainer and the backfill tool program against.
-- ArchiveReader — the read side MusicBot holds: -ping's liveness probe and
-  -leaderboard's aggregate. Deliberately separate, so write-surface fakes do not
-  grow a read method they would never call.
+- ArchiveReader — the read side MusicBot holds (-ping's probe, -leaderboard,
+  -analytics), kept apart so write-surface fakes never grow a read method.
 - PostgresHistoryArchive — asyncpg. Connects lazily so startup never blocks on
   Postgres; applies no DDL (migrations/ owns the schema, _ensure verifies it).
 - HistoryOutboxDrainer — Redis outbox STREAM → Postgres: replay this consumer's
   pending IDs → read new → INSERT ... ON CONFLICT DO NOTHING → XACK+XDEL by ID.
   At-least-once: a crash between insert and ack redelivers and play_history_dedup
-  collapses the replay. The playback loop never awaits Postgres. One task per
-  process but not one per deployment — the consumer group makes concurrent
-  drainers safe with no lease to win (`>` gives them disjoint entries; the
-  pending replay a shared set ON CONFLICT collapses).
+  collapses the replay. The playback loop never awaits Postgres. Concurrent
+  drainers are safe without a lease: `>` gives them disjoint entries and the
+  shared pending replay collapses on the index.
 
-Row mapping (HistoryEntry ↔ play_history row) lives here, not in guild_state.py:
-that module's contract is pure wire schema with no runtime imports.
+Row mapping (HistoryEntry ↔ play_history row) lives here, not in guild_state.py,
+whose contract is pure wire schema with no runtime imports.
 
 The outbox is non-evictable, so anything that stalls the drain grows a Redis key
 that eventually refuses every write in the process. Each guard closes one door:
 
-  poison entry  blocks the batch behind it forever → prevented at construction
-                (HistoryEntry.__post_init__ clamps into the column domain);
-                _isolate parks what still will not insert in play_history_rejected
+  poison entry  blocks the batch behind it forever → HistoryEntry.__post_init__
+                clamps into the column domain; _isolate parks what still will
+                not insert in play_history_rejected
   hung server   a connected-but-unresponsive Postgres never returns, so there is
                 no exception and no alarm → command_timeout + DRAIN_DEADLINE_SECS
   two drainers  structural — XACK settles only the IDs this process archived
-  tombstone     body deleted while pending: the ID replays with no payload and
-                raises out of every handler → _settle_tombstones acks and logs it
+  tombstone     body deleted while pending: the ID replays with no payload →
+                _settle_tombstones acks and logs it
   stranded PEL  entries under a consumer name nothing reads → XAUTOCLAIM sweep
   dead drainer  the task dies unnoticed → _on_task_done respawn with damping
 
@@ -111,9 +109,8 @@ LIMIT $2
 """
 
 # ON CONFLICT against play_history_rejected_dedup makes this exactly-once: two
-# drainers can replay the same pending entry and both fail it. The table is
-# expected to stay empty forever and `just db-rejects` reports its contents, so
-# "3 rows" must read as three distinct failures, not one seen three times.
+# drainers can replay the same pending entry, and `just db-rejects` must report
+# three rows as three failures, not one seen three times.
 _REJECT_SQL = """
 INSERT INTO play_history_rejected (guild_id, error_type, error_detail, trace_id, payload)
 VALUES ($1, $2, $3, $4, $5)
@@ -124,16 +121,10 @@ ON CONFLICT ON CONSTRAINT play_history_rejected_dedup DO NOTHING
 # are excluded: each would merge unrelated plays into one top-10 row. $3 is the
 # period cutoff, to_timestamp(0) for all-time.
 #
-# Two passes, not one, and that is the load-bearing part: taking the display
-# name/title inline as `(array_agg(x ORDER BY ...))[1]` makes it an ORDERED
-# aggregate, which removes hash aggregation from the planner's options entirely
-# and cannot spill. Aggregating first and resolving the ten winners through
-# LATERAL keeps it a HashAggregate. The LATERAL walks back to each winner's
-# newest play, so a song ranking on old plays alone costs more than one still in
-# rotation — measured at 300k rows, 53ms typical against 111ms for that case,
-# both against 880ms for the ordered-aggregate form.
-# Full measurements and the index trade-off:
-# docs/ARCHITECTURE.md#history-archive-tier.
+# Two passes: aggregate first, then resolve the winners' display values through
+# LATERAL. Taking them inline as an ordered `array_agg(...)[1]` removes hash
+# aggregation from the planner's options (880ms against 53ms at 300k rows).
+# See docs/ARCHITECTURE.md#history-archive-tier.
 _TOP_REQUESTERS_SQL = """
 WITH top AS (
     SELECT requester_id,
@@ -187,17 +178,11 @@ ORDER BY t.played_secs DESC, t.plays DESC, t.webpage_url
 """
 
 # ── -analytics ────────────────────────────────────────────────────────────────
-# Seven aggregates over one guild-and-window slice, in one statement returning one
-# row of JSON. play_history_recent serves the predicate; no migration behind it.
-# See docs/ARCHITECTURE.md#analytics-rendering.
-#
-# $1 guild_id, $2 window in days, $3 bucket unit ('day' or 'week').
-#
-# The window is N COMPLETE units, [end - N, end), both edges on a UTC boundary, so
-# every bar covers a whole bucket and the artifact is immutable until the boundary
-# turns — which is what lets the cache TTL run to end of day. Buckets are UTC
-# because that is the frame played_at was written in.
-# Interpolated below so the array and every consumer of its length move together.
+# Seven aggregates over one guild-and-window slice, one statement, one JSON row.
+# $1 guild_id, $2 window in days, $3 bucket unit ('day' or 'week'). The window
+# is N COMPLETE UTC units, [end - N, end), so every bar covers a whole bucket
+# and the result is immutable until the boundary turns, which is what lets the
+# cache TTL run to end of day. See docs/ARCHITECTURE.md#analytics-rendering.
 _WAIT_PCT_SQL: Final[str] = ",".join(str(pct) for pct in WAIT_PERCENTILES)
 
 _ANALYTICS_SQL = f"""
@@ -298,8 +283,8 @@ SELECT
 """
 
 # The three text-keyed top-N branches stay out of the CTE so it can project
-# narrowly; resolving a display name needs a lateral to the winner's newest play.
-# $3/$4 are the window the main query resolved, so the clock is read once.
+# narrowly. $3/$4 are the window the main query resolved, so the clock is read
+# once.
 _ANALYTICS_TOP_LISTENERS_SQL = """
 SELECT t.requester_id, l.requester_name, t.plays, t.played_secs
 FROM (
@@ -322,7 +307,7 @@ CROSS JOIN LATERAL (
 ORDER BY t.played_secs DESC, t.plays DESC, t.requester_id
 """
 
-# No LATERAL: uploader IS the display name, so there is nothing to resolve.
+# No LATERAL: uploader IS the display name.
 _ANALYTICS_TOP_ARTISTS_SQL = """
 SELECT uploader, count(*) AS plays, sum(played_secs) AS played_secs
 FROM play_history
@@ -354,50 +339,32 @@ CROSS JOIN LATERAL (
 ORDER BY t.played_secs DESC, t.plays DESC, t.webpage_url
 """
 
-# Past this window the daily series downsamples to weeks — 371 days of whole weeks
-# is 53 bars. The switch rides the --days allowlist, so it has one known value.
+# Past this window the daily series downsamples to weeks (371 days is 53 bars).
 WEEKLY_BUCKET_MIN_DAYS: Final[int] = 365
 
 _SCHEMA_VERSION_SQL = "SELECT max(version) FROM schema_migrations"
 
 # Cap on the asyncpg message in play_history_rejected.error_detail: enough for
-# the SQLSTATE and the offending value, short enough not to bloat an empty table.
+# the SQLSTATE and the offending value.
 _REJECT_DETAIL_MAX = 2000
 
-# Per-statement bound. Covers what timeout=10 does not: a connection that
-# established fine against a server that then stops answering. A liveness bound,
-# not a latency target — a 100-row executemany is milliseconds.
+# Per-statement bound, covering a server that accepted the connection and then
+# stopped answering. A liveness bound, not a latency target.
 _COMMAND_TIMEOUT_SECS = 30.0
-# Wait for a free connection. The drainer, -ping's health probe and archive reads
-# share max_size=4, so a stuck consumer must not block everyone else unboundedly.
+# Wait for a free connection: the drainer, -ping and the readers share
+# max_size=4, so one stuck consumer must not block the rest unboundedly.
 _ACQUIRE_TIMEOUT_SECS = 10.0
-# Concurrent -leaderboard reads, against that same max_size=4. Reads are the only
-# user-triggered traffic on this pool and are unbounded across guilds
-# (max_concurrency serializes per guild, not globally), so without a cap a burst
-# takes every connection and the drainer's acquire starts timing out — measured:
-# 64 concurrent boards pushed insert_batch from 11.8ms to a 10s TimeoutError and
-# into backoff. Two leaves two, one for the drainer and one for -ping.
+# Concurrent user-triggered reads against that max_size=4. Unbounded across
+# guilds, a burst takes every connection and the drainer's acquire times out;
+# two leaves one for the drainer and one for -ping.
 _READ_CONCURRENCY = 2
-# Whole-operation bound for a read, covering the wait for a slot. Deliberately
-# well under command_timeout: a leaderboard that cannot answer in this long is
-# better failed than left holding a connection the drain needs.
+# Whole-operation bound for a read, including the wait for a slot. Well under
+# command_timeout: a read that cannot answer in this long is better failed than
+# left holding a connection the drain needs.
 _READ_DEADLINE_SECS = 15.0
-# Graceful pool shutdown before terminate(). Short: this runs on the shutdown
-# path, ahead of the Redis pool, discord.py's close and the span flush.
+# Graceful pool shutdown before terminate(). Short: it runs on the shutdown path
+# ahead of the Redis pool, discord.py's close and the span flush.
 _POOL_CLOSE_TIMEOUT_SECS = 5.0
-
-
-def _clamp_epoch(value: float) -> float:
-    """Epoch seconds inside the timestamptz domain HistoryEntry clamps to.
-
-    datetime.fromtimestamp raises OverflowError/OSError past the platform's
-    range, and NaN compares false against every bound — so an unclamped NaN
-    would slip through as an all-time cutoff rather than being rejected. No
-    caller can produce either today (the command validates --days first); this
-    matches the clamping every other conversion in the module already does."""
-    if not value > 0.0:  # False for NaN and for everything at or below the floor
-        return 0.0
-    return min(value, TS_MAX)
 
 
 def _entry_to_row(entry: HistoryEntry) -> tuple:
@@ -421,14 +388,9 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
 
 
 def _json(row: asyncpg.Record, key: str) -> list:
-    """One jsonb branch of the analytics row, as a list.
-
-    asyncpg has no default jsonb codec and this pool passes no `init=`, so the
-    value arrives as `str` — adding a codec would change behaviour for every other
-    caller of this pool. Every branch is `coalesce(..., '[]')` in SQL precisely so
-    this never sees None: `jsonb_agg` over zero rows returns SQL NULL, which would
-    raise here on a brand-new guild's very first -analytics.
-    """
+    """One jsonb branch of the analytics row, as a list. The pool sets no jsonb
+    codec, so the value arrives as `str`. Every branch coalesces to '[]' in SQL
+    (`jsonb_agg` over zero rows is NULL); the None arm is a backstop."""
     raw = row[key]
     if raw is None:
         return []
@@ -444,17 +406,12 @@ def _row_to_metrics(
     days: int,
     unit: str,
 ) -> AnalyticsMetrics:
-    """Decode one _ANALYTICS_SQL row plus its three top-N result sets.
-
-    Free of asyncpg types on the way OUT by design: what this returns is pickled to
-    a chart worker, so every value is an int, float, str or tuple of the frozen
-    guild_state records.
-    """
+    """Decode one _ANALYTICS_SQL row plus its three top-N result sets. Free of
+    asyncpg types on the way out: the result is pickled to a chart worker."""
     window_end = float(row["window_end"])
     first_play = float(row["first_play"])
-    # The requested window, clamped to what the archive actually covers. A 30-day
-    # frame that is 93% empty is a worse answer than a 2-day frame that says so —
-    # and the title names BOTH, so the requested number stays visible.
+    # The requested window clamped to what the archive covers; the title names
+    # both, so the requested number stays visible.
     archived = days
     if first_play > 0:
         archived = max(1, min(days, math.ceil((window_end - first_play) / 86400)))
@@ -471,8 +428,8 @@ def _row_to_metrics(
         unique_songs=int(row["unique_songs"]),
         unique_listeners=int(row["unique_listeners"]),
         unique_artists=int(row["unique_artists"]),
-        # Index 2 of p10/p25/p50/p75/p90. Empty means every queued_at in the window
-        # was the epoch-0 sentinel, which renders "unavailable" rather than 0s.
+        # Empty means every queued_at in the window was the epoch-0 sentinel,
+        # which renders "unavailable" rather than 0s.
         wait_p50_secs=(
             pcts[WAIT_MEDIAN_INDEX]
             if len(pcts) == len(WAIT_PERCENTILES)
@@ -570,9 +527,7 @@ class RequesterLeader:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongLeader:
     """One row of the -leaderboard songs board, grouped by webpage_url. title,
-    duration_secs and query_source are the most recent values seen for that URL —
-    one song can be reached several ways, and the LATERAL resolves the winners
-    against their newest play."""
+    duration_secs and query_source are the values of that URL's newest play."""
 
     title: str
     webpage_url: str
@@ -584,25 +539,18 @@ class SongLeader:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Leaderboard:
-    # Tuples, like GuildPlaybackSnapshot: frozen=True over a list would freeze
-    # the binding and leave the rows mutable.
+    # Tuples: frozen=True over a list would leave the rows mutable.
     requesters: tuple[RequesterLeader, ...]
     songs: tuple[SongLeader, ...]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ArchiveStats:
-    """What -debug's Postgres block shows. Sizes in bytes.
-
-    Row counts are planner ESTIMATES from pg_stat_user_tables, never COUNT(*):
-    play_history is unbounded by design, so an exact count is a full scan on the
-    largest table in the deployment for one line of a diagnostic embed.
-
+    """What -debug's Postgres block shows. Sizes in bytes. Row counts are
+    planner estimates from pg_stat_user_tables, never COUNT(*) — an exact count
+    is a full scan of the largest table for one line of a diagnostic embed.
     The counter fields are cumulative since pg_stat_reset; -debug samples twice
-    and renders their deltas over `monotonic`. Defaulted (unlike the originals)
-    so every existing construction keeps compiling — this never crosses a wire,
-    so the defaults are constructor compatibility, not wire-format tolerance.
-    """
+    and renders their deltas over `monotonic`."""
 
     database_bytes: int
     table_bytes: int
@@ -626,18 +574,13 @@ class ArchiveStats:
     monotonic: float = 0.0
 
 
-# One row, deliberately: this feeds one embed field and a second round trip buys
-# nothing. to_regclass + COALESCE rather than a bare relation name so a database
-# migrated past the version that owns these tables degrades to zeros instead of
-# raising UndefinedTable at the one moment an operator is trying to diagnose it.
-# The active_* FILTERs take client backends only: autovacuum also shows
-# state='active', but pg_stat_database's sessions counters (active_time → the
-# `busy` rate) count client sessions alone, and the two halves of -debug's load
-# row must agree. pid <> pg_backend_pid() or the probe reads itself as
-# permanent load ≥ 1 active. pg_stat_activity masks OTHER roles' state (NULL),
-# so the FILTERs undercount rather than error; every connection today is the
-# bot's own role. If a second role ever appears: GRANT pg_read_all_stats — do
-# not pre-grant it, the bot's role is deliberately minimal.
+# One row for one embed field. to_regclass + COALESCE so a database without
+# these tables degrades to zeros instead of UndefinedTable while an operator is
+# diagnosing it. The active_* FILTERs take client backends only, matching
+# pg_stat_database's session counters (the other half of -debug's load row),
+# and exclude pg_backend_pid() or the probe reads itself as permanent load.
+# pg_stat_activity masks other roles' state as NULL, so the FILTERs undercount
+# rather than error; every connection today is the bot's own role.
 _STATS_SQL = """
 SELECT
     pg_database_size(current_database())                        AS database_bytes,
@@ -705,8 +648,8 @@ LEFT JOIN pg_stat_database AS db ON db.datname = current_database()
 
 class ArchiveReader(Protocol):
     """What MusicBot needs from the archive: liveness for -ping's Postgres row
-    and the aggregate behind -leaderboard. Structural, like ping's ArchiveHealth
-    (which it satisfies), so the cog stays fake-able in tests."""
+    and the aggregates behind -leaderboard and -analytics. Structural, like
+    ping's ArchiveHealth (which it satisfies), so the cog stays fake-able."""
 
     async def health_check(self) -> None: ...
 
@@ -720,9 +663,8 @@ class ArchiveReader(Protocol):
 
 
 class HistoryArchive(Protocol):
-    """The archive surface the drainer (writes) and the backfill tool program
-    against — faked in unit tests, implemented by asyncpg below. recent() reads
-    the durable record; -history does not use it (see
+    """The write surface the drainer and the backfill tool program against.
+    recent() reads the durable record; -history does not use it (see
     docs/ARCHITECTURE.md#history-read-path)."""
 
     async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None: ...
@@ -739,11 +681,8 @@ class HistoryArchive(Protocol):
 
 
 class SchemaVersionError(RuntimeError):
-    """The database's schema is older than the code expects.
-
-    Its own type so callers can tell "run the migrations" (an operator action)
-    apart from "Postgres is down" (a wait).
-    """
+    """The database's schema is older than the code expects: "run the
+    migrations" (an operator action) as distinct from "Postgres is down"."""
 
 
 class PostgresHistoryArchive:
@@ -755,11 +694,11 @@ class PostgresHistoryArchive:
         self._pool: Optional[asyncpg.Pool] = None
         self._init_lock = asyncio.Lock()
         self._closed = False
-        # Per instance, not module-level: one archive owns one pool, and a
-        # shared counter would leak across tests that build several.
+        # Per instance: one archive owns one pool.
         self._read_slots = asyncio.Semaphore(_READ_CONCURRENCY)
-        # Taken in addition to _read_slots, which is what keeps the reader ceiling
-        # at the budget. This one serializes analytics inside it.
+        # Taken in addition to _read_slots, which keeps the reader ceiling at
+        # the budget; this one serializes analytics, the heaviest reader,
+        # inside it.
         self._analytics_slot = asyncio.Semaphore(1)
 
     async def _create_pool(self) -> asyncpg.Pool:
@@ -767,17 +706,15 @@ class PostgresHistoryArchive:
             self._url,
             min_size=1,
             max_size=4,
-            # Connect bound: a fast connect failure keeps the drainer's backoff
-            # loop responsive (asyncpg's default is 60s).
+            # Connect bound: a fast failure keeps the drainer's backoff loop
+            # responsive (asyncpg's default is 60s).
             timeout=10,
-            # Statement bound. Without it a server that accepts the connection
-            # then stops answering hangs executemany forever — no exception, so
-            # no backoff, no DEPTH_ALARM and not one log line while the outbox
-            # grows (the "hung server" guard in the module docstring).
+            # Statement bound: a server that accepts the connection then stops
+            # answering would otherwise hang executemany with no exception, no
+            # backoff and no log line while the outbox grows.
             command_timeout=_COMMAND_TIMEOUT_SECS,
-            # Prepared statements are per-connection, so PgBouncer in
-            # transaction-pooling mode breaks them; POSTGRES_STATEMENT_CACHE=0
-            # turns the cache off for that shape. Default matches asyncpg's own.
+            # Prepared statements are per-connection; POSTGRES_STATEMENT_CACHE=0
+            # for a transaction-pooling PgBouncer.
             statement_cache_size=config.POSTGRES_STATEMENT_CACHE,
             # Identifies this bot's connections in pg_stat_activity.
             server_settings={"application_name": "musicbot-history"},
@@ -785,14 +722,9 @@ class PostgresHistoryArchive:
 
     async def _ensure(self) -> asyncpg.Pool:
         """Lazy pool + schema-version check, double-checked under the lock.
-        First successful call wins; a failed attempt leaves no half-open pool.
-
-        Refuses after close() so a late caller cannot resurrect a pool nothing
-        will ever close again. _closed is re-checked under the lock and after
-        the awaits — close() can win any of those suspension points — and every
-        escape routes through the BaseException handler, so a just-built pool is
-        always closed by whoever built it.
-        """
+        Refuses after close(); _closed is re-checked under the lock and after
+        the awaits because close() can win any of those suspension points, and
+        every escape closes the pool it built."""
         if self._closed:
             raise RuntimeError("PostgresHistoryArchive is closed")
         if self._pool is not None:
@@ -808,9 +740,7 @@ class PostgresHistoryArchive:
                     if self._closed:  # close() ran during our awaits
                         raise RuntimeError("PostgresHistoryArchive is closed")
                 except BaseException:
-                    # Covers the version check, cancellation and the re-check
-                    # above — all three would leak a pool self._pool never
-                    # received and close() cannot see.
+                    # A pool self._pool never received is one close() cannot see.
                     await pool.close()
                     raise
                 self._pool = pool
@@ -819,13 +749,9 @@ class PostgresHistoryArchive:
     @staticmethod
     async def _assert_schema_version(conn: Any) -> None:
         """Verify the database carries the schema this build was written for.
-
-        A *newer* database is tolerated with a warning rather than refused:
-        migrations are additive, so an older bot reads a newer schema fine and
-        refusing would turn a rolled-back deploy into an outage. `conn` is Any
-        because the pool hands out a PoolConnectionProxy, not the
-        asyncpg.Connection asyncpg.connect() returns — duck-identical here.
-        """
+        A newer database is tolerated with a warning: migrations are additive,
+        and refusing would turn a rolled-back deploy into an outage. `conn` is
+        Any because the pool hands out a PoolConnectionProxy."""
         try:
             version = await conn.fetchval(_SCHEMA_VERSION_SQL)
         except asyncpg.exceptions.UndefinedTableError:
@@ -846,11 +772,8 @@ class PostgresHistoryArchive:
 
     async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None:
         """Insert oldest-first; replays and backfill overlap dedup via the
-        play_history_dedup unique index (ON CONFLICT DO NOTHING).
-
-        No conversion guard: HistoryEntry.__post_init__ already clamped every
-        field into this table's column domain — the schema lock — so
-        _entry_to_row cannot hand asyncpg a value it will not encode."""
+        play_history_dedup unique index. No conversion guard: __post_init__
+        already clamped every field into this table's column domain."""
         if not entries:
             return
         rows = [_entry_to_row(e) for e in entries]
@@ -872,21 +795,16 @@ class PostgresHistoryArchive:
         self, guild_id: int, limit: int, *, since_epoch: float = 0.0
     ) -> Leaderboard:
         """Top requesters and songs for one guild, ranked by total played_secs.
-
-        since_epoch 0.0 = all-time; epoch-0 unknown-time rows appear only there,
-        since any real cutoff excludes them by definition. Sentinel groups
-        (requester 0, url '') are excluded — see the SQL constants.
-
-        Bounded twice, because this is the pool's only user-triggered reader and
-        the drainer shares it. _read_slots keeps reads off the last connections
-        so a burst of commands cannot starve the writer, and the deadline covers
-        waiting for a slot as well as the queries — two statements on one
-        connection are otherwise bounded only by 2 x command_timeout, longer
-        than the drainer's whole DRAIN_DEADLINE_SECS.
-        """
+        since_epoch 0.0 = all-time, the only window epoch-0 rows appear in.
+        Bounded twice: _read_slots keeps a burst of commands off the drainer's
+        connections, and the deadline covers the wait for a slot as well as the
+        two statements (otherwise bounded only by 2 x command_timeout)."""
         if limit <= 0:
             return Leaderboard(requesters=(), songs=())
-        cutoff = datetime.fromtimestamp(_clamp_epoch(since_epoch), tz=timezone.utc)
+        # `> 0.0` is false for NaN, folding it into the all-time cutoff rather
+        # than past fromtimestamp's range.
+        clamped = min(since_epoch, TS_MAX) if since_epoch > 0.0 else 0.0
+        cutoff = datetime.fromtimestamp(clamped, tz=timezone.utc)
         async with asyncio.timeout(_READ_DEADLINE_SECS), self._read_slots:
             pool = await self._ensure()
             async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
@@ -921,16 +839,11 @@ class PostgresHistoryArchive:
         self, guild_id: int, *, days: int, top_n: int
     ) -> AnalyticsMetrics:
         """Every -analytics aggregate for one guild and one complete-days window.
-
-        Four statements on one connection: the CTE above, then the three text-keyed
-        top-N branches, which take the window the CTE already resolved rather than
-        reading the clock again — so the buckets, the footer and the cache TTL can
-        never disagree about when the day turned.
-
-        Two semaphores, in this order: _analytics_slot serializes analytics, then
-        _read_slots counts it against the budget leaderboard() draws on, which keeps
-        the reader ceiling where the drainer and -ping expect it. The caller must
-        release before rendering."""
+        Four statements on one connection: the CTE, then the three top-N
+        branches over the window the CTE resolved, so the buckets, the footer
+        and the cache TTL agree on when the day turned. _analytics_slot
+        serializes analytics, then _read_slots counts it against the reader
+        budget. The caller must release before rendering."""
         unit = "week" if days >= WEEKLY_BUCKET_MIN_DAYS else "day"
         async with (
             asyncio.timeout(_READ_DEADLINE_SECS),
@@ -941,9 +854,8 @@ class PostgresHistoryArchive:
             async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
                 row = await conn.fetchrow(_ANALYTICS_SQL, guild_id, days, unit)
                 if row is None or not row["n_rows"]:
-                    # No second round trip for a guild with nothing in the window:
-                    # three top-N queries over an empty slice are three index probes
-                    # that can only return nothing.
+                    # Nothing in the window: the top-N queries could only
+                    # return nothing.
                     return AnalyticsMetrics(
                         days=days,
                         bucket_unit=unit,
@@ -974,24 +886,15 @@ class PostgresHistoryArchive:
         wire: Optional[bytes] = None,
     ) -> None:
         """Park one refused play in play_history_rejected. Best-effort and
-        TERMINAL: never retries, never recurses — a rejects table that can fail
-        into a retry loop is worse than none, so a failed insert goes to the log
-        and the caller moves on. Only reachable on a REJECTION, which means the
-        server is up; an outage leaves the entry on the outbox to redeliver.
-
-        error_detail is text and asyncpg messages echo the offending value, so it
-        is NUL-scrubbed and capped: the same poison this table exists to record
-        would otherwise fail the insert recording it. payload is bytea and takes
-        the delivered `wire` bytes verbatim, never a re-serialized entry — in a
-        mixed-version rollout an entry written by a NEWER build carries fields
-        this parser drops, so the record would be a lossy re-encoding, and since
-        the dedup identity is an md5 of payload, one entry seen by two builds
-        lands as two rows in a table whose row count must be a failure count.
-        Falls back to re-serializing when the caller has no wire bytes.
-        """
+        terminal: never retries, a failed insert goes to the log. Reachable
+        only on a rejection, so the server is up. error_detail is NUL-scrubbed
+        and capped, or the poison being recorded fails the record. payload is
+        the delivered `wire` verbatim: a newer build's entry re-serialized by
+        this parser would be lossy, and the dedup identity is an md5 of payload,
+        so one entry seen by two builds would count as two failures."""
         detail = str(error).replace("\x00", "")[:_REJECT_DETAIL_MAX]
-        # serialize_history_entry cannot raise: `entry` was constructed, so
-        # __post_init__ already proved it orjson-encodable.
+        # serialize_history_entry cannot raise: __post_init__ already proved the
+        # entry orjson-encodable.
         payload = wire if wire is not None else serialize_history_entry(entry)
         try:
             pool = await self._ensure()
@@ -1011,15 +914,10 @@ class PostgresHistoryArchive:
             )
 
     async def stats(self) -> ArchiveStats:
-        """Size, row estimates, connection/cache state and cumulative counters,
-        for -debug's Postgres block. Raises on any failure — the caller renders
-        the degraded row. -debug calls this TWICE per snapshot, bracketing its
-        sampling window, and rates the counter fields over `monotonic`.
-
-        Bounded through _read_slots and the read deadline like leaderboard(): this
-        is user-triggered and shares the pool the drainer writes through, and a
-        diagnostic command must never be the thing that starves the archive.
-        """
+        """Size, row estimates, connection/cache state and cumulative counters
+        for -debug's Postgres block, which calls this twice per snapshot and
+        rates the counters over `monotonic`. Raises on failure. Bounded like
+        leaderboard(): a diagnostic must never starve the archive."""
         async with asyncio.timeout(_READ_DEADLINE_SECS), self._read_slots:
             pool = await self._ensure()
             async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
@@ -1048,35 +946,20 @@ class PostgresHistoryArchive:
         )
 
     async def health_check(self) -> None:
-        """Prove the archive's database is reachable and answering. Raises on any
-        failure — -ping's probe_postgres times it and turns that into a red row.
-
-        Connects if nothing has yet: the pool is lazy, so before the first song
-        end it is simply absent and reporting "not configured" for an enabled
-        tier would be a lie an operator acts on. _ensure's timeout=10 outlasts
-        PING_DEADLINE_SECS (3s), so the first -ping of a cold bot can render one
-        red row for a healthy-but-slow connect; it self-corrects next tick, and
-        widening the deadline would delay every OTHER row's first render.
-
-        SELECT 1 rather than a table read: this asks "is the server answering",
-        not "is the schema right" — _ensure's version check settled that.
-        """
+        """Is the server answering? Raises on failure — -ping's probe times it
+        into a red row. Connects if nothing has yet: before the first song end
+        the lazy pool is absent, and "not configured" for an enabled tier would
+        be a lie. SELECT 1, not a table read: _ensure settled the schema."""
         pool = await self._ensure()
         async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
             await conn.execute("SELECT 1")
 
     async def close(self) -> None:
-        """Close the pool. Terminal: _ensure() refuses afterwards.
-
-        _closed is set first so new callers are turned away immediately, then the
-        init lock is taken so an _ensure() already inside its connect cannot hand
-        a fresh pool to a field nobody will read again. That wait can cost up to
-        the 10s connect timeout, which is the price of not leaking a live pool.
-
-        Keep MusicBotApp.close()'s order — drainer.stop() strictly before this —
-        so the final drain can still reach Postgres. It no longer implies
-        exclusivity: health_check() gave -ping a caller shutdown cannot sequence.
-        """
+        """Close the pool. Terminal: _ensure() refuses afterwards. _closed is set
+        first so new callers are turned away, then the init lock is taken so an
+        _ensure() mid-connect cannot hand a pool to a field nobody reads again
+        (up to the 10s connect timeout). MusicBotApp.close() runs
+        drainer.stop() before this so the final drain can reach Postgres."""
         self._closed = True
         async with self._init_lock:
             pool, self._pool = self._pool, None
@@ -1088,12 +971,9 @@ class PostgresHistoryArchive:
                 pool.terminate()  # don't leave sockets behind on the way out
                 raise
             except Exception as e:
-                # A graceful close waits for in-flight queries, which a hung
-                # server never allows: measured at 30s, and it RAISED — aborting
-                # every remaining step of MusicBotApp.close() (Redis pool open,
-                # discord.py unclosed, yt-dlp left to its 61s atexit join, no
-                # spans flushed). terminate() is synchronous and unconditional;
-                # closing an archive must not take shutdown down with it.
+                # A graceful close waits on in-flight queries a hung server
+                # never releases; raising here would abort every later step of
+                # MusicBotApp.close(). terminate() is synchronous.
                 pool.terminate()
                 log.warning(
                     f"history archive pool close forced: {type(e).__name__}: {e}"
@@ -1101,35 +981,21 @@ class PostgresHistoryArchive:
 
 
 # Errors meaning "this data will never be accepted", not "try again later".
-# Expected UNREACHABLE since the schema lock (HistoryEntry.__post_init__); kept
-# as the backstop for a validator regression or an unexpected schema, where
-# dropping a whole batch would turn a one-row bug into a hundred-play loss.
+# Expected unreachable since HistoryEntry.__post_init__ clamps into the column
+# domain; the backstop for a validator regression or an unexpected schema.
 #
 #   DataError             SQLSTATE 22xxx server-side data rejections
-#                         (CharacterNotInRepertoireError for NUL bytes,
-#                         NumericValueOutOfRangeError, …)
-#   CheckViolationError   23514, and not a DataError — both inherit from
-#   NotNullViolationError IntegrityConstraintViolationError; without both arms a
-#                         CHECK violation wedges the drain head permanently
-#   UndefinedColumnError  42703, schema drift — the DATABASE is older than this
-#                         build, which migrate() cannot see (it skips a version
-#                         already in the ledger without reading the file). Left
-#                         transient it fails EVERY insert and redelivers forever
-#                         onto history:outbox, which has no TTL and is exempt from
-#                         eviction, ending in a Redis OOM that rejects all writes
+#   CheckViolationError   23514 — not a DataError, and without it a CHECK
+#   NotNullViolationError violation wedges the drain head permanently
+#   UndefinedColumnError  42703 — the database is older than this build, which
+#                         migrate() cannot see. Treated as transient it would
+#                         redeliver forever onto the non-evictable outbox
 #
-# Deliberately not here — each would break the drain:
-#   - UndefinedTableError: the isolation path writes to play_history_rejected,
-#     which a build that cannot see play_history usually cannot see either — the
-#     rejection insert raises and nothing settles.
-#   - UniqueViolationError: play_history_dedup is the ON CONFLICT target, so it
-#     cannot surface; catching it hides a genuine index bug.
-#   - bare ValueError / TypeError: asyncpg raises them for whole-statement
-#     problems and unencodable values, but so does an ordinary bug anywhere in
-#     insert_batch — a refactor would dead-letter a healthy batch.
-#   - anything OSError-shaped (InterfaceError, ConnectionResetError,
-#     TimeoutError): that is how a restart or failover presents, so it would
-#     delete healthy history on every outage.
+# Not here, each would break the drain: UndefinedTableError (the rejection
+# insert cannot land either), UniqueViolationError (the ON CONFLICT target;
+# catching it hides an index bug), bare ValueError/TypeError (an ordinary bug
+# in insert_batch would dead-letter a healthy batch), and anything
+# OSError-shaped (a restart or failover would delete healthy history).
 _POISON = (
     asyncpg.exceptions.DataError,
     asyncpg.exceptions.CheckViolationError,
@@ -1140,60 +1006,43 @@ _POISON = (
 
 class HistoryOutboxDrainer:
     """The one task per process that drains the Redis outbox into the archive.
-
-    Wakes on notify() (set by every outbox push) with a periodic fallback tick,
-    drains in batches until the outbox is empty, and on archive/Redis failure
-    backs off exponentially while entries accumulate safely in the outbox
-    (persistent, non-evictable — see HISTORY_OUTBOX_KEY).
-
-    Not single-consumer, and does not need to be: the outbox is a stream consumer
-    group under a stable name, so a second instance (an overlapping k8s rollout,
-    a developer's bot on a shared REDIS_URL) reads disjoint new entries and
-    shares the pending set, which the archive's unique index collapses.
-    Exactly-once rejection recording comes from _REJECT_SQL's ON CONFLICT.
-    """
+    Wakes on notify() with a periodic fallback tick, drains in batches until the
+    outbox is empty, and on failure backs off exponentially while entries
+    accumulate in the outbox (persistent, non-evictable — see HISTORY_OUTBOX_KEY).
+    Not single-consumer: a second instance on the same consumer group reads
+    disjoint new entries and shares the pending set, which the archive's unique
+    index collapses; _REJECT_SQL's ON CONFLICT does the same for rejections."""
 
     BATCH_SIZE: int = 100
     TICK_SECS: float = 30.0
     DEPTH_ALARM: int = 10_000  # backlog that escalates the retry warning to ERROR
-    # Whole-cycle bound, belt to command_timeout's braces: covers connection
-    # acquisition, DNS re-resolution and anything else asyncpg does not bound, so
-    # any hang becomes a TimeoutError on _run's normal error path — which is what
-    # makes DEPTH_ALARM fire for hangs and not only for errors.
+    # Whole-cycle bound over command_timeout: covers connection acquisition and
+    # anything else asyncpg does not bound, so a hang becomes a TimeoutError on
+    # _run's error path and DEPTH_ALARM fires for hangs as well as errors.
     DRAIN_DEADLINE_SECS: float = 60.0
-    # Rate limit for the depth watchdog on the productive path. Matched to
+    # Rate limit for the depth watchdog on the productive path; matched to
     # TICK_SECS so a busy drain reports a growing backlog on an idle one's cadence.
     DEPTH_SAMPLE_INTERVAL_SECS: float = 30.0
-    # PEL sweep (reclaim_outbox_stale). Much slower than TICK_SECS: everything it
-    # catches is rare by construction, and it costs an XAUTOCLAIM scan.
+    # PEL sweep (reclaim_outbox_stale). Slow: what it catches is rare, and it
+    # costs an XAUTOCLAIM scan.
     SWEEP_INTERVAL_SECS: float = 300.0
-    # INVARIANT: must exceed DRAIN_DEADLINE_SECS * 1000. Under a shared consumer
-    # name "idle" is measured from last delivery, so a smaller value lets the
-    # sweep reclaim a live sibling's batch while it is still inserting.
+    # INVARIANT: must exceed DRAIN_DEADLINE_SECS * 1000. "idle" is measured from
+    # last delivery, so a smaller value lets the sweep reclaim a live sibling's
+    # batch while it is still inserting.
     SWEEP_MIN_IDLE_MS: int = 300_000
     # Bounds one sweep's work, and terminates the cursor loop under fakeredis,
     # which returns the last-scanned ID where real Redis returns "0-0".
     SWEEP_MAX_PASSES: int = 20
-    # Respawn damping for a drainer task that dies outside its own error handling.
-    # Short base because the first restart usually works; the cap keeps a
-    # hard-broken drainer from becoming a log flood.
+    # Respawn damping for a drainer task that dies outside its own error
+    # handling; the cap keeps a hard-broken drainer from flooding the log.
     RESTART_BASE: float = 5.0
     RESTART_MAX: float = 300.0
     # 0 = unbounded, the durability default. See config.HISTORY_OUTBOX_MAX.
     OUTBOX_MAX: int = config.HISTORY_OUTBOX_MAX
-    # Bounds one _enforce_cap pass's XRANGE. minid discovery needs the ID of the
-    # (page+1)-th oldest entry and XRANGE has no ID-only form, so the reply
-    # carries bodies: uncapped, a 500k backlog would haul the entire overage over
-    # the socket in one reply hundreds of MB wide. 10k entries ≈ 5 MB — a typical
-    # YouTube entry serializes to ~455-470 B, of which 45 B is the
-    # queued_at/queue_position pair and 18-32 B is query_source.
-    #
-    # Resident cost is a STEP, not that wire size: entries pack into listpack nodes
-    # bounded by stream-node-max-bytes (4096), and the step is the ALLOCATOR BIN the
-    # node lands in. Measured on redis:7-alpine at 1-byte resolution: ~548 B/entry
-    # up to 497 B of wire, a SPIKE to ~676 at 498-499 B exactly, then ~626 from
-    # 500 B on — a function of wire size alone, whatever the field values are.
-    # So 256 MB holds ~429k entries, ~397k for a shape on the spike.
+    # Bounds one _enforce_cap pass's XRANGE, which carries bodies (there is no
+    # ID-only form): uncapped, a 500k backlog would haul the whole overage over
+    # the socket in one reply. 10k entries ≈ 5 MB on the wire; resident cost per
+    # entry steps with the allocator bin (~548 B, ~626 B from 500 B of wire).
     # See docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
@@ -1210,19 +1059,16 @@ class HistoryOutboxDrainer:
         self._stopping = False
         self._restart_delay = self.RESTART_BASE
         self._respawn_handle: Optional[asyncio.TimerHandle] = None
-        # Monotonic deadline for the next PEL sweep. None = due now (start()).
+        # Monotonic deadlines; None = due now (start()).
         self._next_sweep: Optional[float] = None
-        # Same, for the depth watchdog's productive-path rate limit.
         self._next_depth_sample: Optional[float] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         self._stopping = False
-        # _stopped too: stop() latches it forever, so a start-after-stop would
-        # spawn a live _run that the next stop() returns early from without
-        # cancelling — a leaked task draining after teardown, claiming entries
-        # into a PEL nothing acks until the sweep reclaims them.
+        # stop() latches _stopped; without this reset a start-after-stop would
+        # spawn a _run the next stop() returns early from without cancelling.
         self._stopped = False
         self._restart_delay = self.RESTART_BASE
         self._spawn()
@@ -1233,10 +1079,8 @@ class HistoryOutboxDrainer:
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
         """Supervision. _run only ever exits via cancellation, so any exception
-        here is a bug — one that leaves the non-evictable outbox growing with
-        nothing draining it. Log loudly, then restart with exponential damping
-        rather than staying dead.
-        """
+        here is a bug that leaves the non-evictable outbox growing: log loudly
+        and restart with exponential damping."""
         if self._stopping or task.cancelled():
             return
         exc = task.exception()
@@ -1263,20 +1107,11 @@ class HistoryOutboxDrainer:
         self._wake.set()
 
     async def stop(self, timeout: float = 5.0) -> None:
-        """Cancel the loop, then make one bounded final-drain attempt so a clean
-        shutdown ships whatever a healthy Postgres can take. Never raises —
-        anything left simply stays in the outbox for the next start.
-
-        Reentrancy is a correctness property: discord.py calls close() from
-        run()'s finally as well as on demand, so a second call is ordinary, and
-        the lock makes that caller WAIT for the first rather than return early
-        into a still-draining shutdown.
-
-        Under a shared consumer name the final drain's pending replay returns a
-        live peer's in-flight batch, so a departing process duplicates the
-        survivor's work rather than complementing it — harmless (dedup plus an
-        idempotent XACK), but shutdown does more work in the overlap window.
-        """
+        """Cancel the loop, then one bounded final-drain attempt. Never raises;
+        anything left stays in the outbox for the next start. Reentrant:
+        discord.py calls close() from run()'s finally as well as on demand, and
+        the lock makes a second caller wait for the first rather than return
+        early into a still-draining shutdown."""
         async with self._stop_lock:
             if self._stopped:
                 return
@@ -1294,12 +1129,9 @@ class HistoryOutboxDrainer:
                 except asyncio.CancelledError:
                     pass
                 except Exception as e:
-                    # The task can already be FINISHED-with-exception rather
-                    # than cancellable: _on_task_done leaves self._task pointing
-                    # at the failed task while a respawn is pending, so awaiting
-                    # it re-raises whatever killed it. Catching only
-                    # CancelledError lets that escape stop() and skip the final
-                    # drain below.
+                    # A task that already finished with an exception (respawn
+                    # pending) re-raises it here; letting that escape would
+                    # skip the final drain below.
                     log.warning(f"history drainer task ended in error: {e}")
             try:
                 async with asyncio.timeout(timeout):
@@ -1319,19 +1151,13 @@ class HistoryOutboxDrainer:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # The cap must also be enforced here, not only on _drain_batch's
-                # success tail: that one is unreachable for the whole duration of
-                # a Postgres outage — every failure raises before it — so a cap
-                # evaluated only on cycles that delivered never fires while the
-                # backlog is actually growing, the one scenario it exists for.
-                # Depth is an O(1) XLEN, no Postgres.
-                #
-                # This is the failure arm, precisely the state where a batch is
-                # delivered and unacked, and _enforce_cap deliberately trims
-                # across the PEL (its docstring says why refusing would make the
-                # cap a no-op exactly here). ACCEPTED because settlement covers
-                # it: everything the cap destroys is XACKed first, so a trimmed
-                # in-flight batch is dropped-and-logged, never a tombstone.
+                # The cap is enforced here as well as on _drain_batch's success
+                # tail, which is unreachable for the whole of a Postgres outage
+                # — the one scenario the cap exists for. Depth is an O(1) XLEN.
+                # The batch in flight is delivered and unacked here, and
+                # _enforce_cap trims across the PEL; safe because everything it
+                # destroys is XACKed first, so a trimmed in-flight batch is
+                # dropped-and-logged, never a tombstone.
                 await self._enforce_cap_quietly()
                 await self._log_retry(e, backoff)
                 await asyncio.sleep(backoff)
@@ -1339,25 +1165,18 @@ class HistoryOutboxDrainer:
                 continue
             backoff = self._BACKOFF_START
             if drained:
-                # A cycle that delivered proves the drainer is healthy, so the
-                # respawn damping starts over from the base delay.
+                # A cycle that delivered proves the drainer healthy.
                 self._restart_delay = self.RESTART_BASE
-                # Sample here too, or the alarm cannot fire in the case its own
-                # message describes: "keeping up but not catching up" is a
-                # succeeding drain, which takes this branch every time — so with
-                # the sample only below, a backlog growing faster than BATCH_SIZE
-                # per cycle logged nothing at all, forever.
+                # "Keeping up but not catching up" is a succeeding drain that
+                # takes this branch every time, so it must sample here too.
                 await self._sample_depth_if_due()
                 continue  # backlog: keep draining without waiting
-            # Idle — the drain settled everything it can. Sample on the success
-            # path: _log_retry only fires in the except arm, so without this a
-            # healthy drainer sitting on a growing outbox (or a stranded PEL)
-            # says nothing at all.
+            # Idle. _log_retry only fires in the except arm, so without this a
+            # healthy drainer on a growing outbox (or a stranded PEL) says nothing.
             await self._sample_depth()
-            # clear() only ever runs after wait() returns, so a notify() landing
-            # in that window is dropped — but the next iteration drains
-            # unconditionally, so the entry costs at most a TICK_SECS delay,
-            # never a loss.
+            # A notify() landing between wait() and clear() is dropped, but the
+            # next iteration drains unconditionally, so it costs at most one
+            # TICK_SECS delay.
             try:
                 async with asyncio.timeout(self.TICK_SECS):
                     await self._wake.wait()
@@ -1366,12 +1185,9 @@ class HistoryOutboxDrainer:
             self._wake.clear()
 
     async def _sweep_if_due(self) -> None:
-        """Periodic PEL housekeeping — see reclaim_outbox_stale().
-
-        Every SWEEP_INTERVAL_SECS, and once at the first cycle after start().
-        Non-fatal, but not optional either: besides XACK it is the only thing
-        that clears a tombstone on Redis 7 — hence the log, not a silent pass.
-        """
+        """PEL housekeeping every SWEEP_INTERVAL_SECS and once at the first
+        cycle after start() — see reclaim_outbox_stale(). Non-fatal, but
+        besides XACK it is the only thing that clears a tombstone on Redis 7."""
         loop = asyncio.get_running_loop()
         if self._next_sweep is not None and loop.time() < self._next_sweep:
             return
@@ -1387,39 +1203,27 @@ class HistoryOutboxDrainer:
             log.warning(f"history outbox PEL sweep failed: {e}")
             return
         if reclaimed or purged:
-            # INFO, not debug: a healthy drainer's own work is invisible here
-            # (_log_retry only runs on the failure path), so a stranded PEL being
-            # reclaimed would leave no trace at all.
+            # INFO: a healthy drainer's own work is invisible in the log, so a
+            # stranded PEL being reclaimed would otherwise leave no trace.
             log.info(
                 f"history outbox PEL sweep reclaimed {reclaimed} stale "
                 f"entries and purged {purged} tombstones"
             )
 
     async def _drain_once(self) -> int:
-        """One batch, under the whole-cycle deadline. Returns entries SETTLED.
-
-        Callers loop on the return value, so it must be forward progress, not
-        batch size: "batch was empty" is not a sufficient stop condition, because
-        a tombstone the cycle could not ack redelivers on every pass forever.
-        """
+        """One batch, under the whole-cycle deadline. Returns entries SETTLED —
+        callers loop on it, and "batch was empty" is not a sufficient stop
+        condition: a tombstone the cycle could not ack redelivers forever."""
         async with asyncio.timeout(self.DRAIN_DEADLINE_SECS):
             return await self._drain_batch()
 
     async def _read_batch(self) -> list[OutboxEntry]:
-        """Pending first, then new — and never both in one cycle.
-
-        FIFO within this drainer does not generalise: delivery across two live
-        drainers is disjoint, so entry N+1 can commit before entry N. The real reason
-        is a memory bound — the PEL stays within BATCH_SIZE x concurrent readers only
-        while a cycle never reads `>` with a non-empty PEL. Any future head-of-line-blocking fix,
-        whose natural shape is "keep draining new entries while the stuck batch
-        retries", breaks that bound and must re-derive the sizing.
-
-        NOGROUP is healed here, not only at startup: deleting a stream key
-        destroys its consumer groups, operators are told to DEL this key on
-        upgrade, and XADD recreates it groupless — after which every read fails
-        identically forever. Rebuild and retry once.
-        """
+        """Pending first, then new — never both in one cycle: the PEL stays
+        within BATCH_SIZE x concurrent readers only while a cycle never reads
+        `>` with a non-empty PEL, and the drainer's memory bound is sized on
+        that. NOGROUP is healed here, not only at startup: deleting the key
+        destroys its groups and XADD recreates it groupless, after which every
+        read fails identically forever. Rebuild and retry once."""
         for attempt in range(2):
             try:
                 pending = await read_outbox_pending(self._redis, self.BATCH_SIZE)
@@ -1437,18 +1241,12 @@ class HistoryOutboxDrainer:
         return []  # unreachable: the loop either returns or raises
 
     async def _drain_batch(self) -> int:
-        """Read a batch, insert it, settle it by ID.
-
-        No poison taxonomy: every entry here was produced by
-        HistoryEntry.__post_init__, which clamps into the play_history column
-        domain — except guild_id 0, which __post_init__ deliberately declines to
-        fix up. A refusal therefore means a validator regression, schema drift or an
-        unstamped guild_id, all bugs, and is handled as one: recorded to
-        play_history_rejected, dropped, batch continues. Corrupt entries (bytes
-        that do not parse) are dropped and still settled, since leaving them
-        wedges the queue head forever. Tombstones are separated out first: they
-        have no bytes to be corrupt.
-        """
+        """Read a batch, insert it, settle it by ID. Every entry was produced by
+        HistoryEntry.__post_init__, so a refusal is a validator regression,
+        schema drift or an unstamped guild_id (0, which __post_init__ declines
+        to fix up): recorded to play_history_rejected, dropped, batch continues.
+        Corrupt bytes are dropped and still settled, or they wedge the queue
+        head forever. Tombstones are separated out first: no bytes to parse."""
         batch = await self._read_batch()
         if not batch:
             return 0
@@ -1463,9 +1261,8 @@ class HistoryOutboxDrainer:
                 if entries:
                     await self._archive.insert_batch(entries)
             except _POISON:
-                # _isolate settles each entry as it goes, so the batch settle in
-                # the else-branch must not also run — try/except/else keeps the
-                # two settle paths structurally exclusive.
+                # _isolate settles each entry itself; try/except/else keeps the
+                # two settle paths exclusive.
                 await self._isolate(live, span)
             else:
                 await retire_outbox(self._redis, [e.id for e in live])
@@ -1474,18 +1271,11 @@ class HistoryOutboxDrainer:
             return settled
 
     async def _settle_tombstones(self, batch: list[OutboxEntry], span: Span) -> int:
-        """Ack and log entries whose body is gone. Returns how many.
-
-        A tombstone is delivered-but-deleted: XTRIM and any operator XDEL remove
-        bodies without consulting the PEL, so the ID replays with an empty field
-        map. Unrecoverable — a lost PLAY, logged at ERROR and counted apart from
-        a parse failure, which is recoverable in principle.
-
-        Unconditional ack is the point. Left pending, a tombstone is re-read
-        every cycle forever: the drainer never dies, so respawn supervision never
-        fires, nothing escalates past the backoff ceiling, and a non-evictable
-        key grows unbounded — a permanent silent stall.
-        """
+        """Ack and log entries whose body is gone. Returns how many. XTRIM and
+        an operator XDEL remove bodies without consulting the PEL, so the ID
+        replays with an empty field map — a lost PLAY, logged at ERROR. The ack
+        is unconditional: left pending, a tombstone is re-read every cycle
+        forever with no error to escalate, a permanent silent stall."""
         tombstones = [e.id for e in batch if e.wire is None]
         if not tombstones:
             return 0
@@ -1501,28 +1291,14 @@ class HistoryOutboxDrainer:
         return len(tombstones)
 
     async def _isolate(self, batch: list[OutboxEntry], span: Span) -> None:
-        """One batch refused: retry it row by row so one bad row costs one row,
-        not the 99 batched with it. Expected dead code, kept because dropping the
-        whole batch on a validator regression turns a one-row bug into a
-        hundred-play loss.
-
-        Takes the delivered entries, not parsed rows, and settles every element.
-        Both matter:
-
-        - Settle per entry, never once at the end. A transient error partway
-          through raises before an end-of-batch settle would run, redelivering
-          rows already recorded as rejected. Per entry also makes the pass
-          RESUMABLE, which matters because single inserts cost ~22x a batch
-          (measured: 15.7ms for executemany(100) vs 343ms for 100 singles), so on
-          a degraded server this can exceed DRAIN_DEADLINE_SECS and be cancelled.
-        - Iterate the batch, not what parsed. A corrupt element parses to None;
-          settling only what parsed leaves it delivered-and-unacked forever — the
-          wedge this path exists to prevent.
-
-        A transient error raises out of here, leaving the current entry and the
-        rest to redeliver; duplicate rejection rows are prevented by _REJECT_SQL's
-        ON CONFLICT, not by exclusivity.
-        """
+        """One batch refused: retry it row by row so one bad row costs one row.
+        Settles PER ENTRY, never once at the end — a transient error partway
+        through would redeliver rows already recorded as rejected, and singles
+        cost ~22x a batch, so on a degraded server this pass can exceed
+        DRAIN_DEADLINE_SECS and must be resumable. Iterates the delivered batch,
+        not what parsed: a corrupt element settled by neither path is
+        delivered-and-unacked forever. A transient error raises out, leaving the
+        rest to redeliver; _REJECT_SQL's ON CONFLICT absorbs the replay."""
         rejected = 0
         trace_id = trace_id_of(trace.get_current_span())
         for item in batch:
@@ -1541,39 +1317,26 @@ class HistoryOutboxDrainer:
                         f"drifted: {entry.title[:60]!r} / "
                         f"{entry.webpage_url[:80]}"
                     )
-            # else: corrupt, dropped as it always was — but still settled below.
+            # else: corrupt, dropped — but still settled below.
             await retire_outbox(self._redis, [item.id])
         span.set_attribute("drain.rejected", rejected)
 
     async def _enforce_cap(self) -> None:
-        """Opt-in outbox ceiling (config.HISTORY_OUTBOX_MAX, default off, where
-        the trade-off is documented). Dropping un-archived plays is data loss, so
-        every drop logs at ERROR.
+        """Opt-in outbox ceiling (config.HISTORY_OUTBOX_MAX, default off). Every
+        drop is data loss and logs at ERROR. Never runs while shutting down (a
+        departing process knows least about a live peer) and re-checks each
+        pass, so stop() halts a convergence loop in progress.
 
-        Never RUNS while SHUTTING DOWN: a departing process knows least about
-        what a live peer is doing. Re-checked each pass, so stop() also halts a
-        convergence loop already in progress.
+        ACK BEFORE TRIM: XTRIM does not consult the PEL, and trimming first
+        leaves an ID pending with no body — a tombstone, which replays forever.
+        A crash between the two leaves entries acked but not trimmed, reclaimed
+        next pass. The cap crosses the PEL on purpose: during an outage the
+        oldest entries are permanently in flight, so a clamp below the oldest
+        pending ID would trim nothing while the backlog grows.
 
-        ACK before TRIM. XTRIM does not consult the PEL: on real Redis 7.4.9,
-        five delivered-and-unacked entries survived `XTRIM MAXLEN 2` as pending
-        records while three bodies were destroyed, and trimming first leaves an
-        ID pending with no body — a tombstone, which replays forever. A crash
-        between the two leaves entries acked but not trimmed: invisible to
-        readers, reclaimed next pass.
-
-        The cap deliberately crosses the PEL. Refusing to is the one thing that
-        would make it useless: during an outage the cycle re-reads the same
-        pending batch every tick, so the oldest entries are permanently in flight
-        and a clamp below the oldest pending ID trims nothing while the backlog
-        grows. Their drainer still holds the parsed rows, so a later successful
-        insert archives them anyway.
-
-        PAGED until depth is back at the cap. The trim is one MINID command
-        however large the tranche and the ack set is bounded by BATCH_SIZE x live
-        drainers; only minid discovery scales with the backlog, since XRANGE has
-        no ID-only form and one COUNT=overage fetch would run unbounded past
-        DRAIN_DEADLINE_SECS. Hence CAP_PAGE.
-        """
+        Paged (CAP_PAGE) until depth is back at the cap: the trim is one MINID
+        command however large the tranche, but minid discovery is an XRANGE
+        that carries bodies, and one COUNT=overage fetch would run unbounded."""
         if not self.OUTBOX_MAX:
             return
         while not self._stopping:
@@ -1582,17 +1345,15 @@ class HistoryOutboxDrainer:
                 return
             over = depth - self.OUTBOX_MAX
             page = min(over, self.CAP_PAGE)
-            # The ID of the (page+1)-th oldest entry: everything strictly below
-            # it is this pass's tranche. Asking for one extra and taking the last
-            # turns a COUNT into an exclusive lower bound.
+            # The ID of the (page+1)-th oldest entry is this pass's exclusive
+            # upper bound: everything strictly below it is the tranche.
             oldest = cast(
                 list[tuple[bytes, dict[bytes, bytes]]],
                 await self._redis.xrange(HISTORY_OUTBOX_KEY, count=page + 1),
             )
             if len(oldest) <= page:
                 # Raced shorter than the page by a concurrent drain; the next
-                # pass's depth check settles whether anything is genuinely left
-                # over the cap.
+                # pass's depth check settles whether anything is left over.
                 return
             minid = cast(bytes, oldest[-1][0])
             in_flight = await outbox_pending_below(self._redis, minid)
@@ -1600,10 +1361,8 @@ class HistoryOutboxDrainer:
             dropped = await trim_outbox_below(self._redis, minid)
             if not dropped:
                 return
-            # XTRIM's RETURNED count, never the derived depth - OUTBOX_MAX: XLEN
-            # over-counts acked-but-undeleted entries, and under redis-py's
-            # approximate=True default a derived figure would claim drops while
-            # removing nothing.
+            # XTRIM's returned count, never depth - OUTBOX_MAX: XLEN over-counts
+            # acked-but-undeleted entries.
             log.error(
                 f"history outbox over cap (depth={depth}, HISTORY_OUTBOX_MAX="
                 f"{self.OUTBOX_MAX}); dropped {dropped} oldest entries — those "
@@ -1618,34 +1377,27 @@ class HistoryOutboxDrainer:
 
     async def _enforce_cap_quietly(self) -> None:
         """_enforce_cap for the failure path, where Redis may itself be what
-        broke. Never raises: the caller is already handling one error, and losing
-        its backoff to a second would turn a Redis blip into a hot retry loop."""
+        broke. Never raises: a second error would cost the caller its backoff
+        and turn a Redis blip into a hot retry loop."""
         try:
             await self._enforce_cap()
         except Exception as e:
             log.warning(f"history outbox cap check failed: {e}")
 
     async def _sample_depth_if_due(self) -> None:
-        """_sample_depth for the PRODUCTIVE path, rate-limited. An idle cycle can
-        sample every time because it costs a TICK_SECS wait, but a cycle that
-        drained `continue`s straight into the next batch — sampling there
-        unconditionally adds two Redis round trips per BATCH_SIZE entries for a
-        whole catch-up, on the Redis that also serves playback."""
+        """_sample_depth for the productive path, rate-limited: a cycle that
+        drained `continue`s straight into the next batch, and sampling there
+        unconditionally adds two round trips per BATCH_SIZE entries on the
+        Redis that also serves playback."""
         now = asyncio.get_running_loop().time()
         if self._next_depth_sample is not None and now < self._next_depth_sample:
             return
         await self._sample_depth()
 
     async def _sample_depth(self) -> None:
-        """Report a backlog on the success path too. _log_retry is the only other
-        reader of depth and runs exclusively in the failure arm, so a
-        healthy-but-behind drainer — or one on a stranded PEL — reported nothing
-        at all. Best-effort and silent when shallow: a watchdog, not a metric.
-
-        Stamps the rate-limit deadline itself so the idle and productive paths
-        share one clock; otherwise a drain alternating idle and busy cycles
-        samples on both and doubles the round trips it was limited to avoid.
-        """
+        """Report a backlog on the success path. Best-effort and silent when
+        shallow: a watchdog, not a metric. Stamps the rate-limit deadline itself
+        so the idle and productive paths share one clock."""
         self._next_depth_sample = (
             asyncio.get_running_loop().time() + self.DEPTH_SAMPLE_INTERVAL_SECS
         )
