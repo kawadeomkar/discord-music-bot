@@ -650,43 +650,51 @@ class GuildRedisStore:
 
     # Queue operations
 
-    @_guild_op(default=None)
-    async def push_queue(self, entry: QueueEntry) -> None:
+    # The four list-leg writers below return whether they LANDED, and the
+    # caller must check: memory has already moved, so a swallowed failure
+    # leaves the list disagreeing with it, which GuildQueue records as
+    # mirror_dirty and repairs at the next song start.
+
+    @_guild_op(default=False)
+    async def push_queue(self, entry: QueueEntry) -> bool:
         """RPUSH one queue entry and refresh TTL on all guild keys."""
         pipe = self.redis.pipeline()
         pipe.rpush(self.queue_key(), entry.to_redis())
         self._pipe_expire_all(pipe)
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> None:
+    @_guild_op(default=False)
+    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> bool:
         """RPUSH all entries in one round-trip and refresh TTL on all guild keys."""
         if not entries:
-            return
+            return True
         pipe = self.redis.pipeline()
         pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
         self._pipe_expire_all(pipe)
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
+    @_guild_op(default=False)
+    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> bool:
         """LPUSH entries so entries[0] ends up at the queue head — the -playnow
         front insert; reversed first because LPUSH sends each successive
-        argument to the head. A swallowed failure here leaves memory
-        len(entries) ahead of Redis at the HEAD, so later LPOPs retire other
-        songs' entries."""
+        argument to the head. A failure leaves memory len(entries) ahead of
+        Redis at the HEAD, so a later LPOP would retire another song's entry."""
         if not entries:
-            return
+            return True
         pipe = self.redis.pipeline()
         pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
         self._pipe_expire_all(pipe)
         await pipe.execute()
+        return True
 
-    @_guild_op(default=None)
-    async def pop_queue(self) -> None:
-        # At-most-once: LPOP has no ack, so a crash after this loses the song
-        # from Redis. Accepted — the in-memory deque is the source of truth.
+    @_guild_op(default=False)
+    async def pop_queue(self) -> bool:
+        """LPOP the head. At-most-once: LPOP has no ack, so a crash after this
+        loses the song from Redis; the in-memory deque is the source of truth."""
         await self.redis.lpop(self.queue_key())
+        return True
 
     def _now_playing_state_mapping(
         self,

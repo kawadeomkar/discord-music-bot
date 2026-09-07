@@ -295,8 +295,13 @@ class TestPushQueue:
         await store.push_queue(_entry(1))
         assert await fake_redis.ttl(store.history_key()) == -1
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.push_queue(_entry(1))  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        """The caller (GuildQueue.put) has already appended in memory, so False
+        is its only signal that the list now disagrees."""
+        assert await store.push_queue(_entry(1)) is True
+        assert await broken_store.push_queue(_entry(1)) is False  # and no raise
 
 
 class TestPushQueueBatch:
@@ -313,8 +318,12 @@ class TestPushQueueBatch:
         await store.push_queue_batch([])
         assert await fake_redis.exists(store.queue_key()) == 0
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.push_queue_batch([_entry(1)])  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        assert await store.push_queue_batch([_entry(1)]) is True
+        assert await store.push_queue_batch([]) is True  # nothing to land
+        assert await broken_store.push_queue_batch([_entry(1)]) is False
 
 
 class TestPushQueueFront:
@@ -343,8 +352,12 @@ class TestPushQueueFront:
         await store.push_queue_front([])
         assert await fake_redis.exists(store.queue_key()) == 0
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.push_queue_front([_entry(1)])  # must not raise
+    async def test_reports_whether_it_landed(
+        self, store: GuildRedisStore, broken_store: GuildRedisStore
+    ) -> None:
+        assert await store.push_queue_front([_entry(1)]) is True
+        assert await store.push_queue_front([]) is True  # nothing to land
+        assert await broken_store.push_queue_front([_entry(1)]) is False
 
 
 class TestPopQueue:
@@ -357,10 +370,12 @@ class TestPopQueue:
         assert remaining == [b"second"]
 
     async def test_noop_on_empty_queue(self, store: GuildRedisStore) -> None:
-        await store.pop_queue()  # must not raise
+        assert await store.pop_queue() is True  # landed, popped nothing
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.pop_queue()  # must not raise
+    async def test_reports_whether_it_landed(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        assert await broken_store.pop_queue() is False  # and no raise
 
 
 class TestDeleteQueue:

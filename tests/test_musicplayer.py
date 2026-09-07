@@ -6766,9 +6766,9 @@ class TestLoopClaimAccounting:
         popped: list[int] = []
         original = music_player.store.pop_queue
 
-        async def spy_pop() -> None:
+        async def spy_pop() -> bool:
             popped.append(1)
-            await original()
+            return await original()
 
         music_player.store.pop_queue = spy_pop
 

@@ -6,6 +6,7 @@ in memory only, by design, so the mirror is a subset rather than a copy."""
 
 import redis.asyncio as aioredis
 from dataclasses import replace
+from collections.abc import Iterator
 from typing import Any
 import asyncio
 import contextlib
@@ -163,13 +164,13 @@ class TestPut:
         original_batch = store.push_queue_batch
         original_single = store.push_queue
 
-        async def spy_batch(entries: Any) -> None:
+        async def spy_batch(entries: Any) -> bool:
             recorded.append(f"batch:{len(entries)}")
-            await original_batch(entries)
+            return await original_batch(entries)
 
-        async def spy_single(entry: Any) -> None:
+        async def spy_single(entry: Any) -> bool:
             recorded.append("single")
-            await original_single(entry)
+            return await original_single(entry)
 
         store.push_queue_batch = spy_batch
         store.push_queue = spy_single
@@ -205,9 +206,9 @@ class TestPut:
         sizes_at_push: list[int] = []
         original = store.push_queue
 
-        async def spy(entry: Any) -> None:
+        async def spy(entry: Any) -> bool:
             sizes_at_push.append(gq.qsize())
-            await original(entry)
+            return await original(entry)
 
         store.push_queue = spy
         await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
@@ -2335,11 +2336,12 @@ class TestShuffleWithInFlightDequeue:
 
 
 class TestStaleMirror:
-    """The queue's record of a start transaction whose list leg did not land:
-    the list is then one entry ahead of memory, and only a write that REPLACES
-    it can repair that. note_mirror_write is the loop's report; a bulk rebuild
-    clears the flag in passing; the LREM shortcut is refused over a stale list,
-    because LREM keeps whatever it does not name."""
+    """The queue's record of a list-leg write that did not land: the list may
+    then disagree with memory, and only a write that REPLACES it can repair
+    that. note_mirror_write is the loop's report on the start transaction;
+    every other writer records its own failure; a bulk rebuild clears the flag
+    in passing; the LREM shortcut is refused over a stale list, because LREM
+    keeps whatever it does not name."""
 
     def test_only_a_missed_retirement_makes_the_mirror_stale(
         self, gq: GuildQueue
@@ -2443,6 +2445,152 @@ class TestStaleMirror:
         assert calls == ["rebuild_queue"]
         assert not gq.mirror_dirty
         await _assert_mirror_matches(gq, fake_redis, store)
+
+
+class TestWritersRecordTheirOwnFailure:
+    """Every list-leg writer sets mirror_dirty when its store call reports
+    False, so a push or LPOP that Redis swallowed is repaired at the next song
+    start instead of leaving an LPOP to retire the wrong entry."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _down(store: GuildRedisStore, name: str) -> Iterator[None]:
+        """The named store method answers False, as @_guild_op does on a
+        swallowed Redis failure."""
+
+        async def _false(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        with patch.object(store, name, new=_false):
+            yield
+
+    async def test_a_failed_push_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        with self._down(store, "push_queue"):
+            await gq.put([_qobj(1, mock_author)])
+        assert gq.mirror_dirty
+        assert gq.display_items() == [_qobj(1, mock_author)]  # memory kept it
+
+    async def test_one_failed_push_in_a_run_is_enough(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The flag must not be the LAST push's verdict: a middle entry missing
+        from the list is exactly what a rebuild is for."""
+        verdicts = iter([True, False, True])
+        original = store.push_queue
+
+        async def flaky(entry: Any) -> bool:
+            landed = next(verdicts)
+            if landed:
+                await original(entry)
+            return landed
+
+        with patch.object(store, "push_queue", new=flaky):
+            await gq.put([_qobj(n, mock_author) for n in (1, 2, 3)])
+        assert gq.mirror_dirty
+
+    async def test_a_failed_batch_push_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        with self._down(store, "push_queue_batch"):
+            await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)], batch=True)
+        assert gq.mirror_dirty
+
+    async def test_a_failed_front_push_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(2, mock_author)])
+        with self._down(store, "push_queue_front"):
+            await gq.put_front([_qobj(1, mock_author)])
+        assert gq.mirror_dirty
+
+    async def test_a_failed_delete_on_clear_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        with self._down(store, "delete_queue"):
+            await gq.clear()
+        assert gq.mirror_dirty
+
+    async def test_a_failed_rebuild_on_remove_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """remove() with a shallow queue takes the rebuild path, so this is the
+        rebuild leg of _write_mirror; shuffle's is covered in TestStaleMirror."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 4)])
+        with self._down(store, "rebuild_queue"):
+            await gq.remove(remove_matcher("https://yt.com/v=2"))
+        assert gq.mirror_dirty
+
+    async def test_a_failed_delete_when_no_survivors_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        with self._down(store, "delete_queue"):
+            await gq.remove(remove_matcher("https://yt.com/v=1"))
+        assert gq.mirror_dirty
+
+    async def test_a_failed_lpop_on_a_failed_dequeue_marks_the_mirror_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+        item = gq.get_nowait()
+        with self._down(store, "pop_queue"):
+            await gq.finish_failed_dequeue(item)
+        assert gq.mirror_dirty
+        assert gq.display_items() == [_qobj(2, mock_author)]
+
+    async def test_a_write_that_lands_does_not_set_the_flag(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        await gq.put([_qobj(2, mock_author), _qobj(3, mock_author)], batch=True)
+        await gq.put_front([_qobj(0, mock_author)])
+        await gq.finish_failed_dequeue(gq.get_nowait())
+        assert not gq.mirror_dirty
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_stale_flag_from_a_push_refuses_the_lrem_shortcut(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """Same rule as a missed LPOP: LREM keeps whatever it does not name, so
+        a list missing an entry is rebuilt, and the rebuild clears the flag."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 20)])
+        with self._down(store, "push_queue"):
+            await gq.put([_qobj(20, mock_author)])  # memory 20, list 19
+        assert gq.mirror_dirty
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries"):
+            original = getattr(store, name)
+
+            def spy(*args: Any, _n: str = name, _o: Any = original, **kw: Any) -> Any:
+                calls.append(_n)
+                return _o(*args, **kw)
+
+            setattr(store, name, spy)
+
+        await gq.remove(remove_matcher("https://yt.com/v=7"))
+
+        assert calls == ["rebuild_queue"]
+        assert not gq.mirror_dirty
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_no_store_never_sets_the_flag(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        await gq_no_redis.put_front([_qobj(0, mock_author)])
+        await gq_no_redis.clear()
+        assert not gq_no_redis.mirror_dirty
 
 
 class TestMirrorWriteChoice:
@@ -2644,9 +2792,9 @@ class TestPutClearMutualExclusion:
         release = asyncio.Event()
         original_push = store.push_queue
 
-        async def gated_push(entry: Any) -> None:
+        async def gated_push(entry: Any) -> bool:
             await release.wait()
-            await original_push(entry)
+            return await original_push(entry)
 
         with patch.object(store, "push_queue", new=gated_push):
             put_task = asyncio.create_task(gq.put([_qobj(1, mock_author)]))

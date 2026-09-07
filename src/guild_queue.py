@@ -166,9 +166,9 @@ class GuildQueue:
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
         self._generation = 0
-        # True while the list holds an entry memory already retired (the start
-        # transaction's LPOP did not land). Cleared by the next write that
-        # replaces the list: a rebuild, a DELETE, or the next song start.
+        # True while the Redis list may not match the deque: a list-leg write
+        # (push, LPOP, DELETE, rebuild) did not land. Cleared by the next write
+        # that REPLACES the list: a rebuild, a DELETE, or the next song start.
         self._mirror_dirty = False
 
     # ── Wake discipline ───────────────────────────────────────────────────────
@@ -260,10 +260,13 @@ class GuildQueue:
             if not entries:
                 return queued
             if batch:
-                await self._store.push_queue_batch(entries)
+                landed = await self._store.push_queue_batch(entries)
             else:
+                landed = True
                 for entry in entries:
-                    await self._store.push_queue(entry)
+                    landed = await self._store.push_queue(entry) and landed
+            if not landed:
+                self._mirror_dirty = True
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
@@ -289,8 +292,8 @@ class GuildQueue:
                 # An LPUSH of just the new items, not a replacement — so not
                 # _write_mirror's job. Only with no in-flight head.
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
-                if entries:
-                    await self._store.push_queue_front(entries)
+                if entries and not await self._store.push_queue_front(entries):
+                    self._mirror_dirty = True
             return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
@@ -313,8 +316,10 @@ class GuildQueue:
             self._items.clear()
             self._cursor = 0
             self._sync_wake()
-            if self._store is not None and await self._store.delete_queue():
-                self._mirror_dirty = False
+            if self._store is not None:
+                # A DELETE that did not land leaves the old list for the next
+                # start to replace.
+                self._mirror_dirty = not await self._store.delete_queue()
         return cleared_items
 
     async def shuffle(self) -> ShuffleOutcome:
@@ -507,15 +512,20 @@ class GuildQueue:
 
     @property
     def mirror_dirty(self) -> bool:
-        """True while the Redis list holds an entry memory already retired. The
-        next song start must rebuild the list rather than LPOP it; a
-        -clear/-shuffle/-remove rebuild clears it in passing."""
+        """True while the Redis list may not match the deque — a list-leg write
+        did not land. The next song start must REPLACE the list rather than
+        LPOP it; a -clear/-shuffle/-remove rebuild clears it in passing. Every
+        list-leg writer sets it on its own failure (put, put_front, clear,
+        _write_mirror, redis_pop_for); the loop reports the start transaction's
+        through note_mirror_write."""
         return self._mirror_dirty
 
     def note_mirror_write(self, *, landed: bool, retired: bool) -> None:
         """Record the start transaction's outcome, from inside commit_dequeue's
         hold. A write that landed leaves the list correct; one that did not,
-        while memory dropped an entry, leaves the list one ahead."""
+        while memory dropped an entry, leaves the list one ahead. A write that
+        retired nothing (a crash-recovered head) and did not land changes
+        nothing about the list, so the flag is left as it was."""
         if landed:
             self._mirror_dirty = False
         elif retired:
@@ -538,7 +548,8 @@ class GuildQueue:
         if persisted is None:
             persisted = is_persisted(item)
         if self._store is not None and persisted:
-            await self._store.pop_queue()
+            if not await self._store.pop_queue():
+                self._mirror_dirty = True
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -561,8 +572,7 @@ class GuildQueue:
             return
         survivors = sum(1 for s in items if is_persisted(s))
         if not survivors:
-            if await self._store.delete_queue():
-                self._mirror_dirty = False
+            self._mirror_dirty = not await self._store.delete_queue()
             return
         # A count, not entries: one -remove of a collection link routinely drops
         # hundreds, and serializing them costs 100x the counting.
@@ -582,10 +592,9 @@ class GuildQueue:
                     f"queue mirror diverged from memory in guild {self._guild.id}; "
                     "rebuilding instead of removing"
                 )
-        if await self._store.rebuild_queue(
+        self._mirror_dirty = not await self._store.rebuild_queue(
             [_to_entry(s) for s in items if is_persisted(s)]
-        ):
-            self._mirror_dirty = False
+        )
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a
