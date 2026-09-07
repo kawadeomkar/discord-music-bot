@@ -18,6 +18,16 @@ _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 TIMESTAMP_FORMATS: Final = "`90`, `90s`, `1m30s`, `2h30m15s`"
 
 
+class SourceInputError(Exception):
+    """A link the user can fix by editing it. Not a ValueError: parse_input
+    turns those into a YouTube search, and a malformed Spotify link must not be
+    searched for as text. `user_message` is what _command_error renders."""
+
+    def __init__(self, log_message: str, user_message: str) -> None:
+        super().__init__(log_message)
+        self.user_message = user_message
+
+
 def parse_timestamp(raw: str) -> Optional[int]:
     """Seconds from a YouTube `t`/`ts` value (bare seconds or the colon-free
     HMS form), or None. Never raises: an unparseable timestamp must degrade to
@@ -268,13 +278,7 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
             query_source=QUERY_SOURCE_YOUTUBE,
         )
     if domain in ("open.spotify.com", "spotify.com"):
-        path = domain_match.group(4).split("/")
-        try:
-            spotify_type = SpotifyType(path[0])
-        except ValueError:
-            raise Exception(f"Unknown Spotify track type: {path}")
-        log.info(f"Spotify source ID: {path[1]}")
-        return SpotifySource(spotify_type, path[1], process=True)
+        return _parse_spotify_path(domain_match.group(4))
     if domain in ("soundcloud.com",):
         return SoundcloudSource(url, process=True)
     if "." in domain:
@@ -290,6 +294,42 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     # A dotless "host" (e.g. "98" from the search term "98/99"): ValueError
     # makes parse_input fall back to a YouTube search.
     raise ValueError(f"Not a recognised URL: {url!r}")
+
+
+# Spotify's localised share links carry a locale segment: /intl-de/track/<id>.
+_SPOTIFY_LOCALE_RE: Final[re.Pattern[str]] = re.compile(
+    r"intl-[a-z]{2,}(?:-[a-z]+)?", re.I
+)
+# A Spotify id is 22 base62 characters; anything else is a mangled paste.
+_SPOTIFY_ID_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9]{22}")
+
+
+def _parse_spotify_path(path: str) -> SpotifySource:
+    """The `type/id` of a Spotify link, or SourceInputError naming what is
+    wrong: an unsupported type (artist, album, episode) or an id that is not
+    22 base62 characters. Validated here so a mangled link is reported rather
+    than sent to Spotify's API as a 404 the user cannot read."""
+    segments = [seg for seg in path.split("/") if seg]
+    if segments and _SPOTIFY_LOCALE_RE.fullmatch(segments[0]):
+        segments = segments[1:]
+    kind = segments[0] if segments else ""
+    try:
+        spotify_type = SpotifyType(kind)
+    except ValueError:
+        raise SourceInputError(
+            f"Unknown Spotify track type: {segments}",
+            f"I can play Spotify **track** and **playlist** links, not `{kind or '/'}` "
+            "links. Copy the link of a track or a playlist instead.",
+        ) from None
+    spotify_id = segments[1] if len(segments) > 1 else ""
+    if not _SPOTIFY_ID_RE.fullmatch(spotify_id):
+        raise SourceInputError(
+            f"Malformed Spotify {kind} id: {spotify_id!r}",
+            f"That Spotify {kind} link looks cut off — the id after `/{kind}/` "
+            "should be 22 letters and digits. Copy the link again.",
+        )
+    log.info(f"Spotify source ID: {spotify_id}")
+    return SpotifySource(spotify_type, spotify_id, process=True)
 
 
 def unquote_argument(text: str) -> str:

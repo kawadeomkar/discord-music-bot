@@ -4,6 +4,7 @@ import pytest
 
 from src.guild_state import Analytics
 from src.sources import (
+    SourceInputError,
     unquote_argument,
     QUERY_SOURCE_SEARCH,
     TIMESTAMP_FORMATS,
@@ -214,8 +215,35 @@ class TestParseUrlSpotify:
 
     def test_unknown_spotify_type_raises(self) -> None:
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
-        with pytest.raises(Exception, match="Unknown Spotify track type"):
+        with pytest.raises(SourceInputError, match="Unknown Spotify track type") as e:
             parse_url(url)
+        assert "artist" in e.value.user_message
+
+    def test_localised_share_link(self) -> None:
+        """Spotify's share sheet emits /intl-<lang>/ paths."""
+        url = "https://open.spotify.com/intl-de/track/4cOdK2wGLETKBW3PvgPWqT?si=x"
+        result = parse_url(url)
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.TRACK
+        assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "track/",
+            "track",
+            "track/4cOdK2wGLETKBW3Pvg",  # cut off
+            "track/4cOdK2wGLETKBW3PvgPWqT-extra",
+            "playlist/not_base62_but_22_ch",
+        ],
+    )
+    def test_malformed_id_is_reported_not_searched(self, path: str) -> None:
+        """A mangled paste used to reach Spotify's API as an opaque 404, or an
+        IndexError. Not a ValueError: parse_input would search for the URL."""
+        with pytest.raises(SourceInputError) as e:
+            parse_input(f"https://open.spotify.com/{path}")
+        assert not isinstance(e.value, ValueError)
+        assert "22 letters and digits" in e.value.user_message
 
 
 class TestParseUrlSoundcloud:

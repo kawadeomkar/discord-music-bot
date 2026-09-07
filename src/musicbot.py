@@ -45,6 +45,7 @@ from src.commands.history import (
     HistoryFlags,
 )
 from src.play_pipeline import PlaylistInputError
+from src.sources import SourceInputError
 from src.commands.analytics import AnalyticsFlags
 from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
@@ -460,6 +461,7 @@ class MusicBot(commands.Cog):
                 (
                     ExtractionError,
                     PlaylistInputError,
+                    SourceInputError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
                 ),

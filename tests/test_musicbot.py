@@ -73,6 +73,25 @@ class TestCommandErrorRendering:
         assert "github.com" not in detail
         assert "unexpected error" in detail
 
+    async def test_source_input_error_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A malformed link is the user's to fix, so the embed carries the
+        actionable copy rather than the type name and log message."""
+        from src.sources import SourceInputError
+
+        err = SourceInputError(
+            "Malformed Spotify track id: 'x'", "Copy the link again."
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        assert call.args[2] == "Copy the link again."
+
     async def test_a_plain_exception_still_renders_type_and_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
