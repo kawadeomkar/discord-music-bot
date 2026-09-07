@@ -338,6 +338,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `REDIS_URL` | No | Redis connection URL (defaults to `redis://localhost:6379`) |
 | `POSTGRES_URL` | No | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). Unset → the entire Postgres tier is off (no outbox writes, no drainer, pre-Postgres read behavior) |
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
+| `RECOVERY_CONCURRENCY` | No | How many guilds `on_ready` restores at once (default `8`, floor `1`); the rest wait on a semaphore. Bounds the Redis connections recovery draws against the pool's cap of 20 and staggers the voice connects. See [Crash Recovery](#crash-recovery) |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
@@ -752,7 +753,7 @@ Two independent triggers, both handled in `musicbot.py`:
 
 ### Crash Recovery
 
-On `on_ready` (cold start or session loss — **not** WebSocket resume, which fires `on_resumed`), `MusicBot` spawns a `_restore_guild` task per guild (skipped if the guild already has a player):
+On `on_ready` (cold start or session loss — **not** WebSocket resume, which fires `on_resumed`), `MusicBot` spawns one `restore_guild` task per guild (skipped if the guild already has a player). The tasks are spawned together but **run `RECOVERY_CONCURRENCY` at a time** (default 8): each one waits on a per-`on_ready` `asyncio.Semaphore` (`recovery.recovery_limiter`) before entering `restore_guild`, so the number of restores holding a Redis connection or mid-voice-handshake at once is the knob, not the guild count. The wait sits outside the `guild.restore` span, so a span's duration is the restore itself. The pool is a `BlockingConnectionPool` for the same reason — see [Redis connection retry](#redis-connection-retry) — so even a burst past the knob queues for a connection rather than failing.
 
 ```mermaid
 sequenceDiagram
@@ -762,13 +763,13 @@ sequenceDiagram
     participant MP as MusicPlayer
 
     MusicBot->>Redis: acquire_recovery_lock() [SET NX EX 60, random token]
-    Note over Redis: lock:guild:{id}:recovery — prevents two instances racing
+    Note over Redis: lock:guild:{id}:recovery — prevents two instances racing.<br/>Tri-state: True won, False held elsewhere (INFO, skip),<br/>None Redis failed (WARNING, skip, nothing to release)
     MusicBot->>Redis: get_recovery_gate() [pipelined: state hash + LLEN queue]
     Note over MusicBot: gate is None (Redis read failed) → skip with warning,<br/>retried on next on_ready. Queue *contents* deliberately not read here.
     MusicBot->>MusicBot: gate: voice/text channel IDs present?
     MusicBot->>MusicBot: channels still exist? if deleted → clear_connection() +<br/>notice to a usable channel
     MusicBot->>MusicBot: gate: anything restorable? (queue length or crashed song)
-    MusicBot->>VC: voice_channel.connect(timeout=30.0, reconnect=True)
+    MusicBot->>VC: voice_channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
     MusicBot->>MP: MusicPlayer(...) + start() → loop() + _restore_state()
 
     MP->>Redis: get_playback_snapshot() — one round-trip for state +<br/>queue + now_playing + history
@@ -787,6 +788,8 @@ Key properties:
 - **Lightweight gate**: `get_recovery_gate()` reads only the state hash and the queue **length** (LLEN). A `-stop`ped guild keeps its (possibly long) queue list, so gating on LLEN keeps that payload off the wire on every `on_ready`. The full payload is read once by `_restore_state` after a successful connect.
 - **At-most-once crashed song**: `current_song_url` is written when a song starts and cleared on normal end. On recovery the crashed song is rebuilt, injected in-memory only (`persisted=False` — it was never on the Redis queue list), and `current_song_url` is cleared immediately, even when the requester is unresolvable.
 - **Failure isolation**: a failed snapshot read aborts the whole restore rather than fabricating partial state; the lock's 60 s TTL auto-expires if the holder crashes, and release compare-and-deletes so an expired holder cannot delete its successor's lock.
+- **A lock that could not be taken is reported as what it is.** `acquire_recovery_lock` returns `None` when Redis did not answer, and `restore_guild` logs that at WARNING (`recovery lock could not be acquired`) and skips without releasing — nothing was taken. Only `False` means another restore holds the lock, and only that path logs the INFO `Recovery already in progress`. Before the tri-state, every swallowed Redis error read as a competing holder, which is how a pool-cap overflow hid as "already in progress" for every guild past the twentieth.
+- **Bounded fan-out**: `RECOVERY_CONCURRENCY` restores run at once; the rest wait. A test drives 25 guilds through `on_ready` against a Redis double that refuses the 21st concurrent acquire the way a non-blocking pool does, and asserts every guild reaches its gate; a control with the limiter opened to 25 shows the double biting.
 - **Intentional stop vs crash**: `cleanup()` calls `clear_connection()`, which empties the channel-ID fields — `on_ready` then skips that guild.
 
 ---
@@ -1375,6 +1378,18 @@ rule and link here for the reasoning.
 
 ### Redis connection retry
 
+**The pool blocks at its cap.** `create_redis_pool` builds a `BlockingConnectionPool`
+(20 connections, `_POOL_ACQUIRE_TIMEOUT` = 10 s). A plain `ConnectionPool` raises
+`MaxConnectionsError` synchronously the moment 20 connections are checked out — in
+`execute_command`, *before* `call_with_retry`, so no retry policy sees it — and every
+store method swallows it as an ordinary failure. `on_ready`'s restore fan-out hit exactly
+that: the connect happens outside the pool lock, so every task reached the cap check
+before any connection was returned, and guilds 21 and up read as "recovery already in
+progress". The blocking pool parks the caller until a connection frees, and only past the
+10 s wait does it fail (as a `ConnectionError`, swallowed like any other). The fan-out is
+bounded separately by `RECOVERY_CONCURRENCY`, so under normal operation the wait never
+engages; the pool class is the backstop for every other burst.
+
 The pool's `retry_on_error` must name **redis-py's** `ConnectionError`/`TimeoutError`,
 not the builtins of the same name — redis-py's derive from `RedisError`, so the
 builtins match nothing it ever raises. The retry object must also be the **asyncio**
@@ -1961,6 +1976,8 @@ Every `GuildRedisStore` method catches and logs Redis exceptions internally. Red
 The lock is not the last line of defence there. `abc.Connectable.connect` registers the voice client via `state._add_voice_client(...)` **before** its first await, so a second concurrent `restore_guild` in the same process raises `ClientException` and never reaches `MusicPlayer(...)`. The lock's job is to stop the duplicated work and the duplicated user-facing notice ahead of that.
 
 The 60 s TTL auto-expires if the holder crashes before releasing. The value is a per-acquisition random token so release can compare-and-delete under WATCH/MULTI: a holder whose lock expired mid-recovery must not delete the lock its successor now owns, which would admit a third restore and produce exactly the double-restore the lock prevents.
+
+`acquire_recovery_lock` is **tri-state**: `True` (won), `False` (another holder), `None` (Redis did not answer — the `@_guild_op` default). The distinction is the caller's whole reason for asking: a competing holder means the work is being done and an INFO suffices; a Redis failure means it is not, and `restore_guild` says so at WARNING and leaves the retry to the next `on_ready`. Collapsing the two into `False` is what let a pool-cap overflow in the `on_ready` fan-out log "already in progress" for every guild past the twentieth while restoring none of them.
 
 ### `AutoShardedBot`
 

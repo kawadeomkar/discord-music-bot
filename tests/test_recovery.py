@@ -7,7 +7,8 @@ owns both the extracted module and the cog surface that reaches it.
 """
 
 import asyncio
-from typing import Any, Optional
+import logging
+from typing import Any, Optional, cast
 from collections.abc import Coroutine
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,9 @@ import redis.asyncio as aioredis
 from discord.ext import commands
 from redis.asyncio import Redis
 
+from redis.exceptions import MaxConnectionsError
+
+from src import config
 from src.musicbot import MusicBot
 from src.recovery import join_succeeded, restore_guild
 from src.redis_client import GuildRedisStore
@@ -107,13 +111,16 @@ class TestOnReady:
         # it is defined, or the cog keeps calling the real one. Capture happens
         # synchronously in the spy (before stub_create_task closes the coroutine,
         # which would prevent the body running).
-        def _spy(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+        def _spy(
+            cog: MusicBot, guild: MagicMock, limiter: asyncio.Semaphore
+        ) -> Coroutine[Any, Any, None]:
             passed_guilds.append(guild)
+            assert isinstance(limiter, asyncio.Semaphore)
             return _noop()
 
         with (
             patch("asyncio.create_task", stub),
-            patch("src.musicbot.restore_guild", _spy),
+            patch("src.musicbot.restore_guild_bounded", _spy),
         ):
             await music_bot_with_redis.on_ready()
 
@@ -122,7 +129,139 @@ class TestOnReady:
         assert passed_guilds == guilds
 
 
+class _PoolCapRedis:
+    """A fakeredis client whose SET refuses past a pool cap the way a
+    non-blocking redis-py pool does: MaxConnectionsError, raised synchronously
+    when more than `cap` callers are mid-command. Each call yields once first so
+    concurrent tasks really are in flight together. Everything else delegates."""
+
+    def __init__(self, inner: Redis, cap: int) -> None:
+        self._inner = inner
+        self._cap = cap
+        self.in_flight = 0
+        self.peak = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def set(self, *args: Any, **kwargs: Any) -> Any:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            if self.in_flight > self._cap:
+                raise MaxConnectionsError("Too many connections")
+            await asyncio.sleep(0)
+            return await self._inner.set(*args, **kwargs)
+        finally:
+            self.in_flight -= 1
+
+
+def _guilds(n: int) -> list[MagicMock]:
+    """n guilds whose persisted channels (100, 200) still resolve, so a restore
+    with nothing queued returns quietly rather than taking the channel-deleted
+    branch."""
+    voice = MagicMock(spec=discord.VoiceChannel)
+    text = MagicMock(spec=discord.TextChannel)
+    guilds: list[MagicMock] = []
+    for i in range(n):
+        g = MagicMock(spec=discord.Guild)
+        g.id = 500_000_000_000_000_000 + i
+        g.get_channel = MagicMock(side_effect=lambda cid: voice if cid == 100 else text)
+        guilds.append(g)
+    return guilds
+
+
+class TestOnReadyFanOut:
+    """Recovery must reach every guild, not the first pool-cap of them. The
+    limiter keeps the number of restores inside Redis at once under the cap;
+    the control test shows the harness bites without it."""
+
+    @staticmethod
+    async def _run_on_ready(
+        cog: MusicBot, redis: _PoolCapRedis, guilds: list[MagicMock]
+    ) -> list[int]:
+        cog.redis = cast(Any, redis)
+        cast(Any, cog.bot).guilds = guilds
+        for g in guilds:
+            # A persisted connection, no queue: the restore passes the lock and
+            # the gate, then returns with nothing to play — no voice work.
+            await GuildRedisStore(redis._inner, g.id).set_connection(100, 200)
+        gated: list[int] = []
+        original = GuildRedisStore.get_recovery_gate
+
+        async def spy(self: GuildRedisStore) -> Any:
+            gated.append(self.guild_id)
+            return await original(self)
+
+        with patch.object(GuildRedisStore, "get_recovery_gate", spy):
+            await cog.on_ready()
+            await asyncio.gather(*cog._restore_tasks)
+        return gated
+
+    async def test_guild_twenty_one_and_up_are_restored(
+        self,
+        music_bot_with_redis: MusicBot,
+        fake_redis_bot: Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        guilds = _guilds(25)
+        redis = _PoolCapRedis(fake_redis_bot, cap=20)
+        with caplog.at_level(logging.INFO, logger="src.recovery"):
+            gated = await self._run_on_ready(music_bot_with_redis, redis, guilds)
+
+        assert sorted(gated) == sorted(g.id for g in guilds)
+        assert redis.peak <= config.RECOVERY_CONCURRENCY
+        assert "already in progress" not in caplog.text
+        assert "lock could not be acquired" not in caplog.text
+
+    async def test_the_harness_bites_without_the_limiter(
+        self,
+        music_bot_with_redis: MusicBot,
+        fake_redis_bot: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Control: with the limiter wide open, the 21st concurrent acquire
+        fails and those guilds are skipped — with the WARNING that names the
+        failure, never the "already in progress" INFO."""
+        monkeypatch.setattr(config, "RECOVERY_CONCURRENCY", 25)
+        guilds = _guilds(25)
+        redis = _PoolCapRedis(fake_redis_bot, cap=20)
+        with caplog.at_level(logging.INFO, logger="src.recovery"):
+            gated = await self._run_on_ready(music_bot_with_redis, redis, guilds)
+
+        assert redis.peak > 20  # the cap was exceeded, as it is with no limiter
+        assert len(gated) == 20
+        assert caplog.text.count("lock could not be acquired") == 5
+        assert "already in progress" not in caplog.text
+
+
 class TestRestoreGuildLock:
+    async def test_skips_with_a_warning_when_redis_cannot_answer(
+        self,
+        music_bot_with_redis: MusicBot,
+        mock_guild: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """None from acquire_recovery_lock is a Redis failure, not a holder: the
+        log must say so, no channel work happens, and nothing is released
+        (nothing was taken)."""
+        release = AsyncMock()
+        with (
+            patch.object(
+                GuildRedisStore, "acquire_recovery_lock", AsyncMock(return_value=None)
+            ),
+            patch.object(GuildRedisStore, "release_recovery_lock", release),
+            caplog.at_level(logging.INFO, logger="src.recovery"),
+        ):
+            await restore_guild(music_bot_with_redis, mock_guild)
+
+        assert "lock could not be acquired" in caplog.text
+        assert "already in progress" not in caplog.text
+        mock_guild.get_channel.assert_not_called()
+        release.assert_not_awaited()
+        assert mock_guild.id not in music_bot_with_redis.mps
+
     async def test_skips_when_lock_already_held(
         self,
         music_bot_with_redis: MusicBot,
@@ -181,6 +320,12 @@ class TestRestoreGuildLock:
             await restore_guild(music_bot_with_redis, mock_guild)
 
         assert mock_guild.id in music_bot_with_redis.mps
+        # Deafened on the connect itself: one gateway exchange, no second
+        # voice-state update.
+        voice_channel.connect.assert_awaited_once_with(
+            timeout=30.0, reconnect=True, self_deaf=True
+        )
+        mock_guild.change_voice_state.assert_not_awaited()
 
 
 # ── restore_guild: Redis-failure gate ────────────────────────────────────────

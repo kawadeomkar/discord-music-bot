@@ -122,11 +122,20 @@ def _fmt_position(secs: float) -> str:
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
 
-def create_redis_pool() -> aioredis.ConnectionPool:
+# How long a command waits for a pooled connection once all 20 are in use.
+# The pool BLOCKS at the cap rather than raising: a burst (on_ready's restore
+# fan-out, a playlist enqueue) queues behind it and proceeds, where a raise
+# would fail every operation past the twentieth and read as a Redis outage.
+# Past the wait it is a ConnectionError, swallowed like any other failure.
+_POOL_ACQUIRE_TIMEOUT = 10  # seconds
+
+
+def create_redis_pool() -> aioredis.BlockingConnectionPool:
     """Create the application-wide connection pool. Call once at startup."""
-    return aioredis.ConnectionPool.from_url(
+    return aioredis.BlockingConnectionPool.from_url(
         os.getenv("REDIS_URL", "redis://localhost:6379"),
         max_connections=20,
+        timeout=_POOL_ACQUIRE_TIMEOUT,
         decode_responses=False,
         socket_keepalive=True,
         health_check_interval=30,
@@ -534,8 +543,8 @@ async def read_guild_configs(
     not read", not the all-unset GuildConfig an absent hash yields, and a
     caller that caches this must not treat the two alike or a Redis blink reads
     as every guild un-choosing everything. Pipelined rather than one awaited
-    HGETALL each: the pool RAISES rather than queueing past its cap, so a plain
-    fan-out fails every guild past it."""
+    HGETALL each: one round trip per batch, and a fan-out of single reads
+    would queue at the pool's cap behind whatever else is running."""
     configs: dict[int, GuildConfig] = {}
     ids = list(guild_ids)
     for start in range(0, len(ids), _CONFIG_READ_BATCH):
@@ -1241,11 +1250,13 @@ class GuildRedisStore:
     def _recovery_lock_key(self) -> str:
         return f"lock:guild:{self.guild_id}:recovery"
 
-    @_guild_op(default=False)
-    async def acquire_recovery_lock(self) -> bool:
-        """SET NX EX — True if this store won the lock. The value is a
-        per-acquisition random token, so release can prove the lock it deletes
-        is still the one this store acquired."""
+    @_guild_op(default=None)
+    async def acquire_recovery_lock(self) -> Optional[bool]:
+        """SET NX EX. Tri-state: True if this store won the lock, False if
+        another holder has it, None if Redis did not answer — the caller must
+        tell the last two apart, since only the second means a restore is in
+        progress. The value is a per-acquisition random token, so release can
+        prove the lock it deletes is still the one this store acquired."""
         token = secrets.token_hex(16)
         result = await self.redis.set(
             self._recovery_lock_key(), token, nx=True, ex=self._RECOVERY_LOCK_TTL

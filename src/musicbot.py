@@ -65,7 +65,7 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.recovery import VoiceWatchdog, restore_guild
+from src.recovery import VoiceWatchdog, recovery_limiter, restore_guild_bounded
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -1056,12 +1056,15 @@ class MusicBot(commands.Cog):
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         """Cold start or session loss (not a WebSocket resume): one recovery
-        task per guild."""
+        task per guild, RECOVERY_CONCURRENCY of them running at once."""
         if self.redis is None:
             return
         spawn_background(self._hydrate_debug(), self._restore_tasks)
+        limiter = recovery_limiter()
         for guild in self.bot.guilds:
-            spawn_background(restore_guild(self, guild), self._restore_tasks)
+            spawn_background(
+                restore_guild_bounded(self, guild, limiter), self._restore_tasks
+            )
 
     @commands.Cog.listener()
     async def on_voice_state_update(

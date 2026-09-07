@@ -75,6 +75,17 @@ class TestCreateRedisPool:
         pool = create_redis_pool()
         assert pool.max_connections == 20
 
+    def test_pool_blocks_at_the_cap_instead_of_raising(self) -> None:
+        """A plain ConnectionPool raises MaxConnectionsError synchronously once
+        20 connections are in use, before any retry runs, and @_guild_op then
+        reads that as an ordinary failure: on_ready's fan-out once skipped
+        every guild past the twentieth as "recovery already in progress". The
+        blocking pool queues the caller for up to `timeout` seconds instead."""
+        pool = create_redis_pool()
+        assert isinstance(pool, aioredis.BlockingConnectionPool)
+        assert pool.timeout == redis_client._POOL_ACQUIRE_TIMEOUT
+        assert pool.timeout is not None and pool.timeout > 0
+
     def test_redis_errors_are_not_builtin_subclasses(self) -> None:
         """The invariant that made the old config a silent no-op: redis-py's
         ConnectionError and TimeoutError derive from RedisError, not from the
@@ -2288,11 +2299,14 @@ class TestRecoveryLock:
         acquired = await store.acquire_recovery_lock()
         assert acquired is False
 
-    async def test_acquire_returns_false_on_error(
+    async def test_acquire_returns_none_on_error(
         self, broken_store: GuildRedisStore
     ) -> None:
+        """Tri-state: None is "Redis did not answer", which restore_guild must
+        not report as "another restore holds the lock"."""
         result = await broken_store.acquire_recovery_lock()
-        assert result is False
+        assert result is None
+        assert broken_store._recovery_lock_token is None
 
     async def test_release_deletes_a_lock_this_store_acquired(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

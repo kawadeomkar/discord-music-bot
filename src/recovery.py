@@ -21,6 +21,7 @@ from discord.ext import commands
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src import config
 from src.musicplayer import MusicPlayer
 from src.redis_client import GuildRedisStore
 from src.telemetry import get_tracer
@@ -38,6 +39,22 @@ _tracer = get_tracer(__name__)
 ALONE_DISCONNECT_SECS = 10
 
 
+def recovery_limiter() -> asyncio.Semaphore:
+    """One per on_ready: admits RECOVERY_CONCURRENCY restores at a time, so the
+    fan-out's Redis draw and voice connects are bounded by the knob rather than
+    by the guild count. See docs/ARCHITECTURE.md#crash-recovery."""
+    return asyncio.Semaphore(config.RECOVERY_CONCURRENCY)
+
+
+async def restore_guild_bounded(
+    cog: MusicBot, guild: discord.Guild, limiter: asyncio.Semaphore
+) -> None:
+    """restore_guild once the limiter admits it. The wait sits outside the
+    `guild.restore` span, so a span's duration is the restore, not the queue."""
+    async with limiter:
+        await restore_guild(cog, guild)
+
+
 @_tracer.start_as_current_span("guild.restore")
 async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
     """Attempt to rejoin voice and restore queue for one guild after restart."""
@@ -51,8 +68,18 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
     trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
     # One restore per guild at a time: on_ready re-fires on any reconnect that
     # fails to RESUME, and mps[guild.id] is set only after the connect below.
+    # None is a Redis failure, not a holder: the lock was never taken, so there
+    # is nothing to release, and the next on_ready retries.
     # See docs/ARCHITECTURE.md#distributed-recovery-lock
-    if not await store.acquire_recovery_lock():
+    acquired = await store.acquire_recovery_lock()
+    if acquired is None:
+        trace.get_current_span().set_attribute("restore.lock_failed", True)
+        log.warning(
+            f"Recovery skipped for guild {guild.id}: recovery lock could not be "
+            f"acquired (Redis error); retried on the next on_ready"
+        )
+        return
+    if not acquired:
         trace.get_current_span().set_attribute("restore.skipped_lock", True)
         log.info(f"Recovery already in progress for guild {guild.id}, skipping")
         return
@@ -129,10 +156,9 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
         )
 
         try:
-            await voice_channel.connect(timeout=30.0, reconnect=True)
-            await guild.change_voice_state(
-                channel=voice_channel, self_mute=False, self_deaf=True
-            )
+            # self_deaf rides the connect's own voice-state update, so the
+            # handshake is one gateway exchange.
+            await voice_channel.connect(timeout=30.0, reconnect=True, self_deaf=True)
         except Exception as e:
             trace.get_current_span().set_attribute("restore.voice_connect_failed", True)
             trace.get_current_span().record_exception(e)

@@ -120,6 +120,11 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # BATCH_SIZE × peak burst. ~625 B stored per entry on redis:7.
 HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 
+# How many guilds on_ready restores at once; the rest wait their turn. Bounds
+# the Redis connections recovery draws and staggers the voice connects, so a
+# cold start scales with this number rather than with the guild count.
+RECOVERY_CONCURRENCY: int = _int_env("RECOVERY_CONCURRENCY", 8, minimum=1)
+
 # asyncpg statement_cache_size per connection. Set 0 behind a transaction-pooling
 # PgBouncer, where each transaction lands on a backend that never saw the handle.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
