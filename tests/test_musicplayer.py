@@ -14,6 +14,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequ
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
+from discord.ext import commands
 import orjson
 import pytest
 from opentelemetry import trace as trace_api
@@ -4256,6 +4257,15 @@ class TestFromContext:
         mp = MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
         assert mp.store is not None
 
+    def test_refuses_a_thread_with_a_command_error(
+        self, mock_bot: MagicMock, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """CheckFailure, not AssertionError: the cog hook refuses these first,
+        and anything that slips past it must still surface as a CommandError."""
+        mock_ctx.channel = MagicMock(spec=discord.Thread)
+        with pytest.raises(commands.CheckFailure):
+            MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
+
 
 # ── Start ─────────────────────────────────────────────────────────────────────
 
@@ -4346,6 +4356,15 @@ class TestSetContext:
         mock_ctx.author = new_author
         music_player.set_context(mock_ctx)
         assert music_player._last_author is new_author
+
+    def test_refuses_a_voice_channel_chat_and_keeps_the_home(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        home = music_player._channel
+        mock_ctx.channel = MagicMock(spec=discord.VoiceChannel)
+        with pytest.raises(commands.CheckFailure):
+            music_player.set_context(mock_ctx)
+        assert music_player._channel is home
 
 
 # ── RequireRequester ──────────────────────────────────────────────────────────

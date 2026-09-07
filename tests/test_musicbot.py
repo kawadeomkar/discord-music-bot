@@ -627,6 +627,37 @@ class TestCogBeforeInvoke:
         await music_bot.cog_before_invoke(mock_ctx)
         music_bot.get_mp.assert_not_called()
 
+    @pytest.mark.parametrize("channel_type", [discord.Thread, discord.VoiceChannel])
+    async def test_refuses_a_channel_the_player_cannot_call_home(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, channel_type: type
+    ) -> None:
+        """A thread or a voice channel's text chat used to reach from_context's
+        isinstance assertion, and an AssertionError is not a CommandError — the
+        member got silence. Now the hook answers and raises a CheckFailure, so
+        the span closes and no player is manufactured for a home it cannot use."""
+        mock_ctx.channel = MagicMock(spec=channel_type)
+        music_bot.get_mp = MagicMock()
+
+        with pytest.raises(commands.CheckFailure):
+            await music_bot.cog_before_invoke(mock_ctx)
+
+        music_bot.get_mp.assert_not_called()
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "regular text channel" in embed.description
+        # The span bookkeeping the raise path owns: nothing left for after_invoke.
+        assert id(mock_ctx) not in music_bot._active_spans
+
+    async def test_observation_only_commands_are_not_channel_gated(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-analytics and -debug never build a player, so a thread is fine."""
+        mock_ctx.channel = MagicMock(spec=discord.Thread)
+        mock_ctx.command.extras = {"observation_only": True}
+        music_bot.get_mp = MagicMock()
+        await music_bot.cog_before_invoke(mock_ctx)
+        mock_ctx.send.assert_not_awaited()
+        music_bot.get_mp.assert_not_called()
+
 
 class TestValidateCommands:
     async def test_raises_command_error_when_not_in_voice(

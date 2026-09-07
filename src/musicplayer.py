@@ -343,6 +343,17 @@ def _build_now_playing_base_embed(
     return embed
 
 
+def require_text_channel(ctx: commands.Context) -> discord.TextChannel:
+    """The invoking channel, refused unless it is a regular text channel: the
+    player posts its Now Playing host there and persists the id as its home.
+    cog_before_invoke answers the member first; this guards what reaches a
+    player past it."""
+    channel = ctx.channel
+    if not isinstance(channel, discord.TextChannel):
+        raise commands.CheckFailure(f"{type(channel).__name__} is not a text channel")
+    return channel
+
+
 def _link_stream_provenance(span: trace.Span, song: YTDL) -> None:
     """Link this song's trace to the extraction that minted its stream URL, which
     _cache_stream stamped onto the cache entry. A URL extracted in band is already in
@@ -545,11 +556,11 @@ class MusicPlayer:
         redis: Optional[aioredis.Redis] = None,
     ) -> MusicPlayer:
         assert ctx.guild is not None
-        assert isinstance(ctx.channel, discord.TextChannel)
         assert ctx.cog is not None
+        channel = require_text_channel(ctx)
         # ctx.cog is Optional[Cog] to discord.py, but MusicBot is the only cog owning
         # the commands that reach here.
-        mp = cls(bot, ctx.guild, ctx.channel, cast("MusicBot", ctx.cog), redis=redis)
+        mp = cls(bot, ctx.guild, channel, cast("MusicBot", ctx.cog), redis=redis)
         mp._last_author = ctx.author
         return mp
 
@@ -634,8 +645,7 @@ class MusicPlayer:
         return True
 
     def set_context(self, ctx: commands.Context) -> None:
-        assert isinstance(ctx.channel, discord.TextChannel)
-        self._channel = ctx.channel
+        self._channel = require_text_channel(ctx)
         self._last_author = ctx.author
 
     def _require_requester(self) -> Union[discord.User, discord.Member]:

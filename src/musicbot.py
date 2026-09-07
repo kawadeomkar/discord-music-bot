@@ -330,21 +330,32 @@ class MusicBot(commands.Cog):
             # one it just manufactured and leave a 300s gate timeout behind.
             if ctx.command is not None and ctx.command.extras.get("observation_only"):
                 return
+            # Before get_mp(): the player posts and persists its home channel, and
+            # a thread or voice-channel chat is neither. Answered here so the
+            # member sees why — CheckFailure is a CommandError, an assertion is not.
+            channel = ctx.channel
+            if not isinstance(channel, discord.TextChannel):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Music commands work in a regular text channel — threads "
+                        "and voice-channel chats aren't supported. Try again from "
+                        "a text channel.",
+                        discord.Color.orange(),
+                    )
+                )
+                raise commands.CheckFailure(
+                    f"{type(channel).__name__} is not a text channel"
+                )
             old_channel = (
                 self.mps[ctx.guild.id].home_channel
                 if ctx.guild.id in self.mps
                 else None
             )
             mp = self.get_mp(ctx)
-            if (
-                isinstance(ctx.channel, discord.TextChannel)
-                and old_channel != ctx.channel
-                and mp.store is not None
-                and ctx.guild is not None
-            ):
+            if old_channel != channel and mp.store is not None:
                 vc = ctx.guild.voice_client
                 if isinstance(vc, discord.VoiceClient) and vc.channel is not None:
-                    await mp.store.set_connection(vc.channel.id, ctx.channel.id)
+                    await mp.store.set_connection(vc.channel.id, channel.id)
         except Exception as e:
             # cog_after_invoke won't fire if cog_before_invoke raises — end span now.
             self._active_spans.pop(id(ctx))
