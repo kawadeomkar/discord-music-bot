@@ -822,10 +822,35 @@ _SLUG_FIELDS: Final[tuple[str, ...]] = ("query_source",)
 _EPOCH_FIELDS: Final[tuple[str, ...]] = ("played_at", "queued_at")
 _INT4_MAX: Final[int] = 2**31 - 1
 _INT8_MAX: Final[int] = 2**63 - 1
+# Byte budget per text column, matched by the octet_length CHECKs in
+# migrations/0002_text_bounds.sql. webpage_url is in play_history_dedup, whose
+# btree refuses a tuple past 2704 bytes with SQLSTATE 54000, not a CHECK.
+# See docs/ARCHITECTURE.md#text-column-bounds.
+URL_MAX_BYTES: Final[int] = 2048
+TEXT_MAX_BYTES: Final[int] = 1024
+_TEXT_BYTE_LIMITS: Final[dict[str, int]] = {
+    "title": TEXT_MAX_BYTES,
+    "webpage_url": URL_MAX_BYTES,
+    "requester_name": TEXT_MAX_BYTES,
+    "thumbnail": TEXT_MAX_BYTES,
+    "uploader": TEXT_MAX_BYTES,
+}
 # 9999-12-31T23:59:59Z — the epoch domain of the play_history timestamptz
 # columns: history_archive clamps cutoffs to it and the migration's CHECKs
 # spell the same value.
 TS_MAX: Final[float] = 253402300799.0
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    """`value` cut to at most `max_bytes` of UTF-8 on a codepoint boundary, so
+    the result still encodes — a split codepoint would be the NUL problem again,
+    refused by the server rather than clamped here."""
+    if len(value) <= max_bytes // 4:  # every codepoint is at most 4 bytes
+        return value
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -880,14 +905,18 @@ class HistoryEntry:
         means a producer stopped stamping guild_id.
 
         Range tests rather than paired bound checks: a chained comparison is
-        False for NaN, which lands NaN on the sentinel. Everything else the
+        False for NaN, which lands NaN on the sentinel. Text is NUL-stripped and
+        cut to its column's byte budget (_TEXT_BYTE_LIMITS). Everything else the
         columns could refuse (lone surrogates, non-finite floats, >64-bit ints)
         orjson already refuses to encode.
         """
         for name in _TEXT_FIELDS:
             value: str = getattr(self, name)
             if "\x00" in value:
-                object.__setattr__(self, name, value.replace("\x00", ""))
+                value = value.replace("\x00", "")
+            value = _truncate_utf8(value, _TEXT_BYTE_LIMITS[name])
+            if value != getattr(self, name):
+                object.__setattr__(self, name, value)
         for name, ceiling in (
             *((f, _INT4_MAX) for f in _INT4_FIELDS),
             *((f, _INT8_MAX) for f in _INT8_FIELDS),

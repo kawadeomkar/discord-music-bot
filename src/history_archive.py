@@ -1117,6 +1117,11 @@ class PostgresHistoryArchive:
 #                         transient it fails EVERY insert and redelivers forever
 #                         onto history:outbox, which has no TTL and is exempt from
 #                         eviction, ending in a Redis OOM that rejects all writes
+#   ProgramLimitExceededError
+#                         54000, an index tuple over 2704 bytes: a webpage_url
+#                         past the play_history_dedup btree's ceiling. A property
+#                         of the row, so a retry can never succeed; the byte
+#                         budget in HistoryEntry keeps it unreachable
 #
 # Deliberately not here — each would break the drain:
 #   - UndefinedTableError: the isolation path writes to play_history_rejected,
@@ -1135,6 +1140,7 @@ _POISON = (
     asyncpg.exceptions.CheckViolationError,
     asyncpg.exceptions.NotNullViolationError,
     asyncpg.exceptions.UndefinedColumnError,
+    asyncpg.exceptions.ProgramLimitExceededError,
 )
 
 

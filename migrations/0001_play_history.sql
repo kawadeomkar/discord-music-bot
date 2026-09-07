@@ -1,23 +1,9 @@
 -- The play-history schema: the durable long-term home for every played song,
 -- plus the reject table that catches anything the server refuses.
 --
--- Deliberately ONE migration. No deployment holds this schema, so there is no
--- database whose shape this has to evolve, and a sequence of ALTER steps would
--- describe upgrades that never happened to anyone. While that holds, this file
--- is edited IN PLACE.
---
--- The trigger for freezing it is a DEPLOYED database, not a tagged release:
--- v1.3.0 onward all ship this file and v2.4.0 onward all connect, yet editing
--- it stays safe for exactly as long as no instance has run one. Once one has,
--- every change becomes a new numbered migration, because from then on the
--- ALTERs are real.
---
--- Consequence while the window is open: migrate() skips a version already in
--- schema_migrations WITHOUT reading the file, and IF NOT EXISTS makes the DDL a
--- no-op anyway, so a database on an earlier shape does NOT get updated and
--- still reports version 1. Dropping the tables is not enough either — the
--- ledger row survives and the re-run applies nothing. Drop the database (or the
--- compose volume) and re-run.
+-- FROZEN. migrate() skips a version already in schema_migrations without
+-- reading the file, so an edit here reaches fresh databases only; every change
+-- is a new numbered migration (0002_text_bounds.sql is the first).
 --
 -- The zero-value convention ("0 / empty string = unknown") carries over from
 -- the wire format — no NULLs. Deliberate: unique indexes treat NULLs as
@@ -34,9 +20,9 @@
 -- added after release wants NOT VALID instead, to stay off the full-scan,
 -- ACCESS EXCLUSIVE path.
 --
--- webpage_url is deliberately unconstrained: the validator stores '' rather than
+-- webpage_url carries no format CHECK: the validator stores '' rather than
 -- rejecting it, because the read path runs that same validator over rows that
--- already contain it (findings §5.3, open decision §11.1).
+-- already contain it. Its byte bound is 0002_text_bounds.sql.
 CREATE TABLE IF NOT EXISTS play_history (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     guild_id       bigint      NOT NULL,

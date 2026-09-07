@@ -977,6 +977,67 @@ class TestHistoryEntryDomain:
         assert entry.uploader == "chan"
         assert entry.guild_id == 42
 
+    def test_text_at_its_byte_budget_is_untouched(self) -> None:
+        from src.guild_state import TEXT_MAX_BYTES, URL_MAX_BYTES
+
+        entry = HistoryEntry(
+            guild_id=1, title="t" * TEXT_MAX_BYTES, webpage_url="u" * URL_MAX_BYTES
+        )
+        assert len(entry.title) == TEXT_MAX_BYTES
+        assert len(entry.webpage_url) == URL_MAX_BYTES
+
+    @pytest.mark.parametrize(
+        "field", ["title", "requester_name", "thumbnail", "uploader"]
+    )
+    def test_text_past_the_budget_is_cut_to_the_byte_limit(self, field: str) -> None:
+        # The bound is BYTES, the unit octet_length() and the btree measure in,
+        # not characters.
+        from src.guild_state import TEXT_MAX_BYTES
+
+        entry = _entry_with(guild_id=1, **{field: "x" * (TEXT_MAX_BYTES + 500)})
+        assert len(getattr(entry, field).encode("utf-8")) == TEXT_MAX_BYTES
+
+    def test_webpage_url_has_the_wider_budget(self) -> None:
+        # 2048 rather than 1024: a URL is the dedup key, and the btree ceiling it
+        # protects is 2704 bytes for the whole tuple.
+        from src.guild_state import URL_MAX_BYTES
+
+        entry = HistoryEntry(guild_id=1, webpage_url="https://x/" + "a" * 3000)
+        assert len(entry.webpage_url.encode("utf-8")) == URL_MAX_BYTES
+        assert entry.webpage_url.startswith("https://x/")
+
+    def test_the_cut_never_splits_a_codepoint(self) -> None:
+        # 1024 is not a multiple of 3, so a run of 3-byte codepoints must land
+        # one short of the budget rather than on a partial sequence Postgres
+        # would refuse as invalid UTF-8.
+        from src.guild_state import TEXT_MAX_BYTES
+
+        entry = HistoryEntry(guild_id=1, title="\u20ac" * 600)  # 1800 bytes
+        encoded = entry.title.encode("utf-8")
+        assert len(encoded) == TEXT_MAX_BYTES - (TEXT_MAX_BYTES % 3)
+        assert entry.title == "\u20ac" * (TEXT_MAX_BYTES // 3)
+        four = HistoryEntry(guild_id=1, uploader="\U0001f3b5" * 300)  # 1200 bytes
+        assert len(four.uploader.encode("utf-8")) == TEXT_MAX_BYTES
+        assert four.uploader == "\U0001f3b5" * (TEXT_MAX_BYTES // 4)
+
+    def test_nul_strip_and_the_byte_cut_compose(self) -> None:
+        # Stripping first: a NUL inside the budget window frees a byte the cut
+        # then measures, so the result is exactly the budget with no NUL in it.
+        from src.guild_state import TEXT_MAX_BYTES
+
+        entry = HistoryEntry(guild_id=1, title="a\x00" + "b" * (TEXT_MAX_BYTES + 5))
+        assert "\x00" not in entry.title
+        assert len(entry.title.encode("utf-8")) == TEXT_MAX_BYTES
+
+    def test_every_text_field_has_a_byte_budget(self) -> None:
+        # A text field outside the budget table would KeyError at construction,
+        # which is loud — but the table and the tuple are two spellings of one
+        # set, and this pins them together.
+        from src.guild_state import _TEXT_BYTE_LIMITS, _TEXT_FIELDS
+
+        assert set(_TEXT_BYTE_LIMITS) == set(_TEXT_FIELDS)
+        assert all(limit > 0 for limit in _TEXT_BYTE_LIMITS.values())
+
     @pytest.mark.parametrize(
         "played_at",
         [1e18, 1e300, -1e12, -1e18, float("nan"), float("inf"), float("-inf")],
@@ -1109,6 +1170,7 @@ class TestHistoryEntryDomain:
             HistoryEntry(guild_id=1, title="x\x00y"),
             HistoryEntry(guild_id=2**64 - 1, played_at=1e18),
             HistoryEntry(guild_id=1, duration_secs=-5, played_at=float("nan")),
+            HistoryEntry(guild_id=1, title="\u20ac" * 600, webpage_url="u" * 5000),
         ):
             assert parse_history_entry(serialize_history_entry(entry)) == entry
 

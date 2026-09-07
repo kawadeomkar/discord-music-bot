@@ -37,6 +37,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Redis memory bounds](#redis-memory-bounds)
     - [Postgres credential handling](#postgres-credential-handling)
     - [History backfill](#history-backfill)
+    - [Text column bounds](#text-column-bounds)
 15. [Subsystem Invariants](#subsystem-invariants)
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
@@ -875,6 +876,7 @@ Applied by the in-app migration runner (`src/db_migrate.py`; files in `migration
 - **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so a `-playnow`-interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`), `queued_at timestamptz` and `queue_position` (both read at **ask** time — when the user's command message was sent, and how many songs were ahead of it at that moment, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption. `queue_position` is approximate against the insert by design, since the loop dequeues while a command resolves), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
 - **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
+- **`0002_text_bounds.sql`** — `octet_length` CHECKs on the five text columns (2048 bytes for `webpage_url`, 1024 for the rest), added `NOT VALID`. See [Text column bounds](#text-column-bounds).
 
 #### Why `query_source` is stored rather than derived
 
@@ -1367,6 +1369,41 @@ regress:
   in one transaction, so a list already at the cap keeps its length exactly while each
   song end destroys one unread tail entry. A count check sees nothing; re-reading the
   tail bytes is what catches it.
+
+### Text column bounds
+
+`HistoryEntry.__post_init__` cuts every text field to a byte budget — `URL_MAX_BYTES`
+(2048) for `webpage_url`, `TEXT_MAX_BYTES` (1024) for `title`, `requester_name`,
+`thumbnail` and `uploader` — measured in encoded UTF-8 and cut on a codepoint boundary,
+so the result always encodes. `migrations/0002_text_bounds.sql` mirrors the budgets as
+named `octet_length` CHECKs, so a regression of the clamp is a `CheckViolationError`
+that `_isolate` already routes to `play_history_rejected`.
+
+The bound on `webpage_url` is the one that matters, and a CHECK could not have carried
+it alone. `play_history_dedup` is a btree over `(guild_id, played_at, webpage_url)`, and
+a btree refuses an index tuple past **2704 bytes** with SQLSTATE 54000
+(`asyncpg.exceptions.ProgramLimitExceededError`). That error is a property of the row,
+so a retry can never succeed — but it is neither a `DataError` nor an integrity
+violation, so before it was named in `_POISON` a single long URL failed the whole
+`executemany`, the generic handler backed off, and the pending batch redelivered
+forever: the drain wedged on a non-evictable stream with nothing dead-lettered and
+nothing logged past the retry warning. 2048 bytes of URL plus two 8-byte key columns and
+the tuple header stays under the ceiling; the drift the `pg` tier pins is that with the
+CHECK dropped, the btree's own refusal still reads as poison
+(`TestLongUrlAgainstARealServer`).
+
+The cut is a truncation, not a reset to the unknown sentinel. For the display fields a
+prefix is the useful remainder; for `webpage_url` a deterministic prefix keeps two
+deliveries of one play deduplicating, where `''` would merge it into the excluded
+unknown-URL group. No real YouTube, Spotify or SoundCloud URL approaches the budget — a
+`watch?v=` URL is under 60 bytes, a thumbnail under 200 — so a value that reaches it is
+a defect upstream, not a song.
+
+The migration is `NOT VALID` because a deployed table may hold rows written before the
+bounds, and a validating `ADD CONSTRAINT` scans it under `ACCESS EXCLUSIVE`; new rows
+are checked either way. It is also the first migration after `0001`, which is now
+frozen: `migrate()` skips a version already in the ledger without reading the file, so
+an edit to `0001` would reach fresh databases only.
 
 ## Subsystem Invariants
 

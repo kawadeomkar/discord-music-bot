@@ -26,9 +26,12 @@ import asyncpg
 import pytest
 from redis.asyncio import Redis
 
+from src import guild_state
 from src.db_migrate import EXPECTED_SCHEMA_VERSION, migrate
 from src.backfill_history import backfill
 from src.guild_state import (
+    TEXT_MAX_BYTES,
+    URL_MAX_BYTES,
     WAIT_UNAVAILABLE,
     HistoryEntry,
     parse_history_entry,
@@ -213,6 +216,29 @@ class TestMigrations:
             )
         finally:
             await conn.close()
+
+    async def test_0002_adds_the_text_byte_bounds(self, pg_dsn: str) -> None:
+        # Five NOT VALID CHECKs, one per text column, and re-running is a no-op
+        # (the DO block guards each ADD, since ADD CONSTRAINT has no IF NOT
+        # EXISTS). convalidated is false: the ADD scanned nothing.
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            rows = await conn.fetch(
+                "SELECT conname, convalidated FROM pg_constraint "
+                "WHERE conrelid = 'play_history'::regclass AND conname LIKE '%_len' "
+                "ORDER BY conname"
+            )
+        finally:
+            await conn.close()
+        assert [r["conname"] for r in rows] == [
+            "play_history_requester_name_len",
+            "play_history_thumbnail_len",
+            "play_history_title_len",
+            "play_history_uploader_len",
+            "play_history_webpage_url_len",
+        ]
+        assert not any(r["convalidated"] for r in rows)
+        assert await migrate(pg_dsn) == EXPECTED_SCHEMA_VERSION
 
     async def test_inserted_at_column_exists_and_defaults(
         self, archive: PostgresHistoryArchive, pg_dsn: str
@@ -538,6 +564,13 @@ def _boundary_entries() -> list[HistoryEntry]:
         HistoryEntry(guild_id=7, webpage_url="u/qceil", queued_at=253402300799.0),
         HistoryEntry(guild_id=7, webpage_url="u/qpneg", queue_position=-1),
         HistoryEntry(guild_id=7, webpage_url="u/qp31", queue_position=2**31),
+        # Past the byte budget in each text field, multibyte so the cut lands
+        # on a codepoint boundary rather than exactly on the budget.
+        HistoryEntry(guild_id=7, webpage_url="u/lt", title="\u20ac" * 600),
+        HistoryEntry(guild_id=7, webpage_url="u/lw/" + "\u20ac" * 900),
+        HistoryEntry(guild_id=7, webpage_url="u/lr", requester_name="\u20ac" * 600),
+        HistoryEntry(guild_id=7, webpage_url="u/lth", thumbnail="\u20ac" * 600),
+        HistoryEntry(guild_id=7, webpage_url="u/lu", uploader="\u20ac" * 600),
         # NUL in each text field.
         HistoryEntry(guild_id=7, webpage_url="u/t", title="a\x00b"),
         HistoryEntry(guild_id=7, webpage_url="u/w\x00url"),
@@ -584,6 +617,18 @@ class TestSchemaLock:
             # Unlike title/uploader this column holds only machine-minted
             # tokens, so an out-of-domain value means the normalizer regressed.
             ("query_source", "NOT A HOST", "play_history_query_source_valid"),
+            # The 0002 byte bounds. Character counts, so a multibyte value
+            # proves the CHECK measures octets like the validator does.
+            ("title", "x" * (TEXT_MAX_BYTES + 1), "play_history_title_len"),
+            ("title", "\u20ac" * 400, "play_history_title_len"),
+            ("webpage_url", "u" * (URL_MAX_BYTES + 1), "play_history_webpage_url_len"),
+            (
+                "requester_name",
+                "x" * (TEXT_MAX_BYTES + 1),
+                "play_history_requester_name_len",
+            ),
+            ("thumbnail", "x" * (TEXT_MAX_BYTES + 1), "play_history_thumbnail_len"),
+            ("uploader", "x" * (TEXT_MAX_BYTES + 1), "play_history_uploader_len"),
         ],
     )
     async def test_constraints_catch_a_validator_regression(
@@ -678,6 +723,109 @@ class TestSchemaLock:
                 )
         finally:
             await conn.close()
+
+
+class TestLongUrlAgainstARealServer:
+    """The play_history_dedup btree refuses an index tuple past 2704 bytes with
+    SQLSTATE 54000 — a refusal no CHECK can express, which is why the budget in
+    HistoryEntry exists and why ProgramLimitExceededError is in _POISON. Both
+    claims are about the server, so they are settled here."""
+
+    _LONG_URL = "https://x/" + "a" * 3000
+
+    @staticmethod
+    def _disable_the_clamp(monkeypatch: pytest.MonkeyPatch) -> None:
+        # A validator regression, as it would present: every text field keeps
+        # its full value.
+        monkeypatch.setattr(
+            guild_state,
+            "_TEXT_BYTE_LIMITS",
+            dict.fromkeys(guild_state._TEXT_BYTE_LIMITS, 10**9),
+        )
+
+    async def test_the_budget_keeps_a_long_url_insertable(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Forward: the clamp lands the row, cut to the budget.
+        await archive.insert_batch([_play(url=self._LONG_URL, played_at=1.0)])
+        rows = await archive.recent(42, 10)
+        assert len(rows) == 1
+        assert len(rows[0].webpage_url.encode("utf-8")) == URL_MAX_BYTES
+
+    async def test_without_the_check_the_btree_itself_refuses(
+        self,
+        archive: PostgresHistoryArchive,
+        pg_dsn: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The class the CHECK stands in front of. Dropping the bound exposes the
+        # index ceiling, and the error must still read as poison or the drain
+        # wedges on it.
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await conn.execute(
+                "ALTER TABLE play_history DROP CONSTRAINT play_history_webpage_url_len"
+            )
+        finally:
+            await conn.close()
+        self._disable_the_clamp(monkeypatch)
+        with pytest.raises(asyncpg.exceptions.ProgramLimitExceededError) as exc:
+            await archive.insert_batch([_play(url=self._LONG_URL, played_at=1.0)])
+        assert exc.value.sqlstate == "54000"
+        assert isinstance(exc.value, _POISON)
+
+    @pytest.mark.parametrize("keep_check", [True, False], ids=["check", "btree"])
+    async def test_a_regressed_long_url_lands_in_rejected_not_the_outbox(
+        self,
+        archive: PostgresHistoryArchive,
+        pg_dsn: str,
+        fake_redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        keep_check: bool,
+    ) -> None:
+        """The drain path end to end with the validator regressed: the 3 KB URL
+        reaches the server, is refused (by the CHECK, or by the btree with the
+        CHECK gone), and is parked in play_history_rejected with the batch around
+        it delivered and the outbox settled — never redelivered forever."""
+        if not keep_check:
+            conn = await asyncpg.connect(pg_dsn)
+            try:
+                await conn.execute(
+                    "ALTER TABLE play_history DROP CONSTRAINT play_history_webpage_url_len"
+                )
+            finally:
+                await conn.close()
+        self._disable_the_clamp(monkeypatch)
+        await ensure_outbox_group(fake_redis)
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for entry in (
+            _entry(1),
+            _play(url=self._LONG_URL, played_at=1.0),
+            _entry(3),
+        ):
+            await store.push_history(entry)
+
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        assert await drainer._drain_once() == 3
+
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+        landed = await archive.recent(42, 10)
+        assert sorted(e.title for e in landed) == ["Song 1", "Song 3"]
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            rejected = await conn.fetch(
+                "SELECT guild_id, error_type, payload FROM play_history_rejected"
+            )
+        finally:
+            await conn.close()
+        [row] = rejected
+        assert row["guild_id"] == 42
+        assert row["error_type"] == (
+            "CheckViolationError" if keep_check else "ProgramLimitExceededError"
+        )
+        # Verbatim: the play is recoverable from the parked bytes.
+        parked = parse_history_entry(row["payload"])
+        assert parked is not None and parked.webpage_url.startswith("https://x/")
 
 
 class TestRejectsTable:

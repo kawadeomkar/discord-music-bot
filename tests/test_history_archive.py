@@ -2582,6 +2582,15 @@ class TestPoisonClassification:
     def test_not_null_violation_is_poison(self) -> None:
         assert isinstance(asyncpg.exceptions.NotNullViolationError("x"), _POISON)
 
+    def test_program_limit_exceeded_is_poison(self) -> None:
+        # SQLSTATE 54000: an index tuple past the btree's 2704-byte ceiling,
+        # which a long webpage_url reaches through play_history_dedup. A property
+        # of the row, so left transient it redelivers the batch forever.
+        assert not issubclass(
+            asyncpg.exceptions.ProgramLimitExceededError, asyncpg.exceptions.DataError
+        )
+        assert isinstance(asyncpg.exceptions.ProgramLimitExceededError("x"), _POISON)
+
     def test_data_error_is_poison(self) -> None:
         assert isinstance(asyncpg.exceptions.DataError("x"), _POISON)
 
