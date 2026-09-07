@@ -891,6 +891,49 @@ db-rejects COUNT='10':
          FROM play_history_rejected
          ORDER BY rejected_at DESC LIMIT {{ COUNT }}"
 
+# Erasure of archived plays, by guild or by requester. Postgres only: the capped
+# Redis window (guild:{id}:history) and the TTL'd leaderboard and analytics
+# caches are separate copies — docs/ARCHITECTURE.md#retention-and-deletion names
+# each and how to clear it. The id is checked to be digits before it reaches
+# psql, and it travels as a psql variable rather than spliced into the SQL.
+# --single-transaction: a failure deletes nothing.
+[doc('Erase every archived play from one guild (play_history + play_history_rejected)')]
+[group('database')]
+db-forget-guild ID:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    case {{ quote(ID) }} in ''|*[!0-9]*)
+        echo "Error: ID must be a Discord snowflake (digits only), got {{ quote(ID) }}" >&2
+        exit 2 ;;
+    esac
+    docker compose exec -T postgres psql -U "${POSTGRES_USER:-musicbot}" \
+        -d "${POSTGRES_DB:-musicbot}" -v ON_ERROR_STOP=1 --single-transaction \
+        -v id={{ quote(ID) }} <<'SQL'
+    WITH d AS (DELETE FROM play_history WHERE guild_id = :'id'::bigint RETURNING 1)
+        SELECT count(*) AS play_history_rows_deleted FROM d;
+    WITH d AS (DELETE FROM play_history_rejected WHERE guild_id = :'id'::bigint RETURNING 1)
+        SELECT count(*) AS play_history_rejected_rows_deleted FROM d;
+    SQL
+
+# play_history_rejected has no requester column — its payload is the raw entry —
+# so a per-user erasure covers play_history alone; `just db-rejects` shows what
+# that table holds (expected: nothing).
+[doc('Erase every archived play one user requested, across all guilds')]
+[group('database')]
+db-forget-user ID:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    case {{ quote(ID) }} in ''|*[!0-9]*)
+        echo "Error: ID must be a Discord snowflake (digits only), got {{ quote(ID) }}" >&2
+        exit 2 ;;
+    esac
+    docker compose exec -T postgres psql -U "${POSTGRES_USER:-musicbot}" \
+        -d "${POSTGRES_DB:-musicbot}" -v ON_ERROR_STOP=1 --single-transaction \
+        -v id={{ quote(ID) }} <<'SQL'
+    WITH d AS (DELETE FROM play_history WHERE requester_id = :'id'::bigint RETURNING 1)
+        SELECT count(*) AS play_history_rows_deleted FROM d;
+    SQL
+
 # Custom-format dump (-Fc): compressed and restorable selectively, unlike plain
 # SQL. Writes into backups/, which is gitignored.
 [doc('Dump the play-history database to backups/')]

@@ -38,6 +38,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Postgres credential handling](#postgres-credential-handling)
     - [History backfill](#history-backfill)
     - [Text column bounds](#text-column-bounds)
+    - [Retention and deletion](#retention-and-deletion)
 15. [Subsystem Invariants](#subsystem-invariants)
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
@@ -1421,6 +1422,36 @@ bounds, and a validating `ADD CONSTRAINT` scans it under `ACCESS EXCLUSIVE`; new
 are checked either way. It is also the first migration after `0001`, which is now
 frozen: `migrate()` skips a version already in the ledger without reading the file, so
 an edit to `0001` would reach fresh databases only.
+
+### Retention and deletion
+
+What the bot stores about a play, for how long, and how to erase it. Every copy is
+listed because deleting one and not the others is the failure mode: an operator who
+removes the `postgres-data` volume after being asked to erase a user's data has deleted
+nothing if the archive was never enabled (see the note above — the Redis list is then
+the only copy).
+
+| Copy | Where | Retention | Erase |
+|---|---|---|---|
+| Durable record | Postgres `play_history` — title, URL, requester id and display name at play time, uploader, thumbnail, timing, NP message ids | Forever, while `HISTORY_ARCHIVE_ENABLED` is on. Off (the default) it is never written | `just db-forget-guild ID` deletes a guild's rows from `play_history` **and** `play_history_rejected`; `just db-forget-user ID` deletes every row a requester asked for, across guilds. Both refuse a non-numeric id, run in one transaction, and print the row counts |
+| Refused rows | Postgres `play_history_rejected` — the raw entry bytes plus the error | Forever; expected empty | `db-forget-guild` covers it. There is no requester column (the payload is opaque bytes), so `db-forget-user` does not — `just db-rejects` shows what it holds |
+| Undrained plays | Redis `history:outbox` | Until drained, seconds normally | Nothing to do: drained rows are deleted by the recipes above once the drain lands. Run `just outbox` first; a non-zero depth means plays not yet in Postgres |
+| Display window | Redis `guild:{id}:history`, the 50 newest plays per guild, the only source `-history` reads | Forever, by length: never expires, trimmed by count on each song end | Per guild: `docker compose exec redis redis-cli DEL guild:ID:history`. Per user there is no key to delete — the entries are elements of a list — so either delete the guild's list, or accept that the entry leaves the window within 50 plays |
+| Aggregate caches | Redis `leaderboard:v{n}:…`, `analytics:…` | 60 s; until the UTC day turns | Expire on their own. To hide a deleted play immediately: `redis-cli --scan --pattern 'leaderboard:*' | xargs redis-cli DEL`, likewise `analytics:*` |
+| Operator backups | `backups/*.dump` from `just db-backup` | Until removed by hand — outside every recipe here | Delete the files, or restore into a scratch database, apply the recipe, and re-dump |
+| Logs and traces | structlog to stdout; Loki/Tempo in the compose LGTM stack | Container log rotation; the LGTM volume | Song titles and requester ids appear in log lines and span attributes. The LGTM stack's own retention applies; `docker compose down -v` removes its volume |
+
+Discord itself is not on the list: the bot's replies (Now Playing cards, `-history`
+embeds) are messages in the guild's channels, owned by the guild, and no recipe here
+touches them.
+
+The recipes are `psql` through the same compose plumbing `just db-rejects` uses, so they
+run against the bundled stack without a local venv; against an external database, run
+the same statements with the id as a `psql -v` variable. They are not retention
+*policies* — nothing here ages rows out automatically, since the archive exists to be
+permanent. An operator who needs time-bounded retention adds a scheduled
+`DELETE FROM play_history WHERE played_at < now() - interval '…'`; `play_history_recent`
+makes that range cheap to find.
 
 ## Subsystem Invariants
 
