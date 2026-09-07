@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from discord.ext import commands
 from redis.asyncio import Redis
 
 from src import leaderboard
@@ -19,7 +20,7 @@ from src.history_archive import (
     SchemaVersionError,
     SongLeader,
 )
-from src.commands.leaderboard import LeaderboardFlags
+from src.commands.leaderboard import WINDOWS_DAYS, LeaderboardFlags, resolve_days
 from src.musicbot import MusicBot
 from tests.helpers import command_callback, mocked
 
@@ -351,17 +352,109 @@ class TestLeaderboardCommand:
         )
         assert len(mock_ctx.send.call_args[1]["embed"].description) < 4096
 
-    async def test_out_of_range_days_is_refused_without_querying(
+    async def test_negative_days_is_refused_without_querying(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         archive = _fake_archive(_board([_requester(1)]))
         music_bot.history_archive = archive
+        mock_ctx.command.reset_cooldown = MagicMock()
         await command_callback(MusicBot.leaderboard)(
-            music_bot, mock_ctx, flags=_lb_flags(days=leaderboard.MAX_DAYS + 1)
+            music_bot, mock_ctx, flags=_lb_flags(days=-3)
         )
         embed = mock_ctx.send.call_args[1]["embed"]
-        assert "--days must be between" in embed.description
+        assert "--days takes a positive number" in embed.description
+        assert "1, 7, 30, 90 or 365" in embed.description
         archive.leaderboard.assert_not_awaited()
+        # The refusal never reached Postgres, so the cooldown slot comes back.
+        mock_ctx.command.reset_cooldown.assert_called_once_with(mock_ctx)
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [
+            (1, 1),
+            (3, 1),
+            (4, 1),
+            (5, 7),
+            (18, 7),
+            (19, 30),
+            (60, 30),
+            (61, 90),
+            (400, 365),
+            (3650, 365),
+        ],
+    )
+    def test_days_round_to_the_nearest_window(
+        self, requested: int, expected: int
+    ) -> None:
+        """A free integer made every distinct N a cache miss and an aggregate pass —
+        a 3,650-way bypass. Ties go to the shorter window."""
+        assert resolve_days(requested) == expected
+        assert expected in WINDOWS_DAYS
+
+    def test_zero_stays_all_time_and_negative_is_refused(self) -> None:
+        assert resolve_days(0) == 0
+        assert resolve_days(-1) is None
+
+    async def test_a_rounded_window_is_served_and_named(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        archive = _fake_archive(_board([_requester(1)]))
+        music_bot.history_archive = archive
+        with patch("src.commands.leaderboard.time.time", return_value=1_000_000.0):
+            await command_callback(MusicBot.leaderboard)(
+                music_bot, mock_ctx, flags=_lb_flags(days=25)
+            )
+        assert archive.leaderboard.await_args.kwargs["since_epoch"] == (
+            1_000_000.0 - 30 * 86400
+        )
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert embed.title == "🏆 Leaderboard — last 30 days"
+        assert "--days 25 rounded to 30" in embed.footer.text
+
+    async def test_an_exact_window_carries_no_rounding_note(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.history_archive = _fake_archive(_board([_requester(1)]))
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags(days=30)
+        )
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "rounded" not in embed.footer.text
+
+    async def test_pre_query_refusals_refund_the_cooldown(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """discord.py charges the cooldown in prepare(); a refusal that never
+        touched the archive hands it back, as -analytics does."""
+        music_bot.history_archive = None
+        mock_ctx.command.reset_cooldown = MagicMock()
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        mock_ctx.command.reset_cooldown.assert_called_once_with(mock_ctx)
+
+    async def test_a_served_board_keeps_the_cooldown(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.history_archive = _fake_archive(_board([_requester(1)]))
+        mock_ctx.command.reset_cooldown = MagicMock()
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        mock_ctx.command.reset_cooldown.assert_not_called()
+
+    def test_the_command_is_bounded_on_both_axes(self) -> None:
+        """max_concurrency bounds how many run at once; the cooldown how often —
+        the axis the 60s cache cannot cover once --days is bounded to six keys."""
+        cmd = MusicBot.leaderboard
+        assert cmd._max_concurrency is not None
+        cooldown = cmd._buckets._cooldown
+        assert cooldown is not None
+        assert (cooldown.rate, cooldown.per) == (1, 10.0)
+        assert cmd._buckets.type is commands.BucketType.guild
+
+    def test_help_copy_names_the_windows(self) -> None:
+        assert "1, 7, 30, 90 or 365" in (MusicBot.leaderboard.help or "")
 
     async def test_default_window_is_all_time(
         self, music_bot: MusicBot, mock_ctx: MagicMock

@@ -46,7 +46,7 @@ from src.commands.history import (
 )
 from src.play_pipeline import PlaylistInputError
 from src.commands.analytics import AnalyticsFlags
-from src.commands.leaderboard import LeaderboardFlags
+from src.commands.leaderboard import LeaderboardFlags, windows_copy
 from src.history_archive import (
     ArchiveReader,
 )
@@ -436,6 +436,13 @@ class MusicBot(commands.Cog):
             await ctx.send(
                 embed=notice_embed(
                     f"A `{cmd}` request is already running in this server.",
+                    discord.Color.orange(),
+                )
+            )
+        elif isinstance(error, commands.NoPrivateMessage):
+            await ctx.send(
+                embed=notice_embed(
+                    "That command only works in a server channel.",
                     discord.Color.orange(),
                 )
             )
@@ -830,8 +837,9 @@ class MusicBot(commands.Cog):
         help=(
             "Shows this server's top 10 listeners and top 10 songs, ranked by "
             "total listening time (song and play counts included).\n\n"
-            "`--days N` limits both boards to the last N days; without it they "
-            "are all-time. The numbers come from this server's long-term play "
+            f"`--days N` limits both boards to the last {windows_copy()} days "
+            "(N is rounded to the nearest); without it they are all-time. The "
+            "numbers come from this server's long-term play "
             "archive, so they cover every song since the archive was enabled — "
             "not just the recent plays `-history` shows. A song that just "
             "finished can take a moment to appear."
@@ -846,8 +854,10 @@ class MusicBot(commands.Cog):
         },
     )
     # No validate_commands: needs no voice channel. Concurrency bound against the
-    # pool the drainer also draws from; the 60s cache bounds the rate.
+    # pool the drainer also draws from; the cooldown bounds how often, since a
+    # window the 60s cache has not seen is an aggregate pass over the table.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @commands.cooldown(1, 10.0, commands.BucketType.guild)
     @_tracer.start_as_current_span("bot.leaderboard")
     async def leaderboard(
         self, ctx: commands.Context, *, flags: LeaderboardFlags
@@ -991,6 +1001,10 @@ class MusicBot(commands.Cog):
         ),
         extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
+    # Per user, not per guild: one member's spam must not lock the row out for
+    # everyone else. guild_only keeps dependency health out of DMs.
+    @commands.guild_only()
+    @commands.cooldown(1, 10.0, commands.BucketType.user)
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.ping")
     async def ping(self, ctx: commands.Context) -> None:

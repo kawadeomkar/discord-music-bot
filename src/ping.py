@@ -157,6 +157,12 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
     return await _timed("Redis", _do)
 
 
+# The Spotify row is a live API call per -ping; one answer serves every -ping
+# inside this window, process-wide.
+_SPOTIFY_PROBE_TTL_SECS = 30.0
+_spotify_probe_cache: Optional[tuple[float, ProbeResult]] = None
+
+
 async def probe_spotify(
     spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
 ) -> ProbeResult:
@@ -179,6 +185,11 @@ async def probe_spotify(
             "Spotify API", ProbeState.DOWN, detail="credentials rejected"
         )
 
+    global _spotify_probe_cache
+    cached = _spotify_probe_cache
+    if cached is not None and time.monotonic() - cached[0] < _SPOTIFY_PROBE_TTL_SECS:
+        return cached[1]
+
     async def _do() -> None:
         # Reachability without spending quota: a tiny authenticated GET that also
         # exercises the token-refresh path, confirming auth + data plane.
@@ -186,7 +197,9 @@ async def probe_spotify(
             spotify.spotify_endpoint + "v1/browse/categories", params={"limit": 1}
         )
 
-    return await _timed("Spotify API", _do)
+    result = await _timed("Spotify API", _do)
+    _spotify_probe_cache = (time.monotonic(), result)
+    return result
 
 
 async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:

@@ -580,6 +580,11 @@ class TestProbeRedis:
 
 
 class TestProbeSpotify:
+    @pytest.fixture(autouse=True)
+    def _fresh_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Process-wide state: one test's answer must not serve the next.
+        monkeypatch.setattr(ping, "_spotify_probe_cache", None)
+
     def _spotify(self, http_call: object, creds: bool = True) -> object:
         return SimpleNamespace(
             client_id="id" if creds else None,
@@ -624,6 +629,39 @@ class TestProbeSpotify:
         spotify = self._spotify(AsyncMock(side_effect=Exception("401")))
         r = await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
         assert r.state is ProbeState.DOWN
+
+    async def test_one_answer_serves_every_ping_inside_the_window(self) -> None:
+        """The row is a live API call, and -ping is a member-spammable command;
+        inside _SPOTIFY_PROBE_TTL_SECS the first answer is reused."""
+        http_call = AsyncMock(return_value={"categories": {}})
+        spotify = self._spotify(http_call)
+        first = await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
+        second = await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
+        assert second is first
+        http_call.assert_awaited_once()
+
+    async def test_the_cache_expires(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        http_call = AsyncMock(return_value={"categories": {}})
+        spotify = self._spotify(http_call)
+        await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
+        stamped, result = ping._spotify_probe_cache  # type: ignore[misc]
+        monkeypatch.setattr(
+            ping,
+            "_spotify_probe_cache",
+            (stamped - ping._SPOTIFY_PROBE_TTL_SECS - 1, result),
+        )
+        await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
+        assert http_call.await_count == 2
+
+    async def test_a_cached_answer_does_not_shadow_a_status_change(self) -> None:
+        """The short-circuits read the status first: credentials rejected after a
+        cached OK must not keep reporting OK for the window."""
+        http_call = AsyncMock(return_value={"categories": {}})
+        spotify = self._spotify(http_call)
+        await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
+        r = await ping.probe_spotify(spotify, SpotifyStatus.INVALID)  # type: ignore[arg-type]
+        assert r.state is ProbeState.DOWN
+        assert r.detail == "credentials rejected"
 
 
 # ── Postgres ───────────────────────────────────────────────────────────────────

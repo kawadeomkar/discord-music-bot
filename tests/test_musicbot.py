@@ -695,12 +695,36 @@ class TestMaxConcurrencyNotice:
         assert "already running" in embed.description
         assert "ping" in embed.description
 
+    async def test_a_dm_refusal_says_so(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """guild_only raises NoPrivateMessage in prepare(), before any body runs;
+        without this arm the DM gets silence."""
+        await music_bot.cog_command_error(mock_ctx, commands.NoPrivateMessage())
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "server channel" in embed.description
+
+    def test_ping_is_per_user_rate_limited_and_guild_only(self) -> None:
+        """Per user, so one member's spam does not lock the row out for the
+        guild; guild_only, so dependency health never answers a DM."""
+        cmd = MusicBot.ping
+        cooldown = cmd._buckets._cooldown
+        assert cooldown is not None
+        assert (cooldown.rate, cooldown.per) == (1, 10.0)
+        assert cmd._buckets.type is commands.BucketType.user
+        # guild_only registers a check whose failure is NoPrivateMessage.
+        dm_ctx = MagicMock()
+        dm_ctx.guild = None
+        with pytest.raises(commands.NoPrivateMessage):
+            for check in cmd.checks:
+                check(dm_ctx)
+
     async def test_a_cooldown_says_how_long_is_left(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-analytics is the only command with a cooldown, and this arm is the only
-        place a user learns why they were refused. Deleting it falls through to the
-        generic handler, and zeroing retry_after reads as "try again now"."""
+        """This arm is the only place a user learns why a cooldown refused them.
+        Deleting it falls through to the generic handler, and zeroing retry_after
+        reads as "try again now"."""
         mock_ctx.command = MagicMock()
         mock_ctx.command.name = "analytics"
         await music_bot.cog_command_error(

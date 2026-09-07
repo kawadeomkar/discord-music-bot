@@ -37,7 +37,9 @@ def ctx(bot: commands.Bot) -> MagicMock:
     context = MagicMock()
     context.bot = bot
     context.clean_prefix = "-"
-    context.guild = None
+    # A server context: filter_commands runs each command's checks, and a
+    # guild_only command (-ping) is hidden from a DM's listing.
+    context.guild = MagicMock()
     context.command = None
     context.send = AsyncMock()
     return context
@@ -94,6 +96,18 @@ class TestBotHelp:
         body = "\n".join(f.value or "" for f in embed.fields)
         for command in bot.commands:
             assert f"-{command.name}" in body
+
+    async def test_a_dm_listing_omits_guild_only_commands(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
+        """filter_commands runs the checks, so -ping's guild_only hides it where
+        it could not run — the listing never advertises a command that would
+        answer with a refusal."""
+        ctx.guild = None
+        await help_command.command_callback(ctx, command=None)
+        body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
+        assert "-ping" not in body
+        assert "-play" in body
 
     async def test_shows_every_alias(
         self, help_command: MusicHelpCommand, ctx: MagicMock, bot: commands.Bot
