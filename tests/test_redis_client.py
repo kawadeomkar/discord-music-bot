@@ -1,7 +1,9 @@
 """Tests for src/redis_client.py — connection lifecycle, cache helpers, and GuildRedisStore."""
 
 import ast
+import asyncio
 import inspect
+import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Any, Optional, cast
@@ -1619,6 +1621,71 @@ class TestGuildOpDefaults:
                     f"{name}: -> {returns} (not Optional) but default=None"
                 )
         assert not mismatches, "\n".join(mismatches)
+
+
+class TestGuildOpErrorReporting:
+    """What @_guild_op writes when a body raises: an outage names its exception
+    type at WARNING, a defect keeps its traceback at ERROR, and a cancellation
+    is never swallowed."""
+
+    @staticmethod
+    def _store_raising(exc: BaseException) -> GuildRedisStore:
+        r = MagicMock()
+        r.hgetall = AsyncMock(side_effect=exc)
+        return GuildRedisStore(r, guild_id=77)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            RedisConnectionError("refused"),
+            RedisTimeoutError("read timed out"),
+            ConnectionResetError("peer reset"),
+            TimeoutError("waited"),
+        ],
+        ids=["redis-connection", "redis-timeout", "os-error", "timeout"],
+    )
+    async def test_an_outage_is_a_warning_naming_the_type(
+        self, exc: Exception, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store = self._store_raising(exc)
+        with caplog.at_level(logging.WARNING, logger="src.redis_client"):
+            assert await store.get_guild_state() is None
+        record = caplog.records[-1]
+        assert record.levelno == logging.WARNING
+        assert type(exc).__name__ in record.getMessage()
+        assert "get_guild_state failed" in record.getMessage()
+        assert "Traceback" not in record.getMessage()
+
+    async def test_a_defect_is_an_error_with_its_traceback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ValueError out of a body is a bug in the body, not Redis blinking;
+        collapsing it into the outage warning is how a parser regression hides
+        behind "Redis is flaky"."""
+        store = self._store_raising(ValueError("bad wire"))
+        with caplog.at_level(logging.WARNING, logger="src.redis_client"):
+            assert await store.get_guild_state() is None
+        record = caplog.records[-1]
+        assert record.levelno == logging.ERROR
+        message = record.getMessage()
+        assert "get_guild_state raised" in message
+        # structlog renders exc_info into the message under the test config.
+        assert "Traceback" in message
+        assert "ValueError: bad wire" in message
+
+    async def test_cancellation_propagates(self) -> None:
+        """CancelledError is a BaseException: a store call cancelled mid-await
+        must unwind its task, not return the default and keep the task alive."""
+        store = self._store_raising(asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await store.get_guild_state()
+
+    def test_the_decorator_names_no_bare_exception_for_the_warning(self) -> None:
+        """Source-level: the WARNING arm catches the outage tuple, and the
+        generic arm logs at ERROR."""
+        source = inspect.getsource(redis_client._guild_op)
+        assert "except (RedisError, OSError, TimeoutError) as e:" in source
+        assert "exc_info=True" in source
 
 
 # ── State operations ──────────────────────────────────────────────────────────

@@ -13,6 +13,7 @@ from redis.asyncio.client import Pipeline
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
+from redis.exceptions import RedisError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.exceptions import WatchError
@@ -567,12 +568,15 @@ def _guild_op(
     Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]],
 ]:
     """GuildRedisStore's 'log, never raise' contract: on any exception, log
-    `[guild:{id}] {method} failed: {e}` and return `default`. Pass `default`
-    for immutable fallbacks and `default_factory` for anything mutable — a
-    decorator argument is evaluated once at class-body time, so `default=[]`
-    hands the same list to every guild on every failure. `default` is typed
-    Any, not `_R`: pinning it would let `default=None` collapse `_R` to `None`
-    for the Optional-returning readers."""
+    and return `default`. An outage shape (RedisError, OSError, TimeoutError)
+    is a WARNING naming the exception type; anything else is a defect in the
+    body and logs at ERROR with its traceback. CancelledError is a
+    BaseException and propagates. Pass `default` for immutable fallbacks and
+    `default_factory` for anything mutable — a decorator argument is evaluated
+    once at class-body time, so `default=[]` hands the same list to every
+    guild on every failure. `default` is typed Any, not `_R`: pinning it would
+    let `default=None` collapse `_R` to `None` for the Optional-returning
+    readers."""
 
     def decorator(
         func: Callable[Concatenate[GuildRedisStore, _P], Awaitable[_R]],
@@ -583,9 +587,16 @@ def _guild_op(
         ) -> _R:
             try:
                 return await func(self, *args, **kwargs)
-            except Exception as e:
-                log.warning(f"[guild:{self.guild_id}] {func.__name__} failed: {e}")
-                return default_factory() if default_factory is not None else default
+            except (RedisError, OSError, TimeoutError) as e:
+                log.warning(
+                    f"[guild:{self.guild_id}] {func.__name__} failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+            except Exception:
+                log.error(
+                    f"[guild:{self.guild_id}] {func.__name__} raised", exc_info=True
+                )
+            return default_factory() if default_factory is not None else default
 
         return wrapper
 
@@ -1038,11 +1049,11 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def get_playback_snapshot(self) -> Optional[GuildPlaybackSnapshot]:
         """The complete playback aggregate — state, queue, now-playing, history,
-        config — in one pipeline, so a failure aborts the whole snapshot and
-        the caller restores everything or nothing. Same error-vs-empty contract
-        as get_guild_state. Not MULTI: recovery holds the guild lock during
-        the window that matters."""
-        pipe = self.redis.pipeline()
+        config — in one MULTI (the pipeline default), so the five reads land
+        at one instant and the state hash agrees with the list it describes,
+        and a failure aborts the whole snapshot so the caller restores
+        everything or nothing. Same error-vs-empty contract as get_guild_state."""
+        pipe = self.redis.pipeline(transaction=True)
         pipe.hgetall(self.state_key())
         pipe.lrange(self.queue_key(), 0, -1)
         pipe.hgetall(self.now_playing_key())
