@@ -366,6 +366,23 @@ class TestMigrations:
         finally:
             await archive.close()
 
+    async def test_pooled_sessions_carry_the_server_side_timeouts(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # server_settings are startup parameters, so a typo in a name fails the
+        # connect and a wrong unit fails the parse — both only against a server.
+        pool = await archive._ensure()
+        async with pool.acquire() as conn:
+            assert await conn.fetchval("SHOW statement_timeout") == "25s"
+            assert (
+                await conn.fetchval("SHOW idle_in_transaction_session_timeout")
+                == "1min"
+            )
+            with pytest.raises(asyncpg.exceptions.QueryCanceledError):
+                await conn.execute(
+                    "SET LOCAL statement_timeout = '50ms'; SELECT pg_sleep(1)"
+                )
+
     async def test_ensure_is_idempotent(self, archive: PostgresHistoryArchive) -> None:
         # Double-checked lock: the second call reuses the pool.
         p1 = await archive._ensure()

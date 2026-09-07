@@ -2523,6 +2523,38 @@ class TestPoolConfiguration:
         assert kwargs["statement_cache_size"] == 100  # PgBouncer knob
         assert kwargs["server_settings"]["application_name"] == "musicbot-history"
 
+    async def test_server_side_timeouts_are_set_per_session(self) -> None:
+        # The server-side twins of command_timeout: the client bound only stops
+        # asyncpg waiting, while the backend keeps executing until it notices
+        # the cancel. statement_timeout is UNDER command_timeout so the server's
+        # own cancellation, a transient QueryCanceledError, is what arrives.
+        from src.history_archive import (
+            _COMMAND_TIMEOUT_SECS,
+            _IDLE_IN_TRANSACTION_TIMEOUT_SECS,
+            _STATEMENT_TIMEOUT_SECS,
+        )
+
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        with patch(
+            "src.history_archive.asyncpg.create_pool", AsyncMock()
+        ) as create_pool:
+            await archive._create_pool()
+        assert create_pool.await_args is not None
+        settings = create_pool.await_args.kwargs["server_settings"]
+        assert settings["statement_timeout"] == "25000ms"
+        assert settings["idle_in_transaction_session_timeout"] == "60000ms"
+        assert _STATEMENT_TIMEOUT_SECS < _COMMAND_TIMEOUT_SECS
+        assert _IDLE_IN_TRANSACTION_TIMEOUT_SECS > _COMMAND_TIMEOUT_SECS
+        # Every value is text: asyncpg forwards server_settings as startup
+        # parameters, which the protocol carries as strings.
+        assert all(isinstance(v, str) for v in settings.values())
+
+    def test_a_server_cancellation_is_transient_not_poison(self) -> None:
+        # statement_timeout presents as QueryCanceledError (57014). It means the
+        # server was slow, not that the row is bad, so the drainer must back off
+        # and redeliver rather than dead-letter the batch.
+        assert not isinstance(asyncpg.exceptions.QueryCanceledError("x"), _POISON)
+
 
 class TestRecordRejection:
     """play_history_rejected (migrations/0001_play_history.sql). Expected to stay

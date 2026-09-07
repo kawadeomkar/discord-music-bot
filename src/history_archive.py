@@ -368,6 +368,16 @@ _REJECT_DETAIL_MAX = 2000
 # established fine against a server that then stops answering. A liveness bound,
 # not a latency target — a 100-row executemany is milliseconds.
 _COMMAND_TIMEOUT_SECS = 30.0
+# Server-side twins of command_timeout, set per session through server_settings.
+# statement_timeout makes the SERVER cancel a runaway statement — asyncpg's bound
+# only stops the client waiting, and the backend keeps executing (and holding its
+# locks) until it notices the cancel. Shorter than command_timeout so the server's
+# QueryCanceledError, a plain transient, is the error that arrives.
+# idle_in_transaction_session_timeout kills a session parked inside BEGIN — a
+# client that hung mid-transaction otherwise holds its snapshot forever and blocks
+# VACUUM for the whole database.
+_STATEMENT_TIMEOUT_SECS = 25.0
+_IDLE_IN_TRANSACTION_TIMEOUT_SECS = 60.0
 # Wait for a free connection. The drainer, -ping's health probe and archive reads
 # share max_size=4, so a stuck consumer must not block everyone else unboundedly.
 _ACQUIRE_TIMEOUT_SECS = 10.0
@@ -779,8 +789,15 @@ class PostgresHistoryArchive:
             # transaction-pooling mode breaks them; POSTGRES_STATEMENT_CACHE=0
             # turns the cache off for that shape. Default matches asyncpg's own.
             statement_cache_size=config.POSTGRES_STATEMENT_CACHE,
-            # Identifies this bot's connections in pg_stat_activity.
-            server_settings={"application_name": "musicbot-history"},
+            server_settings={
+                # Identifies this bot's connections in pg_stat_activity.
+                "application_name": "musicbot-history",
+                # Postgres takes these as text with a unit suffix.
+                "statement_timeout": f"{int(_STATEMENT_TIMEOUT_SECS * 1000)}ms",
+                "idle_in_transaction_session_timeout": (
+                    f"{int(_IDLE_IN_TRANSACTION_TIMEOUT_SECS * 1000)}ms"
+                ),
+            },
         )
 
     async def _ensure(self) -> asyncpg.Pool:
