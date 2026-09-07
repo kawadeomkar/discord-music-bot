@@ -299,6 +299,9 @@ async def _backfill_one(
                 entries.reverse()
                 await archive.insert_batch(entries)
             attempted += len(entries)
+        # The reconciliation's second read. Inside the try: a Redis failure
+        # here counts this guild failed, like every other read of its list.
+        tail_after = await redis.lindex(key, -1)
     except Exception as e:
         # Counted, not raised, and not folded into `guilds` — that counter means
         # "guilds moved in full". Already-inserted rows stay in Postgres and
@@ -322,7 +325,6 @@ async def _backfill_one(
     #
     # attempted may legitimately EXCEED total — the last page's window clamps at
     # index 0 and picks up entries pushed during the run. Not loss, not flagged.
-    tail_after = await redis.lindex(key, -1)
     shrank = attempted + corrupt < total or (
         tail_before is not None and tail_after != tail_before
     )

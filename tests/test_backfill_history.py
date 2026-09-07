@@ -542,6 +542,37 @@ class TestFailureContainment:
         assert report.scan_aborted
         assert not report.ok
 
+    async def test_a_redis_failure_on_the_tail_read_fails_only_that_guild(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The reconciliation's second LINDEX is inside the per-guild try. Outside
+        it, one Redis error there escaped _backfill_one, killed the SCAN loop in
+        backfill(), and flipped scan_aborted for the whole run — every guild
+        after it in SCAN order unattempted over a read that only ever informed
+        the trim warning."""
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        await _seed(fake_redis, 2, _entry(2, guild_id=2))
+        real_lindex = fake_redis.lindex
+        calls = 0
+
+        async def failing_lindex(name: Any, index: int) -> Any:
+            nonlocal calls
+            calls += 1
+            # First guild: the tail_before read succeeds, the tail_after fails.
+            if calls == 2:
+                raise ConnectionError("redis went away")
+            return await real_lindex(name, index)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(fake_redis, "lindex", failing_lindex)
+            report = await backfill(fake_redis, CollectingArchive())
+
+        assert not report.scan_aborted
+        assert report.failed_guilds == 1
+        assert report.guilds == 1  # the other guild still moved in full
+        assert not report.ok
+        assert "backfill FAILED for guild" in caplog.text
+
     async def test_a_clean_run_is_ok(self, fake_redis: Redis) -> None:
         # The other side of the verdict — `ok` must not be vacuously false.
         await _seed(fake_redis, 1, _entry(1, guild_id=1))

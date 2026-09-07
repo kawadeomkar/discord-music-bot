@@ -112,7 +112,7 @@ async def migrate(url: str, directory: Path = MIGRATIONS_DIR) -> int:
                 )
                 if already:
                     continue
-                await conn.execute(path.read_text())
+                await conn.execute(path.read_text(encoding="utf-8"))
                 await conn.execute(
                     "INSERT INTO schema_migrations (version) VALUES ($1)", version
                 )
