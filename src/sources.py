@@ -28,6 +28,30 @@ class SourceInputError(Exception):
         self.user_message = user_message
 
 
+# Anchored, and only http/https: groups 1/2 = scheme/www prefix, 3 = domain,
+# 4 = path. `-` in the class, or a hyphenated host is not a link at all.
+# See docs/ARCHITECTURE.md#fetch-host-policy.
+_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(https?:\/\/)?(www\.)?([\w.-]+)\/([^?]*)"
+)
+
+
+def looks_like_url(text: str) -> bool:
+    """Whether parse_url would read `text` as a link: an optional http(s)
+    scheme, a dotted host and a path. A dotless "98/99" is not one."""
+    match = _URL_RE.match(text)
+    return match is not None and "." in match.group(3)
+
+
+def with_scheme(url: str) -> str:
+    """`url` with an explicit scheme, https when it carried none. Every source
+    hands yt-dlp a schemed URL: nothing downstream guesses one."""
+    match = _URL_RE.match(url)
+    if match is not None and match.group(1):
+        return url
+    return f"https://{url}"
+
+
 def parse_timestamp(raw: str) -> Optional[int]:
     """Seconds from a YouTube `t`/`ts` value (bare seconds or the colon-free
     HMS form), or None. Never raises: an unparseable timestamp must degrade to
@@ -219,18 +243,17 @@ def _last(args: dict[str, list[str]], key: str) -> Optional[str]:
 
 
 def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
-    domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path."""
-    # `-` must be in the class: without it "my-site.com" is read as the host
-    # "site.com", which lands in the archive's query_source.
-    domain_re = r"(https:\/\/)?(www\.)?([\w.-]+)\/([^?]*)"
-
-    domain_match = re.search(domain_re, url)
+    """Parse a URL into a source dataclass. Raises ValueError if no domain
+    matches (parse_input then searches for the text) and SourceInputError for a
+    link on a known service that is malformed. The returned `url` always
+    carries a scheme (with_scheme)."""
+    domain_match = _URL_RE.match(url)
 
     if not domain_match:
         raise ValueError(f"Not a recognised URL: {url!r}")
 
     domain = domain_match.group(3)
+    url = with_scheme(url)
     # urllib handles percent-encoding and repeated keys, and works on
     # scheme-less input ("youtu.be/x?t=90"), which is what users paste.
     args = parse_qs(urlsplit(url).query)
@@ -333,14 +356,14 @@ def _parse_spotify_path(path: str) -> SpotifySource:
 
 
 def unquote_argument(text: str) -> str:
-    """Drop one matched pair of surrounding quotes. discord.py's `read_rest()`
-    hands consume-rest arguments through with their quotes: parse_url drags the
-    trailing one into the path, and a quoted search stores `"some song"` as the
-    origin `-remove some song` cannot match. Only a whole argument wrapped at
-    both ends, never down to nothing; runs twice (here and at the command), so
-    it must be safe twice."""
-    for quote in ('"', "'"):
-        if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
+    """Drop one matched pair of surrounding quotes or angle brackets (Discord's
+    `<url>` embed suppression). discord.py's `read_rest()` hands consume-rest
+    arguments through as typed: the wrapper would become part of the URL, and a
+    quoted search stores `"some song"` as the origin `-remove some song` cannot
+    match. Only a whole argument wrapped at both ends, never down to nothing;
+    runs twice (here and at the command), so it must be safe twice."""
+    for opening, closing in (('"', '"'), ("'", "'"), ("<", ">")):
+        if len(text) > 2 and text.startswith(opening) and text.endswith(closing):
             return text[1:-1]
     return text
 

@@ -5,7 +5,9 @@ import pytest
 from src.guild_state import Analytics
 from src.sources import (
     SourceInputError,
+    looks_like_url,
     unquote_argument,
+    with_scheme,
     QUERY_SOURCE_SEARCH,
     TIMESTAMP_FORMATS,
     QUERY_SOURCE_SOUNDCLOUD,
@@ -525,11 +527,86 @@ class TestDomainRegex:
         assert result.ytsearch == "ytsearch:you+tube|com/watch"
 
     def test_hyphenated_hosts_are_not_truncated(self) -> None:
-        """`-` has to be in the class: re.search otherwise starts matching after
-        the hyphen, so "my-site.com" parses as the host "site.com" and the
-        archive records a query_source for a domain nobody linked."""
+        """`-` has to be in the class: without it the host stops at the hyphen
+        and "my-site.com" is not a link at all, so a real site is searched for
+        as text."""
         result = parse_url("https://my-site.com/watch?v=x")
         assert query_source_of(result) == "my-site.com"
+
+
+class TestUrlAnchoring:
+    """parse_url matches from the START of the argument and accepts only
+    http/https: a link buried in other text, or on another scheme, is not a
+    link. Every returned url carries a scheme."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "ftp://files.example.com/song.mp3",
+            "file:///etc/passwd",
+            "gopher://example.com/x",
+            "ytsearchall:a.b/c",
+            "see https://youtu.be/dQw4w9WgXcQ",
+        ],
+    )
+    def test_non_http_and_embedded_links_are_searched_for(self, text: str) -> None:
+        result = parse_input(text)
+        assert isinstance(result, YTSource)
+        assert result.url is None
+        assert result.stype == URLSource.SEARCH
+
+    def test_http_is_accepted_and_kept(self) -> None:
+        result = parse_url("http://example.com/clip/1")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert result.url == "http://example.com/clip/1"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("youtu.be/dQw4w9WgXcQ?t=90", "https://youtu.be/dQw4w9WgXcQ?t=90"),
+            ("www.youtube.com/watch?v=abc", "https://www.youtube.com/watch?v=abc"),
+            ("soundcloud.com/artist/track", "https://soundcloud.com/artist/track"),
+            ("vimeo.com/12345678", "https://vimeo.com/12345678"),
+        ],
+    )
+    def test_scheme_less_links_get_https(self, text: str, expected: str) -> None:
+        """yt-dlp is handed an explicit scheme; nothing downstream guesses one."""
+        result = parse_url(text)
+        assert not isinstance(result, SpotifySource)
+        assert result.url == expected
+
+    def test_scheme_less_youtube_still_reads_its_timestamp(self) -> None:
+        result = parse_url("youtu.be/dQw4w9WgXcQ?t=90")
+        assert isinstance(result, YTSource)
+        assert result.ts == 90
+
+    def test_angle_bracketed_link_is_a_link(self) -> None:
+        """Discord's `<url>` suppresses the embed; users paste it that way."""
+        result = parse_input("<https://www.youtube.com/watch?v=dQw4w9WgXcQ>")
+        assert isinstance(result, YTSource)
+        assert result.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("https://www.youtube.com/watch?v=x", True),
+            ("youtu.be/x", True),
+            ("http://a.b/c", True),
+            ("98/99", False),
+            ("My Track Artist", False),
+            ("ytsearch:foo", False),
+            ("ftp://a.b/c", False),
+            ("youtube.com", False),
+        ],
+    )
+    def test_looks_like_url(self, text: str, expected: bool) -> None:
+        assert looks_like_url(text) is expected
+
+    def test_with_scheme(self) -> None:
+        assert with_scheme("youtu.be/x") == "https://youtu.be/x"
+        assert with_scheme("http://a.b/c") == "http://a.b/c"
+        assert with_scheme("https://a.b/c") == "https://a.b/c"
 
 
 class TestNormalizeQueryHost:
@@ -664,6 +741,11 @@ class TestQuotedArgumentsSurviveConsumeRest:
     def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
         assert unquote_argument('""') == '""'
         assert unquote_argument('"') == '"'
+        assert unquote_argument("<>") == "<>"
+
+    def test_angle_brackets_are_a_wrapper(self) -> None:
+        assert unquote_argument("<https://a.b/c>") == "https://a.b/c"
+        assert unquote_argument("<https://a.b/c") == "<https://a.b/c"
 
 
 class TestParseInputDerivesFromTheArgument:
