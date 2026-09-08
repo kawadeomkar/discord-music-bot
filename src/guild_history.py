@@ -88,8 +88,8 @@ class GuildHistory:
             take(await self._read_tier("redis", lambda: store.get_history()))
         take(list(reversed(self._entries)))
         # Both legs are in RECORDED order (song end); played_at is song start, and
-        # a -playnow-parked song is recorded after everything that cut in front.
-        # Stable sort, so ties keep leg order.
+        # an interjection-parked song is recorded after everything that cut in
+        # front. Stable sort, so ties keep leg order.
         merged.sort(key=lambda e: e.played_at, reverse=True)
         return merged[:limit]
 

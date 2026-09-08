@@ -665,7 +665,7 @@ class GuildRedisStore:
 
     @_guild_op(default=False)
     async def push_queue_front(self, entries: Sequence[QueueEntry]) -> bool:
-        """LPUSH entries so entries[0] ends up at the queue head — the -playnow
+        """LPUSH entries so entries[0] ends up at the queue head — the interjection
         front insert; reversed first because LPUSH sends each successive
         argument to the head. A swallowed failure here leaves memory
         len(entries) ahead of Redis at the HEAD, so later LPOPs retire other

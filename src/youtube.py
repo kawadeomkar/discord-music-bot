@@ -676,10 +676,11 @@ class QueueObject:
     # never RPUSHed to the Redis list, so the loop must skip its redis_pop_for().
     # Read via guild_queue.is_persisted().
     persisted: bool = True
-    # -playnow: `interjected` is attribution only (span attribute); `is_resume`
-    # marks the rebuilt tail of an interrupted song (ts = interrupt position) and
-    # selects the "Resuming…" notice; `start_paused` re-pauses right after
-    # vc.play() so a song paused at interjection returns parked.
+    # ── interjection flags ──
+    # `interjected` is attribution only (span attribute); `is_resume` marks the
+    # rebuilt tail of an interrupted song (ts = interrupt position) and selects
+    # the "Resuming…" notice; `start_paused` re-pauses right after vc.play() so
+    # a song paused at interjection returns parked.
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
@@ -813,9 +814,9 @@ class YTDL(discord.FFmpegOpusAudio):
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
         self.start_offset: int = start_offset
-        # Carried from the QueueObject (see its field comments). A resume tail and
-        # _neutralize_prefetch rebuild a QueueObject from these, so every field
-        # the queue entry has must survive here.
+        # Interjection flags carried from the QueueObject (see its field
+        # comments). A resume tail and _neutralize_prefetch rebuild a QueueObject
+        # from these, so every field the queue entry has must survive here.
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
