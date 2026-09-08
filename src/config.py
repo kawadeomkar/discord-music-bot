@@ -85,6 +85,17 @@ ANALYTICS_RENDER_DEADLINE_SECS: float = _float_env(
     "ANALYTICS_RENDER_DEADLINE_SECS", 20.0, minimum=_MIN_DASHBOARD_SECS
 )
 
+# A healthy extraction is one to four seconds; the floor leaves room for yt-dlp's
+# own player-API retries without admitting a value that fails every song.
+_MIN_EXTRACT_TIMEOUT_SECS: Final[float] = 5.0
+
+# Ceiling on one yt-dlp extraction. Armed as a SIGALRM inside the worker, and
+# the caller waits this plus a grace period before giving up on the job.
+# See docs/ARCHITECTURE.md#extraction-bounds.
+YTDLP_EXTRACT_TIMEOUT_SECS: float = _float_env(
+    "YTDLP_EXTRACT_TIMEOUT_SECS", 60.0, minimum=_MIN_EXTRACT_TIMEOUT_SECS
+)
+
 # Higher floor than the dashboards: each tick is a Redis write per PLAYING guild,
 # AOF-appended.
 _MIN_HEARTBEAT_SECS: Final[float] = 0.5

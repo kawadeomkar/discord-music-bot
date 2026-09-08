@@ -1,6 +1,9 @@
+import asyncio
 import copy
 import os
 import re
+import signal
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -17,6 +20,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import hostguard
+from src.config import YTDLP_EXTRACT_TIMEOUT_SECS
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import looks_like_url
@@ -46,6 +50,7 @@ class ExtractionError(Exception):
         video_id: str = "",
         cause_type: str = "",
         unsupported: bool = False,
+        timed_out: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -56,6 +61,9 @@ class ExtractionError(Exception):
         # UnsupportedError, classified in the worker where the original type still
         # exists; yt_source reads it to say "not a site I can play".
         self.unsupported = unsupported
+        # The extraction outran YTDLP_EXTRACT_TIMEOUT_SECS, on either side of the
+        # process boundary.
+        self.timed_out = timed_out
 
     @property
     def user_message(self) -> str:
@@ -63,6 +71,8 @@ class ExtractionError(Exception):
         user-facing reason ("Private video"), minus its "ERROR: " prefix;
         expected=False can carry bug-report boilerplate, so it degrades to a
         generic line. The full message still reaches the span and logs."""
+        if self.timed_out:
+            return "Couldn't load this track — the site took too long to answer."
         if not self.expected:
             return "Couldn't load this track — the extractor hit an unexpected error."
         prefix = "ERROR: "
@@ -228,21 +238,84 @@ class ExtractRequest:
     download: bool = False
     # True at every call site: process=False does no format selection.
     process: bool = True
+    # Worker-side ceiling, armed by _ytdlp_extract; 0 disarms it. The caller
+    # waits this plus _EXTRACT_TIMEOUT_GRACE_SECS.
+    deadline_secs: float = YTDLP_EXTRACT_TIMEOUT_SECS
+
+
+# How much longer than the worker's deadline the caller waits, so the worker's
+# own typed error normally arrives first and the caller's timeout is the
+# backstop for a job the signal could not interrupt.
+_EXTRACT_TIMEOUT_GRACE_SECS = 5.0
+
+
+class _ExtractionDeadline(BaseException):
+    """Raised by the SIGALRM handler in the worker. A BaseException so yt-dlp's
+    `except Exception` retry and fallback paths cannot swallow it."""
+
+
+# Set while a deadline is armed; the handler raises only then, so an alarm
+# landing on the disarm itself cannot escape _ytdlp_extract.
+_deadline_armed = False
+
+
+def _raise_deadline(signum: int, frame: Any) -> None:
+    if _deadline_armed:
+        raise _ExtractionDeadline()
+
+
+def _arm_deadline(secs: float) -> tuple[bool, Any]:
+    """Start a one-shot SIGALRM in `secs`, returning (armed, previous handler).
+    Signals reach the main thread only, so the thread-pool seam (tests) and a
+    platform without SIGALRM run unbounded here and rely on the caller's wait.
+    See docs/ARCHITECTURE.md#extraction-bounds."""
+    global _deadline_armed
+    if (
+        secs <= 0
+        or not hasattr(signal, "SIGALRM")
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        return False, None
+    previous = signal.signal(signal.SIGALRM, _raise_deadline)
+    _deadline_armed = True
+    signal.setitimer(signal.ITIMER_REAL, secs)
+    return True, previous
+
+
+def _disarm_deadline(armed: bool, previous: Any) -> None:
+    """Cancel the alarm and restore the handler it replaced. The flag drops
+    FIRST, so a signal already delivered runs the handler as a no-op."""
+    global _deadline_armed
+    if not armed:
+        return
+    _deadline_armed = False
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, previous)
 
 
 def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     """Extraction worker run in the process pool. Top-level so it is picklable."""
     url, opts = req.url, req.opts
     download, process = req.download, req.process
+    armed, previous = _arm_deadline(req.deadline_secs)
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it;
     # the copy keeps the opts profile immutable across a worker's extractions.
     try:
-        result = youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
-            url, download=download, process=process
-        )
-    except YoutubeDLError as e:
-        # `from e`: the stdlib stringifies the chain into the parent's __cause__.
-        raise _classify_ytdlp_error(e) from e
+        try:
+            result = youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
+                url, download=download, process=process
+            )
+        except YoutubeDLError as e:
+            # `from e`: the stdlib stringifies the chain into the parent's __cause__.
+            raise _classify_ytdlp_error(e) from e
+    except _ExtractionDeadline:
+        raise ExtractionError(
+            f"extraction of {url} exceeded {req.deadline_secs}s in the worker",
+            original_type="TimeoutError",
+            timed_out=True,
+        ) from None
+    finally:
+        _disarm_deadline(armed, previous)
     # Slimmed here so the unpicklable payload never enters the result queue.
     return _slim_info(result)
 
@@ -250,8 +323,22 @@ def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
 async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     """The single call site for _ytdlp_extract. Both module-level names it reads
     (`ytdlp_pool`, `_ytdlp_extract`) are resolved per call, never captured —
-    tests patch them."""
-    return await ytdlp_pool.run(_ytdlp_extract, req)
+    tests patch them. Waits the request's deadline plus a grace period; past
+    that the job is abandoned (a running executor call cannot be cancelled) and
+    the caller gets the same timed_out ExtractionError the worker would raise."""
+    budget = req.deadline_secs + _EXTRACT_TIMEOUT_GRACE_SECS
+    try:
+        async with asyncio.timeout(budget) as deadline:
+            return await ytdlp_pool.run(_ytdlp_extract, req)
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        trace.get_current_span().set_attribute("ytdl.timed_out", True)
+        raise ExtractionError(
+            f"extraction of {req.url} did not return within {budget}s",
+            original_type="TimeoutError",
+            timed_out=True,
+        ) from None
 
 
 class _YtdlpLogger:

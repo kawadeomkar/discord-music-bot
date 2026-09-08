@@ -344,6 +344,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
+| `YTDLP_EXTRACT_TIMEOUT_SECS` | No | Ceiling on one yt-dlp extraction (default `60.0`, floor `5.0`). Armed as a SIGALRM inside the worker so the work itself stops, and waited for plus a 5 s grace by the caller — see [Extraction bounds](#extraction-bounds) |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC endpoint (default `http://localhost:4317`) |
 | `OTEL_SDK_DISABLED` | No | `true` disables telemetry entirely (tests set this) |
@@ -1453,6 +1454,49 @@ Four things cross into the worker processes, each with its own contract:
   cross). **Every field of the flattened error needs a default**: a required
   positional pickles fine and fails on *unpickling* in the parent's result thread,
   which bricks the pool permanently.
+
+### Extraction bounds
+
+What one `-play` may cost the extraction pool is bounded three ways; each bound
+exists because its failure mode was open-ended, not merely slow.
+
+**Entries.** `_YTDL_STREAM_OPTS` carries `playlist_items: "1"`. `noplaylist` only
+governs a watch URL that also carries `list=`; to yt-dlp a channel `/videos` tab, a
+`results?search_query=` page or a SoundCloud profile is a playlist, and without the
+cap every entry was extracted in full (one player-API round each) before `yt_source`
+kept `entries[0]`. `PlaylistEntries.get_requested_items()` yields only the requested
+index, so the cap stops the *work*, not just the result; a `ytsearch:` result has
+one entry and is unaffected. The playlist profile deliberately does not carry it —
+`-play <playlist>` would queue one song.
+
+**Time.** `YTDLP_EXTRACT_TIMEOUT_SECS` (60 s, floor 5 s) bounds one extraction, and
+it is enforced on both sides of the process boundary because neither side alone
+can:
+
+- *In the worker*, `_ytdlp_extract` arms `signal.setitimer(ITIMER_REAL, deadline)`
+  with a handler that raises `_ExtractionDeadline` — a `BaseException`, because
+  yt-dlp's `_handle_extraction_exceptions` and several extractor fallbacks catch
+  `Exception` and would retry or swallow it. It is converted to an
+  `ExtractionError(timed_out=True)` before it leaves the function, and the alarm is
+  disarmed in `finally` with the armed flag dropped *first*, so a signal already
+  delivered runs the handler as a no-op instead of escaping the disarm. SIGALRM is
+  what makes a wall-clock bound possible at all: yt-dlp's `socket_timeout` is
+  per-`recv`, and a server that trickles one byte every few seconds never trips it.
+  The signal is delivered to the worker's main thread, which is where
+  `_process_worker` runs the job under both `spawn` and `forkserver`; on the
+  thread-pool seam the tests use, and on a platform without `SIGALRM`, nothing is
+  armed and the caller's wait is the only bound.
+- *In the parent*, `_run_extract` wraps `ytdlp_pool.run` in `asyncio.timeout(deadline
+  + _EXTRACT_TIMEOUT_GRACE_SECS)`. The grace (5 s) means the worker's own error
+  normally arrives first; the parent's expiry is the backstop for a job the signal
+  could not interrupt (a C call that does not return to the interpreter). Expiring
+  abandons the job — a running executor call cannot be cancelled — and raises the
+  same `timed_out` error, so the command renders one message either way. Only the
+  context's own expiry is remapped: a `TimeoutError` raised *by* the job propagates
+  as itself.
+
+Both bounds surface as `ExtractionError.user_message` = "the site took too long to
+answer"; the span carries `ytdl.timed_out`.
 
 ### Fetch host policy
 

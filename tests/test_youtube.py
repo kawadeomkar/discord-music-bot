@@ -2581,6 +2581,7 @@ class TestExtractionErrorClassification:
             video_id="v9",
             cause_type="NameResolutionError",
             unsupported=True,
+            timed_out=True,
         )
         back = pickle.loads(pickle.dumps(err))
 
@@ -2592,6 +2593,7 @@ class TestExtractionErrorClassification:
         assert back.video_id == "v9"
         assert back.cause_type == "NameResolutionError"
         assert back.unsupported is True
+        assert back.timed_out is True
 
     def test_unsupported_url_is_classified_from_the_wrapped_cause(self) -> None:
         """yt-dlp raises UnsupportedError, then extract_info re-raises a DownloadError
@@ -2719,6 +2721,122 @@ class TestExtractRequest:
             url="http://x", opts={}, download=True
         )
         assert base.download is False  # original untouched
+
+
+class TestExtractionDeadline:
+    """One extraction is bounded twice: a SIGALRM inside the worker stops the
+    work itself, and the caller waits the same deadline plus a grace period as
+    the backstop for a job the signal could not interrupt."""
+
+    def test_the_worker_alarm_stops_a_stalled_extraction(self) -> None:
+        """Runs on the main thread, as the worker's job does. yt-dlp's sleep
+        stands in for a slow-drip server: socket_timeout never fires when bytes
+        keep trickling, and only a wall-clock deadline ends it."""
+        import signal
+        import time
+
+        from src.youtube import ExtractionError, _deadline_armed
+
+        def stall(*_: Any, **__: Any) -> None:
+            time.sleep(5)
+
+        before = signal.getsignal(signal.SIGALRM)
+        started = time.monotonic()
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = stall
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract(
+                    ExtractRequest(url="http://x", opts={}, deadline_secs=0.2)
+                )
+        assert time.monotonic() - started < 2
+        assert caught.value.timed_out is True
+        assert caught.value.original_type == "TimeoutError"
+        assert "too long to answer" in caught.value.user_message
+        # Disarmed and restored: no alarm is left to fire into the next job.
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+        assert signal.getsignal(signal.SIGALRM) is before
+        assert _deadline_armed is False
+
+    def test_a_finished_extraction_disarms_the_alarm(self) -> None:
+        import signal
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = _fake_ytdl_data()
+            result = _ytdlp_extract(
+                ExtractRequest(url="http://x", opts={}, deadline_secs=30.0)
+            )
+        assert result is not None
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+    def test_yt_dlp_errors_still_classify_under_the_deadline(self) -> None:
+        """The alarm wraps the existing except: a real yt-dlp failure keeps its
+        classification and the alarm is still cleared on the way out."""
+        import signal
+
+        from src.youtube import ExtractionError
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = DownloadError("boom")
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract(
+                    ExtractRequest(url="http://x", opts={}, deadline_secs=30.0)
+                )
+        assert caught.value.timed_out is False
+        assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+    def test_off_the_main_thread_nothing_is_armed(self) -> None:
+        """Signals reach the main thread only — the thread-pool seam and any
+        helper thread run the job unbounded here and rely on the caller's wait."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from src.youtube import _arm_deadline
+
+        with ThreadPoolExecutor(1) as pool:
+            armed, previous = pool.submit(_arm_deadline, 1.0).result()
+        assert (armed, previous) == (False, None)
+
+    def test_zero_disarms(self) -> None:
+        from src.youtube import _arm_deadline
+
+        assert _arm_deadline(0) == (False, None)
+
+    def test_the_request_defaults_to_the_configured_deadline(self) -> None:
+        from src.config import YTDLP_EXTRACT_TIMEOUT_SECS
+
+        assert ExtractRequest(url="http://x", opts={}).deadline_secs == (
+            YTDLP_EXTRACT_TIMEOUT_SECS
+        )
+        assert YTDLP_EXTRACT_TIMEOUT_SECS >= 5.0
+
+    async def test_the_caller_gives_up_after_deadline_plus_grace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A running executor call cannot be cancelled, so this abandons the job
+        and reports the same timed_out error the worker would have."""
+        from src import youtube
+        from src.youtube import ExtractionError
+
+        async def never(*_: Any) -> None:
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(youtube, "_EXTRACT_TIMEOUT_GRACE_SECS", 0.0)
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(side_effect=never)
+            started = time.monotonic()
+            with pytest.raises(ExtractionError) as caught:
+                await _run_extract(
+                    ExtractRequest(url="http://x", opts={}, deadline_secs=0.05)
+                )
+        assert time.monotonic() - started < 2
+        assert caught.value.timed_out is True
+
+    async def test_a_worker_timeout_error_is_not_the_callers(self) -> None:
+        """Only the caller's own expiry is remapped; a TimeoutError raised by the
+        job propagates as the exception it is."""
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(side_effect=TimeoutError("from the job"))
+            with pytest.raises(TimeoutError, match="from the job"):
+                await _run_extract(ExtractRequest(url="http://x", opts={}))
 
 
 class TestRunExtract:

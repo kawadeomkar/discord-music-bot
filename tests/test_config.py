@@ -468,6 +468,19 @@ class TestArchiveTunables:
         monkeypatch.setenv(name, override)
         assert getattr(self._reload(monkeypatch), name) == expected
 
+    def test_extract_timeout_default_floor_and_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """60s default; the floor refuses a value that would fail every song, and
+        `inf` is refused by _float_env like every other deadline."""
+        monkeypatch.delenv("YTDLP_EXTRACT_TIMEOUT_SECS", raising=False)
+        assert self._reload(monkeypatch).YTDLP_EXTRACT_TIMEOUT_SECS == 60.0
+        monkeypatch.setenv("YTDLP_EXTRACT_TIMEOUT_SECS", "120")
+        assert self._reload(monkeypatch).YTDLP_EXTRACT_TIMEOUT_SECS == 120.0
+        monkeypatch.setenv("YTDLP_EXTRACT_TIMEOUT_SECS", "1")
+        with pytest.raises(ValueError, match="YTDLP_EXTRACT_TIMEOUT_SECS must be >= 5"):
+            self._reload(monkeypatch)
+
     def test_a_negative_cap_fails_at_import(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
