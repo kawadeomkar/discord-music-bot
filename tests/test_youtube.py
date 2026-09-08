@@ -2123,6 +2123,13 @@ class TestPotProviderCompatibility:
         assert clients[0] == "default"
         assert not [c for c in clients if not c.startswith("-") and c != "default"]
 
+    def test_tab_extractions_skip_the_homepage_fetch(self) -> None:
+        """Without this every search and playlist extraction opens by downloading the
+        878 KB youtube.com homepage — 0.35s of a 1.00s flat search — for a ytcfg only
+        cookie-authenticated playlists read. The key is `youtubetab`, which
+        youtube:search and youtube:tab both read; under `youtube` it does nothing."""
+        assert _EXTRACTOR_ARGS["youtubetab"]["skip"] == ["webpage"]
+
 
 class TestProcessBoundaryContract:
     """Everything that must survive being pickled to a worker process.

@@ -269,6 +269,11 @@ _EXTRACTOR_ARGS = {
     "youtube": {
         "player_client": ["default", "-tv_simply"],
     },
+    # Without this, a search or playlist extraction opens by downloading the
+    # ~880 KB homepage for a ytcfg only cookie-authenticated playlists read, and
+    # we send none: 0.35s of every search. youtube:search and youtube:tab both
+    # read this key, so one entry covers both.
+    "youtubetab": {"skip": ["webpage"]},
     # Set explicitly so a provider living elsewhere overrides via env, not code.
     "youtubepot-bgutilhttp": {
         "base_url": [os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")],
