@@ -4,6 +4,7 @@ utilities."""
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,14 +15,79 @@ from src.util import (
     FOOTER_LIMIT,
     current_traceparent,
     traceparent_context,
+    _TYPING_HOLDS,
+    _TYPING_TASKS,
     _typing_keepalive,
     background_typing,
+    cancel_task,
     fmt_duration,
     get_logger,
     join_footer,
     pluralize,
     queue_message,
 )
+
+
+class TestSharedTyping:
+    """One keepalive per channel, however many commands are waiting."""
+
+    async def test_concurrent_holders_share_one_keepalive(self) -> None:
+        ctx = MagicMock()
+        ctx.channel.id = 7
+        started = 0
+
+        @contextlib.asynccontextmanager
+        async def _typing() -> AsyncIterator[None]:
+            nonlocal started
+            started += 1
+            yield
+
+        ctx.typing = _typing
+        async with background_typing(ctx):
+            async with background_typing(ctx):
+                await asyncio.sleep(0)
+                assert started == 1  # not one POST per command
+            await asyncio.sleep(0)
+            # Still held: the first command returning must not blink the
+            # indicator off while the second is still resolving.
+            assert 7 in _TYPING_TASKS
+        assert _TYPING_TASKS.get(7) is None
+        assert 7 not in _TYPING_HOLDS  # and the refcount does not leak
+
+
+class TestCancelTask:
+    """Whose CancelledError it may swallow."""
+
+    async def test_the_awaited_tasks_cancellation_is_swallowed(self) -> None:
+        task = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        await cancel_task(task)  # no raise: this is the cancellation it asked for
+
+        assert task.cancelled()
+
+    async def test_the_callers_own_cancellation_is_not(self) -> None:
+        """A prefetch pinned in the yt-dlp executor does not stop when asked, so
+        the caller's own deadline fires while this await sits. Swallowed here,
+        asyncio.timeout sees no exception to convert and never raises — the caller
+        runs on past a bound it was told it had."""
+
+        async def _pinned() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(5)  # the worker still holds it
+
+        task = asyncio.create_task(_pinned())
+        await asyncio.sleep(0)
+
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await cancel_task(task)
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 class TestQueueMessage:
