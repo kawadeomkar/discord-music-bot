@@ -49,6 +49,7 @@ from src.youtube import (
     _stream_url_ttl,
     _ytdlp_extract,
     _YtdlpLogger,
+    warm_worker,
     YTDLVideoInfo,
     YTDLVideoMetadata,
 )
@@ -2165,6 +2166,11 @@ class TestProcessBoundaryContract:
         far side, and only a real module-level lookup round-trips to the same object."""
         assert pickle.loads(pickle.dumps(_ytdlp_extract)) is _ytdlp_extract
 
+    def test_warm_worker_is_picklable_by_reference(self) -> None:
+        """prewarm() submits it to every worker, so it is pickled by qualified name
+        and must stay a module-level function."""
+        assert pickle.loads(pickle.dumps(warm_worker)) is warm_worker
+
     def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
         """ProcessPoolExecutor pickles `initializer` to every worker, so a closure or
         bound method here breaks pool construction rather than one extraction. The
@@ -2212,6 +2218,24 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+class TestWarmWorker:
+    """What prewarm() hands each worker. The pool owns lifecycle only, so the warm-up
+    is supplied by this module, like every other callable it submits."""
+
+    def test_builds_one_youtubedl_from_a_copy_of_the_stream_opts(self) -> None:
+        """The first YoutubeDL a process builds discovers plugins and probes for a JS
+        runtime — 166-339 ms every later construction skips. The copy is the rule
+        _ytdlp_extract already follows: YoutubeDL writes into the params it is given,
+        and the opts profiles are shared module state."""
+        with patch("src.youtube.youtube_dl") as mock_ytdl:
+            warm_worker()
+
+        mock_ytdl.YoutubeDL.assert_called_once()
+        (params,) = mock_ytdl.YoutubeDL.call_args.args
+        assert params == _YTDL_STREAM_OPTS
+        assert params is not _YTDL_STREAM_OPTS
 
 
 class TestYtPlaylistEntries:

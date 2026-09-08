@@ -191,9 +191,9 @@ class MusicBotApp(commands.AutoShardedBot):
         for extension in EXTENSIONS:
             await self.load_extension(extension)
         # Fire-and-forget, so the first -play skips spawn + yt-dlp import latency.
-        from src.youtube import ytdlp_pool
+        from src.youtube import warm_worker, ytdlp_pool
 
-        ytdlp_pool.prewarm()
+        ytdlp_pool.prewarm(warm_worker)
         # The chart worker, only with the archive on, after the prewarm that
         # brings the forkserver up. Fire-and-forget.
         if archive_enabled:

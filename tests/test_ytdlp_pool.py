@@ -236,6 +236,23 @@ class TestPrewarm:
         for call in executor.submit.call_args_list:
             assert call.args[0] is _warmup_noop
 
+    def test_prewarm_submits_the_warm_up_the_caller_supplies(self) -> None:
+        """Lifecycle is all this module owns — what a worker warms is the caller's,
+        like every run() callable. src.youtube passes a YoutubeDL construction."""
+        from concurrent.futures import ProcessPoolExecutor
+
+        def warm() -> None:
+            return None
+
+        executor = MagicMock(spec=ProcessPoolExecutor)
+        pool = YtdlpPool(max_workers=2, executor_factory=lambda: executor)
+
+        pool.prewarm(warm)
+
+        assert executor.submit.call_count == 2
+        for call in executor.submit.call_args_list:
+            assert call.args[0] is warm
+
     def test_prewarm_after_shutdown_raises(self) -> None:
         """The closed gate covers every entry point, not just run()."""
         pool = YtdlpPool(executor_factory=_thread_pool_factory())

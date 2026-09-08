@@ -250,6 +250,16 @@ async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     return await ytdlp_pool.run(_ytdlp_extract, req)
 
 
+def warm_worker() -> None:
+    """Handed to prewarm(), so it runs once per pool worker. The first YoutubeDL a
+    process builds discovers plugins and probes for a JS runtime, 166-339 ms that every
+    later construction in that worker skips; paying it at startup keeps it off the first
+    -play each worker serves. Top-level so it is picklable, like _ytdlp_extract."""
+    # cast, as at every other yt-dlp boundary: the opts profiles are the plain dicts
+    # yt-dlp accepts, against a params TypedDict the checker cannot match them to.
+    youtube_dl.YoutubeDL(cast(Any, copy.copy(_YTDL_STREAM_OPTS)))
+
+
 class _YtdlpLogger:
     """Routes yt-dlp's diagnostics into our logger. yt-dlp announces what
     precedes an outage as warnings (formats skipped for a missing PO token,
