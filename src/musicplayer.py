@@ -52,6 +52,7 @@ from src.util import (
     safe_label,
     truncate,
     truncate_embed_title,
+    user_facing_reason,
     get_logger,
 )
 from src.youtube import YTDL, NpHostRef, QueueObject, invalidate_stream_cache
@@ -228,12 +229,17 @@ class EnqueueOutcome:
     limit: int = 0
 
 
+# What the channel sees for a failure whose type vets no copy of its own.
+_STREAM_FAILURE_FALLBACK = "the stream could not be loaded"
+_LOOP_ERROR_FALLBACK = "An unexpected error interrupted this song."
+
+
 @dataclass(frozen=True)
 class StreamFailure:
     """Why a song's stream failed to resolve, captured at the failure point so the
     skip notice can name the cause and the trace carrying the full exception."""
 
-    detail: str  # "<ExceptionType>: <message>"
+    detail: str  # the user-facing line (util.user_facing_reason), never raw text
     trace_id: str  # 32-hex OTel trace id, or "unavailable" when no span is active
 
 
@@ -2124,7 +2130,8 @@ class MusicPlayer:
             ctx = trace.get_current_span().get_span_context()
             trace_id = format(ctx.trace_id, "032x") if ctx.is_valid else "unavailable"
             self._last_stream_error = StreamFailure(
-                detail=f"{type(e).__name__}: {e}", trace_id=trace_id
+                detail=user_facing_reason(e, _STREAM_FAILURE_FALLBACK),
+                trace_id=trace_id,
             )
             log.error(
                 f"Error processing song: {type(e).__name__}: {e} [trace_id={trace_id}]",
@@ -3068,7 +3075,7 @@ class MusicPlayer:
                         # lands before the send; skip_trace dedups the trace id.
                         error_embed = discord.Embed(
                             title="Playback error — skipping song",
-                            description=f"**{type(e).__name__}:** {e}",
+                            description=user_facing_reason(e, _LOOP_ERROR_FALLBACK),
                             color=discord.Color.red(),
                         )
                         error_embed.set_footer(text=trace_footer(span))

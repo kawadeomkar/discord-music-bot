@@ -120,6 +120,17 @@ def refund_cooldown(ctx: commands.Context) -> None:
         ctx.command.reset_cooldown(ctx)
 
 
+def user_facing_reason(e: BaseException, fallback: str) -> str:
+    """The one line a member may see for `e`: its `user_message` when the type
+    vets its own copy (ExtractionError, PlaylistInputError, the Spotify errors),
+    else `fallback`. A raw message can carry yt-dlp's bug-report boilerplate or
+    an endpoint; the full text still reaches the span and the logs."""
+    message = getattr(e, "user_message", None)
+    if isinstance(message, str) and message:
+        return message
+    return fallback
+
+
 def record_span_error(span: Span, e: Exception) -> None:
     """Record an exception on a span and mark its status as ERROR."""
     span.record_exception(e)

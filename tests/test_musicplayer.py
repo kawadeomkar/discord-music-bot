@@ -7216,21 +7216,36 @@ class TestLoop:
         assert failure.detail in description
         assert failure.trace_id in description
 
-    async def test_stream_source_captures_failure(
+    async def test_stream_source_captures_a_generic_failure_without_its_text(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
-        boom = RuntimeError("YouTube refused the audio stream")
+        """A raw exception message can carry yt-dlp's bug-report boilerplate or
+        an endpoint; only a type that vets its own copy gets quoted. The trace id
+        is what joins the notice to the full text in the logs."""
+        boom = RuntimeError("https://internal.example/stream 403 Forbidden")
         with patch.object(YTDL, "yt_stream", new=AsyncMock(side_effect=boom)):
             result = await music_player._stream_source(queue_obj)
 
         assert result is None
         assert music_player._last_stream_error is not None
         assert (
-            music_player._last_stream_error.detail
-            == "RuntimeError: YouTube refused the audio stream"
+            music_player._last_stream_error.detail == "the stream could not be loaded"
         )
+        assert "internal.example" not in music_player._last_stream_error.detail
         # 32-hex trace id, or the "unavailable" sentinel when no span is active.
         assert music_player._last_stream_error.trace_id
+
+    async def test_stream_source_quotes_an_extraction_errors_user_message(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        boom = ExtractionError("ERROR: [youtube] v9: Private video", expected=True)
+        with patch.object(YTDL, "yt_stream", new=AsyncMock(side_effect=boom)):
+            await music_player._stream_source(queue_obj)
+
+        assert music_player._last_stream_error is not None
+        assert music_player._last_stream_error.detail == "[youtube] v9: Private video"
 
     async def test_resolve_failure_balances_queue_and_redis(
         self,
@@ -7263,6 +7278,10 @@ class TestLoop:
         assert music_player.queue._cursor == 0  # the claim settled the get()
         sent_embed = mocked(music_player._channel.send).call_args.kwargs["embed"]
         assert sent_embed.title == "Playback error — skipping song"
+        # The raw message stays in the logs and on the span; the channel gets
+        # the generic line.
+        assert "yt-dlp lookup failed" not in sent_embed.description
+        assert "unexpected error" in sent_embed.description
 
     async def test_resolve_failure_for_non_persisted_item_does_not_pop_redis(
         self,

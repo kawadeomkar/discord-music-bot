@@ -11,6 +11,7 @@ import pytest
 from opentelemetry import trace as trace_api
 
 from src.util import (
+    user_facing_reason,
     FOOTER_LIMIT,
     current_traceparent,
     traceparent_context,
@@ -468,3 +469,25 @@ class TestTypingKeepaliveCancellation:
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
         assert keepalive.cancelled()
+
+
+class TestUserFacingReason:
+    """One rule for every site that renders an exception to a member: the
+    type's own user_message when it has one, the caller's fallback otherwise."""
+
+    def test_a_vetted_message_is_used(self) -> None:
+        from src.youtube import ExtractionError
+
+        err = ExtractionError("ERROR: Private video", expected=True)
+        assert user_facing_reason(err, "fallback") == "Private video"
+
+    def test_a_plain_exception_gets_the_fallback(self) -> None:
+        err = RuntimeError("https://internal.example/x 403")
+        assert user_facing_reason(err, "fallback") == "fallback"
+
+    def test_a_non_string_or_empty_user_message_gets_the_fallback(self) -> None:
+        class Odd(Exception):
+            user_message = ""
+
+        assert user_facing_reason(Odd("raw"), "fallback") == "fallback"
+        assert user_facing_reason(MagicMock(), "fallback") == "fallback"

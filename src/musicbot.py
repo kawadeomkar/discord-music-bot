@@ -44,7 +44,6 @@ from src.commands.history import (
     HISTORY_MIN_LIMIT,
     HistoryFlags,
 )
-from src.play_pipeline import PlaylistInputError
 from src.commands.analytics import AnalyticsFlags
 from src.commands.leaderboard import LeaderboardFlags, windows_copy
 from src.history_archive import (
@@ -54,10 +53,7 @@ from src.musicplayer import MusicPlayer
 from src.spotify import (
     Spotify,
     SpotifyAuthError,
-    SpotifyRateLimitError,
-    SpotifyRequestError,
 )
-from src.youtube import ExtractionError
 from contextvars import Token
 
 from opentelemetry import context as otel_context
@@ -74,6 +70,7 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
+    user_facing_reason,
     get_logger,
 )
 
@@ -497,22 +494,11 @@ class MusicBot(commands.Cog):
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
         # A caller-supplied detail wins: an infrastructure exception would publish
-        # a DSN host or an operator runbook to the channel.
+        # a DSN host or an operator runbook to the channel. Otherwise the type's
+        # own user_message, and for the rest the raw line — yt_source's plain
+        # Exceptions ("Could not find song") carry their copy in the message.
         if detail is None:
-            if isinstance(
-                e,
-                (
-                    ExtractionError,
-                    PlaylistInputError,
-                    SpotifyRateLimitError,
-                    SpotifyRequestError,
-                ),
-            ):
-                # The user-safe line: yt-dlp's raw message carries bug-report
-                # boilerplate, a rate-limit's names an endpoint.
-                detail = e.user_message
-            else:
-                detail = f"**{type(e).__name__}:** {e}"
+            detail = user_facing_reason(e, fallback=f"**{type(e).__name__}:** {e}")
         await send_embed(
             ctx,
             title,
