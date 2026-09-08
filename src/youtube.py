@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import discord
 import yt_dlp as youtube_dl
+from yarl import URL
 from yt_dlp.utils import UnsupportedError, YoutubeDLError
 
 import redis.asyncio as aioredis
@@ -505,14 +506,21 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
     403 and exit, which discord.py cannot tell from a song that ended, so probe
     exactly as ffmpeg opens it: a plain GET, no Range (a revoked URL still
     answers 206 to a ranged GET, and googlevideo rejects HEAD). The body is
-    never read. A probe that never completed is UNCONFIRMED, not DEAD."""
+    never read. A probe that never completed is UNCONFIRMED, not DEAD.
+
+    The URL goes in pre-encoded: yarl requotes a plain string, which decodes the
+    %3D/%3B inside an HLS manifest's SIGNED path and earns a 403 on a URL ffmpeg
+    plays. yt-dlp emits these fully encoded."""
     if not stream_url:
         return StreamProbe.DEAD
     try:
         session = _get_probe_session()
         # read_bufsize=0 + close(), not release(): only the status line matters,
+        # read_bufsize=0 + close(), not release(): only the status line matters,
         # and aiohttp otherwise buffers audio from the moment headers land.
-        async with session.get(stream_url, read_bufsize=0) as response:
+        async with session.get(
+            URL(stream_url, encoded=True), read_bufsize=0
+        ) as response:
             # Only a definite client-side refusal is DEAD: 429 and 5xx say "not
             # right now", as a timeout does, and ffmpeg's -reconnect would very
             # likely have played the song.
