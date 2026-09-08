@@ -142,6 +142,11 @@ class MusicContext(commands.Context):
         return mp
 
 
+# Ceiling on the off-loop span flush at close(); the exporter's own timeout is
+# 30s, so this fires only when the collector hangs past it.
+_TELEMETRY_SHUTDOWN_TIMEOUT = 35.0
+
+
 # GH #5: AutoShardedBot multi-shards in one process; shard_count=None lets Discord
 # assign it. setup_hook is a subclass override — discord.py calls it before connecting.
 class MusicBotApp(commands.AutoShardedBot):
@@ -437,10 +442,20 @@ class MusicBotApp(commands.AutoShardedBot):
         except Exception as e:
             log.warning(f"stream-probe session shutdown failed: {e}")
         # Exception, not BaseException, above: a second Ctrl-C abandons the rest,
-        # which is what it asks for. shutdown_telemetry blocks up to 30s.
+        # which is what it asks for. shutdown_telemetry blocks up to 30s on its
+        # own flush timeout; the bound here is for a collector that hangs past it.
         from src.telemetry import shutdown_telemetry
 
-        await loop.run_in_executor(None, shutdown_telemetry)
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, shutdown_telemetry),
+                _TELEMETRY_SHUTDOWN_TIMEOUT,
+            )
+        except TimeoutError:
+            log.warning(
+                f"telemetry shutdown did not finish within "
+                f"{_TELEMETRY_SHUTDOWN_TIMEOUT:.0f}s; exiting without a full flush"
+            )
 
 
 def main() -> None:

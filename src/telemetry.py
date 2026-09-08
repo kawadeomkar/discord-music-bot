@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # The SDK is imported lazily in _setup_traces/_setup_logs, only when enabled.
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk.trace import TracerProvider
+    from yarl import URL
 
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
@@ -220,9 +221,18 @@ def _setup_logs() -> None:
     logging.root.addHandler(handler)
 
 
+def _strip_stream_query(url: URL) -> str:
+    """The URL an aiohttp span records. A googlevideo stream URL is
+    self-authorizing — its signed query (expire, sig, ip) is what lets anyone
+    fetch the audio — so only its path is kept."""
+    if url.host is not None and url.host.endswith("googlevideo.com"):
+        return str(url.with_query(None))
+    return str(url)
+
+
 def _setup_auto_instrumentation() -> None:
     from opentelemetry.instrumentation.redis import RedisInstrumentor
     from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
 
     RedisInstrumentor().instrument()
-    AioHttpClientInstrumentor().instrument()
+    AioHttpClientInstrumentor().instrument(url_filter=_strip_stream_query)

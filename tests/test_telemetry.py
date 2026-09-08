@@ -176,6 +176,40 @@ class TestSetupTelemetry:
         traces.assert_not_called()
 
 
+class TestStripStreamQuery:
+    """A googlevideo stream URL is self-authorizing: its signed query is what
+    lets anyone fetch the audio, so an aiohttp span must record the path alone."""
+
+    def test_the_signed_query_is_dropped_from_a_stream_url(self) -> None:
+        from yarl import URL
+
+        url = URL(
+            "https://rr3---sn-abc.googlevideo.com/videoplayback"
+            "?expire=1700000000&sig=SECRET&ip=1.2.3.4&itag=251"
+        )
+        recorded = telemetry._strip_stream_query(url)
+        assert recorded == "https://rr3---sn-abc.googlevideo.com/videoplayback"
+        assert "SECRET" not in recorded
+
+    def test_other_hosts_keep_their_query(self) -> None:
+        from yarl import URL
+
+        url = URL("https://api.spotify.com/v1/browse/categories?limit=1")
+        assert telemetry._strip_stream_query(url) == str(url)
+
+    def test_the_filter_is_installed_on_the_aiohttp_instrumentor(self) -> None:
+        with (
+            patch("opentelemetry.instrumentation.redis.RedisInstrumentor"),
+            patch(
+                "opentelemetry.instrumentation.aiohttp_client.AioHttpClientInstrumentor"
+            ) as aiohttp_cls,
+        ):
+            telemetry._setup_auto_instrumentation()
+        aiohttp_cls.return_value.instrument.assert_called_once_with(
+            url_filter=telemetry._strip_stream_query
+        )
+
+
 class TestSetupTraces:
     def test_builds_a_provider_that_exports_spans(
         self, clean_setup: None, monkeypatch: pytest.MonkeyPatch

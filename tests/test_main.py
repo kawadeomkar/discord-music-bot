@@ -1,6 +1,7 @@
 """Tests for src/main.py — MusicBotApp lifecycle (setup_hook, close, on_ready)."""
 
 import asyncio
+import logging
 from collections.abc import Iterator
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -777,6 +778,31 @@ class TestClose:
             await app.close()  # must not raise
 
         shutdown.assert_called_once()
+
+    async def test_a_hung_telemetry_flush_does_not_hold_close_open(
+        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """shutdown_telemetry runs off-loop and blocks on an OTLP flush; a
+        collector that hangs past the exporter's own timeout must not hold the
+        process open indefinitely. The wait is bounded and the expiry logged."""
+        import threading
+
+        app._redis_pool = None
+        released = threading.Event()
+
+        def _hang() -> None:
+            released.wait(5)
+
+        with (
+            patch("src.telemetry.shutdown_telemetry", new=_hang),
+            patch("src.main._TELEMETRY_SHUTDOWN_TIMEOUT", 0.05),
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+            caplog.at_level(logging.WARNING),
+        ):
+            await asyncio.wait_for(app.close(), timeout=2)
+        released.set()  # let the executor thread finish
+
+        assert "telemetry shutdown did not finish" in caplog.text
 
     async def test_the_chart_pool_is_closed_on_the_way_down(
         self, app: MusicBotApp
