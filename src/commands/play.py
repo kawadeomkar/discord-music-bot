@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING, Union
 import discord
 from discord.ext import commands
 
+from opentelemetry import trace
+
 from src.guild_state import Analytics
+from src.play_placement import PlayArgs, split_play_args
 from src.musicplayer import DEPTH_RESTORE_WAIT_SECS, RESTORE_WAIT_SECS
 from src.recovery import abandon_cold_start, join_succeeded
 from src.sources import parse_input, timestamp_warning, unquote_argument
@@ -30,12 +33,22 @@ if TYPE_CHECKING:
 
 
 async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
-    """`-play` — resolve the input, join if needed, and queue it. Takes the cog:
-    the cold path runs -join through discord.py and tears the player down when
-    that join produces no usable client."""
-    # `origin` is stamped from this value and -remove matches on it; read_rest
-    # hands the quotes through, so a quoted origin would need a literal match.
-    url = unquote_argument(url.strip())
+    """`-play` — split the placement flag off, then resolve, join if needed, queue.
+    Takes the cog: the cold path runs -join through discord.py and tears the player
+    down when that join produces no usable client."""
+    # Consume-rest, so a multi-word search arrives whole — it is what -remove
+    # matches on. The strip covers callers that bypass discord.py's parser.
+    args = split_play_args(url.strip())
+    await _run_placed(ctx, args, cog=cog)
+
+
+async def _run_placed(ctx: commands.Context, args: PlayArgs, *, cog: MusicBot) -> None:
+    """The body behind -play, taking the argument already split."""
+    trace.get_current_span().set_attribute("play.mode", args.mode.value)
+    # ONE rebind, so every `origin=url` below is the query with the flag off: a
+    # leaked flag persists a user_input -remove cannot match. read_rest hands the
+    # quotes through, so a quoted origin would need a literal match.
+    url = unquote_argument(args.query)
     async with background_typing(ctx):
         # Paused → interject, not append: the interrupted song returns PLAYING,
         # unlike -playnow. Before parse_input, so the paused path parses once.
@@ -53,7 +66,7 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
                     cog=cog,
                 )
 
-        source = parse_input(url, ctx.message.content)
+        source = parse_input(url)
 
         qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
         async with contextlib.AsyncExitStack() as stack:

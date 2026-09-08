@@ -333,7 +333,7 @@ async def enqueue_single(
         await ctx.send(embed=notice_embed(warning, discord.Color.orange()))
 
 
-async def _resolve_playnow_source(
+async def _resolve_interjection_source(
     ctx: commands.Context,
     source: Union[SpotifySource, YTSource, SoundcloudSource],
     *,
@@ -420,8 +420,8 @@ async def interject_flow(
     `-play` interjects only because the song is paused, so a `-resume` landing
     during the 1–4s extraction removes the reason and the track is appended.
     """
-    source = parse_input(url, ctx.message.content)
-    qobj = await _resolve_playnow_source(ctx, source, origin=url, cog=cog)
+    source = parse_input(url)
+    qobj = await _resolve_interjection_source(ctx, source, origin=url, cog=cog)
     qobj.interjected = True
 
     # Warm the stream-URL cache before interrupting, or a miss at dequeue puts

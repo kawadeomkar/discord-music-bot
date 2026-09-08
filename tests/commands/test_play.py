@@ -471,7 +471,7 @@ class TestPlayWhilePaused:
         ]
         mock_ctx.message.add_reaction = AsyncMock()
         # Distinct sentinel, not tracks[0]: if the URL ever stops parsing as a
-        # playlist, _resolve_playnow_source falls through to queue_source, and
+        # playlist, _resolve_interjection_source falls through to queue_source, and
         # the identity assertion below catches it. (Stubbing it at all is also
         # a network guard — an unstubbed one runs a real yt-dlp extraction.)
         play_pipeline.queue_source = AsyncMock(
