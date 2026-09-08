@@ -1085,6 +1085,15 @@ class MusicPlayer:
             # Always signal finished-or-failed so loop() never blocks forever.
             self._restore_complete.set()
 
+    async def _abandon_unconnected(self) -> None:
+        """Tear down a player whose gate never opened, then write its crash-
+        recovered head back to the state hash. The re-park FOLLOWS cleanup(),
+        whose clear_connection() HDELs the same fields — the ordering
+        abandon_cold_start keeps for the same reason."""
+        with contextlib.suppress(Exception):
+            await self.stop()
+        await self.repark_crashed_head()
+
     async def repark_crashed_head(self) -> bool:
         """Write a crash-recovered queue head back into the state hash it came from.
         True when something was re-parked.
@@ -2527,7 +2536,8 @@ class MusicPlayer:
                     f"Playback gate timed out for guild {self._guild.id} "
                     f"(never connected to voice), tearing down player"
                 )
-                asyncio.create_task(self.stop())
+                # Its own task: cleanup() cancels the loop this runs in.
+                self._spawn_background(self._abandon_unconnected())
                 return
         prefetched_song: Optional[YTDL] = None
 

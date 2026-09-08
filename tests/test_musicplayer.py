@@ -3093,6 +3093,46 @@ class TestPlaybackGate:
         await asyncio.sleep(0.05)
         music_player._cog.cleanup.assert_awaited_once_with(music_player._guild)
 
+    async def test_gate_timeout_reparks_the_crash_recovered_head(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """_restore_state HDELs current_song_* when it re-queues the crashed song,
+        so until it plays the player's memory is its only copy. A player nobody
+        connects is torn down here; without the re-park that song was gone with
+        no error and no log line."""
+        assert music_player.store is not None
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=crash",
+            title="Crashed",
+            requester_id=mock_author.id,
+            ts=42,
+            duration=300,
+            persisted=False,
+        )
+        assert await music_player.queue.restore_crashed(
+            entry, requester_fallback=mock_author
+        )
+        music_player._playback_gate.clear()
+
+        async def _cleanup(_guild: Any) -> None:
+            # What the real cleanup() does to the hash, ahead of the re-park.
+            assert music_player.store is not None
+            await music_player.store.clear_connection()
+
+        music_player._cog.cleanup = AsyncMock(side_effect=_cleanup)
+
+        with patch("src.musicplayer._PLAYBACK_GATE_TIMEOUT", 0.01):
+            await music_player.loop()
+        await asyncio.sleep(0.05)
+
+        music_player._cog.cleanup.assert_awaited_once()
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert state[b"current_song_url"] == b"https://yt.com/v=crash"
+        assert float(state[b"last_position_secs"]) == 42.0
+
     async def test_gate_timeout_waits_out_an_in_flight_hold(
         self, music_player: MusicPlayer
     ) -> None:
