@@ -1739,7 +1739,17 @@ class MusicPlayer:
             # The tail inherits this fragment's NP card, but which message that is
             # is only settled at the fragment's iteration end.
             self._pending_resume_tail = resume
-        await self.queue.put_front(items)
+        try:
+            await self.queue.put_front(items)
+        except BaseException:
+            # Cancelled here (the caller's place bound) there is no tail, and an
+            # armed marker would eat the interrupted song's history entry. Identity-
+            # checked, so a marker a later interjection replaced is left alone.
+            if self._skip_history_for is current:
+                self._skip_history_for = None
+            if self._pending_resume_tail is resume:
+                self._pending_resume_tail = None
+            raise
 
         # Only if the song we measured is still playing: if the loop moved on,
         # stopping would kill the NEXT song.
@@ -1761,22 +1771,30 @@ class MusicPlayer:
             returns_paused=resume is not None and resume.start_paused,
         )
 
+    async def settle_prefetch(self) -> None:
+        """Take any in-flight prefetch off the board ahead of an interjection, so
+        the cancel of a prefetch pinned in the yt-dlp executor runs outside the
+        caller's place lock; interject()'s own call then finds an empty slot."""
+        await self._neutralize_prefetch()
+
     async def _neutralize_prefetch(self) -> None:
-        """Take the in-flight prefetch off the board so the loop's next dequeue comes
-        from the queue head. Claim-then-settle: _prefetch_task is nulled
-        synchronously before any await, and the loop's matching read is also a
-        synchronous read-and-null, so exactly one consumer sees any given result.
-        Running → cancel (its handler requeues the dequeued item). Completed →
-        rebuild an equivalent QueueObject, return it to the front, kill its FFmpeg
-        subprocess; the rebuild must carry EVERY field. Completed-with-None → the
-        prefetch already retired its own dequeue."""
+        """Take the in-flight prefetch off the board so the loop's next dequeue
+        comes from the queue head; exactly one of interject()/loop() consumes a
+        result (loop()'s read is a synchronous read-and-null). A RUNNING prefetch
+        keeps the slot until its cancel settles — nulled first, loop() could take a
+        second claim, and two live claims settle by position. Running → cancel (its
+        handler requeues the item); completed → rebuild the QueueObject with EVERY
+        field, requeue it and kill its FFmpeg; None → it retired its own dequeue."""
         task = self._prefetch_task
-        self._prefetch_task = None
         if task is None:
             return
         if not task.done():
             await cancel_task(task)
-            return
+            if self._prefetch_task is not task:
+                # loop() read-and-nulled it while the cancel settled and awaited the
+                # same task, so the claim is settled and the result is its consumer's.
+                return
+        self._prefetch_task = None
         try:
             song = task.result()
         # This reads a *done* task's result, where a cancelled prefetch surfaces as

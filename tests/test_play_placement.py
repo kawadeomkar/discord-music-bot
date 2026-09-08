@@ -1,8 +1,32 @@
-"""Tests for src/play_placement.py — the `-play` placement grammar."""
+"""Tests for src/play_placement.py — the `-play` placement grammar, and the
+registry whose place lock makes "check, then insert" atomic."""
+
+import asyncio
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from discord.ext import commands
 
-from src.play_placement import PlayArgs, PlayMode, split_play_args
+from src import play_pipeline
+from src.musicbot import MusicBot
+from src.play_placement import (
+    PlayArgs,
+    PlayMode,
+    play_key,
+    split_play_args,
+)
+from src.youtube import QueueObject
+from tests.helpers import (
+    admit,
+    command_callback,
+    connected_vc,
+    mock_mp,
+    no_typing,
+    recording_span,
+    settle,
+    song,
+)
 
 
 class TestSplitPlayArgs:
@@ -124,3 +148,163 @@ class TestSplitPlayArgs:
         args = split_play_args("--now song")
         with pytest.raises(AttributeError):
             setattr(args, "mode", PlayMode.NORMAL)
+
+
+class TestPlayRegistry:
+    """PlayRegistry.register / retire and the per-guild state they keep."""
+
+    def test_register_is_synchronous_to_the_insert(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        first = admit(music_bot, mock_ctx, mp)
+        second = admit(music_bot, mock_ctx, mp)
+
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        # Held by identity, in arrival order: two requests for one query from one
+        # author are two requests, and the drop reports read this order back.
+        assert plays.inflight == [first, second]
+        assert first.generation == mp.queue.generation
+
+    def test_beyond_the_cap_the_request_is_declined(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 2):
+            admit(music_bot, mock_ctx, mp)
+            admit(music_bot, mock_ctx, mp)
+            with (
+                recording_span() as span,
+                pytest.raises(commands.MaxConcurrencyReached) as excinfo,
+            ):
+                admit(music_bot, mock_ctx, mp)
+
+        # Recorded before the cap check: the declined request carries the count
+        # it would have joined, and nothing else counts declines.
+        span.set_attribute.assert_any_call("play.inflight", 3)
+        span.set_attribute.assert_any_call("play.declined", True)
+        assert excinfo.value.number == 2  # the cap, not 1: the wording keys on it
+        assert len(music_bot._plays._guilds[play_key(mock_ctx)].inflight) == 2
+
+    def test_another_guild_has_its_own_count(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        other = MagicMock()
+        other.guild = MagicMock()
+        other.guild.id = mock_ctx.guild.id + 1
+        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
+            admit(music_bot, mock_ctx, mp)
+            admit(music_bot, other, mp)  # no raise
+
+    def test_the_registry_is_dropped_once_idle(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        req = admit(music_bot, mock_ctx, mp)
+        key = play_key(mock_ctx)
+        assert key in music_bot._plays._guilds
+
+        music_bot._plays.retire(req)
+        assert not music_bot._plays._guilds
+
+    async def test_the_registry_outlives_its_requests_while_a_join_runs(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        req = admit(music_bot, mock_ctx, mp)
+        key = play_key(mock_ctx)
+        done = asyncio.Event()
+
+        async def _join(*_a: Any, **_k: Any) -> None:
+            await done.wait()
+
+        mock_ctx.invoke = AsyncMock(side_effect=_join)
+        music_bot._restore_tasks = set()
+
+        join, owns_join = music_bot._plays.cold_join(
+            req,
+            joiner=lambda: mock_ctx.invoke(music_bot.join),
+            tracked=music_bot._restore_tasks,
+        )
+        assert owns_join  # the first request to find no client creates it
+        music_bot._plays.retire(req)
+        assert key in music_bot._plays._guilds  # the join still runs
+
+        done.set()
+        await join
+        await settle()
+        assert not music_bot._plays._guilds
+
+    async def test_the_cap_raise_escapes_the_command_body(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Raised in play() before _play's try/except: caught there it would
+        render as "Failed to queue song"; from here it reaches cog_command_error
+        and the existing decline notice."""
+        mp = mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._command_error = AsyncMock()
+        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
+            admit(music_bot, mock_ctx, mp)
+            with (
+                no_typing("src.commands.play.background_typing"),
+                pytest.raises(commands.MaxConcurrencyReached),
+            ):
+                await command_callback(MusicBot.play)(music_bot, mock_ctx, url="x")
+        music_bot._command_error.assert_not_awaited()
+
+    async def test_the_decline_names_the_cap_not_a_single_slot(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "play"
+        await music_bot.cog_command_error(
+            mock_ctx, commands.MaxConcurrencyReached(16, commands.BucketType.guild)
+        )
+        text = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "Too many" in text and "resolving" in text
+
+
+class TestResolveConcurrency:
+    """PLAY_INFLIGHT_MAX bounds what a guild holds in memory; this bounds what it
+    holds of the shared, process-wide yt-dlp pool."""
+
+    async def test_a_guild_holds_at_most_that_many_workers_at_once(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Without it one guild's paste burst takes every worker for as many waves
+        as it has links, and the jobs queued behind include the playback loop's own
+        in-band extractions in OTHER guilds."""
+        mp = mock_mp()
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        live = 0
+        peak = 0
+        release = asyncio.Event()
+
+        async def _resolve(*_a: Any, **_k: Any) -> QueueObject:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await release.wait()
+            live -= 1
+            return song(1, mock_ctx)
+
+        play_pipeline.queue_source = AsyncMock(side_effect=_resolve)
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
+        ):
+            tasks = [
+                asyncio.create_task(
+                    command_callback(MusicBot.play)(music_bot, mock_ctx, url=f"s{n}")
+                )
+                for n in range(5)
+            ]
+            await settle()
+            assert peak == 2, peak  # not 5
+            release.set()
+            await asyncio.gather(*tasks)
+
+        assert mp.queue_put.await_count == 5  # and all of them still land
