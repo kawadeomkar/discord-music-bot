@@ -84,9 +84,9 @@ _PROCESS_START = time.time()
 # loop-lag measurement, so the two share one wait.
 _CPU_WINDOW_SECS = 0.5
 _GIT_PROBE_TIMEOUT_SECS = 2.0
-# Bound on the whole Redis probe, window included. The pool sets no socket_timeout,
-# so a server that accepts the socket and never answers would otherwise run to the
-# dashboard deadline and take its two blocks down at the very end.
+# Bound on the whole Redis probe, window included. The pool's 5s socket_timeout
+# retries three times, so a server that accepts the socket and never answers would
+# otherwise run to the dashboard deadline and take its two blocks down at the end.
 _REDIS_PROBE_TIMEOUT_SECS = _CPU_WINDOW_SECS + 3.0
 # Postgres samples over its own, longer window: pg_stat_database flushes a
 # backend's pending stats at transaction end and at most about once a second, so
@@ -1644,9 +1644,9 @@ async def _redis_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
     snapshot the Redis rates are computed from, and re-reading it would let the two
     blocks disagree about the same instant.
 
-    Bounded explicitly: the pool sets socket_connect_timeout but no socket_timeout,
-    so without this the dashboard deadline is the only thing standing between a
-    black-holed Redis and a probe that never returns. Failing here costs these two
+    Bounded explicitly: the pool's 5s socket_timeout retries three times, so
+    without this the dashboard deadline is the only thing standing between a
+    black-holed Redis and a probe that outlives it. Failing here costs these two
     blocks and nothing else.
     """
     async with asyncio.timeout(_REDIS_PROBE_TIMEOUT_SECS):

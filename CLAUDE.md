@@ -720,8 +720,9 @@ raise or not, so it cannot park forever.
 
 **Six** call sites wait on the restore before touching the queue, bounded by
 `RESTORE_WAIT_SECS` (musicplayer.py): `-play` (warm and cold), `-resume`, `-shuffle`,
-`-clear` and `-remove`. The pool sets `socket_connect_timeout` but no `socket_timeout`,
-so a Redis that accepts the connection and then stalls would hang the command outright.
+`-clear` and `-remove`. The pool's `socket_timeout` is 5s and idempotent calls retry three
+times, so a Redis that accepts the connection and then stalls holds a command for the
+whole retry cycle; this bound is what a user is asked to wait.
 The two cold-start sites must not **insert** against an unread snapshot — `-play`
 front-inserting there double-queues the song — and the other four must not **rebuild**
 the mirror from a deque the restore has not filled, which deletes the saved queue
@@ -948,10 +949,10 @@ carry as an accepted ISSUE: with the lock released between them, a `put_front` s
 in that tick read a cursor of 0, LPUSHed ahead of the entry the pending LPOP was about to
 retire, and the LPOP ate the new song. Cost is one Redis round trip under the mutex per
 song start (p50 ~2.4ms, p99 ~5.4ms, measured against `redis:7-alpine` through Docker
-Desktop's published port), **bounded by `_START_WRITE_TIMEOUT` (5s)** — the pool sets no
-`socket_timeout`, so an unbounded write parks `-play`/`-clear`/`-shuffle`/`-remove` for
-that guild for as long as Redis stalls, measured past 20s against one that accepts and
-then stops answering. **It is the only write under the hold.** A start transaction that
+Desktop's published port), **bounded by `_START_WRITE_TIMEOUT` (5s)** and sent once under
+`no_retry()` — a write left to the retrying policy parks `-play`/`-clear`/`-shuffle`/
+`-remove` for that guild for the whole retry cycle while Redis stalls, measured past 20s
+against one that accepts and then stops answering. **It is the only write under the hold.** A start transaction that
 does not land — timed out, swallowed by `@_guild_op`, or never dispatched because
 `vc.play()` raised after the settle — leaves the list one entry ahead of memory, and the
 loop reports that through `GuildQueue.note_mirror_write()` rather than repairing it in
