@@ -181,6 +181,10 @@ _PLAYBACK_GATE_TIMEOUT = 300
 # write is attempted under the mutex, so a stalled Redis costs one bound per start.
 _START_WRITE_TIMEOUT = 5.0
 
+# Enqueue-time prefetches one player may have in flight. Each is a pool job the
+# loop cannot cancel; the play-time resolve covers whatever is skipped.
+_MAX_ENQUEUE_PREFETCHES = 4
+
 # How long a command waits for wait_for_restore() before giving up and saying so.
 # Generous for one pipelined read; bounded because the pool sets no socket_timeout,
 # so a server that accepts the connection then stalls would hang the command outright.
@@ -378,6 +382,7 @@ class MusicPlayer:
         "_playback_gate",
         "_playback_holds",
         "_background_tasks",
+        "_enqueue_prefetches",
         "_progress_task",
         "_heartbeat_task",
         "_np_last_rendered",
@@ -418,6 +423,7 @@ class MusicPlayer:
     _playback_gate: asyncio.Event
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
+    _enqueue_prefetches: set[str]
     _progress_task: Optional[asyncio.Task]
     _heartbeat_task: Optional[asyncio.Task]
     # Last payload pushed and the host it went to, for the no-op-edit guard in
@@ -511,6 +517,8 @@ class MusicPlayer:
         # requested song is inserted in front of it.
         self._playback_holds = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # webpage_urls with an enqueue-time prefetch in flight (_spawn_enqueue_prefetch).
+        self._enqueue_prefetches: set[str] = set()
         self._progress_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._np_last_rendered: Optional[list[Any]] = None
@@ -1129,12 +1137,9 @@ class MusicPlayer:
         else:
             items = list(obj)
         items = await self.queue.put(items, batch=not prefetch)
-        if prefetch and self.store is not None:
+        if prefetch:
             for item in items:
-                if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                self._spawn_enqueue_prefetch(item)
 
     async def queue_put_front(
         self,
@@ -1153,12 +1158,36 @@ class MusicPlayer:
         else:
             items = list(obj)
         items = await self.queue.put_front(items)
-        if prefetch and self.store is not None:
+        if prefetch:
             for item in items:
-                if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                self._spawn_enqueue_prefetch(item)
+
+    def _spawn_enqueue_prefetch(self, item: QueueItem) -> None:
+        """Warm the stream cache for one enqueued song in the background, at
+        most _MAX_ENQUEUE_PREFETCHES at a time per player and once per URL: a
+        skipped song is still resolved by _prefetch_next_song or at play time.
+        See docs/ARCHITECTURE.md#extraction-bounds."""
+        if self.store is None or not isinstance(item, QueueObject):
+            return
+        url = item.webpage_url
+        if url in self._enqueue_prefetches:
+            return
+        if len(self._enqueue_prefetches) >= _MAX_ENQUEUE_PREFETCHES:
+            log.info(
+                f"enqueue prefetch skipped for {url}: {_MAX_ENQUEUE_PREFETCHES} "
+                "already in flight"
+            )
+            return
+        self._enqueue_prefetches.add(url)
+        self._spawn_background(self._run_enqueue_prefetch(item, self.store.redis))
+
+    async def _run_enqueue_prefetch(
+        self, item: QueueObject, redis: aioredis.Redis
+    ) -> None:
+        try:
+            await YTDL.prefetch_stream(item, redis=redis)
+        finally:
+            self._enqueue_prefetches.discard(item.webpage_url)
 
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()

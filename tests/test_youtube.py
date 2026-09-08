@@ -2205,6 +2205,89 @@ class TestPrefetchStream:
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf4")
         assert cached is None
 
+    async def test_a_declined_write_leaves_a_marker_that_skips_the_next_prefetch(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        """A source whose URL carries no expiry (SoundCloud, most other sites) can
+        never be cached, so without the marker every repeat -play of it was a
+        source-cache hit that still spawned a full extraction."""
+        fake_data = _fake_ytdl_data(
+            url="https://cf-media.sndcdn.com/abc.128.mp3",
+            webpage_url="https://soundcloud.com/a/t",
+        )
+        qobj = QueueObject("https://soundcloud.com/a/t", "SC", mock_ctx.author)
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=fake_data
+        ) as mock_extract:
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        mock_extract.assert_called_once()
+        marker = "ytdl:nostream:https://soundcloud.com/a/t"
+        assert await fake_redis.get(marker) is not None
+        assert 0 < await fake_redis.ttl(marker) <= 600
+        assert await fake_redis.get("ytdl:stream:https://soundcloud.com/a/t") is None
+
+    async def test_yt_source_leaves_the_marker_too(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        """The enqueue path writes it from the same _probe_and_cache, so the
+        prefetch queue_put spawns right after is the no-op, not a second job."""
+        fake_data = _fake_ytdl_data(
+            url="https://cf-media.sndcdn.com/abc.128.mp3",
+            webpage_url="https://soundcloud.com/a/t2",
+        )
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=fake_data
+        ) as mock_extract:
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "https://soundcloud.com/a/t2",
+                redis=fake_redis,
+                query_source="soundcloud.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        mock_extract.assert_called_once()
+
+    async def test_a_cached_stream_still_wins_over_a_stale_marker(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=both")
+        await fake_redis.set("ytdl:nostream:https://yt.com/v=both", b"1", ex=600)
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=both", orjson.dumps(fake_data), ex=600
+        )
+        qobj = QueueObject("https://yt.com/v=both", "Both", mock_ctx.author)
+        await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        assert qobj.duration == 180  # enriched from the cached entry
+
+    async def test_a_successful_write_leaves_no_marker(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=ok")
+        qobj = QueueObject("https://yt.com/v=ok", "OK", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        assert await fake_redis.get("ytdl:nostream:https://yt.com/v=ok") is None
+
+    async def test_play_time_resolve_ignores_the_marker(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        """The marker gates the warm-up only; the song must still play."""
+        fake_data = _fake_ytdl_data(
+            url="https://cf-media.sndcdn.com/abc.128.mp3",
+            webpage_url="https://soundcloud.com/a/t3",
+        )
+        await fake_redis.set("ytdl:nostream:https://soundcloud.com/a/t3", b"1", ex=600)
+        qobj = QueueObject("https://soundcloud.com/a/t3", "SC", mock_ctx.author)
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=fake_data
+        ) as mock_extract:
+            data = await YTDL._resolve_playable_stream(qobj, fake_redis)
+        mock_extract.assert_called_once()
+        assert data["url"] == fake_data["url"]
+
     async def test_skips_write_when_ttl_too_short(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:

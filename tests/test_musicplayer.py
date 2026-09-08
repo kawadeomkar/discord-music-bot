@@ -399,6 +399,100 @@ class TestQueuePut:
         mock_pf.assert_not_awaited()
 
 
+class TestEnqueuePrefetchBound:
+    """queue_put's warm-up is one uncancellable pool job per spawn, so a player
+    spawns at most _MAX_ENQUEUE_PREFETCHES at a time and never two for one URL.
+    A skipped song is resolved by the one-ahead prefetch or at play time."""
+
+    @staticmethod
+    def _held(release: asyncio.Event) -> AsyncMock:
+        async def hold(*_: Any, **__: Any) -> None:
+            await release.wait()
+
+        return AsyncMock(side_effect=hold)
+
+    async def test_the_same_url_is_not_prefetched_twice_while_in_flight(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        release = asyncio.Event()
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new=self._held(release)
+        ) as pf:
+            await music_player.queue_put(
+                QueueObject("https://yt.com/v=same", "A", mock_author)
+            )
+            await music_player.queue_put(
+                QueueObject("https://yt.com/v=same", "A", mock_author)
+            )
+            await asyncio.sleep(0)
+            assert pf.await_count == 1
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        assert music_player._enqueue_prefetches == set()
+
+    async def test_spawns_stop_at_the_cap_and_resume_as_jobs_finish(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        from src.musicplayer import _MAX_ENQUEUE_PREFETCHES as cap
+
+        release = asyncio.Event()
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new=self._held(release)
+        ) as pf:
+            for i in range(cap + 3):
+                await music_player.queue_put(
+                    QueueObject(f"https://yt.com/v={i}", f"S{i}", mock_author)
+                )
+            await asyncio.sleep(0)
+            assert pf.await_count == cap
+            assert len(music_player._enqueue_prefetches) == cap
+            # Every song is queued regardless: the bound is on the warm-up only.
+            assert music_player.queue.qsize() == cap + 3
+            release.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert music_player._enqueue_prefetches == set()
+            # Capacity is back: the next enqueue warms again.
+            await music_player.queue_put(
+                QueueObject("https://yt.com/v=next", "N", mock_author)
+            )
+            await asyncio.sleep(0)
+            assert pf.await_count == cap + 1
+
+    async def test_a_failing_prefetch_releases_its_slot(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            await music_player.queue_put(
+                QueueObject("https://yt.com/v=f", "F", mock_author)
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        assert music_player._enqueue_prefetches == set()
+
+    async def test_the_front_insert_path_shares_the_bound(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        release = asyncio.Event()
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new=self._held(release)
+        ) as pf:
+            await music_player.queue_put_front(
+                QueueObject("https://yt.com/v=front", "F", mock_author)
+            )
+            await music_player.queue_put(
+                QueueObject("https://yt.com/v=front", "F", mock_author)
+            )
+            await asyncio.sleep(0)
+            assert pf.await_count == 1
+            release.set()
+            await asyncio.sleep(0)
+
+
 # ── QueueClear ────────────────────────────────────────────────────────────────
 
 

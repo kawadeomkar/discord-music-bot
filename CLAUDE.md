@@ -434,7 +434,10 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   ▼
 PHASE 2 — PREFETCH (background):
   • per-song prefetch_stream task at enqueue (skipped for bulk playlists — N
-    concurrent extractions would mint URLs that expire before playback)
+    concurrent extractions would mint URLs that expire before playback); at most
+    `_MAX_ENQUEUE_PREFETCHES` (4) in flight per player, once per URL, and a
+    `ytdl:nostream:` marker (10 min, left by a declined cache write) makes a
+    repeat of an uncacheable source a no-op — play time ignores the marker
   • _prefetch_next_song: while song N plays, song N+1 is fully resolved AND its
     YTDL/FFmpeg source constructed, cached in ytdl:stream:{webpage_url}
     (TTL = min(URL expire − 30min, 30min) — YouTube revokes well before `expire`)

@@ -514,6 +514,16 @@ def _stream_cache_key(webpage_url: str) -> str:
     return f"ytdl:stream:{webpage_url}"
 
 
+# Lifetime of the "nothing cacheable" marker a declined stream-cache write
+# leaves behind, which stops the enqueue-time prefetch re-extracting a source
+# whose URL cannot be cached (no expiry) or probed dead. Play time ignores it.
+_NO_STREAM_CACHE_TTL = 600  # 10 minutes
+
+
+def _no_stream_cache_key(webpage_url: str) -> str:
+    return f"ytdl:nostream:{webpage_url}"
+
+
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
     """How long a stream URL may be cached, or None when it is not worth caching.
     `expire` is a query param on https formats but a path segment
@@ -689,7 +699,22 @@ async def _probe_and_cache(
 ) -> bool:
     """Success-path post-processing for a fresh stream extraction: record the
     serving format, probe, cache. True when an entry was written. A DEAD URL is
-    never cached; an UNCONFIRMED one for _UNCONFIRMED_STREAM_TTL only."""
+    never cached; an UNCONFIRMED one for _UNCONFIRMED_STREAM_TTL only. A
+    declined write leaves the no-stream marker prefetch_stream consults."""
+    cached = await _probe_and_cache_once(redis, cache_key, data)
+    if not cached:
+        await cache_set(
+            redis,
+            _no_stream_cache_key(data.get("webpage_url", "")),
+            1,
+            _NO_STREAM_CACHE_TTL,
+        )
+    return cached
+
+
+async def _probe_and_cache_once(
+    redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
+) -> bool:
     span = trace.get_current_span()
     _record_serving_format(data)
     if _stream_url_ttl(data.get("url", "")) is None:
@@ -901,8 +926,10 @@ class YTDL(discord.FFmpegOpusAudio):
         redis: Optional[aioredis.Redis] = None,
     ) -> None:
         """Populate the stream URL cache for a queued song so yt_stream() is a
-        cache hit by the time it plays. No-op with no redis or an already-cached
-        URL; errors are logged and swallowed (yt_stream() extracts fresh)."""
+        cache hit by the time it plays. No-op with no redis, an already-cached
+        URL, or a fresh no-stream marker (the last write for this song was
+        declined, so another extraction would be declined too); errors are
+        logged and swallowed (yt_stream() extracts fresh)."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
         if redis is None:
             trace.get_current_span().set_attribute("ytdl.skipped", True)
@@ -913,6 +940,9 @@ class YTDL(discord.FFmpegOpusAudio):
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
         if already_cached:
             _enrich_queueobject(qo, cached)
+            return
+        if await cache_get(redis, _no_stream_cache_key(qo.webpage_url)) is not None:
+            trace.get_current_span().set_attribute("ytdl.skipped", True)
             return
         try:
             # Single-video cast: stream opts on a watch URL never yield a

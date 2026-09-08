@@ -575,7 +575,7 @@ flowchart LR
 
 **Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 1 h) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss, **one** full extraction with `_YTDL_STREAM_OPTS` and hardcoded `process=True` (searches *and* direct URLs — unprocessed extraction would do no format selection and leave nothing to cache) yields identity plus a selected stream URL, and `_probe_and_cache` writes the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity. Returns a `QueueObject`.
 
-**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). For songs Phase 1 just resolved it is a cache-hit no-op (one Redis GET); it runs a full extraction only for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
+**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only), at most `_MAX_ENQUEUE_PREFETCHES` in flight per player and once per URL — see [Extraction bounds](#extraction-bounds). For songs Phase 1 just resolved it is a cache-hit no-op (one Redis GET), and a fresh `ytdl:nostream:{webpage_url}` marker (left by a declined cache write, 10 min) is a no-op too; it runs a full extraction only for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
 
 **Phase 2** (`YTDL.yt_stream`): Called just before playback. Cache hit → construct `YTDL` with no yt-dlp call; miss → extract and cache.
 
@@ -1497,6 +1497,20 @@ can:
 
 Both bounds surface as `ExtractionError.user_message` = "the site took too long to
 answer"; the span carries `ytdl.timed_out`.
+
+**Prefetch fan-out.** `queue_put` warms the stream cache for each enqueued single
+in a background task, and each of those is an uncancellable pool job. Two things
+bound it. `MusicPlayer._spawn_enqueue_prefetch` keeps at most
+`_MAX_ENQUEUE_PREFETCHES` (4) in flight per player and never two for one URL; a
+skipped song is still resolved by `_prefetch_next_song` or at play time, so the
+bound costs latency on the fifth rapid `-play`, never a song. And a source whose
+stream URL cannot be cached — no `expire` (SoundCloud, most non-YouTube sites) or a
+dead probe — used to be re-extracted on *every* repeat `-play`: the source cache hit
+and the prefetch found no stream entry, so each was one more job for nothing.
+`_probe_and_cache` now leaves `ytdl:nostream:{webpage_url}` (`_NO_STREAM_CACHE_TTL`,
+10 min) whenever it declines the write, and `prefetch_stream` treats a fresh marker as
+"already known uncacheable" and returns. Only the warm-up consults it: the play-time
+resolve extracts regardless, so the song still plays.
 
 ### Fetch host policy
 
