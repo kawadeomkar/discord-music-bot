@@ -259,6 +259,28 @@ def reset_structlog_contextvars() -> Iterator[None]:
     structlog.contextvars.clear_contextvars()
 
 
+@pytest.fixture(autouse=True)
+def settle_youtube_background_jobs() -> Iterator[None]:
+    """Drain the two fire-and-forget registries src.youtube keeps between tests.
+
+    Both outlive the call that started them by design — the stream-cache warm the
+    reply does not wait for, and the source-cache revalidation served behind a stale
+    hit. Each test gets its own event loop, so one left pending is a task destroyed
+    on a closed loop, and its patches are long gone by the time it would run.
+    """
+    import src.youtube as youtube
+
+    yield
+    pending = [
+        *youtube._INFLIGHT_STREAM_WARMS.values(),
+        *youtube._SOURCE_REVALIDATIONS,
+    ]
+    for job in pending:
+        job.cancel()
+    youtube._INFLIGHT_STREAM_WARMS.clear()
+    youtube._SOURCE_REVALIDATIONS.clear()
+
+
 @pytest.fixture
 def mock_guild() -> MagicMock:
     guild = MagicMock(spec=discord.Guild)

@@ -468,7 +468,10 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   Miss on a LINK, an interjection head, or a declined flat entry → ONE unified
   stream-opts extraction returns identity AND a selected playable stream URL, so
   both caches are written from a single network round (probe first — see phase 2).
-  See docs/ARCHITECTURE.md#resolve-mode.
+  The stream write is STARTED, not awaited: the reply needs identity, and the probe
+  behind it is a network round trip. Everything that reads that cache joins the
+  same job through `_stream_cache_get`, so nothing extracts the URL twice.
+  See docs/ARCHITECTURE.md#resolve-mode and #warming-the-stream-cache.
   Spotify track → title search; Spotify playlist → titles → YTSource ytsearch
   entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
   QueueObjects. Enqueue via GuildQueue.put (batch=one round-trip for playlists).
@@ -482,7 +485,7 @@ PHASE 2 — PREFETCH (background):
   • every candidate URL is PROBED with a plain no-Range GET (HEAD and ranged GETs
     lie about revoked URLs), handed to aiohttp PRE-ENCODED — yarl requotes a plain
     string and an HLS manifest signs its own path; only proven-playable URLs are
-    cached
+    cached, stamped `probed_at` so the play seconds later skips a second probe
   ▼
 PHASE 3 — STREAM (playback loop, usually zero extraction):
   loop(): gate open → dequeue → resolve (if YTSource) → yt_stream (cache hit →
