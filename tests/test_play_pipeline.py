@@ -1247,6 +1247,7 @@ class TestSpotifyDisabled:
             query_source="",
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
+            redis=music_bot.redis,
         )
         assert result == ResolvedYoutubePlaylist(tracks=fake_qobjs)
 
@@ -1300,6 +1301,7 @@ class TestSpotifyDisabled:
             query_source="",
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
+            redis=music_bot.redis,
         )
 
 
