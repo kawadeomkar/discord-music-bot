@@ -463,6 +463,12 @@ class TestYTDLOpts:
     def test_source_address_is_ipv4_any(self) -> None:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
+    def test_certificates_are_verified(self) -> None:
+        """Every extraction and media fetch is TLS to a host the linked site
+        chose; skipping verification would let any on-path party pick the audio."""
+        assert "nocheckcertificate" not in YTDL_OPTS
+        assert "nocheckcertificate" not in _YTDL_PLAYLIST_OPTS
+
     def test_no_default_search(self) -> None:
         """yt_source wraps a bare title in `ytsearch:` itself; only the generic
         extractor ever read default_search, and it is excluded."""

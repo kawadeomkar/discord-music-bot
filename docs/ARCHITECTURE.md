@@ -358,7 +358,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | Bot class | `AutoShardedBot` | Multi-shard within one process; Discord requires sharding at 2500 guilds |
 | Context class | `MusicContext` | Installed via `get_context` override — the NP-block attach point |
 
-**yt-dlp option profiles** (`youtube.py`) — two profiles share `_YTDL_BASE_OPTS` (`quiet`, `no_warnings`, `noplaylist`, `nocheckcertificate`, `source_address 0.0.0.0`, `socket_timeout 30`, `extractor_args: player_client ["default", "-tv_simply"]`, `allowed_extractors: ["default", "-generic", "end"]` — see [Fetch host policy](#fetch-host-policy)):
+**yt-dlp option profiles** (`youtube.py`) — two profiles share `_YTDL_BASE_OPTS` (`quiet`, `no_warnings`, `noplaylist`, `source_address 0.0.0.0`, `socket_timeout 30`, `extractor_args: player_client ["default", "-tv_simply"]`, `allowed_extractors: ["default", "-generic", "end"]` — see [Fetch host policy](#fetch-host-policy)):
 
 | Profile | Used by | Deltas from base |
 |---|---|---|

@@ -300,7 +300,6 @@ _YTDL_BASE_OPTS = {
     "no_warnings": False,  # warnings are the early-warning system (_YtdlpLogger)
     "logger": _YTDLP_LOGGER,
     "noplaylist": True,
-    "nocheckcertificate": True,
     "ignoreerrors": False,
     "source_address": "0.0.0.0",
     "socket_timeout": 30,
