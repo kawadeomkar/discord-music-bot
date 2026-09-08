@@ -21,7 +21,7 @@ from opentelemetry.trace import StatusCode
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import current_traceparent, fmt_duration, get_logger
+from src.util import current_traceparent, fmt_duration, get_logger, spawn_background
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -380,9 +380,16 @@ _YTDL_FLAT_SEARCH_OPTS = {
 # Legacy alias kept so any external callers that imported YTDL_OPTS still work.
 YTDL_OPTS = _YTDL_STREAM_OPTS
 
-# Search-query → identity cache lifetime: short enough to follow YouTube ranking
-# changes, long enough to skip the 3-4s search on repeat plays.
-_YT_SOURCE_TTL = 3600  # 1 hour
+# Search-query → identity cache lifetime, and the age past which a hit is still
+# served but revalidated behind the reply. Entries are ~200 bytes and TTL'd, so
+# eviction-safe; ranking drift is what the revalidation handles.
+# See docs/ARCHITECTURE.md#source-cache-freshness.
+_YT_SOURCE_TTL = 86400  # 24 hours
+_YT_SOURCE_FRESH_SECS = 3600  # 1 hour
+
+# Revalidations in flight. Module-level because the refresh outlives the command that
+# noticed the staleness — the reply has already been served from the stale entry.
+_SOURCE_REVALIDATIONS: set[asyncio.Task[Any]] = set()
 
 # Ceiling on stream-URL caching. YouTube revokes well before the `expire` a URL
 # carries, so this — not `expire` — keeps a dead URL from being replayed.
@@ -459,6 +466,76 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
             f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
             "audio-only primary is degraded and the player is on the fallback ladder"
         )
+
+
+def _looks_like_url(query: str) -> bool:
+    """Whether a resolve input is a link rather than words to search with. One
+    predicate, because two places branch on it and they must agree: the cache key
+    (a link's is not case-folded) and the revalidation (a link's mapping cannot
+    drift)."""
+    return "://" in query.strip()
+
+
+def _source_cache_key(search: str) -> str:
+    """The ytdl:source key for a query. Case-folded so "Destiny" and "destiny " reach
+    one entry — but never for a URL: YouTube video ids are case-sensitive, so `?v=aB`
+    and `?v=Ab` would share an entry and the second would be served the first's song
+    for the whole TTL."""
+    query = search.strip()
+    return f"ytdl:source:{query if _looks_like_url(query) else query.lower()}"
+
+
+def _source_entry_is_stale(cached: Any) -> bool:
+    """Whether a source-cache hit is past _YT_SOURCE_FRESH_SECS and worth refreshing
+    behind the reply. An entry from a build that stamped nothing reads as fresh — it
+    carries that build's one-hour TTL too, so it expires before this could matter, and
+    reading it as stale would revalidate every entry in the cache once on deploy."""
+    stamped = cached.get("cached_at") if isinstance(cached, dict) else None
+    if not isinstance(stamped, (int, float)):
+        return False
+    return time.time() - stamped > _YT_SOURCE_FRESH_SECS
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SourceIdentity:
+    """What a resolve learns about a song before any format is chosen: the five fields
+    ytdl:source stores and the enqueue card shows. kw_only — title, uploader and
+    thumbnail are adjacent strings that would transpose silently."""
+
+    webpage_url: str
+    title: str
+    duration: Optional[int]
+    uploader: Optional[str]
+    thumbnail: Optional[str]
+
+
+def _identity_to_wire(identity: SourceIdentity) -> dict[str, Any]:
+    """One definition of a cached identity's wire shape, shared by the source cache
+    and the playlist cache so neither can drift from what reads it back."""
+    return {
+        "webpage_url": identity.webpage_url,
+        "title": identity.title,
+        "duration": identity.duration,
+        "uploader": identity.uploader,
+        "thumbnail": identity.thumbnail,
+    }
+
+
+def _identity_from_wire(entry: dict[str, Any]) -> SourceIdentity:
+    """Rebuild a cached identity. Explicit `.get()`s rather than `SourceIdentity(**entry)`
+    so an entry written before a field existed still parses."""
+    return SourceIdentity(
+        webpage_url=entry.get("webpage_url", ""),
+        title=entry.get("title", ""),
+        duration=entry.get("duration"),
+        uploader=entry.get("uploader"),
+        thumbnail=entry.get("thumbnail"),
+    )
+
+
+def _source_cache_value(identity: SourceIdentity) -> dict[str, Any]:
+    """A source-cache entry: the identity plus the stamp _source_entry_is_stale reads."""
+    return {**_identity_to_wire(identity), "cached_at": time.time()}
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -751,19 +828,11 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
 _PROCESSED_ENTRY_MARKERS = ("format_id", "protocol", "acodec")
 
 
-def _queue_object_from_flat_entry(
-    entry: YTDLEntry,
-    requester: Union[discord.User, discord.Member],
-    *,
-    query_source: str,
-    analytics: Analytics,
-    user_input: Optional[str],
-    ts: Optional[int] = None,
-) -> Optional[QueueObject]:
-    """Build a QueueObject from a flat search entry, or return None when the entry
-    cannot be queued as a plain song — the caller then takes the full path. webpage_url
-    is derived from `id` rather than read from `url`, so the flat and full paths agree
-    by construction: it is the stream-cache key, what -remove matches, and part of
+def _flat_entry_fields(entry: YTDLEntry) -> Optional[SourceIdentity]:
+    """The identity a flat search entry yields, or None when the entry cannot stand
+    for a plain song — the caller then takes the full path. webpage_url is derived
+    from `id` rather than read from `url`, so the flat and full paths agree by
+    construction: it is the stream-cache key, what -remove matches, and part of
     play_history's dedup tuple."""
     video_id = entry.get("id")
     if not video_id:
@@ -789,15 +858,59 @@ def _queue_object_from_flat_entry(
     title = entry.get("title")
     if not title:
         return None
-    return QueueObject(
-        f"https://www.youtube.com/watch?v={video_id}",
-        title,
-        requester,
-        ts=ts,
-        user_input=user_input,
+    return SourceIdentity(
+        webpage_url=f"https://www.youtube.com/watch?v={video_id}",
+        title=title,
         duration=int(raw_duration),
         uploader=entry.get("uploader") or entry.get("channel"),
         thumbnail=entry.get("thumbnail"),
+    )
+
+
+def _queue_object_from_flat_entry(
+    entry: YTDLEntry,
+    requester: Union[discord.User, discord.Member],
+    *,
+    query_source: str,
+    analytics: Analytics,
+    user_input: Optional[str],
+    ts: Optional[int] = None,
+) -> Optional[QueueObject]:
+    """Build a QueueObject from a flat search entry, or None when the entry cannot be
+    queued as a plain song."""
+    identity = _flat_entry_fields(entry)
+    if identity is None:
+        return None
+    return _queue_object_from_identity(
+        identity,
+        requester,
+        query_source=query_source,
+        analytics=analytics,
+        user_input=user_input,
+        ts=ts,
+    )
+
+
+def _queue_object_from_identity(
+    identity: SourceIdentity,
+    requester: Union[discord.User, discord.Member],
+    *,
+    query_source: str,
+    analytics: Analytics,
+    user_input: Optional[str],
+    ts: Optional[int] = None,
+) -> QueueObject:
+    """The one place a resolved identity becomes a queue entry — shared by the flat
+    path, the full path and a source-cache hit, so all three build the same object."""
+    return QueueObject(
+        identity.webpage_url,
+        identity.title,
+        requester,
+        ts=ts,
+        user_input=user_input,
+        duration=identity.duration,
+        uploader=identity.uploader,
+        thumbnail=identity.thumbnail,
         query_source=query_source,
         analytics=analytics,
     )
@@ -886,6 +999,32 @@ def _first_video_entry(data: YTDLExtractResult) -> YTDLEntry:
         if entry and entry.get("_type", None) != "playlist":
             return entry
     return data
+
+
+async def _revalidate_source(
+    redis: Optional[aioredis.Redis], cache_key: str, search: str
+) -> None:
+    """Refresh a stale source entry behind the reply that was served from it.
+
+    Searches only: what goes stale is the query → video mapping YouTube's ranking
+    decides, and a link's mapping is the link. One flat POST, so the refresh costs a
+    fraction of the resolve it saves the next play. Nothing here may raise into the
+    task — the entry it failed to refresh is still the one being served."""
+    try:
+        data = await _extract_once(
+            _inflight_key(cache_key, "flat"),
+            ExtractRequest(url=search, opts=_YTDL_FLAT_SEARCH_OPTS),
+        )
+        entry = _first_video_entry(data) if data is not None else None
+        identity = _flat_entry_fields(entry) if entry is not None else None
+        if identity is None:
+            # A live result, one without a duration, or none at all. The stale entry
+            # outlives this attempt rather than being dropped: it still plays.
+            return
+        await cache_set(redis, cache_key, _source_cache_value(identity), _YT_SOURCE_TTL)
+        log.debug(f"refreshed a stale source cache entry: {cache_key}")
+    except Exception as e:
+        log.warning(f"source cache revalidation failed for {search!r}: {e!r}")
 
 
 class YTDL(discord.FFmpegOpusAudio):
@@ -1233,9 +1372,8 @@ class YTDL(discord.FFmpegOpusAudio):
         collection `search` is a generated title, not the link -remove matches."""
         origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
-        # Normalised so "Destiny" and "destiny " both hit; ts is a per-request
-        # playback offset, not part of the identity.
-        cache_key = f"ytdl:source:{search.strip().lower()}"
+        # ts is excluded — a per-request playback offset, not part of the identity.
+        cache_key = _source_cache_key(search)
 
         if redis is not None:
             cached = await cache_get(redis, cache_key)
@@ -1244,17 +1382,29 @@ class YTDL(discord.FFmpegOpusAudio):
                 trace.get_current_span().set_attribute(
                     "ytdl.result_title", cached.get("title", "")
                 )
-                return QueueObject(
-                    cached["webpage_url"],
-                    cached["title"],
+                stale = _source_entry_is_stale(cached)
+                trace.get_current_span().set_attribute("ytdl.source_stale", stale)
+                if stale and not _looks_like_url(search):
+                    # Served now, refreshed behind the reply: what ages is the
+                    # ranking a search resolved through, and a link's mapping is
+                    # the link. Not awaited — this play uses the entry it has.
+                    spawn_background(
+                        _revalidate_source(redis, cache_key, search),
+                        _SOURCE_REVALIDATIONS,
+                    )
+                return _queue_object_from_identity(
+                    SourceIdentity(
+                        webpage_url=cached["webpage_url"],
+                        title=cached["title"],
+                        duration=cached.get("duration"),
+                        uploader=cached.get("uploader"),
+                        thumbnail=cached.get("thumbnail"),
+                    ),
                     requester,
-                    ts=ts,
-                    user_input=origin,
-                    duration=cached.get("duration"),
-                    uploader=cached.get("uploader"),
-                    thumbnail=cached.get("thumbnail"),
                     query_source=query_source,
                     analytics=analytics,
+                    user_input=origin,
+                    ts=ts,
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
@@ -1288,13 +1438,15 @@ class YTDL(discord.FFmpegOpusAudio):
                     await cache_set(
                         redis,
                         cache_key,
-                        {
-                            "webpage_url": flat_qobj.webpage_url,
-                            "title": flat_qobj.title,
-                            "duration": flat_qobj.duration,
-                            "uploader": flat_qobj.uploader,
-                            "thumbnail": flat_qobj.thumbnail,
-                        },
+                        _source_cache_value(
+                            SourceIdentity(
+                                webpage_url=flat_qobj.webpage_url,
+                                title=flat_qobj.title,
+                                duration=flat_qobj.duration,
+                                uploader=flat_qobj.uploader,
+                                thumbnail=flat_qobj.thumbnail,
+                            )
+                        ),
                         _YT_SOURCE_TTL,
                     )
                 return flat_qobj
@@ -1338,19 +1490,17 @@ class YTDL(discord.FFmpegOpusAudio):
         uploader = video_data.get("uploader")
         thumbnail = video_data.get("thumbnail")
         trace.get_current_span().set_attribute("ytdl.result_title", title)
+        identity = SourceIdentity(
+            webpage_url=webpage_url,
+            title=title,
+            duration=duration,
+            uploader=uploader,
+            thumbnail=thumbnail,
+        )
 
         if redis is not None:
             await cache_set(
-                redis,
-                cache_key,
-                {
-                    "webpage_url": webpage_url,
-                    "title": title,
-                    "duration": duration,
-                    "uploader": uploader,
-                    "thumbnail": thumbnail,
-                },
-                _YT_SOURCE_TTL,
+                redis, cache_key, _source_cache_value(identity), _YT_SOURCE_TTL
             )
             # Warm the stream cache from the same extraction. Awaited, not
             # spawned, so the write lands before queue_put's prefetch_stream
@@ -1360,17 +1510,13 @@ class YTDL(discord.FFmpegOpusAudio):
             )
             trace.get_current_span().set_attribute("ytdl.stream_cached", stream_cached)
 
-        return QueueObject(
-            webpage_url,
-            title,
+        return _queue_object_from_identity(
+            identity,
             requester,
-            ts=ts,
-            user_input=origin,
-            duration=duration,
-            uploader=uploader,
-            thumbnail=thumbnail,
             query_source=query_source,
             analytics=analytics,
+            user_input=origin,
+            ts=ts,
         )
 
     @staticmethod
