@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     pass
 
 TOP_N: Final[int] = 10
-MAX_DAYS: Final[int] = 3650
 # Bounds Postgres to one aggregate pass per guild per window per minute, whatever
 # the table size. TTL'd, so the key is a legitimate volatile-lru eviction
 # candidate — losing it costs one re-query.
