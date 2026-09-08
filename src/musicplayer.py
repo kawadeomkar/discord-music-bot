@@ -164,6 +164,10 @@ _MIN_RESUME_REMAINING_SECS = 5
 # crash-recovery position cap in _restore_state().
 _RESUME_EOF_MARGIN_SECS = 10
 
+# Consecutive failed NP edits after which the updater stops and releases the
+# host; the next command response or -now re-hosts the block.
+_NP_EDIT_MAX_FAILURES = 5
+
 # ── Progress-bar label ────────────────────
 # The live elapsed label is floored to this step, so consecutive 3s ticks render
 # an identical payload until the label moves and _push_np_edit skips the PATCH.
@@ -426,6 +430,7 @@ class MusicPlayer:
         "_heartbeat_task",
         "_np_last_rendered",
         "_np_last_id",
+        "_np_edit_failures",
         "_np_host_message",
         "_np_host_own_embeds",
         "_np_host_dedicated",
@@ -469,6 +474,7 @@ class MusicPlayer:
     # and list is invariant, so the element type stays Any.
     _np_last_rendered: Optional[list[Any]]
     _np_last_id: Optional[int]
+    _np_edit_failures: int
     _np_host_message: Optional[discord.Message]
     _np_host_own_embeds: list[discord.Embed]
     _np_host_dedicated: bool
@@ -559,6 +565,9 @@ class MusicPlayer:
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._np_last_rendered: Optional[list[Any]] = None
         self._np_last_id: Optional[int] = None
+        # Consecutive HTTPExceptions from _push_np_edit; reset by a success or a
+        # new host, read by the updater against _NP_EDIT_MAX_FAILURES.
+        self._np_edit_failures = 0
         # NP host state: the message carrying the block, its own cached embeds that
         # follow it, and whether it is a dedicated NP message (deleted on retire) or
         # a command response (strip-edited).
@@ -1728,6 +1737,7 @@ class MusicPlayer:
         # goes with the host or a stale entry suppresses a needed edit.
         self._np_last_rendered = None
         self._np_last_id = None
+        self._np_edit_failures = 0
 
     async def retire_np_host_on_stop(self) -> None:
         """-stop / alone-disconnect teardown: dispose of the host so no message keeps
@@ -2339,10 +2349,19 @@ class MusicPlayer:
             # to push would suppress the retry that fixes it.
             self._np_last_rendered = rendered
             self._np_last_id = message.id
+            self._np_edit_failures = 0
             return True
         except discord.NotFound:
             return False
+        except discord.Forbidden as e:
+            # A permission the bot lost stays lost; every tick would re-earn it.
+            log.warning(
+                f"Now-playing edit forbidden for guild {self._guild.id}: {e}; "
+                "releasing the host"
+            )
+            return False
         except discord.HTTPException as e:
+            self._np_edit_failures += 1
             log.warning(f"Now-playing edit failed for guild {self._guild.id}: {e}")
             return True
 
@@ -2449,14 +2468,32 @@ class MusicPlayer:
                     if not await self._push_np_edit(
                         song, host, self._np_host_own_embeds, span=self._playback_span
                     ):
-                        # Host deleted by a user — go dormant rather than die; the
-                        # next command response (or -now) re-hosts. Adopt is
-                        # lock-free, so only release OUR host or a newly swapped-in
-                        # one would be orphaned.
+                        # Host deleted by a user, or the edit forbidden — go dormant
+                        # rather than die; the next command response (or -now)
+                        # re-hosts. Adopt is lock-free, so only release OUR host
+                        # or a newly swapped-in one would be orphaned.
                         if self._np_host_message is host:
                             self._release_np_host()
+                    elif self._np_edit_failures >= _NP_EDIT_MAX_FAILURES:
+                        # A host that keeps refusing edits is not coming back this
+                        # song; stop asking and let a fresh host start clean.
+                        log.error(
+                            f"now-playing updater stopped for guild {self._guild.id} "
+                            f"after {self._np_edit_failures} consecutive failed edits"
+                        )
+                        if self._np_host_message is host:
+                            self._release_np_host()
+                        return
         except asyncio.CancelledError:
             raise
+        except Exception as e:
+            # cancel_task never awaits a task that ended on its own, so the
+            # exception would otherwise surface at GC with no guild attached.
+            log.error(
+                f"now-playing updater stopped for guild {self._guild.id}: "
+                f"{type(e).__name__}: {e}",
+                exc_info=True,
+            )
 
     async def _heartbeat_updater(self, song: YTDL) -> None:
         """Record the playback position to Redis on a fixed cadence.

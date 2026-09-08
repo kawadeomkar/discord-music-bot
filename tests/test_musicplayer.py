@@ -6126,6 +6126,83 @@ class TestProgressUpdater:
 
         assert message.edit.await_count == 2  # kept ticking despite the failure
 
+    async def test_goes_dormant_when_the_edit_is_forbidden(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """A permission the bot lost stays lost for the song; retrying every tick
+        would re-earn the 403 eighty times. Release the host and go dormant, as
+        for a deleted message."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        message = self._host(music_player)
+        message.edit.side_effect = discord.Forbidden(MagicMock(status=403), "nope")
+
+        with patch("asyncio.sleep", new=self._make_sleep(2)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._progress_updater(mock_song)
+
+        message.edit.assert_awaited_once()
+        assert music_player._np_host_message is None
+
+    async def test_stops_after_consecutive_failures(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """A host that keeps refusing edits is not coming back this song: after
+        _NP_EDIT_MAX_FAILURES in a row the updater returns and releases the host,
+        so a fresh one starts with a clean count."""
+        from src.musicplayer import _NP_EDIT_MAX_FAILURES
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        message = self._host(music_player)
+        message.edit.side_effect = discord.HTTPException(MagicMock(), "500")
+
+        with patch("asyncio.sleep", new=self._make_sleep(_NP_EDIT_MAX_FAILURES + 5)):
+            await music_player._progress_updater(mock_song)  # returns, no raise
+
+        assert message.edit.await_count == _NP_EDIT_MAX_FAILURES
+        assert music_player._np_host_message is None
+        assert music_player._np_edit_failures == 0  # the release reset it
+
+    async def test_a_success_resets_the_failure_count(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        message = self._host(music_player)
+        message.edit.side_effect = discord.HTTPException(MagicMock(), "500")
+        await music_player._push_np_edit(mock_song, message, [])
+        await music_player._push_np_edit(mock_song, message, [])
+        assert music_player._np_edit_failures == 2
+        message.edit.side_effect = None
+        await music_player._push_np_edit(mock_song, message, [])
+        assert music_player._np_edit_failures == 0
+
+    async def test_an_unexpected_error_is_logged_not_raised(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Mirrors _heartbeat_updater: cancel_task never awaits a task that ended
+        on its own, so a raise here would surface at GC with no guild attached."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.side_effect = RuntimeError("voice state torn down")
+        mocked(music_player._guild).voice_client = vc
+        self._host(music_player)
+
+        with (
+            patch("asyncio.sleep", new=self._make_sleep(2)),
+            caplog.at_level(logging.ERROR),
+        ):
+            await music_player._progress_updater(mock_song)  # returns, no raise
+
+        assert "now-playing updater stopped" in caplog.text
+        assert str(music_player._guild.id) in caplog.text
+
 
 # ── CancelProgressTask ────────────────────────────────────────────────────────
 
