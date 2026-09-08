@@ -198,11 +198,14 @@ class InterjectOutcome:
     confirmation wording."""
 
     interrupted_title: str
-    # None → no resume entry (the interrupted song was nearly finished, or had no
-    # webpage_url to rebuild from). Every other interruption parks one, however
-    # many are already parked behind it.
+    # None → no resume entry (the interrupted song was nearly finished, a live
+    # stream, or had no webpage_url to rebuild from). Every other interruption
+    # parks one, however many are already parked behind it.
     resume_position: Optional[int]
     was_paused: bool  # the OBSERVED state when it was interrupted
+    # No known length, so no position to return to; the wording says so rather
+    # than "nearly finished".
+    live: bool = False
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
     # -playnow restores what it interrupted while -play brings it back playing.
     # Wording must key off this, or a -play interjection announces "will return
@@ -1012,16 +1015,16 @@ class MusicPlayer:
                         # The recorded position, read straight off the snapshot —
                         # no clock, no IO, so downtime is never credited.
                         position = guild_state.crashed_position_at(time.time())
+                        # No duration means no position to come back to — a live
+                        # stream resumes at its edge, and a seek into one is that
+                        # many seconds of silence.
+                        if not guild_state.current_song_duration:
+                            position = None
                         if position is not None:
                             # Cap at duration − 10s so FFmpeg cannot seek past EOF,
-                            # read from the snapshot this restore already holds. The
-                            # stream cache expires in 30 minutes, so sourcing it there
-                            # capped or did not depending on how long the restart took.
-                            # Falsy covers both unknown and a livestream's 0, either of
-                            # which means no cap rather than a cap at 0.
+                            # read from the snapshot this restore already holds.
                             duration = guild_state.current_song_duration
-                            if duration:
-                                position = min(position, max(0, duration - 10))
+                            position = min(position, max(0, duration - 10))
                             log.info(
                                 f"Computed recovery position {position}s for "
                                 f"'{guild_state.current_song_title}'"
@@ -1895,28 +1898,26 @@ class MusicPlayer:
 
         was_paused = vc.is_paused()
         position = int(current.position_secs)
+        # No duration means no position to come back to: a live stream seeked to
+        # `ts` decodes and discards that many seconds of live audio as silence.
+        live = current.duration_secs <= 0
         resume: Optional[QueueObject] = None
-        if current.webpage_url:
+        if current.webpage_url and not live:
             # On the RAW position: the EOF cap below pulls it back by its margin,
             # which would mask "almost over".
-            near_end = (
-                current.duration_secs > 0
-                and current.duration_secs - position < _MIN_RESUME_REMAINING_SECS
+            near_end = current.duration_secs - position < _MIN_RESUME_REMAINING_SECS
+            # EOF guard matching the crash-recovery cap: imprecise duration
+            # metadata must not make FFmpeg seek past the end.
+            position = min(
+                position, max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS)
             )
-            if current.duration_secs > 0:
-                # EOF guard matching the crash-recovery cap: imprecise duration
-                # metadata must not make FFmpeg seek past the end.
-                position = min(
-                    position,
-                    max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS),
-                )
             if not near_end:
                 resume = QueueObject(
                     current.webpage_url,
                     current.title or "",
                     current.requester or self._require_requester(),
                     ts=position,
-                    duration=current.duration_secs or None,
+                    duration=current.duration_secs,
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
@@ -1977,6 +1978,7 @@ class MusicPlayer:
             resume_position=position if resume is not None else None,
             was_paused=was_paused,
             returns_paused=resume is not None and resume.start_paused,
+            live=live,
         )
 
     async def _neutralize_prefetch(self) -> None:

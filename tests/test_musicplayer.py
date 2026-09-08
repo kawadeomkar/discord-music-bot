@@ -3929,6 +3929,9 @@ class TestRestoreCrashedSong:
             music_player.store.state_key(), b"current_song_title", b"Crashed"
         )
         await fake_redis.hset(
+            music_player.store.state_key(), b"current_song_duration", b"300"
+        )
+        await fake_redis.hset(
             music_player.store.state_key(), b"play_start_epoch", str(start).encode()
         )
         await fake_redis.hset(
@@ -3990,6 +3993,9 @@ class TestRestoreCrashedSong:
             music_player.store.state_key(), b"current_song_title", b"Paused Crash"
         )
         await fake_redis.hset(
+            music_player.store.state_key(), b"current_song_duration", b"300"
+        )
+        await fake_redis.hset(
             music_player.store.state_key(),
             b"play_start_epoch",
             str(play_start).encode(),
@@ -4044,14 +4050,15 @@ class TestRestoreCrashedSong:
         first = await music_player.queue.get()
         assert first.ts == 50  # min(90, 60 − 10)
 
-    async def test_a_livestream_duration_of_zero_does_not_cap_to_zero(
+    async def test_a_livestream_duration_of_zero_resumes_at_the_edge(
         self,
         music_player: MusicPlayer,
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """max(0, 0 - 10) is 0, so treating an unknown duration as a real one would
-        restart every livestream from the beginning."""
+        """A live stream has no position to come back to: seeking `ts` into one
+        decodes and discards that many seconds of live audio as silence, so the
+        recorded position is dropped and the song resumes at the live edge."""
         assert music_player.store is not None
         await fake_redis.hset(
             music_player.store.state_key(),
@@ -4070,16 +4077,17 @@ class TestRestoreCrashedSong:
         await music_player._restore_state()
 
         first = await music_player.queue.get()
-        assert first.ts == 140
+        assert first.ts is None
 
-    async def test_crashed_song_position_uncapped_when_cached_duration_malformed(
+    async def test_crashed_song_without_a_parked_duration_resumes_from_the_start(
         self,
         music_player: MusicPlayer,
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """A malformed cached stream duration degrades to "no cap" — the
-        computed position is kept and the restore still completes (clears the
+        """No duration in the hash means no position to come back to — the same
+        rule as a live stream's 0 — so the recorded position is dropped rather
+        than seeked into blind, and the restore still completes (clears the
         crashed-song state) instead of aborting."""
         assert music_player.store is not None
         import time
@@ -4096,18 +4104,13 @@ class TestRestoreCrashedSong:
         await fake_redis.hset(
             music_player.store.state_key(), b"play_start_epoch", str(start).encode()
         )
-        await fake_redis.set(
-            "ytdl:stream:https://yt.com/v=crash",
-            orjson.dumps({"duration": "not-a-number"}),
-        )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player.bot.wait_until_ready = AsyncMock()
 
         await music_player._restore_state()
 
         first = await music_player.queue.get()
-        assert first.ts is not None
-        assert 80 <= first.ts <= 100  # uncapped ≈90s position survives
+        assert first.ts is None
         state = await fake_redis.hgetall(music_player.store.state_key())
         assert b"current_song_url" not in state  # restore completed and cleared
 
@@ -9540,6 +9543,41 @@ class TestInterject:
         assert music_player.queue.display_items() == [playnow_obj]
         assert outcome is not None and outcome.resume_position is None
         assert music_player._skip_history_for is None
+
+    async def test_a_livestream_parks_no_resume_tail(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """duration 0 used to pass both `> 0` guards by being skipped, leaving a
+        tail with ts=elapsed and no EOF cap — and a seek into a live source is
+        that many seconds of silence. No tail, so the fragment records itself."""
+        live_song.duration_secs = 0
+        live_song.elapsed_secs = 600.0
+        music_player.current_song = live_song
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        assert music_player.queue.display_items() == [playnow_obj]
+        assert outcome is not None
+        assert outcome.resume_position is None
+        assert outcome.live is True
+        assert music_player._skip_history_for is None
+        assert music_player._pending_resume_tail is None
+
+    async def test_a_finite_song_is_not_reported_live(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+        assert outcome is not None and outcome.live is False
 
     async def test_eof_cap_pulls_position_back(
         self,

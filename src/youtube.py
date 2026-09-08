@@ -957,9 +957,11 @@ class YTDL(discord.FFmpegOpusAudio):
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
-            # No user notice here: prefetch constructs this while the previous
-            # song still plays. MusicPlayer's start path announces the offset.
-            ffmpeg_opts["options"] += f" -ss {qo.ts}"
+            # Input-side (before -i): ffmpeg seeks the source instead of decoding
+            # and discarding `ts` seconds. No user notice here: prefetch constructs
+            # this while the previous song still plays; the loop's start path
+            # announces the offset.
+            ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
         if volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 

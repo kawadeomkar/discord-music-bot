@@ -160,6 +160,38 @@ class TestPlaynow:
         assert "nearly finished" in embed.description
         assert "will not resume" in embed.description
 
+    async def test_live_stream_wording(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """A live stream also parks no tail, but "nearly finished" would be a
+        lie about why."""
+        from src.musicplayer import InterjectOutcome
+
+        live_mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="24/7 lofi",
+                resume_position=None,
+                was_paused=False,
+                live=True,
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        )
+
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "24/7 lofi" in embed.description
+        assert "live stream" in embed.description
+        assert "nearly finished" not in embed.description
+
     async def test_interjecting_over_an_interjection_promises_a_return(
         self,
         music_bot: MusicBot,

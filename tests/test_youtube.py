@@ -1098,9 +1098,13 @@ class TestYTStream:
 
         assert "volume=0.5" in captured_options["options"]
 
-    async def test_yt_stream_appends_seek_when_ts_set(
+    async def test_yt_stream_seeks_on_the_input_side_when_ts_set(
         self, mock_ctx: MagicMock
     ) -> None:
+        """before_options land ahead of `-i` (discord.py builds the argv in that
+        order), so ffmpeg seeks the source rather than decoding and discarding
+        `ts` seconds — which on a live source is `ts` seconds of silence. The
+        reconnect flags share that side and must survive the append."""
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -1119,6 +1123,7 @@ class TestYTStream:
             options: str,
         ) -> None:
             noop_ffmpeg_init(self)
+            captured_options["before_options"] = before_options
             captured_options["options"] = options
 
         with (
@@ -1127,7 +1132,9 @@ class TestYTStream:
         ):
             await YTDL.yt_stream(qobj, channel)
 
-        assert "-ss 90" in captured_options["options"]
+        assert "-ss 90" in captured_options["before_options"]
+        assert "-reconnect 1" in captured_options["before_options"]
+        assert "-ss" not in captured_options["options"]
 
     async def test_yt_stream_carries_ts_as_start_offset(
         self, mock_ctx: MagicMock
@@ -2052,7 +2059,7 @@ class TestYTStreamPlaynowFlags:
             options: Optional[str],
         ) -> None:
             noop_ffmpeg_init(self)
-            captured_options["options"] = options
+            captured_options["before_options"] = before_options
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
@@ -2061,7 +2068,7 @@ class TestYTStreamPlaynowFlags:
             await YTDL.yt_stream(qobj, channel)
 
         channel.send.assert_not_awaited()
-        assert "-ss 151" in captured_options["options"]
+        assert "-ss 151" in (captured_options["before_options"] or "")
 
 
 class TestPotProviderCompatibility:

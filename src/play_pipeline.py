@@ -511,7 +511,12 @@ async def interject_flow(
         )
         return
 
-    if outcome.resume_position is None:
+    if outcome.live:
+        desc = (
+            f"**{outcome.interrupted_title}** is a live stream, so it will not "
+            "come back afterwards."
+        )
+    elif outcome.resume_position is None:
         desc = (
             f"**{outcome.interrupted_title}** was nearly finished and will not resume."
         )
