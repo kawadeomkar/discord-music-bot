@@ -20,7 +20,7 @@ from discord.ext import commands
 from src.guild_queue import QueueItem
 from src.guild_state import Analytics
 from src.musicplayer import InterjectOutcome, MusicPlayer
-from src.play_placement import Placement, PlayRequest
+from src.play_placement import Placement, PlayRequest, ResolveMode
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -289,12 +289,17 @@ async def queue_source(
     *,
     analytics: Analytics,
     origin: str,
+    mode: ResolveMode,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
     """Resolve a parsed source into something enqueueable. `analytics` is the
     command's ask-time head value; playlist tracks derive per-track positions
     from it. `origin` is the raw command argument, carried onto every item —
-    for a collection the link, not the per-track search its expansion made."""
+    for a collection the link, not the per-track search its expansion made.
+
+    `mode` is required and has no default: interjection resolves through this
+    same helper, so "a search may go flat" cannot be decided from the input
+    shape — only the caller knows whether the song must be playable."""
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
@@ -328,6 +333,11 @@ async def queue_source(
         search = source.url
     else:
         assert_never(source)
+    # Only a search has a cheap mode; a link pays the watch page either way.
+    flat = mode is ResolveMode.FLAT_OK and (
+        isinstance(source, SpotifySource)
+        or (isinstance(source, YTSource) and source.ytsearch is not None)
+    )
     return await YTDL.yt_source(
         ctx.author,
         search,
@@ -336,6 +346,7 @@ async def queue_source(
         query_source=query_source_of(source),
         analytics=analytics,
         user_input=origin,
+        flat=flat,
     )
 
 
@@ -588,7 +599,16 @@ async def _resolve_interjection_source(
                 )
             )
         return tracks[0], list(tracks[1:])
-    qobj = await queue_source(ctx, source, analytics=analytics, origin=origin, cog=cog)
+    # FULL, not the placement default: interject() stops the current song, so this
+    # head has to be playable before anything is stopped.
+    qobj = await queue_source(
+        ctx,
+        source,
+        analytics=analytics,
+        origin=origin,
+        mode=ResolveMode.FULL,
+        cog=cog,
+    )
     assert isinstance(qobj, QueueObject)
     return qobj, []
 

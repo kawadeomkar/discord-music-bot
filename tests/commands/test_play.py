@@ -20,11 +20,13 @@ from src.recovery import abandon_cold_start
 from src.guild_queue import RemoveMode, RemoveOutcome
 from src.play_placement import (
     PlaceResult,
+    ResolveMode,
     Placement,
     PlayMode,
     PlayRequest,
     _GuildPlays,
     play_key,
+    resolve_mode_for,
 )
 from src.musicplayer import (
     RESTORE_WAIT_SECS,
@@ -216,6 +218,61 @@ class TestPlayCommand:
         cancel_spy.assert_called_once()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
         mock_ctx.send.assert_awaited()
+
+    async def test_the_warm_path_hands_queue_source_the_placement_mode(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The mode has no default, but it could still be hardcoded at one call site
+        and derived at the other. Both must read it from the placement."""
+        mock_ctx.voice_client = playing_vc(mock_ctx)
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        play_pipeline.queue_source = AsyncMock(return_value=fake_qobj)
+        play_pipeline.enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("asyncio.create_task"),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
+
+        assert play_pipeline.queue_source.await_args is not None
+        # The literal, not resolve_mode_for(TAIL): comparing production against the
+        # same function passes however the call site reads its placement.
+        assert (
+            play_pipeline.queue_source.await_args.kwargs["mode"] is ResolveMode.FLAT_OK
+        )
+        assert resolve_mode_for(Placement.TAIL) is ResolveMode.FLAT_OK
+
+    async def test_the_cold_path_hands_queue_source_the_placement_mode(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        play_pipeline.queue_source = AsyncMock(return_value=fake_qobj)
+        play_pipeline.enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
+
+        def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
+            coro.close()
+            mock_ctx.voice_client = connected_vc(mock_ctx)
+            return join_task
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
+
+        assert play_pipeline.queue_source.await_args is not None
+        assert play_pipeline.queue_source.await_args.kwargs["mode"] is ResolveMode.FULL
+        assert resolve_mode_for(Placement.COLD_FRONT) is ResolveMode.FULL
 
 
 class TestPlayAnalytics:

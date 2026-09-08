@@ -60,9 +60,27 @@ class Placement(Enum):
     NEXT = "next"
 
 
-# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
-# hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
-# turns a typed `--` into a single em dash.
+class ResolveMode(Enum):
+    """Whether a resolve may stop at search metadata. FULL is for a head that has to
+    be playable before it is used: an interjection stops the current song, and a cold
+    start has nothing queued behind it. Every other placement is FLAT_OK; a lazy entry
+    resolving at dequeue passes no mode. See docs/ARCHITECTURE.md#resolve-mode."""
+
+    FLAT_OK = "flat_ok"
+    FULL = "full"
+
+
+def resolve_mode_for(placement: Placement) -> ResolveMode:
+    """FULL for a cold start, whose song plays immediately and so pays the stream
+    extraction either way; FLAT_OK for every other placement. Enumerated rather than
+    defaulted, so a Placement added later cannot inherit FLAT_OK in silence."""
+    if placement is Placement.COLD_FRONT:
+        return ResolveMode.FULL
+    return ResolveMode.FLAT_OK
+
+
+# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`.
+# iOS turns a typed `--` into a single em dash.
 _DASHES: Final[str] = "-‐‑‒–—―−"
 # Built from _FLAG_MODES' keys, so a renamed flag cannot leave a stale near-miss.
 # The group is the flag minus its dashes; split_play_args re-attaches them.

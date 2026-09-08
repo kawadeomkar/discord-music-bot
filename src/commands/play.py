@@ -16,6 +16,7 @@ from src.play_placement import (
     NEXT_FLAG,
     NOW_FLAG,
     PlaceStalled,
+    resolve_mode_for,
     Placement,
     PlayArgs,
     PlayMode,
@@ -227,7 +228,12 @@ async def _resolve_and_place(
             try:
                 async with cog._plays.resolve_slot(req):
                     qobj = await play_pipeline.queue_source(
-                        ctx, source, analytics=analytics, origin=url, cog=cog
+                        ctx,
+                        source,
+                        analytics=analytics,
+                        origin=url,
+                        mode=resolve_mode_for(placement),
+                        cog=cog,
                     )
             except BaseException:
                 # Alone on this cold start (the hold count is this command's),
@@ -262,7 +268,12 @@ async def _resolve_and_place(
         else:
             async with cog._plays.resolve_slot(req):
                 qobj = await play_pipeline.queue_source(
-                    ctx, source, analytics=analytics, origin=url, cog=cog
+                    ctx,
+                    source,
+                    analytics=analytics,
+                    origin=url,
+                    mode=resolve_mode_for(placement),
+                    cog=cog,
                 )
         trace.get_current_span().set_attribute(
             "play.resolve_secs", round(time.monotonic() - resolve_started, 3)

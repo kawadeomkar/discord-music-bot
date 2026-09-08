@@ -1032,9 +1032,7 @@ class MusicPlayer:
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+                    self._spawn_background(self._warm_stream(item))
 
     async def _warm_stream(self, item: QueueObject) -> None:
         """One enqueue-time stream warm, under the process-wide background bound.
@@ -1874,6 +1872,8 @@ class MusicPlayer:
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
+        # Full resolve (yt_source's default): a lazy entry resolving here is about to
+        # play, so the stream URL this extraction yields is wanted immediately.
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
                 self._require_requester(),
