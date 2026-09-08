@@ -455,20 +455,41 @@ class TestArchiveTunables:
             ("POSTGRES_STATEMENT_CACHE", 100, "0", 0),
             # A member can queue this many before -play answers "full".
             ("QUEUE_MAX_ENTRIES", 500, "50", 50),
+            # The HEALTHCHECK marks the container unhealthy at 90s of staleness.
+            ("LIVENESS_INTERVAL_SECS", 15.0, "5", 5.0),
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0, "4.5", 4.5),
         ],
     )
     def test_default_and_override(
         self,
         name: str,
-        default: int,
+        default: float,
         override: str,
-        expected: int,
+        expected: float,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.delenv(name, raising=False)
         assert getattr(self._reload(monkeypatch), name) == default
         monkeypatch.setenv(name, override)
         assert getattr(self._reload(monkeypatch), name) == expected
+
+    @pytest.mark.parametrize(
+        ("name", "raw"),
+        [
+            ("LIVENESS_INTERVAL_SECS", "0"),
+            ("LIVENESS_INTERVAL_SECS", "inf"),
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", "0.2"),
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", "nan"),
+        ],
+    )
+    def test_a_tick_below_the_floor_or_non_finite_fails_at_import(
+        self, name: str, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tick of 0 is a hot loop touching a file or PATCHing a message; `inf`
+        never ticks at all. Both used to read straight through float()."""
+        monkeypatch.setenv(name, raw)
+        with pytest.raises(ValueError, match=name):
+            self._reload(monkeypatch)
 
     def test_a_zero_queue_cap_fails_at_import(
         self, monkeypatch: pytest.MonkeyPatch

@@ -32,11 +32,6 @@ def infer_environment_from_git() -> Optional[str]:
 # Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
 # default outside Docker) skips the task.
 LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
-LIVENESS_INTERVAL_SECS: float = float(os.environ.get("LIVENESS_INTERVAL_SECS", "15.0"))
-
-NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
-    os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
-)
 
 
 def _float_env(name: str, default: float, *, minimum: float) -> float:
@@ -83,6 +78,21 @@ DEBUG_DEADLINE_SECS: float = _float_env(
 # See docs/ARCHITECTURE.md#analytics-rendering.
 ANALYTICS_RENDER_DEADLINE_SECS: float = _float_env(
     "ANALYTICS_RENDER_DEADLINE_SECS", 20.0, minimum=_MIN_DASHBOARD_SECS
+)
+
+# Floor for the two per-second-scale loops below: a tick of 0 is a hot loop
+# touching a file or PATCHing a message, and `inf` never ticks at all.
+_MIN_TICK_SECS: Final[float] = 1.0
+
+# Touch cadence for LIVENESS_FILE. Must stay well under the HEALTHCHECK's 90s
+# staleness window (Dockerfile); the two are written separately.
+LIVENESS_INTERVAL_SECS: float = _float_env(
+    "LIVENESS_INTERVAL_SECS", 15.0, minimum=_MIN_TICK_SECS
+)
+
+# NP progress-bar edit cadence: one PATCH per playing guild per tick.
+NOW_PLAYING_UPDATE_INTERVAL_SECS: float = _float_env(
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0, minimum=_MIN_TICK_SECS
 )
 
 # Higher floor than the dashboards: each tick is a Redis write per PLAYING guild,

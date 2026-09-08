@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import datetime
 import time
 from dataclasses import dataclass, replace
@@ -21,6 +22,8 @@ import redis.asyncio as aioredis
 
 from opentelemetry import trace
 from opentelemetry.context import Context
+from opentelemetry.instrumentation.utils import suppress_instrumentation
+from structlog.contextvars import bind_contextvars
 
 from src import config
 from src.guild_history import GuildHistory
@@ -677,12 +680,19 @@ class MusicPlayer:
         head with no extra call site. Otherwise -join / -play open it."""
         if self._guild.voice_client is not None:
             self.open_playback_gate()
+        # Empty contexts: created from inside a command, these tasks would
+        # otherwise carry its structlog fields (command, user_id) and its span
+        # for the life of the player. Each binds its own guild_id on entry.
         if self.store is not None:
-            self._restore_task = self.bot.loop.create_task(self._restore_state())
+            self._restore_task = self.bot.loop.create_task(
+                self._restore_state(), context=contextvars.Context()
+            )
         else:
             # No Redis, so no restore runs — signal now so loop() never waits.
             self._restore_complete.set()
-        self._player = self.bot.loop.create_task(self.loop())
+        self._player = self.bot.loop.create_task(
+            self.loop(), context=contextvars.Context()
+        )
 
     # ── Playback gate ─────────────────────────────────────────────────────────
 
@@ -1046,6 +1056,7 @@ class MusicPlayer:
         pop_queue()s as normal bookkeeping — but that song was never on the Redis
         queue list (it lives in current_song_url state), so the LPOP silently deletes
         an unrelated, still-queued song."""
+        bind_contextvars(guild_id=str(self._guild.id))
         if self.store is None:
             self._restore_read_failed = True
             self._restore_complete.set()
@@ -2421,7 +2432,10 @@ class MusicPlayer:
             rendered = [e.to_dict() for e in embeds]
             if rendered == self._np_last_rendered and message.id == self._np_last_id:
                 return True
-            await message.edit(embeds=embeds)
+            # No span per tick: ~20 PATCHes a minute per playing guild, each an
+            # aiohttp child of the song's trace saying nothing new.
+            with suppress_instrumentation():
+                await message.edit(embeds=embeds)
             # Recorded only after a successful edit: caching a payload we failed
             # to push would suppress the retry that fixes it.
             self._np_last_rendered = rendered
@@ -2591,7 +2605,10 @@ class MusicPlayer:
                 continue
             if self.store is not None:
                 try:
-                    await self.store.heartbeat(song.position_secs, time.time())
+                    # No span per tick: one Redis write every few seconds for the
+                    # whole song, all identical.
+                    with suppress_instrumentation():
+                        await self.store.heartbeat(song.position_secs, time.time())
                 except Exception as e:
                     # Redis failures are already swallowed by @_guild_op, so anything
                     # here is a defect that will recur every tick. Stop, but say so:
@@ -2657,6 +2674,7 @@ class MusicPlayer:
     # ── Main playback loop ────────────────────────────────────────────────────
 
     async def loop(self) -> None:
+        bind_contextvars(guild_id=str(self._guild.id))
         await self.bot.wait_until_ready()
         # Wait for _restore_state() to populate self.queue before dequeuing — see
         # its docstring for the race this prevents (an erroneous pop_queue() for a

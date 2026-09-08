@@ -78,7 +78,7 @@ def stub_create_task(return_value: Optional[Any] = None) -> MagicMock:
     raising "coroutine was never awaited" on GC. This closes each one immediately
     and returns a configurable mock Task so return-value assertions pass."""
 
-    def _impl(coro: Coroutine[Any, Any, Any]) -> Any:
+    def _impl(coro: Coroutine[Any, Any, Any], **_kwargs: Any) -> Any:
         coro.close()
         return return_value if return_value is not None else MagicMock()
 

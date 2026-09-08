@@ -3,6 +3,7 @@
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
+import contextvars
 from collections.abc import AsyncIterator
 import dataclasses
 import datetime
@@ -4528,7 +4529,7 @@ class TestStart:
         player_task = MagicMock(name="player_task")
         returns = [restore_task, player_task]
 
-        def _create(coro: Any) -> MagicMock:
+        def _create(coro: Any, **kwargs: Any) -> MagicMock:
             coro.close()
             return returns.pop(0)
 
@@ -4538,6 +4539,35 @@ class TestStart:
 
         assert music_player._restore_task is restore_task
         assert music_player._player is player_task
+
+    def test_tasks_start_in_an_empty_context(self, music_player: MusicPlayer) -> None:
+        """Created from inside a command, the loop and restore tasks would inherit
+        its structlog fields and its span for the life of the player."""
+        assert music_player.store is not None
+        music_player.bot.loop = MagicMock()
+        music_player.bot.loop.create_task = stub_create_task()
+        music_player.start()
+        for call in music_player.bot.loop.create_task.call_args_list:
+            ctx = call.kwargs["context"]
+            assert isinstance(ctx, contextvars.Context)
+            assert len(ctx) == 0
+
+    async def test_loop_binds_its_own_guild_id(self, music_player: MusicPlayer) -> None:
+        """The empty context drops the command's fields; the loop's own log lines
+        still need the guild."""
+        from structlog.contextvars import get_contextvars
+
+        seen: dict[str, Any] = {}
+
+        async def _ready() -> None:
+            seen.update(get_contextvars())
+            raise asyncio.CancelledError()
+
+        music_player.bot.wait_until_ready = _ready
+        task = asyncio.create_task(music_player.loop(), context=contextvars.Context())
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert seen == {"guild_id": str(music_player._guild.id)}
 
     def test_no_restore_task_when_store_absent(
         self,
@@ -6284,6 +6314,24 @@ class TestProgressUpdater:
         assert message.edit.await_count == _NP_EDIT_MAX_FAILURES
         assert music_player._np_host_message is None
         assert music_player._np_edit_failures == 0  # the release reset it
+
+    async def test_the_patch_is_not_instrumented(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """~20 PATCHes a minute per playing guild, each an aiohttp child span of
+        the song's trace saying nothing new."""
+        from opentelemetry.instrumentation.utils import is_instrumentation_enabled
+
+        message = self._host(music_player)
+        seen: list[bool] = []
+
+        async def _edit(**_kwargs: Any) -> None:
+            seen.append(is_instrumentation_enabled())
+
+        message.edit.side_effect = _edit
+        await music_player._push_np_edit(mock_song, message, [])
+        assert seen == [False]
+        assert is_instrumentation_enabled()  # scoped to the PATCH alone
 
     async def test_a_success_resets_the_failure_count(
         self, music_player: MusicPlayer, mock_song: MagicMock
