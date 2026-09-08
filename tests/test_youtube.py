@@ -2214,6 +2214,72 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+class TestYtPlaylistEntries:
+    """What a flat playlist entry puts on its queue card. The entries yt-dlp returns
+    carry duration and uploader outright and a thumbnails collection _slim_info drops,
+    so these run the real slimming rather than a hand-written entry."""
+
+    @staticmethod
+    def _raw_entry(video_id: str, **overrides: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "id": video_id,
+            "title": f"Song {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": 244,
+            "uploader": "a-ha",
+            "channel": "a-ha - Topic",
+            "thumbnails": [
+                {"url": "https://i.ytimg.com/vi/x/default.jpg"},
+                {"url": "https://i.ytimg.com/vi/x/hq720.jpg"},
+            ],
+        }
+        entry.update(overrides)
+        return entry
+
+    async def _playlist(
+        self, mock_ctx: MagicMock, entries: list[Any]
+    ) -> list[QueueObject]:
+        async def _extract(_request: Any) -> Any:
+            return _slim_info({"_type": "playlist", "entries": entries})
+
+        with patch("src.youtube._run_extract", new=_extract):
+            return await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input="https://www.youtube.com/playlist?list=PL1",
+            )
+
+    async def test_a_track_carries_duration_uploader_and_thumbnail(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        (qobj,) = await self._playlist(mock_ctx, [self._raw_entry("abc")])
+        assert qobj.duration == 244
+        assert qobj.uploader == "a-ha"
+        assert qobj.thumbnail == "https://i.ytimg.com/vi/x/hq720.jpg"
+
+    async def test_uploader_falls_back_to_channel(self, mock_ctx: MagicMock) -> None:
+        """yt-dlp also parses lockupViewModel results, which carry fewer fields than
+        the videoRenderer ones."""
+        (qobj,) = await self._playlist(
+            mock_ctx, [self._raw_entry("lockup", uploader=None)]
+        )
+        assert qobj.uploader == "a-ha - Topic"
+
+    async def test_a_live_entry_still_queues_without_a_duration(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """duration is None on a live entry. The card renders an unknown length; the
+        playlist must not lose the track over it."""
+        (qobj,) = await self._playlist(
+            mock_ctx,
+            [self._raw_entry("live", duration=None, live_status="is_live")],
+        )
+        assert qobj.duration is None
+        assert qobj.title == "Song live"
+
+
 class TestSlimInfoReturnContract:
     """The success-path return value crosses the process boundary on *every* extraction.
 
@@ -2316,6 +2382,60 @@ class TestSlimInfoReturnContract:
             for field in _UNUSED_INFO_COLLECTIONS:
                 assert field not in entry
         pickle.loads(pickle.dumps(slim))  # the whole wrapper still round-trips
+
+    def test_slimming_keeps_the_largest_thumbnail_url(self) -> None:
+        """thumbnails[] leaves with the other oversized collections, but the one URL
+        callers render must not go with it. yt-dlp orders that list ascending by size,
+        so the last entry is the one to keep."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info(thumbnail=None)))
+        assert slim["thumbnail"] == "https://img/2.jpg"
+        assert "thumbnails" not in slim
+
+    def test_a_thumbnail_the_extractor_set_itself_wins(self) -> None:
+        """A processed info-dict already names one; the collection is the fallback."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        assert slim["thumbnail"] == "https://img.yt.com/test.jpg"
+
+    def test_no_thumbnails_collection_means_no_thumbnail_key(self) -> None:
+        """Absent stays absent — an invented empty value would be cached and rendered
+        as a real one."""
+        raw = _realistic_raw_info(thumbnail=None)
+        del raw["thumbnails"]
+        slim = cast(dict[str, Any], _slim_info(raw))
+        assert slim.get("thumbnail") is None
+
+    def test_a_thumbnails_entry_without_a_url_is_ignored(self) -> None:
+        """The last element is not guaranteed to be a usable dict. Reading `url` off
+        one that has none raises inside the worker, which fails the whole extraction
+        rather than losing one field."""
+        slim = cast(
+            dict[str, Any],
+            _slim_info(
+                _realistic_raw_info(thumbnail=None, thumbnails=[{"height": 720}])
+            ),
+        )
+        assert slim.get("thumbnail") is None
+
+    def test_an_empty_thumbnails_collection_is_survivable(self) -> None:
+        """yt-dlp emits `thumbnails: []` for a video that has none. Reading the last
+        element of it would raise inside the worker, which fails the whole extraction
+        rather than one field."""
+        slim = cast(
+            dict[str, Any],
+            _slim_info(_realistic_raw_info(thumbnail=None, thumbnails=[])),
+        )
+        assert slim.get("thumbnail") is None
+
+    def test_each_entry_keeps_its_own_largest_thumbnail(self) -> None:
+        """Playlist and search entries carry their own collection, dropped per entry —
+        so the lift has to run at both levels, not just the top."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [_realistic_raw_info(thumbnail=None), None],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        assert slim["entries"][0]["thumbnail"] == "https://img/2.jpg"
+        assert "thumbnails" not in slim["entries"][0]
 
     def test_slim_info_passes_none_through(self) -> None:
         """A failed extract_info returns None; callers branch on `data is None`, so

@@ -176,21 +176,37 @@ _UNUSED_INFO_COLLECTIONS = frozenset(
 _sanitize_info = youtube_dl.YoutubeDL.sanitize_info
 
 
+def _lift_thumbnail(info: dict[str, Any]) -> None:
+    """Keep the one thumbnail URL callers render before `thumbnails` leaves with the
+    other large collections. yt-dlp orders that list ascending by size, so the last
+    entry is the largest; a `thumbnail` the extractor set itself wins."""
+    if info.get("thumbnail"):
+        return
+    thumbs = info.get("thumbnails")
+    if isinstance(thumbs, list) and thumbs:
+        last = thumbs[-1]
+        if isinstance(last, dict) and isinstance(last.get("url"), str):
+            info["thumbnail"] = last["url"]
+
+
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker:
     sanitize_info() reduces the live objects of a process=True info-dict to JSON
     primitives (without which every extraction fails to pickle), then the large
-    unread collections are dropped, top level and per `entries` element."""
+    unread collections are dropped, top level and per `entries` element — after
+    the one thumbnail URL callers render is lifted out of one of them."""
     info = _sanitize_info(info)
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
+    _lift_thumbnail(info)
     for key in _UNUSED_INFO_COLLECTIONS:
         info.pop(key, None)
     entries = info.get("entries")
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, dict):
+                _lift_thumbnail(entry)
                 for key in _UNUSED_INFO_COLLECTIONS:
                     entry.pop(key, None)
     # cast: the checker cannot verify yt-dlp's untyped dict conforms.
@@ -1172,14 +1188,22 @@ class YTDL(discord.FFmpegOpusAudio):
             video_url = (
                 entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             )
+            # A flat entry already carries what the queue card shows, so read it
+            # here rather than leaving every track blank until its prefetch lands.
+            # duration is None on a live entry; uploader falls back to channel.
+            raw_duration = entry.get("duration")
             # Offset by tracks KEPT, never the enumerate index: skipped null
-            # entries must not leave gaps in queue_position.
+            # entries must not leave gaps in queue_position. replace() so a field
+            # added to Analytics later is carried here.
             qobjs.append(
                 QueueObject(
                     video_url,
                     title,
                     requester,
                     user_input=user_input,
+                    duration=int(raw_duration) if raw_duration is not None else None,
+                    uploader=entry.get("uploader") or entry.get("channel"),
+                    thumbnail=entry.get("thumbnail"),
                     query_source=query_source,
                     analytics=replace(
                         analytics,
