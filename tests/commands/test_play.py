@@ -2241,3 +2241,83 @@ class TestPlaynowWrapper:
         cmd = music_bot.playnow
         assert cmd.name == "playnow" and "pn" in cmd.aliases
         assert "playnow" in CATEGORY_COMMANDS["Playback"]
+
+
+class TestPlaynextWrapper:
+    """`-playnext` is `-play --next` under another name, the `--now` wrapper's twin.
+    It front-inserts without interrupting, so unlike `-playnow` a live song keeps
+    playing and nothing is parked."""
+
+    @staticmethod
+    def _vc(*, playing: bool = False) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = playing
+        vc.is_paused.return_value = False
+        vc.is_connected.return_value = True
+        return vc
+
+    def _wire(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, *, live: bool
+    ) -> MagicMock:
+        mp = mock_mp()
+        mp.current_song = MagicMock() if live else None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        play_pipeline.enqueue_single = AsyncMock()
+        play_pipeline.interject_flow = AsyncMock()
+        music_bot._command_error = AsyncMock()
+        mock_ctx.invoke = AsyncMock()
+        seams = MagicMock()
+        seams.mp = mp
+        seams.queue_source = play_pipeline.queue_source
+        seams.enqueue_single = play_pipeline.enqueue_single
+        seams.interject = play_pipeline.interject_flow
+        seams.command_error = music_bot._command_error
+        return seams
+
+    async def test_it_front_inserts_without_interrupting(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The whole difference from -playnow: a live song is left alone."""
+        seams = self._wire(music_bot, mock_ctx, live=True)
+        mock_ctx.voice_client = self._vc(playing=True)
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.playnext)(music_bot, mock_ctx, url="s")
+        seams.interject.assert_not_awaited()
+        seams.enqueue_single.assert_awaited_once()
+        assert seams.enqueue_single.await_args.kwargs["placement"] is Placement.NEXT
+        seams.command_error.assert_not_awaited()
+
+    async def test_the_flag_never_reaches_the_query(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx, live=True)
+        mock_ctx.voice_client = self._vc(playing=True)
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.playnext)(
+                music_bot, mock_ctx, url="never gonna give you up"
+            )
+        assert (
+            seams.queue_source.await_args.kwargs["origin"] == "never gonna give you up"
+        )
+
+    async def test_a_flag_typed_anyway_is_not_searched_for(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """`-playnext --now x` is still next: the placement this command names wins,
+        and the flag does not survive into the query as text."""
+        seams = self._wire(music_bot, mock_ctx, live=True)
+        mock_ctx.voice_client = self._vc(playing=True)
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.playnext)(
+                music_bot, mock_ctx, url="--now some song"
+            )
+        seams.interject.assert_not_awaited()
+        assert seams.queue_source.await_args.kwargs["origin"] == "some song"
+
+    def test_it_is_registered_and_listed(self, music_bot: MusicBot) -> None:
+        cmd = music_bot.playnext
+        assert cmd.name == "playnext" and "pnx" in cmd.aliases
+        assert "playnext" in CATEGORY_COMMANDS["Playback"]

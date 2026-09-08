@@ -614,6 +614,48 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e, title="Failed to play song now")
 
     @commands.command(
+        name="playnext",
+        aliases=["pnx"],
+        brief="queue a song at the front, without interrupting",
+        usage="<url|search>",
+        help=(
+            "Queues your song at the front of the queue, so it plays as soon as the "
+            "current song ends. Nothing is interrupted — unlike `-playnow`, whatever "
+            "is playing finishes first.\n\n"
+            "The same request as `-play --next`, kept as its own command. Takes the "
+            "same input as `-play`, and takes a whole playlist in full.\n\n"
+            "Send it twice and the second one lands behind the first: each takes the "
+            "front of the queue as it arrives, so they play in the order you asked."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": [
+                "-playnext never gonna give you up",
+                "-pnx https://youtu.be/dQw4w9WgXcQ",
+            ],
+            "note": (
+                "`-play` adds to the back of the queue; `-playnext` takes the front "
+                "and `-playnow` cuts in immediately. Use `-playnext` when the current "
+                "song should finish."
+            ),
+        },
+    )
+    # No max_concurrency, for -play's reason: the body admits the request itself,
+    # and a decorator here would refuse a spelling the flag route accepts.
+    @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.playnext")
+    async def playnext(self, ctx: commands.Context, *, url: str) -> None:
+        try:
+            await play_cmd.run_next(ctx, url, cog=self)
+        except commands.MaxConcurrencyReached:
+            # As -play: cog_command_error owns the wording for a refused request.
+            raise
+        except Exception as e:
+            # No InterjectionFailed leg: --next interrupts nothing, so there is no
+            # branch here whose failure the user asked for over the one they typed.
+            await self._command_error(ctx, e, title="Failed to queue song")
+
+    @commands.command(
         name="skip",
         aliases=["sk"],
         brief="skip to the next song in the queue",

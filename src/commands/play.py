@@ -74,6 +74,15 @@ async def run_now(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
     await run(ctx, f"{NOW_FLAG} {split_play_args(url.strip()).query}", cog=cog)
 
 
+async def run_next(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
+    """`-playnext` — the same request as `-play --next`, kept as its own command.
+
+    The `--now` sibling's reasoning, one flag over: the placement is re-parsed and
+    forced so a flag the user spells here anyway is not searched for as text.
+    """
+    await run(ctx, f"{NEXT_FLAG} {split_play_args(url.strip()).query}", cog=cog)
+
+
 @contextlib.asynccontextmanager
 async def play_bucket(
     cog: MusicBot, ctx: commands.Context, mode: PlayMode
