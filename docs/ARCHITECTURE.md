@@ -698,17 +698,25 @@ Mechanics:
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
-**Identical re-renders are not pushed.** `_push_np_edit` compares the rendered payload
-(`[e.to_dict() for e in embeds]`) and the host id against the last pair it sent
-successfully, and returns without a PATCH when both match. The bar has ten segments, so a
-four-minute song's display changes ~10 times while the 3 s tick fires ~80: roughly seven
-in eight edits carried nothing new, one request each from a bucket shared across every
-concurrently-playing guild. Keying on the payload rather than on playback position covers
-pause state, next-up, volume and a swapped-in own embed without enumerating them — the
-same approach `dashboard.py` uses for `-ping` and `-debug`. The pair is recorded only
-after a successful edit, so a failure cannot suppress its own retry, and
-`_release_np_host` clears it because retirement can strip-edit the message by a path that
-never reaches `_push_np_edit`.
+**Identical re-renders are not pushed, and the live label is quantized so that they
+exist.** `_push_np_edit` compares the rendered payload (`[e.to_dict() for e in embeds]`)
+and the host id against the last pair it sent successfully, and returns without a PATCH
+when both match. The bar's ten segments alone would make that skip common, but the
+elapsed label beside it (`0:47`) changed every second, so every 3 s tick produced a new
+payload and the guard never fired. The live render therefore floors the position to
+`_ELAPSED_LABEL_STEP_SECS` (10 s) before building the label and the bar: the payload
+moves once per 10 s of playback while the tick fires every 3 s, so roughly two ticks in
+three are skipped, and the label is at most 10 s behind the audio. The "Estimated finish"
+clock is derived from the same floored position, so it moves with it; its wall-clock
+component can still flip a minute boundary between steps, at most one extra edit a minute.
+Only the *live* render is floored: `_finalize_now_playing` passes an explicit override —
+the duration for a song that reached its end, the exact stop position otherwise — so the
+bar left behind as a record is truthful to the second. Keying the skip on the payload
+rather than on playback position covers pause state, next-up, volume and a swapped-in own
+embed without enumerating them — the same approach `dashboard.py` uses for `-ping` and
+`-debug`. The pair is recorded only after a successful edit, so a failure cannot suppress
+its own retry, and `_release_np_host` clears it because retirement can strip-edit the
+message by a path that never reaches `_push_np_edit`.
 
 A guild with **debug mode** enabled saves nothing here: the footer carries the runtime
 snapshot, which `RuntimeSampler` resamples at

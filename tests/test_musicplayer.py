@@ -2431,7 +2431,9 @@ class TestBuildNowPlayingEmbed:
     ) -> None:
         mock_song.elapsed_secs = 105.0  # roughly halfway through 210s
         embed = music_player._build_now_playing_embed(mock_song)
-        assert fmt_duration(105) in described(embed)
+        # The live label is floored to the 10s step (see _label_position).
+        assert fmt_duration(100) in described(embed)
+        assert "🟦🟦🟦🟦🔘" in described(embed)
 
     def test_no_progress_bar_line_when_duration_unknown(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -2920,16 +2922,18 @@ class TestFinalizeCompletion:
     async def test_incomplete_renders_true_position(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """position_override=None makes _build_now_playing_embed fall back to
-        the live position_secs — frozen at the stop (or pause) point."""
+        """The exact live position_secs — frozen at the stop (or pause) point —
+        is passed as the override: the live render floors its label to the 10s
+        step, and the record left behind must not."""
         message = MagicMock(spec=discord.Message)
+        mock_song.elapsed_secs = 47.0
         with patch.object(MusicPlayer, "_push_np_edit", new=AsyncMock()) as push:
             await music_player._finalize_now_playing(
                 mock_song, message, [], completed=False
             )
         push_call = push.await_args
         assert push_call is not None
-        assert push_call.kwargs["position_override"] is None
+        assert push_call.kwargs["position_override"] == 47.0
 
     async def test_defaults_to_completed(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -11676,9 +11680,9 @@ class TestHeartbeatUpdater:
 
 
 class TestNowPlayingEditDiffing:
-    """A 3s tick re-renders an identical payload most of the time; the bar only
-    changes ~10 times in a 4-minute song. Per *bot*, those PATCHes are the
-    dominant REST rate-limit cost."""
+    """The live label is floored to a 10s step, so consecutive 3s ticks render
+    an identical payload and the PATCH is skipped. Per *bot*, those PATCHes are
+    the dominant REST rate-limit cost."""
 
     @staticmethod
     def _host() -> AsyncMock:
@@ -11686,15 +11690,60 @@ class TestNowPlayingEditDiffing:
         message.id = 999
         return message
 
-    async def test_identical_rerender_is_not_pushed(
+    async def test_ticks_inside_one_label_step_are_not_pushed(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
+        """The position ADVANCES between calls, as it does between real ticks: a
+        constant position would pass against a label that changes every second,
+        which is exactly the regression this guards."""
         message = self._host()
+        mock_song.elapsed_secs = 10.0
         assert await music_player._push_np_edit(mock_song, message, []) is True
         assert message.edit.await_count == 1
 
-        assert await music_player._push_np_edit(mock_song, message, []) is True
-        assert message.edit.await_count == 1  # skipped
+        for elapsed in (13.0, 16.0, 19.9):
+            mock_song.elapsed_secs = elapsed
+            assert await music_player._push_np_edit(mock_song, message, []) is True
+        assert message.edit.await_count == 1  # all three skipped
+
+    async def test_crossing_a_label_step_is_pushed(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        message = self._host()
+        mock_song.elapsed_secs = 19.9
+        await music_player._push_np_edit(mock_song, message, [])
+        mock_song.elapsed_secs = 20.0
+        await music_player._push_np_edit(mock_song, message, [])
+        assert message.edit.await_count == 2
+        embed = message.edit.call_args.kwargs["embeds"][0]
+        assert "`0:20`" in embed.description
+
+    async def test_the_live_label_is_floored_to_the_step(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        mock_song.elapsed_secs = 47.0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "`0:40`" in embed.description
+        assert "`0:47`" not in embed.description
+
+    async def test_an_override_renders_exactly(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The finalize passes the true stop point; the record it leaves must not
+        be floored."""
+        embed = music_player._build_now_playing_embed(mock_song, position_override=47.0)
+        assert "`0:47`" in embed.description
+
+    async def test_finalize_uses_the_exact_stop_position(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        message = self._host()
+        mock_song.elapsed_secs = 47.0
+        await music_player._finalize_now_playing(
+            mock_song, message, [], completed=False
+        )
+        embed = message.edit.call_args.kwargs["embeds"][0]
+        assert "`0:47`" in embed.description
 
     async def test_changed_render_is_pushed(
         self, music_player: MusicPlayer, mock_song: MagicMock

@@ -164,6 +164,19 @@ _MIN_RESUME_REMAINING_SECS = 5
 # crash-recovery position cap in _restore_state().
 _RESUME_EOF_MARGIN_SECS = 10
 
+# ── Progress-bar label ────────────────────
+# The live elapsed label is floored to this step, so consecutive 3s ticks render
+# an identical payload until the label moves and _push_np_edit skips the PATCH.
+# The bar's ten segments are coarser still for any song over 100s.
+_ELAPSED_LABEL_STEP_SECS = 10
+
+
+def _label_position(position_secs: float) -> float:
+    return float(
+        int(position_secs) // _ELAPSED_LABEL_STEP_SECS * _ELAPSED_LABEL_STEP_SECS
+    )
+
+
 # ── Progress-bar finalize ─────────────────
 # Tolerance for "this song reached its end", absorbing drift between yt-dlp's
 # duration metadata and the real stream length. Anything that stopped short —
@@ -1370,16 +1383,17 @@ class MusicPlayer:
     def _build_now_playing_embed(
         self, song: YTDL, *, position_override: Optional[float] = None
     ) -> discord.Embed:
-        """position_override renders the bar at a given position instead of
-        song.position_secs — used by _finalize_now_playing() to show a complete bar
-        once the song has actually ended."""
+        """position_override renders the bar at an EXACT position — the finalize
+        passes the song's end or its true stop point. The live position is
+        floored to _ELAPSED_LABEL_STEP_SECS so the periodic tick re-renders an
+        identical payload between steps."""
         lines = []
         position = 0.0
         if song.duration_secs > 0:
             position = (
                 position_override
                 if position_override is not None
-                else song.position_secs
+                else _label_position(song.position_secs)
             )
             bar = _build_progress_bar(position, song.duration_secs)
             if bar:
@@ -2304,8 +2318,8 @@ class MusicPlayer:
             # the block (parity with MusicContext.send's guard; unreachable today).
             embeds = embeds[:10]
             # Skip the PATCH when the payload is identical to the last one pushed
-            # to this host. The bar changes ~10 times in a 4-minute song while the
-            # 3s tick fires ~80, so most edits carry nothing new.
+            # to this host: the elapsed label moves every _ELAPSED_LABEL_STEP_SECS
+            # while the tick fires every 3s, so most ticks carry nothing new.
             # See docs/ARCHITECTURE.md#now-playing-host-model
             rendered = [e.to_dict() for e in embeds]
             if rendered == self._np_last_rendered and message.id == self._np_last_id:
@@ -2371,9 +2385,12 @@ class MusicPlayer:
                 song,
                 message,
                 own_embeds,
-                # None → falls back to the live position_secs, frozen at the stop
-                # point (and, for a paused song, at the pause point).
-                position_override=song.duration_secs if completed else None,
+                # Exact either way: the live render floors the label to its step,
+                # and the final record must not. position_secs is frozen at the
+                # stop point (and, for a paused song, at the pause point).
+                position_override=(
+                    song.duration_secs if completed else song.position_secs
+                ),
                 span=span,
             )
 
