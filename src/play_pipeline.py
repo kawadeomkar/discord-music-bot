@@ -292,6 +292,7 @@ async def queue_source(
     analytics: Analytics,
     origin: str,
     mode: ResolveMode,
+    pool_slot: Optional[asyncio.Semaphore] = None,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
     """Resolve a parsed source into something enqueueable. `analytics` is the
@@ -301,7 +302,12 @@ async def queue_source(
 
     `mode` is required and has no default: interjection resolves through this
     same helper, so "a search may go flat" cannot be decided from the input
-    shape — only the caller knows whether the song must be playable."""
+    shape — only the caller knows whether the song must be playable on arrival.
+
+    `pool_slot` is the guild's resolve bound, handed down rather than held around
+    this call: it is taken at the extraction itself, so a cache hit and the pure
+    HTTP of a Spotify playlist do not queue behind two in-flight lookups. See
+    docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
@@ -321,6 +327,7 @@ async def queue_source(
             analytics=analytics,
             user_input=origin,
             redis=cog.redis,
+            pool_slot=pool_slot,
         )
         tracks, skipped = _apply_playlist_index(tracks, source.index)
         _apply_playlist_timestamp(tracks, source)
@@ -350,6 +357,7 @@ async def queue_source(
         analytics=analytics,
         user_input=origin,
         flat=flat,
+        pool_slot=pool_slot,
     )
 
 
@@ -559,6 +567,7 @@ async def _resolve_interjection_source(
     source: Union[SpotifySource, YTSource, SoundcloudSource],
     *,
     origin: str,
+    pool_slot: Optional[asyncio.Semaphore] = None,
     cog: MusicBot,
 ) -> tuple[QueueObject, list[QueueItem]]:
     """Resolve an interjection's input into (head, everything behind it). The
@@ -585,6 +594,7 @@ async def _resolve_interjection_source(
             query_source=query_source_of(yts[0]),
             analytics=analytics,
             user_input=origin,
+            pool_slot=pool_slot,
         )
         return head, list(yts[1:])
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
@@ -595,6 +605,7 @@ async def _resolve_interjection_source(
             analytics=analytics,
             user_input=origin,
             redis=cog.redis,
+            pool_slot=pool_slot,
         )
         # Indexed here too: `--now` on a link copied mid-playlist starts at the
         # track the user was looking at, not the playlist's first.
@@ -617,6 +628,7 @@ async def _resolve_interjection_source(
         analytics=analytics,
         origin=origin,
         mode=ResolveMode.FULL,
+        pool_slot=pool_slot,
         cog=cog,
     )
     assert isinstance(qobj, QueueObject)
@@ -644,13 +656,13 @@ async def interject_flow(
     during the 1–4s extraction removes the reason and the track is appended.
     """
     source = parse_input(url)
-    async with cog._plays.resolve_slot(req):
-        qobj, follow_on = await _resolve_interjection_source(
-            ctx,
-            source,
-            origin=url,
-            cog=cog,
-        )
+    qobj, follow_on = await _resolve_interjection_source(
+        ctx,
+        source,
+        origin=url,
+        pool_slot=cog._plays.resolve_slot(req),
+        cog=cog,
+    )
     # The head only: `interjected` is attribution, which song cut the line.
     qobj.interjected = True
 

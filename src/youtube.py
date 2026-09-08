@@ -1039,19 +1039,47 @@ def _inflight_key(cache_key: str, profile: str) -> str:
     return f"{cache_key}|{profile}"
 
 
+def _held(
+    slot: Optional[asyncio.Semaphore],
+) -> contextlib.AbstractAsyncContextManager[Any]:
+    """`slot` as an async context manager, or nothing to hold. A resolve reached
+    outside a command (a lazy entry at dequeue, a test) passes None."""
+    return slot if slot is not None else contextlib.nullcontext()
+
+
+async def _gated_extract(
+    request: ExtractRequest, pool_slot: Optional[asyncio.Semaphore]
+) -> Optional[YTDLExtractResult]:
+    """One extraction, holding the requesting guild's pool slot for as long as it
+    runs. The wait for the slot belongs to the job rather than to _extract_once, so
+    that a queued job is still a registered one and its key still deduplicates."""
+    async with _held(pool_slot):
+        return await _run_extract(request)
+
+
 async def _extract_once(
-    key: str, request: ExtractRequest
+    key: str, request: ExtractRequest, *, pool_slot: Optional[asyncio.Semaphore] = None
 ) -> Optional[YTDLExtractResult]:
     """One extraction per distinct query at a time, process-wide: N users pasting the
     same link are N identical jobs against a four-worker pool, racing to write one
     cache entry. The first caller starts the job and the rest await its outcome,
     exception included. Every caller reaches it through shield, the leader included:
-    the key carries no guild, so one guild's cancellation must not reach another's."""
+    the key carries no guild, so one guild's cancellation must not reach another's.
+
+    `pool_slot` is the guild's bound on workers held at once, and it is taken HERE
+    rather than around the caller's whole resolve: a cache hit and a joined job hold
+    no worker, and queueing those behind two extractions is what the bound is meant
+    to prevent, not to cause. See docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
     running = _INFLIGHT_EXTRACTS.get(key)
     if running is not None:
+        # A joiner holds no worker of its own — the leader's job is the one running.
         trace.get_current_span().set_attribute("ytdl.extract_shared", True)
         return await asyncio.shield(running)
-    job = asyncio.ensure_future(_run_extract(request))
+    # The slot is taken INSIDE the job, so nothing is awaited between the read above
+    # and the write below. Awaiting the slot here instead loses the single flight
+    # exactly when it is worth most: with the semaphore full, every caller for one
+    # key reads an empty registry, queues, and starts a job of its own.
+    job = asyncio.ensure_future(_gated_extract(request, pool_slot))
     _INFLIGHT_EXTRACTS[key] = job
     # Registered before the shield, so it runs first: the key is gone before any
     # awaiter resumes, and a re-extraction starts a fresh job.
@@ -1060,12 +1088,16 @@ async def _extract_once(
 
 
 async def _extract_for_source(
-    key: str, request: ExtractRequest, search: str
+    key: str,
+    request: ExtractRequest,
+    search: str,
+    *,
+    pool_slot: Optional[asyncio.Semaphore] = None,
 ) -> Optional[YTDLExtractResult]:
     """yt_source's extraction, shared by its two request profiles so that an input
     yt-dlp refuses fails identically whichever one asked."""
     try:
-        return await _extract_once(key, request)
+        return await _extract_once(key, request, pool_slot=pool_slot)
     except ExtractionError as e:
         # parse_url whitelists no domains, so any dotted host lands here for yt-dlp
         # to accept or reject. An unrecognised site arrives flattened as `unsupported`
@@ -1506,6 +1538,7 @@ class YTDL(discord.FFmpegOpusAudio):
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
         flat: bool = False,
+        pool_slot: Optional[asyncio.Semaphore] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject, from the source cache
         when present. flat=True answers a SEARCH from one search POST when the
@@ -1563,6 +1596,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 _inflight_key(cache_key, "flat"),
                 ExtractRequest(url=search, opts=_YTDL_FLAT_SEARCH_OPTS),
                 search,
+                pool_slot=pool_slot,
             )
             flat_qobj = (
                 _queue_object_from_flat_entry(
@@ -1609,6 +1643,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
             ),
             search,
+            pool_slot=pool_slot,
         )
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
@@ -1675,6 +1710,7 @@ class YTDL(discord.FFmpegOpusAudio):
         analytics: Analytics,
         user_input: str,
         redis: Optional[aioredis.Redis] = None,
+        pool_slot: Optional[asyncio.Semaphore] = None,
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist.
 
@@ -1697,6 +1733,7 @@ class YTDL(discord.FFmpegOpusAudio):
             data = await _extract_once(
                 _inflight_key(cache_key, "playlist"),
                 ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS),
+                pool_slot=pool_slot,
             )
             if data is None:
                 raise Exception(f"Could not fetch YouTube playlist: {url}")
