@@ -57,6 +57,7 @@ from src.util import (
 )
 from src.youtube import (
     YTDL,
+    ExtractionError,
     NpHostRef,
     QueueObject,
     invalidate_stream_cache,
@@ -1900,8 +1901,15 @@ class MusicPlayer:
         except Exception as e:
             ctx = trace.get_current_span().get_span_context()
             trace_id = format(ctx.trace_id, "032x") if ctx.is_valid else "unavailable"
+            # yt-dlp's raw text carries its bug-report boilerplate and its
+            # --cookies-from-browser advice, neither of which means anything here.
             self._last_stream_error = StreamFailure(
-                detail=f"{type(e).__name__}: {e}", trace_id=trace_id
+                detail=(
+                    e.user_message
+                    if isinstance(e, ExtractionError)
+                    else f"{type(e).__name__}: {e}"
+                ),
+                trace_id=trace_id,
             )
             log.error(
                 f"Error processing song: {type(e).__name__}: {e} [trace_id={trace_id}]",

@@ -2245,6 +2245,53 @@ class TestStreamExtractionSingleflight:
 
 
 class TestPrefetchStream:
+    """Its bool is a gate, not a hint: _interject_flow stops what is already
+    playing, so a head this could not extract must not get that far. Anything
+    unprovable answers True — the bot plays without Redis."""
+
+    async def test_a_failed_extraction_reports_not_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        qobj = QueueObject("https://yt.com/v=pfg1", "Boom", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", side_effect=ExtractionError("nope")):
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
+
+    async def test_an_empty_extraction_reports_not_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=pfg2", "Nothing", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", return_value=None):
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
+
+    async def test_a_warmed_song_reports_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=pfg3", "Fine", mock_ctx.author)
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=pfg3", title="Fine")
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
+
+    async def test_no_redis_reports_warmed(self, mock_ctx: MagicMock) -> None:
+        """Nothing to warm and nothing provable — not a "not playable" answer."""
+        qobj = QueueObject("https://yt.com/v=pfg4", "No Redis", mock_ctx.author)
+        assert await YTDL.prefetch_stream(qobj, redis=None) is True
+
+    async def test_an_already_cached_song_reports_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=pfg5", "Cached", mock_ctx.author)
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=pfg5",
+            orjson.dumps(
+                _fake_ytdl_data(webpage_url="https://yt.com/v=pfg5", title="Cached")
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract") as extract:
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
+        extract.assert_not_called()
+
     async def test_populates_cache_on_miss(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:

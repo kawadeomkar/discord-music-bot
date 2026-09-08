@@ -499,9 +499,9 @@ class TestPlayWhilePaused:
         qobj = QueueObject("https://yt.com/v=new", "New", mock_ctx.author)
         play_pipeline.queue_source = AsyncMock(return_value=qobj)
 
-        async def _resolve_then_resume(*a: Any, **kw: Any) -> None:
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> bool:
             vc.is_paused.return_value = False  # user hit -resume mid-extraction
-            return None
+            return True
 
         with (
             no_typing("src.commands.play.background_typing"),
@@ -1748,7 +1748,9 @@ class TestNowFlag:
         play_pipeline.queue_source = AsyncMock(return_value=qobj)
 
         order: list[str] = []
-        prefetch = AsyncMock(side_effect=lambda *a, **k: order.append("prefetch"))
+        prefetch = AsyncMock(
+            side_effect=lambda *a, **k: order.append("prefetch") or True
+        )
         outcome = InterjectOutcome(
             interrupted_title="Original Song",
             resume_position=151,

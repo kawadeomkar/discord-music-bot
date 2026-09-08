@@ -1002,21 +1002,25 @@ class YTDL(discord.FFmpegOpusAudio):
         cls,
         qo: QueueObject,
         redis: Optional[aioredis.Redis] = None,
-    ) -> None:
+    ) -> bool:
         """Populate the stream URL cache for a queued song so yt_stream() is a
         cache hit by the time it plays. No-op with no redis or an already-cached
-        URL; errors are logged and swallowed (yt_stream() extracts fresh)."""
+        URL; errors are logged and swallowed (yt_stream() extracts fresh).
+
+        Returns False ONLY when an extraction was attempted and produced nothing,
+        so an interjection can decline a head it cannot prove playable. Anything
+        unprovable — no Redis — answers True."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
         if redis is None:
             trace.get_current_span().set_attribute("ytdl.skipped", True)
-            return
+            return True
         cache_key = _stream_cache_key(qo.webpage_url)
         cached: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
         already_cached = cached is not None
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
         if already_cached:
             _enrich_queueobject(qo, cached)
-            return
+            return True
         try:
             # Single-video cast: stream opts on a watch URL never yield a
             # search/playlist wrapper. Single-flighted with the playback loop's
@@ -1038,10 +1042,12 @@ class YTDL(discord.FFmpegOpusAudio):
                 StatusCode.ERROR, f"prefetch_stream failed: {e}"
             )
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
-            return
+            return False
         if data is not None:
             await _probe_and_cache(redis, cache_key, data)
             _enrich_queueobject(qo, data)
+            return True
+        return False
 
     @classmethod
     async def _resolve_playable_stream(

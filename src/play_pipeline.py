@@ -566,9 +566,8 @@ async def _resolve_interjection_source(
         if not titles:
             raise EmptyPlaylistError()
         yts = spotify_playlist_to_ytsearch(titles, analytics=analytics, origin=origin)
-        # Only the head is resolved — it has to be playable to interrupt with.
-        # The rest stay lazy searches resolved at dequeue, so a 100-track album
-        # does not pay 100 searches up front.
+        # The head takes the full path — it has to be playable to interrupt
+        # with. The rest stay lazy searches, resolved at dequeue.
         head = await YTDL.yt_source(
             ctx.author,
             yts[0].ytsearch or "",
@@ -644,13 +643,15 @@ async def interject_flow(
     # The head only: `interjected` is attribution, which song cut the line.
     qobj.interjected = True
 
-    # Warm the stream-URL cache before interrupting, or a miss at dequeue puts
-    # seconds of dead air between the interrupt and the new song. Awaited: the
-    # current song plays through the wait. Also back-fills duration/thumbnail.
-    #
-    # The head only: warming N tracks would be N concurrent extractions minting
-    # URLs that expire before playback reaches them.
-    await YTDL.prefetch_stream(qobj, redis=cog.redis)
+    # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
+    # the interrupt and the new song, and the current song plays through the wait.
+    # A gate, not a hint — this flow stops what is playing, so a head that could
+    # not be extracted must not get that far. Also back-fills the embed fields.
+    if not await YTDL.prefetch_stream(qobj, redis=cog.redis):
+        raise RuntimeError(
+            "Could not get a playable stream for that song, so the current "
+            "song was left alone."
+        )
 
     # Before the lock: the neutralize can wait on a prefetch pinned in the
     # yt-dlp executor, which under _place would hold the guild's lock.
@@ -670,9 +671,8 @@ async def interject_flow(
                 qobj, vc, resume_paused=resume_paused, follow_on=follow_on
             )
             if outcome is None:
-                # The song ended during the resolve. Insert qobj directly, at
-                # the front — the user asked for "now" and this window can be
-                # seconds long. It interrupted nothing, so the marker comes off.
+                # The song ended during the resolve, so this interrupted nothing:
+                # the marker comes off and the song front-inserts instead.
                 qobj.interjected = False
                 # interject() also returns None when the loop moved on to a
                 # DIFFERENT song, which this insert waits behind: depth 1.
