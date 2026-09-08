@@ -594,7 +594,11 @@ Returns a `QueueObject`.
 
 `ResolveMode` (`src/play_placement.py`) is how a caller says whether a resolve may stop at search metadata. `resolve_mode_for(placement)` maps `TAIL` and `NEXT` to `FLAT_OK` and `COLD_FRONT` to `FULL`; `_resolve_interjection_source` passes `FULL` explicitly, and `MusicPlayer._resolve_source` takes `yt_source`'s `flat=False` default. The function enumerates `Placement` rather than defaulting, so a member added later cannot inherit `FLAT_OK` in silence — a test asserts the mapping member by member.
 
-**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the 300 s idle timeout. Every other placement has something already playing behind it.
+**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the 300 s idle timeout.
+
+**Flat for cold starts was weighed and declined, on the failure boundary rather than the clock.** The clock argues for it: a cold search would acknowledge from the flat POST at ~0.65 s instead of ~2.46 s, and time-to-audio is measured materially unchanged (0.65 s + 1.86 s against 2.46 s — see [yt-dlp three-phase pipeline](#yt-dlp-three-phase-pipeline)), so the trade on latency alone is nearly two seconds of acknowledgement for about fifty milliseconds of audio. What it costs is where a failure lands. Two cases separate: a search that resolves to *nothing* raises either way and `_abandon_cold_start` runs unchanged, but a head whose **stream** extraction fails later is the new exposure — under FULL the bot never joins and the user is told the song was not queued, under flat the bot has already joined, already sent the card, and answers with `_handle_dead_stream`'s notice before idling out of a channel it entered for one song. Re-creating the boundary means holding the playback gate across the spawned stream extraction and tearing down on failure, which puts a new await inside the cold-start teardown path — the most delicate sequencing in the repo — to buy back a boundary the current code gets for free. Reopen it with that cost in view, not with the latency number alone.
+
+**`FLAT_OK` is on the time-to-audio path in exactly one case, and it is measured, not assumed.** A `TAIL` onto a connected but idle, empty-queue bot has nothing playing behind it, so its flat POST is additive rather than hidden behind a song. The measurement is in [yt-dlp three-phase pipeline](#yt-dlp-three-phase-pipeline): 0.65 s + 1.86 s against the unified path's 2.46 s — the card lands ~1.8 s sooner and the music starts ~0.05 s later. Every other `TAIL` and every `NEXT` is placed behind something already playing, where the prefetch's stream extraction finishes long before the slot is reached and flat is free outright. So the idle case buys nearly two seconds of acknowledgement for a difference in audio that is inside the noise of a CDN round trip, and it needs no fourth `Placement` to carve out.
 
 **It is a parameter rather than an inference, because the input cannot answer it.** Both the command path and interjection resolve through `MusicBot.queue_source`, so "a search may go flat" would have to carry the exception "unless it is an interjection head" — and `--now <words>` is a search by every test the input itself can offer. `interject()` stops the current song, so its head must be playable before anything is stopped.
 
@@ -1049,9 +1053,13 @@ channel off every other request. What that costs is exactness in an estimate —
 sibling placing in between leaves the quoted time one song short, the same ±1
 `enqueue_depth()` already carries against a queue the loop keeps moving.
 
-`PLACE_TIMEOUT_SECS` is 5s because the pool sets no `socket_timeout`, so a Redis
+`PLACE_TIMEOUT_SECS` exists because the pool sets no `socket_timeout`, so a Redis
 that accepts and then stalls has no bound of its own; it is outer to the lock, so a
-request parked behind a stalled sibling gives up on its own clock. The hold is one
+request parked behind a stalled sibling gives up on its own clock. It is 7s rather
+than 5s so that it outlives `_START_WRITE_TIMEOUT`, the 5s a song start may hold the
+queue mutex for against that same stall. Equal bounds expire together, and a placer
+waiting out a stalled start would report a stall of its own at the instant the mutex
+it wanted was about to free. The hold is one
 round trip long, so a guild bursting to `PLAY_INFLIGHT_MAX` serializes that many —
 ~40ms at the 2.4ms p50 the start transaction measures, and past ~300ms a trip the
 sixteenth request spends its whole budget waiting. That is reported as a busy queue,

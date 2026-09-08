@@ -25,7 +25,10 @@ log = get_logger(__name__)
 
 # Bound on a -play's place section: the wait for the guild's lock plus one Redis
 # round trip. The pool sets no socket_timeout, so this is the only bound on it.
-PLACE_TIMEOUT_SECS = 5.0
+# Above musicplayer._START_WRITE_TIMEOUT (5s), which a song start holds the queue
+# mutex for against the same stall: equal bounds expire together, so a request that
+# could have landed the moment the mutex freed reports a stall instead.
+PLACE_TIMEOUT_SECS = 7.0
 
 
 # ── The flag grammar ──────────────────────────────────────────────────────────
@@ -338,7 +341,7 @@ class PlayRegistry:
         deque and then the mirror, and a flag set between the two leaves the song
         in one leg only. Taken under the place lock, so a put in progress finishes
         and every later request finds the player retired. Retired anyway once the
-        put's own 5s bound expires — a stalled Redis must not hold a teardown."""
+        put's own bound expires — a stalled Redis must not hold a teardown."""
         plays = self._guilds.get(guild_id)
         if plays is None:
             mp.mark_retired()
