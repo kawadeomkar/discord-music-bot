@@ -344,6 +344,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
+| `YTDLP_WORKER_MEMORY_MB` | No | `RLIMIT_DATA` each extraction worker applies to itself (default `1024`; `0` lifts it), so a runaway page fails as a `MemoryError` in one job rather than killing the worker — see [Extraction bounds](#extraction-bounds) |
 | `YTDLP_EXTRACT_TIMEOUT_SECS` | No | Ceiling on one yt-dlp extraction (default `60.0`, floor `5.0`). Armed as a SIGALRM inside the worker so the work itself stops, and waited for plus a 5 s grace by the caller — see [Extraction bounds](#extraction-bounds) |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC endpoint (default `http://localhost:4317`) |
@@ -1497,6 +1498,25 @@ can:
 
 Both bounds surface as `ExtractionError.user_message` = "the site took too long to
 answer"; the span carries `ytdl.timed_out`.
+
+**Memory.** yt-dlp reads response bodies whole, so one runaway page could grow a
+worker until the kernel killed it — and a killed worker breaks the executor for
+every in-flight future, not just the offending one. `_worker_init` therefore applies
+`YTDLP_WORKER_MEMORY_MB` (1 GiB; `0` lifts it) as **`RLIMIT_DATA`**, so the
+allocation fails inside the job as a `MemoryError`, which `_ytdlp_extract` classifies
+as an `ExtractionError` naming the page while the worker lives on. `RLIMIT_DATA`
+rather than `RLIMIT_AS` is a measured choice, not a preference: rlimits are inherited
+by children, and yt-dlp's JS runtime (Deno, for the `web` client's challenges) is a
+child of the worker. V8 reserves address space it never commits, and Deno 2.9 aborts
+on startup under a 1 GiB `RLIMIT_AS` (`ulimit -v 1048576; deno eval 1` — stack trace)
+while running unchanged under the same `RLIMIT_DATA`; Python under that
+`RLIMIT_DATA` raises `MemoryError` for a 1.5 GiB `bytearray` and allocates 200 MiB
+without complaint. On Linux ≥ 4.7 `RLIMIT_DATA` covers private writable anonymous
+mappings as well as `brk`, which is where both Python's arenas and a decoded body
+live. The soft limit is clamped to the existing hard limit (raising `soft > hard`
+would make the initializer raise, which bricks the pool and every rebuild).
+The compose file's `mem_limit` on the bot service is the backstop behind this cap,
+sized for the parent, the workers and one runaway at the cap.
 
 **Prefetch fan-out.** `queue_put` warms the stream cache for each enqueued single
 in a background task, and each of those is an uncancellable pool job. Two things

@@ -131,6 +131,12 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # BATCH_SIZE × peak burst. ~625 B stored per entry on redis:7.
 HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 
+# Per-worker ceiling on committed private memory (RLIMIT_DATA) in MiB; 0 lifts
+# it. yt-dlp reads response bodies whole, so a runaway page fails as a
+# MemoryError inside one job instead of the kernel killing the worker and
+# breaking the pool. See docs/ARCHITECTURE.md#extraction-bounds.
+YTDLP_WORKER_MEMORY_MB: int = _int_env("YTDLP_WORKER_MEMORY_MB", 1024)
+
 # asyncpg statement_cache_size per connection. Set 0 behind a transaction-pooling
 # PgBouncer, where each transaction lands on a backend that never saw the handle.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)

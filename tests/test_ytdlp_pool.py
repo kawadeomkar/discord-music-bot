@@ -26,6 +26,7 @@ from src.ytdlp_pool import (
     PoolClosedError,
     RemoteCallError,
     YtdlpPool,
+    _apply_memory_limit,
     _picklable_call,
     _warmup_noop,
     _worker_init,
@@ -106,6 +107,13 @@ def _return_slimmed_info_from_worker(_ignored: object) -> object:
     return _slim_info(_realistic_raw_info())
 
 
+def _read_data_rlimit_in_worker(_ignored: object) -> tuple[int, int]:
+    """Runs in a real worker: the RLIMIT_DATA the initializer left in place."""
+    import resource
+
+    return resource.getrlimit(resource.RLIMIT_DATA)
+
+
 def _log_warning_in_worker(message: str) -> int:
     """Runs in a real worker: emit one warning the way youtube._YtdlpLogger does, so the
     parent's listener can prove it arrives with worker_id and the propagated trace_id.
@@ -154,7 +162,7 @@ class TestLazyCreation:
             ctor.assert_called_once_with(
                 max_workers=3,
                 initializer=_worker_init,
-                initargs=(pool._log_queue,),
+                initargs=(pool._log_queue, pool._memory_limit_bytes),
             )
             # the real spawn path starts a listener to drain that queue into the parent
             assert pool._log_listener is not None
@@ -646,13 +654,79 @@ class TestWorkerInit:
     def test_warmup_noop_returns_nothing(self) -> None:
         assert _warmup_noop() is None
 
+    def test_worker_init_applies_the_memory_limit(self) -> None:
+        with (
+            patch("src.ytdlp_pool.configure_worker_logging"),
+            patch("src.ytdlp_pool._apply_memory_limit") as apply,
+        ):
+            _worker_init(None, 512 * 1024 * 1024)
+        apply.assert_called_once_with(512 * 1024 * 1024)
+
+    def test_worker_init_swallows_a_failing_memory_limit(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Same contract as the logging setup: an initializer that raises bricks
+        the pool and every rebuild of it."""
+        with (
+            patch("src.ytdlp_pool.configure_worker_logging"),
+            patch(
+                "src.ytdlp_pool._apply_memory_limit",
+                side_effect=ValueError("not allowed"),
+            ),
+        ):
+            _worker_init(None, 1)  # must not raise
+        assert "worker memory limit not applied" in capsys.readouterr().err
+
+
+class TestApplyMemoryLimit:
+    """RLIMIT_DATA, set against the process's own hard limit. Patched rather than
+    applied: lowering the test process's soft limit would outlive the test."""
+
+    def test_sets_the_soft_limit_and_keeps_the_hard_one(self) -> None:
+        import resource
+
+        with (
+            patch(
+                "src.ytdlp_pool.resource.getrlimit",
+                return_value=(resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+            ),
+            patch("src.ytdlp_pool.resource.setrlimit") as setrlimit,
+        ):
+            _apply_memory_limit(1024 * 1024 * 1024)
+        setrlimit.assert_called_once_with(
+            resource.RLIMIT_DATA, (1024 * 1024 * 1024, resource.RLIM_INFINITY)
+        )
+
+    def test_a_lower_hard_limit_clamps_the_request(self) -> None:
+        """setrlimit refuses soft > hard, and an initializer that raises bricks
+        the pool — so the cap is whatever the hard limit already allows."""
+        import resource
+
+        with (
+            patch("src.ytdlp_pool.resource.getrlimit", return_value=(256, 512)),
+            patch("src.ytdlp_pool.resource.setrlimit") as setrlimit,
+        ):
+            _apply_memory_limit(1024)
+        setrlimit.assert_called_once_with(resource.RLIMIT_DATA, (512, 512))
+
+    def test_zero_applies_nothing(self) -> None:
+        with patch("src.ytdlp_pool.resource.setrlimit") as setrlimit:
+            _apply_memory_limit(0)
+        setrlimit.assert_not_called()
+
+    def test_the_pool_default_comes_from_the_config_knob(self) -> None:
+        from src.config import YTDLP_WORKER_MEMORY_MB
+
+        assert YtdlpPool()._memory_limit_bytes == YTDLP_WORKER_MEMORY_MB * 1024 * 1024
+        assert YTDLP_WORKER_MEMORY_MB == 1024
+
 
 class TestRealWorkerProcess:
     """The only tests that spawn real worker processes.
 
     Everything else uses a thread-pool seam, so nothing else asserts the production
     path end to end (spawn, initializer, pickle arguments and result, ship back,
-    route worker logs to the parent, join). Kept to three, ~1 s of re-imports each:
+    route worker logs to the parent, join). Kept few, ~1 s of re-imports each:
     a callable crossing a real boundary with a late submit refused; an
     ExtractionError surviving pickling with its fields and cause, which the seam can
     never exercise since it never pickles an exception; a worker log record reaching
@@ -723,6 +797,21 @@ class TestRealWorkerProcess:
         assert slim["webpage_url"] == "https://www.youtube.com/watch?v=test"
         assert slim["url"].startswith("https://r2.googlevideo.com/")
         assert "formats" not in slim and "thumbnails" not in slim
+
+    async def test_a_real_worker_runs_under_the_configured_data_limit(self) -> None:
+        """The initializer's RLIMIT_DATA is in force in the child: the soft limit
+        a job reads back is the one the pool was built with."""
+        import resource
+
+        limit = 768 * 1024 * 1024
+        _, hard = resource.getrlimit(resource.RLIMIT_DATA)
+        pool = YtdlpPool(max_workers=1, memory_limit_bytes=limit)
+        try:
+            soft, _ = await pool.run(_read_data_rlimit_in_worker, None)
+        finally:
+            await pool.aclose()
+        expected = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
+        assert soft == expected
 
     async def test_worker_logs_reach_the_parent_with_worker_id_and_trace_id(
         self,

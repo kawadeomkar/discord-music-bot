@@ -29,14 +29,21 @@ from typing import Any, Optional, TypeVar
 import structlog
 from opentelemetry import trace
 
+from src.config import YTDLP_WORKER_MEMORY_MB
 from src.telemetry import configure_worker_logging
 from src.util import get_logger
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - not a Unix platform
+    resource = None
 
 log = get_logger(__name__)
 
 T = TypeVar("T")
 
 _DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
+_DEFAULT_WORKER_MEMORY_BYTES = YTDLP_WORKER_MEMORY_MB * 1024 * 1024
 # How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30
 # with retries=10 can outlive any shutdown.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
@@ -48,15 +55,34 @@ def _warmup_noop() -> None:
     return None
 
 
-def _worker_init(log_queue: Optional[Any] = None) -> None:
+def _apply_memory_limit(limit_bytes: int) -> None:
+    """Cap this worker's committed private memory so a runaway response body
+    fails as a MemoryError in one job. RLIMIT_DATA, not RLIMIT_AS: yt-dlp's Deno
+    child inherits the limit, and V8 reserves address space it never commits —
+    Deno aborts under a 1 GiB RLIMIT_AS and runs under the same RLIMIT_DATA.
+    See docs/ARCHITECTURE.md#extraction-bounds."""
+    if limit_bytes <= 0 or resource is None:
+        return
+    _, hard = resource.getrlimit(resource.RLIMIT_DATA)
+    if hard != resource.RLIM_INFINITY:
+        limit_bytes = min(limit_bytes, hard)
+    resource.setrlimit(resource.RLIMIT_DATA, (limit_bytes, hard))
+
+
+def _worker_init(log_queue: Optional[Any] = None, memory_limit_bytes: int = 0) -> None:
     """Per-worker setup that can never raise: an initializer that raises makes
     every pending and future submit raise BrokenProcessPool, and the heal-once
     retry runs the same initializer. Reported on stderr, because what just
-    failed is the logging configuration."""
+    failed may be the logging configuration."""
     try:
         configure_worker_logging(log_queue)
     except Exception:
         print("worker logging setup failed:", file=sys.stderr)
+        traceback.print_exc()
+    try:
+        _apply_memory_limit(memory_limit_bytes)
+    except Exception:
+        print("worker memory limit not applied:", file=sys.stderr)
         traceback.print_exc()
 
 
@@ -142,9 +168,12 @@ class YtdlpPool:
         max_workers: int = _DEFAULT_WORKERS,
         executor_factory: Optional[Callable[[], Executor]] = None,
         name: str = "yt-dlp extraction",
+        memory_limit_bytes: int = _DEFAULT_WORKER_MEMORY_BYTES,
     ) -> None:
         self._max_workers = max_workers
         self._name = name
+        # RLIMIT_DATA applied by each worker's initializer; 0 applies none.
+        self._memory_limit_bytes = memory_limit_bytes
         self._executor_factory = executor_factory or self._spawn_process_pool
         self._executor: Optional[Executor] = None
         self._closed = False
@@ -172,7 +201,7 @@ class YtdlpPool:
         return ProcessPoolExecutor(
             max_workers=self._max_workers,
             initializer=_worker_init,
-            initargs=(self._log_queue,),
+            initargs=(self._log_queue, self._memory_limit_bytes),
         )
 
     def _stop_log_listener(self) -> None:

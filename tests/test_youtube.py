@@ -2867,6 +2867,18 @@ class TestExtractionDeadline:
         assert caught.value.timed_out is False
         assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
 
+    def test_a_memory_error_is_classified_as_this_pages_failure(self) -> None:
+        """Under the worker's RLIMIT_DATA a runaway body raises MemoryError; it
+        crosses as a typed error naming the page, and the worker lives on."""
+        from src.youtube import ExtractionError
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = MemoryError()
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract(ExtractRequest(url="http://x", opts={}, deadline_secs=0))
+        assert caught.value.original_type == "MemoryError"
+        assert "too large" in caught.value.user_message
+
     def test_off_the_main_thread_nothing_is_armed(self) -> None:
         """Signals reach the main thread only — the thread-pool seam and any
         helper thread run the job unbounded here and rely on the caller's wait."""

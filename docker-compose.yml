@@ -14,6 +14,13 @@ services:
         GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
+    # Backstop for the per-worker cap (YTDLP_WORKER_MEMORY_MB, 1 GiB by default,
+    # applied as RLIMIT_DATA in each worker): the parent, four extraction
+    # workers, the chart worker and Deno sit near 1 GB together, plus one
+    # runaway fetch at the cap. Under this limit the kernel kills the largest
+    # process in the container — a worker, which the pool heals — rather than
+    # the host's OOM killer choosing for it.
+    mem_limit: 3g
     # Linux only. On Docker Desktop the daemon runs in a VM, where this is a
     # no-op and the bot cannot reach Redis or the OTLP endpoint on localhost.
     network_mode: host

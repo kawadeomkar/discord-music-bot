@@ -453,6 +453,8 @@ class TestArchiveTunables:
             ("HISTORY_OUTBOX_MAX", 0, "5000", 5000),
             # Matches asyncpg's own default; 0 is the PgBouncer setting.
             ("POSTGRES_STATEMENT_CACHE", 100, "0", 0),
+            # 1 GiB per worker; 0 lifts the RLIMIT_DATA cap.
+            ("YTDLP_WORKER_MEMORY_MB", 1024, "0", 0),
         ],
     )
     def test_default_and_override(
@@ -683,6 +685,16 @@ class TestComposeMetricsProfile:
         that matters most to get right."""
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
         assert "--profile archive --profile metrics down" in justfile
+
+
+class TestComposeMemoryBackstop:
+    def test_the_bot_service_carries_a_memory_limit(self) -> None:
+        """The container limit backs the per-worker RLIMIT_DATA cap: without it a
+        runaway that the worker cap somehow misses is the host's OOM killer's
+        choice, not the pool's to heal."""
+        assert re.search(
+            r"^    mem_limit: \d+[gm]$", _service_block("discord-music-bot"), re.M
+        )
 
 
 class TestComposeBakesTheCommit:

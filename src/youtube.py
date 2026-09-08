@@ -308,6 +308,14 @@ def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
         except YoutubeDLError as e:
             # `from e`: the stdlib stringifies the chain into the parent's __cause__.
             raise _classify_ytdlp_error(e) from e
+    except MemoryError:
+        # The worker's RLIMIT_DATA (ytdlp_pool._apply_memory_limit) refused an
+        # allocation: this page, not the worker, is what failed.
+        raise ExtractionError(
+            "Couldn't load this track — the page was too large to process.",
+            original_type="MemoryError",
+            expected=True,
+        ) from None
     except _ExtractionDeadline:
         raise ExtractionError(
             f"extraction of {url} exceeded {req.deadline_secs}s in the worker",
