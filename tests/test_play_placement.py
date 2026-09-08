@@ -13,10 +13,12 @@ import pytest
 from discord.ext import commands
 
 from src.musicbot import MusicBot
+from src.config import PLAY_RESOLVE_CONCURRENCY
 from src.play_placement import (
     PlayArgs,
     _GuildPlays,
     PlayMode,
+    ResolveWaitExpired,
     play_key,
     split_play_args,
 )
@@ -459,3 +461,84 @@ class TestPlacedMeansLanded:
             assert verdict.placed
 
         assert req.placed
+
+
+class TestResolveSlot:
+    """The guild's resolve bound, with a deadline on the WAIT for it. The
+    extraction it guards stays unbounded — the slot exists to queue expensive work,
+    so a bound covering it would cancel the resolve it was sized for."""
+
+    async def test_a_free_slot_is_entered_without_waiting(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        slot = music_bot._plays.resolve_slot(req)
+        async with slot:
+            pass  # released on exit; a second entry proves it
+
+        async with music_bot._plays.resolve_slot(req):
+            pass
+
+    async def test_the_extraction_holding_a_slot_is_not_bounded(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The whole point of the split: a 5,547-track playlist runs 99s inside the
+        slot and must not be cut off by the bound on queueing FOR one."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
+            async with music_bot._plays.resolve_slot(req):
+                # Comfortably past the wait bound, inside the slot.
+                await asyncio.sleep(0.15)
+
+    async def test_a_slot_that_never_frees_expires_the_wait(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        # Take every slot and never give one back.
+        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+            await plays.resolves.acquire()
+
+        with (
+            patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05),
+            recording_span() as span,
+            pytest.raises(ResolveWaitExpired),
+        ):
+            async with music_bot._plays.resolve_slot(req):
+                pass  # pragma: no cover - the acquire above never returns
+        span.set_attribute.assert_any_call("play.resolve_wait_expired", True)
+
+    async def test_an_expired_wait_releases_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """__aexit__ does not run for an __aenter__ that raised. A release here
+        would hand out a permit the guild never held, uncapping the bound."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+            await plays.resolves.acquire()
+
+        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
+            with pytest.raises(ResolveWaitExpired):
+                async with music_bot._plays.resolve_slot(req):
+                    pass  # pragma: no cover
+        assert plays.resolves.locked()
+
+    async def test_a_slot_freed_inside_the_bound_is_taken(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+            await plays.resolves.acquire()
+
+        async def _free() -> None:
+            await asyncio.sleep(0.02)
+            plays.resolves.release()
+
+        freeing = asyncio.create_task(_free())
+        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 5.0):
+            async with music_bot._plays.resolve_slot(req):
+                entered = True
+        await freeing
+        assert entered

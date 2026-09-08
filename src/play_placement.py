@@ -17,7 +17,11 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
-from src.config import PLAY_INFLIGHT_MAX, PLAY_RESOLVE_CONCURRENCY
+from src.config import (
+    PLAY_INFLIGHT_MAX,
+    PLAY_RESOLVE_CONCURRENCY,
+    PLAY_RESOLVE_WAIT_SECS,
+)
 from src.musicplayer import MusicPlayer
 from src.util import get_logger, record_span_error, spawn_background
 
@@ -221,6 +225,56 @@ class PlaceStalled(Exception):
         self.before_the_put = before_the_put
 
 
+class ResolveWaitExpired(Exception):
+    """PLAY_RESOLVE_WAIT_SECS elapsed queueing for one of the guild's resolve
+    slots, before any yt-dlp work began. Raised in place of a wait with no end:
+    the caller renders it, so the request that never started says so."""
+
+    def __init__(self) -> None:
+        super().__init__(f"resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
+
+
+class ResolveSlot:
+    """One guild's resolve bound, entered per extraction, with a deadline on the
+    WAIT alone.
+
+    The extraction inside is deliberately unbounded — the slot exists to queue
+    expensive work, and a bound covering it would cancel exactly the resolve it was
+    sized for. What is bounded is the stretch before it, which yields no output at
+    all and so cannot be told from a hung bot.
+
+    Stateless per entry, because one request's resolve can enter this more than
+    once: the count lives in the semaphore, and each `async with` owns only its own
+    acquire.
+    """
+
+    __slots__ = ("_sem",)
+
+    def __init__(self, sem: asyncio.Semaphore) -> None:
+        self._sem = sem
+
+    async def __aenter__(self) -> None:
+        waited = time.monotonic()
+        try:
+            async with asyncio.timeout(PLAY_RESOLVE_WAIT_SECS):
+                await self._sem.acquire()
+        except TimeoutError as e:
+            # Nothing was acquired, and __aexit__ does not run for an __aenter__
+            # that raised — so releasing here would hand out a permit the guild
+            # never held and uncap the bound.
+            span = trace.get_current_span()
+            span.set_attribute("play.resolve_wait_expired", True)
+            record_span_error(span, e)
+            log.warning(f"Resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
+            raise ResolveWaitExpired() from e
+        trace.get_current_span().set_attribute(
+            "play.resolve_wait_secs", round(time.monotonic() - waited, 3)
+        )
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self._sem.release()
+
+
 @dataclass(slots=True, eq=False)
 class PlayRequest:
     """One -play between dispatch and reply. `mp` and `generation` are the world at
@@ -321,9 +375,11 @@ class PlayRegistry:
         if plays.idle():
             self._guilds.pop(req.guild_id, None)
 
-    def resolve_slot(self, req: PlayRequest) -> asyncio.Semaphore:
-        """The guild's bound on how many of its requests hold a yt-dlp worker."""
-        return self._guilds[req.guild_id].resolves
+    def resolve_slot(self, req: PlayRequest) -> ResolveSlot:
+        """The guild's bound on how many of its requests hold a yt-dlp worker, with
+        the deadline on queueing for it. A fresh wrapper per call: it holds the
+        semaphore alone, and every acquire is owned by its own `async with`."""
+        return ResolveSlot(self._guilds[req.guild_id].resolves)
 
     def sibling_placed(self, req: PlayRequest) -> bool:
         """Whether another of this guild's in-flight -plays has already landed — what

@@ -132,6 +132,13 @@ PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=1)
 # process-wide and FIFO, so a paste burst in one guild queues every other guild's
 # in-band extractions behind it. Half the default pool.
 PLAY_RESOLVE_CONCURRENCY: int = _int_env("PLAY_RESOLVE_CONCURRENCY", 2, minimum=1)
+# Bound on the WAIT for one of those slots, never on the extraction holding it: a
+# 5,547-track playlist legitimately runs 99s, and cutting it off would fail the
+# request it is serving. The wait is the half that produces nothing, so an
+# unbounded one reads as a bot that stopped answering. Generous on purpose —
+# every second of it can be another guild member's legitimate resolve, and the
+# cost of expiring early is a refusal the user did not need to get.
+PLAY_RESOLVE_WAIT_SECS: float = _float_env("PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=1.0)
 
 
 def _parse_bool_env(name: str) -> bool:
