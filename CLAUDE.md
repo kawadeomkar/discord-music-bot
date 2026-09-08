@@ -1230,18 +1230,16 @@ than of the queue slot, it also needs `StateField` + `GuildStateData` +
 `_now_playing_state_mapping` + `_TRANSIENT_SONG_FIELDS`, or a crash silently resets it
 (see `is_resume`/`start_paused`).
 
-**Add a schema migration**: **while no deployment holds the schema, don't** — edit
-`migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,
-so an ALTER sequence would describe upgrades that never happened), then drop and re-create
-the scratch **database** — not just the tables, since the `schema_migrations` row survives
-them and the re-run applies nothing. The trigger for freezing `0001` is a deployed
-database, not a tagged release. Once one exists, editing a migration fails silently and in
-the worst direction: `migrate()` skips a version already in the ledger without reading the
-file, so the change reaches fresh databases only, the deployed one keeps the old shape and
-still passes the version check, and every insert then raises `UndefinedColumnError` —
-which is not in `_POISON`, so the drainer treats it as transient and redelivers onto the
-non-evictable outbox forever. From that point on: new
-`migrations/NNNN_short_name.sql` (numeric prefix, next
+**Add a schema migration**: `0001` is **frozen** (its header says so, and
+`0002_text_bounds.sql` is the first change layered on it). Editing a migration already
+in a ledger fails silently and in the worst direction: `migrate()` skips a version
+already in `schema_migrations` without reading the file, so the change reaches fresh
+databases only, the deployed one keeps the old shape and still passes the version
+check, and every insert then raises `UndefinedColumnError` — which is not in `_POISON`,
+so the drainer treats it as transient and redelivers onto the non-evictable outbox
+forever. `_assert_schema_shape` at connect time now names a missing column or index
+and raises `SchemaDriftError`, so the drift is loud rather than a dead-letter stream —
+but it detects, it does not repair. Every change is a new file: `migrations/NNNN_short_name.sql` (numeric prefix, next
 free number — `discover()` rejects duplicates and orders numerically, so `0010` follows
 `0009`) → bump `EXPECTED_SCHEMA_VERSION` in `src/db_migrate.py` (a test asserts the two
 agree) → `just db-migrate` locally → `just test-pg`. Each migration runs in its own
@@ -1260,11 +1258,10 @@ against the outbox's allocator-bin cliff (`docs/ARCHITECTURE.md#why-query_source
 18 bytes once cost 11% of the OOM runway and the next 32 cost another 14%, and the
 curve is NOT monotonic — an unstamped entry measured worse than a larger stamped
 one, so measure every shape a field takes and never just the populated one) → `to_redis`/`parse_history_entry`
-(`.get(..., default)`, so pre-migration wire entries still parse) → the column in
-`migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
-table definition pre-release (free to validate on an empty table); a separate `NOT VALID`
-`ADD CONSTRAINT` once the table holds real rows, so the migration neither scans it nor
-takes ACCESS EXCLUSIVE → `_INSERT_SQL`/`_RECENT_SQL`/`_entry_to_row`/`_row_to_entry` in
+(`.get(..., default)`, so pre-migration wire entries still parse) → the column in a NEW numbered
+migration (`0001` is frozen), plus a named `CHECK` for its domain, added `NOT VALID` so the
+migration neither scans the table nor takes ACCESS EXCLUSIVE — text columns also get an
+`octet_length` bound mirroring `_TEXT_BYTE_LIMITS` (see `0002_text_bounds.sql`) → `_INSERT_SQL`/`_RECENT_SQL`/`_entry_to_row`/`_row_to_entry` in
 history_archive.py.
 
 **Touch the history outbox**: it is a Redis **stream** with the `drainers` consumer
