@@ -1741,13 +1741,14 @@ class MusicPlayer:
         try:
             await self.queue.put_front(items)
         except BaseException:
-            # Cancelled here (the caller's place bound) there is no tail, and an
-            # armed marker would eat the interrupted song's history entry. Identity-
-            # checked, so a marker a later interjection replaced is left alone.
-            if self._skip_history_for is current:
-                self._skip_history_for = None
-            if self._pending_resume_tail is resume:
-                self._pending_resume_tail = None
+            # put_front mutates the deque synchronously and awaits the mirror after,
+            # so a cancellation here can leave the tail queued — disarming over one
+            # that landed records the song twice. Identity-checked against `resume`.
+            if resume is None or not self.queue.holds(resume):
+                if self._skip_history_for is current:
+                    self._skip_history_for = None
+                if self._pending_resume_tail is resume:
+                    self._pending_resume_tail = None
             raise
 
         # Only if the song we measured is still playing: if the loop moved on,
@@ -1828,7 +1829,10 @@ class MusicPlayer:
             np_host_ref=song.np_host_ref,
         )
         self.queue.requeue_front(rebuilt)
-        song.cleanup()
+        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
+        # communicate(), and this runs under the caller's place lock. loop() keeps
+        # its twin call off its own mutex for the same reason.
+        self._spawn_background(asyncio.to_thread(song.cleanup))
 
     async def _announce_start_offset(self, song: YTDL) -> None:
         """One-line notice for a song starting partway in (a `?t=` link). Sent from

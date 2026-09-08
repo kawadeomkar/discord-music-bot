@@ -693,6 +693,31 @@ class TestCleanup:
             "player task must be cancelled before voice disconnect"
         )
 
+    async def test_cleanup_claims_the_song_before_it_awaits_the_retire(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """claim_current_song_for_history is synchronous by design — it reads the
+        song and takes the _skip_history_for marker with no await between. Behind
+        retire_player's wait on the place lock, the loop can end this song, record
+        it and start the next one inside the window, and the claim then writes a
+        play_history row for a song that played a fraction of a second, with a
+        fresh played_at that ON CONFLICT will not dedup."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(
+            side_effect=lambda: order.append("claim")
+        )
+
+        async def _retire(guild_id: int, mp: Any) -> None:
+            order.append("retire")
+
+        music_bot._plays.retire_player = _retire
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert order == ["claim", "retire"]
+
 
 class TestCogBeforeInvoke:
     async def test_calls_get_mp(self, music_bot: MusicBot, mock_ctx: MagicMock) -> None:

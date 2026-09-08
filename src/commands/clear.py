@@ -30,9 +30,8 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer, cog: MusicBot) -> None:
     if not await await_restore(ctx, mp):
         return
     cleared = await mp.queue_clear()
-    # Right after the clear, with no await between: every request still
-    # resolving fails its generation check at the insert and reports
-    # itself; this names them here too.
+    # Right after the clear, no await between. Each request reports itself at
+    # the insert too, when its generation check fails; this names them here.
     dropped = cog._plays.inflight(play_key(ctx), "clear")
     if not cleared and not dropped:
         await ctx.send(

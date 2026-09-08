@@ -2,7 +2,7 @@
 registry whose place lock makes "check, then insert" atomic."""
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,6 +12,7 @@ from src import play_pipeline
 from src.musicbot import MusicBot
 from src.play_placement import (
     PlayArgs,
+    _GuildPlays,
     PlayMode,
     play_key,
     split_play_args,
@@ -308,3 +309,81 @@ class TestResolveConcurrency:
             await asyncio.gather(*tasks)
 
         assert mp.queue_put.await_count == 5  # and all of them still land
+
+
+class TestRetirePlayerFence:
+    """retire_player stamps a player retired without landing mid-placement."""
+
+    async def test_it_waits_for_a_put_in_progress(self, music_bot: MusicBot) -> None:
+        """The put writes the deque and then the mirror, and a flag set between the
+        two leaves the song in one leg only. So the stamp takes the place lock, and
+        a put holding it finishes first."""
+        plays = _GuildPlays()
+        music_bot._plays._guilds[7] = plays
+        mp = MagicMock()
+        await plays.lock.acquire()
+
+        retire = asyncio.create_task(music_bot._plays.retire_player(7, cast(Any, mp)))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        mp.mark_retired.assert_not_called()
+
+        plays.lock.release()
+        await retire
+        mp.mark_retired.assert_called_once()
+
+    async def test_a_stalled_put_does_not_hold_the_stamp_forever(
+        self, music_bot: MusicBot
+    ) -> None:
+        """A stalled Redis must not keep a teardown from retiring the player: past
+        the put's own bound the stamp lands anyway, or every later -play places into
+        a player that is already torn down."""
+        plays = _GuildPlays()
+        music_bot._plays._guilds[7] = plays
+        mp = MagicMock()
+        await plays.lock.acquire()  # never released
+
+        with patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01):
+            await music_bot._plays.retire_player(7, cast(Any, mp))
+
+        mp.mark_retired.assert_called_once()
+        plays.lock.release()
+
+    async def test_a_guild_with_no_requests_retires_without_a_lock(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Nothing to fence against, so the stamp is immediate."""
+        mp = MagicMock()
+        await music_bot._plays.retire_player(999, cast(Any, mp))
+        mp.mark_retired.assert_called_once()
+
+
+class TestPlacedMeansLanded:
+    """`placed` is what -stop/-clear/-remove read to decide whether a request is
+    past dropping. Set before the body, a put that raised claims to have landed."""
+
+    async def test_a_body_that_raises_leaves_the_request_droppable(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        req = admit(music_bot, mock_ctx, mp)
+
+        with pytest.raises(RuntimeError):
+            async with music_bot._plays.place(req) as verdict:
+                assert verdict.placed
+                raise RuntimeError("the put failed")
+
+        assert not req.placed
+
+    async def test_a_body_that_completes_marks_it_placed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        req = admit(music_bot, mock_ctx, mp)
+
+        async with music_bot._plays.place(req) as verdict:
+            assert verdict.placed
+
+        assert req.placed

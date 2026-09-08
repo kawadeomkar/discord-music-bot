@@ -1566,3 +1566,53 @@ class TestResolveModeThreading:
             )
         assert spy.await_args is not None
         assert spy.await_args.kwargs["mode"] is ResolveMode.FULL
+
+
+class TestTheResumeNoticeDescribesARestoredQueue:
+    """It calls what sits behind the head 'the previous session'."""
+
+    async def test_a_sibling_that_landed_suppresses_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Two cold starts in one burst: the second would file the song the same
+        user pasted a second earlier under the previous session."""
+        mp = mock_mp()
+        mp.queue.qsize = MagicMock(return_value=1)
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        qobj = QueueObject("https://yt.com/v=2", "Second", mock_ctx.author)
+
+        first = admit(music_bot, mock_ctx, mp)
+        first.placed = True
+        second = admit(music_bot, mock_ctx, mp)
+
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            second,
+            placement=Placement.COLD_FRONT,
+            cog=music_bot,
+        )
+
+        mp.build_resume_notice_embed.assert_not_called()
+        mp.build_queued_song_embed.assert_called()
+
+    async def test_a_lone_cold_start_still_gets_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        qobj = QueueObject("https://yt.com/v=1", "First", mock_ctx.author)
+
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            qobj,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            placement=Placement.COLD_FRONT,
+            cog=music_bot,
+        )
+
+        mp.build_resume_notice_embed.assert_called_once()
