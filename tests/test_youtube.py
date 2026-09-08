@@ -39,6 +39,7 @@ from src.youtube import (
     _record_serving_format,
     _run_extract,
     ExtractRequest,
+    _inflight_key,
     _slim_info,
     _EXTRACTOR_ARGS,
     _probe_stream_url,
@@ -884,6 +885,134 @@ class TestYTPlaylistAnalytics:
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
 
 
+class TestExtractSingleflight:
+    """One extraction per distinct query at a time, process-wide."""
+
+    async def test_identical_concurrent_queries_extract_once(self) -> None:
+        """Requests resolve concurrently now, so N users pasting the same trending
+        link is N identical jobs against a FIFO pool of four workers, all racing to
+        write the same cache entry."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            request = MagicMock()
+            waiters = [
+                asyncio.create_task(_extract_once("k", request)) for _ in range(4)
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            results = await asyncio.gather(*waiters)
+
+        assert calls == 1
+        assert all(r == {"title": "shared"} for r in results)
+
+    async def test_a_failure_is_not_replayed_by_the_next_caller(self) -> None:
+        """The waiters share the winner's exception — retrying it N times is the
+        pile-up this exists to prevent — but the entry goes before the result is
+        published, so the call AFTER extracts again."""
+        from src.youtube import ExtractionError, _extract_once
+
+        calls = 0
+
+        async def _boom(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            raise ExtractionError("nope")
+
+        with patch("src.youtube._run_extract", new=_boom):
+            for _ in range(2):
+                with pytest.raises(ExtractionError):
+                    await _extract_once("k", MagicMock())
+
+        assert calls == 2
+
+    async def test_a_completed_extraction_is_not_replayed_by_the_next_caller(
+        self,
+    ) -> None:
+        """The success half of the same rule: the entry goes before the result is
+        published, so a caller arriving afterwards extracts fresh. That is what makes
+        the playback loop's re-extraction after a DEAD probe a NEW job — rejoining
+        would hand it back the URL that just failed."""
+        from src.youtube import _extract_once
+
+        calls = 0
+
+        async def _once(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {"title": "fresh"}
+
+        with patch("src.youtube._run_extract", new=_once):
+            for _ in range(2):
+                await _extract_once("k", MagicMock())
+
+        assert calls == 2
+
+    async def test_different_profiles_of_one_query_do_not_share_a_job(self) -> None:
+        """The profile is part of the key because the results are not
+        interchangeable: a flat entry's `url` is the watch page, a processed one's is
+        the googlevideo CDN URL. Sharing one job between them would persist a CDN URL
+        as a song's identity — into ytdl:source, the queue, and play_history."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            waiters = [
+                asyncio.create_task(
+                    _extract_once(_inflight_key("ytdl:source:q", profile), MagicMock())
+                )
+                for profile in ("full", "flat", "stream")
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            await asyncio.gather(*waiters)
+
+        assert calls == 3
+
+    async def test_one_profile_of_one_query_still_collapses(self) -> None:
+        """The keying change must not cost the collapse it exists to provide."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            waiters = [
+                asyncio.create_task(
+                    _extract_once(_inflight_key("ytdl:source:q", "full"), MagicMock())
+                )
+                for _ in range(4)
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            await asyncio.gather(*waiters)
+
+        assert calls == 1
+
+
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
     populates both the ytdl:source and ytdl:stream
@@ -909,6 +1038,31 @@ class TestYTSourceUnifiedExtraction:
         req = mock_extract.call_args[0][0]
         assert req.opts is _YTDL_STREAM_SEARCH_OPTS
         assert req.process is True
+
+    async def test_the_inflight_key_names_the_request_profile(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """yt_source single-flights under the cache key PLUS its profile. Keyed by the
+        cache key alone, a flat caller of the same query would join this job and read
+        `url` — the CDN stream URL on a processed result — as the watch page."""
+        from src.youtube import _INFLIGHT_EXTRACTS
+
+        seen: list[str] = []
+
+        async def _record(_request: Any) -> Any:
+            seen.extend(_INFLIGHT_EXTRACTS)
+            return _fake_ytdl_data()
+
+        with patch("src.youtube._run_extract", new=_record):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "some song",
+                query_source="ytsearch",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert seen == ["ytdl:source:some song|full"]
 
     async def test_fresh_extraction_writes_both_caches(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -1943,6 +2097,71 @@ class TestRecordServingFormat:
         """The shape fields must be in _STREAM_CACHE_FIELDS, or cache-hit plays would
         lose attribution and the degraded-primary signal would only fire on misses."""
         assert {"format_id", "protocol", "vcodec"} <= _STREAM_CACHE_FIELDS
+
+
+class TestStreamExtractionSingleflight:
+    """prefetch_stream and the playback loop's resolve build the same request for the
+    same song. Today the unified play-path extraction pre-warms the stream cache so
+    they rarely both run; a flat-resolved song has no such warm, and then the enqueue
+    prefetch and the loop race on one video."""
+
+    async def test_prefetch_and_loop_resolve_share_one_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _fake_ytdl_data(webpage_url="https://yt.com/v=race")
+
+        qobj = QueueObject("https://yt.com/v=race", "Raced Song", mock_ctx.author)
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(YTDL.prefetch_stream(qobj, redis=fake_redis)),
+                asyncio.create_task(YTDL._resolve_playable_stream(qobj, fake_redis)),
+            ]
+            # Both must clear their cache read (several fakeredis awaits) and reach
+            # the extraction before the gate opens, or the second one is a cache hit
+            # and the test passes for the wrong reason.
+            await asyncio.sleep(0.05)
+            assert calls == 1
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        assert calls == 1
+
+    async def test_a_second_song_is_still_its_own_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The key is per song: single-flighting collapses duplicates of one video,
+        never two different ones."""
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _fake_ytdl_data(webpage_url=request.url)
+
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(
+                    YTDL.prefetch_stream(
+                        QueueObject(f"https://yt.com/v=s{i}", "Song", mock_ctx.author),
+                        redis=fake_redis,
+                    )
+                )
+                for i in range(2)
+            ]
+            await asyncio.sleep(0.05)
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        assert calls == 2
 
 
 class TestPrefetchStream:

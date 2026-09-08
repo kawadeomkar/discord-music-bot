@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import os
 import re
@@ -713,6 +714,50 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
         qo.thumbnail = data.get("thumbnail")
 
 
+_INFLIGHT_EXTRACTS: dict[str, asyncio.Future[Optional[YTDLExtractResult]]] = {}
+
+
+def _inflight_key(cache_key: str, profile: str) -> str:
+    """Single-flight key: the cache key the lookup missed on, plus the shape of the
+    request. Results of different profiles are not interchangeable — a flat entry's
+    `url` is the watch page, a processed one's is the CDN stream URL — so sharing one
+    job between them would persist the wrong URL as a song's identity."""
+    return f"{cache_key}|{profile}"
+
+
+async def _extract_once(
+    key: str, request: ExtractRequest
+) -> Optional[YTDLExtractResult]:
+    """One extraction per distinct query at a time, process-wide: N users pasting
+    the same link are N identical jobs against a four-worker pool, racing to write
+    one cache entry. The first caller extracts and the rest await its outcome,
+    exception included — a failure answers their query too. Keyed by _inflight_key;
+    the entry is removed before the result is published, so the next call after a
+    failure extracts again."""
+    running = _INFLIGHT_EXTRACTS.get(key)
+    if running is not None:
+        trace.get_current_span().set_attribute("ytdl.extract_shared", True)
+        return await asyncio.shield(running)
+    future: asyncio.Future[Optional[YTDLExtractResult]] = (
+        asyncio.get_running_loop().create_future()
+    )
+    _INFLIGHT_EXTRACTS[key] = future
+    try:
+        data = await _run_extract(request)
+    except BaseException as e:
+        _INFLIGHT_EXTRACTS.pop(key, None)
+        if not future.done():
+            future.set_exception(e)
+        # Retrieved by every waiter, or by nobody — asyncio logs an unretrieved
+        # future exception at GC otherwise, and a lone caller is the common case.
+        future.exception()
+        raise
+    _INFLIGHT_EXTRACTS.pop(key, None)
+    if not future.done():
+        future.set_result(data)
+    return data
+
+
 class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -844,11 +889,14 @@ class YTDL(discord.FFmpegOpusAudio):
             return
         try:
             # Single-video cast: stream opts on a watch URL never yield a
-            # search/playlist wrapper.
+            # search/playlist wrapper. Single-flighted with the playback loop's
+            # own resolve of the same song; a joined caller shares the winner's
+            # dict, so neither path may mutate it.
             data = cast(
                 Optional[YTDLVideoInfo],
-                await _run_extract(
-                    ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
+                await _extract_once(
+                    _inflight_key(cache_key, "stream"),
+                    ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS),
                 ),
             )
             trace.get_current_span().set_attribute(
@@ -896,11 +944,15 @@ class YTDL(discord.FFmpegOpusAudio):
             if data is None:
                 if extractions >= _MAX_STREAM_EXTRACTIONS:
                     break
-                # Single-video cast, as in prefetch_stream.
+                # Single-video cast, as in prefetch_stream, and single-flighted with
+                # it. _extract_once pops its key before publishing the result, so the
+                # re-extraction this loop performs after a DEAD probe starts a fresh
+                # job rather than rejoining the one that produced the dead URL.
                 data = cast(
                     Optional[YTDLVideoInfo],
-                    await _run_extract(
-                        ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
+                    await _extract_once(
+                        _inflight_key(cache_key, "stream"),
+                        ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS),
                     ),
                 )
                 extractions += 1
@@ -1073,10 +1125,11 @@ class YTDL(discord.FFmpegOpusAudio):
         # both caches from one network round. process stays True: unprocessed,
         # data["url"] is absent and the stream-cache write silently never happens.
         try:
-            data = await _run_extract(
+            data = await _extract_once(
+                _inflight_key(cache_key, "full"),
                 ExtractRequest(
                     url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
-                )
+                ),
             )
         except ExtractionError as e:
             # parse_url whitelists no domains; an unrecognised site arrives as
