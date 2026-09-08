@@ -917,6 +917,54 @@ class TestYTPlaylistAnalytics:
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
 
 
+class TestYTSourceCacheKey:
+    """The source cache is keyed on the input: case-folded for search text,
+    verbatim for a link — YouTube ids are case-sensitive, so `?v=AbC` and
+    `?v=abc` are different videos."""
+
+    async def test_search_text_is_case_folded(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        with patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "  Never Gonna ",
+                redis=fake_redis,
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+        assert await fake_redis.get("ytdl:source:never gonna") is not None
+
+    async def test_links_are_kept_verbatim(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        upper = "https://www.youtube.com/watch?v=AbCdEfGhIjK"
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()
+        ) as mock_extract:
+            await YTDL.yt_source(
+                mock_ctx.author,
+                upper,
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+            # The lowercased id is a different video: a miss, so a second extraction.
+            await YTDL.yt_source(
+                mock_ctx.author,
+                upper.lower(),
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+        assert await fake_redis.get(f"ytdl:source:{upper}") is not None
+        assert await fake_redis.get(f"ytdl:source:{upper.lower()}") is not None
+        assert mock_extract.call_count == 2
+
+
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
     populates both the ytdl:source and ytdl:stream

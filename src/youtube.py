@@ -1033,9 +1033,11 @@ class YTDL(discord.FFmpegOpusAudio):
         collection `search` is a generated title, not the link -remove matches."""
         origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
-        # Normalised so "Destiny" and "destiny " both hit; ts is a per-request
-        # playback offset, not part of the identity.
-        cache_key = f"ytdl:source:{search.strip().lower()}"
+        # Search text is case-folded so "Destiny" and "destiny " both hit; a
+        # link is kept verbatim, since a YouTube id is case-sensitive. ts is a
+        # per-request playback offset, not part of the identity.
+        query = search.strip()
+        cache_key = f"ytdl:source:{query if looks_like_url(query) else query.lower()}"
 
         if redis is not None:
             cached = await cache_get(redis, cache_key)
