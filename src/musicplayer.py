@@ -2153,6 +2153,16 @@ class MusicPlayer:
             )
             return None
 
+    @staticmethod
+    def _discard_unplayed(*songs: Optional[YTDL], handed_off: Optional[YTDL]) -> None:
+        """Kill the ffmpeg subprocess of every source constructed but never given
+        to vc.play(): discord.py's player thread cleans up only what it played,
+        and an orphan otherwise lives until garbage collection. `handed_off` is
+        the one the voice client owns and is left alone."""
+        for song in songs:
+            if song is not None and song is not handed_off:
+                song.cleanup()
+
     def note_deliberate_stop(self) -> None:
         """Record that the live song is about to be stopped by us, not by ffmpeg.
         Call BEFORE vc.stop(); the loop clears it at each vc.play(). A stop we initiate
@@ -2577,6 +2587,9 @@ class MusicPlayer:
             # None — and None defaults to popping. Written beside the flag above,
             # so it never describes a different item than the one claimed.
             claim_persisted = True
+            # The source vc.play() took, which discord.py's player thread will
+            # clean up; both handlers below reap any other source still in hand.
+            handed_off: Optional[YTDL] = None
             # Each iteration spans a full song (3–5 min), staying open across
             # play_next.wait(), and roots its own trace so one song is one trace.
             # See docs/ARCHITECTURE.md#observability.
@@ -2736,6 +2749,7 @@ class MusicPlayer:
 
                                 self._stopped_deliberately = False
                                 vc.play(song, after=_after_play)
+                                handed_off = song
                                 if song.start_paused:
                                     # Park the player thread SYNCHRONOUSLY, before any await, so
                                     # a song returning paused leaks a frame or two rather than a
@@ -3040,6 +3054,9 @@ class MusicPlayer:
                         await self._drop_unplayable_stream_cache(song)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
+                    self._discard_unplayed(
+                        prefetched_song, self.current_song, handed_off=handed_off
+                    )
                     await self._cancel_progress_task()
                     await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
@@ -3075,6 +3092,9 @@ class MusicPlayer:
                     # No finalize for a song that errored — just release the host so
                     # the next song starts clean.
                     self._release_np_host()
+                    self._discard_unplayed(
+                        prefetched_song, self.current_song, handed_off=handed_off
+                    )
                     prefetched_song = None
                     self._skip_history_for = None
                     # A tail left holding this slot would receive a LATER fragment's
@@ -3102,3 +3122,5 @@ class MusicPlayer:
                         log.warning(
                             f"Failed to send playback-error embed in guild {self._guild.id}: {e}"
                         )
+        # The bot closed between songs with the next one already resolved.
+        self._discard_unplayed(prefetched_song, handed_off=None)

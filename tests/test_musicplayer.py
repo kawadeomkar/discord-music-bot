@@ -3,6 +3,7 @@
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
+from collections.abc import AsyncIterator
 import dataclasses
 import datetime
 import logging
@@ -8640,6 +8641,140 @@ class TestLoopAdditional:
         # extraction that minted its URL, and that value is parsed as a string.
         song.data = {}
         return song
+
+    def test_discard_unplayed_reaps_every_source_but_the_handed_off_one(
+        self,
+    ) -> None:
+        playing, resolved, prefetched = MagicMock(), MagicMock(), MagicMock()
+        MusicPlayer._discard_unplayed(prefetched, resolved, None, handed_off=playing)
+        playing.cleanup.assert_not_called()
+        resolved.cleanup.assert_called_once()
+        prefetched.cleanup.assert_called_once()
+
+    async def test_a_cancel_before_vc_play_reaps_the_resolved_source(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Between _stream_source and vc.play() the loop holds a live ffmpeg
+        nothing else knows about; a teardown landing in that window (the commit's
+        mutex wait, the start transaction) must not orphan it until GC."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+
+        @contextlib.asynccontextmanager
+        async def _cancelled_commit(_self: Any, _gen: int) -> AsyncIterator[bool]:
+            raise asyncio.CancelledError()
+            yield False  # pyright: ignore[reportUnreachable]
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(GuildQueue, "commit_dequeue", new=_cancelled_commit),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await music_player.loop()
+
+        mock_song.cleanup.assert_called_once()
+
+    async def test_a_handed_off_source_is_left_to_the_player_thread(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Once vc.play() has the source, discord.py's AudioPlayer cleans it up;
+        a second cleanup from the loop's cancel handler would kill a song that
+        cleanup() is about to stop in order."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await music_player.loop()
+
+        vc.play.assert_called_once()
+        mock_song.cleanup.assert_not_called()
+
+    async def test_vc_play_raising_reaps_the_source_it_refused(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=discord.ClientException("Not connected"))
+        mocked(music_player._guild).voice_client = vc
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+        ):
+            await music_player.loop()
+
+        mock_song.cleanup.assert_called_once()
+        assert music_player.current_song is None
+
+    async def test_closing_between_songs_reaps_the_prefetched_source(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The loop exits on is_closed() with the next song already resolved and
+        constructed; that source was never handed to vc.play()."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        prefetched = self._song("https://yt.com/v=next", "Next")
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(
+                MusicPlayer,
+                "_prefetch_next_song",
+                new=AsyncMock(return_value=prefetched),
+            ),
+        ):
+            await music_player.loop()
+
+        prefetched.cleanup.assert_called_once()
+        mock_song.cleanup.assert_not_called()
 
     async def test_update_activity_called_at_song_start_and_end(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
