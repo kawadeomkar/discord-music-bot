@@ -1255,9 +1255,26 @@ class GuildRedisStore:
 
     @_guild_op(default=False)
     async def clear_config(self) -> bool:
-        """Drop this guild's stored preferences when the bot leaves it, so a
-        departed guild stops occupying a key nothing will ever expire."""
+        """Drop this guild's stored preferences. clear_guild covers the leave
+        path; this is the single-key form for callers that want only it."""
         await self.redis.delete(self.config_key())
+        return True
+
+    @_guild_op(default=False)
+    async def clear_guild(self) -> bool:
+        """DEL every key this guild owns, in one command: state, queue,
+        now_playing, history, config and the recovery lock. For on_guild_remove
+        only. History and config are PERSISTed and no other path may delete
+        them — a guild the bot has left is the one case where keeping them
+        forever serves nobody. Returns whether it landed."""
+        await self.redis.delete(
+            self.state_key(),
+            self.queue_key(),
+            self.now_playing_key(),
+            self.history_key(),
+            self.config_key(),
+            self._recovery_lock_key(),
+        )
         return True
 
     # TTL management

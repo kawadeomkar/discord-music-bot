@@ -2089,8 +2089,10 @@ class DebugSettings:
         )
         return persisted
 
-    async def forget(self, redis: Optional[aioredis.Redis], guild_id: int) -> None:
-        """Drop a departed guild's override, cache and durable copy alike.
+    def forget(self, guild_id: int) -> None:
+        """Drop a departed guild's in-memory override and cache. The durable
+        copy goes with the guild's other keys (GuildRedisStore.clear_guild, from
+        on_guild_remove).
 
         One bool per guild, so this is hygiene rather than a leak — but the override
         is the only debug state that is NOT re-derived from the environment, so a
@@ -2103,11 +2105,6 @@ class DebugSettings:
         self._unpersisted.discard(guild_id)
         if self._overrides.pop(guild_id, None) is not None:
             self.sync_sampler()
-        # The durable copy goes too, or a guild that removes and re-adds the bot
-        # silently resumes a setting nobody there chose — and the key would sit in
-        # Redis forever, since config carries no TTL by design.
-        if redis is not None:
-            await GuildRedisStore(redis, guild_id).clear_config()
 
     # ── Sampler lifecycle ─────────────────────────────────────────────────────
 

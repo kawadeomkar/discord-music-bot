@@ -3137,8 +3137,9 @@ class TestDebugModeIsPerGuildAndDurable:
     async def test_leaving_a_guild_drops_the_stored_choice(
         self, music_bot_with_redis: MusicBotCog
     ) -> None:
-        """Config carries no TTL, so nothing else would ever remove it — and a
-        rejoin would silently resume a setting nobody there chose."""
+        """Config carries no TTL, so nothing but on_guild_remove's clear_guild
+        ever removes it — and a rejoin would silently resume a setting nobody
+        there chose."""
         redis = cast(Any, music_bot_with_redis.redis)
         await GuildRedisStore(redis, 111).set_debug_mode(True)
         music_bot_with_redis.debug_settings._overrides = {111: True}

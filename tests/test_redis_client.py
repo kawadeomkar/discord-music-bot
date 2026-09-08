@@ -3368,6 +3368,57 @@ class TestGuildConfigStore:
         assert await fake_redis.exists(store.config_key()) == 0
 
 
+class TestClearGuild:
+    """on_guild_remove's one DEL: every key the guild owns, the two PERSISTed
+    ones included, and nothing belonging to another guild."""
+
+    @staticmethod
+    async def _seed(store: GuildRedisStore, fake_redis: aioredis.Redis) -> list[str]:
+        await store.set_connection(100, 200)
+        await store.push_queue_batch([_entry(1), _entry(2)])
+        await store.pop_queue_and_start_song(_entry(1), 1000.0, now_playing=None)
+        await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
+        await store.push_history(_hentry(1))
+        await store.set_debug_mode(True)
+        assert await store.acquire_recovery_lock() is True
+        keys = [
+            store.state_key(),
+            store.queue_key(),
+            store.now_playing_key(),
+            store.history_key(),
+            store.config_key(),
+            store._recovery_lock_key(),
+        ]
+        for key in keys:
+            assert await fake_redis.exists(key) == 1, key
+        return keys
+
+    async def test_deletes_every_guild_key(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        keys = await self._seed(store, fake_redis)
+        assert await store.clear_guild() is True
+        for key in keys:
+            assert await fake_redis.exists(key) == 0, key
+
+    async def test_leaves_other_guilds_alone(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        other = GuildRedisStore(fake_redis, guild_id=store.guild_id + 1)
+        other_keys = await self._seed(other, fake_redis)
+        await self._seed(store, fake_redis)
+        await store.clear_guild()
+        for key in other_keys:
+            assert await fake_redis.exists(key) == 1, key
+        # The outbox is global and holds the play the archive has not drained.
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
+
+    async def test_reports_whether_it_landed(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        assert await broken_store.clear_guild() is False  # and no raise
+
+
 class TestAnalyticsPngCache:
     """Raw bytes in and out. Deliberately not cache_get/cache_set: those
     orjson-encode, which would base64 a PNG for a 33% penalty."""

@@ -66,6 +66,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
 from src.recovery import VoiceWatchdog, recovery_limiter, restore_guild_bounded
+from src.redis_client import GuildRedisStore
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -1005,8 +1006,15 @@ class MusicBot(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
-        """Registration only — see DebugSettings.forget."""
-        await self.debug_settings.forget(self.redis, guild.id)
+        """The bot left or was removed: stop a live player first (its teardown
+        writes — a claimed history entry, clear_connection), then DEL every key
+        the guild owns, the PERSISTed history and config included. Nothing else
+        may delete those two; a guild without the bot is the one case."""
+        if guild.id in self.mps:
+            await self.cleanup(guild)
+        self.debug_settings.forget(guild.id)
+        if self.redis is not None:
+            await GuildRedisStore(self.redis, guild.id).clear_guild()
 
     @commands.command(
         name="debug",

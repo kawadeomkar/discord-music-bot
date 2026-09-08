@@ -18,6 +18,7 @@ from src.musicbot import (
     MusicBot,
     _check_voice_permissions,
 )
+from src.redis_client import GuildRedisStore
 from src.spotify import SpotifyAuthError
 from tests.helpers import (
     make_mock_task,
@@ -191,6 +192,64 @@ class TestGetMp:
         assert result is mock_mp
         mock_mp.start.assert_called_once()
         assert mock_guild.id in music_bot.mps
+
+
+class TestOnGuildRemove:
+    """Leaving a guild stops its player before its keys go, and deletes every
+    key — history and config included, the one path allowed to."""
+
+    async def test_a_live_player_is_torn_down_before_the_keys_go(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        order: list[str] = []
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+
+        async def cleanup(guild: Any) -> None:
+            assert guild is mock_guild
+            order.append("cleanup")
+
+        async def clear_guild(self: Any) -> bool:
+            order.append("clear_guild")
+            return True
+
+        with (
+            patch.object(music_bot_with_redis, "cleanup", new=cleanup),
+            patch.object(GuildRedisStore, "clear_guild", new=clear_guild),
+        ):
+            await music_bot_with_redis.on_guild_remove(mock_guild)
+
+        assert order == ["cleanup", "clear_guild"]
+
+    async def test_no_player_means_no_cleanup(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        cleanup = AsyncMock()
+        with patch.object(music_bot_with_redis, "cleanup", new=cleanup):
+            await music_bot_with_redis.on_guild_remove(mock_guild)
+        cleanup.assert_not_awaited()
+
+    async def test_every_key_the_guild_owns_is_deleted(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        redis = cast(Any, music_bot_with_redis.redis)
+        store = GuildRedisStore(redis, mock_guild.id)
+        await store.set_connection(100, 200)
+        await store.push_history(HistoryEntry(guild_id=mock_guild.id, title="T"))
+        await store.set_debug_mode(True)
+        music_bot_with_redis.debug_settings._overrides = {mock_guild.id: True}
+
+        await music_bot_with_redis.on_guild_remove(mock_guild)
+
+        for key in (store.state_key(), store.history_key(), store.config_key()):
+            assert await redis.exists(key) == 0, key
+        assert mock_guild.id not in music_bot_with_redis.debug_settings._overrides
+
+    async def test_without_redis_only_memory_is_forgotten(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        music_bot.debug_settings._overrides = {mock_guild.id: True}
+        await music_bot.on_guild_remove(mock_guild)  # must not raise
+        assert mock_guild.id not in music_bot.debug_settings._overrides
 
 
 class TestCleanup:
