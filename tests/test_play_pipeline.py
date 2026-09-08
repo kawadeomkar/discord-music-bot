@@ -1,4 +1,4 @@
-"""Tests for the -play/-playnow pipeline (src/play_pipeline.py)."""
+"""Tests for the -play pipeline (src/play_pipeline.py)."""
 
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -561,7 +561,7 @@ class TestQuerySourceClassification:
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
-        # keep_first_only is -playnow's; -play enqueues the whole tail.
+        # The interjection keeps the whole tail now; -play enqueues it too.
         assert len(result.tracks) == 3
         # The ask time is untouched by the slice — one instant for the command.
         assert all(t.analytics.queued_at == 1752530000.5 for t in result.tracks)
@@ -631,7 +631,7 @@ class TestQuerySourceClassification:
     async def test_empty_playlist_raises_instead_of_queueing_nothing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """The same guard -playnow already had: a playlist that resolves to
+        """The same guard the interjection path already had: a playlist that resolves to
         nothing is an error, not a successful enqueue of zero songs."""
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
@@ -739,10 +739,10 @@ class TestQuerySourceClassification:
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
 
-    async def test_playnow_index_past_the_end_reports_it(
+    async def test_interjection_index_past_the_end_reports_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow shares the guard, and its own error path renders the same
+        """the interjection path shares the guard, and its own error path renders the same
         embed under its own title."""
         url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
         source = parse_input(url)
@@ -765,7 +765,7 @@ class TestQuerySourceClassification:
         assert "**#9**" in embed.description
         assert "**3 songs**" in embed.description
 
-    async def test_playnow_spotify_playlist_bypasses_queue_source(
+    async def test_interjection_spotify_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         # _resolve_interjection_source resolves both playlist shapes directly, so a
@@ -781,7 +781,7 @@ class TestQuerySourceClassification:
             )
         assert self._passed_query_source(spy) == "spotify.com"
 
-    async def test_playnow_youtube_playlist_bypasses_queue_source(
+    async def test_interjection_youtube_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         url = "https://www.youtube.com/playlist?list=PLabc"
@@ -794,7 +794,7 @@ class TestQuerySourceClassification:
             )
         assert self._passed_query_source(spy) == "youtube.com"
 
-    async def test_playnow_indexed_playlist_rebases_only_the_track_it_keeps(
+    async def test_interjection_indexed_playlist_rebases_only_the_track_it_keeps(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """The head lands at 0, the depth an interjection actually has, and every
@@ -825,7 +825,7 @@ class TestQuerySourceClassification:
         assert follow_on == tracks[4:]
         assert [t.analytics.queue_position for t in follow_on] == [1, 2]
 
-    async def test_playnow_analytics_is_depth_zero(
+    async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         # An interjection plays immediately by definition, so -playnow reads no
