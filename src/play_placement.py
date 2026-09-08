@@ -73,9 +73,11 @@ class ResolveMode(Enum):
 
 
 def resolve_mode_for(placement: Placement) -> ResolveMode:
-    """FULL for a cold start, whose song plays immediately and so pays the stream
-    extraction either way; FLAT_OK for every other placement. Enumerated rather than
-    defaulted, so a Placement added later cannot inherit FLAT_OK in silence."""
+    """FULL for a cold start, because the bot joins a channel FOR that song: a head
+    that cannot be extracted must fail before the join, not leave the bot parked in
+    an empty channel until the idle timeout. FLAT_OK everywhere else. Enumerated
+    rather than defaulted, so a Placement added later cannot inherit FLAT_OK in
+    silence. See docs/ARCHITECTURE.md#resolve-mode."""
     if placement is Placement.COLD_FRONT:
         return ResolveMode.FULL
     return ResolveMode.FLAT_OK
