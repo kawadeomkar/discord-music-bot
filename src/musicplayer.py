@@ -357,6 +357,49 @@ class MusicPlayer:
         "_last_stream_error",
     )
 
+    bot: commands.Bot
+    _guild: discord.Guild
+    _channel: discord.TextChannel
+    _last_author: Optional[Union[discord.User, discord.Member]]
+    _cog: MusicBot
+    current_song: Optional[YTDL]
+    _playback_span: Optional[trace.Span]
+    play_next: asyncio.Event
+    queue: GuildQueue
+    play_message: Optional[discord.Embed]
+    history: GuildHistory
+    volume: float
+    timezone: ZoneInfo
+    _player: Optional[asyncio.Task]
+    # Parameterized, unlike its siblings: _neutralize_prefetch reads fields off
+    # this task's result, and a bare Task makes result() Any — so a field YTDL
+    # does not carry would raise at runtime with pyright reporting nothing.
+    _prefetch_task: Optional[asyncio.Task[Optional[YTDL]]]
+    store: Optional[GuildRedisStore]
+    _restore_task: Optional[asyncio.Task]
+    _restore_complete: asyncio.Event
+    _restore_read_failed: bool
+    _stopped_deliberately: bool
+    _playback_gate: asyncio.Event
+    _playback_holds: int
+    _background_tasks: set[asyncio.Task[Any]]
+    _progress_task: Optional[asyncio.Task]
+    _heartbeat_task: Optional[asyncio.Task]
+    # Last payload pushed and the host it went to, for the no-op-edit guard in
+    # _push_np_edit. Compared only for equality; Embed.to_dict() is a TypedDict
+    # and list is invariant, so the element type stays Any.
+    _np_last_rendered: Optional[list[Any]]
+    _np_last_id: Optional[int]
+    _np_host_message: Optional[discord.Message]
+    _np_host_own_embeds: list[discord.Embed]
+    _np_host_dedicated: bool
+    _np_edit_lock: asyncio.Lock
+    _pause_debounce_task: Optional[asyncio.Task]
+    _skip_history_for: Optional[YTDL]
+    _pending_resume_tail: Optional[QueueObject]
+    _ended_song: Optional[YTDL]
+    _last_stream_error: Optional[StreamFailure]
+
     def __init__(
         self,
         bot: commands.Bot,
