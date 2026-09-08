@@ -675,7 +675,7 @@ Counted per distinct serialization, never `LREM … 0`: two enqueues of one song
 
 **No residual window against a concurrent mutation**: the loop settles its claim through `commit_dequeue()`, the async context manager that holds the bulk mutex across the caller's own store dispatch, so the in-memory settle and the start transaction's server-side LPOP land under one hold. This closed the window a separate commit-then-dispatch used to leave open, where a bulk mutation scheduled in that event-loop tick raced the LPOP server-side. A caller with no Redis write to make passes an empty body.
 
-The hold is bounded by `_START_WRITE_TIMEOUT` (5s, musicplayer.py). The pool sets no `socket_timeout`, so an unbounded write would park `-play`/`-clear`/`-shuffle`/`-remove` for that guild for as long as Redis stalls — measured past 20s against one that accepts and then stops answering. A `socket_timeout` on the pool would be the wrong lever: redis-py runs the whole `MULTI/EXEC` through `call_with_retry` and `retry_on_error` already lists `RedisTimeoutError`, so a read timeout would re-execute the transaction and LPOP twice. Cancellation is not retried, and redis-py disconnects the connection on `BaseException`, so nothing poisoned returns to the pool. The start transaction is the ONLY write under the hold: a second one through the same stalled pool would park the guild for the rest of the stall, which is what the bound exists to prevent.
+The hold is bounded by `_START_WRITE_TIMEOUT` (5s, musicplayer.py). Without it, a Redis that accepts and then stops answering parks `-play`/`-clear`/`-shuffle`/`-remove` for that guild for the length of the stall — measured past 20s, which is the 5 s socket timeout times the four attempts of the retrying policy. The start transaction runs under `no_retry()` (see [Redis connection retry](#redis-connection-retry)), so it makes one attempt: a read timeout fails it rather than re-executing the `MULTI/EXEC` and LPOPing twice. Cancellation is not retried either, and redis-py disconnects the connection on `BaseException`, so nothing poisoned returns to the pool. The start transaction is the ONLY write under the hold: a second one through the same stalled pool would park the guild for the rest of the stall, which is what the bound exists to prevent.
 
 **A start transaction that does not land leaves the list one entry ahead of memory, and the queue records that rather than repairing it in place.** `pop_queue_and_start_song` is `@_guild_op`-wrapped, so a Redis failure is swallowed and returns `False`; the timeout reaches the same conclusion, and so does a `vc.play()` that raises after the settle (the report is in a `finally`). In every case the in-memory settle already happened, so an LPOP at the next start would retire the wrong entry — replaying a song after a crash and recording it twice in `play_history`, forever. The loop tells the queue through `GuildQueue.note_mirror_write(landed, retired)`, and while `mirror_dirty` is set the next song start calls `rebuild_queue_and_start_song` — DEL + RPUSH from memory plus the state and snapshot HSETs in one MULTI — instead of the LPOP, so the song is parked over a correct list or nothing changed. Any `-clear`/`-shuffle`/`-remove` rebuild clears the flag in passing (the LREM shortcut is refused over a stale list, since LREM keeps whatever it does not name), and a further failure leaves it set. Cost under a persistently slow Redis is one bounded attempt per song start. A crash inside the window restores the song from its stale entry and replays it: a duplicate, never a loss — the state the list holds then is exactly what it held before the start, and restore already replays from it.
 
@@ -1389,6 +1389,51 @@ progress". The blocking pool parks the caller until a connection frees, and only
 10 s wait does it fail (as a `ConnectionError`, swallowed like any other). The fan-out is
 bounded separately by `RECOVERY_CONCURRENCY`, so under normal operation the wait never
 engages; the pool class is the backstop for every other burst.
+
+**Two retry policies, chosen per call.** Every pooled connection carries
+`_RETRY_POLICY` — `Retry(ExponentialBackoff(), 3)`, three re-sends over 8 ms→512 ms,
+which covers an ordinary Redis restart — for `ConnectionError` and `TimeoutError`. The
+connection class is redis-py's own (`Connection`, or `SSLConnection`/the unix-socket
+class when the URL selects one) with `_RetryPolicyMixin` in front of it: its `retry`
+property answers `_SINGLE_ATTEMPT` (`Retry(NoBackoff(), 0)`) while `no_retry()` is
+active in the calling task, and the configured policy otherwise. redis-py reads
+`conn.retry` at the start of each `execute_command` and each `Pipeline.execute`, so the
+choice is made per call on a shared connection; the flag is a `ContextVar`, so a
+concurrent task on the same connection keeps its own policy. One pool, no second client.
+
+**What runs under `no_retry()`, and why exactly that set.** redis-py cannot tell a
+connection error raised before the send from one raised after `EXEC` applied, so a
+re-send is a second application. The writers whose second application is wrong are the
+queue's list legs: `push_queue`, `push_queue_batch`, `push_queue_front` (a second
+RPUSH/LPUSH duplicates an entry), `pop_queue` and `pop_queue_and_start_song` (a second
+LPOP retires the next song's entry), and `remove_queue_entries` (a second LREM takes out
+an identical copy still queued). Each returns False/0 on its single failure, and
+`GuildQueue` records that as `mirror_dirty`, so the next song start replaces the list
+from memory — a repair that is itself idempotent and retried. A test asserts the set by
+reading the source, so adding a writer without deciding this fails the suite.
+
+Three writes stay on the retrying policy on purpose:
+
+- `rebuild_queue` / `rebuild_queue_and_start_song` — DEL + RPUSH restates the whole
+  list; a second application yields the same list. These are the repair path, and a
+  retry that lands is strictly better here.
+- `push_history` — a re-send after a lost `EXEC` reply duplicates one entry on the
+  display list (the outbox copy is deduplicated by `play_history_dedup` in Postgres);
+  a single attempt on a stale pooled connection loses the play in both places. The
+  project rule — a duplicate over a loss — decides it.
+- `acquire_recovery_lock` — `SET NX` re-sent after the first applied answers `None`
+  against our own token, so the method follows the reply with a `GET` and owns the lock
+  when the key holds its token. The key decides ownership, not the reply; the re-send
+  is then harmless and the reconnect it buys on a stale connection is what lets
+  recovery proceed after a Redis blip.
+
+**`socket_timeout` is 5 s, written explicitly.** redis-py 8 gives every connection
+`DEFAULT_SOCKET_TIMEOUT = 5` unless told otherwise; `create_redis_pool` names it
+(`_SOCKET_TIMEOUT`) so the value is visible rather than inherited. A read that stalls past
+it is a `RedisTimeoutError`: re-sent under the retrying policy (four attempts, ~20 s in
+all — the figure the queue section measured), failed once under `no_retry()`. The
+`_START_WRITE_TIMEOUT` bound on the start transaction (5 s) therefore coincides with the
+socket timeout of the one attempt it makes.
 
 The pool's `retry_on_error` must name **redis-py's** `ConnectionError`/`TimeoutError`,
 not the builtins of the same name — redis-py's derive from `RedisError`, so the

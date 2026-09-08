@@ -66,6 +66,176 @@ from src.redis_client import (
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
 
+class _Silent:
+    """A pool whose connections never touch a socket: connect and health checks
+    succeed, every send is counted, and every read fails the way a connection
+    dropped mid-reply does. Patched on the pool's OWN connection class, so the
+    retry decision under test is the real one redis-py makes."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.pool = create_redis_pool()
+        self.sends = 0
+        cls = self.pool.connection_class
+
+        async def send(_self: Any, *_a: Any, **_k: Any) -> None:
+            self.sends += 1
+
+        async def read(_self: Any, *_a: Any, **_k: Any) -> Any:
+            raise RedisConnectionError("Connection closed by server.")
+
+        async def ok(_self: Any, *_a: Any, **_k: Any) -> bool:
+            return False
+
+        async def noop(_self: Any, *_a: Any, **_k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(cls, "connect", noop)
+        monkeypatch.setattr(cls, "disconnect", noop)
+        monkeypatch.setattr(cls, "can_read", ok)
+        monkeypatch.setattr(cls, "send_packed_command", send)
+        monkeypatch.setattr(cls, "read_response", read)
+        self.client = aioredis.Redis(connection_pool=self.pool)
+
+
+class TestRetryPolicy:
+    """Which Redis calls redis-py may re-send. The policy lives on the pooled
+    connection and is chosen per call through no_retry(): idempotent commands
+    get the three-attempt backoff, the queue's list writers get one attempt,
+    because a MULTI/EXEC re-sent after its reply was lost applies twice."""
+
+    def test_socket_timeout_is_explicit(self) -> None:
+        conn = create_redis_pool().make_connection()
+        assert conn.socket_timeout == redis_client._SOCKET_TIMEOUT == 5
+
+    def test_no_retry_selects_a_single_attempt_for_the_calling_task(self) -> None:
+        conn = create_redis_pool().make_connection()
+        assert conn.retry.get_retries() == 3
+        with redis_client.no_retry():
+            assert conn.retry.get_retries() == 0
+            assert isinstance(conn.retry._backoff, NoBackoff)
+        assert conn.retry.get_retries() == 3
+
+    async def test_no_retry_is_task_local(self) -> None:
+        """A concurrent task outside the block keeps the retrying policy: the
+        flag is a contextvar, not connection state, so one pooled connection
+        serves both policies without either leaking into the other."""
+        conn = create_redis_pool().make_connection()
+        seen: list[int] = []
+        gate = asyncio.Event()
+
+        async def outsider() -> None:
+            await gate.wait()
+            seen.append(conn.retry.get_retries())
+
+        task = asyncio.create_task(outsider())
+        with redis_client.no_retry():
+            gate.set()
+            await task
+            assert conn.retry.get_retries() == 0
+        assert seen == [3]
+
+    def test_the_url_connection_class_is_wrapped_not_replaced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """rediss:// selects SSLConnection through the URL; the policy mixin
+        has to sit in front of THAT class, and querystring options still win."""
+        from redis.asyncio.connection import SSLConnection
+
+        monkeypatch.setenv("REDIS_URL", "rediss://localhost:6380/2?socket_timeout=7")
+        pool = create_redis_pool()
+        assert issubclass(pool.connection_class, SSLConnection)
+        assert issubclass(pool.connection_class, redis_client._RetryPolicyMixin)
+        conn = pool.make_connection()
+        assert conn.socket_timeout == 7 and conn.db == 2
+        with redis_client.no_retry():
+            assert conn.retry.get_retries() == 0
+
+    async def test_a_start_transaction_is_sent_once_after_a_lost_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ConnectionError after EXEC went out must not re-send the MULTI:
+        the LPOP may already have applied, and a second one retires the next
+        song's entry. The write fails, @_guild_op reports False, and the loop
+        marks the mirror stale instead."""
+        silent = _Silent(monkeypatch)
+        store = GuildRedisStore(silent.client, guild_id=1)
+        assert await store.pop_queue_and_start_song(_entry(1), 1000.0) is False
+        assert silent.sends == 1
+
+    async def test_an_idempotent_read_is_still_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control for the test above: the same failure on HGETALL is re-sent
+        three times (four attempts), so the policy split is real and the
+        harness would have counted the retries."""
+        silent = _Silent(monkeypatch)
+        store = GuildRedisStore(silent.client, guild_id=1)
+        assert await store.get_guild_state() is None
+        assert silent.sends == 4
+
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "push_queue",
+            "push_queue_batch",
+            "push_queue_front",
+            "pop_queue",
+            "remove_queue_entries",
+        ],
+    )
+    async def test_every_list_writer_is_sent_once(
+        self, monkeypatch: pytest.MonkeyPatch, method: str
+    ) -> None:
+        silent = _Silent(monkeypatch)
+        store = GuildRedisStore(silent.client, guild_id=1)
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=1", title="S", requester_id=1
+        )
+        args: dict[str, tuple[Any, ...]] = {
+            "push_queue": (entry,),
+            "push_queue_batch": ([entry],),
+            "push_queue_front": ([entry],),
+            "pop_queue": (),
+            "remove_queue_entries": ([entry],),
+        }
+        result = await getattr(store, method)(*args[method])
+        assert result in (False, 0)
+        assert silent.sends == 1
+
+    def test_exactly_the_non_idempotent_writers_use_no_retry(self) -> None:
+        """Source-level: the set of GuildRedisStore methods executing under
+        no_retry() is exactly the list writers. push_history and the lock are
+        deliberately absent (retried; see their docstrings), and so are the
+        rebuilds, which restate the whole list."""
+        source = Path(redis_client.__file__).read_text()
+        tree = ast.parse(source)
+        store_cls = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "GuildRedisStore"
+        )
+        using: set[str] = set()
+        for method in store_cls.body:
+            if not isinstance(method, ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(method):
+                if isinstance(node, ast.With) and any(
+                    isinstance(item.context_expr, ast.Call)
+                    and isinstance(item.context_expr.func, ast.Name)
+                    and item.context_expr.func.id == "no_retry"
+                    for item in node.items
+                ):
+                    using.add(method.name)
+        assert using == {
+            "push_queue",
+            "push_queue_batch",
+            "push_queue_front",
+            "pop_queue",
+            "pop_queue_and_start_song",
+            "remove_queue_entries",
+        }
+
+
 class TestCreateRedisPool:
     def test_returns_connection_pool(self) -> None:
         pool = create_redis_pool()
@@ -2298,6 +2468,32 @@ class TestRecoveryLock:
         await fake_redis.set(store._recovery_lock_key(), "1", nx=True, ex=60)
         acquired = await store.acquire_recovery_lock()
         assert acquired is False
+
+    async def test_acquire_owns_a_lock_whose_set_reply_was_lost(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The retrying policy re-sends SET NX after a connection error; when
+        the first send applied, the second answers None. The key holds our
+        token, so we own the lock — and release must be able to delete it."""
+        original = fake_redis.set
+
+        async def set_and_lose_the_reply(*args: Any, **kwargs: Any) -> None:
+            await original(*args, **kwargs)
+            return None
+
+        with patch.object(fake_redis, "set", new=set_and_lose_the_reply):
+            assert await store.acquire_recovery_lock() is True
+        assert store._recovery_lock_token is not None
+        await store.release_recovery_lock()
+        assert await fake_redis.exists(store._recovery_lock_key()) == 0
+
+    async def test_acquire_does_not_own_another_holders_lock(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Same None reply, but the key holds someone else's token."""
+        await fake_redis.set(store._recovery_lock_key(), "theirs", nx=True, ex=60)
+        assert await store.acquire_recovery_lock() is False
+        assert store._recovery_lock_token is None
 
     async def test_acquire_returns_none_on_error(
         self, broken_store: GuildRedisStore

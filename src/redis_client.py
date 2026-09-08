@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Concatenate, Final, Optional, ParamSpec, TypeVar, cast
@@ -10,7 +12,8 @@ from typing import Any, Concatenate, Final, Optional, ParamSpec, TypeVar, cast
 import orjson
 import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
-from redis.backoff import ExponentialBackoff
+from redis.asyncio.connection import parse_url
+from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
 from redis.exceptions import RedisError
@@ -129,15 +132,71 @@ def _fmt_position(secs: float) -> str:
 # Past the wait it is a ConnectionError, swallowed like any other failure.
 _POOL_ACQUIRE_TIMEOUT = 10  # seconds
 
+# redis-py's own per-connection default, written out so it is visible: a read
+# that stalls past it is a RedisTimeoutError, re-sent under the retry policy
+# below and failed once under no_retry().
+_SOCKET_TIMEOUT = 5  # seconds
+
+# The retry policy for everything idempotent: 3 attempts over
+# ExponentialBackoff's 8ms→512ms covers an ordinary Redis restart.
+# `redis.asyncio.retry.Retry`, not `redis.retry.Retry`: same name and
+# constructor, but only the async one awaits, and only attempt counts tell
+# them apart. docs/ARCHITECTURE.md#redis-connection-retry.
+_RETRY_POLICY = Retry(ExponentialBackoff(), 3)
+_SINGLE_ATTEMPT = Retry(NoBackoff(), 0)
+# Set by no_retry() in the calling task; read by _RetryPolicyMixin.retry.
+_NO_RETRY_ACTIVE: ContextVar[bool] = ContextVar("redis_no_retry", default=False)
+
+
+@contextlib.contextmanager
+def no_retry() -> Iterator[None]:
+    """Run the enclosed Redis calls with a single attempt each. For writes that
+    are not idempotent under re-send (LPOP, RPUSH, LPUSH, LREM): redis-py
+    re-sends a whole MULTI/EXEC after a ConnectionError or TimeoutError, and
+    one raised after EXEC applied would apply it twice. The call fails instead
+    and the caller records the divergence (GuildQueue.mirror_dirty).
+    See docs/ARCHITECTURE.md#redis-connection-retry."""
+    token = _NO_RETRY_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _NO_RETRY_ACTIVE.reset(token)
+
+
+class _RetryPolicyMixin:
+    """Makes a connection's `retry` answer per call: the configured policy, or
+    a single attempt while no_retry() is active in the calling task. redis-py
+    reads `conn.retry` at the start of each command and pipeline execute, so
+    one pooled connection serves both policies."""
+
+    _retry_policy: Retry
+
+    @property
+    def retry(self) -> Retry:
+        return _SINGLE_ATTEMPT if _NO_RETRY_ACTIVE.get() else self._retry_policy
+
+    @retry.setter
+    def retry(self, value: Retry) -> None:
+        self._retry_policy = value
+
+
+def _policy_connection_class(
+    base: type[aioredis.Connection],
+) -> type[aioredis.Connection]:
+    """`base` with the retry-policy mixin ahead of it in the MRO, so the
+    property wins over the attribute redis-py's __init__ assigns."""
+    return type(f"Policy{base.__name__}", (_RetryPolicyMixin, base), {})
+
 
 def create_redis_pool() -> aioredis.BlockingConnectionPool:
     """Create the application-wide connection pool. Call once at startup."""
-    return aioredis.BlockingConnectionPool.from_url(
-        os.getenv("REDIS_URL", "redis://localhost:6379"),
+    kwargs: dict[str, Any] = dict(
         max_connections=20,
         timeout=_POOL_ACQUIRE_TIMEOUT,
         decode_responses=False,
         socket_keepalive=True,
+        socket_timeout=_SOCKET_TIMEOUT,
+        socket_connect_timeout=5,
         health_check_interval=30,
         retry_on_timeout=True,
         # redis-py's OWN exception classes: `redis.exceptions.ConnectionError`
@@ -145,12 +204,19 @@ def create_redis_pool() -> aioredis.BlockingConnectionPool:
         # would match nothing redis-py raises — invisibly, since every store
         # method logs-and-swallows.
         retry_on_error=[RedisConnectionError, RedisTimeoutError],
-        # 3 attempts over ExponentialBackoff's 8ms→512ms covers an ordinary
-        # restart. `redis.asyncio.retry.Retry`, not `redis.retry.Retry`: same
-        # name and constructor, but only the async one awaits, and only attempt
-        # counts tell them apart. docs/ARCHITECTURE.md#redis-connection-retry.
-        retry=Retry(ExponentialBackoff(), 3),
-        socket_connect_timeout=5,
+        retry=_RETRY_POLICY,
+    )
+    # What BlockingConnectionPool.from_url does, except that the URL's own
+    # connection class (SSLConnection for rediss://, the unix-socket class for
+    # unix://) is wrapped rather than replaced. Querystring options win.
+    url_options = dict(parse_url(os.getenv("REDIS_URL", "redis://localhost:6379")))
+    base = cast(
+        type[aioredis.Connection],
+        url_options.pop("connection_class", aioredis.Connection),
+    )
+    kwargs.update(url_options)
+    return aioredis.BlockingConnectionPool(
+        connection_class=_policy_connection_class(base), **kwargs
     )
 
 
@@ -662,7 +728,8 @@ class GuildRedisStore:
     # The four list-leg writers below return whether they LANDED, and the
     # caller must check: memory has already moved, so a swallowed failure
     # leaves the list disagreeing with it, which GuildQueue records as
-    # mirror_dirty and repairs at the next song start.
+    # mirror_dirty and repairs at the next song start. Each executes under
+    # no_retry(): a re-sent push or pop would move the list twice.
 
     @_guild_op(default=False)
     async def push_queue(self, entry: QueueEntry) -> bool:
@@ -670,7 +737,8 @@ class GuildRedisStore:
         pipe = self.redis.pipeline()
         pipe.rpush(self.queue_key(), entry.to_redis())
         self._pipe_expire_all(pipe)
-        await pipe.execute()
+        with no_retry():
+            await pipe.execute()
         return True
 
     @_guild_op(default=False)
@@ -681,7 +749,8 @@ class GuildRedisStore:
         pipe = self.redis.pipeline()
         pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
         self._pipe_expire_all(pipe)
-        await pipe.execute()
+        with no_retry():
+            await pipe.execute()
         return True
 
     @_guild_op(default=False)
@@ -695,14 +764,16 @@ class GuildRedisStore:
         pipe = self.redis.pipeline()
         pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
         self._pipe_expire_all(pipe)
-        await pipe.execute()
+        with no_retry():
+            await pipe.execute()
         return True
 
     @_guild_op(default=False)
     async def pop_queue(self) -> bool:
         """LPOP the head. At-most-once: LPOP has no ack, so a crash after this
         loses the song from Redis; the in-memory deque is the source of truth."""
-        await self.redis.lpop(self.queue_key())
+        with no_retry():
+            await self.redis.lpop(self.queue_key())
         return True
 
     def _now_playing_state_mapping(
@@ -779,12 +850,14 @@ class GuildRedisStore:
         every now-playing field set, never absent from both. Returns whether
         the transaction landed, and THE CALLER MUST CHECK: the in-memory settle
         already happened, so a swallowed failure leaves the list holding an
-        entry memory does not (GuildQueue.note_mirror_write)."""
+        entry memory does not (GuildQueue.note_mirror_write). no_retry():
+        a re-sent transaction LPOPs twice."""
         pipe = self._start_song_pipeline(
             current, play_start_epoch, now_playing, start_offset
         )
         pipe.lpop(self.queue_key())
-        await pipe.execute()
+        with no_retry():
+            await pipe.execute()
         return True
 
     @_guild_op(default=False)
@@ -798,7 +871,8 @@ class GuildRedisStore:
     ) -> bool:
         """pop_queue_and_start_song with the list REPLACED by `entries` instead
         of LPOPed — for a mirror the caller knows is stale. DELETE + RPUSH ride
-        the same MULTI as the state fields. Returns whether it landed."""
+        the same MULTI as the state fields. Returns whether it landed. Retried
+        like the reads: restating the whole list is idempotent under re-send."""
         pipe = self._start_song_pipeline(
             current, play_start_epoch, now_playing, start_offset
         )
@@ -861,7 +935,8 @@ class GuildRedisStore:
             # redis-py's stub types `value` as str; its encoder takes bytes.
             pipe.lrem(self.queue_key(), count, blob)  # pyright: ignore[reportArgumentType]
         pipe.expire(self.queue_key(), GUILD_TTL)
-        replies = await pipe.execute()
+        with no_retry():  # a re-sent LREM takes out a second identical copy
+            replies = await pipe.execute()
         return sum(cast(list[int], replies[:-1]))  # the last reply is the EXPIRE
 
     # History operations
@@ -896,7 +971,12 @@ class GuildRedisStore:
         On the SWALLOWING side of the split, unlike the drain helpers: the
         playback loop must never die because Redis blinked. So the producer can
         never report a mis-shaped outbox, which is why ensure_outbox_group()
-        aborts at STARTUP instead."""
+        aborts at STARTUP instead.
+
+        Retried, unlike the queue writers: a re-send after a lost EXEC reply
+        duplicates one display entry (the archive dedups on its unique index),
+        where a single attempt on a stale pooled connection loses the play in
+        both places. docs/ARCHITECTURE.md#redis-connection-retry."""
         wire = serialize_history_entry(entry)
         try:
             await self._push_history_pipeline(wire)
@@ -1258,10 +1338,12 @@ class GuildRedisStore:
         progress. The value is a per-acquisition random token, so release can
         prove the lock it deletes is still the one this store acquired."""
         token = secrets.token_hex(16)
-        result = await self.redis.set(
-            self._recovery_lock_key(), token, nx=True, ex=self._RECOVERY_LOCK_TTL
-        )
-        if result is True:
+        key = self._recovery_lock_key()
+        result = await self.redis.set(key, token, nx=True, ex=self._RECOVERY_LOCK_TTL)
+        # A re-sent SET NX (the first reply lost to a connection error after
+        # the write applied) answers None against our own token: the key
+        # decides ownership, not the reply.
+        if result is True or await self.redis.get(key) == token.encode():
             self._recovery_lock_token = token
             return True
         return False

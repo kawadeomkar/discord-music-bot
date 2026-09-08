@@ -501,8 +501,9 @@ class GuildQueue:
         caller-side, outside the hold). `generation` is the value captured
         beside the claim; a prefetched claim passes the current value and is
         refused by the cursor reset instead. Keep the body to ONE bounded Redis
-        write and never touch Discord in it (the pool sets no socket_timeout);
-        vc.play() belongs inside or after the commit, never before.
+        write and never touch Discord in it (a stalled write holds the mutex
+        for the socket timeout); vc.play() belongs inside or after the commit,
+        never before.
         See docs/ARCHITECTURE.md#queue-operations."""
         async with self._mutex:
             if generation != self._generation:
