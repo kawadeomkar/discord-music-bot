@@ -53,6 +53,7 @@ from redis.exceptions import OutOfMemoryError
 
 from src.guild_state import HistoryEntry, SongQueueEntry
 from src.redis_client import (
+    create_redis_pool,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
     HISTORY_OUTBOX_GROUP,
@@ -117,6 +118,12 @@ def redis_url() -> Iterator[str]:
         warnings.filterwarnings(
             "ignore",
             message=r".*wait_container_is_ready decorator is deprecated.*",
+            category=DeprecationWarning,
+        )
+        # testcontainers 4.15 also deprecates the module path itself.
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*testcontainers\.redis is deprecated.*",
             category=DeprecationWarning,
         )
         from testcontainers.redis import RedisContainer
@@ -634,9 +641,12 @@ class TestOutboxKeyIsNonEvictable:
 
 class TestConfigReadsSurviveTheConnectionCap:
     """The divergence this tier exists for. fakeredis has no connection pool, so a
-    per-guild fan-out looks perfect there and fails on a real server the moment a
-    bot passes `max_connections` guilds — silently, because @_guild_op turns the
-    pool's error into an all-unset config that reads as "this guild never chose"."""
+    per-guild fan-out looks perfect there; on a real server a NON-BLOCKING pool
+    fails every operation past `max_connections` — silently, because @_guild_op
+    turns the pool's error into an all-unset config that reads as "this guild
+    never chose". The app pool blocks at its cap (create_redis_pool), which the
+    last test proves against the same server; read_guild_configs batches anyway,
+    since one round trip per batch beats queueing sixty."""
 
     @staticmethod
     async def _client(redis_url: str) -> tuple[aioredis.Redis, Any]:
@@ -648,10 +658,10 @@ class TestConfigReadsSurviveTheConnectionCap:
     async def test_the_naive_per_guild_fanout_really_does_lose_guilds(
         self, redis_url: str
     ) -> None:
-        """The bug, pinned. Not hypothetical and not a timing artefact: the pool
-        RAISES `MaxConnectionsError` rather than queueing (that is
-        BlockingConnectionPool), and the raise happens before `call_with_retry`, so
-        the configured retry never applies. Exactly `max_connections` survive."""
+        """redis-py's non-blocking pool, pinned. Not hypothetical and not a timing
+        artefact: it RAISES `MaxConnectionsError` rather than queueing, and the
+        raise happens before `call_with_retry`, so a configured retry never
+        applies. Exactly `max_connections` survive."""
         client, pool = await self._client(redis_url)
         try:
             await client.flushdb()
@@ -684,6 +694,32 @@ class TestConfigReadsSurviveTheConnectionCap:
 
             assert sorted(configs) == ids
             assert all(c.debug_mode is True for c in configs.values())
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+    async def test_the_app_pool_queues_past_its_cap(
+        self, redis_url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """create_redis_pool's BlockingConnectionPool against the same server
+        and the same 60-way fan-out: every guild answers, because a caller past
+        the cap waits for a connection instead of failing. This is the property
+        on_ready's restore fan-out relies on as its backstop."""
+        monkeypatch.setenv("REDIS_URL", redis_url)
+        pool = create_redis_pool()
+        client = aioredis.Redis(connection_pool=pool)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            configs = await asyncio.gather(
+                *(GuildRedisStore(client, g).get_config() for g in ids)
+            )
+
+            assert sum(c.debug_mode is True for c in configs) == 60
         finally:
             await client.flushdb()
             await client.aclose()
