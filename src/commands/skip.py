@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
-from src.util import fmt_duration, notice_embed
+from src.util import INLINE_TITLE_MAX, fmt_duration, notice_embed, safe_label
 
 
 async def run(ctx: commands.Context, *, mp: Optional[MusicPlayer]) -> None:
@@ -29,7 +29,8 @@ async def run(ctx: commands.Context, *, mp: Optional[MusicPlayer]) -> None:
     if vc.is_paused() and mp is not None:
         song = mp.current_song
         if song is not None:
-            skipped_title = song.title
+            # Rendered in bold beside a code span; a title can close either.
+            skipped_title = safe_label(song.title or "", INLINE_TITLE_MAX)
             # position_secs is frozen while paused: the exact leave point.
             skipped_position = fmt_duration(int(song.position_secs))
 

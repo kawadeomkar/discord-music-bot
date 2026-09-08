@@ -215,6 +215,8 @@ EMBED_FIELD_LIMIT = 1024
 
 # One row of a multi-row field of user-supplied titles; ten share one field.
 ECHO_ROW_MAX = 70
+# One title rendered inline in a notice's text — bold, or beside a link.
+INLINE_TITLE_MAX = 200
 
 
 # Control characters end a rendered embed line early; they have no visible form.

@@ -41,6 +41,7 @@ from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
+    INLINE_TITLE_MAX,
     cancel_task,
     spawn_background,
     fmt_duration,
@@ -933,7 +934,8 @@ class MusicPlayer:
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
-                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
+                f"Playing now: {safe_label(started.title, INLINE_TITLE_MAX)} - "
+                f"({started.webpage_url})\n\n"
                 f"**{count}** {songs} from the previous session "
                 f"{verb} after it."
             ),
@@ -1512,7 +1514,7 @@ class MusicPlayer:
         else:
             paused_at = fmt_duration(position)
         return discord.Embed(
-            title=f"⏸️ Paused: {song.title}",
+            title=truncate_embed_title(f"⏸️ Paused: {song.title}"),
             description=f"Paused at: `{paused_at}`",
             color=discord.Color.orange(),
         )
@@ -2186,13 +2188,14 @@ class MusicPlayer:
         send_with_np would adopt the notice only for _send_now_playing to immediately
         retire it."""
         position = fmt_duration(int(song.position_secs))
+        title = safe_label(song.title or "", INLINE_TITLE_MAX)
         if song.start_paused:
             text = (
-                f"⏮ Returned to **{song.title}** at `{position}` — still paused. "
+                f"⏮ Returned to **{title}** at `{position}` — still paused. "
                 f"Use `-resume` to continue."
             )
         else:
-            text = f"⏮ Resuming **{song.title}** at `{position}`"
+            text = f"⏮ Resuming **{title}** at `{position}`"
         try:
             await self._channel.send(embed=self._notice(text, discord.Color.blue()))
         except Exception as e:
@@ -2301,8 +2304,8 @@ class MusicPlayer:
         if self.store is not None and song.webpage_url:
             await invalidate_stream_cache(self.store.redis, song.webpage_url)
         embed = self._notice(
-            f"Could not play **{song.title}** — YouTube refused the audio "
-            "stream. Queue it again to retry.",
+            f"Could not play **{safe_label(song.title or '', INLINE_TITLE_MAX)}** — "
+            "YouTube refused the audio stream. Queue it again to retry.",
             discord.Color.red(),
         )
         try:

@@ -144,6 +144,30 @@ class TestSkipCommand:
         assert "Paused Song" in embed.description
         assert "1:23" in embed.description  # frozen position, not 83.4
 
+    async def test_paused_skip_neutralizes_the_title(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The title lands in bold beside a code span; a yt-dlp title can close
+        either and forge a link."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=True)
+        vc.stop = MagicMock()
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+        mp = MagicMock(spec=MusicPlayer)
+        mp.current_song = MagicMock(
+            title="evil](https://x.example) `x` " + "A" * 300, position_secs=1.0
+        )
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "](https://x.example)" not in embed.description
+        assert "A" * 300 not in embed.description
+
     async def test_paused_skip_without_current_song_sends_no_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

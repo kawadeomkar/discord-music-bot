@@ -160,6 +160,38 @@ class TestPlaynow:
         assert "nearly finished" in embed.description
         assert "will not resume" in embed.description
 
+    async def test_the_interrupted_title_cannot_forge_markup(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The title sits inside bold beside a code span; a yt-dlp title can carry
+        `]`, backticks and 300 characters, and the embed title has a 256 cap."""
+        from src.musicplayer import InterjectOutcome
+
+        live_mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="evil](https://x.example) `code` " + "A" * 300,
+                resume_position=30,
+                was_paused=False,
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "B" * 300, mock_ctx.author)
+        )
+
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "](https://x.example)" not in embed.description
+        assert "`code`" not in embed.description
+        assert "A" * 300 not in embed.description
+        assert len(embed.title) <= 256
+
     async def test_live_stream_wording(
         self,
         music_bot: MusicBot,

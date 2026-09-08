@@ -20,7 +20,13 @@ from src import config
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import current_traceparent, fmt_duration, get_logger
+from src.util import (
+    INLINE_TITLE_MAX,
+    current_traceparent,
+    fmt_duration,
+    get_logger,
+    safe_label,
+)
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -1050,7 +1056,7 @@ class YTDL(discord.FFmpegOpusAudio):
             if e.unsupported:
                 trace.get_current_span().set_attribute("ytdl.unsupported_url", True)
                 raise Exception(
-                    f"This link isn't from a site I can play: {search}. Try a "
+                    f"This link isn't from a site I can play: {safe_label(search, INLINE_TITLE_MAX)}. Try a "
                     "YouTube, Spotify, or SoundCloud link, another yt-dlp-supported "
                     "site, or just search by name."
                 ) from e

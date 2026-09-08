@@ -5169,6 +5169,17 @@ class TestPlayerDebugDecoration:
         embed = music_player._channel.send.call_args.kwargs["embed"]
         assert "🐞" in (embed.footer.text or "")
 
+    async def test_the_dead_stream_notice_neutralizes_the_title(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.store = None
+        music_player._channel.send = AsyncMock()
+        mock_song.title = "evil](https://x.example) " + "A" * 300
+        await music_player._handle_dead_stream(mock_song)
+        embed = music_player._channel.send.call_args.kwargs["embed"]
+        assert "](https://x.example)" not in embed.description
+        assert "A" * 300 not in embed.description
+
     async def test_the_playback_error_embed_is_decorated(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
@@ -10930,6 +10941,16 @@ class TestNeutralizePrefetch:
 
 
 class TestAnnounceResume:
+    async def test_title_is_neutralized(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
+    ) -> None:
+        live_song.title = "evil](https://x.example) `x` " + "A" * 300
+        live_song.is_resume = True
+        await music_player._announce_resume(live_song)
+        embed = mock_channel.send.call_args.kwargs["embed"]
+        assert "](https://x.example)" not in embed.description
+        assert "A" * 300 not in embed.description
+
     async def test_playing_wording(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
     ) -> None:

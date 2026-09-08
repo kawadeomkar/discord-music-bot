@@ -603,6 +603,29 @@ class TestYTSource:
                     user_input=None,
                 )
 
+    async def test_unsupported_site_message_neutralizes_the_input(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """What the user typed is echoed back inside the reply; a crafted input
+        must not close the surrounding markdown or run to thousands of chars."""
+        url = "https://example.com/](https://x.example) " + "A" * 300
+        cause = UnsupportedError(url)
+        wrapped = DownloadError(
+            "ERROR: Unsupported URL", cast(Any, (type(cause), cause, None))
+        )
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = wrapped
+            with pytest.raises(Exception, match="isn't from a site I can play") as e:
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    url,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+        assert "](https://x.example)" not in str(e.value)
+        assert "A" * 300 not in str(e.value)
+
     async def test_yt_source_reraises_non_unsupported_extraction_error(
         self, mock_ctx: MagicMock
     ) -> None:

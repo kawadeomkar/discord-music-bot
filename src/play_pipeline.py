@@ -33,12 +33,14 @@ from src.sources import (
 from src.telemetry import get_tracer
 from src.util import (
     ECHO_ROW_MAX,
+    INLINE_TITLE_MAX,
     get_logger,
     notice_embed,
     pluralize,
     queue_message,
     safe_label,
     send_embed,
+    truncate_embed_title,
 )
 from src.youtube import YTDL, QueueObject
 
@@ -500,7 +502,7 @@ async def interject_flow(
         await asyncio.gather(
             send_embed(
                 ctx,
-                f"▶️ Playing next: {qobj.title}",
+                truncate_embed_title(f"▶️ Playing next: {qobj.title}"),
                 f"Requested by: [{ctx.author.mention}]\n"
                 "The song being interrupted already ended — "
                 "queued to play next instead.",
@@ -511,36 +513,31 @@ async def interject_flow(
         )
         return
 
+    # Inside bold and beside a code span: a yt-dlp title can close either.
+    interrupted = safe_label(outcome.interrupted_title, INLINE_TITLE_MAX)
     if outcome.live:
         desc = (
-            f"**{outcome.interrupted_title}** is a live stream, so it will not "
-            "come back afterwards."
+            f"**{interrupted}** is a live stream, so it will not come back afterwards."
         )
     elif outcome.resume_position is None:
-        desc = (
-            f"**{outcome.interrupted_title}** was nearly finished and will not resume."
-        )
+        desc = f"**{interrupted}** was nearly finished and will not resume."
     elif outcome.returns_paused:
         # returns_paused, not was_paused: with resume_paused=False a paused
         # song comes back playing.
         desc = (
-            f"**{outcome.interrupted_title}** will return paused at "
-            f"`{outcome.resume_position_str}`."
+            f"**{interrupted}** will return paused at `{outcome.resume_position_str}`."
         )
     elif outcome.was_paused:
         desc = (
-            f"**{outcome.interrupted_title}** was paused at "
-            f"`{outcome.resume_position_str}` and will resume from there."
+            f"**{interrupted}** was paused at `{outcome.resume_position_str}` "
+            "and will resume from there."
         )
     else:
-        desc = (
-            f"**{outcome.interrupted_title}** will resume at "
-            f"`{outcome.resume_position_str}`."
-        )
+        desc = f"**{interrupted}** will resume at `{outcome.resume_position_str}`."
     await asyncio.gather(
         send_embed(
             ctx,
-            f"▶️ Playing now: {qobj.title}",
+            truncate_embed_title(f"▶️ Playing now: {qobj.title}"),
             f"Requested by: [{ctx.author.mention}]\n{desc}",
             discord.Color.blue(),
             thumbnail=qobj.thumbnail,
