@@ -16,8 +16,10 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src import hostguard
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
+from src.sources import looks_like_url
 from src.telemetry import get_tracer
 from src.util import current_traceparent, fmt_duration, get_logger
 from src.ytdlp_pool import YtdlpPool
@@ -68,6 +70,25 @@ class ExtractionError(Exception):
         if message.startswith(prefix):
             message = message[len(prefix) :]
         return message or "Couldn't load this track."
+
+
+class UnsafeHostError(ExtractionError):
+    """A link, or the media URL it resolved to, names a host the bot will not
+    fetch from (hostguard). Raised in the parent only; an ExtractionError so
+    _command_error renders `user_message`, which is the whole message."""
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(message, original_type="UnsafeHostError", expected=True)
+
+
+async def _ensure_public_host(url: str, *, what: str) -> None:
+    """Raise UnsafeHostError unless `url` names a host on the public internet.
+    `what` is the URL's role in the sentence ("that link", "its media URL").
+    See docs/ARCHITECTURE.md#fetch-host-policy."""
+    reason = await hostguard.refusal_reason(url)
+    if reason is not None:
+        trace.get_current_span().set_attribute("ytdl.unsafe_host", True)
+        raise UnsafeHostError(f"I won't fetch {what}: {reason}")
 
 
 def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
@@ -284,6 +305,11 @@ _YTDL_BASE_OPTS = {
     "source_address": "0.0.0.0",
     "socket_timeout": 30,
     "extractor_args": _EXTRACTOR_ARGS,
+    # Every site with a dedicated extractor, minus `generic`, which fetches the
+    # input URL itself and would make any host a media source. `end` is the
+    # catch-all that reports an unmatched URL as UnsupportedError, disabled by
+    # default and re-added last. See docs/ARCHITECTURE.md#fetch-host-policy.
+    "allowed_extractors": ["default", "-generic", "end"],
     # No rm_cachedir: yt-dlp's JS player cache means the signature JS is fetched
     # only on a new player version, not per call.
 }
@@ -303,13 +329,6 @@ _YTDL_STREAM_OPTS = {
     "check_formats": False,
     "retries": 10,
     "playlist_items": "1",
-}
-
-# yt_source's unified extraction: one stream-opts call returns identity AND a
-# playable URL, so both caches are written from one network round.
-_YTDL_STREAM_SEARCH_OPTS = {
-    **_YTDL_STREAM_OPTS,
-    "default_search": "auto",
 }
 
 # yt_playlist: entry metadata without per-video stream extraction. extract_flat
@@ -478,10 +497,10 @@ class ProbeSessionClosed(RuntimeError):
 
 def _get_probe_session() -> aiohttp.ClientSession:
     """The process's probe session, created on first use so it binds to the
-    running loop. DummyCookieJar is required: `-play <any url>` reaches this
-    session, so a real jar lets one guild set a `Domain=com` cookie that is
-    replayed to googlevideo for every guild until restart. Rebuilt if closed
-    from outside, never after close_probe_session()."""
+    running loop. DummyCookieJar is required: the media host a `-play` probes
+    is chosen by the linked site, so a real jar lets one guild set a
+    `Domain=com` cookie that is replayed to googlevideo for every guild until
+    restart. Rebuilt if closed from outside, never after close_probe_session()."""
     global _probe_session
     if _probe_session_closed:
         raise ProbeSessionClosed("stream-probe session is closed")
@@ -821,6 +840,8 @@ class YTDL(discord.FFmpegOpusAudio):
             trace.get_current_span().set_attribute(
                 "ytdl.extract_success", data is not None
             )
+            if data is not None and (media_url := data.get("url")):
+                await _ensure_public_host(media_url, what="its media URL")
         except Exception as e:
             trace.get_current_span().record_exception(e)
             trace.get_current_span().set_status(
@@ -876,6 +897,9 @@ class YTDL(discord.FFmpegOpusAudio):
                     raise RuntimeError("Could not extract stream data")
                 extracted_fresh = True
 
+            # Cached or fresh: the probe and ffmpeg both open this host.
+            if media_url := data.get("url"):
+                await _ensure_public_host(media_url, what="its media URL")
             probe = await _probe_stream_url(data.get("url", ""))
             span.set_attribute("ytdl.stream_probe", probe.value)
 
@@ -1036,14 +1060,21 @@ class YTDL(discord.FFmpegOpusAudio):
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
 
+        # yt-dlp is handed a link or an explicit `ytsearch:`; a bare title (a
+        # Spotify track) is wrapped here, because no extractor guesses for it.
+        if looks_like_url(search):
+            await _ensure_public_host(search, what="that link")
+            target = search
+        elif search.startswith("ytsearch"):
+            target = search
+        else:
+            target = f"ytsearch:{search}"
         # One stream-opts extraction yields identity AND a playable URL, filling
         # both caches from one network round. process stays True: unprocessed,
         # data["url"] is absent and the stream-cache write silently never happens.
         try:
             data = await _run_extract(
-                ExtractRequest(
-                    url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
-                )
+                ExtractRequest(url=target, opts=_YTDL_STREAM_OPTS, download=download)
             )
         except ExtractionError as e:
             # parse_url whitelists no domains; an unrecognised site arrives as
@@ -1083,6 +1114,10 @@ class YTDL(discord.FFmpegOpusAudio):
 
         # cast: `selected` is one entry now, which the checker cannot verify.
         video_data = cast(YTDLVideoInfo, selected)
+        # Before anything is cached or queued: a refused media host fails the
+        # command here rather than the song at play time.
+        if media_url := video_data.get("url"):
+            await _ensure_public_host(media_url, what="the media URL behind that link")
 
         webpage_url = video_data["webpage_url"]
         title = video_data.get("title", "")

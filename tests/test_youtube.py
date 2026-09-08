@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import redis.asyncio as aioredis
+import ipaddress
 import pickle
 from dataclasses import FrozenInstanceError, replace
 import threading
@@ -23,6 +24,7 @@ from yarl import URL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
+from src import hostguard
 from src.guild_state import Analytics
 from src.youtube import (
     YTDL,
@@ -34,7 +36,6 @@ from src.youtube import (
     _UNUSED_INFO_COLLECTIONS,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
-    _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
     _record_serving_format,
     _run_extract,
@@ -457,16 +458,42 @@ class TestYTDLOpts:
         in full for the one yt_source keeps. Both single-song profiles carry the
         cap; the playlist profile must NOT, or -play <playlist> queues one song."""
         assert _YTDL_STREAM_OPTS["playlist_items"] == "1"
-        assert _YTDL_STREAM_SEARCH_OPTS["playlist_items"] == "1"
         assert "playlist_items" not in _YTDL_PLAYLIST_OPTS
 
     def test_source_address_is_ipv4_any(self) -> None:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
-    def test_default_search_is_auto(self) -> None:
-        # Default_search belongs to yt_source's unified search opts, not the stream opts
-        assert _YTDL_STREAM_SEARCH_OPTS["default_search"] == "auto"
+    def test_no_default_search(self) -> None:
+        """yt_source wraps a bare title in `ytsearch:` itself; only the generic
+        extractor ever read default_search, and it is excluded."""
         assert "default_search" not in _YTDL_STREAM_OPTS
+
+    def test_generic_extractor_is_excluded_and_unsupported_still_reports(
+        self,
+    ) -> None:
+        """`generic` fetches the input URL itself, which is the SSRF surface; `end`
+        (UnsupportedURLIE, disabled by default) is what turns an unmatched URL
+        into the UnsupportedError yt_source keys its friendly message off, so it
+        must be re-added and must come LAST — its _VALID_URL is `.*`."""
+        import yt_dlp
+
+        assert YTDL_OPTS["allowed_extractors"] == ["default", "-generic", "end"]
+        ydl = yt_dlp.YoutubeDL(
+            {"quiet": True, "allowed_extractors": YTDL_OPTS["allowed_extractors"]}
+        )
+        # The registry is private; there is no public listing of loaded extractors.
+        ies: dict[str, Any] = ydl._ies  # pyright: ignore[reportAttributeAccessIssue]
+        names = list(ies)
+        assert "Generic" not in names
+        assert names[-1] == "UnsupportedURL"
+        # The flows that used to lean on generic's default_search resolve directly.
+        for url, expected in (
+            ("ytsearch:foo", "YoutubeSearch"),
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Youtube"),
+            ("https://soundcloud.com/artist/track", "Soundcloud"),
+        ):
+            first = next(k for k, ie in ies.items() if ie.suitable(url))
+            assert first == expected, url
 
     def test_ytdlp_warnings_are_not_suppressed(self) -> None:
         """yt-dlp's warnings are the early-warning system for YouTube changing the rules
@@ -510,16 +537,8 @@ class TestYtdlpLogger:
     def test_stream_opts_have_format(self) -> None:
         assert _YTDL_STREAM_OPTS["format"] == "bestaudio/best[height<=360]/best"
 
-    def test_unified_search_opts_carry_stream_format(self) -> None:
-        """yt_source's single extraction must select a playable stream — the unified
-        play path populates the ytdl:stream cache from
-        the same call, which only works with the stream format ladder and its retry
-        budget. Dropping the format key would silently revert to double extraction."""
-        assert _YTDL_STREAM_SEARCH_OPTS["format"] == _YTDL_STREAM_OPTS["format"]
-        assert _YTDL_STREAM_SEARCH_OPTS["retries"] == _YTDL_STREAM_OPTS["retries"]
-
     def test_no_verbose_or_rm_cachedir(self) -> None:
-        for opts in (_YTDL_STREAM_SEARCH_OPTS, _YTDL_STREAM_OPTS):
+        for opts in (_YTDL_PLAYLIST_OPTS, _YTDL_STREAM_OPTS):
             assert not opts.get("verbose")
             assert not opts.get("rm_cachedir")
 
@@ -915,8 +934,34 @@ class TestYTSourceUnifiedExtraction:
                 user_input=None,
             )
         req = mock_extract.call_args[0][0]
-        assert req.opts is _YTDL_STREAM_SEARCH_OPTS
+        assert req.opts is _YTDL_STREAM_OPTS
         assert req.process is True
+
+    @pytest.mark.parametrize(
+        "search,target",
+        [
+            ("My Track Artist", "ytsearch:My Track Artist"),
+            ("ytsearch:already wrapped", "ytsearch:already wrapped"),
+            ("https://yt.com/watch?v=direct", "https://yt.com/watch?v=direct"),
+            ("youtu.be/direct", "youtu.be/direct"),
+        ],
+    )
+    async def test_a_bare_title_is_wrapped_in_ytsearch(
+        self, mock_ctx: MagicMock, search: str, target: str
+    ) -> None:
+        """A Spotify track arrives as its title; with the generic extractor (and
+        its default_search guessing) gone, yt_source is what makes it a search."""
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()
+        ) as mock_extract:
+            await YTDL.yt_source(
+                mock_ctx.author,
+                search,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+        assert mock_extract.call_args[0][0].url == target
 
     async def test_fresh_extraction_writes_both_caches(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -1045,6 +1090,122 @@ class TestYTSourceUnifiedExtraction:
         assert result.duration == 180
         assert result.uploader == "Test Channel"
         assert result.thumbnail == "https://img.yt.com/test.jpg"
+
+
+_PRIVATE = [ipaddress.ip_address("10.0.0.7")]
+
+
+class TestFetchHostPolicy:
+    """Every host the bot would connect to is checked against hostguard first:
+    the pasted link before yt-dlp fetches it, and the media URL before the probe
+    and ffmpeg open it — on the -play path, at prefetch, and at play time."""
+
+    async def test_a_link_on_a_private_host_is_refused_before_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, public_hosts: AsyncMock
+    ) -> None:
+        from src.youtube import UnsafeHostError
+
+        public_hosts.return_value = _PRIVATE
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            with pytest.raises(UnsafeHostError) as caught:
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "https://intranet.example/stream/1",
+                    redis=fake_redis,
+                    query_source="intranet.example",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+        mock_extract.assert_not_called()
+        public_hosts.assert_awaited_once_with("intranet.example")
+        assert "private or local network" in caught.value.user_message
+        assert await fake_redis.keys("*") == []
+
+    async def test_a_search_resolves_no_host(
+        self, mock_ctx: MagicMock, public_hosts: AsyncMock
+    ) -> None:
+        """Only links are checked; a search names no host of its own, and the
+        media URL check runs on what the search resolved to."""
+        with patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:some song",
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+        public_hosts.assert_awaited_once_with("r2.googlevideo.com")
+
+    async def test_a_private_media_url_fails_the_command_and_caches_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, public_hosts: AsyncMock
+    ) -> None:
+        """The pasted link is public but the site hands back a media URL on a
+        private host: refused before either cache is written, so the song is
+        neither queued nor replayed from cache."""
+        from src.youtube import UnsafeHostError
+
+        async def resolve(host: str) -> list[hostguard.IPAddress]:
+            return _PRIVATE if host == "10.0.0.7" else [ipaddress.ip_address("1.1.1.1")]
+
+        public_hosts.side_effect = resolve
+        fake_data = _fake_ytdl_data(
+            url="http://10.0.0.7/admin", webpage_url="https://public.example/v/1"
+        )
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            with pytest.raises(UnsafeHostError, match="media URL"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "https://public.example/v/1",
+                    redis=fake_redis,
+                    query_source="public.example",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+        assert await fake_redis.keys("*") == []
+
+    async def test_play_time_resolve_refuses_a_private_media_url_from_cache(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, public_hosts: AsyncMock
+    ) -> None:
+        """A cached entry is re-checked at play time: ffmpeg opens whatever is
+        cached, so the check cannot rely on the write having been checked."""
+        from src.youtube import UnsafeHostError
+
+        data = _fake_ytdl_data(
+            url="http://169.254.169.254/latest/meta-data",
+            webpage_url="https://yt.com/v=meta",
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=meta", orjson.dumps(data), ex=600
+        )
+        public_hosts.return_value = [ipaddress.ip_address("169.254.169.254")]
+        qobj = QueueObject("https://yt.com/v=meta", "Meta", mock_ctx.author)
+        with patch("src.youtube._probe_stream_url") as probe:
+            with pytest.raises(UnsafeHostError):
+                await YTDL.yt_stream(qobj, mock_ctx.channel, redis=fake_redis)
+        probe.assert_not_called()
+
+    async def test_prefetch_swallows_the_refusal_and_caches_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, public_hosts: AsyncMock
+    ) -> None:
+        public_hosts.return_value = _PRIVATE
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=pfp")
+        qobj = QueueObject("https://yt.com/v=pfp", "Prefetch", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)  # must not raise
+        assert await fake_redis.get("ytdl:stream:https://yt.com/v=pfp") is None
+
+    def test_unsafe_host_error_renders_its_whole_message(self) -> None:
+        """Parent-side only, but it keeps ExtractionError's contract: every
+        field defaults, so it round-trips like its base."""
+        from src.youtube import UnsafeHostError
+
+        err = UnsafeHostError(
+            "I won't fetch that link: `x` points at a private address."
+        )
+        assert err.user_message == str(err)
+        assert err.expected is True
+        back = pickle.loads(pickle.dumps(err))
+        assert isinstance(back, UnsafeHostError) and back.message == err.message
 
 
 class TestYTStreamRuntimeError:
@@ -2120,7 +2281,6 @@ class TestProcessBoundaryContract:
         "name,opts",
         [
             ("stream", _YTDL_STREAM_OPTS),
-            ("search", _YTDL_STREAM_SEARCH_OPTS),
             ("playlist", _YTDL_PLAYLIST_OPTS),
         ],
     )

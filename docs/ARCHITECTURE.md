@@ -172,6 +172,7 @@ graph TD
     youtube["src/youtube.py\nYTDL + QueueObject"]
     ytdlp_pool["src/ytdlp_pool.py\nYtdlpPool"]
     sources["src/sources.py\nparse_input + source types"]
+    hostguard["src/hostguard.py\npublic-host policy"]
     spotify["src/spotify.py\nSpotify client"]
     redis_client["src/redis_client.py\nGuildRedisStore + cache helpers"]
     telemetry["src/telemetry.py\nOTel + structlog setup"]
@@ -216,6 +217,8 @@ graph TD
     redis_client --> guild_state
     youtube --> redis_client
     youtube --> ytdlp_pool
+    youtube --> hostguard
+    youtube --> sources
     musicbot --> analytics_card
     musicbot --> analytics_render
     musicbot --> chart_pool
@@ -239,7 +242,8 @@ graph TD
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
 | `youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
-| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`. |
+| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`; `looks_like_url`/`with_scheme` are the one definition of what a link is; `SourceInputError` is a malformed link the user can fix. |
+| `hostguard.py` | Whether a URL's host is on the public internet: `is_public_address` (the pure policy) and `refusal_reason` (bounded resolution through the loop). Consulted by `youtube.py` before yt-dlp, the stream probe or ffmpeg opens a host — see [Fetch host policy](#fetch-host-policy). |
 | `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
 | `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `read_guild_configs` (pipelined, chunked — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose") and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
@@ -354,12 +358,11 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | Bot class | `AutoShardedBot` | Multi-shard within one process; Discord requires sharding at 2500 guilds |
 | Context class | `MusicContext` | Installed via `get_context` override — the NP-block attach point |
 
-**yt-dlp option profiles** (`youtube.py`) — three profiles share `_YTDL_BASE_OPTS` (`quiet`, `no_warnings`, `noplaylist`, `nocheckcertificate`, `source_address 0.0.0.0`, `socket_timeout 30`, `extractor_args: player_client ["default", "-tv_simply"]`):
+**yt-dlp option profiles** (`youtube.py`) — two profiles share `_YTDL_BASE_OPTS` (`quiet`, `no_warnings`, `noplaylist`, `nocheckcertificate`, `source_address 0.0.0.0`, `socket_timeout 30`, `extractor_args: player_client ["default", "-tv_simply"]`, `allowed_extractors: ["default", "-generic", "end"]` — see [Fetch host policy](#fetch-host-policy)):
 
 | Profile | Used by | Deltas from base |
 |---|---|---|
-| `_YTDL_STREAM_OPTS` | `yt_stream` / `prefetch_stream` | `format: bestaudio/best[height<=360]/best`, `check_formats: False` (skips HEAD probes), `retries: 10` |
-| `_YTDL_STREAM_SEARCH_OPTS` | `yt_source` (unified single extraction) | stream opts + `default_search: auto` — one call yields identity **and** stream URL, populating both caches |
+| `_YTDL_STREAM_OPTS` | `yt_source` (unified single extraction), `yt_stream` / `prefetch_stream` | `format: bestaudio/best[height<=360]/best`, `check_formats: False` (skips HEAD probes), `retries: 10`, `playlist_items: "1"` (see [Extraction bounds](#extraction-bounds)). One call yields identity **and** stream URL, populating both caches; there is no `default_search` — `yt_source` wraps a bare title in `ytsearch:` itself |
 | `_YTDL_PLAYLIST_OPTS` | `yt_playlist` | `noplaylist: False`, `extract_flat: True` — enumerates entries without per-video extraction |
 
 `rm_cachedir` is deliberately **absent**: yt-dlp's JS-player cache is kept across calls so the signature-decryption JS is only re-fetched when YouTube publishes a new player version. A fresh `YoutubeDL` instance is constructed per extraction call (`_ytdlp_extract`), and it is handed a **shallow copy** of the opts profile — `YoutubeDL.__init__` keeps the params dict by reference and writes into it (`js_runtimes`, `http_headers`, ...), so passing the module-level dicts directly would make them shared mutable state across repeated extractions within a worker process.
@@ -534,8 +537,11 @@ flowchart TD
     IsSP -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
     IsSP -->|No| IsSC
     IsSC -->|Yes| SC["SoundcloudSource(url)"]
-    IsSC -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    IsSC -->|"No, dotted host"| OTHER["YTSource(url, stype=OTHER)"]
+    Input -->|"not a link"| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
 ```
+
+A "link" is the anchored `_URL_RE`: optional `http(s)://`, an optional `www.`, a dotted host and a path, matched from the start of the argument. Anything else — another scheme, a link buried in words, a dotless `98/99`, a yt-dlp `<key>searchall:` prefix — is a search for the text. Every returned `url` carries a scheme (`with_scheme`, https when none was typed), and a malformed Spotify link raises `SourceInputError` rather than becoming a search. Where the link may point is a separate question, answered by [Fetch host policy](#fetch-host-policy).
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
@@ -566,7 +572,7 @@ flowchart LR
     Phase1b -->|"Redis cache populated"| Phase2
 ```
 
-**Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 1 h) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss, **one** full extraction with `_YTDL_STREAM_SEARCH_OPTS` and hardcoded `process=True` (searches *and* direct URLs — unprocessed extraction would do no format selection and leave nothing to cache) yields identity plus a selected stream URL, and `_probe_and_cache` writes the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity. Returns a `QueueObject`.
+**Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 1 h) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss, **one** full extraction with `_YTDL_STREAM_OPTS` and hardcoded `process=True` (searches *and* direct URLs — unprocessed extraction would do no format selection and leave nothing to cache) yields identity plus a selected stream URL, and `_probe_and_cache` writes the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity. Returns a `QueueObject`.
 
 **Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). For songs Phase 1 just resolved it is a cache-hit no-op (one Redis GET); it runs a full extraction only for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
 
@@ -1448,6 +1454,51 @@ Four things cross into the worker processes, each with its own contract:
   positional pickles fine and fails on *unpickling* in the parent's result thread,
   which bricks the pool permanently.
 
+### Fetch host policy
+
+A `-play` names hosts the bot then connects to from three places — yt-dlp in the
+worker, the aiohttp stream probe, and ffmpeg — so the policy that a host must be on
+the public internet is enforced once, in `hostguard`, and consulted at every site
+that hands a URL to one of them (`_ensure_public_host` in `youtube.py`):
+
+- **the pasted link**, in `yt_source` before the extraction (only on a source-cache
+  miss, and only when `looks_like_url` says it is a link — a search names no host);
+- **the media URL yt-dlp returned**, in `yt_source` before either cache is written
+  (so the command fails, not the song at play time), in `prefetch_stream` before
+  `_probe_and_cache` (swallowed and logged like every prefetch failure), and in
+  `_resolve_playable_stream` **whether the entry came from the cache or fresh**,
+  before the probe — ffmpeg opens exactly that URL a moment later.
+
+`is_public_address` is `is_global and not is_multicast`, judging an IPv4-mapped or
+NAT64 IPv6 address as the IPv4 it embeds; the table in `tests/test_hostguard.py` is
+the authoritative list of what that refuses. A name resolving to **any** non-public
+address is refused outright — aiohttp and ffmpeg resolve it again and cannot be
+pinned to the public answer. Resolution goes through `loop.getaddrinfo`, bounded by
+`RESOLVE_TIMEOUT_SECS` (5 s); a name that does not resolve, or does not resolve in
+time, is refused too, with a message that says which. Builtin `TimeoutError` is an
+`OSError`, so its clause comes first. The refusal is `UnsafeHostError`, an
+`ExtractionError` raised parent-side only, so `_command_error` renders its message.
+
+Two things narrow the surface before any of that runs. `parse_url` matches an
+anchored `http(s)` regex (a `ftp://` or `file://` input is a search), and hands every
+source a schemed URL. And yt-dlp runs with `allowed_extractors: ["default",
+"-generic", "end"]`: the `generic` extractor fetches the input URL itself and reads
+media out of whatever comes back, which made any reachable host a media source. With
+it gone, only sites with a dedicated extractor play, and that extractor chooses the
+media host. `end` is `UnsupportedURLIE` — `_ENABLED = False`, so not in `default`,
+and `_VALID_URL = '.*'`, so it must be **last** — which is what raises the
+`UnsupportedError` that `yt_source` turns into "isn't from a site I can play"; without
+it an unmatched URL is a bare "No suitable extractor" `DownloadError` with no
+classification. Removing `generic` also removed the `default_search: auto` guessing
+that resolved a bare Spotify title into a search, so `yt_source` wraps a non-link,
+non-`ytsearch` input in `ytsearch:` itself.
+
+What remains: a public host that **redirects** to a private one. yt-dlp follows the
+redirect inside the worker and parses the response as a page, and the media URL it
+finds there is checked as above — so the exposure is the redirected page's
+title/description reaching an embed, not its body reaching ffmpeg. There is no
+per-request redirect control in yt-dlp's options to close that.
+
 ### Stream probe session
 
 `_probe_stream_url` runs before every song and holds one process-wide
@@ -1473,9 +1524,9 @@ The residual real benefit is the connector's 10 s `ttl_dns_cache`, which helps i
 one resolve and not across songs.
 
 **`DummyCookieJar` is load-bearing.** A default `CookieJar` would be process-wide and
-attacker-writable: `parse_url` hands any dotted domain to yt-dlp, whose generic
-extractor returns the input URL for the probe to fetch, so one `-play` reaches this
-session with a host the user chose. aiohttp applies no public-suffix check, so a
+writable by any site a user links: `parse_url` hands every dotted domain with a
+dedicated extractor to yt-dlp, and that site chooses the media host the probe then
+fetches. aiohttp applies no public-suffix check, so a
 `Domain=com` cookie set by that host is replayed to `googlevideo.com` — and enough
 cookie bytes turns every probe into an HTTP 400, which maps to `DEAD`, deletes the
 cache entry and burns the one re-extraction, for every guild, until restart. Nothing

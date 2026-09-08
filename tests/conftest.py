@@ -165,6 +165,25 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def public_hosts(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Resolve every host to one public address, without DNS.
+
+    hostguard.refusal_reason runs before every extraction and probe, and the
+    suite's URLs (googlevideo, yt.com, example.com) must neither reach a resolver
+    nor depend on what one answers. Tests that need a private answer set
+    `.return_value` on the returned mock, or restore the real
+    `resolve_addresses` via monkeypatch.
+    """
+    import ipaddress
+
+    import src.hostguard as hostguard
+
+    resolver = AsyncMock(return_value=[ipaddress.ip_address("93.184.216.34")])
+    monkeypatch.setattr(hostguard, "resolve_addresses", resolver)
+    return resolver
+
+
+@pytest.fixture(autouse=True)
 def use_thread_chart_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Render -analytics charts on an in-process ThreadPoolExecutor.
 
