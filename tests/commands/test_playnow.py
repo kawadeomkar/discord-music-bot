@@ -199,14 +199,14 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """A live stream also parks no tail, but "nearly finished" would be a
-        lie about why."""
+        """A live stream's tail carries no offset; "will resume at 0:00" or
+        "nearly finished" would both misdescribe it."""
         from src.musicplayer import InterjectOutcome
 
         live_mp.interject = AsyncMock(
             return_value=InterjectOutcome(
                 interrupted_title="24/7 lofi",
-                resume_position=None,
+                resume_position=0,
                 was_paused=False,
                 live=True,
             )
@@ -221,8 +221,9 @@ class TestPlaynow:
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "24/7 lofi" in embed.description
-        assert "live stream" in embed.description
+        assert "live edge" in embed.description
         assert "nearly finished" not in embed.description
+        assert "will resume at" not in embed.description
 
     async def test_interjecting_over_an_interjection_promises_a_return(
         self,

@@ -285,8 +285,8 @@ class InterjectOutcome:
     # parks one, however many are already parked behind it.
     resume_position: Optional[int]
     was_paused: bool  # the OBSERVED state when it was interrupted
-    # No known length, so no position to return to; the wording says so rather
-    # than "nearly finished".
+    # No known length: the tail carries no offset, so the song comes back at the
+    # live edge (or, for a VOD missing its duration, from the start).
     live: bool = False
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
     # -playnow restores what it interrupted while -play brings it back playing.
@@ -2024,26 +2024,34 @@ class MusicPlayer:
 
         was_paused = vc.is_paused()
         position = int(current.position_secs)
-        # No duration means no position to come back to: a live stream seeked to
-        # `ts` decodes and discards that many seconds of live audio as silence.
+        # No duration means no position to come back to: a seek into a live
+        # stream is that many seconds of silence. The tail still parks, with no
+        # offset, so the song returns at the live edge (a VOD from its start).
         live = current.duration_secs <= 0
+        if live:
+            position = 0
         resume: Optional[QueueObject] = None
-        if current.webpage_url and not live:
+        if current.webpage_url:
             # On the RAW position: the EOF cap below pulls it back by its margin,
-            # which would mask "almost over".
-            near_end = current.duration_secs - position < _MIN_RESUME_REMAINING_SECS
-            # EOF guard matching the crash-recovery cap: imprecise duration
-            # metadata must not make FFmpeg seek past the end.
-            position = min(
-                position, max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS)
+            # which would mask "almost over". Only a known duration can be near
+            # its end.
+            near_end = (
+                not live
+                and current.duration_secs - position < _MIN_RESUME_REMAINING_SECS
             )
+            if not live:
+                # EOF guard matching the crash-recovery cap: imprecise duration
+                # metadata must not make FFmpeg seek past the end.
+                position = min(
+                    position, max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS)
+                )
             if not near_end:
                 resume = QueueObject(
                     current.webpage_url,
                     current.title or "",
                     current.requester or self._require_requester(),
-                    ts=position,
-                    duration=current.duration_secs,
+                    ts=position or None,
+                    duration=current.duration_secs or None,
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,

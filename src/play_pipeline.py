@@ -518,7 +518,8 @@ async def interject_flow(
     interrupted = safe_label(outcome.interrupted_title, INLINE_TITLE_MAX)
     if outcome.live:
         desc = (
-            f"**{interrupted}** is a live stream, so it will not come back afterwards."
+            f"**{interrupted}** has no known length — it comes back at the live "
+            "edge afterwards (from the start, if it isn't a live stream)."
         )
     elif outcome.resume_position is None:
         desc = f"**{interrupted}** was nearly finished and will not resume."

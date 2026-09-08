@@ -9984,7 +9984,7 @@ class TestInterject:
         assert outcome is not None and outcome.resume_position is None
         assert music_player._skip_history_for is None
 
-    async def test_a_livestream_parks_no_resume_tail(
+    async def test_a_livestream_parks_a_tail_with_no_offset(
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
@@ -9993,19 +9993,27 @@ class TestInterject:
     ) -> None:
         """duration 0 used to pass both `> 0` guards by being skipped, leaving a
         tail with ts=elapsed and no EOF cap — and a seek into a live source is
-        that many seconds of silence. No tail, so the fragment records itself."""
+        that many seconds of silence. The tail still parks so the stream comes
+        back, but carries no offset: it returns at the live edge."""
         live_song.duration_secs = 0
         live_song.elapsed_secs = 600.0
         music_player.current_song = live_song
 
         outcome = await music_player.interject(playnow_obj, mock_vc)
 
-        assert music_player.queue.display_items() == [playnow_obj]
+        items = music_player.queue.display_items()
+        assert items[0] is playnow_obj
+        tail = queue_object(items[1])
+        assert tail.is_resume is True
+        assert tail.ts is None  # no -ss
+        assert tail.duration is None
+        assert tail.webpage_url == live_song.webpage_url
         assert outcome is not None
-        assert outcome.resume_position is None
         assert outcome.live is True
-        assert music_player._skip_history_for is None
-        assert music_player._pending_resume_tail is None
+        assert outcome.resume_position == 0
+        # The tail records the play when it ends, as any other tail does.
+        assert music_player._skip_history_for is live_song
+        assert music_player._pending_resume_tail is tail
 
     async def test_a_finite_song_is_not_reported_live(
         self,
