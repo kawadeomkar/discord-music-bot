@@ -2819,7 +2819,7 @@ class TestPresenceThrottle:
         throttle = PresenceThrottle(0.05)
         landed: list[str] = []
 
-        async def _slow_change(*, activity: discord.BaseActivity) -> None:
+        async def _slow_change(*, activity: Any) -> None:
             landed.append(activity.name or "")
             if activity.name == "second":
                 await throttle.apply(bot, discord.Game(name="third"))
@@ -3358,7 +3358,7 @@ class TestQueueCap:
             self._songs(mock_author, 5), prefetch=False
         )
 
-        assert [q.title for q in outcome.queued] == ["v 0", "v 1"]
+        assert [queue_object(q).title for q in outcome.queued] == ["v 0", "v 1"]
         assert outcome.refused == 3
         assert outcome.limit == 3
         assert music_player.queue.display_size() == 3
@@ -3398,7 +3398,7 @@ class TestQueueCap:
             self._songs(mock_author, 3), prefetch=False
         )
 
-        assert [q.title for q in outcome.queued] == ["v 0"]
+        assert [queue_object(q).title for q in outcome.queued] == ["v 0"]
         assert outcome.refused == 2
         assert [queue_object(i).title for i in music_player.queue.display_items()] == [
             "v 0",
@@ -12110,8 +12110,8 @@ class TestNowPlayingEditDiffing:
     ) -> None:
         mock_song.elapsed_secs = 47.0
         embed = music_player._build_now_playing_embed(mock_song)
-        assert "`0:40`" in embed.description
-        assert "`0:47`" not in embed.description
+        assert "`0:40`" in described(embed)
+        assert "`0:47`" not in described(embed)
 
     async def test_an_override_renders_exactly(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -12119,7 +12119,7 @@ class TestNowPlayingEditDiffing:
         """The finalize passes the true stop point; the record it leaves must not
         be floored."""
         embed = music_player._build_now_playing_embed(mock_song, position_override=47.0)
-        assert "`0:47`" in embed.description
+        assert "`0:47`" in described(embed)
 
     async def test_finalize_uses_the_exact_stop_position(
         self, music_player: MusicPlayer, mock_song: MagicMock

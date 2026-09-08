@@ -293,8 +293,9 @@ async def enqueue_playlist(
             if qobj.skipped
             else ""
         )
+        # The admitted items are the batch's prefix, so the echo is tracks[:queued].
         shown_titles = queue_message(
-            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(outcome.queued, 10)]
+            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, min(queued, 10))]
         )
         title = (
             f"Queued playlist — {queued} of {count} {pluralize(count, 'song')}"

@@ -1119,12 +1119,12 @@ class MusicPlayer:
                         # No duration means no position to come back to — a live
                         # stream resumes at its edge, and a seek into one is that
                         # many seconds of silence.
-                        if not guild_state.current_song_duration:
+                        duration = guild_state.current_song_duration
+                        if not duration:
                             position = None
-                        if position is not None:
+                        if position is not None and duration:
                             # Cap at duration − 10s so FFmpeg cannot seek past EOF,
                             # read from the snapshot this restore already holds.
-                            duration = guild_state.current_song_duration
                             position = min(position, max(0, duration - 10))
                             log.info(
                                 f"Computed recovery position {position}s for "

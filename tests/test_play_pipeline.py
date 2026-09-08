@@ -1052,7 +1052,8 @@ class TestQueueCapReporting:
                 mock_ctx, source, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN
             )
 
-        title, description = send_embed.await_args.args[1:3]
+        assert (call := send_embed.await_args) is not None
+        title, description = call.args[1:3]
         assert title == "Queued playlist — 3 of 8 songs"
         assert "Queued **3** of **8** — the queue is full at 5 songs" in description
         # Only what was admitted is echoed back.
@@ -1092,7 +1093,8 @@ class TestQueueCapReporting:
                 mock_ctx, source, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN
             )
 
-        description = send_embed.await_args.args[2]
+        assert (call := send_embed.await_args) is not None
+        description = call.args[2]
         assert "Queued **1** of **4**" in description
         assert "Track 0" in description and "Track 1" not in description
 
