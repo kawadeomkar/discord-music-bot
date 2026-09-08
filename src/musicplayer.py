@@ -187,6 +187,66 @@ def _label_position(position_secs: float) -> float:
 # skipped, interjected, dead stream — keeps the bar where it actually reached.
 _SONG_COMPLETE_MARGIN_SECS = 5
 
+# ── Presence ─────────────────────────────────────
+# Floor between change_presence calls, process-wide: presence is one gateway
+# state for the whole bot, and every guild's song start and end asks for it.
+_PRESENCE_MIN_INTERVAL_SECS = 10.0
+
+
+class PresenceThrottle:
+    """At most one change_presence per interval, process-wide. A request inside
+    the window is deferred to the window's end and replaced by any later one, so
+    the state that lands is always the latest asked for."""
+
+    def __init__(self, interval: float) -> None:
+        self._interval = interval
+        self._last = float("-inf")
+        self._pending: Optional[discord.BaseActivity] = None
+        self._flush: Optional[asyncio.Task[None]] = None
+
+    async def apply(self, bot: commands.Bot, activity: discord.BaseActivity) -> None:
+        now = time.monotonic()
+        if self._flush is None and now - self._last >= self._interval:
+            self._last = now
+            await bot.change_presence(activity=activity)
+            return
+        self._pending = activity
+        if self._flush is None:
+            self._flush = asyncio.create_task(
+                self._flush_later(bot, self._last + self._interval - now)
+            )
+
+    async def _flush_later(self, bot: commands.Bot, delay: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(0.0, delay))
+                activity, self._pending = self._pending, None
+                self._last = time.monotonic()
+                if activity is not None:
+                    try:
+                        await bot.change_presence(activity=activity)
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to update bot activity: {e}", exc_info=True
+                        )
+                # A request that landed during the send above waits a full window.
+                if self._pending is None:
+                    return
+                delay = self._interval
+        finally:
+            self._flush = None
+
+    def reset(self) -> None:
+        """Forget the window and drop any deferred update."""
+        if self._flush is not None:
+            self._flush.cancel()
+        self._flush = None
+        self._pending = None
+        self._last = float("-inf")
+
+
+_presence = PresenceThrottle(_PRESENCE_MIN_INTERVAL_SECS)
+
 # ── Playback gate ────────────────────────────────
 # How long loop() waits for a voice connection before tearing the player down.
 # Matches the idle queue_get() timeout, so a player that never connects and one
@@ -1774,8 +1834,27 @@ class MusicPlayer:
             self._adopt_np_host_if_current(message, own, song)
         return message
 
+    def _other_guilds_playing(self) -> int:
+        """Guilds other than this one with a song playing right now."""
+        return sum(
+            1
+            for vc in self.bot.voice_clients
+            if isinstance(vc, discord.VoiceClient)
+            and vc.guild.id != self._guild.id
+            and vc.is_playing()
+        )
+
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
-        if song is not None:
+        activity: discord.BaseActivity
+        others = self._other_guilds_playing()
+        if song is not None and others:
+            # Presence is one state for the whole bot: naming this guild's song
+            # would misreport the others', so the count is what is shown.
+            activity = discord.Activity(
+                type=discord.ActivityType.listening,
+                name=f"music in {others + 1} servers",
+            )
+        elif song is not None:
             timestamps: dict[str, int] = {}
             vc = self._guild.voice_client
             is_paused = isinstance(vc, discord.VoiceClient) and vc.is_paused()
@@ -1817,16 +1896,11 @@ class MusicPlayer:
             # before disconnecting, so the CancelledError handler reaches here while
             # this guild's client is still connected, and counting it would strand
             # the presence on the stopped song.
-            active = any(
-                vc.is_playing()
-                for vc in self.bot.voice_clients
-                if isinstance(vc, discord.VoiceClient) and vc.guild.id != self._guild.id
-            )
-            if active:
+            if others:
                 return
             activity = discord.Game(name="music")
         try:
-            await self.bot.change_presence(activity=activity)
+            await _presence.apply(self.bot, activity)
         except Exception as e:
             log.warning(f"Failed to update bot activity: {e}", exc_info=True)
 

@@ -342,6 +342,15 @@ def mock_ctx(
     return ctx
 
 
+@pytest.fixture(autouse=True)
+def _fresh_presence_window() -> None:
+    """The presence throttle is process-wide state; a window opened by one test
+    must not defer the next test's change_presence."""
+    from src.musicplayer import _presence
+
+    _presence.reset()
+
+
 @pytest.fixture
 def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot = MagicMock()

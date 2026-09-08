@@ -2753,6 +2753,112 @@ class TestUpdateActivity:
         assert activity.timestamps["start"] >= now_ms - 90_000 - 2000
 
 
+class TestUpdateActivityAcrossGuilds:
+    """Presence is one gateway state for the whole bot."""
+
+    async def test_shows_a_count_when_another_guild_is_playing(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.bot.change_presence = AsyncMock()
+        other = MagicMock(spec=discord.VoiceClient)
+        other.is_playing.return_value = True
+        mocked(music_player.bot).voice_clients = [other]
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert activity.name == "music in 2 servers"
+        assert mock_song.title not in activity.name
+
+    async def test_own_client_does_not_count_as_another_guild(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.bot.change_presence = AsyncMock()
+        own = MagicMock(spec=discord.VoiceClient)
+        own.is_playing.return_value = True
+        own.guild = music_player._guild
+        mocked(music_player.bot).voice_clients = [own]
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert activity.name.startswith(mock_song.title)
+
+
+class TestPresenceThrottle:
+    """At most one change_presence per window, process-wide; a request inside
+    the window is deferred to its end and superseded by a later one."""
+
+    async def test_the_first_request_lands_immediately(self) -> None:
+        from src.musicplayer import PresenceThrottle
+
+        bot = MagicMock()
+        bot.change_presence = AsyncMock()
+        throttle = PresenceThrottle(10.0)
+        await throttle.apply(bot, discord.Game(name="a"))
+        bot.change_presence.assert_awaited_once()
+
+    async def test_requests_inside_the_window_coalesce_to_the_latest(self) -> None:
+        """A -skip is song end then song start within milliseconds: the reset
+        must not be the state that sticks, and the new song must not be dropped."""
+        from src.musicplayer import PresenceThrottle
+
+        bot = MagicMock()
+        bot.change_presence = AsyncMock()
+        throttle = PresenceThrottle(0.05)
+        await throttle.apply(bot, discord.Game(name="first"))
+        await throttle.apply(bot, discord.Game(name="reset"))
+        await throttle.apply(bot, discord.Game(name="second"))
+        assert bot.change_presence.await_count == 1  # deferred, not sent
+
+        await asyncio.sleep(0.1)
+        assert bot.change_presence.await_count == 2
+        assert bot.change_presence.call_args.kwargs["activity"].name == "second"
+
+    async def test_a_request_during_the_flush_waits_a_full_window(self) -> None:
+        from src.musicplayer import PresenceThrottle
+
+        bot = MagicMock()
+        throttle = PresenceThrottle(0.05)
+        landed: list[str] = []
+
+        async def _slow_change(*, activity: discord.BaseActivity) -> None:
+            landed.append(activity.name or "")
+            if activity.name == "second":
+                await throttle.apply(bot, discord.Game(name="third"))
+
+        bot.change_presence = AsyncMock(side_effect=_slow_change)
+        await throttle.apply(bot, discord.Game(name="first"))
+        await throttle.apply(bot, discord.Game(name="second"))
+        await asyncio.sleep(0.2)
+        assert landed == ["first", "second", "third"]
+
+    async def test_a_deferred_failure_is_logged_not_raised(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from src.musicplayer import PresenceThrottle
+
+        bot = MagicMock()
+        bot.change_presence = AsyncMock(side_effect=[None, Exception("gateway")])
+        throttle = PresenceThrottle(0.05)
+        await throttle.apply(bot, discord.Game(name="a"))
+        await throttle.apply(bot, discord.Game(name="b"))
+        with caplog.at_level(logging.WARNING):
+            await asyncio.sleep(0.1)
+        assert "Failed to update bot activity" in caplog.text
+
+    async def test_reset_drops_the_deferred_update(self) -> None:
+        from src.musicplayer import PresenceThrottle
+
+        bot = MagicMock()
+        bot.change_presence = AsyncMock()
+        throttle = PresenceThrottle(0.05)
+        await throttle.apply(bot, discord.Game(name="a"))
+        await throttle.apply(bot, discord.Game(name="b"))
+        throttle.reset()
+        await asyncio.sleep(0.1)
+        assert bot.change_presence.await_count == 1
+        # And the window is forgotten: the next request lands at once.
+        await throttle.apply(bot, discord.Game(name="c"))
+        assert bot.change_presence.await_count == 2
+
+
 class TestUpdateActivityPause:
     """Presence timestamps must track pause state, not just be stamped once at
     song start."""
