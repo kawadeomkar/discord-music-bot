@@ -133,6 +133,14 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     return SearchQueueEntry.from_ytsource(item)
 
 
+def item_label(item: QueueItem) -> str:
+    """What to call a queued item in a reply. A YTSource is an unresolved search
+    with no `title`, so its term stands in, `ytsearch:` prefix off."""
+    if isinstance(item, QueueObject):
+        return item.title or "?"
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+
+
 def is_persisted(item: Optional[QueueItem]) -> bool:
     """True when the item has a matching entry on the Redis list — its dequeue
     must be mirrored with an LPOP, and rebuilds may write it back. Only the
@@ -296,12 +304,12 @@ class GuildQueue:
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
-        """Insert items at the front — the -playnow interjection path. An
-        in-flight head (dequeued but uncommitted) stays AHEAD of them and forces
-        the rebuild path: its Redis entry still sits at the list head awaiting a
-        commit-time LPOP, so an LPUSH in front of it would make that LPOP eat the
-        new head. Reachable: _interject_flow's outcome-is-None fallback calls this
-        with the prefetch's claim still open."""
+        """Insert items at the front — the interjection path. An in-flight head
+        (dequeued but uncommitted) stays AHEAD of them and forces the rebuild
+        path: its Redis entry still sits at the list head awaiting a commit-time
+        LPOP, so an LPUSH in front of it would make that LPOP eat the new head.
+        Reachable: _interject_flow's outcome-is-None fallback calls this with the
+        prefetch's claim still open."""
         if not items:
             return []
         async with self._mutex:
@@ -332,7 +340,7 @@ class GuildQueue:
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything on it — claimed prefix included,
         because the caller records these (MusicPlayer._flush_played) and a parked
-        -playnow tail is among them. Bumps the generation and resets the cursor
+        resume tail is among them. Bumps the generation and resets the cursor
         under the mutex: a claim the loop took before this captured the old value
         and is refused by commit_dequeue(); a prefetch's claim commits under the
         current value and is refused because nothing is claimed at cursor 0. The
@@ -365,6 +373,8 @@ class GuildQueue:
             self._items = deque(head + tail)
             self._sync_wake()
 
+            # DELETE when nothing persisted survives: it heals a mirror
+            # holding entries memory no longer has.
             if tail:
                 await self._write_mirror(self._items)
 
@@ -467,16 +477,15 @@ class GuildQueue:
         )
 
     def resume_tail_depth(self) -> int:
-        """Parked plays waiting behind the song that just cut the line — the run
-        of consecutive resume tails after it (1 = plain -playnow, 2+ = a stack).
-        The run starts after the claimed prefix, since put_front inserts behind
-        a dequeued-but-uncommitted item."""
-        depth = 0
-        for item in islice(self._items, self._cursor + 1, None):
-            if not (isinstance(item, QueueObject) and item.is_resume):
-                break
-            depth += 1
-        return depth
+        """How many parked plays wait behind the song that just cut the line: 1 is
+        a plain interjection, 2+ a stack. Counts every pending tail past the claimed
+        prefix (`--now` takes a whole playlist, so tails are not adjacent) — plays,
+        not fragments. O(len(_items)), once per interjection."""
+        return sum(
+            1
+            for item in islice(self._items, self._cursor + 1, None)
+            if isinstance(item, QueueObject) and item.is_resume
+        )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 

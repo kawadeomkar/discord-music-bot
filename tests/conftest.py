@@ -501,6 +501,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._play_inflight = set()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -549,6 +550,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._play_inflight = set()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -575,7 +577,16 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     return cog
 
 
-_PLAY_STAGES = ("queue_source", "enqueue_single", "enqueue_playlist")
+_PLAY_STAGES = (
+    "queue_source",
+    "enqueue_single",
+    "enqueue_playlist",
+    "interject_flow",
+)
+
+# The cold-start teardown -play reaches through, stubbed by the routing tests the
+# same way and restored for the same reason.
+_PLAY_CMD_SEAMS = ("abandon_cold_start",)
 
 
 @pytest.fixture(autouse=True)
@@ -586,7 +597,12 @@ def _restore_play_stages() -> Iterator[None]:
     next one runs against the previous one's mock. Here rather than in one test file
     because -play, -playnow and the pipeline's own tests all stub them.
     """
+    from src.commands import play as play_cmd
+
     saved = {name: getattr(play_pipeline, name) for name in _PLAY_STAGES}
+    saved_cmd = {name: getattr(play_cmd, name) for name in _PLAY_CMD_SEAMS}
     yield
     for name, fn in saved.items():
         setattr(play_pipeline, name, fn)
+    for name, fn in saved_cmd.items():
+        setattr(play_cmd, name, fn)

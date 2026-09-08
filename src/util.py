@@ -202,7 +202,12 @@ EMBED_TITLE_LIMIT = 256
 FOOTER_LIMIT = 2048
 EMBED_FIELD_LIMIT = 1024
 
-# One row of a multi-row field of user-supplied titles; ten share one field.
+# Bound on one echoed needle, which owns a field to itself. Discord renders
+# markdown in field values, so what a user typed goes through safe_label first.
+ECHO_MAX = 200
+
+# One row of a multi-row field of user-supplied titles; ten share the budget one
+# echoed needle gets.
 ECHO_ROW_MAX = 70
 
 

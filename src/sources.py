@@ -146,7 +146,8 @@ class YTSource:
     @property
     def playlist_url(self) -> str:
         """Canonical playlist URL for a type=PLAYLIST source: the pasted URL,
-        else rebuilt from list_id."""
+        else rebuilt from list_id. One spelling for the enqueue/interject/resolve
+        paths."""
         return self.url or f"https://www.youtube.com/playlist?list={self.list_id}"
 
 
