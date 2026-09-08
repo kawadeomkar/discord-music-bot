@@ -177,6 +177,22 @@ _UNUSED_INFO_COLLECTIONS = frozenset(
 _sanitize_info = youtube_dl.YoutubeDL.sanitize_info
 
 
+# Every character RFC 3986 allows in a URI unencoded, percent included. A yt-dlp
+# `url` outside this set needs quoting — a raw space or non-ASCII reaches here from
+# the sites URLSource.OTHER allows. Inside it, re-quoting breaks a signed HLS path.
+_URI_SAFE = re.compile(r"^[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$")
+
+
+def _probe_target(stream_url: str) -> URL:
+    """The URL to probe. Pre-encoded when the string is already a valid URI, so yarl
+    does not decode the %3D/%3B an HLS manifest signs inside its own path; quoted
+    normally otherwise, since encoded=True would emit those bytes into the request
+    line verbatim and earn a 400 for a URL ffmpeg would have played."""
+    if _URI_SAFE.match(stream_url):
+        return URL(stream_url, encoded=True)
+    return URL(stream_url)
+
+
 def _lift_thumbnail(info: dict[str, Any]) -> None:
     """Keep the one thumbnail URL callers render before `thumbnails` leaves with the
     other large collections. yt-dlp orders that list ascending by size, so the last
@@ -253,9 +269,10 @@ async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
 
 def warm_worker() -> None:
     """Handed to prewarm(), so it runs once per pool worker. The first YoutubeDL a
-    process builds discovers plugins and probes for a JS runtime, 166-339 ms that every
-    later construction in that worker skips; paying it at startup keeps it off the first
-    -play each worker serves. Top-level so it is picklable, like _ytdlp_extract."""
+    process builds discovers plugins and probes for a JS runtime; measured at 136 ms
+    against 61 ms for the next two in the same process, so paying the ~75 ms delta at
+    startup keeps it off the first -play each worker serves. Top-level so it is
+    picklable, like _ytdlp_extract."""
     # cast, as at every other yt-dlp boundary: the opts profiles are the plain dicts
     # yt-dlp accepts, against a params TypedDict the checker cannot match them to.
     youtube_dl.YoutubeDL(cast(Any, copy.copy(_YTDL_STREAM_OPTS)))
@@ -519,6 +536,9 @@ def _get_probe_session() -> aiohttp.ClientSession:
             connector=aiohttp.TCPConnector(limit=0),
             timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT),
             cookie_jar=aiohttp.DummyCookieJar(),
+            # The Location header is parsed as URL(loc, encoded=not this): a redirect
+            # gets the same pre-encoded treatment _probe_target gives the first hop.
+            requote_redirect_url=False,
         )
     return _probe_session
 
@@ -550,9 +570,7 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
         # read_bufsize=0 + close(), not release(): only the status line matters,
         # read_bufsize=0 + close(), not release(): only the status line matters,
         # and aiohttp otherwise buffers audio from the moment headers land.
-        async with session.get(
-            URL(stream_url, encoded=True), read_bufsize=0
-        ) as response:
+        async with session.get(_probe_target(stream_url), read_bufsize=0) as response:
             # Only a definite client-side refusal is DEAD: 429 and 5xx say "not
             # right now", as a timeout does, and ffmpeg's -reconnect would very
             # likely have played the song.
