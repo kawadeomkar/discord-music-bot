@@ -258,14 +258,14 @@ _presence = PresenceThrottle(_PRESENCE_MIN_INTERVAL_SECS)
 _PLAYBACK_GATE_TIMEOUT = 300
 
 # Ceiling on the start transaction, the one Redis write under the queue's bulk
-# mutex; the pool sets no socket_timeout. Past it the song plays unpersisted and
-# the queue notes its mirror as stale (GuildQueue.note_mirror_write) — no second
-# write is attempted under the mutex, so a stalled Redis costs one bound per start.
+# mutex; the pool's 5s socket_timeout retries three times, so this bounds the
+# retry cycle. Past it the song plays unpersisted and the queue notes its mirror
+# as stale (GuildQueue.note_mirror_write) — a stalled Redis costs one bound per start.
 _START_WRITE_TIMEOUT = 5.0
 
 # How long a command waits for wait_for_restore() before giving up and saying so.
-# Generous for one pipelined read; bounded because the pool sets no socket_timeout,
-# so a server that accepts the connection then stalls would hang the command outright.
+# Generous for one pipelined read; bounded because the pool's 5s socket_timeout
+# retries three times, so a stalled server would otherwise hang the command for 15s+.
 RESTORE_WAIT_SECS = 5.0
 
 # How long a warm -play waits for its restore before reading the ask-time queue
@@ -743,9 +743,9 @@ class MusicPlayer:
         while restore_entries() is in-memory only precisely because its entries are
         already on that list.
 
-        False when `timeout` elapsed first. The pool sets no socket_timeout, so a
-        Redis that accepts the connection and then stalls hangs the read — and with
-        it any command that waits here — until the server answers.
+        False when `timeout` elapsed first. The pool's 5s socket_timeout retries
+        three times, so a Redis that accepts the connection and then stalls holds
+        the read — and any command waiting here — through that whole cycle.
         """
         if timeout is None:
             await self._restore_complete.wait()
