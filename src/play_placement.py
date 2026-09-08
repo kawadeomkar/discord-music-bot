@@ -21,9 +21,10 @@ from src.config import (
     PLAY_INFLIGHT_MAX,
     PLAY_RESOLVE_CONCURRENCY,
     PLAY_RESOLVE_WAIT_SECS,
+    PLAY_SLOW_NOTICE_SECS,
 )
 from src.musicplayer import MusicPlayer
-from src.util import get_logger, record_span_error, spawn_background
+from src.util import get_logger, notice_embed, record_span_error, spawn_background
 
 log = get_logger(__name__)
 
@@ -273,6 +274,55 @@ class ResolveSlot:
 
     async def __aexit__(self, *_exc: Any) -> None:
         self._sem.release()
+
+
+@contextlib.asynccontextmanager
+async def slow_resolve_notice(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Say that a request is still being looked up once it outlives
+    PLAY_SLOW_NOTICE_SECS, and take the message back when it lands.
+
+    Covers the whole wait rather than the slot queue alone: a full pool and a slow
+    extraction are the same silence to the user. No position is quoted — requests
+    resolve concurrently, so there is no line to be Nth in.
+
+    ctx.channel.send, not ctx.send: MusicContext.send prepends the Now Playing
+    block and adopts the message as its host, so deleting this notice would drag
+    the live progress bar onto it. The same exception -ping and -debug take.
+    """
+    posted: Optional[discord.Message] = None
+    settled = asyncio.Event()
+
+    async def _post() -> None:
+        nonlocal posted
+        try:
+            async with asyncio.timeout(PLAY_SLOW_NOTICE_SECS):
+                await settled.wait()
+        except TimeoutError:
+            pass
+        else:
+            # Landed inside the delay, which is the common case: say nothing.
+            return
+        with contextlib.suppress(discord.HTTPException):
+            posted = await ctx.channel.send(
+                embed=notice_embed(
+                    "Still looking that one up — it will be queued as soon as it "
+                    "resolves.",
+                    discord.Color.orange(),
+                )
+            )
+
+    notice = asyncio.create_task(_post())
+    try:
+        yield
+    finally:
+        settled.set()
+        # Awaited, not abandoned: the task owns `posted`, so a delete racing its
+        # send would read None and leave the notice standing forever.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await notice
+        if posted is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await posted.delete()
 
 
 @dataclass(slots=True, eq=False)

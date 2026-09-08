@@ -182,6 +182,16 @@ def no_typing(target: str) -> AbstractContextManager[MagicMock]:
     return patch(target, MagicMock(return_value=contextlib.nullcontext()))
 
 
+def no_slow_notice(target: str) -> AbstractContextManager[MagicMock]:
+    """Stub a module's slow_resolve_notice with an inert async CM.
+
+    The same trap no_typing names, for the same reason: the notice arms a delayed
+    poster with asyncio.create_task, which TestPlayCommand's join-task spy would
+    otherwise catch. Paired with no_typing wherever that spy runs. The notice
+    itself is covered by TestSlowResolveNotice."""
+    return patch(target, MagicMock(return_value=contextlib.nullcontext()))
+
+
 def in_authors_channel(vc: MagicMock, ctx: Optional[MagicMock]) -> MagicMock:
     """Seat a voice-client double in the author's channel, or somewhere else. Queue
     control is gated on the bot being in the author's channel at dispatch AND at

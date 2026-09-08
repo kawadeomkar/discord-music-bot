@@ -10,6 +10,7 @@ import orjson
 import redis.asyncio as aioredis
 
 import pytest
+import discord
 from discord.ext import commands
 
 from src.musicbot import MusicBot
@@ -20,6 +21,7 @@ from src.play_placement import (
     PlayMode,
     ResolveWaitExpired,
     play_key,
+    slow_resolve_notice,
     split_play_args,
 )
 from tests.helpers import (
@@ -542,3 +544,52 @@ class TestResolveSlot:
                 entered = True
         await freeing
         assert entered
+
+
+class TestSlowResolveNotice:
+    """A request that outlives the delay says so, and takes the message back when
+    it lands. Silence is what the concurrent resolve costs the user: nothing is
+    serialized, so there is no queue position to report — only that work is on."""
+
+    async def test_a_fast_resolve_says_nothing(self, mock_ctx: MagicMock) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 5.0):
+            async with slow_resolve_notice(mock_ctx):
+                pass
+        mock_ctx.channel.send.assert_not_awaited()
+
+    async def test_a_slow_resolve_posts_and_retracts(self, mock_ctx: MagicMock) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx):
+                await asyncio.sleep(0.08)
+        mock_ctx.channel.send.assert_awaited_once()
+        mock_ctx.channel.send.return_value.delete.assert_awaited_once()
+
+    async def test_the_notice_never_becomes_the_now_playing_host(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the
+        NP host, and deleting it would drag the live progress bar onto it."""
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx):
+                await asyncio.sleep(0.08)
+        mock_ctx.send.assert_not_awaited()
+
+    async def test_a_send_that_fails_leaves_the_request_alone(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.channel.send.side_effect = discord.HTTPException(
+            MagicMock(), "no perms"
+        )
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx):
+                await asyncio.sleep(0.08)
+
+    async def test_the_body_raising_still_retracts_the_notice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            with pytest.raises(RuntimeError):
+                async with slow_resolve_notice(mock_ctx):
+                    await asyncio.sleep(0.08)
+                    raise RuntimeError("resolve failed")
+        mock_ctx.channel.send.return_value.delete.assert_awaited_once()

@@ -52,6 +52,7 @@ from tests.helpers import (
     settle,
     song,
     mock_mp,
+    no_slow_notice,
     no_typing,
     paused_vc,
     playing_vc,
@@ -98,6 +99,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task) as mock_create,
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -119,6 +121,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task") as mock_create,
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -150,6 +153,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -183,6 +187,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -213,6 +218,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -235,6 +241,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task"),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -268,6 +275,7 @@ class TestPlayCommand:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -310,6 +318,7 @@ class TestPlayAnalytics:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -409,6 +418,7 @@ class TestPlayWhilePaused:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -433,6 +443,7 @@ class TestPlayWhilePaused:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -457,6 +468,7 @@ class TestPlayWhilePaused:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task"),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -480,6 +492,7 @@ class TestPlayWhilePaused:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task"),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -507,6 +520,7 @@ class TestPlayWhilePaused:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
             ),
@@ -568,6 +582,7 @@ class TestPlayWhilePaused:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
         ):
@@ -605,6 +620,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -635,6 +651,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch(
                 "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
             ),
@@ -672,6 +689,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -701,6 +719,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch(
                 "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
             ),
@@ -723,6 +742,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task"),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -774,6 +794,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -805,6 +826,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -916,6 +938,7 @@ class TestPlayFrontInsertion:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
@@ -1604,6 +1627,7 @@ class TestNowFlag:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
         ):
@@ -1638,6 +1662,7 @@ class TestNowFlag:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
         ):
@@ -1803,6 +1828,7 @@ class TestNowFlag:
         music_bot._plays.place = _spy
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
@@ -1901,6 +1927,7 @@ class TestNowFlag:
         music_bot._plays.place = _spy
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             await command_callback(MusicBot.play)(
@@ -1966,6 +1993,7 @@ class TestPlacementInsertsAndConfirmations:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
             patch.object(
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
@@ -2014,6 +2042,7 @@ class TestPlacementInsertsAndConfirmations:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
             patch.object(
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
@@ -2055,6 +2084,7 @@ class TestPlacementInsertsAndConfirmations:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
         ):
@@ -2100,6 +2130,7 @@ class TestPlacementInsertsAndConfirmations:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
             await command_callback(MusicBot.play)(
@@ -2585,6 +2616,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
@@ -2616,6 +2648,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
@@ -2644,6 +2677,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
@@ -2710,6 +2744,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
@@ -2730,6 +2765,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
@@ -2815,6 +2851,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             collection = asyncio.create_task(
@@ -2849,6 +2886,7 @@ class TestResolveThenPlace:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             recording_span() as span,
             patch("asyncio.create_task", side_effect=fake_create_task),
         ):
@@ -3375,6 +3413,7 @@ class TestPlaceRefuses:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
@@ -3424,6 +3463,7 @@ class TestPlaceRefuses:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
@@ -3701,6 +3741,7 @@ class TestColdStartSingleflight:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             recording_span() as span,
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
@@ -3982,6 +4023,7 @@ class TestPlacementRevalidationCarriesDispatch:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
         ):
             await command_callback(MusicBot.play)(
@@ -4034,6 +4076,7 @@ class TestTheInterjectionHeadMustBePlayable:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=False)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
@@ -4059,6 +4102,7 @@ class TestTheInterjectionHeadMustBePlayable:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=True)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
@@ -4123,6 +4167,7 @@ class TestTheGateHoldEndsAtTheInsert:
 
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_pipeline._reply", new=_slow_reply),
         ):
             play = asyncio.create_task(
@@ -4157,6 +4202,7 @@ class TestTheGateHoldEndsAtTheInsert:
         )
         with (
             no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch("src.play_pipeline._reply", new=_slow_reply),
             patch("src.commands.play.parse_input", return_value=source),
         ):

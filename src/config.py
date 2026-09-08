@@ -139,6 +139,9 @@ PLAY_RESOLVE_CONCURRENCY: int = _int_env("PLAY_RESOLVE_CONCURRENCY", 2, minimum=
 # every second of it can be another guild member's legitimate resolve, and the
 # cost of expiring early is a refusal the user did not need to get.
 PLAY_RESOLVE_WAIT_SECS: float = _float_env("PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=1.0)
+# How long a request resolves before it says so. Above the 1–4s a warm resolve
+# takes, so the notice marks the unusual rather than narrating every -play.
+PLAY_SLOW_NOTICE_SECS: float = _float_env("PLAY_SLOW_NOTICE_SECS", 6.0, minimum=0.5)
 
 
 def _parse_bool_env(name: str) -> bool:
