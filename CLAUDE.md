@@ -444,9 +444,11 @@ play():
   │      • otherwise                 → TAIL
   ├─ cold start:
   │      • defer_playback() hold (gate stays shut so a Redis-restored queue head
-  │        can't start while this input resolves)
+  │        can't start while this input resolves), RELEASED at the put — the
+  │        confirmation embed is presentation, not something the first note waits on
   │      • join launched CONCURRENTLY with queue_source (no data dependency);
-  │        any failure cancels join and runs full cleanup() (zombie-loop prevention)
+  │        any failure cancels join and runs full cleanup() (zombie-loop prevention);
+  │        -join's own 👋 + latency line are SPAWNED, so waiters get the handshake
   ├─ EVERY placement, TAIL included: wait_for_restore() BEFORE the insert —
   │        ordering is load-bearing: put_front LPUSHes Redis, restore_entries replays
   │        entries already on that list in-memory-only, so inserting first
@@ -554,6 +556,13 @@ concurrent callers no-op). Each player owns:
   refcount for `defer_playback()`)
 - NP host state: `_np_host_message` / `_np_host_own_embeds` / `_np_host_dedicated` /
   `_np_edit_lock`
+
+The gate hold lives on a nested `AsyncExitStack` inside `_resolve_and_place`, and the
+enqueue helpers take a `release_hold` callable they invoke the moment the put lands:
+the put is the whole of what the hold waits for, and behind it sat one or two Discord
+round trips. `AsyncExitStack.aclose()` is idempotent, so every path that does NOT place
+still releases through the outer stack unchanged — which is what `_abandon_cold_start`'s
+hold-count read depends on.
 
 `cleanup(guild)` cancels all six tasks BEFORE disconnecting (so the loop can't start
 the next song mid-teardown), retires the NP host, disconnects voice, resets presence,

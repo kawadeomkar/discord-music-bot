@@ -262,7 +262,9 @@ class TestPingCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Regression: -join must post the cheap latency line and
-        must not run the dependency probes."""
+        must not run the dependency probes. The line is SPAWNED — a cold-start
+        -play waits out this whole task before it may place — so the assertion
+        settles the spawned work rather than expecting it inside join()."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.channel = mock_ctx.author.voice.channel
         mock_ctx.guild.change_voice_state = AsyncMock()
@@ -270,6 +272,7 @@ class TestPingCommand:
         mp.store = None
         mp.open_playback_gate = MagicMock()
         music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._restore_tasks = set()
         redis_spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
 
         with (
@@ -279,6 +282,8 @@ class TestPingCommand:
             patch("src.ping.probe_redis", new=redis_spy),
         ):
             await command_callback(MusicBot.join)(music_bot, mock_ctx)
+            assert music_bot._restore_tasks  # spawned, not awaited
+            await asyncio.gather(*tuple(music_bot._restore_tasks))
 
         latency_line.assert_awaited_once()
         redis_spy.assert_not_awaited()  # no health dashboard on the join path
