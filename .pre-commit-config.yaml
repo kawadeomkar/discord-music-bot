@@ -9,11 +9,11 @@
 # The split across stages is a time budget, and it is the whole design:
 #
 #   pre-commit  ruff (~0.13s) + trivia    fast enough to never think about
-#   pre-push    just check (~24s)         the "will CI pass" gate, once per push
+#   pre-push    just check                the "will CI pass" gate, once per push
 #
-# pyright (6s) and pytest (14s) are deliberately NOT on pre-commit. A hook slow
-# enough to interrupt your train of thought is a hook that teaches you to reach
-# for --no-verify, and that habit costs more than the checks ever caught.
+# pyright and pytest are deliberately not on pre-commit. A hook slow enough to
+# interrupt your train of thought is a hook that teaches you to reach for
+# --no-verify, and that habit costs more than the checks ever caught.
 #
 # Note: the formatting hooks REWRITE files. A commit that trips one fails and
 # leaves the fixes unstaged — `git add` them and commit again. That is working as
@@ -28,7 +28,7 @@ default_install_hook_types: [pre-commit, pre-push]
 #
 # This covers only hooks that declare no stages of their own. Three of the
 # pre-commit-hooks below ship upstream stages that outrank it and opt out
-# individually; just-check opts back IN to pre-push.
+# individually; the `just` gate hooks opt back in to pre-push.
 default_stages: [pre-commit]
 
 # coverage.json is a generated artifact that happens to be tracked (last written
@@ -80,33 +80,79 @@ repos:
 
   - repo: local
     hooks:
-      - id: just-check
-        name: just check (ruff + pyright + pytest)
-        # `language: system` runs this against git's ambient PATH, so `just` must be
-        # installed system-wide -- see the README's Requirements. Do NOT "fix" that
-        # with `language: python` + `additional_dependencies: [rust-just]`:
-        # pre-commit sets VIRTUAL_ENV to the isolated hook env, the justfile's
-        # VENV_BIN follows $VIRTUAL_ENV, and every tool would then be looked up
-        # inside a venv containing only `just`. Measured, not theorised.
-        #
-        # Unlike `make`, this CAN fail for want of the runner. A push from a GUI
-        # client with a minimal PATH may not find `just`; --no-verify is the escape
-        # hatch, as it always was.
-        entry: just check
+      # These five are `just check`'s dependency list, one hook each, in its order.
+      # Keep them in step with it; `just --dump --dump-format json` prints them.
+      #
+      # One hook per check, because pre-commit renders one status line per hook, runs
+      # hooks sequentially, and replays a hook's output only once that hook exits.
+      # Concurrency inside a single hook cannot produce a status line. `types` and
+      # `test` are fused into `check-heavy` — see HEAVY in the justfile.
+      #
+      # `language: system` runs these against git's ambient PATH, so `just` must be
+      # installed system-wide -- see the README's Requirements. Do not "fix" that
+      # with `language: python` + `additional_dependencies: [rust-just]`:
+      # pre-commit sets VIRTUAL_ENV to the isolated hook env, the justfile's
+      # VENV_BIN follows $VIRTUAL_ENV, and every tool would then be looked up
+      # inside a venv containing only `just`.
+      #
+      # Unlike `make`, these can fail for want of the runner. A push from a GUI
+      # client with a minimal PATH may not find `just`; --no-verify is the escape
+      # hatch.
+      #
+      # Every one needs pass_filenames: false and always_run: true. The first because
+      # pyright is a whole-program analysis and the test suite is not partitioned by
+      # path; the second because pre-commit skips a hook whose filename list came out
+      # empty, which a deletions-only push produces — the gate would report "Skipped"
+      # on precisely the change most likely to break the build.
+      #
+      # No fail_fast on any of them: a red push reports every failure at once.
+      - id: just-fmt-justfile
+        name: justfile format
+        entry: just fmt-justfile
         language: system
-        # Whole-repo gate: pyright is a whole-program analysis and the test suite
-        # is not partitioned by path, so passing filenames would be meaningless.
         pass_filenames: false
-        # always_run is the necessary partner to pass_filenames: false. pre-commit
-        # skips a hook whose filename list came out empty, and a push containing
-        # only deletions produces exactly that — the gate would report "Skipped"
-        # on precisely the change most likely to break the build.
         always_run: true
+        stages: [pre-push]
+
+      - id: just-pins
+        name: version pins
+        entry: just pins
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: just-fmt-check
+        name: ruff format
+        entry: just fmt-check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: just-lint
+        name: ruff lint
+        entry: just lint
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: just-check-heavy
+        name: pyright + pytest (concurrent)
+        entry: just check-heavy
+        language: system
+        pass_filenames: false
+        always_run: true
+        # The one hook covering two tools, so it has to say which of them failed —
+        # and on a green run, that pyright was not silently skipped. `verbose` makes
+        # pre-commit print a passing hook's output too, where that recap lands.
+        verbose: true
         stages: [pre-push]
 
       # Keeps the task file canonically formatted, which `make` had no equivalent
       # for. Runs on commit rather than push: it is ~0.01s and only fires when the
-      # justfile itself is staged. Same PATH requirement as just-check above.
+      # justfile itself is staged. Same PATH requirement as the gate hooks above.
       - id: just-fmt
         name: just --fmt --check
         entry: just --fmt --check --justfile

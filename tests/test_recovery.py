@@ -15,10 +15,11 @@ import discord
 import orjson
 import pytest
 import redis.asyncio as aioredis
+from discord.ext import commands
 from redis.asyncio import Redis
 
 from src.musicbot import MusicBot
-from src.recovery import restore_guild
+from src.recovery import join_succeeded, restore_guild
 from src.redis_client import GuildRedisStore
 from tests.helpers import make_mock_task, mocked, stub_create_task
 
@@ -741,3 +742,34 @@ class TestAloneCountdown:
                 await music_bot.voice_watchdog._countdown(mock_guild)
 
         assert mock_guild.id not in music_bot.voice_watchdog._timers
+
+
+class TestJoinSucceeded:
+    """The check both cold-start commands gate their insert on. Its whole reason to
+    exist is the still-connecting case: a type-only check passes there and hands the
+    loop a client vc.play() raises on, once per restored song."""
+
+    @staticmethod
+    def _ctx(voice_client: object) -> MagicMock:
+        ctx = MagicMock(spec=commands.Context)
+        ctx.voice_client = voice_client
+        return ctx
+
+    def test_connected_client_succeeds(self) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = True
+        assert join_succeeded(self._ctx(vc)) is True
+
+    def test_still_connecting_client_fails(self) -> None:
+        # discord.py registers the client on the guild BEFORE the handshake, so this
+        # is a real state a concurrent cold -play leaves behind — not a mock artifact.
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = False
+        assert join_succeeded(self._ctx(vc)) is False
+
+    def test_absent_client_fails(self) -> None:
+        # join swallows its own failures, so a failed join arrives as None.
+        assert join_succeeded(self._ctx(None)) is False
+
+    def test_non_voice_client_fails(self) -> None:
+        assert join_succeeded(self._ctx(MagicMock())) is False

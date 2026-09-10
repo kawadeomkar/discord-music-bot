@@ -22,6 +22,7 @@ from src.guild_queue import (
     RemoveMode,
     ShuffleOutcome,
     is_persisted,
+    item_label,
     remove_matcher,
 )
 from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
@@ -90,6 +91,36 @@ class TestIsPersisted:
 
 
 class TestPut:
+    async def test_an_unpersisted_item_never_reaches_the_mirror(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """persisted=False means "no entry of mine is on that list" and redis_pop_for
+        honours it at the dequeue, so writing one here would leave an entry nothing
+        ever LPOPs — the mirror one ahead of memory forever."""
+        await gq.put([_qobj(1, mock_author, persisted=False)])
+
+        assert gq.display_size() == 1
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+    async def test_a_mixed_batch_mirrors_only_the_persisted_half(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        persisted = _qobj(2, mock_author)
+        await gq.put([_qobj(1, mock_author, persisted=False), persisted])
+
+        assert gq.display_size() == 2
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == [
+            SongQueueEntry.from_queue_object(persisted).to_redis()
+        ]
+
     async def test_single_syncs_all_three_legs(
         self,
         gq: GuildQueue,
@@ -133,13 +164,16 @@ class TestPut:
         original_batch = store.push_queue_batch
         original_single = store.push_queue
 
-        async def spy_batch(entries: Any) -> None:
+        # Return the wrapped result, never None: the push methods now answer
+        # whether the write LANDED, and the queue reads that to decide whether the
+        # mirror is dirty. A spy swallowing it makes every push look cut short.
+        async def spy_batch(entries: Any) -> bool:
             recorded.append(f"batch:{len(entries)}")
-            await original_batch(entries)
+            return await original_batch(entries)
 
-        async def spy_single(entry: Any) -> None:
+        async def spy_single(entry: Any) -> bool:
             recorded.append("single")
-            await original_single(entry)
+            return await original_single(entry)
 
         store.push_queue_batch = spy_batch
         store.push_queue = spy_single
@@ -175,9 +209,9 @@ class TestPut:
         sizes_at_push: list[int] = []
         original = store.push_queue
 
-        async def spy(entry: Any) -> None:
+        async def spy(entry: Any) -> bool:
             sizes_at_push.append(gq.qsize())
-            await original(entry)
+            return await original(entry)
 
         store.push_queue = spy
         await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
@@ -363,6 +397,52 @@ class TestReleaseVsFinishFailedDequeue:
         await gq.finish_failed_dequeue(first, context="test")
 
         assert gq.display_size() == 1
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+
+    async def test_the_settle_and_the_pop_share_one_mutex_hold(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Both legs under ONE hold, or a bulk mutation lands between them and
+        rebuilds the mirror — and the LPOP then retires the head of the NEW list.
+        The mutex is what makes the pair atomic; nothing else does."""
+        held: list[bool] = []
+        original = store.pop_queue
+
+        async def spy() -> None:
+            held.append(gq._mutex.locked())
+            await original()
+
+        first = _qobj(1, mock_author)
+        await gq.put([first, _qobj(2, mock_author)])
+        await gq.get()
+
+        with patch.object(store, "pop_queue", spy):
+            await gq.finish_failed_dequeue(first, context="test")
+
+        assert held == [True]
+
+    async def test_a_cleared_claim_does_not_pop_the_song_that_replaced_it(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """-clear during a resolve leaves nothing claimed, and the queue has since
+        been refilled. The settle correctly no-ops; an LPOP alongside it would
+        retire the NEW head, which this dequeue never owned — losing it from Redis
+        alone, so it survives in memory until a restart drops it."""
+        claimed = _qobj(1, mock_author)
+        await gq.put([claimed])
+        await gq.get()
+
+        await gq.clear()
+        replacement = _qobj(2, mock_author)
+        await gq.put([replacement])
+
+        await gq.finish_failed_dequeue(claimed, context="test")
+
+        assert gq.display_items() == [replacement]
         assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
 
 
@@ -828,6 +908,23 @@ class TestTheTwoCounters:
     `play_history.queue_position` (MusicPlayer.enqueue_depth), so a swap writes a
     plausible wrong number to Postgres permanently, with no error to notice."""
 
+    async def test_claim_outstanding_follows_the_cursor(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The third view of the same two fields, and the one that survives the
+        handoff: between loop() taking a prefetch result out of its slot and
+        committing it, this is the only thing that says a song is on its way —
+        `_prefetch_task` is already None and `current_song` is not yet set."""
+        a = _qobj(1, mock_author)
+        await gq.put([a])
+        assert gq.claim_outstanding() is False
+
+        claimed = gq.get_nowait()
+        assert gq.claim_outstanding() is True
+
+        gq.requeue_front(claimed)
+        assert gq.claim_outstanding() is False
+
     async def test_they_differ_by_exactly_the_in_flight_head(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
@@ -933,7 +1030,7 @@ class TestBlockingWait:
     async def test_put_front_wakes_a_parked_getter(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """-playnow into an idle player: the loop is parked on an empty queue, and
+        """`-play --now` into an idle player: the loop is parked on an empty queue, and
         put_front has to wake it like put() and restore_entries() do. An unwoken
         getter does not fail — it waits forever on a queue that has an item in
         it."""
@@ -1056,7 +1153,7 @@ class TestBlockingWait:
         assert not gq_no_redis._wake.is_set()
 
 
-# ── put_front (-playnow interjection) ─────────────────────────────────────────
+# ── put_front (interjection) ─────────────────────────────────────────────────
 
 
 class TestPutFront:
@@ -1456,7 +1553,7 @@ class TestRemoveMatcher:
 
     def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
-        only thing it can be matched by, and the only place the album link is."""
+        only thing it can be matched by, and the only place that link is."""
         album = "https://open.spotify.com/album/xyz"
         item = YTSource(ytsearch="ytsearch:Track One", user_input=album)
         assert remove_matcher(album)(item) is RemoveMode.ORIGIN
@@ -1553,7 +1650,7 @@ class TestRemove:
 
 
 class TestResumeTailDepth:
-    """How deep the -playnow stack is: the run of parked plays behind the head.
+    """How deep the interjection stack is: the run of parked plays behind the head.
     Index 0 is skipped because it is the song that just cut the line, not
     something waiting to resume."""
 
@@ -1599,21 +1696,37 @@ class TestResumeTailDepth:
         )
         assert gq_no_redis.resume_tail_depth() == 3
 
-    async def test_stops_at_the_first_ordinary_song(
+    async def test_ordinary_songs_are_not_counted(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """Songs past the tails were queued normally and were never interrupted.
+        """Songs queued normally were never interrupted, so they park no play.
         Counting them would report depth as "queue length" on any guild that had
-        ever used -playnow."""
+        ever interjected."""
         await gq_no_redis.put(
             [
                 _qobj(9, mock_author),
                 self._tail(1, mock_author),
                 _qobj(5, mock_author),
-                self._tail(2, mock_author),  # not contiguous — not part of the stack
+                _qobj(6, mock_author),
             ]
         )
         assert gq_no_redis.resume_tail_depth() == 1
+
+    async def test_a_tail_separated_from_the_others_still_counts(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Adjacency is not what makes a play parked: `--now` takes a whole playlist,
+        so the layout is [head, *playlist, tail] and a consecutive-run count reads 0
+        for every playlist interjection and for a stack of them."""
+        await gq_no_redis.put(
+            [
+                _qobj(9, mock_author),
+                self._tail(1, mock_author),
+                _qobj(5, mock_author),
+                self._tail(2, mock_author),
+            ]
+        )
+        assert gq_no_redis.resume_tail_depth() == 2
 
     async def test_a_head_that_is_itself_a_tail_is_not_counted(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
@@ -1623,9 +1736,12 @@ class TestResumeTailDepth:
         await gq_no_redis.put([self._tail(1, mock_author), self._tail(2, mock_author)])
         assert gq_no_redis.resume_tail_depth() == 1
 
-    async def test_a_search_entry_breaks_the_run(
+    async def test_a_search_entry_is_not_a_parked_play(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
+        """An unresolved search has never played, so it parks nothing — but it no
+        longer hides the tails behind it either, which is exactly the shape a
+        Spotify playlist `--now` produces: [head, *lazy searches, tail]."""
         await gq_no_redis.put(
             [
                 _qobj(9, mock_author),
@@ -1634,7 +1750,7 @@ class TestResumeTailDepth:
                 self._tail(2, mock_author),
             ]
         )
-        assert gq_no_redis.resume_tail_depth() == 1
+        assert gq_no_redis.resume_tail_depth() == 2
 
 
 # ── crash recovery ────────────────────────────────────────────────────────────
@@ -1689,7 +1805,7 @@ class TestRestoreEntries:
         assert count == 0
         assert gq.qsize() == 0
 
-    async def test_playnow_flags_rehydrate(
+    async def test_interjection_flags_rehydrate(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         mock_guild.get_member.return_value = mock_author
@@ -1734,8 +1850,8 @@ class TestRestoreEntries:
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         """The song branch already carried user_input; the search branch is the new
-        leg, and it is the one that matters — a Spotify-album track holds the album
-        link nowhere else, so losing it here breaks -remove after a restart."""
+        leg, and it is the one that matters — a lazy Spotify-playlist track holds
+        that link nowhere else, so losing it here breaks -remove after a restart."""
         mock_guild.get_member.return_value = mock_author
         album = "https://open.spotify.com/album/abc123"
         assert (
@@ -1811,6 +1927,46 @@ class TestRestoreCrashed:
         assert item.ts == 95
         assert queue_object(item).persisted is False
         assert queue_object(item).requester is mock_author
+
+    async def test_it_goes_to_the_front_even_with_a_queue_behind_it(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """ "At the front of the line" is the contract, and its one caller runs on an
+        empty deque, where an append satisfies it by accident. The crashed song was
+        PLAYING, so behind the restored queue it would return after songs queued
+        while it was mid-play."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+
+        assert await gq.restore_crashed(
+            self._crashed_entry(mock_author.id), requester_fallback=mock_guild.me
+        )
+
+        assert [queue_object(i).title for i in gq.display_items()] == [
+            "Crashed",
+            "Song 1",
+            "Song 2",
+        ]
+
+    async def test_it_goes_ahead_of_pending_but_behind_a_claim(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """Front means the PENDING front. Ahead of a claimed item it would break the
+        claimed-prefix invariant Redis's LPOP retirement depends on."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+        await gq.get()  # Song 1 claimed
+
+        assert await gq.restore_crashed(
+            self._crashed_entry(mock_author.id), requester_fallback=mock_guild.me
+        )
+
+        assert [queue_object(i).title for i in gq.display_items()] == [
+            "Song 1",
+            "Crashed",
+            "Song 2",
+        ]
+        assert gq._cursor == 1
 
     async def test_carries_the_enqueue_stamps_of_the_original_enqueue(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
@@ -2105,6 +2261,33 @@ class TestRequeueFront:
         assert gq.get_nowait() is a
         assert gq._cursor == 1  # and the new consumer holds it
 
+    async def test_a_returned_claim_does_not_destroy_a_later_one(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """Two claims are live — the prefetch's, and the loop's, taken while the
+        prefetch's cancel awaited. The returned item belongs in its own slot, index
+        0; written at the cursor it overwrote the entry loop() had just claimed,
+        which the mirror kept, and the commit pops both by position."""
+        prefetched, claimed_by_loop, pending = (
+            _qobj(n, mock_author) for n in (1, 2, 3)
+        )
+        await gq.put([prefetched, claimed_by_loop, pending])
+        assert gq.get_nowait() is prefetched
+        assert gq.get_nowait() is claimed_by_loop
+
+        gq.requeue_front(prefetched)
+
+        # Nothing destroyed, nothing duplicated, order untouched — and one claim
+        # given back, so the newest entry is pending again.
+        assert gq.display_items() == [prefetched, claimed_by_loop, pending]
+        assert gq._cursor == 1
+        assert gq.qsize() == 2
+        await _assert_mirror_matches(gq, fake_redis, store)
+
     async def test_accepts_resolved_substitute(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
@@ -2189,6 +2372,42 @@ class TestShuffleWithInFlightDequeue:
         assert len(gq.display_items()) == 5
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert len(redis_items) == 4  # the crashed head is never persisted
+
+
+def _spy_mirror_calls(store: GuildRedisStore) -> list[str]:
+    """Record which whole-list write a mutation reaches for, in order."""
+    calls: list[str] = []
+    for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+        original = getattr(store, name)
+
+        def spy(*args: Any, _n: str = name, _o: Any = original, **kw: Any) -> Any:
+            calls.append(_n)
+            return _o(*args, **kw)
+
+        setattr(store, name, spy)
+    return calls
+
+
+async def _stall_one_put(
+    gq: GuildQueue, store: GuildRedisStore, item: QueueObject
+) -> None:
+    """Put one song through the cancellation the place lock's bound produces: the
+    deque takes it, the RPUSH never returns, and the queue is left knowing only
+    that the list no longer matches."""
+    stall = asyncio.Event()
+
+    async def _hang(*_a: Any, **_k: Any) -> bool:
+        await stall.wait()
+        return True
+
+    original = store.push_queue
+    store.push_queue = _hang
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await gq.put([item])
+    finally:
+        store.push_queue = original
 
 
 class TestStaleMirror:
@@ -2301,31 +2520,41 @@ class TestStaleMirror:
         assert not gq.mirror_dirty
         await _assert_mirror_matches(gq, fake_redis, store)
 
+    async def test_the_next_put_repairs_a_missed_retirement(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """One flag, two sources: a start transaction whose LPOP did not land is
+        repaired by the next enqueue as well as by the next song start."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 5)])
+        await fake_redis.lpush(store.queue_key(), b"stale-head")
+        gq.note_mirror_write(landed=False, retired=True)
+        calls = _spy_mirror_calls(store)
+
+        await gq.put([_qobj(5, mock_author)])
+
+        assert calls == ["rebuild_queue"]
+        assert not gq.mirror_dirty
+        await _assert_mirror_matches(gq, fake_redis, store)
+
 
 class TestMirrorWriteChoice:
     """Which Redis write a mutation picks. A rebuild costs the same whether it
     drops one entry or fifty, so a small -remove takes the LREM path instead —
     but only a removal may, because LREM says the survivors kept their order."""
 
-    def _spy(self, store: GuildRedisStore) -> list[str]:
-        calls: list[str] = []
-        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
-            original = getattr(store, name)
-
-            def spy(*args: Any, _n: str = name, _o: Any = original, **kw: Any) -> Any:
-                calls.append(_n)
-                return _o(*args, **kw)
-
-            setattr(store, name, spy)
-        return calls
-
     async def test_a_small_removal_lrems(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        """Small against the SURVIVORS, not in absolute terms — the gate is a
-        ratio, because a rebuild's cost scales with what it rewrites."""
+        """Small in absolute terms AND against the survivors. The crossover is a
+        COUNT — LREM is O(position), so N of them cost O(N x depth) against a
+        rebuild's O(depth) and the depth cancels — while the share clause keeps the
+        shortcut off queues too shallow for it to win anything."""
         await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
-        calls = self._spy(store)
+        calls = _spy_mirror_calls(store)
 
         await gq.remove(remove_matcher("https://yt.com/v=3"))
 
@@ -2349,7 +2578,7 @@ class TestMirrorWriteChoice:
             ]
             + survivors
         )
-        calls = self._spy(store)
+        calls = _spy_mirror_calls(store)
 
         outcome = await gq.remove(remove_matcher(album))
 
@@ -2372,7 +2601,7 @@ class TestMirrorWriteChoice:
             # threshold is ever consulted.
             + [_qobj(999, mock_author)]
         )
-        calls = self._spy(store)
+        calls = _spy_mirror_calls(store)
 
         outcome = await gq.remove(remove_matcher(album))
 
@@ -2385,7 +2614,7 @@ class TestMirrorWriteChoice:
         """Not an LREM of each: an empty list must not be left behind for the next
         restore to find, and DELETE is one round trip rather than n."""
         await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
-        calls = self._spy(store)
+        calls = _spy_mirror_calls(store)
 
         await gq.remove(lambda _item: RemoveMode.RESOLVED)
 
@@ -2404,7 +2633,7 @@ class TestMirrorWriteChoice:
         same path; the rebuild restates the whole list from memory."""
         await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
         await fake_redis.delete(store.queue_key())
-        calls = self._spy(store)
+        calls = _spy_mirror_calls(store)
 
         await gq.remove(remove_matcher("https://yt.com/v=3"))
 
@@ -2418,7 +2647,7 @@ class TestMirrorWriteChoice:
         Passing it a `removed` set here would silently leave Redis in the old
         order while memory held the new one."""
         await gq.put([_qobj(n, mock_author) for n in range(1, 6)])
-        calls = self._spy(store)
+        calls = _spy_mirror_calls(store)
 
         await gq.shuffle()
 
@@ -2521,6 +2750,155 @@ class TestPutClearMutualExclusion:
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
 
 
+class TestAMirrorWriteCutShort:
+    """put() appends the deque and then awaits the mirror, so a cancellation
+    between them leaves the Redis list short of what memory holds. Nothing
+    repairs it in place — the queue records that the list is untrustworthy and
+    the next enqueue rebuilds it."""
+
+    async def test_a_cancelled_push_marks_the_list_stale(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The 5s place bound against a Redis that accepts and then stalls. The
+        song is queued and playable; only its Redis leg is unknown."""
+        await _stall_one_put(gq, store, _qobj(1, mock_author))
+
+        assert gq.mirror_dirty
+        assert gq.display_size() == 1
+        assert await fake_redis.llen(store.queue_key()) == 0
+
+    async def test_the_next_put_rebuilds_instead_of_appending(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """An RPUSH onto a list of the wrong shape preserves the difference, and a
+        later dequeue's LPOP then retires an entry that is not its own."""
+        await _stall_one_put(gq, store, _qobj(1, mock_author))
+        calls = _spy_mirror_calls(store)
+
+        await gq.put([_qobj(2, mock_author)])
+
+        assert calls == ["rebuild_queue"]
+        assert not gq.mirror_dirty
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_clean_queue_still_appends(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The repair is the exception. Routing every append through the rebuild
+        turns an O(1) RPUSH into a full serialize under the mutex on every -play."""
+        calls = _spy_mirror_calls(store)
+
+        await gq.put([_qobj(1, mock_author)])
+
+        assert calls == []
+
+    async def test_a_rebuild_that_did_not_land_stays_stale(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """@_guild_op swallows a Redis failure and returns the default, so the
+        repair's own write can fail silently. Clearing the flag on a rebuild that
+        never happened is worse than never having set it: the next put appends
+        onto the same wrong list and nothing tries again."""
+        await _stall_one_put(gq, store, _qobj(1, mock_author))
+
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.rebuild_queue = _refused
+        await gq.put([_qobj(2, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_put_front_repairs_the_same_way(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """Its LPUSH branch is an append too, and it is the one -play --next and
+        every interjection take."""
+        await _stall_one_put(gq, store, _qobj(1, mock_author))
+        calls = _spy_mirror_calls(store)
+
+        await gq.put_front([_qobj(2, mock_author)])
+
+        assert calls == ["rebuild_queue"]
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_cancelled_front_push_marks_it_too(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        stall = asyncio.Event()
+
+        async def _hang(*_a: Any, **_k: Any) -> bool:
+            await stall.wait()
+            return True
+
+        store.push_queue_front = _hang
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await gq.put_front([_qobj(1, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_cancelled_clear_marks_it_too(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """Empty means DELETE, and that write can be cut short like any other. The
+        list still holds every entry -clear thought it dropped, so an unmarked
+        queue RPUSHes the next -play onto them and the following restore hands the
+        guild back the queue it just cleared."""
+        await gq.put([_qobj(n, mock_author) for n in (1, 2)])
+        stall = asyncio.Event()
+
+        async def _hang(*_a: Any, **_k: Any) -> bool:
+            await stall.wait()
+            raise AssertionError("unreachable: the wait never returns")
+
+        store.delete_queue = _hang
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await gq.clear()
+
+        assert gq.mirror_dirty
+        assert await fake_redis.llen(store.queue_key()) == 2  # nothing was dropped
+
+        await gq.put([_qobj(3, mock_author)])
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_the_lrem_shortcut_is_refused_while_stale(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """LREM asserts the survivors kept their order. A list that is already a
+        different shape has no order to keep, so the one removal small enough for
+        the shortcut has to take the rebuild instead."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
+        await _stall_one_put(gq, store, _qobj(8, mock_author))
+        calls = _spy_mirror_calls(store)
+
+        await gq.remove(remove_matcher("https://yt.com/v=2"))
+
+        assert calls == ["rebuild_queue"]
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+
 # ── Generation counter (stream preemption) ────────────────────────────────────
 
 
@@ -2546,7 +2924,7 @@ class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
 
         async with gq.commit_dequeue(generation) as committed:
             assert committed
-            # -playnow, scheduled into the window the hold has to close.
+            # an interjection, scheduled into the window the hold has to close.
             racer = asyncio.create_task(gq.put_front([interjected]))
             await asyncio.sleep(0)
             assert not racer.done(), (
@@ -2635,3 +3013,137 @@ class TestGenerationCounter:
         gen = gq.generation
         await gq.clear()
         assert gq.generation == gen + 1
+
+
+class TestItemLabelNamesEveryItemType:
+    """The Songs field exists because one argument can now take out a whole
+    playlist and there is no undo. `YTSource` has no `.title` at all, so reaching
+    for it rendered every unresolved Spotify-playlist track as `?` — the exact
+    case the field was added for, and the one the -remove help now advertises."""
+
+    def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
+        item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
+        assert item_label(item) == "Real Title"
+
+    def test_an_unresolved_search_uses_its_search_text(self) -> None:
+        item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
+        assert item_label(item) == "Artist - Song"
+
+    def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
+        item = YTSource(url="https://yt.com/v=2", process=True)
+        assert item_label(item) == "https://yt.com/v=2"
+
+
+class TestASwallowedAppendMarksTheMirrorStale:
+    """The append legs are @_guild_op-wrapped, so a Redis failure there neither
+    raises nor returns anything the caller can read. The _mirror_write guard sees
+    only cancellations; a swallowed RPUSH is the far more common way this mirror
+    goes short, and unmarked it never repairs: the next put appends onto a list
+    already missing an entry, and the next dequeue LPOPs a song it did not
+    dequeue — a restart then restores a queue offset by that many songs."""
+
+    async def test_a_swallowed_rpush_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.push_queue = _refused
+        await gq.put([_qobj(1, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_swallowed_batch_push_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.push_queue_batch = _refused
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)], batch=True)
+
+        assert gq.mirror_dirty
+
+    async def test_one_refused_push_of_several_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Per-entry RPUSHes: the mirror is wrong if ANY of them was swallowed."""
+        original = store.push_queue
+        calls = 0
+
+        async def _second_fails(entry: Any) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return False
+            return await original(entry)
+
+        store.push_queue = _second_fails
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_swallowed_front_push_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Worse than the tail case: the in-memory legs end up ahead of Redis at the
+        HEAD, so the next commit-time LPOP retires another song's entry."""
+
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.push_queue_front = _refused
+        await gq.put_front([_qobj(1, mock_author)])
+
+        assert gq.mirror_dirty
+
+    async def test_a_push_that_landed_leaves_it_clean(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The flag means the list is KNOWN to differ — a rebuild on every enqueue
+        is what setting it unconditionally would cost."""
+        await gq.put([_qobj(1, mock_author)])
+
+        assert not gq.mirror_dirty
+
+    async def test_a_swallowed_delete_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The DELETE leg reads a landed bool already, but nothing drove it: a
+        -clear whose DELETE was swallowed leaves the old list in Redis, the next
+        -play RPUSHes onto it, and the next restore hands the guild back the queue
+        it cleared."""
+        await gq.put([_qobj(1, mock_author)])
+        assert not gq.mirror_dirty
+
+        async def _refused(*_a: Any, **_k: Any) -> bool:
+            return False
+
+        store.delete_queue = _refused
+        await gq.clear()
+
+        assert gq.mirror_dirty
+
+
+class TestACutShortLremMarksTheMirrorStale:
+    """The LREM shortcut was the one mirror write outside _mirror_write(): a
+    cancellation there leaves the deque short by N and the list short by fewer,
+    with nothing to tell the next enqueue that appending preserves the difference."""
+
+    async def test_a_cancelled_lrem_marks_it(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        # Enough survivors that the LREM shortcut is taken at all: one dropped
+        # entry may not exceed one in five (_LREM_MAX_SHARE).
+        await gq.put([_qobj(i, mock_author) for i in range(8)])
+        assert not gq.mirror_dirty
+
+        async def _cancelled(*_a: Any, **_k: Any) -> int:
+            raise asyncio.CancelledError
+
+        store.remove_queue_entries = _cancelled
+
+        with pytest.raises(asyncio.CancelledError):
+            await gq.remove(remove_matcher("https://yt.com/v=1"))
+
+        assert gq.mirror_dirty

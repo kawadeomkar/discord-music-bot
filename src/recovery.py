@@ -1,10 +1,11 @@
 """Voice-session lifecycle: rejoining after a restart, and leaving when alone.
 
-Two halves of one question — when does the bot join a voice channel, and when
-does it leave one. restore_guild() is the join side (crash recovery, documented
-in docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the
-10s alone-disconnect countdown). on_voice_state_update's bot-was-ejected arm is
-the third case and routes straight to cog.cleanup().
+restore_guild() is the join side (crash recovery,
+docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the 10s
+alone-disconnect countdown), and its bot-was-ejected arm routes straight to
+cog.cleanup(). The two cold-start helpers at the bottom are what -play and
+-resume both do about a join that produced no usable voice client; they live
+here so the two commands' checks cannot diverge.
 
 Both take the MusicBot cog as an explicit parameter, the way MusicPlayer does.
 
@@ -12,28 +13,28 @@ Do not rename the `guild.restore` span — Tempo queries match on it.
 """
 
 import asyncio
+import contextlib
 from typing import TYPE_CHECKING, Optional
 
 import discord
+from discord.ext import commands
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
-from src import debug as debug_mode
 from src.musicplayer import MusicPlayer
 from src.redis_client import GuildRedisStore
 from src.telemetry import get_tracer
 from src.util import first_sendable_channel, get_logger, notice_embed, record_span_error
 
 if TYPE_CHECKING:
-    # A runtime import would close the cycle (musicbot imports this module); the
-    # cog is only named in annotations. Same guard musicplayer.py and debug.py use.
+    # A runtime import would close the cycle (musicbot imports this module).
     from src.musicbot import MusicBot
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
 # How long the bot waits alone in a voice channel before disconnecting, and the
-# number the countdown notice quotes. One constant so the two cannot disagree.
+# number the countdown notice quotes.
 ALONE_DISCONNECT_SECS = 10
 
 
@@ -48,29 +49,25 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
     store = GuildRedisStore(cog.redis, guild.id)
 
     trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
-    # One restore per guild at a time. on_ready re-fires on any reconnect that
-    # fails to RESUME, and the mps check above cannot cover that window because
-    # mps[guild.id] is set only after the connect below. Acquired inside the span
-    # so the SET NX EX is a child span.
+    # One restore per guild at a time: on_ready re-fires on any reconnect that
+    # fails to RESUME, and mps[guild.id] is set only after the connect below.
     # See docs/ARCHITECTURE.md#distributed-recovery-lock
     if not await store.acquire_recovery_lock():
         trace.get_current_span().set_attribute("restore.skipped_lock", True)
         log.info(f"Recovery already in progress for guild {guild.id}, skipping")
         return
     try:
-        # One pipelined read serves both gates below: connection (state hash) and
+        # One pipelined read serves both gates: connection (state hash) and
         # anything-to-restore (queue length + crashed song). _restore_state
-        # re-reads the real payload after a successful connect, so a stopped
-        # guild's leftover queue never rides the wire on the nothing-to-do path.
+        # re-reads the payload after a successful connect.
         gate = await store.get_recovery_gate()
         if gate is None:
-            # Read failed — do not treat as "nothing to restore". Skip this
-            # attempt; the lock expires on its TTL and the next on_ready retries.
+            # Read failed, not "nothing to restore": the lock expires on its
+            # TTL and the next on_ready retries.
             log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
             return
         guild_state = gate.state
-        # Equivalent to `not has_active_connection`, spelled as explicit None
-        # checks so the channel IDs narrow to int below.
+        # Explicit None checks so the channel IDs narrow to int.
         vc_id = guild_state.voice_channel_id
         tc_id = guild_state.text_channel_id
         if vc_id is None or tc_id is None:
@@ -109,13 +106,9 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
                     discord.Color.orange(),
                 )
                 # No player exists on this path, so the cog decorates directly.
-                if cog.debug_settings.enabled(guild.id):
-                    debug_mode.decorate_embeds(
-                        [notice],
-                        span=trace.get_current_span(),
-                        shard_id=guild.shard_id,
-                        runtime=cog.debug_settings.snapshot,
-                    )
+                cog.debug_settings.decorate(
+                    [notice], guild, span=trace.get_current_span()
+                )
                 try:
                     await notify_channel.send(embed=notice)
                 except Exception as notify_err:
@@ -125,7 +118,6 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
                     )
             return
 
-        # Check there is something to restore before connecting.
         if not gate.has_restorable_playback:
             return
 
@@ -165,14 +157,8 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
 
 
 class VoiceWatchdog:
-    """Disconnects the bot once it is alone in a voice channel.
-
-    Owns the per-guild timer tasks: the cancel-before-pop ordering and the
-    current-task guard below are the whole of this feature's correctness, and
-    they belong with the state they protect.
-
-    One instance per cog, built in MusicBot.__init__.
-    """
+    """Disconnects the bot once it is alone in a voice channel. Owns the
+    per-guild timer tasks; one instance per cog, built in MusicBot.__init__."""
 
     __slots__ = ("_cog", "_timers")
 
@@ -181,12 +167,9 @@ class VoiceWatchdog:
         self._timers: dict[int, asyncio.Task] = {}
 
     def cancel(self, guild_id: int) -> None:
-        """Drop a guild's pending countdown, if any.
-
-        Never cancels the CALLING task: _countdown ends in cog.cleanup(), which
-        calls straight back here, and cancelling yourself mid-teardown raises
-        CancelledError out of cleanup and abandons the rest of it.
-        """
+        """Drop a guild's pending countdown, if any. Never cancels the CALLING
+        task: _countdown ends in cog.cleanup(), which calls back here, and
+        cancelling yourself mid-teardown abandons the rest of cleanup."""
         existing = self._timers.pop(guild_id, None)
         if existing and not existing.done() and existing is not asyncio.current_task():
             existing.cancel()
@@ -206,7 +189,6 @@ class VoiceWatchdog:
         # ── Case A: bot itself was disconnected or moved ──────────────────────
         if cog.bot.user is not None and member.id == cog.bot.user.id:
             if before.channel is not None and after.channel is None:
-                # Bot ejected — full cleanup.
                 if guild.id in cog.mps:
                     with _tracer.start_as_current_span(
                         "bot.voice_state_update",
@@ -217,30 +199,28 @@ class VoiceWatchdog:
                         )
                         await cog.cleanup(guild)
             elif before.channel is not None and after.channel is not None:
-                # Bot moved — cancel any stale timer counting down the old channel.
+                # Moved — cancel any timer counting down the old channel.
                 self.cancel(guild.id)
             return
 
         # ── Case B: a human member's voice state changed ──────────────────────
         if guild.id not in cog.mps:
-            return  # bot isn't active in this guild
+            return
 
         vc = guild.voice_client
         if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
             return
 
-        # Skip mute/deafen/server-deafen events — channel is unchanged.
+        # Mute/deafen events leave the channel unchanged.
         if before.channel == after.channel:
             return
 
-        # Only care about events that affect the bot's current channel.
         if before.channel != vc.channel and after.channel != vc.channel:
             return
 
         human_members = [m for m in vc.channel.members if not m.bot]
 
         if len(human_members) == 0:
-            # Bot is now alone — start (or restart) the countdown.
             self.cancel(guild.id)
             log.info(
                 f"Bot is alone in guild {guild.id}, starting "
@@ -248,28 +228,26 @@ class VoiceWatchdog:
             )
             self._timers[guild.id] = asyncio.create_task(self._countdown(guild))
         else:
-            # A human is present — cancel any running alone-timer.
             if guild.id in self._timers:
                 log.info(f"User rejoined guild {guild.id}, cancelling alone timer")
             self.cancel(guild.id)
 
     async def _countdown(self, guild: discord.Guild) -> None:
         """Warn the guild's text channel, wait, then disconnect if the bot is
-        still alone in its voice channel. Cancelled if a human rejoins."""
+        still alone. Cancelled if a human rejoins."""
         try:
             mp = self._cog.mps.get(guild.id)
 
             if mp is not None:
-                # Its own short span rather than one stretched over the sleep (see
-                # below): without one current, this notice's debug footer carries no
-                # trace id.
+                # Its own short span: without one current, the notice's debug
+                # footer carries no trace id.
                 with _tracer.start_as_current_span(
                     "bot.alone_countdown.notice",
                     attributes={"discord.guild_id": str(guild.id)},
                 ):
                     try:
-                        # send_with_np, not a bare channel send: this can fire
-                        # mid-song and a bare send would bury the NP host message.
+                        # send_with_np: this can fire mid-song, and a bare send
+                        # would bury the NP host message.
                         embed = discord.Embed(
                             title="No users remaining in voice channel",
                             description=(
@@ -287,8 +265,8 @@ class VoiceWatchdog:
 
             await asyncio.sleep(ALONE_DISCONNECT_SECS)
 
-            # Span covers only the post-sleep decision, so it isn't open for the
-            # full countdown (which confuses OTLP exporters and leaks OTel context).
+            # Covers only the post-sleep decision: a span held open across the
+            # countdown confuses OTLP exporters and leaks OTel context.
             with _tracer.start_as_current_span(
                 "bot.alone_countdown",
                 attributes={"discord.guild_id": str(guild.id)},
@@ -310,3 +288,34 @@ class VoiceWatchdog:
             log.error(f"alone countdown error in guild {guild.id}: {e}", exc_info=True)
         finally:
             self._timers.pop(guild.id, None)
+
+
+def join_succeeded(ctx: commands.Context) -> bool:
+    """Did the join a cold-start command just ran leave a USABLE voice client?
+    is_connected(), not just the type: discord.py registers the client on the
+    guild BEFORE the handshake completes, and vc.play() on a still-connecting
+    one raises once per restored song. A failed join arrives as an absent
+    client, not an exception."""
+    vc = ctx.voice_client
+    return isinstance(vc, discord.VoiceClient) and vc.is_connected()
+
+
+async def abandon_cold_start(
+    cog: MusicBot, ctx: commands.Context, mp: MusicPlayer
+) -> None:
+    """Drop the player a cold-start command (`-play`, `-resume`) was about to
+    hand a voice connection to. defer_playback opens the gate as it unwinds
+    whether or not the join worked, and a loop waking with no voice client
+    fails its `vc` assertion once per restored song, draining the in-memory
+    queue while Redis keeps every entry; tearing down first makes that
+    gate-open land on a cancelled loop. The re-park FOLLOWS cleanup(), whose
+    clear_connection() HDELs the fields it writes. Skipped while another
+    command holds the gate: it is mid-join on this player and owns the
+    teardown."""
+    if mp.playback_holds > 1:  # this command's own hold, plus someone else's
+        return
+    if ctx.guild is not None:
+        with contextlib.suppress(Exception):
+            await cog.cleanup(ctx.guild)
+    with contextlib.suppress(Exception):
+        await mp.repark_crashed_head()

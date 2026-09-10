@@ -180,14 +180,10 @@ class TestRecent:
     async def test_a_stacked_interruption_is_reordered_by_played_at(
         self, store: GuildRedisStore
     ) -> None:
-        """The persisted leg is in RECORD order, which is song-end order — and
-        since played_at became the song's START, an interrupted song is recorded
-        after everything that cut in front of it. So the leg's own head can hold
-        the earliest played_at, and the sort in recent() is what stops -history
-        rendering in end order under a "newest first" promise.
-
-        Shaped like a real -playnow stack: A starts, B and C cut in and finish
-        first, A resumes and finishes last."""
+        """The persisted leg is in record (song-end) order while played_at is the
+        start, so an interrupted song is recorded after what cut in front of it and
+        the leg's head can hold the earliest played_at; recent()'s sort is what keeps
+        -history newest-first. Shaped like a stack: A starts, B and C cut in, A last."""
         a, b, c = (
             _entry(1, played_at=1000.0),
             _entry(2, played_at=1100.0),
@@ -390,7 +386,7 @@ class TestRecentIsRedisOnly:
 class TestRecentWindowIsTheCap:
     """The arithmetic the Redis-only read path rests on: push_history trims to
     HISTORY_CACHE_LIMIT, get_history reads that whole window, and
-    musicbot.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
+    guild_history.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
     three and -history silently starts losing depth.
     """
 
@@ -410,7 +406,7 @@ class TestRecentWindowIsTheCap:
         # Imported here rather than at module scope: this is the one assertion
         # in this file that reaches into the command layer, and it is asserting
         # a relationship between two constants, not exercising a command.
-        from src.musicbot import HISTORY_MAX_LIMIT
+        from src.commands.history import HISTORY_MAX_LIMIT
 
         assert HISTORY_MAX_LIMIT == HISTORY_CACHE_LIMIT
 

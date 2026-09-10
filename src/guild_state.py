@@ -1,16 +1,12 @@
 """
 Guild state schema — single source of truth for all Redis state stored per guild.
 
-The two Redis hashes and the queue list each have corresponding frozen dataclasses
-(value objects). GuildRedisStore in redis_client.py uses these for typed reads and
-field-name constants; GuildQueue in guild_queue.py converts between at-rest queue
-entries and live queue items. Callers never touch raw bytes from Redis directly.
-
-Pure schema: constructors, serializers, derived read-only properties, and the
-domain NORMALIZATION that keeps a value object inside the column domain it is
-stored in (HistoryEntry.__post_init__) — no behaviour, and no runtime imports from
-the rest of the project (orjson is the project-wide wire codec). Normalization
-lives here so the type and the domain it promises cannot drift apart.
+Each Redis hash and list has a frozen value object here; GuildRedisStore reads
+and writes through them and GuildQueue converts between at-rest entries and live
+items, so no caller touches raw bytes. Pure schema: constructors, serializers,
+derived properties, and the domain normalization that keeps a value object inside
+the column it is stored in (HistoryEntry.__post_init__). No runtime imports from
+the rest of the project.
 """
 
 import logging
@@ -36,28 +32,22 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Analytics:
     """Values carried on live queue objects (QueueObject, YTSource, YTDL) for
-    storage alone: read only to serialize or to carry onto the next object.
-    Admission rule — a field anything branches on or renders belongs elsewhere.
+    storage alone — read only to serialize or to carry onto the next object; a
+    field anything branches on or renders belongs elsewhere. In-memory shape
+    only: wire entries and play_history columns stay FLAT. Frozen, because carry
+    sites alias one instance across a resume tail and its source."""
 
-    An in-memory shape only. Wire entries and play_history columns stay FLAT,
-    exploded at the serialization boundary in this module.
-
-    Frozen: carry sites alias one instance across a resume tail and its source
-    (analytics=current.analytics)."""
-
-    # Unix epoch when the user ASKED for the song: the command message's
-    # snowflake time. Discord's clock, so played_at - queued_at is cross-clock
-    # and goes slightly negative under host drift.
+    # Unix epoch when the user ASKED: the command message's snowflake time
+    # (Discord's clock, so played_at - queued_at can go slightly negative).
     # 0.0 = unknown (pre-feature wire entries).
     queued_at: float
     # Songs ahead at ask time, counting the one playing (0 = played immediately).
-    # Read once at command dispatch (MusicPlayer.enqueue_depth), so the loop's
-    # continuous dequeuing leaves it approximate against the insert.
+    # Read once at dispatch, so it is approximate against the insert.
     queue_position: int
 
 
-# The unknown value: what a pre-feature wire entry rehydrates as, and the
-# default on live objects whose construction site cannot know the values yet.
+# What a pre-feature wire entry rehydrates as, and the default on live objects
+# whose construction site cannot know the values yet.
 ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
 
@@ -65,13 +55,9 @@ ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
 
 class StateField:
-    # LEGACY. Volume moved to guild:{id}:config (GuildConfig) because this hash
-    # expires in 24h and a setting must not. Config is the source of truth and is
-    # read first; this field is still both read AND written for one release, so a
-    # rollback to a build that only knows this one still finds a fresh value —
-    # deleting it outright reset every migrated guild to 100% on `just up
-    # <older-sha>`. Drop this, GuildStateData.volume and set_volume's second write
-    # together once every deployment understands :config.
+    # LEGACY: volume lives in guild:{id}:config (GuildConfig), read first. Still
+    # read AND written for one release so a rollback finds a fresh value. Drop
+    # this, GuildStateData.volume and set_volume's second write together.
     VOLUME: Final[str] = "volume"
     VOICE_CHANNEL_ID: Final[str] = "voice_channel_id"
     TEXT_CHANNEL_ID: Final[str] = "text_channel_id"
@@ -80,40 +66,35 @@ class StateField:
     CURRENT_SONG_DURATION: Final[str] = "current_song_duration"
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
-    # "1" when the playing song was queued via -playnow — attribution that would
-    # otherwise be lost across a crash mid-interjection.
+    # "1" when the playing song was queued by an interjection (attribution only).
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
-    # "1" when the playing song is a -playnow resume tail, and when it was parked
-    # paused. is_resume drives the resume announcement, _remaining_secs' billing and
-    # the tail's NP-card cleanup, so losing it across a crash changes behaviour.
+    # "1" when the playing song is an interjection's resume tail / was parked
+    # paused. is_resume drives the announcement, _remaining_secs and NP-card
+    # cleanup.
     CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
     CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
     # Set once at ask time and carried, never rewritten, so a crash-recovered
-    # song still archives the position it was originally queued at.
+    # song still archives what it was originally queued with.
     CURRENT_SONG_QUEUED_AT: Final[str] = "current_song_queued_at"
     CURRENT_SONG_QUEUE_POSITION: Final[str] = "current_song_queue_position"
-    # Same reason: without it a song recovered after a crash archives as unknown,
-    # silently and only for crashed plays.
     CURRENT_SONG_QUERY_SOURCE: Final[str] = "current_song_query_source"
-    # What the user typed. Carried for -remove rather than the archive: without it
-    # a crash-recovered head is the one track a collection link cannot take out.
+    # What the user typed, so -remove <collection link> can take out a
+    # crash-recovered head.
     CURRENT_SONG_USER_INPUT: Final[str] = "current_song_user_input"
-    # When the audio started. Not PLAY_START_EPOCH below, which is backdated by the
-    # -ss offset, and not derivable from this run's clock at all — a resume tail
-    # inherits its value from an earlier fragment.
+    # When the audio started. Not PLAY_START_EPOCH (backdated by -ss) and not
+    # derivable from this run's clock: a resume tail inherits an earlier
+    # fragment's value.
     CURRENT_SONG_PLAYED_AT: Final[str] = "current_song_played_at"
-    # LEGACY, all three: superseded by LAST_POSITION_SECS below and read only by
-    # _legacy_wall_clock_position_at. Still written so a rollback recovers; drop them
-    # with that method and on_pause/on_resume one release after the heartbeat ships.
+    # LEGACY, all three: read only by _legacy_wall_clock_position_at, still
+    # written so a rollback recovers. Drop with that method and on_pause/
+    # on_resume one release after the heartbeat ships.
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
-    # The recorded playback position, read with no wall-clock arithmetic. The
-    # three fields above are its predecessors, still written for rollback safety;
-    # they go one release after this ships.
+    # The recorded playback position, read with no wall-clock arithmetic.
     LAST_POSITION_SECS: Final[str] = "last_position_secs"
-    # When that position was recorded. Never an addend — it dates the field above,
-    # so _heartbeat_predates_song can refuse one belonging to an earlier song.
+    # When that position was recorded. Never an addend — it lets
+    # _heartbeat_predates_song refuse a position belonging to an earlier song.
     LAST_HEARTBEAT_EPOCH: Final[str] = "last_heartbeat_epoch"
 
 
@@ -135,21 +116,17 @@ class NowPlayingField:
     REQUESTER_MENTION: Final[str] = "requester_mention"
 
 
-# ── Parsing helpers (module-level; shared by both from_redis constructors) ───
+# ── Parsing helpers (shared by the from_redis constructors) ──────────────────
 #
-# The bare `except A, B:` clauses below are PEP 758 (Python 3.14+) multi-exception
-# syntax, not the old Python-2 catch-one/bind-name form: they catch the tuple
-# (A, B) and let unlisted types propagate. ruff's formatter normalizes to this at
-# `target-version = "py314"`; do not re-parenthesize, ruff strips it back.
+# `except A, B:` below is PEP 758 (Python 3.14+) tuple-catch syntax, normalized
+# by ruff at target-version py314; do not re-parenthesize.
 
 
 def _b_str(raw: dict[bytes, bytes], key: str, default: str = "") -> str:
     v = raw.get(key.encode())
-    # `is None`, not truthiness: a missing key gets the default, a stored b"" stays
-    # "". errors="replace" so one corrupt non-UTF8 byte degrades to a mangled
-    # string — a strict decode would raise out of from_redis(), get_guild_state()
-    # would return None, and corruption would be misclassified as "Redis
-    # unavailable", blocking recovery until TTL expiry.
+    # `is None`, not truthiness: a stored b"" stays "". errors="replace" so one
+    # corrupt byte degrades to a mangled string rather than raising out of
+    # from_redis(), which would read as "Redis unavailable" and block recovery.
     return v.decode(errors="replace") if v is not None else default
 
 
@@ -162,8 +139,7 @@ def _b_float(raw: dict[bytes, bytes], key: str) -> float | None:
     except ValueError, TypeError:
         log.warning(f"guild_state: malformed float for {key!r}: {v!r}")
         return None
-    # nan/inf parse fine but poison downstream arithmetic (int(nan) raises, inf
-    # overflows) — treat them as malformed like any other corrupt value.
+    # nan/inf parse fine but poison downstream arithmetic.
     if not math.isfinite(f):
         log.warning(f"guild_state: non-finite float for {key!r}: {v!r}")
         return None
@@ -174,16 +150,14 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
     v = raw.get(key.encode())
     if v is None or v == b"":
         return None
-    # Exact parse first: snowflake IDs exceed float's 53-bit integer precision,
-    # so routing them through float() would silently corrupt them.
+    # Exact parse first: snowflake IDs exceed float's 53-bit integer precision.
     try:
         return int(v)
     except ValueError, TypeError:
         pass
     try:
-        # Tolerates values stored as "111.0" (already float-rounded at write
-        # time, so this round-trip loses nothing further). OverflowError covers
-        # int(float(b"inf")) — non-finite is malformed here too.
+        # Tolerates "111.0" (float-rounded at write time). OverflowError covers
+        # int(float(b"inf")).
         return int(float(v))
     except ValueError, TypeError, OverflowError:
         log.warning(f"guild_state: malformed int for {key!r}: {v!r}")
@@ -194,27 +168,21 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
 
 
 class ConfigField:
-    """Wire field names for guild:{id}:config. Spelled out, like every other field
-    table here, so renaming a Python attribute can never silently rename a Redis
-    field and orphan every guild's stored setting."""
+    """Wire field names for guild:{id}:config, spelled out so renaming a Python
+    attribute can never silently rename a Redis field."""
 
     DEBUG_MODE: Final[str] = "debug_mode"
     VOLUME: Final[str] = "volume"
     TIMEZONE: Final[str] = "timezone"
 
 
-# The zone every guild renders ETAs in until it picks one. Named here rather than
-# in musicplayer so the schema layer can validate against the same default it
-# hands back, and so the eventual `-options timezone <name>` has one answer to
-# "what does unset mean?".
+# The zone every guild renders ETAs in until it picks one; the schema layer
+# validates against the same default it hands back.
 DEFAULT_TIMEZONE: Final[str] = "America/Los_Angeles"
 
-# Zone names already proven unusable on this host. ZoneInfo caches SUCCESSFUL
-# lookups itself; a failed one is the expensive direction (a filesystem miss, ~155us
-# measured) and it also logs, so without this a stored name the host cannot resolve
-# would pay both on every render once -options lets a guild set one. Bounded by the
-# cap rather than by trust: the write boundary validates, but this key outlives
-# builds and can be hand-edited.
+# Zone names already proven unusable on this host. ZoneInfo caches successful
+# lookups only; a failed one is a filesystem miss plus a log line on every
+# render. Capped because this key outlives builds and can be hand-edited.
 _UNUSABLE_ZONES: Final[set[str]] = set()
 _MAX_UNUSABLE_ZONES: Final[int] = 256
 
@@ -224,60 +192,37 @@ _MAX_TIMEZONE_NAME: Final[int] = 64
 
 @lru_cache(maxsize=1)
 def _known_zones() -> frozenset[str]:
-    """Every zone this host can name. Cached: available_timezones() walks the whole
-    tz database, and the answer cannot change without a restart."""
+    """Every zone this host can name. available_timezones() walks the whole tz
+    database, and the answer cannot change without a restart."""
     return frozenset(available_timezones())
 
 
 def valid_timezone(name: str) -> bool:
-    """True if `name` is a zone this host can actually resolve.
-
-    The WRITE boundary's check. tzinfo()'s fallback is a backstop for a name that
-    stopped resolving (a base-image change), not a substitute for this: a bad name
-    stored unvalidated fails SILENTLY — the write succeeds, the command reports
-    success, and the guild's ETAs stay on the default forever with only a log line
-    nobody reads.
-
-    Membership, not `ZoneInfo(name)`: ZoneInfo resolves against the tz database BY
-    PATH, so `zone.tab` and `leapseconds` are real files that construct fine without
-    being zones.
-    """
-    if not name or len(name) > _MAX_TIMEZONE_NAME:
-        return False
-    return name in _known_zones()
+    """The WRITE boundary's check: a bad name stored unvalidated fails silently
+    (the write succeeds, the command reports success, ETAs stay on the default
+    forever). Membership, not `ZoneInfo(name)`: ZoneInfo resolves BY PATH, so
+    `zone.tab` and `leapseconds` construct fine without being zones."""
+    return 0 < len(name) <= _MAX_TIMEZONE_NAME and name in _known_zones()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildConfig:
-    """A guild's DURABLE preferences — what an operator chose, not what the bot is
-    doing right now.
-
-    Deliberately its own key rather than fields on guild:{id}:state. That hash is
-    runtime state (current song, pause epochs) and carries a 24h TTL, so a setting
-    stored there would silently revert on any guild that went a day without playing
-    anything — a worse failure than the in-memory version it replaces, because the
-    reset would be tied to nothing the user can see.
-
-    Every field is Optional and that is the whole point: absent means "follow the
-    host default", which is NOT the same as an explicitly chosen value. A guild that
-    turned debug off while the host default is on must stay off, and a guild that
-    never touched it must follow the host — a plain bool cannot express both. Volume
-    carries the same distinction for the same reason GuildStateData.volume did:
-    restore must skip the assignment rather than clobber a concurrent -volume with a
-    fabricated 1.0.
-    """
+    """A guild's DURABLE preferences, in its own key: guild:{id}:state carries a
+    24h TTL, and a setting stored there reverts on any guild idle for a day.
+    Every field is Optional because absent means "follow the host default",
+    which is not the same as an explicitly chosen value — a guild that turned
+    debug off while the host default is on must stay off, and restore must skip
+    an unset volume rather than clobber a concurrent -volume with 1.0."""
 
     debug_mode: bool | None = None
     volume: float | None = None
-    # An IANA name, not a ZoneInfo: the wire stays human-readable and the
-    # eventual -options command can write what the user typed. Resolved by
-    # tzinfo() below, which is also where an unusable name degrades.
+    # An IANA name, not a ZoneInfo: the wire stays human-readable. Resolved by
+    # tzinfo(), which is also where an unusable name degrades.
     timezone: str | None = None
 
     def to_redis(self) -> dict[str, str]:
-        """Only fields with a value. An unset field is ABSENT from the hash rather
-        than stored as a sentinel, so "never chose" stays distinguishable after a
-        round trip."""
+        """Only fields with a value: an unset field is ABSENT from the hash, so
+        "never chose" survives a round trip."""
         mapping: dict[str, str] = {}
         if self.debug_mode is not None:
             mapping[ConfigField.DEBUG_MODE] = "1" if self.debug_mode else "0"
@@ -289,14 +234,10 @@ class GuildConfig:
 
     def tzinfo(self) -> ZoneInfo:
         """The guild's zone, or the default when it has not chosen a usable one.
-
-        Resolution happens HERE rather than at write time because the tz database is
-        a property of the host, not of the stored value: a name that resolved when it
-        was set can stop resolving after a base-image change, and an ETA rendered in
-        the default beats a render path that raises.
-        """
-        # tzdata is a declared dependency, so the default always resolves and this
-        # cannot raise on a render path even where the host ships no tz database.
+        Resolved at read time because the tz database is a property of the host:
+        a name that resolved when set can stop resolving after a base-image
+        change, and a default beats a render path that raises."""
+        # tzdata is a declared dependency, so the default always resolves.
         if self.timezone is None or self.timezone in _UNUSABLE_ZONES:
             return ZoneInfo(DEFAULT_TIMEZONE)
         try:
@@ -311,18 +252,11 @@ class GuildConfig:
 
     @classmethod
     def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
-        """Deserialize raw HGETALL output; an empty dict yields all-unset.
-
-        Anything that is neither "1" nor "0" reads as unset rather than raising:
-        this key outlives builds, and one unparseable field must not cost the guild
-        its whole config (the same rule the queue and history parsers follow).
-        """
-        stored = _b_str(raw, ConfigField.DEBUG_MODE)
-        debug_mode = {"1": True, "0": False}.get(stored)
-        # _b_float already logs and returns None on a malformed value, which is the
-        # same "unset" this class wants.
+        """Deserialize raw HGETALL output; an empty dict yields all-unset. An
+        unparseable field reads as unset rather than raising: this key outlives
+        builds, and one bad field must not cost the guild its whole config."""
         return cls(
-            debug_mode=debug_mode,
+            debug_mode={"1": True, "0": False}.get(_b_str(raw, ConfigField.DEBUG_MODE)),
             volume=_b_float(raw, ConfigField.VOLUME),
             timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
         )
@@ -330,13 +264,10 @@ class GuildConfig:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildStateData:
-    """Typed snapshot of guild:{id}:state deserialized from Redis.
-
-    Zero-value defaults throughout, so GuildStateData() is the canonical "empty
-    hash" snapshot. volume is None when nothing is stored, not 1.0: the caller must
-    tell "nothing persisted" from "user set 1.0" so a restore can skip the
-    assignment instead of clobbering a concurrent -volume with a fabricated default.
-    """
+    """Typed snapshot of guild:{id}:state. Zero-value defaults throughout, so
+    GuildStateData() is the "empty hash" snapshot. volume is None when nothing
+    is stored, not 1.0, so a restore can skip the assignment instead of
+    clobbering a concurrent -volume."""
 
     volume: float | None = None
     voice_channel_id: int | None = None
@@ -352,8 +283,8 @@ class GuildStateData:
     current_song_queued_at: float = 0.0
     current_song_queue_position: int = 0
     current_song_query_source: str = ""
-    # None, not "": absent means a pre-migration entry, not a song genuinely queued
-    # without an origin. parse_queue_entry draws the same line.
+    # None, not "": absent means a pre-migration entry, and an empty needle must
+    # never be what -remove matches on. parse_queue_entry draws the same line.
     current_song_user_input: str | None = None
     current_song_played_at: float = 0.0
     play_start_epoch: float | None = None
@@ -361,8 +292,6 @@ class GuildStateData:
     pause_start_epoch: float | None = None
     last_position_secs: float | None = None
     last_heartbeat_epoch: float | None = None
-
-    # Convenience properties — derived from stored fields, not stored separately.
 
     @property
     def has_active_connection(self) -> bool:
@@ -376,47 +305,35 @@ class GuildStateData:
 
     @property
     def was_paused_at_crash(self) -> bool:
-        """True when a pause_start_epoch is recorded (bot was paused at crash).
-
-        Named for the crash, not is_paused, to stay distinct from live state
-        (vc.is_paused()): this is persisted crash-time state only."""
+        """True when a pause_start_epoch is recorded — persisted crash-time
+        state, distinct from the live vc.is_paused()."""
         return self.pause_start_epoch is not None
 
     def crashed_position_at(self, now: float) -> int | None:
         """Playback position (seconds) at the last recorded heartbeat, or None
-        when nothing was recorded.
-
-        No clock is read, so neither downtime nor skew between restarts can be
-        credited as playback. Resumes at last_position_secs exactly, so the worst
-        case replays one heartbeat interval — the deliberate bias, since replaying
-        3s is imperceptible and skipping 3s is not. `now` feeds only the legacy
-        fallback. Callers still cap at the song's duration to stop an EOF seek.
-        """
+        when nothing was recorded. No clock is read, so downtime and skew are
+        never credited as playback; the worst case replays one heartbeat
+        interval. `now` feeds only the legacy fallback. Callers still cap at the
+        song's duration."""
         if self.last_position_secs is not None and not self._heartbeat_predates_song():
             return max(0, int(self.last_position_secs))
         return self._legacy_wall_clock_position_at(now)
 
     def _heartbeat_predates_song(self) -> bool:
-        """True when the recorded position belongs to an EARLIER song.
-
-        A build without these fields cannot clear them, so `just up <older-sha>`
-        and back leaves one song's position parked on a later song's hash — which
-        would resume it minutes in. Every legitimate write puts the heartbeat at or
-        after the start it belongs to: the seed writes play_start_epoch +
-        start_offset, and ticks read a clock the backdated epoch precedes. Judged
-        only when both values are present, so a corrupt one costs nothing.
-        """
+        """True when the recorded position belongs to an EARLIER song: a build
+        without these fields cannot clear them, so `just up <older-sha>` and back
+        leaves one song's position parked on a later song's hash. Every
+        legitimate write puts the heartbeat at or after the start it belongs to.
+        Judged only when both values are present."""
         if self.last_heartbeat_epoch is None or self.play_start_epoch is None:
             return False
         return self.last_heartbeat_epoch < self.play_start_epoch
 
     def _legacy_wall_clock_position_at(self, now: float) -> int | None:
-        """Pre-heartbeat position math: extrapolate from the start epoch.
-
-        Reads a state hash written before last_position_secs existed. `now` is read
-        at RESTART, so downtime lands straight on the position — the bug the
-        heartbeat replaces. Kept one release: resuming badly beats not resuming.
-        """
+        """Position extrapolated from the start epoch, for a hash written
+        before last_position_secs existed. `now` is read at RESTART, so downtime
+        lands on the position. Kept one release: resuming badly beats not
+        resuming."""
         if self.play_start_epoch is None:
             return None
         elapsed = now - self.play_start_epoch
@@ -427,10 +344,10 @@ class GuildStateData:
 
     @classmethod
     def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
-        """Deserialize raw HGETALL output. All byte coercions are centralised here;
-        an empty dict yields the zero-value snapshot."""
-        # No `_b_float(...) or 0.0` coalescing — 0.0 is falsy, so that would
-        # elevate a stored 0.0 to the default. Explicit None checks instead.
+        """Deserialize raw HGETALL output; an empty dict yields the zero-value
+        snapshot."""
+        # No `_b_float(...) or 0.0` on total_pause: 0.0 is falsy and a stored
+        # 0.0 would be elevated to the default.
         total_pause = _b_float(raw, StateField.TOTAL_PAUSE_SECONDS)
         return cls(
             volume=_b_float(raw, StateField.VOLUME),
@@ -452,8 +369,7 @@ class GuildStateData:
             current_song_start_paused=(
                 _b_str(raw, StateField.CURRENT_SONG_START_PAUSED) == "1"
             ),
-            # `or` coalescing is safe on these two: the zero value IS the default,
-            # unlike total_pause_seconds below.
+            # `or` coalescing is safe on these: the zero value IS the default.
             current_song_queued_at=(
                 _b_float(raw, StateField.CURRENT_SONG_QUEUED_AT) or 0.0
             ),
@@ -477,11 +393,9 @@ class GuildStateData:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class NowPlayingData:
-    """Typed snapshot of guild:{id}:now_playing.
-
-    Bidirectional: from_song() builds it from a live YTDL for the atomic start-song
-    write, from_redis() rebuilds it during crash recovery. One type, so the live
-    and recovered embeds can't drift."""
+    """Typed snapshot of guild:{id}:now_playing. from_song() builds it from a
+    live YTDL for the start-song write, from_redis() rebuilds it during crash
+    recovery — one type, so the live and recovered embeds cannot drift."""
 
     title: str = ""
     webpage_url: str = ""
@@ -498,16 +412,14 @@ class NowPlayingData:
 
     @classmethod
     def from_song(cls, song: YTDL) -> Self:
-        """Canonical field extraction from a live song — one source of truth for
-        the live embed and the Redis snapshot, so the two can't drift."""
+        """The one field extraction behind both the live embed and the Redis
+        snapshot."""
         return cls(
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             uploader=song.uploader or "",
-            # Empty for unknown duration (livestream, missing metadata) rather than
-            # fmt_duration's "0:00" — mirrors the live embed, which draws no bar at
-            # duration_secs <= 0, and the recovered embed keys its Duration line
-            # off this being truthy.
+            # Empty for unknown duration (livestream) rather than "0:00": the
+            # recovered embed keys its Duration line off this being truthy.
             duration=song.duration if song.duration_secs > 0 else "",
             thumbnail=song.thumbnail or "",
             view_count=str(song.views) if song.views is not None else "",
@@ -521,8 +433,8 @@ class NowPlayingData:
 
     @classmethod
     def from_redis(cls, raw: dict[bytes, bytes]) -> Self | None:
-        """Deserialize raw HGETALL output. Returns None if the hash is empty
-        (the hash is DELETE'd wholesale on song end, so empty == no song)."""
+        """Deserialize raw HGETALL output; None when the hash is empty (it is
+        DELETE'd wholesale on song end, so empty == no song)."""
         if not raw:
             return None
         return cls(
@@ -543,12 +455,8 @@ class NowPlayingData:
         )
 
     def to_redis_mapping(self) -> dict[str, str]:
-        """Serialize to a flat string dict for Redis HSET mapping.
-
-        Spelled out rather than dataclasses.asdict(), which would bind the wire
-        schema to Python attribute names — renaming one would silently rename the
-        hash field. This table pins it to the NowPlayingField constants.
-        """
+        """Flat string dict for HSET, spelled out (not asdict()) so the wire
+        schema is pinned to NowPlayingField rather than attribute names."""
         return {
             NowPlayingField.TITLE: self.title,
             NowPlayingField.WEBPAGE_URL: self.webpage_url,
@@ -580,23 +488,19 @@ class QueueEntryField:
     UPLOADER: Final[str] = "uploader"
     THUMBNAIL: Final[str] = "thumbnail"
     PERSISTED: Final[str] = "persisted"
-    # -playnow flags — absent on pre-feature entries, parsed as False.
+    # Interjection flags — absent on pre-feature entries, parsed as False.
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Ask-time analytics, carried on both entry types. FLAT on the wire even
-    # though they group as Analytics in memory — nesting would break these
-    # parsers, the clamp-domain coverage and the positional row mapping. Absent
-    # on pre-feature entries, parsed as the 0 defaults.
+    # Ask-time analytics, on both entry types. FLAT on the wire although they
+    # group as Analytics in memory. Absent on pre-feature entries → 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
-    # Parse-time classification, carried on both entry types (see sources.py).
+    # Parse-time classification, on both entry types (see sources.py).
     QUERY_SOURCE: Final[str] = "query_source"
-    # When the audio started. Only "qobj" entries carry it — a search has not
-    # played by definition. Absent on pre-feature entries, parsed as 0.0.
+    # When the audio started; "qobj" entries only. Absent → 0.0.
     PLAYED_AT: Final[str] = "played_at"
-    # The frozen Now Playing card a resume tail is responsible for disposing of.
-    # Absent on pre-feature entries, parsed as 0 / 0 / False = "nothing to clean".
+    # The frozen Now Playing card a resume tail disposes of. Absent → 0/0/False.
     NP_MESSAGE_ID: Final[str] = "np_message_id"
     NP_CHANNEL_ID: Final[str] = "np_channel_id"
     NP_DEDICATED: Final[str] = "np_dedicated"
@@ -606,8 +510,7 @@ class QueueEntryField:
     PROCESS: Final[str] = "process"
 
 
-# Wire discriminator values — kept verbatim from the original serializer so
-# entries written before and after the migration stay mutually readable.
+# Wire discriminator values; entries written before and after stay readable.
 _ENTRY_TYPE_SONG: Final[str] = "qobj"
 _ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 
@@ -617,14 +520,10 @@ _ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongQueueEntry:
-    """A resolved song at rest ("qobj" on the wire) — the pure-data twin of
-    src.youtube.QueueObject.
-
-    requester is an ID because a live discord.Member cannot exist at rest;
-    rehydration (which needs a guild to resolve members) happens in GuildQueue.
-    requester_id is None only for the crashed-head entry from from_crashed_state();
-    snowflakes stay exact end-to-end (orjson native ints, never a float path).
-    """
+    """A resolved song at rest ("qobj" on the wire), the pure-data twin of
+    src.youtube.QueueObject. requester is an ID (a live discord.Member cannot
+    exist at rest; GuildQueue rehydrates it), None only for the crashed-head
+    entry. Snowflakes stay exact end-to-end: orjson native ints, never floats."""
 
     webpage_url: str
     title: str
@@ -635,7 +534,7 @@ class SongQueueEntry:
     uploader: str | None = None
     thumbnail: str | None = None
     persisted: bool = True
-    # -playnow flags — see the matching QueueObject field comments.
+    # Interjection flags — see the matching QueueObject field comments.
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
@@ -644,13 +543,12 @@ class SongQueueEntry:
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
     query_source: str = ""
-    # When the audio started (0.0 = not played yet), see QueueObject. Carried so a
-    # song interrupted by -playnow, or recovered from a crash, still records the
-    # start of the play rather than the start of its last fragment.
+    # When the audio started (0.0 = not played yet). Carried so a song
+    # interrupted by an interjection or recovered from a crash records the start
+    # of the play, not of its last fragment.
     played_at: float = 0.0
-    # The interrupted fragment's frozen NP card, see QueueObject. The live
-    # np_host_ref beside them cannot be serialized, so a rehydrated tail can only
-    # DELETE a dedicated card, never strip-edit a command response.
+    # The interrupted fragment's frozen NP card. The live np_host_ref cannot be
+    # serialized, so a rehydrated tail can only DELETE a dedicated card.
     np_message_id: int = 0
     np_channel_id: int = 0
     np_dedicated: bool = False
@@ -682,12 +580,9 @@ class SongQueueEntry:
 
     @classmethod
     def from_song(cls, song: YTDL) -> Self:
-        """The queue-entry view of a now-playing song — write-side twin of
-        from_crashed_state(). The loop hands this to the atomic start-song
-        transaction, which parks the fields in the state hash as current_song_*:
-
-            from_song → HSET state → crash → from_crashed_state → re-queue
-        """
+        """The queue-entry view of a now-playing song, write-side twin of
+        from_crashed_state(): from_song → HSET state → crash →
+        from_crashed_state → re-queue."""
         return cls(
             webpage_url=song.webpage_url or "",
             title=song.title or "",
@@ -695,10 +590,9 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             interjected=song.interjected,
-            # These three round-trip through the state hash and back out of
-            # from_crashed_state(), so a default here is a loss visible only after
-            # a crash: a resume tail returns as a fresh song billing the whole
-            # duration, a paused stack returns playing, and -remove loses the origin.
+            # These round-trip through the state hash, so a default here is a
+            # loss visible only after a crash: a resume tail returns as a fresh
+            # song, a paused stack returns playing, -remove loses the origin.
             is_resume=song.is_resume,
             start_paused=song.start_paused,
             user_input=song.user_input,
@@ -712,23 +606,18 @@ class SongQueueEntry:
     def from_crashed_state(
         cls, state: GuildStateData, *, position: int | None
     ) -> Self | None:
-        """The crashed "current song" reborn as a queue entry — the typed inverse of
+        """The crashed "current song" as a queue entry — the inverse of
         pop_queue_and_start_song(), whose current_song_* fields ARE the entry it
-        LPOPed. None when no crashed song is recorded.
-
-        persisted=False: that LPOP already committed, so this entry is not on the
-        Redis list and the loop must not LPOP again for it. `position` is the
-        caller-computed resume offset (crashed_position_at() plus its duration cap),
-        passed in so this stays a pure field mapping.
+        LPOPed. None when no crashed song is recorded. persisted=False: that
+        LPOP already committed, so the loop must not LPOP again. `position` is
+        the caller-computed resume offset.
 
         FIXME: A song interrupted mid-play by the crash is a resume in everything
         but the flag — `ts` holds the interrupt position while is_resume stays
-        false, so the loop announces "Starting song at 137 seconds" rather than
-        resuming, and _remaining_secs bills the whole duration instead of the
-        tail, skewing every ETA behind it. A song that WAS a -playnow tail is
-        fine: from_song() carries is_resume through the hash. Synthesizing the
-        flag from `ts > 0` would also move the queue display and the -playnow
-        wording, so it wants its own change.
+        false, so the loop announces "Starting song at N seconds" and
+        _remaining_secs bills the whole duration. Synthesizing the flag from
+        `ts > 0` would also move the queue display and the interjection wording,
+        so it wants its own change.
         """
         if not state.has_crashed_song:
             return None
@@ -740,27 +629,24 @@ class SongQueueEntry:
             duration=state.current_song_duration,
             uploader=state.current_song_uploader,
             persisted=False,
-            # Attribution only, carried so a crash mid-interjection does not
-            # silently reclassify how the song was queued.
             interjected=state.current_song_interjected,
             # Losing these reclassifies a resume tail as a fresh song on every
-            # restart: no resume announcement, _remaining_secs billing the whole
-            # duration, no NP-card cleanup, and a paused stack coming back playing.
+            # restart, and brings a paused stack back playing.
             is_resume=state.current_song_is_resume,
             start_paused=state.current_song_start_paused,
             queued_at=state.current_song_queued_at,
             queue_position=state.current_song_queue_position,
             query_source=state.current_song_query_source,
+            # This hash is the only place the origin link survives a restart.
             user_input=state.current_song_user_input,
-            # The parked entry is the only at-rest copy of a playing song's start
-            # (its queue entry was LPOPed when it started), so recovery reads it
-            # back rather than restamping to the recovery clock. Absent = 0.0.
+            # The only at-rest copy of a playing song's start (its queue entry
+            # was LPOPed), read back rather than restamped. Absent = 0.0.
             played_at=state.current_song_played_at,
         )
 
     def to_redis(self) -> bytes:
-        """Serialize to the wire format. Field table spelled out so the wire schema
-        is pinned to QueueEntryField, not to Python attribute names."""
+        """Serialize to the wire format; the table pins the schema to
+        QueueEntryField, not to attribute names."""
         return orjson.dumps(
             {
                 QueueEntryField.TYPE: _ENTRY_TYPE_SONG,
@@ -797,15 +683,14 @@ class SearchQueueEntry:
     url: str | None = None
     process: bool | None = None
     ts: int | None = None
-    # What the user typed, for -remove to match on. Nothing downstream can
-    # reconstruct it: the ytsearch here is a title the expansion generated.
+    # What the user typed, for -remove: the ytsearch here is a generated title.
     user_input: str | None = None
-    # Ask-time analytics, carried so a Spotify playlist track keeps its position
-    # through the resolve at dequeue.
+    # Ask-time analytics, so a Spotify playlist track keeps its position through
+    # the resolve at dequeue.
     queued_at: float = 0.0
     queue_position: int = 0
-    # Likewise for the classification — this is the leg that makes a Spotify
-    # playlist track archive as Spotify and not as the YouTube URL it becomes.
+    # The leg that makes a Spotify playlist track archive as Spotify rather than
+    # as the YouTube URL it becomes.
     query_source: str = ""
 
     @classmethod
@@ -843,12 +728,9 @@ QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 # `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
 # narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
 def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
-    """Deserialize one queue-list entry into a value object.
-
-    The "type" field discriminates searches from songs. Corrupt entries (bad JSON,
-    missing required fields) return None with a warning, so one bad entry is
-    dropped and the rest of the queue survives.
-    """
+    """Deserialize one queue-list entry; "type" discriminates searches from
+    songs. Corrupt entries return None with a warning, so the rest of the queue
+    survives."""
     try:
         d = orjson.loads(data)
         if d.get(QueueEntryField.TYPE) == _ENTRY_TYPE_SEARCH:
@@ -890,7 +772,7 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────
 # One JSON object of HistoryEntryField keys per entry, most-recently-recorded
-# first (song-end order — see GuildHistory.recent, which sorts on played_at).
+# first (song-end order; GuildHistory.recent sorts on played_at).
 
 
 class HistoryEntryField:
@@ -911,10 +793,8 @@ class HistoryEntryField:
     QUERY_SOURCE: Final[str] = "query_source"
 
 
-# The play_history column domain (migrations/0001_play_history.sql), mirrored here
-# because HistoryEntry is what guarantees it — next to the dataclass rather than in
-# history_archive.py so the type and its domain cannot drift apart, and so this
-# module stays free of runtime imports from the rest of the project.
+# The play_history column domain (migrations/0001_play_history.sql), kept beside
+# the dataclass that guarantees it so the type and its domain cannot drift.
 _TEXT_FIELDS: Final[tuple[str, ...]] = (
     "title",
     "webpage_url",
@@ -933,10 +813,9 @@ _INT8_FIELDS: Final[tuple[str, ...]] = (
     "message_id",
     "channel_id",
 )
-# Machine-generated tokens (src.sources.query_source_of), never raw user text: a
-# lowercase host, or the literal "search". Anything else is a producer defect, so
-# it clamps to the unknown sentinel rather than being stored — which is what lets
-# play_history CHECK the same domain without the constraint ever firing.
+# Machine-minted tokens (src.sources.query_source_of): a lowercase host, or the
+# literal "search". Anything else is a producer defect and clamps to the unknown
+# sentinel, so play_history's CHECK on the same domain never fires.
 _SLUG_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9.-]{0,64}")
 _SLUG_FIELDS: Final[tuple[str, ...]] = ("query_source",)
 # The timestamptz columns: clamped to the epoch sentinel rather than to a bound,
@@ -944,28 +823,26 @@ _SLUG_FIELDS: Final[tuple[str, ...]] = ("query_source",)
 _EPOCH_FIELDS: Final[tuple[str, ...]] = ("played_at", "queued_at")
 _INT4_MAX: Final[int] = 2**31 - 1
 _INT8_MAX: Final[int] = 2**63 - 1
-# 9999-12-31T23:59:59Z. Public because it is the epoch domain of the play_history
-# timestamptz columns, not just this validator's: history_archive clamps cutoffs to
-# it, and migrations/0001_play_history.sql spells the same value into its CHECKs.
+# 9999-12-31T23:59:59Z — the epoch domain of the play_history timestamptz
+# columns: history_archive clamps cutoffs to it and the migration's CHECKs
+# spell the same value.
 TS_MAX: Final[float] = 253402300799.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HistoryEntry:
-    """One played song at rest — an element of guild:{id}:history.
+    """One played song at rest — an element of guild:{id}:history, matching the
+    play_history row. Zero-values mean "unknown": absent wire fields default on
+    parse and the display layer degrades.
 
-    Zero-values mean "unknown": absent wire fields default on parse and the display
-    layer degrades. The field set matches the Postgres play_history row.
+    guild_id is redundant on the per-guild list but required on the global
+    history:outbox stream, where the drainer maps each entry to a row; entries
+    written before the field existed parse as guild_id=0.
 
-    guild_id is redundant on the per-guild display list (the key carries it) but
-    required on the global history:outbox stream, where all guilds interleave and
-    the drainer maps each entry to a Postgres row. Entries written before the field
-    existed parse as guild_id=0.
-
-    message_id and channel_id are a WEAK reference, taken off the same message at
-    song end so the pair is both real or both 0: the NP host migrates across
-    messages and channels during one song and a dedicated host is deleted when
-    retired, so it is neither a foreign key nor part of play_history_dedup.
+    message_id and channel_id are a WEAK reference, taken off the same message
+    at song end so the pair is both real or both 0: the NP host migrates across
+    messages during one song and a dedicated host is deleted when retired, so it
+    is neither a foreign key nor part of play_history_dedup.
     """
 
     guild_id: int = 0
@@ -978,50 +855,36 @@ class HistoryEntry:
     thumbnail: str = ""
     uploader: str = ""
     # Unix epoch when the audio started; drives <t:…:f>. One value per play, not
-    # per fragment: a -playnow resume tail inherits the interrupted song's stamp,
-    # so an interrupted play files under when the listener first heard it.
+    # per fragment: an interjection's resume tail inherits the interrupted song's
+    # stamp.
     played_at: float = 0.0
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
     channel_id: int = 0  # the channel that host was in; 0 = unknown, always paired
     queued_at: float = 0.0  # unix epoch when the user ASKED; 0 = unknown
-    # Songs ahead of it at ask time, counting the one playing. 0 means it
-    # played immediately — and is also what a pre-feature entry parses as.
+    # Songs ahead at ask time, counting the one playing. 0 = played immediately,
+    # also what a pre-feature entry parses as.
     queue_position: int = 0
-    # How the song was asked for: "search", or the host of the link that was
-    # pasted. "" = unknown, which is what every pre-feature entry parses as.
-    # Classified at parse time (src.sources) because it is not recoverable from
-    # webpage_url — a Spotify link and a plaintext search both resolve to a
-    # YouTube watch URL.
+    # "search", or the host of the pasted link; "" = unknown. Classified at parse
+    # time (src.sources) because a Spotify link and a plaintext search both
+    # resolve to a YouTube watch URL.
     query_source: str = ""
 
     def __post_init__(self) -> None:
-        """Normalize into the play_history column domain at construction.
+        """Normalize into the play_history column domain: an instance is, by
+        construction, a row Postgres accepts, and every producer routes through
+        here. Total — never raises — because it runs on the read path over rows
+        that predate it; strictness lives in the DB CHECK constraints. No type
+        coercion: HistoryEntry(title=None) raising TypeError here is correct.
 
-        The schema lock: an instance is, by construction, a row Postgres accepts.
-        Every producer routes through here — from_song, parse_history_entry,
-        _row_to_entry, dataclasses.replace, the backfill — so no consumer re-proves
-        it and the archive holds no opinion about data.
+        One exemption: integers floor at 0, but play_history's CHECK on guild_id
+        is `> 0`, so a guild_id-0 entry is constructible and not insertable.
+        Refusing at the database routes it to play_history_rejected, where a row
+        means a producer stopped stamping guild_id.
 
-        One field is exempt: the clamp floors every integer at 0, but play_history's
-        CHECK on guild_id is strictly `> 0`, so a guild_id-0 entry is constructible
-        and not insertable. Clamping up to 1 would file an unattributable play into
-        a real guild's history; relaxing the CHECK would make guild 0 a permanent
-        bucket of orphans no read path excludes. Refusing at the database routes
-        those entries to play_history_rejected, where a row means "a producer
-        stopped stamping guild_id" — the actual defect.
-
-        These are the only ways a wire-parseable entry could fail an INSERT:
-        everything else the columns could refuse — lone surrogates, non-finite
-        floats, integers past 64 bits — orjson already refuses to encode. Range
-        tests rather than pairs of bound checks because a chained comparison is
-        False for NaN, which lands NaN on the sentinel.
-
-        Total BY DESIGN — never raises, and it runs on the read path over stored
-        rows that predate it, so a validator that rejected them would break -history
-        for precisely the guilds with the most history; strictness lives in the DB
-        CHECK constraints instead. No type coercion: HistoryEntry(title=None)
-        raising TypeError out of the `in` test below is correct — coercing would
-        store a row reading "None".
+        Range tests rather than paired bound checks: a chained comparison is
+        False for NaN, which lands NaN on the sentinel. Everything else the
+        columns could refuse (lone surrogates, non-finite floats, >64-bit ints)
+        orjson already refuses to encode.
         """
         for name in _TEXT_FIELDS:
             value: str = getattr(self, name)
@@ -1047,21 +910,12 @@ class HistoryEntry:
     def from_song(
         cls, song: YTDL, *, guild_id: int, message_id: int, channel_id: int
     ) -> Self:
-        """Canonical extraction from a finished song. guild_id, message_id and
-        channel_id are keyword-required because the song doesn't carry them and a
-        forgotten stamp writes cleanly as 0 (play_history's CHECKs are `>= 0`),
-        permanently indistinguishable from a song that genuinely had no host — pass
-        0 explicitly for that, and take both ids off the same message.
-
-        played_at rides the song rather than a caller clock: the loop stamps it at
-        vc.play() and every later fragment inherits it, so an interrupted song files
-        once, under the moment it actually started.
-
-        played_secs is the position reached (start_offset + audio delivered), capped
-        at duration when known. A -playnow-interrupted song is recorded once at its
-        resume tail, whose position spans the full listened range; a ?t= song
-        includes the skip.
-        """
+        """Extraction from a finished song. The ids are keyword-required because
+        a forgotten stamp writes cleanly as 0, indistinguishable from a song that
+        had no host — pass 0 explicitly for that, both ids off the same message.
+        played_at rides the song (stamped at vc.play(), inherited by every later
+        fragment). played_secs is the position reached, capped at duration when
+        known; an interrupted song is recorded once at its resume tail."""
         played = round(song.position_secs)
         duration = song.duration_secs or 0
         if duration:
@@ -1086,21 +940,12 @@ class HistoryEntry:
 
     @classmethod
     def from_queue_object(cls, item: QueueObject, *, guild_id: int) -> Self:
-        """A played song recorded as it LEAVES the queue, rather than as it ends.
-
-        The -clear/-remove counterpart to from_song. There is no YTDL to hand it:
-        this entry was interrupted by a -playnow and destroyed before its tail could
-        play, so the queue object is all that is left of it.
-
-        played_secs comes from `ts`, the resume offset, which is ABSOLUTE (see
-        YTDL.position_secs = start_offset + elapsed) — it already spans everything
-        heard across every earlier fragment. Capped at duration like from_song's.
-
-        The host ids come off the tail's np_* fields, which name the card its
-        interrupted fragment left frozen. Still resolvable here: the cleanup that
-        deletes that card fires only when a tail STARTS, and a flushed tail never
-        does. 0/0 when the tail was never stamped.
-        """
+        """A played song recorded as it LEAVES the queue — the -clear/-remove
+        counterpart to from_song, for an interjection-interrupted entry destroyed
+        before its tail could play. played_secs comes from `ts`, the ABSOLUTE
+        resume offset, capped at duration. The host ids come off the tail's
+        np_* fields: the cleanup that deletes that card fires only when a tail
+        STARTS, and a flushed tail never does."""
         played = item.ts or 0
         duration = item.duration or 0
         if duration:
@@ -1124,8 +969,8 @@ class HistoryEntry:
         )
 
     def to_redis(self) -> bytes:
-        """Serialize to the wire format. Field table spelled out so the wire schema
-        is pinned to HistoryEntryField, not to Python attribute names."""
+        """Serialize to the wire format; the table pins the schema to
+        HistoryEntryField, not to attribute names."""
         return orjson.dumps(
             {
                 HistoryEntryField.GUILD_ID: self.guild_id,
@@ -1152,21 +997,16 @@ def serialize_history_entry(entry: HistoryEntry) -> bytes:
 
 
 def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
-    """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong type,
-    malformed fields) are dropped with a warning, as in parse_queue_entry. Unknown
-    keys are ignored and missing keys default, so mixed-build readers stay tolerant
-    in both directions."""
+    """Deserialize one history-list entry; corrupt entries are dropped with a
+    warning. Unknown keys are ignored and missing keys default, so mixed-build
+    readers stay tolerant in both directions."""
     try:
         entry = orjson.loads(data)
-    except Exception as e:
-        log.warning(f"guild_state: corrupt history entry dropped: {e}")
-        return None
-    if not isinstance(entry, dict):
-        log.warning(
-            f"guild_state: corrupt history entry dropped: unexpected JSON type ({type(entry).__name__})"
-        )
-        return None
-    try:
+        if not isinstance(entry, dict):
+            log.warning(
+                f"guild_state: corrupt history entry dropped: unexpected JSON type ({type(entry).__name__})"
+            )
+            return None
         return HistoryEntry(
             guild_id=int(entry.get(HistoryEntryField.GUILD_ID) or 0),
             title=str(entry.get(HistoryEntryField.TITLE) or ""),
@@ -1194,40 +1034,29 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildPlaybackSnapshot:
-    """A guild's complete persisted playback aggregate — state hash, pending queue,
-    now-playing snapshot, played-song history — read together in one pipelined
-    round-trip (GuildRedisStore.get_playback_snapshot).
-
-    "A guild owns a queue (and a history)" as a type: recovery decisions spanning
-    the halves live here as named properties, not expressions at call sites.
-    """
+    """A guild's complete persisted playback aggregate — state hash, pending
+    queue, now-playing snapshot, history, config — read in one pipelined round
+    trip (GuildRedisStore.get_playback_snapshot). Recovery decisions spanning
+    the halves live here as named properties."""
 
     state: GuildStateData
     queue: tuple[QueueEntry, ...] = ()
-    # None when no song was playing (the hash is DELETE'd wholesale on song
-    # end, so empty == no song — same contract as NowPlayingData.from_redis).
+    # None when no song was playing (empty hash == no song).
     now_playing: NowPlayingData | None = None
-    # Newest-first, as stored (GuildHistory.restore() handles the reversal).
+    # Newest-first, as stored (GuildHistory.restore() reverses).
     history: tuple[HistoryEntry, ...] = ()
-    # The guild's durable settings, read in the same round trip because restore is
-    # exactly when they are needed.
+    # Read in the same round trip because restore is when they are needed.
     config: GuildConfig = GuildConfig()
 
     @property
     def stored_volume(self) -> float | None:
-        """The guild's volume, or None if it never set one.
-
-        Config first, then the legacy state field. The fallback is a one-release
-        migration path: volume used to live in guild:{id}:state, and dropping it
-        outright would silently reset every deployed guild to 100%. Restore SEEDS
-        config from whatever it finds here (migrate_volume, HSETNX — never an
-        overwrite), and set_volume keeps both copies fresh, so the two agree in
-        both directions and a rollback is a no-op. Delete this leg, StateField.VOLUME
-        and set_volume's legacy write together once every deployment has started once.
-        """
-        if self.config.volume is not None:
-            return self.config.volume
-        return self.state.volume
+        """The guild's volume, or None if it never set one. Config first, then
+        the legacy state field (one-release migration path: restore SEEDS config
+        from it via migrate_volume, HSETNX, and set_volume keeps both fresh, so
+        a rollback is a no-op). Delete this leg with StateField.VOLUME."""
+        return (
+            self.config.volume if self.config.volume is not None else self.state.volume
+        )
 
     @property
     def pending_count(self) -> int:
@@ -1235,46 +1064,38 @@ class GuildPlaybackSnapshot:
 
     @property
     def has_restorable_playback(self) -> bool:
-        """The restore_guild() gate: True when a restart has anything to resume
-        — pending queue entries or a song that was mid-play at crash time."""
+        """The restore_guild() gate: pending queue entries or a song mid-play at
+        crash time."""
         return bool(self.queue) or self.state.has_crashed_song
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildRecoveryGate:
-    """The minimal read `restore_guild()` needs to decide whether to reconnect: the
-    state hash plus the pending queue's *length* — never its contents.
-
-    _restore_state re-reads the full GuildPlaybackSnapshot after a successful voice
-    connect. Reading only the length keeps a -stopped guild's (possibly long)
-    leftover queue off the wire on every on_ready.
-    """
+    """The minimal read restore_guild() needs to decide whether to reconnect:
+    the state hash plus the pending queue's LENGTH, never its contents, so a
+    -stopped guild's leftover queue stays off the wire on every on_ready."""
 
     state: GuildStateData
     pending_count: int = 0
 
     @property
     def has_restorable_playback(self) -> bool:
-        """True when a restart has anything to resume — pending entries or a song
-        mid-play at crash time. GuildPlaybackSnapshot.has_restorable_playback over
-        the queue length."""
+        """GuildPlaybackSnapshot.has_restorable_playback over the queue length."""
         return self.pending_count > 0 or self.state.has_crashed_song
 
 
 # ── -analytics: the render worker's boundary payload ──────────────────────────
-# Unpickling a dataclass imports its defining module, so their home decides what a
-# chart worker drags in — this module is stdlib + orjson.
+# Unpickling a dataclass imports its defining module, so their home decides what
+# a chart worker drags in — this module is stdlib + orjson. Every field
+# defaults, so an entry written by an older build still decodes.
 # See docs/ARCHITECTURE.md#analytics-rendering.
-#
-# Every field defaults, so an entry written by an older build still decodes through
-# analytics_card.from_cache.
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DailyPoint:
-    """One x-position of the per-day series. `day` is an ISO date (`YYYY-MM-DD`)
-    naming the bucket's first UTC day — at --days 365 the bucket is a week, and
-    the date is its Monday."""
+    """One x-position of the per-day series. `day` is an ISO date naming the
+    bucket's first UTC day — at --days 365 the bucket is a week, and the date
+    is its Monday."""
 
     day: str = ""
     plays: int = 0
@@ -1283,8 +1104,8 @@ class DailyPoint:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SourceDay:
-    """One segment of a stacked bar: how many plays a query_source contributed to
-    one bucket. Sparse — a source with no plays that day has no row."""
+    """One segment of a stacked bar: plays a query_source contributed to one
+    bucket. Sparse — a source with no plays that day has no row."""
 
     day: str = ""
     source: str = ""
@@ -1293,8 +1114,8 @@ class SourceDay:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HeatCell:
-    """One weekday x hour-of-day cell. `dow` is ISO (1 = Monday), `hour` is 0-23,
-    both in UTC — the frame play_history was written in."""
+    """One weekday x hour-of-day cell. `dow` is ISO (1 = Monday), `hour` 0-23,
+    both UTC — the frame play_history was written in."""
 
     dow: int = 0
     hour: int = 0
@@ -1303,9 +1124,9 @@ class HeatCell:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CompletionBucket:
-    """Plays whose played/duration ratio fell in one tenth, per source. `bucket` is
-    1-10 covering [0,0.1) .. [0.9,1.0]; the SQL folds width_bucket's overflow 11
-    into 10 because a ratio of exactly 1.0 is the modal value."""
+    """Plays whose played/duration ratio fell in one tenth, per source. `bucket`
+    is 1-10 covering [0,0.1) .. [0.9,1.0]; the SQL folds width_bucket's overflow
+    11 into 10 because a ratio of exactly 1.0 is the modal value."""
 
     source: str = ""
     bucket: int = 0
@@ -1315,8 +1136,8 @@ class CompletionBucket:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DurationBucket:
     """Plays by song length in whole minutes, 0-19, with 20 meaning "20 min or
-    longer" — an open top bucket, since an hour-long mix must not stretch the axis
-    over every three-minute song."""
+    longer" — an open top bucket, so an hour-long mix does not stretch the
+    axis."""
 
     minutes: int = 0
     plays: int = 0
@@ -1324,14 +1145,10 @@ class DurationBucket:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SourceCompletion:
-    """DURATION-WEIGHTED completion for one source: the sums, not the ratio, so the
-    renderer divides once and the zero case is visible rather than encoded.
-
-    This is a different question from CompletionBucket and the two disagree by
-    design — on the live archive pasted YouTube links play 21% of their seconds but
-    14 of 16 individual plays run to the end, because a handful of abandoned
-    hour-long mixes dominate the weighted number.
-    """
+    """DURATION-WEIGHTED completion for one source: the sums, not the ratio, so
+    the renderer divides once and the zero case is visible. A different
+    question from CompletionBucket — a handful of abandoned hour-long mixes
+    dominate the weighted number."""
 
     source: str = ""
     played_secs: int = 0
@@ -1341,8 +1158,8 @@ class SourceCompletion:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopListener:
     """One row of the embed's listeners section. Distinct from history_archive's
-    RequesterLeader, which serves -leaderboard: this one may not live in a module
-    the render worker would have to import (see the block comment above)."""
+    RequesterLeader: this one must not live in a module the render worker would
+    have to import."""
 
     requester_id: int = 0
     requester_name: str = ""
@@ -1366,41 +1183,36 @@ class TopSong:
     played_secs: int = 0
 
 
-# Sentinel for "no usable queue-wait data in this window". Negative because 0 is a
-# legitimate wait — a song queued into an empty queue — and the two must not collapse.
+# "No usable queue-wait data in this window". Negative because 0 is a legitimate
+# wait (a song queued into an empty queue).
 WAIT_UNAVAILABLE: Final[float] = -1.0
-# The queue-wait percentiles and the median's index within them. The SQL array, the
-# length checks and the figure's labels all read from here.
+# The queue-wait percentiles and the median's index. The SQL array, the length
+# checks and the figure's labels all read from here.
 WAIT_PERCENTILES: Final[tuple[float, ...]] = (0.1, 0.25, 0.5, 0.75, 0.9)
 WAIT_MEDIAN_INDEX: Final[int] = WAIT_PERCENTILES.index(0.5)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AnalyticsMetrics:
-    """Everything -analytics knows about one guild and one window.
-
-    The whole object crosses to the chart worker, including the three top-N lists
-    it never draws: they are ~2 KB against a ~15 KB payload, and one boundary type
-    is worth more than the split. What the worker may NOT draw is any of their
-    strings — the runtime image has no CJK, Thai or emoji glyphs, so a human-authored
-    name renders as tofu, silently. _ascii_safe() enforces that in analytics_render.
-
-    `days` is the REQUESTED window and archived_days its real coverage; the title
-    names both when they differ, because a 30-day frame that is 93% empty is a worse
-    answer than a 2-day frame that says so.
-    """
+    """Everything -analytics knows about one guild and one window. The whole
+    object crosses to the chart worker, including the three top-N lists it
+    never draws (~2 KB of ~15 KB). The worker may NOT draw any of their strings:
+    the runtime image has no CJK, Thai or emoji glyphs, so a human-authored name
+    renders as tofu (_ascii_safe() in analytics_render enforces it). `days` is
+    the REQUESTED window and archived_days its real coverage; the title names
+    both when they differ."""
 
     days: int = 0
-    # Both epochs, so the footer and the cache TTL read the same clock the buckets
-    # did. window_end is exclusive and is the day (or, at --days 365, the week)
-    # boundary the window stops at — never "now".
+    # Both epochs, so the footer and the cache TTL read the same clock the
+    # buckets did. window_end is exclusive: the day (or week) boundary the
+    # window stops at, never "now".
     window_start_epoch: float = 0.0
     window_end_epoch: float = 0.0
-    # "day" or "week". At 365 days a daily series would be 365 sub-pixel bars, so
-    # the SQL downsamples; the y-axis label has to move with it.
+    # "day" or "week". At 365 days the SQL downsamples, and the y-axis label
+    # has to move with it.
     bucket_unit: str = "day"
-    # Today's UTC midnight, from the same clock read as the bounds. The cache expiry
-    # derives from this, so it cannot outlive the day the aggregate covers.
+    # Today's UTC midnight, from the same clock read as the bounds; the cache
+    # expiry derives from it.
     today_start_epoch: float = 0.0
     archived_days: int = 0
 
@@ -1410,9 +1222,8 @@ class AnalyticsMetrics:
     unique_listeners: int = 0
     unique_artists: int = 0
     wait_p50_secs: float = WAIT_UNAVAILABLE
-    # Plays with duration_secs <= 0 — livestreams. Counted everywhere else and
-    # excluded from the completion panel alone, which names the number so a guild
-    # with many of them is not silently reading a partial chart.
+    # Plays with duration_secs <= 0 (livestreams): counted everywhere else,
+    # excluded from the completion panel alone, which names the number.
     livestream_plays: int = 0
 
     daily: tuple[DailyPoint, ...] = ()
@@ -1421,8 +1232,8 @@ class AnalyticsMetrics:
     completion: tuple[CompletionBucket, ...] = ()
     durations: tuple[DurationBucket, ...] = ()
     source_completion: tuple[SourceCompletion, ...] = ()
-    # p10/p25/p50/p75/p90 of queue wait, seconds. Empty when no row in the window
-    # had a non-sentinel queued_at.
+    # p10/p25/p50/p75/p90 of queue wait, seconds. Empty when no row in the
+    # window had a non-sentinel queued_at.
     wait_pcts: tuple[float, ...] = ()
 
     top_listeners: tuple[TopListener, ...] = ()
@@ -1431,19 +1242,18 @@ class AnalyticsMetrics:
 
     @property
     def is_empty(self) -> bool:
-        """Whether the window holds nothing. Reads the explicit play count, never a
-        branch's shape: every aggregate coalesces to `[]`, so an empty daily series
-        also describes a guild whose rows all failed one branch's filter."""
+        """Reads the explicit play count, never a branch's shape: every
+        aggregate coalesces to `[]`, so an empty daily series also describes a
+        guild whose rows all failed one branch's filter."""
         return self.plays == 0
 
     @property
     def period_label(self) -> str:
-        """The window as a period, in the unit it is actually bucketed by.
-
-        365 mod 7 is 1, so `date_trunc('week', end - 365 days)` snaps back six days
-        and the weekly window covers 53 whole weeks — 371 days. Calling that "last
-        365 days" names six fewer days than the chart draws. Lives here because the
-        card and the figure must agree and the figure cannot import the card."""
+        """The window as a period, in the unit it is bucketed by. 365 mod 7 is
+        1, so the weekly window covers 53 whole weeks (371 days), and calling
+        that "last 365 days" names six fewer days than the chart draws. Lives
+        here because the card and the figure must agree and the figure cannot
+        import the card."""
         if self.bucket_unit == "week":
             weeks = -(-self.days // 7)
             return f"last {weeks} week{'s' if weeks != 1 else ''}"

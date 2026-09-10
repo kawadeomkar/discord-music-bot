@@ -4,19 +4,90 @@ utilities."""
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from opentelemetry import trace as trace_api
 
 from src.util import (
+    FOOTER_LIMIT,
+    current_traceparent,
+    traceparent_context,
+    _TYPING_HOLDS,
+    _TYPING_TASKS,
     _typing_keepalive,
     background_typing,
+    cancel_task,
     fmt_duration,
     get_logger,
+    join_footer,
     pluralize,
     queue_message,
 )
+
+
+class TestSharedTyping:
+    """One keepalive per channel, however many commands are waiting."""
+
+    async def test_concurrent_holders_share_one_keepalive(self) -> None:
+        ctx = MagicMock()
+        ctx.channel.id = 7
+        started = 0
+
+        @contextlib.asynccontextmanager
+        async def _typing() -> AsyncIterator[None]:
+            nonlocal started
+            started += 1
+            yield
+
+        ctx.typing = _typing
+        async with background_typing(ctx):
+            async with background_typing(ctx):
+                await asyncio.sleep(0)
+                assert started == 1  # not one POST per command
+            await asyncio.sleep(0)
+            # Still held: the first command returning must not blink the
+            # indicator off while the second is still resolving.
+            assert 7 in _TYPING_TASKS
+        assert _TYPING_TASKS.get(7) is None
+        assert 7 not in _TYPING_HOLDS  # and the refcount does not leak
+
+
+class TestCancelTask:
+    """Whose CancelledError it may swallow."""
+
+    async def test_the_awaited_tasks_cancellation_is_swallowed(self) -> None:
+        task = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        await cancel_task(task)  # no raise: this is the cancellation it asked for
+
+        assert task.cancelled()
+
+    async def test_the_callers_own_cancellation_is_not(self) -> None:
+        """A prefetch pinned in the yt-dlp executor does not stop when asked, so
+        the caller's own deadline fires while this await sits. Swallowed here,
+        asyncio.timeout sees no exception to convert and never raises — the caller
+        runs on past a bound it was told it had."""
+
+        async def _pinned() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(5)  # the worker still holds it
+
+        task = asyncio.create_task(_pinned())
+        await asyncio.sleep(0)
+
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await cancel_task(task)
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 class TestQueueMessage:
@@ -67,6 +138,29 @@ class TestQueueMessage:
         result = queue_message(songs)
         assert "song15" not in result
         assert "song20" not in result
+
+    def test_ten_long_titles_stay_inside_the_field_cap(self) -> None:
+        # Ten 100-char titles composed to 1040 — past Discord's 1024 field cap,
+        # which 400s the WHOLE send. For -remove that arrives after the songs are
+        # gone from memory and Redis, so the user is told a destructive command
+        # failed when it succeeded, with nothing to undo it.
+        result = queue_message(["t" * 100 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.endswith("...")
+
+    def test_a_length_overflow_still_names_what_it_can(self) -> None:
+        # Dropped for length, not for count: some entries still render, and the
+        # trailing mark says the list was cut.
+        result = queue_message(["x" * 200 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.startswith("1: ")
+        assert result.endswith("...")
+
+    def test_one_oversized_title_is_truncated_not_dropped(self) -> None:
+        # An empty field would say nothing at all about what was taken.
+        result = queue_message(["y" * 5000])
+        assert 0 < len(result) <= 1024
+        assert result.startswith("1: ")
 
 
 class TestGetLogger:
@@ -173,6 +267,78 @@ class TestFmtDuration:
 
     def test_minute_rollover_pads_seconds(self) -> None:
         assert fmt_duration(61) == "1:01"
+
+
+class TestTraceparentRoundTrip:
+    """How a span context crosses the stream cache and comes back as a link."""
+
+    @staticmethod
+    def _span(trace_id: int) -> trace_api.NonRecordingSpan:
+        return trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=trace_id,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+
+    def test_it_round_trips_a_span(self) -> None:
+        trace_id = 0x4BF92F3577B34DA6A3CE929D0E0E4736
+        with trace_api.use_span(self._span(trace_id), end_on_exit=False):
+            carried = current_traceparent()
+        assert carried.startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        ctx = traceparent_context(carried)
+        assert ctx is not None and ctx.trace_id == trace_id
+        # is_remote marks it as arriving from elsewhere, which a link's context is.
+        assert ctx.is_remote
+
+    def test_no_span_carries_nothing(self) -> None:
+        """Reachable: prewarm, a cache write outside any command, the whole suite."""
+        assert current_traceparent() == ""
+
+    def test_an_absent_or_broken_value_is_no_link(self) -> None:
+        """A pre-feature cache entry has no traceparent, and a truncated one must
+        not raise on the playback path — both are simply "nothing to link"."""
+        assert traceparent_context("") is None
+        assert traceparent_context("not-a-traceparent") is None
+        assert traceparent_context("00-" + "0" * 32 + "-" + "0" * 16 + "-01") is None
+
+
+class TestJoinFooter:
+    """The one definition of how an embed's own footer and debug mode's suffix share
+    a footer. Three seams write one (both decoration seams and the two dashboards),
+    and a seam that joined them differently would put the mark somewhere else."""
+
+    def test_the_suffix_takes_its_own_line(self) -> None:
+        assert join_footer("environment: test", "\U0001f41e shard 0") == (
+            "environment: test\n\U0001f41e shard 0"
+        )
+
+    def test_a_lone_suffix_is_the_whole_footer(self) -> None:
+        assert join_footer("", "\U0001f41e shard 0") == "\U0001f41e shard 0"
+
+    def test_a_lone_base_is_returned_unjoined(self) -> None:
+        assert join_footer("environment: test", "") == "environment: test"
+
+    def test_two_empty_sides_stay_empty(self) -> None:
+        assert join_footer("", "") == ""
+
+    def test_the_clip_falls_on_the_base(self) -> None:
+        """Clipping the join instead would take the break and the head of the suffix,
+        putting both footers back on one line."""
+        suffix = "\U0001f41e shard 0"
+        text = join_footer("B" * FOOTER_LIMIT, suffix)
+        assert len(text) == FOOTER_LIMIT
+        assert text.endswith(f"\n{suffix}")
+        assert text.startswith("BB")
+
+    def test_a_suffix_with_no_room_left_drops_the_base(self) -> None:
+        """truncate() to a limit of zero returns an ellipsis on a nearly whole string,
+        so clamping the width alone would return a footer over the limit."""
+        text = join_footer("B" * 400, "S" * FOOTER_LIMIT)
+        assert len(text) == FOOTER_LIMIT
+        assert "B" not in text
 
 
 class TestBackgroundTyping:

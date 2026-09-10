@@ -5,16 +5,59 @@ import them directly, without routing through pytest's plugin machinery.
 """
 
 import asyncio
-from typing import Any, Optional, cast
-from collections.abc import Callable, Coroutine
-from unittest.mock import MagicMock
+import contextlib
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Any, Optional, cast
+from collections.abc import Callable, Coroutine, Iterator
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
+from src.play_placement import PlayMode, PlayRequest
 from src.youtube import QueueObject
+
+if TYPE_CHECKING:
+    from src.musicbot import MusicBot
+
+
+def admit(
+    music_bot: MusicBot,
+    ctx: MagicMock,
+    mp: Any,
+    *,
+    mode: PlayMode = PlayMode.NORMAL,
+    query: str = "test",
+) -> PlayRequest:
+    """Register a request as -play would, so a helper that inserts under the
+    place lock can be called directly. A bare MagicMock answers `retired` with a
+    truthy mock, which place() reads as torn down; pin it as mock_mp() does."""
+    if isinstance(mp, MagicMock) and isinstance(mp.retired, MagicMock):
+        mp.retired = False
+    return music_bot._plays.register(ctx, query=query, mp=mp, mode=mode)
+
+
+async def settle(ticks: int = 12) -> None:
+    """Let every runnable task reach its next suspension point."""
+    for _ in range(ticks):
+        await asyncio.sleep(0)
+
+
+def song(n: int, ctx: MagicMock) -> QueueObject:
+    return QueueObject(f"https://yt.com/v={n}", f"Song {n}", ctx.author)
+
+
+@contextlib.contextmanager
+def recording_span() -> Iterator[MagicMock]:
+    """A span double in place of the current span. Its context is invalid so
+    structlog's OTel processor, which reads the same global, skips the trace-id
+    format it would otherwise apply to a MagicMock."""
+    with patch("src.musicbot.trace.get_current_span") as current:
+        span = current.return_value
+        span.get_span_context.return_value.is_valid = False
+        yield span
 
 
 def command_callback(
@@ -123,3 +166,102 @@ def seed_queue(gq: GuildQueue, *items: QueueItem) -> None:
     """
     gq._items.extend(items)
     gq._sync_wake()
+
+
+def no_typing(target: str) -> AbstractContextManager[MagicMock]:
+    """Stub a module's background_typing with an inert async CM.
+
+    `target` is the MODULE the command under test resolves the name in, not where
+    it is defined, and it has no default: every command body owns its own reference
+    now, so a wrong module leaves the real keepalive running instead of failing.
+
+    TestPlayCommand needs this because it patches asyncio.create_task as a join-task
+    spy, and the typing keepalive would otherwise hit the same patch, polluting call
+    counts and taking the fake join future. The wrapper itself is covered by
+    TestBackgroundTyping."""
+    return patch(target, MagicMock(return_value=contextlib.nullcontext()))
+
+
+def in_authors_channel(vc: MagicMock, ctx: Optional[MagicMock]) -> MagicMock:
+    """Seat a voice-client double in the author's channel, or somewhere else. Queue
+    control is gated on the bot being in the author's channel at dispatch AND at
+    the insert, and a double with no channel reads as "somewhere else"."""
+    vc.channel = (
+        ctx.author.voice.channel
+        if ctx is not None
+        else MagicMock(spec=discord.VoiceChannel)
+    )
+    return vc
+
+
+def connected_vc(ctx: Optional[MagicMock] = None) -> MagicMock:
+    """Connected voice client, nothing playing — what a successful cold join leaves
+    behind. is_connected is explicit: the cold path checks it, because discord.py
+    registers the client on the guild before the handshake completes."""
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    vc.is_connected.return_value = True
+    return in_authors_channel(vc, ctx)
+
+
+def playing_vc(ctx: Optional[MagicMock] = None) -> MagicMock:
+    """Connected voice client, actively playing. Both flags must be set explicitly:
+    an unstubbed is_paused() returns a truthy Mock, silently sending -play down the
+    interjection branch instead of the append path."""
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    vc.is_connected.return_value = True
+    return in_authors_channel(vc, ctx)
+
+
+def paused_vc(ctx: Optional[MagicMock] = None) -> MagicMock:
+    """Connected voice client with a song parked paused. is_connected is explicit:
+    -resume's rejoin checks it, and an auto-vivified one answers True by accident
+    rather than by choice."""
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = True
+    vc.is_connected.return_value = True
+    return in_authors_channel(vc, ctx)
+
+
+def mock_mp(qsize: int = 0) -> MagicMock:
+    """MusicPlayer stand-in for the -play cold path, with the playback-gate
+    hooks awaitable: play() takes defer_playback() as an async context manager
+    and awaits wait_for_restore() before front-inserting."""
+    mp = MagicMock()
+    mp.defer_playback = MagicMock(return_value=contextlib.nullcontext())
+    mp.wait_for_restore = AsyncMock(return_value=True)
+    # Numeric, not auto-vivified: _abandon_cold_start COMPARES this, and a Mock
+    # raises TypeError there rather than answering.
+    mp.playback_holds = 1  # the hold this command itself takes
+    # Explicit, not auto-vivified: place() reads it, and a MagicMock is truthy.
+    mp.retired = False
+    mp.queue.generation = 0
+    mp.repark_crashed_head = AsyncMock()
+    # Awaitable, not auto-vivified: interject_flow settles the prefetch BEFORE it
+    # takes the place lock, and a bare Mock is not awaitable there.
+    mp.settle_prefetch = AsyncMock()
+    mp.queue_put_front = AsyncMock()
+    mp.queue_put = AsyncMock()
+    # `--next` inserts through its own wrapper, which neutralizes the loop's
+    # prefetch first — a plain front insert lands behind that claim.
+    mp.queue_put_next = AsyncMock()
+    mp.queue.claim_outstanding = MagicMock(return_value=False)
+    mp.queue.qsize = MagicMock(return_value=qsize)
+    # Numeric for the same reason as playback_holds: this lands in
+    # Analytics.queue_position and rides to Postgres through HistoryEntry's
+    # integer clamp, which a Mock raises on rather than answering.
+    mp.enqueue_depth = MagicMock(return_value=qsize)
+    # Numeric for that reason too: _cold_start_left_something_playable compares it
+    # to decide whether a late refusal may disconnect the session, and an
+    # auto-vivified Mock is truthy — which spares every teardown these tests pin.
+    mp.queue.display_size = MagicMock(return_value=qsize)
+    # Mirrors the real builder's contract: a notice only when the restore
+    # actually left something in the queue (see build_resume_notice_embed).
+    mp.build_resume_notice_embed = MagicMock(
+        return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
+    )
+    return mp
