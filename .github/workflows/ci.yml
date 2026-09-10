@@ -93,14 +93,35 @@ jobs:
     # outcome there. `github.base_ref` is set for no other event.
     if: github.event_name == 'pull_request'
     steps:
+      # Dependency PRs are exempt, and the job still reports success rather than
+      # skipping, so nothing downstream has to distinguish the two. Dependabot does
+      # not touch the project version and cannot know which patch number is free,
+      # so on its PRs the rule only ever reports a number nobody chose. What the
+      # rule protects is unharmed: whatever main carries after such a merge is
+      # still the version the last human PR set. Keyed on the PR's author, not its
+      # branch name — a name is chosen by whoever pushes the branch.
+      - name: Dependency upgrades are exempt
+        id: gate
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+            echo "PR opened by $PR_AUTHOR — a dependency upgrade does not bump the project version"
+            echo "exempt=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exempt=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Depth 1, and the tree is never read: the base branch's pyproject.toml is
       # fetched as a blob below and the head's version arrives as a resolve-env
       # output. The checkout is only what gives that fetch a repository to land in.
       - uses: actions/checkout@v7
+        if: steps.gate.outputs.exempt != 'true'
         with:
           fetch-depth: 1
 
       - name: Version bumps the base branch
+        if: steps.gate.outputs.exempt != 'true'
         env:
           BASE_REF: ${{ github.base_ref }}
           BASE_FILE: ${{ runner.temp }}/base-pyproject.toml
