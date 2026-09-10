@@ -158,6 +158,12 @@ class YtdlpPool:
         self._log_queue: Optional[Any] = None
         self._log_listener: Optional[QueueListener] = None
 
+    @property
+    def max_workers(self) -> int:
+        """Worker count this pool runs with, for callers sizing their own bounds
+        against it — YTDLP_POOL_WORKERS stays read in one place."""
+        return self._max_workers
+
     def _spawn_process_pool(self) -> Executor:
         # Cheap under the lock: ProcessPoolExecutor.__init__ does not spawn.
         if self._log_listener is None:
@@ -256,9 +262,13 @@ class YtdlpPool:
         if not isinstance(executor, ProcessPoolExecutor):
             return  # a thread pool (tests) has nothing to spawn
         for _ in range(self._max_workers):
-            # concurrent.futures never reports an unretrieved exception, so
-            # without the callback a warm that raises is silent.
-            executor.submit(warm).add_done_callback(self._log_warm_failure)
+            # Through _call_with_context like every run() call: it flattens a yt-dlp
+            # exception, which otherwise fails to unpickle and bricks the pool.
+            # concurrent.futures never reports an unretrieved exception the way
+            # asyncio does, so without the callback a warm that raises is silent.
+            executor.submit(_call_with_context, {}, warm).add_done_callback(
+                self._log_warm_failure
+            )
 
     def _log_warm_failure(self, future: Future[Any]) -> None:
         error = future.exception()

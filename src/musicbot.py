@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Optional,
-    Union,
 )
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
@@ -31,7 +30,6 @@ from src.commands import now as now_cmd
 from src.commands import pause as pause_cmd
 from src.commands import ping as ping_cmd
 from src.commands import play as play_cmd
-from src.commands import playnow as playnow_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import resume as resume_cmd
@@ -46,6 +44,14 @@ from src.commands.history import (
 )
 from src.play_pipeline import PlaylistInputError
 from src.commands.analytics import AnalyticsFlags
+from src.play_placement import (
+    PlaceResult,
+    PlaceVerdict,
+    PlayRegistry,
+    PlayRequest,
+    check_voice_permissions,
+    play_takes_the_queue,
+)
 from src.commands.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -76,6 +82,7 @@ from src.util import (
     trace_footer,
     get_logger,
 )
+from src.commands._common import echo
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -114,25 +121,6 @@ class ActiveCommand:
     started: float
 
 
-def _check_voice_permissions(
-    author: Union[discord.Member, discord.User],
-    voice_client: Optional[discord.VoiceClient],
-    command_name: str,
-) -> Optional[str]:
-    """Returns an error message string if validation fails, None if OK."""
-    if isinstance(author, discord.User):
-        return f"You must be a member of this channel {author}"
-    if not author.voice or not author.voice.channel:
-        return f"You are not connected to a voice channel, you silly baka {author}"
-    if (
-        command_name != "play"
-        and voice_client is not None
-        and voice_client.channel != author.voice.channel
-    ):
-        return f"Bot is already being used in channel {voice_client.channel}"
-    return None
-
-
 class MusicBot(commands.Cog):
     """The music cog: command registration, one try/except per command, the
     per-guild player registry and the discord.py hooks."""
@@ -165,6 +153,9 @@ class MusicBot(commands.Cog):
         self._active_spans: dict[int, ActiveCommand] = {}
         self.voice_watchdog = VoiceWatchdog(self)
         self._restore_tasks: set[asyncio.Task] = set()
+        # Per guild: the -play requests resolving, their place lock, and the
+        # cold-start join they share. Created on demand, dropped once idle.
+        self._plays = PlayRegistry()
         # Read directly by MusicContext.send and MusicPlayer. Not named `debug`:
         # that is the -debug command.
         self.debug_settings = debug_mode.DebugSettings()
@@ -263,10 +254,12 @@ class MusicBot(commands.Cog):
         trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         if mp is None:
             return
-        log.info("going to cleanup/disconnect")
-        # Before any await, so the loop cannot slip its iteration end into the
-        # window. Nothing else records this song: it left the queue at start.
+        # Before any await, so the loop's iteration end cannot land in the window.
+        # Nothing else records this song: it left the queue at start, and
+        # clear_connection() drops the parked copy.
         pending_history = mp.claim_current_song_for_history()
+        await self._plays.retire_player(guild.id, mp)
+        log.info("going to cleanup/disconnect")
         try:
             # Cancel before disconnecting so the loop cannot start the next song
             # between voice_client.stop() and cancellation.
@@ -422,12 +415,14 @@ class MusicBot(commands.Cog):
             )
         elif isinstance(error, commands.MaxConcurrencyReached):
             cmd = ctx.command.name if ctx.command else "command"
-            await ctx.send(
-                embed=notice_embed(
-                    f"A `{cmd}` request is already running in this server.",
-                    discord.Color.orange(),
-                )
+            # number > 1 is -play's in-flight cap; the renders keep their one slot.
+            text = (
+                f"Too many `{cmd}` requests are still resolving in this server — "
+                "try again in a moment."
+                if error.number > 1
+                else f"A `{cmd}` request is already running in this server."
             )
+            await ctx.send(embed=notice_embed(text, discord.Color.orange()))
 
     async def validate_commands(self, ctx: commands.Context) -> None:
         """before_invoke hook: rejects the command with a user-facing message
@@ -435,7 +430,12 @@ class MusicBot(commands.Cog):
         vc = ctx.voice_client
         voice_client = vc if isinstance(vc, discord.VoiceClient) else None
         command_name = ctx.command.name if ctx.command is not None else ""
-        msg = _check_voice_permissions(ctx.author, voice_client, command_name)
+        msg = check_voice_permissions(
+            ctx.author,
+            voice_client,
+            command_name,
+            queue_control=play_takes_the_queue(ctx, voice_client),
+        )
         if msg:
             await ctx.send(embed=notice_embed(msg, discord.Color.red()))
             raise commands.CommandError(msg)
@@ -477,46 +477,91 @@ class MusicBot(commands.Cog):
             footer=trace_footer(span),
         )
 
+    async def _report_dropped(self, req: PlayRequest, verdict: PlaceResult) -> None:
+        """Tell the author why a resolved request did not place. An ordinary
+        command reply, so it carries the NP block like any other."""
+        if verdict.verdict is PlaceVerdict.VOICE:
+            text = verdict.refusal
+        elif req.dropped_by:
+            text = (
+                f"Your play request was dropped — `-{req.dropped_by}` ran while "
+                "it was resolving."
+            )
+        elif verdict.verdict is PlaceVerdict.CLEARED:
+            text = (
+                "Your play request was dropped — the queue was cleared while it "
+                "was resolving."
+            )
+        else:
+            text = (
+                "Your play request was dropped — the session ended before your "
+                "song could be queued."
+            )
+        # Which one: a user with three resolving requests gets three of these, and
+        # the dropping command's own listing is not reachable from every path.
+        text = f"{text}\n{echo(req.query)}"
+        await req.ctx.send(embed=notice_embed(text, discord.Color.red()))
+
     @commands.command(
         name="play",
         aliases=["p", "sing"],
         brief="queue a song and start playing",
-        usage="<url|search>",
+        usage="[--now|--next] <url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track or playlist link, a SoundCloud link, or "
-            "plain words to search YouTube with.\n\n"
+            "playlist, a Spotify track or playlist link, a SoundCloud link, or plain "
+            "words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
-            "If something is already playing, the song is appended to the queue "
-            "and you get an estimated start time. A YouTube link carrying a "
-            "`?t=` / `?ts=` timestamp starts the song at that offset.\n\n"
-            "A YouTube playlist link copied from partway through — one carrying "
-            "an `&index=` — queues from that position, skipping the songs "
-            "before it. Drop the `&index=` to queue the whole playlist."
+            "Otherwise the song is appended to the queue with an estimated start time. "
+            "A `?t=` / `?ts=` timestamp starts it at that offset, and a playlist link's "
+            "`&index=` starts from that position instead of from the first track.\n\n"
+            "One option, as the first word:\n\n"
+            "`--now` plays it immediately. The interrupted song returns from the exact "
+            "position it left off at, paused if it was paused, unless it was nearly "
+            "over. Interrupt again and the parked songs unwind most recent first.\n\n"
+            "`--next` queues it at the front instead, without interrupting anything."
+            "\n\n"
+            "Both take a whole playlist in full. With `--now` that means the "
+            "interrupted song does not return until the last track — `-remove` with "
+            "the same link takes the whole thing back out."
         ),
         extras={
             "category": "Playback",
             "examples": [
                 "-play never gonna give you up",
+                "-p --now never gonna give you up",
+                "-p --next https://youtu.be/dQw4w9WgXcQ",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
                 "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
-                "Spotify links are matched to YouTube audio one title at a time, "
-                "so a long playlist takes a few seconds to finish queueing."
+                "Spotify links are matched to YouTube audio one title at a time, so a "
+                "long playlist takes a few seconds to finish queueing. Requests sent "
+                "meanwhile are looked up alongside it and land as each one is ready — "
+                "a `--now` sent behind a long playlist interrupts as soon as its own "
+                "song resolves. `-clear` and `-stop` also drop requests still being "
+                "looked up."
             ),
         },
     )
-    # Serialized per guild: two concurrent invocations both read a live
-    # current_song and both park a resume tail for it.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    # Not max_concurrency: the decorator acquires before the argument is parsed.
+    # The inflight cap is raised inside the body, before its except, so it reaches
+    # cog_command_error rather than rendering as "Failed to queue song".
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
         try:
             await play_cmd.run(ctx, url, cog=self)
+        except commands.MaxConcurrencyReached:
+            # PlayRegistry.register's refusal past PLAY_INFLIGHT_MAX, raised by
+            # hand inside the body. cog_command_error owns the wording; an embed
+            # here would fork it.
+            raise
+        except play_cmd.InterjectionFailed as e:
+            # The branch the user asked for, not the command they typed.
+            await self._command_error(ctx, e.cause, title="Failed to play song now")
         except Exception as e:
             await self._command_error(ctx, e, title="Failed to queue song")
 
@@ -529,8 +574,9 @@ class MusicBot(commands.Cog):
             "Interrupts whatever is playing so your song starts right now. The "
             "interrupted song is not lost — it comes back from the exact position "
             "it left off at, and if it was paused it returns paused.\n\n"
-            "Takes the same input as `-play`. If nothing is playing there is "
-            "nothing to interrupt, so this behaves exactly like `-play`.\n\n"
+            "The same request as `-play --now`, kept as its own command. Takes the "
+            "same input as `-play`. If nothing is playing there is nothing to "
+            "interrupt, so this behaves exactly like `-play`.\n\n"
             "A playlist can't be interjected — only its **first track** is played, "
             "since queueing the whole thing would delay the interrupted song "
             "indefinitely. Use `-play` for the full playlist."
@@ -550,15 +596,64 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # See -play; interject()'s current_song re-check cannot serialize two callers.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    # No max_concurrency, for -play's reason: the body admits the request itself,
+    # and a decorator here would refuse a spelling the flag route accepts.
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
     async def playnow(self, ctx: commands.Context, *, url: str) -> None:
         try:
-            await playnow_cmd.run(ctx, url, cog=self)
+            await play_cmd.run_now(ctx, url, cog=self)
+        except commands.MaxConcurrencyReached:
+            # As -play: cog_command_error owns the wording for a refused request.
+            raise
+        except play_cmd.InterjectionFailed as e:
+            await self._command_error(ctx, e.cause, title="Failed to play song now")
         except Exception as e:
+            # Every failure of this spelling is a failed interjection to the user,
+            # whichever stage raised it.
             await self._command_error(ctx, e, title="Failed to play song now")
+
+    @commands.command(
+        name="playnext",
+        aliases=["pnx"],
+        brief="queue a song at the front, without interrupting",
+        usage="<url|search>",
+        help=(
+            "Queues your song at the front of the queue, so it plays as soon as the "
+            "current song ends. Nothing is interrupted — unlike `-playnow`, whatever "
+            "is playing finishes first.\n\n"
+            "The same request as `-play --next`, kept as its own command. Takes the "
+            "same input as `-play`, and takes a whole playlist in full.\n\n"
+            "Send it twice and the second one lands behind the first: each takes the "
+            "front of the queue as it arrives, so they play in the order you asked."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": [
+                "-playnext never gonna give you up",
+                "-pnx https://youtu.be/dQw4w9WgXcQ",
+            ],
+            "note": (
+                "`-play` adds to the back of the queue; `-playnext` takes the front "
+                "and `-playnow` cuts in immediately. Use `-playnext` when the current "
+                "song should finish."
+            ),
+        },
+    )
+    # No max_concurrency, for -play's reason: the body admits the request itself,
+    # and a decorator here would refuse a spelling the flag route accepts.
+    @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.playnext")
+    async def playnext(self, ctx: commands.Context, *, url: str) -> None:
+        try:
+            await play_cmd.run_next(ctx, url, cog=self)
+        except commands.MaxConcurrencyReached:
+            # As -play: cog_command_error owns the wording for a refused request.
+            raise
+        except Exception as e:
+            # No InterjectionFailed leg: --next interrupts nothing, so there is no
+            # branch here whose failure the user asked for over the one they typed.
+            await self._command_error(ctx, e, title="Failed to queue song")
 
     @commands.command(
         name="skip",
@@ -589,7 +684,8 @@ class MusicBot(commands.Cog):
         brief="stop playback and disconnect, keeping the queue",
         help=(
             "Stops the current song, removes the Now Playing card and "
-            "disconnects the bot from the voice channel.\n\n"
+            "disconnects the bot from the voice channel. Play requests still "
+            "being looked up are dropped and listed.\n\n"
             "This is the full teardown — use `-pause` if you only want to take a "
             "break, or `-clear` if you want to empty the queue but keep playing.\n\n"
             "The queue is **kept** on the server for 24 hours, so `-resume` (or "
@@ -692,7 +788,12 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.join")
     async def join(self, ctx: commands.Context) -> None:
         try:
-            await join_cmd.run(ctx, mp=self.get_mp(ctx), bot_latency=self.bot.latency)
+            await join_cmd.run(
+                ctx,
+                mp=self.get_mp(ctx),
+                bot_latency=self.bot.latency,
+                tracked=self._restore_tasks,
+            )
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -701,8 +802,9 @@ class MusicBot(commands.Cog):
         aliases=["c"],
         brief="empty the queue",
         help=(
-            "Removes every song waiting in the queue and lists what was dropped. "
-            "The song currently playing keeps going — use `-skip` to move past it "
+            "Removes every song waiting in the queue and lists what was dropped, "
+            "along with any play requests still being looked up. The song "
+            "currently playing keeps going — use `-skip` to move past it "
             "or `-stop` to end the session entirely."
         ),
         extras={"category": "Queue", "examples": ["-clear", "-c"]},
@@ -712,7 +814,7 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.clear")
     async def clear(self, ctx: commands.Context) -> None:
         try:
-            await clear_cmd.run(ctx, mp=self.get_mp(ctx))
+            await clear_cmd.run(ctx, mp=self.get_mp(ctx), cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -729,7 +831,10 @@ class MusicBot(commands.Cog):
             "— so removing a playlist link takes back out every track it added. "
             "Run it with no argument for a reminder.\n\n"
             "Links are matched as typed, so a `youtu.be` short link will not "
-            "match a song queued from a full `youtube.com` one."
+            "match a song queued from a full `youtube.com` one.\n\n"
+            "Play requests still being looked up match the same way and are "
+            "dropped before they can be queued, so a link you have only just "
+            "typed can be taken back during the wait."
         ),
         extras={
             "category": "Queue",
@@ -751,7 +856,7 @@ class MusicBot(commands.Cog):
         self, ctx: commands.Context, *, needle: Optional[str] = None
     ) -> None:
         try:
-            await remove_cmd.run(ctx, needle, mp=self.get_mp(ctx))
+            await remove_cmd.run(ctx, needle, mp=self.get_mp(ctx), cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
 

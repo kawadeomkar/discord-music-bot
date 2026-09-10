@@ -86,6 +86,14 @@ def _normalize(s: str) -> str:
     return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
 
+def matches_origin(needle: str, origin: str) -> bool:
+    """Whether one `-remove` argument matches an input by ORIGIN — what the user
+    typed — under the queue's own fold. Also applied to the `-play` requests still
+    resolving, whose query is that origin before any queue item carries it."""
+    needle = needle.strip().strip("<>")
+    return bool(needle) and _normalize(origin) == _normalize(needle)
+
+
 def remove_matcher(needle: str) -> RemoveMatcher:
     """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
     first, then what the user typed. An origin match takes out every item sharing
@@ -131,6 +139,14 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     if isinstance(item, QueueObject):
         return SongQueueEntry.from_queue_object(item)
     return SearchQueueEntry.from_ytsource(item)
+
+
+def item_label(item: QueueItem) -> str:
+    """What to call a queued item in a reply. A YTSource is an unresolved search
+    with no `title`, so its term stands in, `ytsearch:` prefix off."""
+    if isinstance(item, QueueObject):
+        return item.title or "?"
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
 def is_persisted(item: Optional[QueueItem]) -> bool:
@@ -231,6 +247,12 @@ class GuildQueue:
     def empty(self) -> bool:
         return self._cursor >= len(self._items)
 
+    def claim_outstanding(self) -> bool:
+        """Is a consumer holding an item it has not settled yet? True across the
+        prefetch's claim and loop()'s own (from taking the prefetch result until
+        commit_dequeue()), when `_prefetch_task` is None and `current_song` unset."""
+        return self._cursor > 0
+
     def qsize(self) -> int:
         """PENDING only — what is still waiting to be claimed."""
         return len(self._items) - self._cursor
@@ -290,12 +312,12 @@ class GuildQueue:
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
-        """Insert items at the front — the -playnow interjection path. An
-        in-flight head (dequeued but uncommitted) stays AHEAD of them and forces
-        the rebuild path: its Redis entry still sits at the list head awaiting a
-        commit-time LPOP, so an LPUSH in front of it would make that LPOP eat the
-        new head. Reachable: _interject_flow's outcome-is-None fallback calls this
-        with the prefetch's claim still open."""
+        """Insert items at the front — the interjection path. An in-flight head
+        (dequeued but uncommitted) stays AHEAD of them and forces the rebuild
+        path: its Redis entry still sits at the list head awaiting a commit-time
+        LPOP, so an LPUSH in front of it would make that LPOP eat the new head.
+        Reachable: _interject_flow's outcome-is-None fallback calls this with the
+        prefetch's claim still open."""
         if not items:
             return []
         async with self._mutex:
@@ -326,7 +348,7 @@ class GuildQueue:
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything on it — claimed prefix included,
         because the caller records these (MusicPlayer._flush_played) and a parked
-        -playnow tail is among them. Bumps the generation and resets the cursor
+        resume tail is among them. Bumps the generation and resets the cursor
         under the mutex: a claim the loop took before this captured the old value
         and is refused by commit_dequeue(); a prefetch's claim commits under the
         current value and is refused because nothing is claimed at cursor 0. The
@@ -359,6 +381,8 @@ class GuildQueue:
             self._items = deque(head + tail)
             self._sync_wake()
 
+            # DELETE when nothing persisted survives: it heals a mirror
+            # holding entries memory no longer has.
             if tail:
                 await self._write_mirror(self._items)
 
@@ -461,16 +485,15 @@ class GuildQueue:
         )
 
     def resume_tail_depth(self) -> int:
-        """Parked plays waiting behind the song that just cut the line — the run
-        of consecutive resume tails after it (1 = plain -playnow, 2+ = a stack).
-        The run starts after the claimed prefix, since put_front inserts behind
-        a dequeued-but-uncommitted item."""
-        depth = 0
-        for item in islice(self._items, self._cursor + 1, None):
-            if not (isinstance(item, QueueObject) and item.is_resume):
-                break
-            depth += 1
-        return depth
+        """How many parked plays wait behind the song that just cut the line: 1 is
+        a plain interjection, 2+ a stack. Counts every pending tail past the claimed
+        prefix (`--now` takes a whole playlist, so tails are not adjacent) — plays,
+        not fragments. O(len(_items)), once per interjection."""
+        return sum(
+            1
+            for item in islice(self._items, self._cursor + 1, None)
+            if isinstance(item, QueueObject) and item.is_resume
+        )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
@@ -603,7 +626,9 @@ class GuildQueue:
             dropped = [_to_entry(s) for s in removed if is_persisted(s)]
             dropped_blobs = [entry.to_redis() for entry in dropped]
             if not self._claimed_blobs(dropped_blobs):
-                if await self._store.remove_queue_entries(dropped) == len(dropped):
+                with self._mirror_write():
+                    lremmed = await self._store.remove_queue_entries(dropped)
+                if lremmed == len(dropped):
                     return
                 log.warning(
                     f"queue mirror diverged from memory in guild {self._guild.id}; "

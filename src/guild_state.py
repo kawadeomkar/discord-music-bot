@@ -66,10 +66,11 @@ class StateField:
     CURRENT_SONG_DURATION: Final[str] = "current_song_duration"
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
-    # "1" when the playing song was queued via -playnow (attribution only).
+    # "1" when the playing song was queued by an interjection (attribution only).
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
-    # "1" when the playing song is a -playnow resume tail / was parked paused.
-    # is_resume drives the announcement, _remaining_secs and NP-card cleanup.
+    # "1" when the playing song is an interjection's resume tail / was parked
+    # paused. is_resume drives the announcement, _remaining_secs and NP-card
+    # cleanup.
     CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
     CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
     # Set once at ask time and carried, never rewritten, so a crash-recovered
@@ -282,8 +283,8 @@ class GuildStateData:
     current_song_queued_at: float = 0.0
     current_song_queue_position: int = 0
     current_song_query_source: str = ""
-    # None, not "": absent means a pre-migration entry, not a song queued
-    # without an origin. parse_queue_entry draws the same line.
+    # None, not "": absent means a pre-migration entry, and an empty needle must
+    # never be what -remove matches on. parse_queue_entry draws the same line.
     current_song_user_input: str | None = None
     current_song_played_at: float = 0.0
     play_start_epoch: float | None = None
@@ -487,7 +488,7 @@ class QueueEntryField:
     UPLOADER: Final[str] = "uploader"
     THUMBNAIL: Final[str] = "thumbnail"
     PERSISTED: Final[str] = "persisted"
-    # -playnow flags — absent on pre-feature entries, parsed as False.
+    # Interjection flags — absent on pre-feature entries, parsed as False.
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
@@ -533,7 +534,7 @@ class SongQueueEntry:
     uploader: str | None = None
     thumbnail: str | None = None
     persisted: bool = True
-    # -playnow flags — see the matching QueueObject field comments.
+    # Interjection flags — see the matching QueueObject field comments.
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
@@ -543,8 +544,8 @@ class SongQueueEntry:
     # How it was asked for ("" = unknown), see QueueObject.
     query_source: str = ""
     # When the audio started (0.0 = not played yet). Carried so a song
-    # interrupted by -playnow or recovered from a crash records the start of the
-    # play, not of its last fragment.
+    # interrupted by an interjection or recovered from a crash records the start
+    # of the play, not of its last fragment.
     played_at: float = 0.0
     # The interrupted fragment's frozen NP card. The live np_host_ref cannot be
     # serialized, so a rehydrated tail can only DELETE a dedicated card.
@@ -615,8 +616,8 @@ class SongQueueEntry:
         but the flag — `ts` holds the interrupt position while is_resume stays
         false, so the loop announces "Starting song at N seconds" and
         _remaining_secs bills the whole duration. Synthesizing the flag from
-        `ts > 0` would also move the queue display and the -playnow wording, so
-        it wants its own change.
+        `ts > 0` would also move the queue display and the interjection wording,
+        so it wants its own change.
         """
         if not state.has_crashed_song:
             return None
@@ -854,7 +855,8 @@ class HistoryEntry:
     thumbnail: str = ""
     uploader: str = ""
     # Unix epoch when the audio started; drives <t:…:f>. One value per play, not
-    # per fragment: a -playnow resume tail inherits the interrupted song's stamp.
+    # per fragment: an interjection's resume tail inherits the interrupted song's
+    # stamp.
     played_at: float = 0.0
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
     channel_id: int = 0  # the channel that host was in; 0 = unknown, always paired
@@ -913,7 +915,7 @@ class HistoryEntry:
         had no host — pass 0 explicitly for that, both ids off the same message.
         played_at rides the song (stamped at vc.play(), inherited by every later
         fragment). played_secs is the position reached, capped at duration when
-        known; a -playnow-interrupted song is recorded once at its resume tail."""
+        known; an interrupted song is recorded once at its resume tail."""
         played = round(song.position_secs)
         duration = song.duration_secs or 0
         if duration:
@@ -939,7 +941,7 @@ class HistoryEntry:
     @classmethod
     def from_queue_object(cls, item: QueueObject, *, guild_id: int) -> Self:
         """A played song recorded as it LEAVES the queue — the -clear/-remove
-        counterpart to from_song, for a -playnow-interrupted entry destroyed
+        counterpart to from_song, for an interjection-interrupted entry destroyed
         before its tail could play. played_secs comes from `ts`, the ABSOLUTE
         resume offset, capped at duration. The host ids come off the tail's
         np_* fields: the cleanup that deletes that card fires only when a tail

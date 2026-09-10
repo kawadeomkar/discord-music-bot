@@ -159,7 +159,7 @@ class TestGuildStateDataFromRedis:
     @pytest.mark.parametrize("raw", [b"", b"0", b"true"])
     def test_interjected_anything_but_one_is_false(self, raw: Any) -> None:
         # The write path stores exactly "1" or "" — anything else (including
-        # a missing field on pre-playnow state hashes) reads as False.
+        # a missing field on pre-interjection state hashes) reads as False.
         data = GuildStateData.from_redis({b"current_song_interjected": raw})
         assert data.current_song_interjected is False
 
@@ -398,10 +398,12 @@ class TestNowPlayingDataImmutability:
 
 # Golden wire fixtures — byte literals capturing the current writer output.
 # These pin the wire format in both directions so a rolling restart can mix
-# old and new writers. The _PRE_PLAYNOW golden pins the reader against entries
-# written before the -playnow flags existed (parsed as False).
+# old and new writers. The _PRE_INTERJECTION golden pins the reader against entries
+# written before the interjection flags existed (parsed as False).
 
-_PLAYNOW_FLAGS_FALSE = b'"interjected":false,"is_resume":false,"start_paused":false'
+_INTERJECTION_FLAGS_FALSE = (
+    b'"interjected":false,"is_resume":false,"start_paused":false'
+)
 _ENQUEUE_STAMPS_ZERO = b'"queued_at":0.0,"queue_position":0'
 _QUERY_SOURCE_UNKNOWN = b'"query_source":""'
 # "qobj" only — a search has not played, so SearchQueueEntry carries no such field.
@@ -410,7 +412,7 @@ _PLAYED_AT_UNPLAYED = b'"played_at":0.0'
 _NP_HOST_NONE = b'"np_message_id":0,"np_channel_id":0,"np_dedicated":false'
 _GOLDEN_QOBJ_FULL = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
-    + _PLAYNOW_FLAGS_FALSE
+    + _INTERJECTION_FLAGS_FALSE
     + b","
     + _ENQUEUE_STAMPS_ZERO
     + b","
@@ -423,7 +425,7 @@ _GOLDEN_QOBJ_FULL = (
 )
 _GOLDEN_QOBJ_BARE = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=2","title":"Bare","requester_id":42,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true,'
-    + _PLAYNOW_FLAGS_FALSE
+    + _INTERJECTION_FLAGS_FALSE
     + b","
     + _ENQUEUE_STAMPS_ZERO
     + b","
@@ -436,7 +438,7 @@ _GOLDEN_QOBJ_BARE = (
 )
 _GOLDEN_QOBJ_UNPERSISTED = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=4","title":"Crashed","requester_id":8,"ts":95,"user_input":null,"duration":180,"uploader":null,"thumbnail":null,"persisted":false,'
-    + _PLAYNOW_FLAGS_FALSE
+    + _INTERJECTION_FLAGS_FALSE
     + b","
     + _ENQUEUE_STAMPS_ZERO
     + b","
@@ -447,7 +449,7 @@ _GOLDEN_QOBJ_UNPERSISTED = (
     + _NP_HOST_NONE
     + b"}"
 )
-_GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
+_GOLDEN_QOBJ_PRE_INTERJECTION = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
 _GOLDEN_YTSOURCE = (
     b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,'
     b'"ts":null,"user_input":null,'
@@ -503,12 +505,12 @@ class TestSongQueueEntryWire:
     def test_round_trip(self) -> None:
         assert parse_queue_entry(_FULL_ENTRY.to_redis()) == _FULL_ENTRY
 
-    def test_reader_parses_pre_playnow_entry_with_false_flags(self) -> None:
-        # Entries written before the -playnow fields existed must parse with
+    def test_reader_parses_pre_interjection_entry_with_false_flags(self) -> None:
+        # Entries written before the interjection fields existed must parse with
         # all three flags defaulting False.
-        assert parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW) == _FULL_ENTRY
+        assert parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION) == _FULL_ENTRY
 
-    def test_playnow_flags_round_trip(self) -> None:
+    def test_interjection_flags_round_trip(self) -> None:
         entry = dataclasses.replace(
             _FULL_ENTRY, interjected=True, is_resume=True, start_paused=True
         )
@@ -543,7 +545,7 @@ class TestSongQueueEntryWire:
     def test_reader_defaults_np_host_fields_on_pre_feature_entry(self) -> None:
         # An entry written before the fields existed has no card to dispose of,
         # which is what 0/0/False means — never "delete message 0".
-        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(pre_feature, SongQueueEntry)
         assert (
             pre_feature.np_message_id,
@@ -552,7 +554,7 @@ class TestSongQueueEntryWire:
         ) == (0, 0, False)
 
     def test_played_at_round_trips(self) -> None:
-        # A queued entry carries a nonzero start only when it is a -playnow resume
+        # A queued entry carries a nonzero start only when it is an interjection's
         # tail, which inherits the interrupted song's — so this is the leg that
         # keeps one play from being filed twice under two different moments after
         # a restart.
@@ -566,7 +568,7 @@ class TestSongQueueEntryWire:
         # Entries written before the field existed must parse as unplayed rather
         # than dropping as corrupt.
         assert _FULL_ENTRY.played_at == 0.0
-        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(pre_feature, SongQueueEntry)
         assert pre_feature.played_at == 0.0
 
@@ -592,7 +594,7 @@ class TestSongQueueEntryWire:
         )
         assert SongQueueEntry.from_queue_object(item) == _FULL_ENTRY
 
-    def test_from_queue_object_carries_playnow_flags(self) -> None:
+    def test_from_queue_object_carries_interjection_flags(self) -> None:
         item = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
@@ -614,7 +616,7 @@ class TestSongQueueEntryWire:
 
     def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
         # Entries written before the enqueue stamps existed default both to 0.
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(entry, SongQueueEntry)
         assert (entry.queued_at, entry.queue_position) == (0.0, 0)
 
@@ -643,7 +645,7 @@ class TestSongQueueEntryWire:
         assert parsed.query_source == "tiktok.com"
 
     def test_reader_defaults_query_source_on_a_pre_feature_entry(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(entry, SongQueueEntry)
         assert entry.query_source == ""
 
@@ -654,10 +656,10 @@ class TestSearchQueueEntryWire:
         assert entry.to_redis() == _GOLDEN_YTSOURCE
 
     def test_origin_survives_the_wire(self) -> None:
-        """An unresolved Spotify-album track is the only place the album link still
+        """An unresolved Spotify-playlist track is the only place that link still
         exists: its ytsearch is a title the expansion generated, and the resolved
         YouTube URL it becomes names neither. Drop this field on the wire and
-        -remove <album link> stops matching the moment the bot restarts."""
+        -remove <playlist link> stops matching the moment the bot restarts."""
         album = "https://open.spotify.com/album/abc123"
         entry = SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)
         parsed = parse_queue_entry(entry.to_redis())
@@ -1168,7 +1170,7 @@ class TestHistoryEntryFromSong:
     def test_played_at_is_read_off_the_song(self) -> None:
         # It is a stamp the playback loop wrote at vc.play() and every later
         # fragment inherits, NOT a clock read here: a from_song that called
-        # time.time() would restamp a -playnow resume tail to when the tail
+        # time.time() would restamp an interjection's resume tail to when the tail
         # started, filing one play under two different moments across a redelivery.
         song = _history_song_stub(played_at=1700000000.0)
         entry = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
@@ -1258,7 +1260,7 @@ class TestHistoryEntryFromSong:
 
 
 def _played_tail(**overrides: Any) -> QueueObject:
-    """A -playnow resume tail: the interrupted song parked at the queue front,
+    """An interjection's resume tail: the interrupted song parked at the front,
     carrying the play's start and the absolute position it reached."""
     fields: dict = dict(
         webpage_url="https://yt.com/v=1",
@@ -1279,7 +1281,7 @@ def _played_tail(**overrides: Any) -> QueueObject:
 
 class TestHistoryEntryFromQueueObject:
     """The -clear/-remove write path: a song that played, was interrupted by a
-    -playnow, and had its tail destroyed before it could finish. Nothing else will
+    interjected, and had its tail destroyed before it could finish. Nothing else
     ever record it — the loop's single write site only fires for a song it played
     to the end — so this classmethod is the whole record."""
 
@@ -1439,11 +1441,9 @@ class TestCrashedSongRoundTrip:
         )
 
     def test_the_loop_closes_through_the_state_hash(self) -> None:
-        """A -playnow resume tail crashing mid-play comes back as a resume tail,
-        still paused, still removable by the link that queued it. Losing any of
-        the three reclassifies it as a fresh song: no resume announcement,
-        _remaining_secs billing the whole duration, a paused stack coming back
-        playing, and the collection link short one track."""
+        """A `-play --now` resume tail crashing mid-play comes back as a resume tail,
+        still paused, still removable by the link that queued it. Losing any of the
+        three reclassifies it as a fresh song."""
         entry = SongQueueEntry.from_song(self._song())
         # The write side's own mapping, so a field this test adds cannot pass by
         # being spelled differently here than in the store.
@@ -1493,11 +1493,10 @@ class TestFromCrashedState:
         assert entry.requester_id is None  # no requester recorded
 
     def test_a_resume_tail_is_still_a_resume_after_a_crash(self) -> None:
-        """is_resume and start_paused are BEHAVIOUR, not attribution. Losing them
-        reclassified a -playnow tail as a fresh song on every restart: no resume
-        announcement, _remaining_secs billing the whole duration instead of the
-        tail so every ETA behind it skewed, the tail's NP-card cleanup silently
-        disabled, and a stack parked while paused coming back playing."""
+        """is_resume and start_paused are BEHAVIOUR, not attribution: without them a
+        resume tail restarts as a fresh song — no resume announcement, the whole
+        duration billed by _remaining_secs, the NP-card cleanup skipped, and a stack
+        parked while paused coming back playing."""
         state = GuildStateData(
             current_song_url="https://yt.com/v=tail",
             current_song_title="Tail",
@@ -1522,7 +1521,7 @@ class TestFromCrashedState:
     def test_interjected_flag_survives_crash(self) -> None:
         # A crash mid-interjection must not demote the recovered song. Attribution
         # only since stacking replaced replace semantics — it is what tells you the
-        # song was queued by -playnow, and nothing branches on it.
+        # song was queued by an interjection, and nothing branches on it.
         state = GuildStateData(
             current_song_url="https://x",
             current_song_title="T",

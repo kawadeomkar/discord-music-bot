@@ -310,6 +310,16 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
     ),
     _ConfigVar(name="YTDLP_POOL_WORKERS", kind=_ConfigKind.VALUE, fallback="4"),
     _ConfigVar(
+        name="PLAY_INFLIGHT_MAX",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PLAY_INFLIGHT_MAX),
+    ),
+    _ConfigVar(
+        name="PLAY_RESOLVE_CONCURRENCY",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PLAY_RESOLVE_CONCURRENCY),
+    ),
+    _ConfigVar(
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
         fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
