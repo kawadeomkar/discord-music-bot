@@ -1,14 +1,10 @@
 """Debug mode: the `-debug` diagnostic snapshot and the per-guild toggle behind it.
 
-OBSERVATION-ONLY, and that is the whole design constraint. Nothing here changes
-playback, caching, queueing or persistence — only what the bot shows. It is what
-keeps "test with debug on, ship with debug off" a valid methodology: nothing you
-validated changes when the toggle flips.
-
-Every collector degrades to a labeled `unknown`/`n/a` rather than raising (see
-_safe_block) — a debug tool that crashes is worse than no debug tool. src/musicbot.py
-owns only the command registration and the override state; parsing, collection and
-rendering live here, the same split -ping uses.
+OBSERVATION-ONLY: nothing here changes playback, caching, queueing or persistence,
+only what the bot shows, so nothing validated with debug on changes when it flips
+off. Every collector degrades to a labeled `unknown`/`n/a` rather than raising
+(see _safe_block). src/musicbot.py owns only the command registration and the
+override state; parsing, collection and rendering live here, as -ping's do.
 """
 
 import asyncio
@@ -56,8 +52,7 @@ if TYPE_CHECKING:
 
     from src.history_archive import ArchiveStats
 
-    # A runtime import would close the cycle (musicbot imports this module); the cog
-    # is only named in annotations. Same guard recovery.py and musicplayer.py use.
+    # A runtime import would close the cycle (musicbot imports this module).
     from src.musicplayer import MusicPlayer
     from src.ytdlp_pool import PoolState
 
@@ -65,43 +60,35 @@ log = get_logger(__name__)
 
 
 class ArchiveStatsReader(Protocol):
-    """The one thing -debug's Postgres block needs, declared structurally — exactly
-    like ping's ArchiveHealth, and declared HERE for the same reason that one lives
-    in ping.py. Importing it from history_archive.py instead put `import asyncpg` in
-    this module's runtime graph and made the decoupling it claimed a fiction; the
-    ArchiveStats annotation stays behind TYPE_CHECKING so it is a type, not an edge.
-    """
+    """What -debug's Postgres block needs from the archive, declared structurally
+    (like ping's ArchiveHealth) so `import asyncpg` stays out of this module's
+    runtime graph; the ArchiveStats annotation is a type, not an edge."""
 
     async def stats(self) -> ArchiveStats: ...
 
 
-# Stamped at import: the extension loads within seconds of process start, so this
-# is the process's start time for every purpose this command has.
+# The extension loads within seconds of process start.
 _PROCESS_START = time.time()
 
-# The CPU sampling window. Long enough that a short burst does not read as 100%,
-# short enough to sit inside a command's latency budget — and it is also the
-# loop-lag measurement, so the two share one wait.
+# The CPU sampling window; also the loop-lag measurement, so the two share one wait.
 _CPU_WINDOW_SECS = 0.5
 _GIT_PROBE_TIMEOUT_SECS = 2.0
-# Bound on the whole Redis probe, window included. The pool sets no socket_timeout,
-# so a server that accepts the socket and never answers would otherwise run to the
-# dashboard deadline and take its two blocks down at the very end.
+# Bound on the whole Redis probe, window included: the pool sets no
+# socket_timeout, so a server that accepts the socket and never answers would
+# otherwise run to the dashboard deadline.
 _REDIS_PROBE_TIMEOUT_SECS = _CPU_WINDOW_SECS + 3.0
-# Postgres samples over its own, longer window: pg_stat_database flushes a
-# backend's pending stats at transaction end and at most about once a second, so
-# a _CPU_WINDOW_SECS delta reads flush quantization rather than load.
+# Postgres samples over a longer window: pg_stat_database flushes a backend's
+# stats at transaction end and at most about once a second, so a shorter delta
+# reads flush quantization rather than load.
 _PG_WINDOW_SECS = 2.0
-# Bounds the whole two-sample Postgres probe, like _REDIS_PROBE_TIMEOUT_SECS.
-# Defense in depth, not the primary release: the dashboard cancels every pending
-# probe at its deadline, which already frees the archive's read slots. This cap
-# covers what that cannot — a raised DEBUG_DEADLINE_SECS, or the pre-loop send
-# blocking before any deadline exists. Deliberately does NOT stretch with either.
+# Bounds the two-sample Postgres probe. Defense in depth behind the dashboard
+# deadline: covers a raised DEBUG_DEADLINE_SECS and the pre-loop send, and does
+# not stretch with either.
 _PG_PROBE_TIMEOUT_SECS = _PG_WINDOW_SECS + 6.0
 _git_sha_cache: Optional[str] = None
 
-# Block order in the embed, and which probe fills each deferred one. The mapping is
-# what lets the deadline mark exactly the blocks a straggler owed and no others.
+# Block order in the embed, and which probe fills each deferred one — what lets
+# the deadline mark exactly the blocks a straggler owed.
 _BLOCK_ORDER = (
     "Build",
     "Versions",
@@ -120,19 +107,16 @@ _PROBE_BLOCKS: dict[str, tuple[str, ...]] = {
     "build": ("Build",),
 }
 _PENDING_LINES = ["⏳ collecting…"]
-# Named rather than blank: a block that silently vanished would read as "this host
-# has no Postgres", which is a different and wrong answer.
+# Named rather than blank: a vanished block would read as "this host has no Postgres".
 _TIMEOUT_LINES = ["⚠️ timed out"]
 
-# What a non-owner is told instead of the host blocks. Names the reason, so it reads
-# as a boundary rather than as a failure the user should retry.
+# What a non-owner is told instead of the host blocks.
 _OPERATOR_NOTICE = (
     "-# Host details (configuration, storage, runtime) are shown to the bot owner "
     "only. Run `-ping` for dependency health."
 )
 
-# Discord's hard cap on an embed field value; util.py's FOOTER_LIMIT is its footer
-# sibling.
+# Discord's cap on an embed field value; util.py's FOOTER_LIMIT is its footer sibling.
 _FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
@@ -161,23 +145,15 @@ DEBUG_USAGE = "`-debug`, `-debug --enable`, `-debug --disable`"
 
 
 def parse_debug_arg(arg: str) -> Optional[DebugAction]:
-    """The action `arg` names, or None when it names none.
-
-    Hand-parsed rather than a FlagConverter: these are valueless switches, which the
-    converter's `--flag value` grammar cannot express, and a missing-dashes `-debug
-    enable` gets a helpful answer here (see unknown_arg_message) instead of a FlagError
-    raised before the command body ever runs.
-    """
+    """The action `arg` names, or None. Hand-parsed: these are valueless switches
+    a FlagConverter cannot express, and `-debug enable` gets a did-you-mean here
+    instead of a FlagError before the body runs."""
     return _ACTIONS.get(arg.strip().lower())
 
 
 def unknown_arg_message(arg: str) -> str:
-    """The reply for an unparseable argument.
-
-    Deliberately does not echo the argument back: rendering user text into an embed
-    the bot sends is a mention-injection surface, and the did-you-mean branch already
-    covers the realistic typo.
-    """
+    """The reply for an unparseable argument. Never echoes the argument: user
+    text rendered into a bot embed is a mention-injection surface."""
     cleaned = arg.strip().lower()
     if f"--{cleaned}" in _ACTIONS:
         return f"Did you mean `-debug --{cleaned}`? Options take two dashes."
@@ -188,8 +164,7 @@ def unknown_arg_message(arg: str) -> str:
 # SECTION 2 · FOOTER DECORATION
 # ════════════════════════════════════════════════════════════════════════════
 # With debug mode on, every embed the bot sends grows a footer identifying the
-# request. Three seams apply it, one per place embeds are sent from: this one, the
-# player, and the live dashboards. See docs/ARCHITECTURE.md#debug-footer-seams.
+# request. See docs/ARCHITECTURE.md#debug-footer-seams.
 
 _DEBUG_MARK = "🐞"
 
@@ -203,18 +178,10 @@ def debug_footer(
     skip_environment: bool = False,
     skip_trace: bool = False,
 ) -> str:
-    """The debug suffix, or "" when nothing is known worth showing.
-
-    The environment leads and comes from config — it is a property of the process,
-    not of the request. Every other part is optional because every other part has an
-    absent case: a send outside any command has no elapsed time, a DM has no shard,
-    an unsampled span has no trace id, and the runtime segment is absent until the
-    sampler's first tick.
-
-    Two lines: where the request ran, then what it counted. The break is written
-    here rather than left to Discord, which wraps at the card's width and so lands
-    mid-segment — the 32-hex trace id makes that certain on any card.
-    """
+    """The debug suffix, or "" when nothing is worth showing. The environment
+    leads (a property of the process); every other part has an absent case. Two
+    lines — where the request ran, then what it counted — broken here rather than
+    by Discord, which wraps mid-segment on the 32-hex trace id."""
     where: list[str] = []
     counts: list[str] = []
     if not skip_environment:
@@ -240,9 +207,9 @@ def debug_footer(
 
 
 def _strip_debug_suffix(text: str) -> str:
-    """`text` with any previous debug suffix removed, including the line break before
-    it. The first mark is the boundary — no bot-authored footer contains one, asserted
-    over src/ below — so a doubled suffix heals in one pass."""
+    """`text` with any previous debug suffix and the break before it removed. The
+    first mark is the boundary — no bot-authored footer contains one (asserted by
+    a test) — so a doubled suffix heals in one pass."""
     idx = text.find(_DEBUG_MARK)
     if idx == -1:
         return text
@@ -250,12 +217,9 @@ def _strip_debug_suffix(text: str) -> str:
 
 
 def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
-    """Remove a previous debug suffix; what the seams call while debug mode is off.
-
-    Decoration is in place and `play_message` outlives the toggle, so a --disable
-    has to strip rather than skip. The mark check costs one substring test per embed
-    in the default configuration, where none carries a suffix.
-    """
+    """Remove a previous debug suffix — what the seams call while debug mode is
+    off. Decoration is in place and `play_message` outlives the toggle, so a
+    --disable has to strip rather than skip."""
     for embed in embeds:
         existing = embed.footer.text or ""
         if _DEBUG_MARK not in existing:
@@ -271,13 +235,10 @@ def decorate_embeds(
     shard_id: Optional[int] = None,
     runtime: Optional[RuntimeSnapshot] = None,
 ) -> None:
-    """Write the debug footer onto each embed, in place, replacing a previous suffix
-    rather than appending after it. That is what keeps a cached embed sent more than
-    once (`play_message`, re-served by -now) from growing a footer per send.
-
-    Every embed reaching here gets a suffix — the environment alone is always worth
-    showing. strip_debug_footers is the removal path.
-    """
+    """Write the debug footer onto each embed in place, replacing a previous
+    suffix so a cached embed sent more than once (`play_message`, re-served by
+    -now) does not grow a footer per send. Every embed gets a suffix — the
+    environment alone is always worth showing."""
     for embed in embeds:
         existing = embed.footer.text or ""
         base = _strip_debug_suffix(existing)
@@ -286,9 +247,8 @@ def decorate_embeds(
             elapsed_ms=elapsed_ms,
             shard_id=shard_id,
             runtime=runtime,
-            # Read from the pre-suffix footer: error embeds carry their own trace
-            # and the same id twice reads as two traces, but a trace in our own
-            # previous suffix must not suppress the fresh one replacing it.
+            # Read from the pre-suffix footer: error embeds carry their own trace,
+            # but a trace in our own previous suffix must not suppress the fresh one.
             skip_trace="trace:" in base or "trace " in base,
         )
         _write_footer(embed, base, suffix)
@@ -299,8 +259,7 @@ def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
     text = join_footer(base, suffix)
     embed.set_footer(
         text=text or None,
-        # Discord rejects an icon with no text, so it goes with the text.
-        # Unreachable today — nothing in src/ sets a footer icon.
+        # Discord rejects an icon with no text.
         icon_url=embed.footer.icon_url if text else None,
     )
 
@@ -310,7 +269,6 @@ def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 # An env var absent from _CONFIG_ALLOWLIST does not render at all, so a knob added
 # later opts in at review time and a future secret can never leak by default.
-# Django's debug-page scrub convention, decided by hand instead of by pattern-match.
 
 
 class _ConfigKind(Enum):
@@ -323,12 +281,10 @@ class _ConfigKind(Enum):
 class _ConfigVar:
     name: str
     kind: _ConfigKind
-    # What the bot uses when the variable is unset, as text. Read from config's own
-    # resolved constants where there is one, so this can't drift from the real default.
+    # What the bot uses when unset, as text; read from config's resolved constants
+    # where there is one, so it cannot drift from the real default.
     fallback: Optional[str] = None
-    # For a default main() can still replace. src.main imports this module, so that
-    # assignment lands after this tuple is built and a stored string would freeze
-    # the pre-inference value.
+    # For a default main() can still replace after this tuple is built.
     fallback_factory: Optional[Callable[[], str]] = None
 
 
@@ -353,6 +309,16 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback=str(config.POSTGRES_STATEMENT_CACHE),
     ),
     _ConfigVar(name="YTDLP_POOL_WORKERS", kind=_ConfigKind.VALUE, fallback="4"),
+    _ConfigVar(
+        name="PLAY_INFLIGHT_MAX",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PLAY_INFLIGHT_MAX),
+    ),
+    _ConfigVar(
+        name="PLAY_RESOLVE_CONCURRENCY",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PLAY_RESOLVE_CONCURRENCY),
+    ),
     _ConfigVar(
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
@@ -397,16 +363,16 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         name="REDIS_URL", kind=_ConfigKind.URL, fallback="redis://localhost:6379"
     ),
     _ConfigVar(name="DEBUG_PROMETHEUS_URL", kind=_ConfigKind.URL),
-    # Credential-bearing: presence only, never the value. POSTGRES_URL is here rather
-    # than under URL because it embeds the password in its userinfo.
+    # Credential-bearing: presence only. POSTGRES_URL embeds the password in its
+    # userinfo, so it is SECRET rather than URL.
     _ConfigVar(name="DISCORD_TOKEN", kind=_ConfigKind.SECRET),
     _ConfigVar(name="SPOTIFY_CLIENT_ID", kind=_ConfigKind.SECRET),
     _ConfigVar(name="SPOTIFY_CLIENT_SECRET", kind=_ConfigKind.SECRET),
     _ConfigVar(name="POSTGRES_URL", kind=_ConfigKind.SECRET),
 )
 
-# Substrings marking a query parameter whose value is a credential. Matched against
-# the lowercased key, so `api_key` and `X-Auth-Token` are both caught.
+# Substrings marking a query parameter whose value is a credential, matched
+# against the lowercased key.
 _CREDENTIAL_QUERY_KEYS = (
     "pass",  # also covers passwd / password
     "pwd",
@@ -420,71 +386,55 @@ _CREDENTIAL_QUERY_KEYS = (
 
 
 def redact_url(raw: str, *, hide_host: bool = False) -> str:
-    """A URL safe to render: userinfo replaced with `***`, credential-bearing query
-    values replaced with `***`. Those are the two places a DSN hides a password —
-    asyncpg honours `?password=` as readily as userinfo."""
-    # The whole body is guarded, not just urlsplit. `.port` is a LAZY property:
-    # urlsplit("redis://h:99999/0") succeeds and the ValueError fires on dereference,
-    # so a try around the parse alone never caught the one input that needed it — one
-    # typo'd port in .env replaced all of Config with "unavailable (ValueError)",
-    # precisely while someone was diagnosing that host.
+    """A URL safe to render: userinfo and credential-bearing query values replaced
+    with `***` — the two places a DSN hides a password."""
+    # The whole body is guarded: `.port` is lazy, so urlsplit("redis://h:99999/0")
+    # succeeds and the ValueError fires on dereference.
     try:
-        # Normalise a scheme-less value to an authority BEFORE splitting. Without
-        # the "//", urlsplit puts the host in .scheme/.path and leaves .netloc
-        # empty, so every rewrite below — including hide_host's — lands in a slot
-        # that was never carrying the host, and the host survives verbatim next to
-        # a `***` that reads as "this was redacted". Operators do write these
-        # scheme-less: ping.probe_otel carries the same normalisation and says so.
+        # Scheme-less values go to an authority first; otherwise urlsplit puts the
+        # host in .scheme/.path and every rewrite below misses it.
         parts = urlsplit(raw if "://" in raw else f"//{raw}")
         netloc = parts.netloc
         if parts.username is not None or parts.password is not None:
             host = parts.hostname or ""
             netloc = f"***@{host}:{parts.port}" if parts.port else f"***@{host}"
         if hide_host:
-            # The snapshot is posted in the channel the operator typed in, so this
-            # block has to survive being read by everyone there. A host:port pair is
-            # internal topology even with no credential on it. Redacted
-            # UNCONDITIONALLY, including for localhost: redacting only remote hosts
-            # would make the presence of `***` the disclosure instead.
+            # The snapshot is posted where the operator typed, so host:port is
+            # topology to redact unconditionally — localhost included, or the
+            # presence of `***` becomes the disclosure.
             if "://" not in raw:
-                # Without a scheme there is no authority to rewrite, and the host
-                # can land in .path as well ("http:/host:9090/x"), so replacing one
-                # component would leave it visible beside a `***` that claims it was
-                # hidden. Nothing in a value this shape is safe to echo.
+                # Without a scheme the host can land in .path ("http:/host:9090/x"),
+                # so no single component rewrite is safe.
                 return "***"
             netloc = "***"
         query = parts.query
         if query:
-            # safe="*" so the redaction marker survives quoting as `***` rather than
-            # arriving as %2A%2A%2A, which reads like data rather than a redaction.
+            # safe="*" so the marker survives quoting as `***`, not %2A%2A%2A.
             query = urlencode(
                 [
-                    (k, "***" if _is_credential_key(k) else v)
+                    (
+                        k,
+                        "***"
+                        if any(t in k.lower() for t in _CREDENTIAL_QUERY_KEYS)
+                        else v,
+                    )
                     for k, v in parse_qsl(query, keep_blank_values=True)
                 ],
                 safe="*",
             )
-        # A fragment is never meaningful in any allowlisted URL, and urlsplit puts
-        # everything after a stray `#` there — so it is the one component that can
-        # carry a credential past both redactions above. Marked, not dropped, so
-        # the row still says something was there.
+        # Everything after a stray `#` lands in the fragment, past both redactions
+        # above. Marked, not dropped, so the row still says something was there.
         fragment = "***" if parts.fragment else ""
         return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
     except ValueError:
         return "unparseable"
 
 
-def _is_credential_key(key: str) -> bool:
-    lowered = key.lower()
-    return any(token in lowered for token in _CREDENTIAL_QUERY_KEYS)
-
-
 def render_config_value(var: _ConfigVar) -> str:
     """One allowlist row's value, redacted per its kind."""
     raw = os.environ.get(var.name)
     if var.kind is _ConfigKind.SECRET:
-        # Presence only, always. This block has to stay safe to screenshot into an
-        # issue; a value here is one paste away from a leaked credential.
+        # Presence only: this block has to stay safe to screenshot into an issue.
         return "set" if (raw or "").strip() else "unset"
     if raw is None or not raw.strip():
         fallback = var.fallback_factory() if var.fallback_factory else var.fallback
@@ -509,15 +459,13 @@ def config_lines() -> list[str]:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DebugInputs:
     """What the cog hands the snapshot: state this module cannot reach without
-    importing MusicBot, which would be an import cycle. Later blocks add fields with
-    defaults, so the cog's call site stays one expression."""
+    importing MusicBot. New fields take defaults, so the cog's call site stays
+    one expression."""
 
     debug_enabled: bool
     debug_overridden: bool
     # False only when a toggle's Redis write failed, so the snapshot can say
-    # "this session only" instead of claiming a durability the user was just
-    # warned did not happen. True for a guild that never chose, where the
-    # question does not arise.
+    # "this session only" rather than claim a durability that did not happen.
     debug_persisted: bool = True
     players: int
     player: Optional[MusicPlayer] = None
@@ -526,23 +474,19 @@ class DebugInputs:
     archive: Optional[ArchiveStatsReader] = None
     archive_enabled: bool = False
     prometheus_url: Optional[str] = None
-    # Is the caller the bot owner? Gates every block that describes the HOST rather
-    # than the caller's own server — see _OPERATOR_BLOCKS. Defaults False so a call
-    # site that forgets to ask discloses nothing.
+    # Gates every block describing the HOST rather than the caller's own server.
+    # Defaults False so a call site that forgets to ask discloses nothing.
     operator: bool = False
-    # None = not asked, and only an operator is ever asked. Set symmetrically with
-    # `operator` rather than only when it is True: a row that appears for False and
-    # vanishes for True would make its own absence the answer.
+    # None = not asked, and only an operator is asked. Set symmetrically with
+    # `operator`, or the row's absence would be the answer.
     default_password: Optional[bool] = None
-    # Debug mode's footer, rendered once by the cog and constant for the whole live
-    # loop (see run_health_dashboard). None when the guild has debug mode off —
-    # reading this card does not require the mode to be on.
+    # Debug mode's footer, rendered once by the cog and constant for the loop.
+    # None when the guild has debug mode off.
     debug_suffix: Optional[str] = None
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
-    """Run a collector, or render why it could not run. The degrade principle made
-    mechanical: no block may take the embed down with it."""
+    """Run a collector, or render why it could not run."""
     try:
         return fn()
     except Exception as e:  # noqa: BLE001 — a debug collector must never raise out
@@ -575,11 +519,8 @@ def _in_container() -> bool:
 
 
 def _fmt_ms(seconds: float) -> str:
-    """Latency in ms, or the word for a latency that is not a number yet.
-
-    nan is discord.py's gateway-is-reconnecting value and inf is the voice client's
-    before-first-heartbeat value; both would render as garbage arithmetic.
-    """
+    """Latency in ms; nan is discord.py's gateway-reconnecting value and inf the
+    voice client's before-first-heartbeat value."""
     ms = seconds * 1000
     if math.isnan(ms):
         return "reconnecting"
@@ -589,13 +530,9 @@ def _fmt_ms(seconds: float) -> str:
 
 
 def git_sha() -> str:
-    """The commit this build was made from, cached for process lifetime.
-
-    GIT_SHA is baked into the runtime image (Dockerfile ARG→ENV); the git fallback
-    covers `just run` from a checkout, where there is no image at all. A dirty
-    build's tag is `<sha>-dirty.<digest>` and passes through unchanged, so the bot
-    reports exactly the tag that was deployed.
-    """
+    """The commit this build was made from, cached for process lifetime: the
+    GIT_SHA baked into the image (a dirty tag passes through unchanged), else
+    `git rev-parse` for `just run` from a checkout."""
     global _git_sha_cache
     if _git_sha_cache is not None:
         return _git_sha_cache
@@ -619,13 +556,9 @@ def git_sha() -> str:
 
 
 def build_lines(sha: Optional[str]) -> list[str]:
-    """`sha` is REQUIRED, and resolved by the caller off the event loop.
-
-    Not defaulted to None-then-git_sha(): git_sha() shells out (measured 16ms
-    uncached, most of an audio frame's scheduling slack) and a default made that
-    blocking call reachable from any future caller that forgot. None here means
-    "the caller looked and there is no sha", which renders as unknown.
-    """
+    """`sha` is required and resolved by the caller off the event loop: git_sha()
+    shells out (~16ms), and a default would make that reachable from any caller
+    that forgot. None means "looked, and there is none"."""
     return [
         f"version      {bot_version()}",
         f"commit       {sha if sha is not None else 'unknown'}",
@@ -644,20 +577,18 @@ def version_lines(versions: dict[str, str]) -> list[str]:
 
 
 # ── Process & event-loop readers ──────────────────────────────────────────────
-# psutil is not cgroup-aware (psutil#2100): inside a container virtual_memory()
-# reports the HOST. Honest container numbers mean reading /sys/fs/cgroup by hand
-# either way, so there is no dependency to add here — only files to read.
+# psutil is not cgroup-aware (psutil#2100): inside a container it reports the
+# HOST, so the cgroup files are read by hand.
 
-# Module constants, not literals inline: these are the seam tests point at a
-# fixture directory, since the real files exist only on Linux.
+# Module constants so tests can point them at a fixture directory.
 _CGROUP = Path("/sys/fs/cgroup")
 _PROC_STATUS = Path("/proc/self/status")
 _PROC_MEMINFO = Path("/proc/meminfo")
 
 
 def _read_text(path: Path) -> str:
-    """A pseudo-file's contents, or "" wherever it does not exist (macOS dev, cgroup
-    v1, a restricted container). Never raises: every caller is a debug row."""
+    """A pseudo-file's contents, or "" wherever it does not exist (macOS dev,
+    cgroup v1, a restricted container). Never raises."""
     try:
         return path.read_text().strip()
     except OSError:
@@ -674,15 +605,10 @@ def _read_int(path: Path) -> Optional[int]:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CpuSample:
-    """A CUMULATIVE cpu reading plus the clock it was taken at.
-
-    CPU% is a rate and exists only between two of these — psutil's
-    cpu_percent(interval=None) returning 0.0 on its first call is the same lesson
-    from the other side. `scope` says what was measured, because the two sources
-    answer different questions: cgroup covers the whole container (FFmpeg
-    subprocesses and pool workers included), os.times() only this process and its
-    REAPED children (so FFmpeg lands at song end, workers at shutdown).
-    """
+    """A CUMULATIVE cpu reading plus the clock it was taken at; CPU% exists only
+    between two of these. `scope` says what was measured: cgroup covers the whole
+    container (FFmpeg and pool workers included), os.times() only this process
+    and its REAPED children."""
 
     seconds: float
     monotonic: float
@@ -691,9 +617,9 @@ class CpuSample:
 
 
 def cpu_cores() -> float:
-    """Cores this process may actually use: the cgroup quota when one is set, else
-    the host count. A container capped at 1.5 cores must not report 12% of 12 while
-    it is saturated."""
+    """Cores this process may use: the cgroup quota when set, else the host
+    count. A container capped at 1.5 cores must not report 12% of 12 while
+    saturated."""
     raw = _read_text(_CGROUP / "cpu.max").split()
     if len(raw) == 2 and raw[0] != "max":
         try:
@@ -706,10 +632,8 @@ def cpu_cores() -> float:
 
 
 def read_cpu_sample() -> CpuSample:
-    # Gated on _in_container(): cpu.stat is readable on a bare-metal host too, where
-    # /sys/fs/cgroup is the ROOT cgroup and the counter covers EVERY process on the
-    # machine — the bot would report the whole host's CPU as its own. A wrong number
-    # is worse than a narrower one, so off-container this falls to the process scope.
+    # Gated on _in_container(): on bare metal /sys/fs/cgroup is the ROOT cgroup
+    # and the counter covers every process on the machine.
     if _in_container():
         for line in _read_text(_CGROUP / "cpu.stat").splitlines():
             if line.startswith("usage_usec "):
@@ -733,8 +657,8 @@ def read_cpu_sample() -> CpuSample:
 
 
 def cpu_percent(first: CpuSample, second: CpuSample) -> Optional[float]:
-    """Percent of available cores used between two samples, or None when the window
-    is too short to divide by."""
+    """Percent of available cores used between two samples, or None when the
+    window is too short to divide by."""
     wall = second.monotonic - first.monotonic
     if wall <= 0 or second.cores <= 0:
         return None
@@ -756,17 +680,10 @@ class MemoryReading:
 
 
 def read_memory() -> MemoryReading:
-    """Memory used and the ceiling it counts against, best source first.
-
-    The cgroup pair is the one the OOM killer acts on, which is what makes its
-    percentage meaningful rather than decorative.
-
-    Gated on _in_container() for the same reason read_cpu_sample is: off-container
-    that path reads the ROOT cgroup, so the row would report the whole machine's
-    usage against the machine's total and label it `(container)`. Worse than the CPU
-    twin, in fact — this is an absolute number rather than a rate, so nothing about
-    it looks wrong. The /proc fallback below is strictly more correct off-container.
-    """
+    """Memory used and the ceiling it counts against, best source first: the
+    cgroup pair the OOM killer acts on, then /proc, then getrusage. Gated on
+    _in_container() as read_cpu_sample is — off-container the cgroup path is the
+    whole machine's usage, labelled `(container)`."""
     current = _read_int(_CGROUP / "memory.current") if _in_container() else None
     if current is not None:
         return MemoryReading(
@@ -780,8 +697,7 @@ def read_memory() -> MemoryReading:
         return MemoryReading(
             used_bytes=rss, limit_bytes=_physical_memory(), scope="process", label="rss"
         )
-    # macOS dev: no /proc at all. ru_maxrss is a PEAK, not a current reading, and
-    # its units differ by platform — bytes on darwin, KiB on Linux (getrusage(2)).
+    # macOS dev: no /proc. ru_maxrss is a PEAK, in bytes on darwin and KiB on Linux.
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return MemoryReading(
         used_bytes=peak if sys.platform == "darwin" else peak * 1024,
@@ -830,11 +746,8 @@ def _physical_memory() -> Optional[int]:
 
 
 async def measure_loop_lag(delay: float) -> float:
-    """How late the loop ran a callback it asked for `delay` seconds out, in ms.
-
-    Doubles as the CPU window when the caller brackets its samples around this —
-    the measurement and the window are the same wait, so neither costs the other.
-    """
+    """How late the loop ran a callback asked for `delay` seconds out, in ms.
+    Doubles as the CPU window when the caller brackets its samples around it."""
     loop = asyncio.get_running_loop()
     start = loop.time()
     await asyncio.sleep(delay)
@@ -842,15 +755,14 @@ async def measure_loop_lag(delay: float) -> float:
 
 
 def pool_state() -> PoolState:
-    # Resolved per call rather than imported at module scope: the test seam
-    # monkeypatches src.youtube.ytdlp_pool, and a captured reference would miss it.
+    # Resolved per call: the test seam monkeypatches src.youtube.ytdlp_pool.
     from src.youtube import ytdlp_pool
 
     return ytdlp_pool.state
 
 
 def chart_pool_state() -> PoolState:
-    # Same per-call rule, same reason: conftest patches src.chart_pool.chart_pool.
+    # Same per-call rule: conftest patches src.chart_pool.chart_pool.
     from src.chart_pool import chart_pool
 
     return chart_pool.state
@@ -866,9 +778,8 @@ def runtime_lines(
     lag_ms: Optional[float] = None,
     tasks: Optional[int] = None,
 ) -> list[str]:
-    # A plain duration, NOT a `<t:…:R>` timestamp: every row here is rendered inside
-    # a ``` fence, where Discord prints markup as its literal source — the row read
-    # `uptime <t:1785881580:R>` to every operator who ran it.
+    # A plain duration, not a `<t:…:R>` timestamp: inside a ``` fence Discord
+    # prints markup as its literal source.
     lines = [f"uptime       {fmt_duration(int(time.time() - _PROCESS_START))}"]
     if cpu is None:
         lines.append("cpu          unknown")
@@ -885,20 +796,17 @@ def runtime_lines(
             f"{memory.label} ({memory.scope})"
         )
     lag = f" · lag {lag_ms:.1f} ms" if lag_ms is not None else ""
-    # "loop tasks", not "bot tasks": all_tasks() is loop-global and counts
-    # discord.py's internals too. `tasks` is passed in by the caller, counted BEFORE
-    # the dashboard launches its own probes — counting it here would run inside one
-    # of them and inflate by however many are still in flight, which is exactly the
-    # error an operator reading this number to spot a task leak cannot afford.
+    # "loop tasks": all_tasks() is loop-global and counts discord.py's internals.
+    # `tasks` is counted by the caller BEFORE the dashboard launches its probes;
+    # counting here would inflate by however many are still in flight.
     count = len(asyncio.all_tasks()) if tasks is None else tasks
     lines.append(f"loop         {count} loop tasks{lag}")
     state = pool_state()
     spawned = "spawned" if state.spawned else "not spawned"
     healed = f" · {state.generation} generations" if state.generation > 1 else ""
     lines.append(f"yt-dlp pool  {state.max_workers} workers · {spawned}{healed}")
-    # Reported even when it has never spawned, which is the common case: "not
-    # spawned" is the answer to "why is this bot not holding 173 MB of matplotlib",
-    # and an absent row would read as a missing feature instead.
+    # Reported even when never spawned: "not spawned" answers "why is this bot
+    # not holding 173 MB of matplotlib", and an absent row reads as a missing feature.
     chart = chart_pool_state()
     chart_spawned = "spawned" if chart.spawned else "not spawned"
     chart_healed = f" · {chart.generation} generations" if chart.generation > 1 else ""
@@ -913,8 +821,8 @@ def _mb(value: float) -> str:
 
 
 def discord_lines(bot: commands.Bot, *, players: int) -> list[str]:
-    # latencies is AutoShardedClient-only; the single-shard shape is the fallback so
-    # this block works against a plain Bot (and the doubles in tests).
+    # latencies is AutoShardedClient-only; the single-shard shape is the fallback
+    # for a plain Bot (and the doubles in tests).
     latencies = getattr(bot, "latencies", None)
     if not isinstance(latencies, list):
         latencies = [(0, bot.latency)]
@@ -935,8 +843,8 @@ def discord_lines(bot: commands.Bot, *, players: int) -> list[str]:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RuntimeSnapshot:
-    """The runtime metrics the debug footer prints. Every field is optional because
-    the first tick has no previous sample to rate against."""
+    """The runtime metrics the debug footer prints. Optional fields because the
+    first tick has no previous sample to rate against."""
 
     cpu_percent: Optional[float]
     mem_percent: Optional[float]
@@ -950,21 +858,16 @@ _FIRST_SAMPLE_SECS = 0.5
 
 
 class RuntimeSampler:
-    """A background sampler feeding the debug footer, on the Now Playing tick's
-    cadence (see INTERVAL_SECS).
+    """A background sampler feeding the debug footer on the Now Playing tick's
+    cadence. Background because CPU% needs a wall-clock window and a response
+    must never wait on one; a send reads the cached snapshot, at most one tick
+    old. The tick's own scheduling drift IS the loop-lag measurement. One
+    instance, held on the cog: a module global would outlive a cog reload and
+    leak the task."""
 
-    Sampled in the background rather than at send time because CPU% needs a
-    wall-clock window and a response must never wait on one; a send reads the
-    cached snapshot, at most one tick old. The tick's own scheduling drift IS the
-    loop-lag measurement — a late tick measures exactly what it wanted to report.
-
-    ONE instance, held on the cog. Deliberately not module state: a module global
-    outlives a cog reload and would leak the task.
-    """
-
-    # Tied to the NP tick, the fastest surface that renders a snapshot: sampling
-    # slower re-pushes footers whose numbers have not moved. Floored so a tiny tick
-    # cannot spin /proc reads, capped so a long one cannot stale command replies.
+    # Tied to the NP tick, the fastest surface that renders a snapshot. Floored
+    # so a tiny tick cannot spin /proc reads, capped so a long one cannot stale
+    # command replies.
     INTERVAL_SECS = max(1.0, min(5.0, config.NOW_PLAYING_UPDATE_INTERVAL_SECS))
 
     def __init__(self) -> None:
@@ -974,8 +877,8 @@ class RuntimeSampler:
 
     @property
     def snapshot(self) -> Optional[RuntimeSnapshot]:
-        """The latest sample, or None before the first tick completes — in which
-        case the footer simply omits the runtime segment rather than guessing."""
+        """The latest sample, or None before the first tick completes — the
+        footer then omits the runtime segment rather than guessing."""
         return self._snapshot
 
     @property
@@ -984,12 +887,8 @@ class RuntimeSampler:
 
     def apply(self, *, wanted: bool) -> None:
         """Start or stop to match whether ANY guild is effectively debug-enabled.
-
-        Must be called at cog load as well as on every toggle: a DEBUG_MODE=true
-        deployment starts already-enabled and no toggle ever fires, so a
-        transition-only trigger would leave the footer permanently without runtime
-        metrics.
-        """
+        Called at cog load as well as on every toggle: a DEBUG_MODE=true
+        deployment starts enabled and no toggle ever fires."""
         if wanted:
             self.start()
         else:
@@ -1009,17 +908,17 @@ class RuntimeSampler:
             task.cancel()
 
     async def aclose(self) -> None:
-        """Stop and await the task. Cog teardown uses this so a reload cannot leave
-        a sampler dripping /proc reads forever."""
+        """Stop and await the task, so a cog reload cannot leave a sampler
+        dripping /proc reads forever."""
         task = self._task
         self.stop()
         await cancel_task(task)
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
-        # First sample on a short delay, so `-debug --enable` does not answer with
-        # a footer carrying no runtime numbers. Not instant: cpu% needs a window,
-        # and start() took the baseline. Never longer than the interval itself.
+        # First sample on a short delay, so `-debug --enable` does not answer
+        # with a footer carrying no runtime numbers; not instant, since cpu%
+        # needs a window and start() took the baseline.
         delay = min(_FIRST_SAMPLE_SECS, self.INTERVAL_SECS)
         while True:
             expected = loop.time() + delay
@@ -1043,12 +942,9 @@ class RuntimeSampler:
 
 
 def _voice_latency_text(vc: discord.VoiceClient) -> str:
-    """Voice WS heartbeat latency and its 20-sample average.
-
-    Both are inf (and average_latency raises ZeroDivisionError) until the first ACK,
-    ~5s after joining — discord.py #6430. That window is exactly when a tester looks,
-    since testing starts with a fresh join.
-    """
+    """Voice WS heartbeat latency and its 20-sample average. Both are inf (and
+    average_latency raises ZeroDivisionError) until the first ACK, ~5s after
+    joining — discord.py #6430."""
     try:
         latency = _fmt_ms(vc.latency)
         average = _fmt_ms(vc.average_latency)
@@ -1060,17 +956,10 @@ def _voice_latency_text(vc: discord.VoiceClient) -> str:
 
 
 def _fence_safe(text: str) -> str:
-    """User-controlled text, made safe to interpolate into a ``` fence.
-
-    A voice-channel name is the only string in this snapshot a user picks, and the
-    "This server" block is public. A name containing a backtick run CLOSES the fence,
-    and Discord renders masked links inside embed field values — so `[Verify your
-    account](https://evil)` in a channel name becomes a clickable link inside a card
-    carrying the bot's own name and avatar. Join-to-create bots hand ordinary members
-    naming rights over their channel, so this needs no elevated permission.
-    unknown_arg_message already refuses to echo user text for this reason; the rule
-    is the same one function over.
-    """
+    """User-controlled text, made safe to interpolate into a ``` fence. A voice-
+    channel name is the one user-picked string here and the block is public: a
+    backtick run closes the fence, and a masked link in a channel name renders
+    clickable inside a card carrying the bot's own name."""
     return truncate(text.replace("`", "'"), 60)
 
 
@@ -1078,8 +967,7 @@ def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> li
     mp = inputs.player
     lines = [
         f"player       {'yes' if mp is not None else 'no'}",
-        # display_size(), so a song the loop has claimed but not yet started
-        # still reads as queued.
+        # display_size(), so a claimed-but-not-started song still reads as queued.
         f"queue        {mp.queue.display_size() if mp is not None else 0} queued",
         f"volume       {round(mp.volume * 100) if mp is not None else 100}%",
         f"debug        {'on' if inputs.debug_enabled else 'off'} ({source})",
@@ -1091,8 +979,7 @@ def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> li
     state = "playing" if vc.is_playing() else "paused" if vc.is_paused() else "idle"
     lines.append(f"voice        {_fence_safe(vc.channel.name)} · {state}")
     lines.append(f"voice ws     {_voice_latency_text(vc)}")
-    # connect/speak only: they are the two whose absence looks exactly like a
-    # playback bug rather than a permission problem.
+    # connect/speak: the two whose absence looks like a playback bug.
     perms = vc.channel.permissions_for(guild.me)
     lines.append(
         f"perms        connect {'✅' if perms.connect else '⚠️'} · "
@@ -1103,9 +990,9 @@ def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> li
 
 # ── Dependencies: everything in-protocol ──────────────────────────────────────
 # The bot cannot read another container's /proc or cgroup, so a dependency's
-# metrics exist here only if its wire protocol reports them. Redis reports plenty
-# over INFO; Postgres answers the database's own questions over SQL and nothing
-# about its container (see the Prometheus row for that half).
+# metrics exist here only if its wire protocol reports them: Redis over INFO;
+# Postgres answers the database's own questions over SQL and nothing about its
+# container (see the Prometheus row for that half).
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1116,8 +1003,7 @@ class RedisSample:
 
 async def read_redis_sample(redis: Optional[aioredis.Redis]) -> Optional[RedisSample]:
     """One INFO read, or None when Redis is absent or unreachable. Two of these
-    bracketing a window give Redis's CPU%, the same way the bot's own is measured.
-    """
+    bracketing a window give Redis's CPU%."""
     if redis is None:
         return None
     try:
@@ -1138,8 +1024,7 @@ def redis_lines(
         return ["unavailable (no INFO — Redis down or not configured)"]
     info = second.info
     lines: list[str] = []
-    # No core normalization: Redis is effectively single-threaded, so 100% is one
-    # saturated core and the number means the same on any host.
+    # No core normalization: Redis is single-threaded, so 100% is one saturated core.
     used_cpu = _redis_cpu(first, second)
     lines.append(
         "cpu          unknown" if used_cpu is None else f"cpu          {used_cpu:.1f}%"
@@ -1150,8 +1035,7 @@ def redis_lines(
     if used is None:
         lines.append("mem          unknown")
     else:
-        # The % is against maxmemory because that is the threshold volatile-lru
-        # acts at — it reads as the eviction runway, not as host pressure.
+        # Against maxmemory, the threshold volatile-lru acts at: the eviction runway.
         ceiling = (
             f" / {_mb(maxmemory)} ({used / maxmemory * 100:.0f}%)"
             if maxmemory
@@ -1167,8 +1051,7 @@ def redis_lines(
     if dbsize is None:
         lines.append("keys         unknown")
     else:
-        # The persistent population is exactly what golden rule 12 protects —
-        # history lists and the outbox — so its size is the number worth watching.
+        # The persistent population is what golden rule 12 protects.
         lines.append(
             f"keys         {dbsize} total · {max(0, dbsize - expires)} persistent"
         )
@@ -1210,46 +1093,32 @@ def _redis_cpu(
 
 
 # ── Container metrics, from the observability plane ───────────────────────────
-# The half of a dependency's story its own protocol cannot tell. Stock Postgres
-# exposes no OS metrics over SQL and its container's cgroup is invisible here, so
-# the numbers come from the metrics stack that already collects them.
-#
-# Deliberately NOT single-source-everything (a postgres_exporter and the whole
-# block via PromQL). All-through-Prometheus is the convention for MONITORING —
-# dashboards, alerts — not for an app diagnostic, which asks its dependencies
-# directly over connections it already holds (the -ping / Actuator pattern). The
-# direct SQL read is itself a diagnostic: it proves THIS bot's pool reaches the
-# database, it is exact rather than scrape-interval stale, and an LGTM outage
-# blanks one line instead of the whole block.
+# Stock Postgres exposes no OS metrics over SQL and its container's cgroup is
+# invisible here, so cpu/mem come from the metrics stack. Only that pair: the
+# direct SQL read proves THIS bot's pool reaches the database, is exact rather
+# than scrape-interval stale, and survives an LGTM outage.
 
 # The compose container_name, promoted to a Prometheus label from docker_stats'
-# container.name resource attribute. Pinned in docker-compose.yml, so a rename
-# there silently empties this row — there is no join that would catch it.
+# container.name attribute. A rename there silently empties this row.
 _POSTGRES_CONTAINER = "discord-postgres"
-# One request, three series. Names are the OTel docker_stats receiver's as
-# Prometheus renames them — NOT cAdvisor's container_cpu_usage_seconds_total,
-# and utilization is already a 0-100 percent despite the `_ratio` suffix.
+# The OTel docker_stats receiver's names as Prometheus renames them — NOT
+# cAdvisor's; utilization is already 0-100 despite the `_ratio` suffix.
 _CONTAINER_METRICS = (
     "container_cpu_utilization_ratio",
     "container_memory_usage_total_bytes",
     "container_memory_usage_limit_bytes",
 )
 _PROMETHEUS_TIMEOUT_SECS = 2.0
-# A Prometheus instant query over three series answers in well under a kilobyte;
-# this is a sanity bound, not a tuning knob.
+# An instant query over three series answers in well under a kilobyte.
 _PROMETHEUS_MAX_BYTES = 1 << 20
 
 _prometheus_session_cache: Optional[aiohttp.ClientSession] = None
 
 
 def _prometheus_session() -> aiohttp.ClientSession:
-    """The process's Prometheus session, created on first use.
-
-    One per query cost an extra connect every time — 0.92 ms against 0.37 ms on
-    loopback, and a full TCP (plus TLS) handshake against a remote. Lazily rather
-    than at import because a ClientSession binds to the running loop, and this
-    module is imported before there is one. Closed by close_prometheus_session().
-    """
+    """The process's Prometheus session, created on first use: a ClientSession
+    binds to the running loop, and this module is imported before there is one.
+    Closed by close_prometheus_session()."""
     global _prometheus_session_cache
     if _prometheus_session_cache is None or _prometheus_session_cache.closed:
         _prometheus_session_cache = aiohttp.ClientSession(
@@ -1276,12 +1145,9 @@ class ContainerMetrics:
 async def read_container_metrics(
     base_url: Optional[str], container: str
 ) -> Optional[ContainerMetrics]:
-    """CPU and memory for one container, or None when there is no source.
-
-    Absent-series tolerant on purpose: an archive-disabled deployment runs no
-    postgres container at all, so "no data" is the ordinary answer rather than a
-    failure worth reporting.
-    """
+    """CPU and memory for one container, or None when there is no source. Absent
+    series are tolerated: an archive-disabled deployment runs no postgres
+    container, so "no data" is the ordinary answer."""
     if not base_url:
         return None
     selector = (
@@ -1293,10 +1159,9 @@ async def read_container_metrics(
             f"{base_url.rstrip('/')}/api/v1/query", params={"query": selector}
         ) as response:
             response.raise_for_status()
-            # ClientTimeout bounds TIME, not BYTES, and .json() would buffer whatever
-            # arrives inside it. The default target is a loopback port on a
-            # host-networked bot, so anything that can bind :9090 could otherwise feed
-            # this gigabytes. Read a capped body and parse that.
+            # ClientTimeout bounds TIME, not BYTES; the default target is a
+            # loopback port on a host-networked bot, so anything that can bind
+            # :9090 could otherwise feed .json() gigabytes.
             body = await response.content.read(_PROMETHEUS_MAX_BYTES + 1)
             if len(body) > _PROMETHEUS_MAX_BYTES:
                 raise ValueError(f"response exceeded {_PROMETHEUS_MAX_BYTES} bytes")
@@ -1347,8 +1212,8 @@ def _container_lines(metrics: Optional[ContainerMetrics]) -> list[str]:
 
 
 def _rate(value: float) -> str:
-    """One decimal below 10, integer above; an exact zero stays a bare 0.
-    The split is decided off the ROUNDED value: 9.99 renders "10", never "10.0"."""
+    """One decimal below 10, integer above, decided off the ROUNDED value so
+    9.99 renders "10", never "10.0"; an exact zero stays a bare 0."""
     if value == 0:
         return "0"
     text = f"{value:.1f}"
@@ -1365,7 +1230,7 @@ def _count_rate(value: float) -> str:
 
 
 def _bytes_rate(value: float) -> str:
-    # Same rounded-mantissa promotion as _count_rate ("1024 KB/s" never renders).
+    # Same rounded-mantissa promotion ("1024 KB/s" never renders).
     if round(value / 1024) >= 1024:
         return f"{value / 1_048_576:.1f} MB/s"
     if round(value) >= 1024:
@@ -1374,9 +1239,8 @@ def _bytes_rate(value: float) -> str:
 
 
 def _wait_parenthetical(stats: ArchiveStats) -> str:
-    """Only nonzero wait kinds; `(0 waiting)` when every active backend is on-CPU
-    (that IS information); nothing at 0 active — a parenthetical on zero is noise.
-    On-CPU is implied (active − waits), never printed."""
+    """Only nonzero wait kinds; `(0 waiting)` when every active backend is on-CPU;
+    nothing at 0 active. On-CPU is implied (active − waits), never printed."""
     if stats.active_backends == 0:
         return ""
     nonzero = [
@@ -1402,17 +1266,15 @@ def postgres_lines(
     after: ArchiveStats,
 ) -> list[str]:
     """Pure renderer over the two-sample bracket _postgres_probe takes. Instant
-    fields come from `after` alone; the load/throughput/mem-signal rates are
-    windowed deltas, clamped at 0 so a pg_stat_reset() (or crash) between samples
-    cannot render negative. The native rows are NOT a fallback for the Prometheus
-    cpu/mem pair — they measure demand and pressure, not utilization, so they
-    render whenever the SQL answers, profile or no profile.
-    """
+    fields come from `after` alone; the rates are windowed deltas clamped at 0 so
+    a pg_stat_reset() between samples cannot render negative. The native rows are
+    not a fallback for the Prometheus pair — they measure demand, not
+    utilization — so they render whenever the SQL answers."""
     window = (after.monotonic - before.monotonic) if before is not None else 0.0
     if before is not None and window > 0:
-        # busy averages when work was REPORTED, not when it happened — stats flush
-        # at transaction end, so a spike above the active count just means a long
-        # statement finished inside the window. Rendered honestly, uncapped.
+        # busy averages when work was REPORTED (stats flush at transaction end),
+        # so a spike above the active count is a long statement finishing inside
+        # the window. Rendered uncapped.
         busy = max(0.0, after.active_time_ms - before.active_time_ms) / 1000 / window
         busy_text = f"busy {busy:.1f} bk-s/s"
         xacts = max(0, after.xacts_total - before.xacts_total) / window
@@ -1420,8 +1282,7 @@ def postgres_lines(
         throughput = f"{_rate(xacts)} tx/s · {_count_rate(tuples)} tuples/s"
         delta_hit = max(0, after.blks_hit - before.blks_hit)
         delta_read = max(0, after.blks_read - before.blks_read)
-        # A zero denominator is the common case, not a fault: an idle database
-        # touched no blocks at all during the window.
+        # A zero denominator is the common case: an idle database touched no blocks.
         window_hit = (
             f"window hit {delta_hit / (delta_hit + delta_read) * 100:.1f}%"
             if delta_hit + delta_read > 0
@@ -1441,13 +1302,13 @@ def postgres_lines(
         f"mem signal   {mem_signal}",
         f"storage      db {_mb(after.database_bytes)} · "
         f"play_history {_mb(after.table_bytes)}",
-        # Estimates, not COUNT(*): play_history is unbounded by design. A non-zero
-        # rejected count means __post_init__'s clamp regressed — `just db-rejects`.
+        # Estimates, not COUNT(*): play_history is unbounded. A non-zero rejected
+        # count means __post_init__'s clamp regressed — `just db-rejects`.
         f"rows         ~{after.rows_estimate} plays · "
         f"{after.rejected_estimate} rejected",
         f"conns        {after.connections} / {after.max_connections}",
-        # (lifetime) since the window ratio landed above it: an unlabeled
-        # cumulative ratio next to a windowed one invites misreading.
+        # (lifetime), since an unlabeled cumulative ratio beside the windowed one
+        # above invites misreading.
         f"cache        buffers {after.shared_buffers} · "
         f"hit rate {after.cache_hit_ratio * 100:.1f}% (lifetime)",
     ]
@@ -1462,8 +1323,7 @@ def _check(ok: Optional[bool], label: str, detail: str) -> str:
 
 
 async def _none() -> None:
-    """An awaitable None, so the gather below stays one shape whether or not there
-    is a store to ask."""
+    """An awaitable None, so the gather below stays one shape with no store."""
     return None
 
 
@@ -1490,25 +1350,21 @@ async def checks_lines(
                 else "volatile-lru",
             )
         )
-        # The early warning for the MISCONF incident in probe_redis's docstring:
         # Redis keeps serving READS after a failed bgsave while refusing writes,
         # so this goes red BEFORE state writes start failing.
         rdb = info.get("rdb_last_bgsave_status", "unknown")
         aof = info.get("aof_last_write_status", "unknown")
         healthy = rdb == "ok" and aof in ("ok", "unknown")
         lines.append(_check(healthy, "persistence", f"bgsave {rdb} · aof {aof}"))
-    # Two independent round trips, so they ride together rather than back to back.
-    # Co-located Redis makes this ~0.5ms; against a 5ms-RTT server it halves the
-    # block's tail.
+    # Two independent round trips, so they ride together.
     outbox_line, ttl = await asyncio.gather(
         _outbox_check(redis, archive_enabled=archive_enabled),
         store.history_ttl() if store is not None else _none(),
     )
     lines.append(outbox_line)
     if store is not None:
-        # A @_guild_op read, so it degrades to None rather than raising. -1 is
-        # redis's "no expiry" — the PERSIST invariant; -2 is "no such key", which
-        # is simply a guild that has played nothing.
+        # A @_guild_op read, so None rather than raising. -1 is "no expiry" (the
+        # PERSIST invariant); -2 is "no such key", a guild that has played nothing.
         if ttl is None:
             lines.append(_check(None, "history ttl", "unknown (Redis unreachable)"))
         elif ttl == -2:
@@ -1522,10 +1378,9 @@ async def checks_lines(
                 )
             )
     if default_password:
-        # Deliberately detail-free. DEFAULT_POSTGRES_PASSWORD is a literal in this
-        # public repo, so spelling out "still the compose default" in a channel
-        # anyone can read publishes the credential itself. -ping carries the full
-        # wording for the operator.
+        # Detail-free: DEFAULT_POSTGRES_PASSWORD is a literal in this public
+        # repo, and this block is readable by anyone in the channel. -ping
+        # carries the full wording for the operator.
         lines.append(_check(False, "db password", "see -ping"))
     elif default_password is False and archive_enabled:
         lines.append(_check(True, "db password", "not the default"))
@@ -1538,16 +1393,15 @@ async def _outbox_check(
     if redis is None:
         return _check(None, "outbox", "unknown (no Redis)")
     try:
-        # Its own try/except: the outbox helpers deliberately RAISE (golden rule 5's
-        # split) because the drainer's backoff loop is their error handler, so every
-        # other consumer owns one.
+        # The outbox helpers RAISE (golden rule 5's split), so every other
+        # consumer owns its own try/except.
         depth = await outbox_depth(redis)
     except Exception as e:  # noqa: BLE001 — a debug row, not the drain path
         return _check(None, "outbox", f"unknown ({type(e).__name__})")
     if archive_enabled:
         return _check(True, "outbox", f"{depth} buffered, draining")
-    # Mirrors _warn_if_outbox_left_over: with the archive off nothing drains these,
-    # and they sit in a non-evictable key.
+    # Mirrors _warn_if_outbox_left_over: with the archive off nothing drains
+    # these, and they sit in a non-evictable key.
     return _check(
         depth == 0,
         "outbox",
@@ -1561,9 +1415,9 @@ async def _outbox_check(
 
 
 def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
-    """Lines as one or more codeblock fields, each within Discord's 1024-char field
-    cap. Splits rather than truncates: a silently clipped config listing is worse
-    than none, since it reads as a complete one."""
+    """Lines as one or more codeblock fields within Discord's 1024-char field
+    cap. Splits rather than truncates: a silently clipped config listing reads
+    as a complete one."""
     fence = 8  # "```\n" + "\n```"
     fields: list[tuple[str, str]] = []
     chunk: list[str] = []
@@ -1585,41 +1439,23 @@ def _fence(lines: list[str]) -> str:
 
 
 def mode_source(overridden: bool, *, persisted: bool = True) -> str:
-    """Why debug mode is in its current state — the half of the answer a bare on/off
-    does not give. Renders inside "Debug mode is **on** for this server (...)", so
-    it stays short enough not to repeat the sentence around it.
-
-    Three states, not two. "saved here" is a stored choice that outlives restarts;
-    "host default" means this guild has never set one and follows DEBUG_MODE, so
-    changing that variable moves it and setting it here would pin it. "this session
-    only" is a toggle whose Redis write failed: the toggle already warned the user,
-    and reporting it as "saved here" one message later would make the command whose
-    job is to describe reality contradict the one that just changed it.
-    """
+    """Why debug mode is in its current state, rendered inside "Debug mode is
+    **on** for this server (...)". "saved here" is a stored choice; "host default"
+    means the guild never chose and follows DEBUG_MODE; "this session only" is a
+    toggle whose Redis write failed, which the toggle already reported."""
     if not overridden:
         return "host default"
     return "saved here" if persisted else "this session only"
 
 
 async def _runtime_blocks(tasks: int) -> dict[str, list[str]]:
-    """Runtime alone, and deliberately touching NO IO.
-
-    cpu_before/cpu_after bracket a single window and that window IS the loop-lag
-    measurement, so the CPU rate and the lag describe the same interval — that is
-    why these two stay together. Redis used to share the window and does NOT belong
-    here: its sample was awaited BEFORE cpu_after, so a Redis that accepted the
-    socket and never answered hid uptime, memory, task count and pool state behind
-    it, and the block then claimed IT had timed out. Everything this block reads
-    (os.times, /proc, pool_state) is local and cannot block, so it must be able to
-    render while every dependency is down — that is the state -debug exists for.
-
-    The Redis probe runs its own window CONCURRENTLY with this one, so the wall
-    clock is unchanged; only the failure coupling is gone.
-    """
-    # Known and accepted skew: on the `process` scope os.times() counts REAPED
-    # children, and the build probe may reap `git rev-parse` inside this window.
-    # Measured at 0.17-0.50% on 12 cores (~2-6% on a single-core container), and
-    # only where GIT_SHA is not baked into the image — i.e. `just run`, not a deploy.
+    """Runtime alone, touching NO IO: everything it reads (os.times, /proc,
+    pool_state) is local, so this block renders while every dependency is down.
+    cpu_before/cpu_after bracket one window that IS the loop-lag measurement;
+    the Redis probe runs its own window concurrently."""
+    # Accepted skew: on the `process` scope os.times() counts REAPED children,
+    # and the build probe may reap `git rev-parse` inside this window (~0.2-0.5%
+    # on 12 cores, and only where GIT_SHA is not baked in).
     cpu_before = read_cpu_sample()
     lag_ms = await measure_loop_lag(_CPU_WINDOW_SECS)
     cpu_after = read_cpu_sample()
@@ -1640,20 +1476,14 @@ async def _runtime_blocks(tasks: int) -> dict[str, list[str]]:
 
 
 async def _redis_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
-    """Redis and Checks — one probe, because Checks reads the same post-window
-    snapshot the Redis rates are computed from, and re-reading it would let the two
-    blocks disagree about the same instant.
-
-    Bounded explicitly: the pool sets socket_connect_timeout but no socket_timeout,
-    so without this the dashboard deadline is the only thing standing between a
-    black-holed Redis and a probe that never returns. Failing here costs these two
-    blocks and nothing else.
-    """
+    """Redis and Checks from one probe: Checks reads the same post-window
+    snapshot the Redis rates are computed from, so the two blocks cannot
+    disagree about the same instant. Bounded explicitly — the pool sets no
+    socket_timeout — and failing here costs these two blocks and nothing else."""
     async with asyncio.timeout(_REDIS_PROBE_TIMEOUT_SECS):
         redis_before = await read_redis_sample(inputs.redis)
         await asyncio.sleep(_CPU_WINDOW_SECS)
-        # DBSIZE has no ordering relationship with the second INFO, so it rides
-        # alongside it rather than costing its own round trip after it.
+        # DBSIZE has no ordering relationship with the second INFO.
         redis_after, dbsize = await asyncio.gather(
             read_redis_sample(inputs.redis), _dbsize(inputs.redis)
         )
@@ -1676,14 +1506,12 @@ async def _redis_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
 
 async def _postgres_probe(inputs: DebugInputs) -> list[str]:
     """Two stats() samples bracketing _PG_WINDOW_SECS, so the counter rows render
-    windowed rates. The failure paths are asymmetric ON PURPOSE: a failed first
-    sample costs only the rates (`unknown`), a failed second is the degraded row —
-    the second sample is the sole source of the instant fields.
-    """
+    windowed rates. The failure paths are asymmetric: a failed first sample costs
+    only the rates (`unknown`); the second is the sole source of the instant
+    fields, so its failure is the degraded row."""
     archive = inputs.archive
     if archive is None:
-        # Mirrors -ping's OFF row: the default deployment made a choice, and a
-        # missing archive must read as that choice rather than as a fault.
+        # Mirrors -ping's OFF row: a missing archive reads as the choice it is.
         return ["off (archive disabled)" if not inputs.archive_enabled else "n/a"]
     async with asyncio.timeout(_PG_PROBE_TIMEOUT_SECS):
         try:
@@ -1691,15 +1519,11 @@ async def _postgres_probe(inputs: DebugInputs) -> list[str]:
         except Exception as e:  # noqa: BLE001 — degrade rates, keep the block
             log.warning(f"first postgres sample failed: {type(e).__name__}: {e}")
             before = None
-        # A dead first sample leaves nothing to rate over, so the window would
-        # buy no data — skip straight to the instant fields.
+        # A dead first sample leaves nothing to rate over, so skip the window.
         if before is not None:
             await asyncio.sleep(_PG_WINDOW_SECS)
-        # Concurrent, not sequential: these share no data, and awaiting Prometheus
-        # first spent up to _PROMETHEUS_TIMEOUT_SECS of this probe's budget before
-        # the query that carries the block's real content even started. A
-        # black-holed metrics endpoint plus a slow Postgres then lost the
-        # storage/rows/conns lines entirely.
+        # Concurrent: awaiting Prometheus first would spend up to its timeout of
+        # this probe's budget before the query carrying the block's content starts.
         container, after = await asyncio.gather(
             read_container_metrics(inputs.prometheus_url, _POSTGRES_CONTAINER),
             archive.stats(),
@@ -1714,17 +1538,11 @@ async def _postgres_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
 
 
 async def _build_blocks() -> dict[str, list[str]]:
-    """git_sha() shells out to git, so it goes to the default executor — the same
-    hop collect_versions() makes for `ffmpeg -version`, and for the same reason:
-    a subprocess on the event loop stalls voice heartbeats and every other guild.
-
-    Not cancellable, and that is accepted rather than overlooked: cancelling this
-    future does not stop a thread that has already started, so a `git rev-parse`
-    blocked on an index.lock holds one default-executor thread for its full
-    _GIT_PROBE_TIMEOUT_SECS after the deadline gave up on it. Bounded by that
-    timeout, once per process (git_sha caches), and nothing else contends for that
-    executor — the yt-dlp pool has its own.
-    """
+    """git_sha() shells out, so it goes to the default executor like
+    collect_versions()'s ffmpeg probe: a subprocess on the event loop stalls
+    voice heartbeats. Not cancellable — a thread already started runs to
+    _GIT_PROBE_TIMEOUT_SECS after the deadline gave up — which is bounded, once
+    per process, and contends with nothing (the yt-dlp pool has its own)."""
     loop = asyncio.get_running_loop()
     sha = await loop.run_in_executor(None, git_sha)
     return {"Build": _safe_block("build", lambda: build_lines(sha))}
@@ -1733,11 +1551,7 @@ async def _build_blocks() -> dict[str, list[str]]:
 def instant_blocks(
     ctx: commands.Context, inputs: DebugInputs, *, source: str
 ) -> dict[str, list[str]]:
-    """Everything answerable without IO, so it is on the skeleton send.
-
-    Versions is here rather than gated because -ping already publishes the same
-    tuple to everyone; gating it would hide nothing.
-    """
+    """Everything answerable without IO, so it is on the skeleton send."""
     blocks: dict[str, list[str]] = {}
     guild = ctx.guild
     if inputs.operator:
@@ -1759,8 +1573,8 @@ def render_snapshot_embed(
     blocks: dict[str, list[str]],
     source: str,
 ) -> discord.Embed:
-    """One embed from whatever has been collected so far. Pure and cheap: the live
-    loop calls it every tick and throws the result away unless it differs."""
+    """One embed from whatever has been collected so far. Pure and cheap: the
+    live loop calls it every tick and discards the result unless it differs."""
     embed = discord.Embed(
         title="\U0001f41e Debug snapshot",
         description=_snapshot_description(inputs, ctx.guild is not None, source),
@@ -1772,13 +1586,11 @@ def render_snapshot_embed(
             continue
         for field_name, value in _codeblock_fields(name, lines):
             embed.add_field(name=field_name, value=value, inline=False)
-    # Published to everyone, while the same value is an operator-gated row in Config
-    # and Build — and on a `just run` deployment it is the git branch name. Known and
-    # inherited rather than decided here: -ping prints this identical footer to every
-    # caller, so gating it would hide nothing the sibling command does not disclose.
+    # Published to everyone while the same value is an operator-gated row above;
+    # -ping prints this identical footer to every caller, so gating it hides nothing.
     footer = f"environment: {config.ENVIRONMENT}"
     if (tf := trace_footer(trace.get_current_span())) is not None:
-        footer += f" \u00b7 {tf}"
+        footer += f" · {tf}"
     embed.set_footer(text=join_footer(footer, inputs.debug_suffix or ""))
     return embed
 
@@ -1793,27 +1605,15 @@ def _snapshot_description(inputs: DebugInputs, in_guild: bool, source: str) -> s
 
 
 async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> None:
-    """The `-debug` snapshot, sent immediately and filled in as its IO lands.
-
-    Every host block costs a round trip somewhere — Redis twice, Postgres, the
-    metrics plane, a git subprocess — plus a half-second CPU sampling window that
-    no amount of concurrency removes. Collecting all of it before the first send
-    made the command look hung for the better part of a second on a healthy host,
-    and far longer on a sick one, which is exactly when it gets run.
-
-    So the shape is -ping's: skeleton now, edits as blocks land, a deadline that
-    marks stragglers rather than failing the whole card. That last part matters
-    more here than in -ping — this command has nine blocks and one slow dependency
-    used to take all of them down with it.
-
-    A non-operator has no deferred blocks at all (nothing they see needs IO), so
-    the driver degrades to a single send with no loop.
-    """
+    """The `-debug` snapshot, sent immediately and filled in as its IO lands —
+    -ping's shape: skeleton now, edits as blocks land, a deadline that marks
+    stragglers rather than failing the card. A non-operator has no deferred
+    blocks, so the driver degrades to a single send with no loop."""
     span = trace.get_current_span()
     source = mode_source(inputs.debug_overridden, persisted=inputs.debug_persisted)
     blocks = instant_blocks(ctx, inputs, source=source)
 
-    # Counted here, before the driver creates its probe tasks — see runtime_lines.
+    # Counted before the driver creates its probe tasks — see runtime_lines.
     loop_tasks = len(asyncio.all_tasks())
 
     probes: dict[str, Callable[[], Coroutine[Any, Any, dict[str, list[str]]]]] = {}
@@ -1829,15 +1629,15 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
                 blocks[name] = list(_PENDING_LINES)
 
     async def _prepare() -> None:
-        """Versions is the one public block that needs a (cached, executor-hopped)
-        call, so it rides the pre-send step exactly as -ping's does."""
+        """Versions is the one public block that needs a (cached, executor-
+        hopped) call, so it rides the pre-send step as -ping's does."""
         versions = await collect_versions()
         blocks["Versions"] = _safe_block("versions", lambda: version_lines(versions))
 
     def _settle(key: str, outcome: dict[str, list[str]] | Exception) -> None:
         if isinstance(outcome, Exception):
             # _safe_block guards each collector, so reaching here means the probe
-            # itself broke rather than one block. Fail only its own blocks.
+            # itself broke. Fail only its own blocks.
             e = outcome
             log.warning(f"debug probe {key!r} failed: {type(e).__name__}: {e}")
             for name in _PROBE_BLOCKS[key]:
@@ -1871,21 +1671,15 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 6 · PER-GUILD DEBUG SETTINGS — the mutable half of debug mode
 # ════════════════════════════════════════════════════════════════════════════
-# Everything above renders debug mode; this decides whether it is ON. It lived on
-# the MusicBot cog, which made two modules outside command dispatch
-# (MusicContext.send and MusicPlayer's NP render) reach through the cog for state
-# that has nothing to do with commands. The cog now holds one attribute.
+# Everything above renders debug mode; this decides whether it is ON. The cog
+# holds one instance, which MusicContext.send and the NP render read directly.
 
 
 class DebugSettings:
     """Per-guild debug-mode state: the durable choice, its read cache, and the
-    sampler feeding the footer.
-
-    DEBUG_MODE is the default every guild starts from: set it and all of them are
-    on unless they opted out; leave it false or unset and each guild turns itself
-    on with `-debug --enable`. The durable copy lives in guild:{id}:config; this
-    holds the read cache. One instance per cog, built in MusicBot.__init__.
-    """
+    sampler feeding the footer. DEBUG_MODE is the default every guild starts
+    from; the durable copy lives in guild:{id}:config and this holds the read
+    cache. One instance per cog, built in MusicBot.__init__."""
 
     __slots__ = (
         "_default",
@@ -1897,30 +1691,21 @@ class DebugSettings:
     )
 
     def __init__(self) -> None:
-        # Read ONCE, here, which is what makes a garbage value abort startup
-        # inside load_extension rather than surfacing later from somewhere that
-        # swallows it.
+        # Read ONCE, here, so a garbage value aborts startup inside load_extension.
         self._default: bool = debug_mode_default()
-        # Per guild — an ungated toggle's blast radius must stay inside the guild
-        # that typed it. A guild that never chose is ABSENT from this dict and
-        # follows _default, and keeps following it when the operator changes the
-        # env var; that is why absence is not the same as False.
+        # A guild that never chose is ABSENT and follows _default, including when
+        # the env var later changes — absence is not False.
         self._overrides: dict[int, bool] = {}
-        # Monotonic stamp bumped by every explicit toggle, plus the value it had
-        # when each guild was last toggled. hydrate() reads Redis and applies the
-        # result across an await; these let it tell whether a guild changed under
-        # it in that window and leave the newer value alone.
+        # A monotonic stamp bumped by every toggle, and its value at each guild's
+        # last toggle: hydrate() applies a Redis read across an await and uses
+        # these to leave a guild toggled in that window alone. _unpersisted holds
+        # the guilds whose cached value did NOT reach Redis.
         self._toggle_seq: int = 0
         self._toggled_at: dict[int, int] = {}
-        # Guilds whose cached value did NOT reach Redis, so -debug can report
-        # "this session only". Cleared as soon as a write or a hydration proves
-        # the durable copy agrees.
         self._unpersisted: set[int] = set()
         self._sampler = RuntimeSampler()
         if self._default and config.ENVIRONMENT == "production":
-            # Debug modes announce themselves in production; the convention is
-            # Flask's and Django's. Observation-only, so this is an advisory, not
-            # a refusal — but a production deployment should have chosen it.
+            # Observation-only, so an advisory rather than a refusal.
             log.warning(
                 "DEBUG_MODE is on in production: every command response will "
                 "carry a debug footer (trace id, timings, runtime metrics). "
@@ -1930,15 +1715,9 @@ class DebugSettings:
     # ── Queries ───────────────────────────────────────────────────────────────
 
     def enabled(self, guild_id: Optional[int]) -> bool:
-        """Whether debug mode is on for this guild — the one query surface for it.
-
-        A guild with no stored choice (and every DM, which has no guild to scope
-        one to) follows the host default.
-
-        SYNCHRONOUS and in-memory on purpose: MusicContext.send calls this on every
-        reply, so a Redis round trip here would put the persistence layer on the hot
-        path of every command.
-        """
+        """Whether debug mode is on for this guild. A guild with no stored choice
+        (and every DM) follows the host default. Synchronous and in-memory:
+        MusicContext.send calls this on every reply."""
         if guild_id is None:
             return self._default
         return self._overrides.get(guild_id, self._default)
@@ -1950,7 +1729,7 @@ class DebugSettings:
 
     @property
     def snapshot(self) -> Optional[RuntimeSnapshot]:
-        """The rolling runtime metrics the debug footer prints, or None before the
+        """The rolling runtime metrics the footer prints, or None before the
         sampler's first tick. Read by MusicContext.send."""
         return self._sampler.snapshot
 
@@ -1965,23 +1744,19 @@ class DebugSettings:
     def footer(
         self, guild: Optional[discord.Guild], *, host_metrics: bool = True
     ) -> Optional[str]:
-        """Debug mode's footer for the two live dashboards, which neither decoration
-        seam reaches. Rendered once per invocation; no elapsed-ms, since every
-        segment must be constant across the loop (see run_health_dashboard).
-        `host_metrics=False` drops the runtime segment — -debug passes the caller's
-        operator status, matching the Runtime block it withholds from a non-owner.
-        None while the guild has debug mode off.
-        """
+        """Debug mode's footer for the two live dashboards, which neither
+        decoration seam reaches. Rendered once per invocation with no elapsed-ms,
+        since every segment must be constant across the loop. `host_metrics=False`
+        drops the runtime segment for a non-owner. None while debug mode is off."""
         if not self.enabled(guild.id if guild else None):
             return None
         return (
             debug_footer(
                 shard_id=guild.shard_id if guild else None,
                 runtime=self.snapshot if host_metrics else None,
-                # Both cards print `environment: <name>` and `trace: <id>` in their
-                # own footer, and twice in one line reads as two. The trace flag is
-                # inert while no span is passed, and kept so adding one cannot double
-                # it.
+                # Both cards print `environment:` and `trace:` in their own footer.
+                # The trace flag is inert while no span is passed; kept so adding
+                # one cannot double it.
                 skip_environment=True,
                 skip_trace=True,
             )
@@ -1996,13 +1771,10 @@ class DebugSettings:
         span: Optional[trace.Span] = None,
         elapsed_ms: Optional[float] = None,
     ) -> None:
-        """Put debug mode's footer on `embeds`, or take a stale one off. The single
-        entry point for every embed the bot sends: a seam passes only the span it
-        names and, for a command response, its elapsed time.
-
-        Off is a STRIP, not a skip: `play_message` and a host's cached embeds outlive
-        a mid-song `--disable`. See docs/ARCHITECTURE.md#debug-footer-seams.
-        """
+        """Put debug mode's footer on `embeds`, or take a stale one off — the
+        single entry point for every embed the bot sends. Off is a STRIP, not a
+        skip: `play_message` and a host's cached embeds outlive a mid-song
+        `--disable`. See docs/ARCHITECTURE.md#debug-footer-seams."""
         if not self.enabled(guild.id if guild else None):
             strip_debug_footers(embeds)
             return
@@ -2019,25 +1791,12 @@ class DebugSettings:
     async def hydrate(
         self, redis: Optional[aioredis.Redis], guilds: Sequence[discord.Guild]
     ) -> None:
-        """Hydrate the in-memory cache from each guild's stored config.
-
-        Runs at cog_load and again on every on_ready — reconnects included, and
-        on_ready re-fires on every session loss, not once per process. Two skip rules
-        make replaying it safe, and both are load-bearing:
-
-        A guild whose config could not be READ is skipped entirely. read_guild_configs
-        omits it rather than handing back a zero value, because "Redis blinked" and
-        "this guild never chose" must not be the same answer here — treating them
-        alike made one failed read DELETE a correct stored choice and revert that
-        guild to the host default for the rest of the process. This is the discipline
-        restore_guild() already applies to a failed get_recovery_gate.
-
-        A guild toggled while this pass was reading is skipped too. The read and the
-        apply straddle an await, so a `-debug --enable` landing between them would
-        otherwise be overwritten by the value that was true before the user ran it:
-        they are told "saved for this server", Redis agrees, and the footer never
-        appears until the next session loss.
-        """
+        """Hydrate the in-memory cache from each guild's stored config. Runs at
+        cog_load and again on every on_ready, so it must be safe to replay. Two
+        skip rules: a guild whose config could not be READ is skipped
+        (read_guild_configs omits it, so "Redis blinked" cannot revert a stored
+        choice to the host default), and a guild toggled while this pass was
+        reading is skipped (the read and the apply straddle an await)."""
         if redis is None:
             return
         guilds = list(guilds)
@@ -2050,38 +1809,34 @@ class DebugSettings:
             if config is None or self._toggled_at.get(guild.id, 0) > started:
                 continue
             if config.debug_mode is None:
-                # No stored choice: follow the host default, and do NOT cache that
-                # — caching it would freeze the guild against a later env change.
+                # No stored choice: follow the host default, uncached, or a later
+                # env change would not reach this guild.
                 self._overrides.pop(guild.id, None)
             else:
                 self._overrides[guild.id] = config.debug_mode
-                # Read back from Redis, so the durable copy is the source.
                 self._unpersisted.discard(guild.id)
         self.sync_sampler()
 
     async def toggle(
         self, redis: Optional[aioredis.Redis], guild_id: int, enabled: bool
     ) -> bool:
-        """Apply an explicit choice for one guild. Returns whether it reached Redis;
-        the caller reports that, since a setting that quietly reverts on the next
-        restart reads as the bot ignoring the guild."""
-        # Redis FIRST, cache second. The reverse would let a failed write leave the
-        # cache claiming a setting the durable copy never took, which the next
-        # on_ready would silently undo.
+        """Apply an explicit choice for one guild. Returns whether it reached
+        Redis; the caller reports that."""
+        # Redis FIRST, cache second: a failed write must not leave the cache
+        # claiming a setting the next on_ready would silently undo.
         persisted = False
         if redis is not None:
             persisted = await GuildRedisStore(redis, guild_id).set_debug_mode(enabled)
         self._overrides[guild_id] = enabled
         # Stamp this guild so a hydration pass that read BEFORE this write cannot
-        # apply its older value on top of it — see hydrate().
+        # apply its older value on top of it.
         self._toggle_seq += 1
         self._toggled_at[guild_id] = self._toggle_seq
         if persisted:
             self._unpersisted.discard(guild_id)
         else:
             self._unpersisted.add(guild_id)
-        # Re-evaluated on every toggle: the sampler runs only while some guild
-        # wants it, so the last --disable stops it.
+        # The sampler runs only while some guild wants it.
         self.sync_sampler()
         log.info(
             f"debug mode {'enabled' if enabled else 'disabled'} by command",
@@ -2090,22 +1845,14 @@ class DebugSettings:
         return persisted
 
     async def forget(self, redis: Optional[aioredis.Redis], guild_id: int) -> None:
-        """Drop a departed guild's override, cache and durable copy alike.
-
-        One bool per guild, so this is hygiene rather than a leak — but the override
-        is the only debug state that is NOT re-derived from the environment, so a
-        guild that removes the bot and re-adds it inside one process lifetime would
-        silently resume its old setting, which reads as the toggle ignoring them.
-        Re-syncing the sampler matters too: the last enabled guild leaving should
-        stop it, exactly as `--disable` would.
-        """
+        """Drop a departed guild's override, cache and durable copy alike, or a
+        guild that removes and re-adds the bot silently resumes a setting nobody
+        there chose — and the config key carries no TTL, so it would sit in
+        Redis forever."""
         self._toggled_at.pop(guild_id, None)
         self._unpersisted.discard(guild_id)
         if self._overrides.pop(guild_id, None) is not None:
             self.sync_sampler()
-        # The durable copy goes too, or a guild that removes and re-adds the bot
-        # silently resumes a setting nobody there chose — and the key would sit in
-        # Redis forever, since config carries no TTL by design.
         if redis is not None:
             await GuildRedisStore(redis, guild_id).clear_config()
 
@@ -2113,13 +1860,9 @@ class DebugSettings:
 
     def sync_sampler(self) -> None:
         """Run the sampler exactly while some guild is effectively debug-enabled.
-
-        Public because cog_load calls it before any toggle has happened — see
-        RuntimeSampler.apply for why load, not only toggles.
-        """
+        Public because cog_load calls it before any toggle has happened."""
         self._sampler.apply(wanted=self._default or any(self._overrides.values()))
 
     async def aclose(self) -> None:
-        """Stop the sampler. Unconditional: a cog reload that left it running would
-        drip /proc reads for the life of the process."""
+        """Stop the sampler, unconditionally."""
         await self._sampler.aclose()

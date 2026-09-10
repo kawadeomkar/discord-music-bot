@@ -14,12 +14,11 @@ from discord.ext import commands
 import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_state import Analytics, HistoryEntry
-from src.musicbot import (
-    MusicBot,
-    _check_voice_permissions,
-)
+from src.musicbot import MusicBot
+from src.play_placement import check_voice_permissions, play_takes_the_queue
 from src.spotify import SpotifyAuthError
 from tests.helpers import (
+    described,
     make_mock_task,
 )
 
@@ -89,12 +88,12 @@ class TestCommandErrorRendering:
 class TestCheckVoicePermissions:
     def test_rejects_non_member_user(self) -> None:
         user = MagicMock(spec=discord.User)
-        assert _check_voice_permissions(user, None, "play") is not None
+        assert check_voice_permissions(user, None, "play") is not None
 
     def test_rejects_member_not_in_voice_channel(self) -> None:
         member = MagicMock(spec=discord.Member)
         member.voice = None
-        assert _check_voice_permissions(member, None, "play") is not None
+        assert check_voice_permissions(member, None, "play") is not None
 
     def test_rejects_wrong_voice_channel_for_non_play(self) -> None:
         member = MagicMock(spec=discord.Member)
@@ -104,7 +103,7 @@ class TestCheckVoicePermissions:
         member.voice.channel = channel_a
         vc = MagicMock(spec=discord.VoiceClient)
         vc.channel = channel_b
-        assert _check_voice_permissions(member, vc, "skip") is not None
+        assert check_voice_permissions(member, vc, "skip") is not None
 
     def test_allows_play_in_different_channel(self) -> None:
         member = MagicMock(spec=discord.Member)
@@ -112,7 +111,7 @@ class TestCheckVoicePermissions:
         member.voice.channel = MagicMock()
         vc = MagicMock(spec=discord.VoiceClient)
         vc.channel = MagicMock()  # different from member's channel — OK for play
-        assert _check_voice_permissions(member, vc, "play") is None
+        assert check_voice_permissions(member, vc, "play") is None
 
     def test_passes_valid_member_in_correct_channel(self) -> None:
         member = MagicMock(spec=discord.Member)
@@ -121,13 +120,146 @@ class TestCheckVoicePermissions:
         member.voice.channel = channel
         vc = MagicMock(spec=discord.VoiceClient)
         vc.channel = channel
-        assert _check_voice_permissions(member, vc, "skip") is None
+        assert check_voice_permissions(member, vc, "skip") is None
 
     def test_passes_when_no_voice_client(self) -> None:
         member = MagicMock(spec=discord.Member)
         member.voice = MagicMock()
         member.voice.channel = MagicMock()
-        assert _check_voice_permissions(member, None, "skip") is None
+        assert check_voice_permissions(member, None, "skip") is None
+
+    def test_rejects_an_interjecting_play_in_a_different_channel(self) -> None:
+        """-play's exemption is for QUEUEING into a session running elsewhere,
+        which costs its listeners nothing. An interjection STOPS what that channel
+        is hearing, so it is gated like every other command — otherwise a member
+        in channel B can cut the song for a room they are not in."""
+        member = MagicMock(spec=discord.Member)
+        member.voice = MagicMock()
+        member.voice.channel = MagicMock()
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()  # not the member's channel
+        assert (
+            check_voice_permissions(member, vc, "play", queue_control=True) is not None
+        )
+
+    def test_an_interjecting_play_in_the_same_channel_is_fine(self) -> None:
+        member = MagicMock(spec=discord.Member)
+        channel = MagicMock()
+        member.voice = MagicMock()
+        member.voice.channel = channel
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = channel
+        assert check_voice_permissions(member, vc, "play", queue_control=True) is None
+
+
+class TestPlayTakesTheQueue:
+    """What the voice gate reads to decide whether a -play is queue control. It is
+    a before_invoke hook, and Command.prepare() parses before call_before_hooks, so
+    the parsed argument is in ctx.kwargs by then."""
+
+    @staticmethod
+    def _ctx(url: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.kwargs = {"url": url}
+        return ctx
+
+    @staticmethod
+    def _vc(*, paused: bool, channel: Optional[MagicMock] = None) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_paused.return_value = paused
+        # Explicit: check_voice_permissions compares this against the author's,
+        # and an unset one on a spec'd mock raises rather than answering.
+        vc.channel = (
+            channel if channel is not None else MagicMock(spec=discord.VoiceChannel)
+        )
+        return vc
+
+    def test_no_voice_client_never_interjects(self) -> None:
+        assert play_takes_the_queue(self._ctx("--now song"), None) is False
+
+    def test_the_flag_says_so(self) -> None:
+        assert (
+            play_takes_the_queue(self._ctx("--now song"), self._vc(paused=False))
+            is True
+        )
+
+    def test_a_plain_play_appends(self) -> None:
+        assert play_takes_the_queue(self._ctx("song"), self._vc(paused=False)) is False
+
+    def test_the_next_flag_says_so_too(self) -> None:
+        """`--next` interrupts nothing but decides what the channel hears next, which
+        is queue control — what -skip, -shuffle, -remove and -clear are gated on.
+        -play's exemption exists because APPENDING costs other listeners nothing."""
+        assert (
+            play_takes_the_queue(self._ctx("--next song"), self._vc(paused=False))
+            is True
+        )
+
+    def test_a_paused_song_interjects_without_the_flag(self) -> None:
+        """-play on a paused song interrupts it to bring it back playing, so it
+        has always been an interjection — and has always carried -play's
+        exemption. Closing that is why this reads the pause state too."""
+        assert play_takes_the_queue(self._ctx("song"), self._vc(paused=True)) is True
+
+    def test_a_trailing_flag_is_not_the_flag(self) -> None:
+        """Same leading-token rule as everywhere else: the gate must agree with
+        the body about what counts, or one refuses what the other would append."""
+        assert (
+            play_takes_the_queue(self._ctx("song --now"), self._vc(paused=False))
+            is False
+        )
+
+    def test_a_command_with_no_url_argument_falls_out(self) -> None:
+        ctx = MagicMock()
+        ctx.kwargs = {}
+        assert play_takes_the_queue(ctx, self._vc(paused=False)) is False
+
+
+class TestValidateCommandsGatesQueueControl:
+    """The hook wires the two halves together. Both are tested apart above, and
+    both stay green if the hook stops passing the flag — so this is what proves a
+    cross-channel `-p --now` / `-p --next` is actually refused end to end."""
+
+    @staticmethod
+    def _ctx(url: str, *, same_channel: bool) -> MagicMock:
+        ctx = MagicMock()
+        ctx.kwargs = {"url": url}
+        ctx.command.name = "play"
+        channel = MagicMock()
+        ctx.author = MagicMock(spec=discord.Member)
+        ctx.author.voice = MagicMock()
+        ctx.author.voice.channel = channel
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = channel if same_channel else MagicMock()
+        vc.is_paused.return_value = False
+        ctx.voice_client = vc
+        ctx.send = AsyncMock()
+        return ctx
+
+    @pytest.mark.parametrize("flag", ["--now", "--next"])
+    async def test_a_cross_channel_queue_control_is_refused(
+        self, music_bot: MusicBot, flag: str
+    ) -> None:
+        ctx = self._ctx(f"{flag} song", same_channel=False)
+        with pytest.raises(commands.CommandError):
+            await music_bot.validate_commands(ctx)
+        assert "already being used" in described(ctx.send.call_args.kwargs["embed"])
+
+    async def test_a_cross_channel_plain_play_is_still_allowed(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The exemption survives for queueing, which is what it was for."""
+        ctx = self._ctx("song", same_channel=False)
+        await music_bot.validate_commands(ctx)
+        ctx.send.assert_not_awaited()
+
+    @pytest.mark.parametrize("flag", ["--now", "--next"])
+    async def test_a_same_channel_queue_control_is_allowed(
+        self, music_bot: MusicBot, flag: str
+    ) -> None:
+        ctx = self._ctx(f"{flag} song", same_channel=True)
+        await music_bot.validate_commands(ctx)
+        ctx.send.assert_not_awaited()
 
 
 # ── __init__, get_mp, cleanup, validate_commands, on_ready ──
@@ -434,6 +566,27 @@ class TestCleanup:
 
         assert missing == [], f"commands with no span: {missing}"
 
+    async def test_cleanup_retires_the_player_before_its_first_await(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Verdict ① of place() reads MusicPlayer.retired, and cleanup() is its only
+        producer. Without this call — or with it past the teardown gather — a -play
+        that resolved across a -stop places into a torn-down player and the entry
+        lands in the Redis mirror alone, for the next restore to resurrect."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.mark_retired = MagicMock(side_effect=lambda: order.append("retire"))
+
+        async def _cancel(task: Any) -> None:
+            order.append("await")
+
+        mock_guild.voice_client = None
+        with patch("src.musicbot.cancel_task", new=_cancel):
+            await music_bot.cleanup(mock_guild)
+
+        mp.mark_retired.assert_called_once()
+        assert order and order[0] == "retire", order
+
     async def test_the_claim_precedes_every_await_in_cleanup(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -539,6 +692,31 @@ class TestCleanup:
         assert call_order.index("cancel") < call_order.index("disconnect"), (
             "player task must be cancelled before voice disconnect"
         )
+
+    async def test_cleanup_claims_the_song_before_it_awaits_the_retire(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """claim_current_song_for_history is synchronous by design — it reads the
+        song and takes the _skip_history_for marker with no await between. Behind
+        retire_player's wait on the place lock, the loop can end this song, record
+        it and start the next one inside the window, and the claim then writes a
+        play_history row for a song that played a fraction of a second, with a
+        fresh played_at that ON CONFLICT will not dedup."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(
+            side_effect=lambda: order.append("claim")
+        )
+
+        async def _retire(guild_id: int, mp: Any) -> None:
+            order.append("retire")
+
+        music_bot._plays.retire_player = _retire
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert order == ["claim", "retire"]
 
 
 class TestCogBeforeInvoke:

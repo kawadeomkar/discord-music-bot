@@ -3148,3 +3148,57 @@ class TestDebugModeIsPerGuildAndDurable:
 
         assert 111 not in music_bot_with_redis.debug_settings._overrides
         assert (await GuildRedisStore(redis, 111).get_config()).debug_mode is None
+
+
+class TestTheConfigAllowlistFallbacksTrackTheDefaults:
+    """`-debug` renders the fallback when a variable is unset, so a hardcoded copy
+    that drifts from config.py reports a default the process is not running with."""
+
+    def test_every_fallback_matches_its_config_default(self) -> None:
+        from src import config
+        from src.debug import _CONFIG_ALLOWLIST, _ConfigKind
+
+        checked = 0
+        for var in _CONFIG_ALLOWLIST:
+            if var.kind is not _ConfigKind.VALUE:
+                continue
+            default = getattr(config, var.name, None)
+            if default is None or not isinstance(default, (int, float)):
+                # Only the numeric tunables: ENVIRONMENT's fallback is a label for
+                # "unset", not a copy of the value config.py resolved at import.
+                continue
+            checked += 1
+            assert var.fallback == str(default), var.name
+        assert checked >= 3, "the reflection found nothing to check"
+
+    def test_a_numeric_fallback_is_derived_and_not_a_literal(self) -> None:
+        """The equality above cannot fail while the literal happens to match today's
+        default — the defect is drift, which only a later edit to config.py exposes.
+        So the shape is asserted instead: these rows must READ the constant."""
+        import ast
+        import inspect
+
+        from src import config, debug
+
+        tree = ast.parse(inspect.getsource(debug))
+        literal_rows: list[str] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_ConfigVar"
+            ):
+                continue
+            kwargs = {k.arg: k.value for k in node.keywords}
+            name_node, fallback = kwargs.get("name"), kwargs.get("fallback")
+            if not isinstance(name_node, ast.Constant) or fallback is None:
+                continue
+            default = getattr(config, str(name_node.value), None)
+            if not isinstance(default, (int, float)) or isinstance(default, bool):
+                continue
+            if isinstance(fallback, ast.Constant):
+                literal_rows.append(str(name_node.value))
+
+        assert literal_rows == [], (
+            f"hardcoded fallbacks that must read config.py: {literal_rows}"
+        )

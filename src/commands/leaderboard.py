@@ -35,14 +35,8 @@ async def run(
     archive: Optional[ArchiveReader],
     redis: Optional[aioredis.Redis],
 ) -> None:
-    """The whole of `-leaderboard`, minus the error handling the cog keeps.
-
-    The cog resolves what discord.py owns — the flags, the archive, the Redis
-    handle — and hands them over; nothing here reaches back into MusicBot. Raising
-    is the contract: the caller's `except` renders the board's failure copy.
-    """
-    # A local: ctx.guild is a property, so narrowing it would not survive the
-    # awaits below.
+    """The whole of `-leaderboard`, minus the error handling the cog keeps."""
+    # A local: ctx.guild is a property, so its narrowing would not survive an await.
     guild = ctx.guild
     if guild is None:
         await ctx.send(

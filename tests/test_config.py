@@ -420,6 +420,38 @@ class TestFloatEnv:
             _float_env("KNOB", 1.0, minimum=0.05)
 
 
+class TestPlayBounds:
+    """The two -play knobs, and the floor that keeps them meaningful."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload: fixture teardown runs ahead of monkeypatch's
+        own, so a reload here would re-read the very value under test and raise
+        out of teardown."""
+        import importlib
+
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    def test_defaults(self) -> None:
+        assert config.PLAY_INFLIGHT_MAX == 16
+        assert config.PLAY_RESOLVE_CONCURRENCY == 2
+
+    @pytest.mark.parametrize("name", ["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"])
+    def test_zero_is_refused_at_import(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """Floored at 1, and loudly. Zero admits nothing: every -play in every
+        guild declined, or every resolve waiting on a semaphore that never opens,
+        with no error to say why."""
+        import importlib
+
+        monkeypatch.setenv(name, "0")
+        with pytest.raises(ValueError, match=name):
+            importlib.reload(config)
+
+
 class TestArchiveTunables:
     """The env -> constant path, which asserting the defaults alone cannot pin.
 

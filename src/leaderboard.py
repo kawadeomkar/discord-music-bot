@@ -1,22 +1,13 @@
 """`-leaderboard` — the board's tunables, its Redis result cache codec, and its
-renderer.
+renderer. Pure: takes a `Leaderboard` (from history_archive) and returns
+strings, dicts or an embed; the command body is commands/leaderboard.py.
 
-Two halves. The first is PURE: it takes a `Leaderboard` (from history_archive)
-and returns strings, dicts or an embed. The second is `run()`, the command body —
-it reads the cache, queries the archive and sends. Only the wrapper stays on the
-MusicBot cog in musicbot.py, because discord.py needs the command there and
-because the error-embed policy is the cog's.
-
-NOT in util.py, which is imported by the yt-dlp worker graph and must stay free
-of asyncpg — this module reads history_archive's row types, so it may not move
-there. See docs/ARCHITECTURE.md#history-archive-tier.
-
-Names are unqualified (`cache_key`, `build_embed`) because the module already
-says leaderboard; musicbot imports the module, not the names.
+Not in util.py, which the yt-dlp worker graph imports and which must stay free
+of asyncpg. See docs/ARCHITECTURE.md#history-archive-tier.
 """
 
 import re
-from typing import TYPE_CHECKING, Final, Optional
+from typing import Final, Optional
 from urllib.parse import urlsplit
 
 import discord
@@ -30,40 +21,35 @@ from src.sources import (
 )
 from src.util import fmt_duration, pluralize, truncate
 
-if TYPE_CHECKING:
-    pass
-
 TOP_N: Final[int] = 10
 MAX_DAYS: Final[int] = 3650
-# Bounds Postgres to one aggregate pass per guild per window per minute, whatever
-# the table size. TTL'd, so the key is a legitimate volatile-lru eviction
-# candidate — losing it costs one re-query.
+# Bounds Postgres to one aggregate pass per guild per window per minute. TTL'd,
+# so eviction costs one re-query.
 CACHE_TTL_SECS: Final[int] = 60
-# Bumped on any change to the cached shape. The codec defaults missing fields
-# rather than rejecting them, so without this a rolling deploy would decode an
-# old entry into a valid-looking board with wrong values.
+# Bumped on any change to the cached shape: the codec defaults missing fields,
+# so a rolling deploy would otherwise decode an old entry into a valid-looking
+# board with wrong values.
 _CACHE_VERSION: Final[int] = 2
-# Masked-link label budget. escape_markdown can double it, so 50 holds all twenty
-# lines under 3 KB — inside the 4096-char description limit, and inside the 6000
-# characters Discord counts across EVERY embed in the message, which this shares
-# with the ≤2-embed Now Playing block MusicContext.send prepends. The "· via
-# <source>" tail adds at most 20 characters to each of the ten song lines.
+# Masked-link label budget. escape_markdown can double it, so 50 holds all
+# twenty lines under 3 KB — inside the 6000 characters Discord counts across
+# EVERY embed in the message, shared with the Now Playing block
+# MusicContext.send prepends.
 _TITLE_MAX: Final[int] = 50
 # Past this the URL is dropped from the line rather than budgeted for.
 _URL_MAX: Final[int] = 150
 # The link's host, rendered beside the label.
 _HOST_MAX: Final[int] = 32
-# Display names for the query-source tokens sources.py mints for the services it
-# special-cases. Everything else is a bare host and renders as itself.
+# Display names for the query-source tokens sources.py mints for the services
+# it special-cases. Everything else is a bare host and renders as itself.
 _QUERY_SOURCE_LABELS: Final[dict[str, str]] = {
     QUERY_SOURCE_SEARCH: "search",
     QUERY_SOURCE_SPOTIFY: "Spotify",
     QUERY_SOURCE_YOUTUBE: "YouTube",
     QUERY_SOURCE_SOUNDCLOUD: "SoundCloud",
 }
-# Characters that end a masked link early: a newline splits the line and leaks
-# the rest of the markdown as its own text, and U+2028/9 do the same on some
-# clients. Flattened rather than dropped so words do not run together.
+# Characters that end a masked link early (a newline leaks the rest of the
+# markdown as its own text). Flattened rather than dropped so words do not
+# run together.
 _LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -102,13 +88,10 @@ def to_cache(board: Leaderboard) -> dict:
 
 def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
     """Rebuild a cached Leaderboard. None means MALFORMED, never "empty": an
-    empty board is a valid cached value and caching it is what stops an idle
+    empty board is a valid cached value, and caching it is what stops an idle
     guild re-querying Postgres on every invocation. Do not test truthiness.
-
-    Both boards are capped at `top_n` on the way in: the entry is decoded before
-    anything checks its size, so the cap is what stops an oversized value —
-    written by another build, or by anything else holding the key — from
-    rendering more rows than the command promises."""
+    Both boards are capped at `top_n` on the way in, so an oversized value
+    written by another build cannot render more rows than the command promises."""
     if not isinstance(raw, dict):
         return None
     try:
@@ -139,15 +122,10 @@ def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
 
 
 def _sanitize_label(text: str) -> str:
-    """Render-safe archive text — a song title or a requester's stored name.
-    Flatten the control characters that end a line early, cap, neutralize the
-    brackets that break a masked link (escape_markdown does not cover them),
-    then escape the rest so the text cannot bold or strike its line.
-
-    Cap BEFORE escaping: escaping first and cutting after can split an escape
-    pair and leave a trailing backslash that eats the next character. The cap
-    ellipsizes — two songs sharing a 50-character prefix would otherwise render
-    as the same line."""
+    """Render-safe archive text: flatten control characters, cap, neutralize
+    the brackets that break a masked link (escape_markdown does not cover
+    them), then escape the rest. Cap BEFORE escaping, or the cut can split an
+    escape pair and leave a trailing backslash that eats the next character."""
     flattened = _LABEL_UNSAFE.sub(" ", text)
     clipped = truncate(flattened, _TITLE_MAX)
     return discord.utils.escape_markdown(clipped.replace("[", "(").replace("]", ")"))
@@ -155,8 +133,8 @@ def _sanitize_label(text: str) -> str:
 
 def _link_host(url: str) -> str:
     """Host of a song's link, empty when it has none. Rendered beside the label
-    because both halves of a masked link come from the archive: without it a
-    played song's title can name a destination its URL does not go to."""
+    because both halves of a masked link come from the archive, so a title can
+    name a destination its URL does not go to."""
     try:
         host = urlsplit(url).hostname or ""
     except ValueError:
@@ -172,25 +150,16 @@ def _line_requester(
     who = f"<@{r.requester_id}>"
     if guild is not None and guild.get_member(r.requester_id) is None:
         who = _sanitize_label(r.requester_name) or "unknown"
-    # "listened" labels the ranking key. A bare clock reads as a track length,
-    # which is the other duration on the songs board two lines down.
+    # "listened" labels the ranking key; a bare clock reads as a track length.
     return (
         f"**{rank}.** {who} — {fmt_duration(r.played_secs)} listened · "
         f"{r.plays} {pluralize(r.plays, 'song')}"
     )
 
 
-def _source_label(token: str) -> str:
-    """Display name for a query-source token. Known services get their own
-    spelling; anything else is a host, which reads fine as itself (tiktok.com).
-    Empty stays empty — the caller drops the segment rather than printing
-    "unknown", which every pre-feature row would carry."""
-    return _QUERY_SOURCE_LABELS.get(token, token)
-
-
 def _line_song(rank: int, s: SongLeader) -> str:
-    # A blank title is a real archived value (the zero-value convention), and an
-    # empty masked-link label renders as an invisible link.
+    # A blank title is a real archived value, and an empty masked-link label
+    # renders as an invisible link.
     title = _sanitize_label(s.title) or "Unknown"
     url = s.webpage_url
     # A paren, whitespace or control character inside a masked-link URL ends the
@@ -206,17 +175,16 @@ def _line_song(rank: int, s: SongLeader) -> str:
         label = f"[{title}]({url})" + (f" `{host}`" if host else "")
     else:
         label = title
-    # Both clocks are labelled: the first is the ranking key (time this server
-    # spent on the song), the second the track's own length, and unlabelled they
-    # render as two interchangeable durations.
+    # Both clocks labelled: the ranking key, then the track's own length.
     line = (
         f"**{rank}.** {label} — {fmt_duration(s.played_secs)} listened · "
         f"{s.plays} {pluralize(s.plays, 'play')} · track {fmt_duration(s.duration_secs)}"
     )
-    # The host chip names where the LINK goes; this names how the song was
-    # ASKED for, which webpage_url cannot answer — a Spotify link and a
-    # plaintext search both resolve to youtube.com.
-    source = _sanitize_label(_source_label(s.query_source))
+    # How the song was ASKED for, which webpage_url cannot answer — a Spotify
+    # link and a plaintext search both resolve to youtube.com. Known services
+    # get their own spelling, any other token is a host and renders as itself,
+    # and empty drops the segment rather than printing "unknown".
+    source = _sanitize_label(_QUERY_SOURCE_LABELS.get(s.query_source, s.query_source))
     return f"{line} · via {source}" if source else line
 
 
@@ -224,9 +192,9 @@ def build_embed(
     board: Leaderboard, *, days: int = 0, guild: Optional[discord.Guild] = None
 ) -> Optional[discord.Embed]:
     """One embed, both boards in the DESCRIPTION: an embed field caps at 1024
-    characters and ten masked-link lines do not reliably fit, while the 4096-char
-    description does. Sections render independently; both empty -> None, and the
-    caller sends the nothing-archived notice."""
+    characters and ten masked-link lines do not reliably fit. Sections render
+    independently; both empty -> None, and the caller sends the
+    nothing-archived notice."""
     sections: list[str] = []
     if board.requesters:
         rows = [
@@ -239,10 +207,9 @@ def build_embed(
         sections.append("**Top songs**\n" + "\n".join(rows))
     if not sections:
         return None
-    # The period is always named, including all-time. FlagConverter silently
-    # defaults days=0 for every input it does not recognise — `--days=7`, a bare
-    # `--days`, a positional `7` — so an unnamed title would render a dropped
-    # window as an all-time board the requester reads as their window.
+    # The period is always named, including all-time: FlagConverter silently
+    # defaults days=0 for input it does not recognise (`--days=7`, a bare
+    # `--days`), so an unnamed title would render a dropped window as all-time.
     period = f"last {days} {pluralize(days, 'day')}" if days else "all time"
     embed = discord.Embed(
         title=f"🏆 Leaderboard — {period}",

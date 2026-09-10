@@ -4,9 +4,7 @@ import discord
 from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
-from src.util import (
-    notice_embed,
-)
+from src.util import notice_embed
 
 
 async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
@@ -20,20 +18,15 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
         and song is not None
     ):
         if ctx.channel.id != mp.home_channel.id:
-            # Outside the player's home channel: the host never leaves home, so
-            # answer HERE with a static snapshot (MusicContext's channel guard
-            # keeps it unattached).
+            # The host never leaves home; answer here with a static snapshot.
             await ctx.send(embed=mp.now_playing_snapshot(song))
             return
-        # Re-host the live block at the bottom (retiring the old host) rather than
-        # sending a snapshot that immediately goes stale.
+        # Re-host the live block at the bottom rather than send a stale snapshot.
         if await mp.repin_now_playing():
             return
-        # Song ended between the liveness check and the repin — fall through to the
-        # static/none responses instead of silence.
+        # Song ended between the check and the repin: fall through.
     if mp.play_message is not None:
-        # Crash-recovery window: current_song isn't live yet but a snapshot survived
-        # the restart. Static embed (no bar) until loop() starts.
+        # Crash-recovery window: a snapshot survived the restart, no bar yet.
         await ctx.send(embed=mp.play_message)
     else:
         await ctx.send(
