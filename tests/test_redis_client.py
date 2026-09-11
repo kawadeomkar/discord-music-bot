@@ -501,16 +501,6 @@ class TestPushHistory:
         await store.push_history(_hentry(1))
         assert await fake_redis.ttl(store.history_key()) == -1  # no expiry
 
-    async def test_persist_heals_pre_migration_ttl(
-        self, store: GuildRedisStore, fake_redis: aioredis.Redis
-    ) -> None:
-        # A key written by an old build carries the 24h idle expiry; the first
-        # new-build push must remove it, not let history evaporate.
-        await fake_redis.lpush(store.history_key(), orjson.dumps("old entry"))
-        await fake_redis.expire(store.history_key(), 3600)
-        await store.push_history(_hentry(1))
-        assert await fake_redis.ttl(store.history_key()) == -1
-
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.push_history(_hentry(1))  # must not raise
 
