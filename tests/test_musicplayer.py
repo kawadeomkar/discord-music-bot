@@ -4211,6 +4211,7 @@ class TestRestoreCompleteLoopGuard:
         music_player._restore_complete.clear()
         await music_player._restore_state()
         assert music_player._restore_complete.is_set()
+        assert music_player.restore_read_failed is False
 
     async def test_restore_state_sets_restore_complete_on_failure(
         self, music_player: MusicPlayer
@@ -4227,6 +4228,11 @@ class TestRestoreCompleteLoopGuard:
         assert music_player._restore_complete.is_set()
         # Restore aborted before touching the queue.
         assert music_player.queue.qsize() == 0
+        assert len(music_player.history) == 0
+        # The empty queue above means "unknown", not "nothing was left" — only
+        # this flag says which, and -play/-resume read it to decide whether they
+        # may report an empty queue to the guild.
+        assert music_player.restore_read_failed is True
 
     async def test_restore_state_sets_restore_complete_when_no_store(
         self,
@@ -4238,6 +4244,24 @@ class TestRestoreCompleteLoopGuard:
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
         await mp._restore_state()
         assert mp._restore_complete.is_set()
+        assert mp.restore_read_failed is True
+
+    async def test_restore_state_sets_restore_complete_when_the_read_raises(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The inner `except Exception` arm, which the None early-return above does
+        not reach: a partial restore leaves what landed standing, but the queue is
+        no longer known complete."""
+        music_player._restore_complete.clear()
+        music_player.bot.wait_until_ready = AsyncMock()
+        with patch.object(
+            music_player.store,
+            "get_playback_snapshot",
+            new=AsyncMock(side_effect=Exception("redis down")),
+        ):
+            await music_player._restore_state()
+        assert music_player._restore_complete.is_set()
+        assert music_player.restore_read_failed is True
 
     async def test_loop_waits_for_restore_before_dequeuing(
         self,
@@ -8431,44 +8455,6 @@ class TestLoop:
 
 
 # ── _restore_complete event ───────────────────────────────────────────────────
-
-
-class TestRestoreCompleteEvent:
-    async def test_set_after_successful_restore(
-        self, music_player: MusicPlayer
-    ) -> None:
-        music_player.bot.wait_until_ready = AsyncMock()
-        await music_player._restore_state()
-        assert music_player._restore_complete.is_set()
-
-    async def test_set_even_when_restore_raises(
-        self, music_player: MusicPlayer
-    ) -> None:
-        music_player.bot.wait_until_ready = AsyncMock()
-        with patch.object(
-            music_player.store,
-            "get_playback_snapshot",
-            new=AsyncMock(side_effect=Exception("redis down")),
-        ):
-            await music_player._restore_state()
-        assert music_player._restore_complete.is_set()
-
-    async def test_set_and_restore_aborted_when_state_read_fails(
-        self, music_player: MusicPlayer
-    ) -> None:
-        """get_playback_snapshot() returning None (Redis unavailable) aborts
-        the restore early — nothing is fabricated — but the loop guard event
-        is still set."""
-        music_player.bot.wait_until_ready = AsyncMock()
-        with patch.object(
-            music_player.store,
-            "get_playback_snapshot",
-            new=AsyncMock(return_value=None),
-        ):
-            await music_player._restore_state()
-        assert music_player._restore_complete.is_set()
-        assert music_player.queue.qsize() == 0
-        assert len(music_player.history) == 0
 
 
 # ── _build_now_playing_embed_from_data ────────────────────────────────────────
