@@ -205,15 +205,15 @@ async def _resolve_and_place(
     be followed by an await before the gate hold is released."""
     qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
     async with contextlib.AsyncExitStack() as stack:
+        # Entered before the gate hold so it unwinds AFTER it: retracting the
+        # notice awaits its poster, and an await between the teardown decision and
+        # the hold release is exactly what this path may not have.
+        await stack.enter_async_context(slow_resolve_notice(ctx))
         # The cold-start gate hold lives on its own stack, so the path that PLACES
         # can release it the moment the put lands rather than holding the first note
         # behind a confirmation embed. aclose() is idempotent — an already-unwound
         # stack unwinds nothing — so every other exit still releases through the
         # outer stack exactly as it did.
-        # Entered before the gate hold so it unwinds AFTER it: retracting the
-        # notice awaits its poster, and an await between the teardown decision and
-        # the hold release is exactly what this path may not have.
-        await stack.enter_async_context(slow_resolve_notice(ctx))
         hold = await stack.enter_async_context(contextlib.AsyncExitStack())
         # Not connected: this song goes ahead of any queue restored from Redis. A
         # running join counts as cold — discord.py registers the client BEFORE

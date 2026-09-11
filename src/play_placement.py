@@ -237,17 +237,10 @@ class ResolveWaitExpired(Exception):
 
 class ResolveSlot:
     """One guild's resolve bound, entered per extraction, with a deadline on the
-    WAIT alone.
-
-    The extraction inside is deliberately unbounded — the slot exists to queue
-    expensive work, and a bound covering it would cancel exactly the resolve it was
-    sized for. What is bounded is the stretch before it, which yields no output at
-    all and so cannot be told from a hung bot.
-
-    Stateless per entry, because one request's resolve can enter this more than
-    once: the count lives in the semaphore, and each `async with` owns only its own
-    acquire.
-    """
+    WAIT alone — the extraction inside is deliberately unbounded. Stateless per
+    entry, because one resolve can enter it more than once: the count lives in the
+    semaphore, and each `async with` owns only its own acquire.
+    See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait."""
 
     __slots__ = ("_sem",)
 
@@ -281,14 +274,9 @@ async def slow_resolve_notice(ctx: commands.Context) -> AsyncGenerator[None]:
     """Say that a request is still being looked up once it outlives
     PLAY_SLOW_NOTICE_SECS, and take the message back when it lands.
 
-    Covers the whole wait rather than the slot queue alone: a full pool and a slow
-    extraction are the same silence to the user. No position is quoted — requests
-    resolve concurrently, so there is no line to be Nth in.
-
-    ctx.channel.send, not ctx.send: MusicContext.send prepends the Now Playing
-    block and adopts the message as its host, so deleting this notice would drag
-    the live progress bar onto it. The same exception -ping and -debug take.
-    """
+    ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the Now
+    Playing host, so deleting it would drag the live progress bar onto it.
+    See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait."""
     posted: Optional[discord.Message] = None
     settled = asyncio.Event()
 

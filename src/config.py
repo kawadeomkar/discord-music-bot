@@ -134,10 +134,7 @@ PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=1)
 PLAY_RESOLVE_CONCURRENCY: int = _int_env("PLAY_RESOLVE_CONCURRENCY", 2, minimum=1)
 # Bound on the WAIT for one of those slots, never on the extraction holding it: a
 # 5,547-track playlist legitimately runs 99s, and cutting it off would fail the
-# request it is serving. The wait is the half that produces nothing, so an
-# unbounded one reads as a bot that stopped answering. Generous on purpose —
-# every second of it can be another guild member's legitimate resolve, and the
-# cost of expiring early is a refusal the user did not need to get.
+# request it is serving. See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait.
 PLAY_RESOLVE_WAIT_SECS: float = _float_env("PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=1.0)
 # How long a request resolves before it says so. Above the 1–4s a warm resolve
 # takes, so the notice marks the unusual rather than narrating every -play.

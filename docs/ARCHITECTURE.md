@@ -624,6 +624,30 @@ The slot is passed down as `pool_slot` — through `queue_source`, `yt_source` a
 
 ---
 
+### A resolve that has to wait
+
+`PLAY_RESOLVE_CONCURRENCY` decides how many of a guild's `-play`s may hold a worker; this is what happens to the ones that may not. `ResolveSlot` wraps that semaphore and puts a deadline on the **acquire alone** — `PLAY_RESOLVE_WAIT_SECS`, default 120s.
+
+**The extraction inside is deliberately unbounded.** The slot exists to queue expensive work: a 5,547-track playlist legitimately runs 99s, and a deadline covering the job would cancel exactly the resolve the bound was sized for. What is bounded is the stretch before it, which produces no output at all and so cannot be told apart from a bot that stopped answering.
+
+The default is generous on purpose. Every second of that wait can be another guild member's legitimate resolve finishing, and the cost of expiring early is a refusal the user did not need to get — so the deadline is sized to catch a pool that is genuinely wedged, not a pool that is merely busy.
+
+On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases nothing**: `__aexit__` does not run for an `__aenter__` that raised, so a release there would hand out a permit the guild never held and uncap the bound. The wrapper is stateless per entry for the same reason one request's resolve can enter it more than once — the count lives in the semaphore, and each `async with` owns only its own acquire.
+
+**The command renders it, not the resolve.** `-play`'s cold path already handles failures around `queue_source` by unwinding a join, and reporting a full pool as a failed join would name the wrong subsystem. The refusal is honest about what did not happen: the request queued for a slot and gave up before any extraction began, so nothing was searched and nothing was queued. Unlike a stalled place (`PlaceStalled`), "try again" here cannot duplicate a song.
+
+`pool_slot` is typed as `AbstractAsyncContextManager` rather than `asyncio.Semaphore` throughout `src/youtube.py`, so the slot can carry the deadline without that module learning anything about guilds. A resolve reached outside a command still passes `None`.
+
+#### Saying so while it waits
+
+`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands. It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
+
+No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
+
+It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits its poster, and an await between the teardown decision and the hold release is exactly what that path may not have.
+
+---
+
 ### The playlist cache
 
 `yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
