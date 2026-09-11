@@ -51,7 +51,14 @@ from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
 from src.util import cancel_task, current_traceparent, fmt_duration, trace_id_of
 from src.youtube import NpHostRef, QueueObject, YTDL
-from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
+from tests.helpers import (
+    described,
+    message_mock,
+    mocked,
+    queue_object,
+    seed_queue,
+    stub_create_task,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -2116,9 +2123,7 @@ class TestClaimCurrentSongForHistory:
         """cleanup() disposes of the host right after this; the id still records
         which message carried the block, which is what the column is for."""
         self._playing(music_player, mock_song)
-        host = AsyncMock(spec=discord.Message)
-        host.id = 777777777777777777
-        host.channel.id = 888888888888888888
+        host = message_mock(777777777777777777, 888888888888888888)
         music_player._np_host_message = host
 
         entry = music_player.claim_current_song_for_history()
@@ -5336,11 +5341,9 @@ class TestNpHostAdoptRetire:
     async def test_adopt_retires_old_dedicated_host_with_delete(
         self, music_player: MusicPlayer
     ) -> None:
-        old = AsyncMock(spec=discord.Message)
-        old.id = 1
+        old = message_mock(1)
         music_player._adopt_np_host(old, [], dedicated=True)
-        new = AsyncMock(spec=discord.Message)
-        new.id = 2
+        new = message_mock(2)
         music_player._adopt_np_host(new, [])
         await asyncio.gather(*list(music_player._background_tasks))
         old.delete.assert_awaited_once()
@@ -5349,12 +5352,10 @@ class TestNpHostAdoptRetire:
     async def test_adopt_strips_old_response_host_with_edit(
         self, music_player: MusicPlayer
     ) -> None:
-        old = AsyncMock(spec=discord.Message)
-        old.id = 1
+        old = message_mock(1)
         old_own = [discord.Embed(title="Queue")]
         music_player._adopt_np_host(old, old_own)
-        new = AsyncMock(spec=discord.Message)
-        new.id = 2
+        new = message_mock(2)
         music_player._adopt_np_host(new, [], dedicated=True)
         await asyncio.gather(*list(music_player._background_tasks))
         old.edit.assert_awaited_once_with(embeds=old_own)
@@ -5363,8 +5364,7 @@ class TestNpHostAdoptRetire:
     async def test_adopt_same_message_retires_nothing(
         self, music_player: MusicPlayer
     ) -> None:
-        msg = AsyncMock(spec=discord.Message)
-        msg.id = 1
+        msg = message_mock(1)
         music_player._adopt_np_host(msg, [])
         music_player._adopt_np_host(msg, [discord.Embed(title="p")])
         assert not music_player._background_tasks
@@ -5404,11 +5404,9 @@ class TestNpHostAdoptRetire:
         send-start order, adopts run in send-return order) — an older message
         adopting late would pull the block up from the true bottom. The adopt
         is ignored and the older message sheds the block it carries."""
-        newer = AsyncMock(spec=discord.Message)
-        newer.id = 2
+        newer = message_mock(2)
         music_player._adopt_np_host(newer, [])
-        older = AsyncMock(spec=discord.Message)
-        older.id = 1
+        older = message_mock(1)
         older_own = [discord.Embed(title="Queue")]
         music_player._adopt_np_host(older, older_own)
         await asyncio.gather(*list(music_player._background_tasks))
@@ -5485,8 +5483,7 @@ class TestAdoptNpHostIfCurrent:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        msg = AsyncMock(spec=discord.Message)
-        msg.id = 1
+        msg = message_mock(1)
         own = [discord.Embed(title="Queue")]
         assert music_player._adopt_np_host_if_current(msg, own, mock_song) is True
         assert music_player._np_host_message is msg
@@ -5530,8 +5527,7 @@ class TestAdoptNpHostIfCurrent:
         song A's late send returns — B's host must survive untouched."""
         song_b = MagicMock()
         music_player.current_song = song_b
-        host_b = AsyncMock(spec=discord.Message)
-        host_b.id = 2
+        host_b = message_mock(2)
         music_player._adopt_np_host(host_b, [], dedicated=True)
 
         late = AsyncMock(spec=discord.Message)
@@ -5641,8 +5637,7 @@ class TestRepinNowPlaying:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        old = AsyncMock(spec=discord.Message)
-        old.id = 1
+        old = message_mock(1)
         music_player._adopt_np_host(old, [], dedicated=True)
         sent = MagicMock(spec=discord.Message)
         sent.id = 2
@@ -5693,8 +5688,7 @@ class TestRetireNpHostOnStop:
     as history, a bar frozen mid-song on a stopped player is misleading."""
 
     async def test_deletes_dedicated_host(self, music_player: MusicPlayer) -> None:
-        host = AsyncMock(spec=discord.Message)
-        host.id = 1
+        host = message_mock(1)
         music_player._adopt_np_host(host, [], dedicated=True)
         await music_player.retire_np_host_on_stop()
         host.delete.assert_awaited_once()
@@ -5703,8 +5697,7 @@ class TestRetireNpHostOnStop:
     async def test_strips_response_host_to_own_embeds(
         self, music_player: MusicPlayer
     ) -> None:
-        host = AsyncMock(spec=discord.Message)
-        host.id = 1
+        host = message_mock(1)
         own = [discord.Embed(title="Queue")]
         music_player._adopt_np_host(host, own)
         await music_player.retire_np_host_on_stop()
@@ -5727,8 +5720,7 @@ class TestRehostNpAfterResume:
     ) -> None:
         music_player.current_song = mock_song
         pause_embed = discord.Embed(title="⏸️ Paused: x")
-        old = AsyncMock(spec=discord.Message)
-        old.id = 1
+        old = message_mock(1)
         music_player._adopt_np_host(old, [pause_embed])
         sent = MagicMock(spec=discord.Message)
         sent.id = 2
@@ -5746,8 +5738,7 @@ class TestRehostNpAfterResume:
     ) -> None:
         """A dedicated NP message has no stale state to shed — no extra send."""
         music_player.current_song = mock_song
-        host = AsyncMock(spec=discord.Message)
-        host.id = 1
+        host = message_mock(1)
         music_player._adopt_np_host(host, [], dedicated=True)
         await music_player.rehost_np_after_resume()
         mocked(music_player._channel.send).assert_not_awaited()
@@ -7346,14 +7337,10 @@ class TestLoop:
         # Decoy: the host left over from the PREVIOUS song, in another channel.
         # Stamping this is the off-by-one-song failure, so neither of its ids may
         # land in history.
-        stale_host = AsyncMock(spec=discord.Message)
-        stale_host.id = 555555555555555555
-        stale_host.channel.id = 111111111111111111
+        stale_host = message_mock(555555555555555555, 111111111111111111)
         music_player._np_host_message = stale_host
 
-        this_songs_host = AsyncMock(spec=discord.Message)
-        this_songs_host.id = 777777777777777777
-        this_songs_host.channel.id = 888888888888888888
+        this_songs_host = message_mock(777777777777777777, 888888888888888888)
 
         async def adopt_this_songs_host(_song: object) -> None:
             music_player._np_host_message = this_songs_host
@@ -10948,9 +10935,7 @@ class TestHistorySkipMarker:
     ) -> None:
         """The late-bound half of the NP-card cleanup: the tail learns which
         message froze this fragment's bar, at the one moment that is settled."""
-        host = AsyncMock(spec=discord.Message)
-        host.id = 777777777777777777
-        host.channel.id = 888888888888888888
+        host = message_mock(777777777777777777, 888888888888888888)
         music_player._np_host_message = host
         music_player._np_host_own_embeds = []
         music_player._np_host_dedicated = True
@@ -10976,9 +10961,7 @@ class TestHistorySkipMarker:
         """Identity mismatch — the marker names a song that ended during
         interject()'s awaits. Stamping anyway would point this tail at an unrelated
         song's card and delete it."""
-        host = AsyncMock(spec=discord.Message)
-        host.id = 777777777777777777
-        host.channel.id = 888888888888888888
+        host = message_mock(777777777777777777, 888888888888888888)
         music_player._np_host_message = host
         music_player._np_host_dedicated = True
 
@@ -11925,8 +11908,7 @@ class TestNowPlayingEditDiffing:
 
     @staticmethod
     def _host() -> AsyncMock:
-        message = AsyncMock(spec=discord.Message)
-        message.id = 999
+        message = message_mock(999)
         return message
 
     async def test_identical_rerender_is_not_pushed(

@@ -295,3 +295,15 @@ async def outbox_entries(redis: Any) -> list[tuple[bytes, dict[bytes, bytes]]]:
         list[tuple[bytes, dict[bytes, bytes]]],
         await redis.xrange(HISTORY_OUTBOX_KEY),
     )
+
+
+def message_mock(message_id: int = 1, channel_id: Optional[int] = None) -> MagicMock:
+    """A discord.Message double whose edit/delete are awaitable.
+
+    `id` is set explicitly because _adopt_np_host compares it — an auto-vivified
+    one compares as a Mock and the newer-host check silently stops working."""
+    message = AsyncMock(spec=discord.Message)
+    message.id = message_id
+    if channel_id is not None:
+        message.channel.id = channel_id
+    return message
