@@ -941,18 +941,6 @@ class TestDefaultPasswordWarningReachesTheWire:
             "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
         )
 
-    async def test_the_skeleton_send_leads_with_the_warning(
-        self, music_bot: MusicBot, mock_ctx: MagicMock, on_default: None
-    ) -> None:
-        _ping_message(mock_ctx)
-        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
-            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
-        assert len(embeds) == 2
-        # First, above the health card — an advisory below the fold is one the
-        # operator scrolls past.
-        assert "Default database password" in (embeds[0].title or "")
-
     async def test_a_real_password_sends_only_the_health_card(
         self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1061,6 +1049,8 @@ class TestTheAdvisoryIsForTheOperator:
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
         embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
         assert len(embeds) == 2
+        # embeds[0], not "somewhere in embeds": an advisory below the fold is one
+        # the operator scrolls past.
         assert "Default database password" in (embeds[0].title or "")
 
     async def test_everyone_else_gets_the_health_card_alone(

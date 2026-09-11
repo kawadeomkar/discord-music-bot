@@ -515,26 +515,6 @@ class TestNoTaskIsEverLeaked:
             assert task.cancelled()
 
 
-async def _run_and_get_message(
-    ctx: MagicMock,
-    probe: Any,
-    *,
-    render: Any,
-    tick_secs: float = 0.01,
-    deadline_secs: float = 1.0,
-) -> MagicMock:
-    await run_live_dashboard(
-        ctx,
-        probes={"p": probe},
-        settle=lambda k, v: None,
-        abandon=lambda k: None,
-        render=render,
-        tick_secs=tick_secs,
-        deadline_secs=deadline_secs,
-    )
-    return ctx.channel.send.return_value
-
-
 class TestNothingToWaitFor:
     async def test_no_probes_sends_once_and_never_edits(
         self, dash_ctx: MagicMock

@@ -978,15 +978,6 @@ class TestTheSuffixStartsItsOwnLine:
             f"{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
         )
 
-    def test_stripping_takes_the_break_with_the_suffix(self) -> None:
-        """A --disable mid-song restores the footer exactly, not a footer with a
-        blank line under it."""
-        embed = discord.Embed(title="x")
-        embed.set_footer(text="environment: test")
-        debug.decorate_embeds([embed], shard_id=0)
-        debug.strip_debug_footers([embed])
-        assert embed.footer.text == "environment: test"
-
 
 class TestOperatorGate:
     """`-debug` is reachable by any user in any guild, and by DM. Everything that

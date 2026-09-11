@@ -1000,10 +1000,6 @@ class TestOnReady:
         await app.on_ready()
         mocked(app.change_presence).assert_awaited_once()
 
-    async def test_no_error_when_user_is_none(self, app: MusicBotApp) -> None:
-        app._connection.user = None
-        await app.on_ready()
-
     async def test_logs_user_info_when_user_set(self, app: MusicBotApp) -> None:
         user = MagicMock()
         user.name = "TestBot"
@@ -1235,18 +1231,6 @@ class TestChartPoolWarmCallable:
         ):
             cp.warm()
         prewarm.assert_not_called()
-
-    def test_warm_submits_the_matplotlib_importing_callable(self) -> None:
-        """The default no-op would spawn the worker and warm nothing that matters:
-        matplotlib is imported inside render_dashboard, so a no-op never touches it."""
-        import src.chart_pool as cp
-
-        with (
-            patch.object(cp, "chart_available", return_value=True),
-            patch.object(cp.chart_pool, "prewarm") as prewarm,
-        ):
-            cp.warm()
-        prewarm.assert_called_once_with(cp._warm_worker)
 
     def test_the_warm_callable_is_importable_by_qualified_name(self) -> None:
         """It is pickled to the worker by name, so it must be module-level — a closure

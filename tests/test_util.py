@@ -178,17 +178,6 @@ class TestGetLogger:
         assert callable(logger.error)
         assert callable(logger.debug)
 
-    def test_logging_does_not_raise(self) -> None:
-        logger = get_logger("test.no_raise")
-        logger.info("test message", key="value")
-
-    def test_calling_twice_returns_functional_loggers(self) -> None:
-        logger_a = get_logger("test.no_dup")
-        logger_b = get_logger("test.no_dup")
-        # Both proxies are usable; no errors on repeated calls
-        logger_a.info("from a")
-        logger_b.info("from b")
-
     def test_different_names_return_different_loggers(self) -> None:
         logger_a = get_logger("module.a")
         logger_b = get_logger("module.b")

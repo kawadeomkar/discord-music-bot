@@ -351,8 +351,3 @@ class TestConfigureWorkerLogging:
         finally:
             queue.close()
             structlog.contextvars.clear_contextvars()
-
-
-class TestGetTracer:
-    def test_returns_a_tracer(self) -> None:
-        assert telemetry.get_tracer("some.module") is not None

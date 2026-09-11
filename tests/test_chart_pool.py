@@ -31,6 +31,9 @@ class TestWarmCallable:
         assert isinstance(render.call_args.args[0], AnalyticsMetrics)
 
     def test_warm_submits_that_callable_to_the_pool(self) -> None:
+        """_warm_worker and not prewarm's default no-op: a no-op spawns the worker
+        and warms nothing that matters, since matplotlib is imported inside
+        render_dashboard rather than at module scope."""
         pool = MagicMock(spec=YtdlpPool)
         with patch.object(chart_pool, "chart_pool", pool):
             chart_pool.warm()
