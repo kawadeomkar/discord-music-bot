@@ -271,6 +271,35 @@ class TestBackfill:
         assert report.guilds == 0
         assert not report.ok
 
+    async def test_a_key_that_vanishes_after_the_count_is_flagged(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The COUNT leg alone, which every other shrink case leaves untested. A
+        tail-side trim moves the oldest entry's bytes, so both clauses of `shrank`
+        fire together and neither test can say which one did — deleting
+        `attempted + corrupt < total` used to leave this whole file green. The one
+        shape that isolates it is the key disappearing between the LLEN and the
+        LINDEX (on_guild_remove, or an operator DEL): `tail_before` is then None,
+        which is exactly what the identity clause guards itself off for, while the
+        walk reads none of the entries LLEN counted."""
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
+        real_llen = fake_redis.llen
+
+        async def llen_then_vanish(name: str) -> int:
+            total = await real_llen(name)
+            await fake_redis.delete(key)
+            return total
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(fake_redis, "llen", llen_then_vanish)
+            report = await backfill(fake_redis, CollectingArchive(), page=2)
+
+        assert "trimmed from the tail" in caplog.text
+        assert report.short_guilds == 1
+        assert report.guilds == 0
+        assert not report.ok
+
     async def test_a_trim_that_keeps_the_length_is_still_caught(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
