@@ -308,12 +308,11 @@ startup, paid on every invocation, and it dominates the short recipes (a bare
 | `just fmt-check` | `ruff format --check`, no rewrites | ~0.05s |
 | `just lint` | `ruff check`, no rewrites | ~0.05s |
 | `just types` | pyright over `src/` **and** `tests/` | ~19s |
-| `just test` | pytest with coverage | ~95s |
-| `just test-fast` | pytest across 8 workers, no coverage — inner loop only | ~⅓ of `test` |
-| `just test-report` | `test`, plus the coverage/JUnit artifacts CI's PR comment consumes | ~95s |
-| `just check` | `fmt-justfile` + `pins` + `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~100s |
-| `just container-test` | Build the test image and run the suite inside it | ~3min |
-| `just ci` | `check` + `container-test` + `test-pg` + `test-redis` — full local mirror of CI | ~6min |
+| `just test` | pytest across all cores, with coverage | ~35s |
+| `just test-report` | `test`, plus the coverage/JUnit artifacts CI's PR comment consumes | ~35s |
+| `just check` | `fmt-justfile` + `pins` + `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~38s |
+| `just container-test` | Build the test image and run the suite inside it | ~2min |
+| `just ci` | `check` + `container-test` + `test-pg` + `test-redis` — full local mirror of CI | ~4min |
 
 `just check` is a dependency list, not a script: `fmt-justfile`, `pins`, `fmt-check`
 and `lint` run in order and stop at the first failure (~1.3s combined), then
@@ -324,26 +323,35 @@ the longer of the two rather than their sum.
 `just container-test`'s number is for a warm image; the first run after a dependency
 change also rebuilds it, roughly doubling that.
 
-`just test` forwards extra arguments to pytest:
+**`just test` behaves differently with and without arguments**, and the split is
+deliberate:
 
 ```bash
-just test tests/test_youtube.py    # one file
-just test -k spotify               # one pattern
+just test                          # whole suite: parallel (-n auto), coverage gated
+just test tests/test_youtube.py    # one file:    serial, no coverage
+just test -k spotify               # one pattern: serial, no coverage
 just test --maxfail=1              # stop at the first failure
 ```
 
-`just test-fast` runs the whole suite across 8 worker processes with coverage off.
-Use it while iterating; use `just test` (or `just check`) before pushing, since
-`test-fast` trades the 80% coverage gate for wall-clock. Two caveats worth knowing:
+No arguments is the whole suite, so it runs across all cores under `-n auto` and
+enforces the 80% coverage floor. **That is the only way the whole suite runs**, which
+is the point: `just check`, the pre-push hook and CI all go through it, so a test that
+is not safe to run in parallel fails the gate rather than quietly breaking a separate
+"fast" command nobody runs before pushing.
 
-- **It is for the whole suite.** Worker startup is a flat ~4s, so on a narrow
-  selection it is *slower* — `just test tests/test_util.py` beats
-  `just test-fast -k test_util` comfortably.
-- **Coverage is not what makes parallel fast.** `-n 8` with coverage still halves
-  the serial time; dropping coverage saves a further ~15s (at the cost of the
-  gate). If you want both, `COVERAGE_GATE=1 just test -n 8` — a bare
-  `just test -n 8` is an argument, so `test` reads it as a subset run and drops
-  coverage. Prefer `-n 8` over `-n auto`, which is slower on a 12-core machine.
+Any argument is a subset, which runs **serially** with coverage off. That matters for
+more than the flat ~4s of worker startup a narrow selection cannot amortize: every flag
+xdist is known to break is itself an argument, so it lands on the serial path and simply
+works. `-s` is *silently swallowed* under `-n` (worker stdout is not forwarded), `--pdb`
+disables distribution, `--lf`/`--ff` re-run everything, and `--sw`/`--maxfail` stop late.
+All of them behave normally here.
+
+To run the whole suite serially — reproducing a failure that only appears in parallel —
+use `just test tests/`. It is an argument, so it takes the serial path.
+
+The worker count is a plateau rather than a tuned number: below your physical core
+count costs about 20%, and above it costs nothing measurable. `-n auto` is xdist's own
+count, so there is nothing to configure.
 
 **Build**
 

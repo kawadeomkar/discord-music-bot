@@ -217,19 +217,27 @@ just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
 just pins           # assert the eight duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
-just test           # full suite, coverage gated (fail_under=80)  ~27s
+just test           # full suite, PARALLEL (-n auto), coverage gated (fail_under=80) ~35s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
-just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~35s
+just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~38s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
 just container-test # build test image, run suite inside it       ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
-# Test selection (args forward to pytest). ANY argument means a subset run, so
-# coverage is skipped — fail_under is a PROJECT floor and one file measures ~26%,
-# which used to fail a green run with exit 1. The gate rides the no-args form — what
-# `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
+# Test selection (args forward to pytest). ANY argument means a subset run, so it runs
+# SERIALLY and coverage is skipped — fail_under is a PROJECT floor and one file measures
+# ~26%, which used to fail a green run with exit 1. The gate rides the no-args form —
+# what `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
 # reporting flags rather than a selection, keeps it with COVERAGE_GATE=1.
+#
+# The no-args form is also the ONLY parallel one (`-n auto`), and that is deliberate:
+# the gate is the only way the whole suite runs, so a test that is not parallel-safe
+# fails the pre-push hook and CI instead of rotting a separate "fast" recipe. A subset
+# stays serial because worker startup (~4s flat) cannot amortize over a narrow
+# selection, and because execnet does not forward worker stdout — `-s` is silently
+# swallowed under `-n` and `--pdb` disables it. `just test tests/` is the escape hatch:
+# the whole suite, serially, to reproduce a parallel-only failure.
 just test tests/test_youtube.py
 just test -k spotify
 just test --maxfail=1
