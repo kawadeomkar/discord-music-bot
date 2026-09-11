@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from opentelemetry import trace as trace_api
+from src import util
 
 from src.util import (
     FOOTER_LIMIT,
@@ -385,29 +386,49 @@ class TestBackgroundTyping:
         self, mock_ctx: MagicMock
     ) -> None:
         exited = asyncio.Event()
+        # return_value=None, not a bare AsyncMock: __aexit__ returning a truthy
+        # value SUPPRESSES the CancelledError this test says unwinds the CM, so
+        # the keepalive would finish normally and the claim below go untested.
         mock_ctx.typing.return_value.__aexit__ = AsyncMock(
-            side_effect=lambda *a: exited.set()
+            return_value=None, side_effect=lambda *a: exited.set()
         )
         entered = asyncio.Event()
         mock_ctx.typing.return_value.__aenter__ = AsyncMock(
-            side_effect=lambda: entered.set()
+            return_value=None, side_effect=lambda: entered.set()
         )
 
         async with background_typing(mock_ctx):
             await asyncio.wait_for(entered.wait(), timeout=1)
+            task = util._TYPING_TASKS[mock_ctx.channel.id]
         # Cancellation unwinds through the async with → indicator dropped promptly.
         await asyncio.wait_for(exited.wait(), timeout=1)
         mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
+        # Bounded: with the CM's task.cancel() gone the keepalive sits on its
+        # 3600s sleep, and an unbounded await would hang the run instead of
+        # failing it.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert task.cancelled(), (
+            "keepalive completed normally instead of ending cancelled — "
+            "__aexit__ swallowed the CancelledError"
+        )
 
     async def test_typing_failure_never_surfaces_into_command_body(
         self, mock_ctx: MagicMock
     ) -> None:
+        """The body is protected by the task boundary, so "nothing propagates" is
+        true with or without the handler. What the handler buys is a task that ends
+        CLEAN: an unretrieved RuntimeError there reaches the loop's exception
+        handler and prints a traceback nobody can act on."""
         mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
 
         async with background_typing(mock_ctx):
+            task = util._TYPING_TASKS[mock_ctx.channel.id]
             await asyncio.sleep(0)  # let the keepalive task hit the failure
             await asyncio.sleep(0)
-        # No exception propagates; the command body is unaffected.
+
+        assert task.done() and not task.cancelled()
+        assert task.exception() is None
 
     async def test_body_exception_still_cancels_keepalive(
         self, mock_ctx: MagicMock
