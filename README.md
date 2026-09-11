@@ -58,6 +58,8 @@ details, aliases, and examples.
 | Command | Aliases | Description |
 |---|---|---|
 | `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything |
+| `-playnow <url\|search>` | `pn` | The same request as `-play --now`, kept as its own command |
+| `-playnext <url\|search>` | `pnx` | The same request as `-play --next`, kept as its own command |
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
@@ -70,12 +72,12 @@ details, aliases, and examples.
 |---|---|---|
 | `-queue` | `q` | List the songs waiting to play (up to 10) |
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
-| `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
+| `-history [--limit N]` | `h` | Show recently played songs, most recent first. `--limit` is 1–50 (default 10); 50 is also the whole retained record, and it persists across restarts |
 | `-leaderboard [--days N]` | `lb`, `top` | Top 10 listeners and top 10 songs by listening time, each song labelled with how it was asked for (Spotify, search, a pasted host) — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-analytics [--days N]` | `an` | A six-panel chart of this server's listening — plays per day by source, when it listens, listening time, how much of each song gets played, song lengths and queue wait — plus top listeners, artists and songs. `--days` is one of 7, 30, 90, 365; the window covers COMPLETE UTC days, so today is not included — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
-| `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
+| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one playlist link takes back out every track it queued |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
 
 ### Utility
@@ -269,7 +271,7 @@ Multi-step pipelines live in the shell scripts (`./build_docker.sh`,
 virtualenv. No Python, Poetry or Node is required on the host:
 
 ```bash
-DOCKER=1 just check    # the full gate, container-only  (~31s)
+DOCKER=1 just check    # the full gate, container-only
 DOCKER=1 just fmt      # ruff rewrites your files, not the image's
 ```
 
@@ -282,14 +284,16 @@ by you rather than by root. The image is built automatically the first time; aft
 changing `pyproject.toml` or `poetry.lock`, run `just test-image-rebuild` so the
 container picks up the new dependencies.
 
-The native path is the default because it is faster (~24s vs ~31s, and ~0.05s vs
-~0.6s for a bare `just lint` — the difference is container startup).
+The native path is the default because it is faster: the difference is container
+startup, paid on every invocation, and it dominates the short recipes (a bare
+`just lint` is ~0.05s native against ~0.6s containerized).
 
 **Setup**
 
 | Recipe | Does |
 |---|---|
 | `just install` | Create the venv with main + test + lint + dev dependencies |
+| `just setup` | Create or refresh `.env` with a generated Postgres password (wraps `./setup_env.sh`) |
 | `just services` | Start the backing services `just run` needs — Postgres included only when the archive is enabled |
 | `just hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
 | `just hooks-run` | Run every hook against every file, not just staged ones |
@@ -303,19 +307,51 @@ The native path is the default because it is faster (~24s vs ~31s, and ~0.05s vs
 | `just fmt` | Format and auto-fix `src/` and `tests/` — **rewrites files** | ~0.1s |
 | `just fmt-check` | `ruff format --check`, no rewrites | ~0.05s |
 | `just lint` | `ruff check`, no rewrites | ~0.05s |
-| `just types` | pyright over `src/` **and** `tests/` | ~6s |
-| `just test` | pytest with coverage | ~13s |
-| `just check` | `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~24s |
-| `just container-test` | Build the test image and run the suite inside it | ~1min |
-| `just ci` | `check` + `container-test` + `test-pg` + `test-redis` — full local mirror of CI | ~2min |
+| `just types` | pyright over `src/` **and** `tests/` | ~19s |
+| `just test` | pytest across all cores, with coverage | ~35s |
+| `just test-report` | `test`, plus the coverage/JUnit artifacts CI's PR comment consumes | ~35s |
+| `just check` | `fmt-justfile` + `pins` + `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~38s |
+| `just container-test` | Build the test image and run the suite inside it | ~2min |
+| `just ci` | `check` + `container-test` + `test-pg` + `test-redis` — full local mirror of CI | ~4min |
 
-`just test` forwards extra arguments to pytest:
+`just check` is a dependency list, not a script: `fmt-justfile`, `pins`, `fmt-check`
+and `lint` run in order and stop at the first failure (~1.3s combined), then
+`check-heavy` runs `types` and `test` **concurrently** and reports both outcomes — so a
+pyright failure no longer hides what pytest would have said, and the total is roughly
+the longer of the two rather than their sum.
+
+`just container-test`'s number is for a warm image; the first run after a dependency
+change also rebuilds it, roughly doubling that.
+
+**`just test` behaves differently with and without arguments**, and the split is
+deliberate:
 
 ```bash
-just test tests/test_youtube.py    # one file
-just test -k spotify               # one pattern
+just test                          # whole suite: parallel (-n auto), coverage gated
+just test tests/test_youtube.py    # one file:    serial, no coverage
+just test -k spotify               # one pattern: serial, no coverage
 just test --maxfail=1              # stop at the first failure
 ```
+
+No arguments is the whole suite, so it runs across all cores under `-n auto` and
+enforces the 80% coverage floor. **That is the only way the whole suite runs**, which
+is the point: `just check`, the pre-push hook and CI all go through it, so a test that
+is not safe to run in parallel fails the gate rather than quietly breaking a separate
+"fast" command nobody runs before pushing.
+
+Any argument is a subset, which runs **serially** with coverage off. That matters for
+more than the flat ~4s of worker startup a narrow selection cannot amortize: every flag
+xdist is known to break is itself an argument, so it lands on the serial path and simply
+works. `-s` is *silently swallowed* under `-n` (worker stdout is not forwarded), `--pdb`
+disables distribution, `--lf`/`--ff` re-run everything, and `--sw`/`--maxfail` stop late.
+All of them behave normally here.
+
+To run the whole suite serially — reproducing a failure that only appears in parallel —
+use `just test tests/`. It is an argument, so it takes the serial path.
+
+The worker count is a plateau rather than a tuned number: below your physical core
+count costs about 20%, and above it costs nothing measurable. `-n auto` is xdist's own
+count, so there is nothing to configure.
 
 **Build**
 
@@ -337,6 +373,7 @@ run `just check`.
 | `just db-rejects [count]` | List play_history rows Postgres refused (expected: nothing) |
 | `just db-backup` | Dump the play-history database to `backups/` |
 | `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
+| `just outbox [idle_ms]` | Outbox health: depth, in flight, stranded entries, and lost plays |
 
 These resolve `POSTGRES_URL` from the environment first, then `.env`, and finally by
 building a host DSN from `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/
@@ -471,7 +508,10 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
 | `PLAY_INFLIGHT_MAX` | | `16` | Per-server ceiling on `-play` requests admitted at once; past it a request is declined. One admitted request is one coroutine, one open span and one typing keepalive, so this bounds memory — pool time is `PLAY_RESOLVE_CONCURRENCY` below. Floored at 1 |
-| `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
+| `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused, for as long as `PLAY_RESOLVE_WAIT_SECS` allows. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
+| `PLAY_RESOLVE_WAIT_SECS` | | `120.0` | How long a request waits for one of those slots before giving up. Bounds the WAIT alone, never the lookup holding the slot — a 5,547-track playlist legitimately runs 99s, and cutting that off would fail the request it is serving. Waiting is the half that produces nothing, so leaving it unbounded is what makes a busy bot look like a stopped one. A request that expires is declined having looked up and queued nothing, so trying again cannot double-queue the song. Floored at 1.0 |
+| `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a `-play` takes before the bot says it is still looking the song up. The message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5 |
+| `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
@@ -482,11 +522,13 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `DEBUG_TICK_SECS` | | `1.0` | `-debug` snapshot: a ceiling on how long the card can be stale, not a polling interval — the loop wakes as soon as a block is ready |
 | `DEBUG_DEADLINE_SECS` | | `8.0` | `-debug` snapshot: how long a block may collect before it renders `timed out`. Longer than `-ping`'s because each block does strictly more work (a Postgres stats query, a Prometheus round trip) and a straggler is not retried |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | | `20.0` | `-analytics`: how long to wait for the chart before sending the card without one. Sized for the COLD path, which dominates. Expiry is **silent** — the card still sends, just without its chart — so raise this rather than lower it if charts go missing |
+| `LIVENESS_FILE` | | — (`/tmp/bot-alive` in the image) | Path a loop-resident task touches every `LIVENESS_INTERVAL_SECS`, read by the container `HEALTHCHECK`. A stale mtime (>90s) means the event loop wedged while the process stayed up — something `restart: always` cannot see, because it only observes the process exiting. It **reports**; Compose takes no action on an unhealthy container. Not a dependency probe: a Redis blip must not mark the bot dead. Unset outside Docker, where the task never starts |
+| `LIVENESS_INTERVAL_SECS` | | `15.0` | How often that file is touched. Must stay well under the healthcheck's 90s staleness window |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
-## Upgrading to 2.31.0
+## Upgrading to 2.35.1
 
 **`-play <search>` answers in about half a second instead of two and a half.** A search —
 typed words, or a Spotify track link, which resolves to one — is now answered from the
@@ -499,37 +541,33 @@ after it. Pasted links, `-play --now`, playlists, and a `-play` that finds the b
 disconnected are unchanged — the last of those still resolves in full, because its song
 plays immediately and a failure there would leave the bot sitting in an empty channel.
 
-A search no longer selects a format at enqueue, so a video that cannot actually be
-played — age-gated, region-blocked, members-only — now queues successfully and fails
-when its turn comes, with a red "Failed to load the next song, skipping." card, instead
-of failing the `-play` outright. The queue carries on to the next song.
+**One behaviour genuinely changes.** A search no longer selects a format at enqueue, so
+a video that cannot actually be played — private, geo-blocked, age-gated, members-only,
+or with no usable audio — is no longer caught by the command. It queues successfully and
+fails when its turn comes, with a red "Failed to load the next song, skipping." card and
+a gap in playback, the way playlist tracks always have; the queue carries on to the next
+song. A bad *link* still fails the command with nothing queued.
 
 **Several `-play`s sent at an idle bot play in reverse order.** Each one finds no voice
 client, so each takes the front of the queue: paste three and they play third, second,
 first. Send them one at a time, or use `-play --next` once the first is playing.
 
-**One behaviour genuinely changes.** Because a search no longer selects a format at
-enqueue time, a video that cannot be played — private, geo-blocked, age-gated, or with no
-usable audio — is no longer caught by the command. It queues successfully and fails at its
-turn, as a notice in the channel and a gap in playback, the way playlist tracks always
-have. A bad *link* still fails the command with nothing queued.
-
 Nothing to configure, no data touched, and no migration: rolling back is only a redeploy.
 
-## Upgrading to 2.31.x
+## Upgrading to 2.35.0
 
-**`-playnow` and its `pn` alias are gone.** They are replaced by a flag on `-play`:
+**`-play` takes a `--now` flag**, which interrupts what is playing:
 
 ```
 -p --now never gonna give you up
 ```
 
-The behaviour is unchanged — the interrupted song still returns from the exact position
-it left off at, and interjections still stack. Only the spelling moved, and the flag must
-be the **first** word so a `--now` inside a search term stays part of the search.
+The behaviour is the one `-playnow` always had — the interrupted song returns from the
+exact position it left off at, and interjections still stack. `-playnow` and its `pn`
+alias stay exactly as they were; the flag is a second spelling, not a replacement. It
+must be the **first** word, so a `--now` inside a search term stays part of the search.
 
-`-pn` now answers with nothing, the way any unknown command does. Two things changed
-alongside it:
+Two things changed alongside it:
 
 - An interjection is no longer exempt from the "bot is already being used in channel X"
   rule. Queueing into a session running elsewhere still works; **stopping** what that
@@ -541,7 +579,11 @@ alongside it:
   have 16 requests waiting at once (`PLAY_INFLIGHT_MAX`) and past that one is declined,
   while only 2 of them hold a yt-dlp worker (`PLAY_RESOLVE_CONCURRENCY`) — the rest wait
   their turn rather than being refused, so one server's paste burst cannot delay the
-  extractions another server's playback is waiting on.
+  extractions another server's playback is waiting on. That wait is bounded
+  (`PLAY_RESOLVE_WAIT_SECS`, 2 minutes): a request that never gets a slot is declined
+  having queued nothing, so sending it again cannot double-queue the song. A lookup
+  still running after `PLAY_SLOW_NOTICE_SECS` says so, and takes the message back once
+  the song is queued.
 
 **`-play` takes a `--next` flag**, which queues a song at the front without
 interrupting what is playing:
@@ -552,7 +594,8 @@ interrupting what is playing:
 
 Like `--now`, it must be the **first** word, and it is subject to the "bot is already
 being used in channel X" rule — cutting to the front of a queue is queue control, the
-same as `-skip` or `-shuffle`.
+same as `-skip` or `-shuffle`. It also gained a command spelling, `-playnext` (`pnx`),
+so both placements are reachable the same two ways.
 
 **A playlist is no longer collapsed to its first track.** `-p --now <playlist>` used to
 play track 1 and discard the rest; it now plays track 1 immediately and queues the whole
@@ -957,11 +1000,13 @@ Discord over UDP via FFmpeg. Every `-play` goes through a three-phase yt-dlp pip
 3. **Stream** — when the song reaches the front, the loop usually finds a warm cache
    entry and starts FFmpeg with no extraction call at all.
 
-Queue state lives in three synchronized representations (an `asyncio.Queue` for the
-playback loop, a deque for display, and a Redis list for persistence), all privately
-owned by a `GuildQueue` domain class. Redis also stores the current song and playback
-position, which is how the bot survives crashes: on startup it detects interrupted
-sessions, rejoins voice, and resumes the queue.
+A guild's queue is **one deque plus a cursor into it**, privately owned by a
+`GuildQueue` domain class and mirrored to a Redis list. Everything before the cursor is
+claimed by the playback loop but not yet settled; everything after it is pending. That
+replaced an `asyncio.Queue` and a parallel deque whose agreement had to be maintained by
+hand. Redis also stores the current song and playback position, which is how the bot
+survives crashes: on startup it detects interrupted sessions, rejoins voice, and resumes
+the queue.
 
 The full reference lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -969,33 +1014,48 @@ The full reference lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ```
 src/
-├── main.py            # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool
-├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
-├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
-├── play_placement.py  # -play's flag grammar, its voice gate, and PlayRegistry
-├── guild_queue.py     # GuildQueue — one deque + a cursor, and the Redis mirror
-├── guild_history.py   # GuildHistory — play history: capped Redis list + cache
-├── guild_state.py     # Redis schema: frozen value objects + field constants
-├── redis_client.py    # connection pool, GuildRedisStore, cache helpers
-├── youtube.py         # yt-dlp integration, YTDL audio source, prefetch pipeline
-├── sources.py         # input parsing → YTSource / SpotifySource / SoundcloudSource
-├── spotify.py         # Spotify Client Credentials API client with Redis caching
-├── help.py            # custom man-page-style -help command
-├── telemetry.py       # OpenTelemetry + structlog setup
-├── config.py          # ENVIRONMENT detection, tunables
-└── util.py            # logging factory, queue message formatting
+├── main.py             # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool
+├── musicbot.py         # MusicBot cog — command REGISTRATION and one try/except each,
+│                       # plus the per-guild player registry. No command bodies
+├── commands/           # ONE MODULE PER COMMAND — play.py, queue.py, skip.py, …
+│                       # each exposing run(); _common.py holds the shared restore guard
+├── musicplayer.py      # per-guild playback loop, prefetch, Now Playing host, ETA
+├── play_pipeline.py    # the machinery behind -play/-playnow/-playnext
+├── play_placement.py   # -play's flag grammar, its voice gate, and PlayRegistry
+├── recovery.py         # rejoin-after-restart, the alone-in-channel watchdog, cold starts
+├── guild_queue.py      # GuildQueue — one deque + a cursor, and the Redis mirror
+├── guild_history.py    # GuildHistory — play history: capped Redis list + cache
+├── guild_state.py      # Redis schema: frozen value objects + field constants
+├── redis_client.py     # connection pool, GuildRedisStore, cache helpers
+├── history_archive.py  # the opt-in Postgres archive and its outbox drainer
+├── db_migrate.py       # SQL migration runner; backfill_history.py is the one-shot import
+├── youtube.py          # yt-dlp integration, YTDL audio source, prefetch pipeline
+├── ytdlp_pool.py       # the extraction ProcessPoolExecutor's lifecycle
+├── sources.py          # input parsing → YTSource / SpotifySource / SoundcloudSource
+├── spotify.py          # Spotify Client Credentials API client with Redis caching
+├── leaderboard.py      # -leaderboard tunables, cache codec, embed renderer
+├── analytics_card.py   # -analytics: the pure half and the IO half
+├── analytics_render.py # the six-panel figure; chart_pool.py owns its worker
+├── ping.py             # -ping probes and render; dashboard.py drives both live cards
+├── debug.py            # -debug snapshot machinery (observation-only by rule)
+├── help.py             # custom man-page-style -help command
+├── telemetry.py        # OpenTelemetry + structlog setup
+├── config.py           # ENVIRONMENT detection, tunables
+└── util.py             # logging factory, embed helpers, task helpers
 
-tests/                 # one test_*.py per src/ module, plus:
-├── conftest.py        # shared fixtures
-├── helpers.py         # test-only builders
-└── test_context.py    # Discord context doubles
+tests/                  # one test_*.py per src/ module, plus:
+├── commands/           # mirrors src/commands/ — a command's tests live with its body
+├── conftest.py         # shared fixtures and seams
+├── helpers.py          # test-only builders
+└── test_context.py     # Discord context doubles
 
-docs/                  # architecture reference + design docs
+migrations/             # NNNN_*.sql, applied in numeric order — the only source of schema
+docs/                   # architecture reference + design docs
 ```
 
-Most modules have a matching `tests/test_<name>.py`. `config.py` and `telemetry.py`
-do not, and are the two lowest-covered files in the report.
-The coverage gate (`fail_under = 80`, project-wide) is enforced by `just test`.
+Nearly every module has a matching `tests/test_<name>.py`. The coverage gate
+(`fail_under = 80`, project-wide) is enforced by `just test`; the project measures
+about 96%, and `db_migrate.py` is the lowest at 60%.
 
 ## Development
 
@@ -1003,9 +1063,10 @@ Every command lives in the justfile — see [Just recipes](#just-recipes) for th
 full list. This section covers behavior beyond the recipe list itself.
 
 **`just check` is the contract for CI's lint and test jobs:** if it passes, those
-two pass. Those jobs call the same recipes — `just fmt-justfile`, `just fmt-check`,
-`just lint`, `just types`, `just test-report` — so there is one definition of each
-check and both callers use it.
+two pass. Those jobs call the same recipes — `just fmt-justfile`, `just pins`,
+`just fmt-check`, `just lint`, `just types`, `just test-report` — so there is one
+definition of each check and both callers use it. CI invokes them individually rather
+than calling `check`, so its jobs fail independently of that ordering.
 
 `just check` does not cover the whole pipeline:
 
@@ -1013,14 +1074,16 @@ check and both callers use it.
 |---|---|
 | Lint & Type Check | `just check` |
 | Test Suite | `just check` |
+| Postgres Integration | `just ci` (adds `just test-pg`) |
+| Redis Integration | `just ci` (adds `just test-redis`) |
 | Container Test | `just ci` (adds `just container-test`) |
 | Build Image | nothing — it builds the `runtime` stage, which no local recipe exercises |
 | Security / pip-audit | nothing — it audits `poetry.lock` against advisories |
 
 A green `just check` is therefore a strong signal, not a guarantee of a green PR: a
 dependency that breaks only the runtime image, or a CVE published against a locked
-package, turns the PR red with no local warning. `just ci` closes the container gap;
-the other two run only remotely. Green CI on `main` publishes the runtime image to
+package, turns the PR red with no local warning. `just ci` closes the container and
+integration gaps; the other two run only remotely. Green CI on `main` publishes the runtime image to
 GHCR.
 
 `just types` passes `--pythonpath` explicitly for the same reason: pyright resolves
@@ -1037,7 +1100,7 @@ what CI and the Dockerfile use.
 | Stage | Runs | Cost |
 |---|---|---|
 | pre-commit | `ruff check --fix`, `ruff format`, `just --fmt --check`, whitespace/YAML/TOML checks | ~0.1s |
-| pre-push | `just check` | ~24s |
+| pre-push | `just check` | ~100s |
 
 The hooks are a convenience, not the gate — CI runs every one of these checks, and
 `--no-verify` is available. The formatting hooks **rewrite files**: a commit that

@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.35.7, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.36.2, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -217,19 +217,27 @@ just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
 just pins           # assert the eight duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
-just test           # full suite, coverage gated (fail_under=80)  ~27s
+just test           # full suite, PARALLEL (-n auto), coverage gated (fail_under=80) ~35s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
-just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~35s
+just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~38s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
 just container-test # build test image, run suite inside it       ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
-# Test selection (args forward to pytest). ANY argument means a subset run, so
-# coverage is skipped — fail_under is a PROJECT floor and one file measures ~26%,
-# which used to fail a green run with exit 1. The gate rides the no-args form — what
-# `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
+# Test selection (args forward to pytest). ANY argument means a subset run, so it runs
+# SERIALLY and coverage is skipped — fail_under is a PROJECT floor and one file measures
+# ~26%, which used to fail a green run with exit 1. The gate rides the no-args form —
+# what `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
 # reporting flags rather than a selection, keeps it with COVERAGE_GATE=1.
+#
+# The no-args form is also the ONLY parallel one (`-n auto`), and that is deliberate:
+# the gate is the only way the whole suite runs, so a test that is not parallel-safe
+# fails the pre-push hook and CI instead of rotting a separate "fast" recipe. A subset
+# stays serial because worker startup (~4s flat) cannot amortize over a narrow
+# selection, and because execnet does not forward worker stdout — `-s` is silently
+# swallowed under `-n` and `--pdb` disables it. `just test tests/` is the escape hatch:
+# the whole suite, serially, to reproduce a parallel-only failure.
 just test tests/test_youtube.py
 just test -k spotify
 just test --maxfail=1
@@ -1236,7 +1244,9 @@ duplicated.
 | `POT_PROVIDER_URL` | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `PLAY_INFLIGHT_MAX` | `16` | per-guild ceiling on `-play` requests ADMITTED at once; past it a request is declined with the existing notice. Its unit is one coroutine, one open span and one typing keepalive — memory, not pool time, which `PLAY_RESOLVE_CONCURRENCY` bounds instead. Requests resolve concurrently and serialize only at the insert. `play.inflight` on the `bot.play` span is the number that says whether 16 is right. Floored at 1 |
-| `PLAY_RESOLVE_CONCURRENCY` | `2` | per-guild ceiling on admitted requests holding a yt-dlp worker to RESOLVE (`_GuildPlays.resolves`). The pool is process-wide and FIFO, so admission alone bounds nothing on it: sixteen links is sixteen jobs against four workers, and what queues behind them includes the playback loop's own in-band extractions in OTHER guilds — dead air between their songs. Half the default pool, so one guild can never hold all of it; requests wait here rather than being refused. It does NOT cover the enqueue-time stream warm, which is spawned per song and bounded by `prefetch_warm_slot()` instead. Raise it with `YTDLP_POOL_WORKERS` — and raise it to `YTDLP_POOL_WORKERS` on a single-guild install, where the fairness it buys has no other guild to protect and a 3-link burst serializes its third request behind two slots while two workers idle. Floored at 1 |
+| `PLAY_RESOLVE_CONCURRENCY` | `2` | per-guild ceiling on admitted requests holding a yt-dlp worker to RESOLVE (`_GuildPlays.resolves`). The pool is process-wide and FIFO, so admission alone bounds nothing on it: sixteen links is sixteen jobs against four workers, and what queues behind them includes the playback loop's own in-band extractions in OTHER guilds — dead air between their songs. Half the default pool, so one guild can never hold all of it; requests wait here rather than being refused, bounded by `PLAY_RESOLVE_WAIT_SECS`. It does NOT cover the enqueue-time stream warm, which is spawned per song and bounded by `prefetch_warm_slot()` instead. Raise it with `YTDLP_POOL_WORKERS` — and raise it to `YTDLP_POOL_WORKERS` on a single-guild install, where the fairness it buys has no other guild to protect and a 3-link burst serializes its third request behind two slots while two workers idle. Floored at 1 |
+| `PLAY_RESOLVE_WAIT_SECS` | `120.0` | Bound on the WAIT for one of those slots, never on the extraction holding it — a 5,547-track playlist legitimately runs 99s, and a bound covering it would cancel the resolve it was sized for. The wait is the half that produces nothing, so an unbounded one is indistinguishable from a hung bot. Expiring raises `ResolveWaitExpired`, and the request is declined having searched and queued nothing — so unlike a stalled place, "try again" cannot duplicate a song. Floored at 1.0 |
+| `PLAY_SLOW_NOTICE_SECS` | `6.0` | How long a `-play` resolves before it says so, covering the whole wait rather than the slot queue alone (a full pool and a slow extraction are the same silence). Above the 1–4s a warm resolve takes, so it marks the unusual rather than narrating every `-play`. The notice is retracted when the song lands, and posts through `ctx.channel.send` so it never becomes the NP host. Floored at 0.5 |
 | `STREAM_PROBE_TIMEOUT_SECS` | `2.0` | Cap on the pre-playback stream-URL probe. Short because a single resolve can pay it twice and exceeding it now costs a **cache entry**, not just a verdict — an unconfirmed URL still plays, so firing early is cheap. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
 | `HEARTBEAT_INTERVAL_SECS` | `3.0` | How often a playing guild records its playback position for crash recovery. Bounds the worst-case recovery error — a crash resumes at the last heartbeat, so at most this many seconds replay. Same default as the progress bar because the same reasoning applies, but a separate knob: one is display cadence, the other durability. Floored at 0.5s and refused non-finite — each tick is a Redis write per PLAYING guild, so `0` would be an unbounded HSET loop and `inf` would silently disable recovery |

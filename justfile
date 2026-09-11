@@ -233,12 +233,27 @@ lint: (_tools 'ruff')
 types: (_tools 'pyright')
     {{ PYRIGHT }}
 
-# Run the test suite (~13s); coverage gates the no-args run, subset runs skip it
+# Run the test suite; the whole-suite run is parallel and gated, a subset is neither
 #
 # fail_under is a PROJECT floor, so it answers a whole-suite run or nothing: one file
 # measures ~26% of src/ and fails a green run. No args is the whole suite; test-report
 # sets COVERAGE_GATE because its args are reporting flags, not a selection. The tiers
 # reach the same conclusion by passing --no-cov outright.
+#
+# -n auto on the SAME branch, and that is the point: the gate is the only way the whole
+# suite runs, so parallel-safety is enforced by construction rather than by a second
+# recipe someone remembers to run. A test that shares state across workers fails the
+# pre-push hook and CI, not a convenience command that was allowed to rot. `auto` is
+# xdist's own count — psutil's physical if that extra is installed, os.cpu_count()
+# otherwise; measured, everything at or above the physical count is one plateau, so
+# which of the two it resolves to does not matter. See test-report for the measurements.
+#
+# A subset stays SERIAL, and that carries more than the startup cost it was chosen for:
+# every flag xdist is known to break is itself an argument, so it lands on this branch
+# and works. `-s` is silently swallowed under -n (execnet does not forward worker
+# stdout), `--pdb` disables distribution, `--lf`/`--ff` re-run everything, and
+# `--sw`/`--maxfail` stop late. All of them behave normally here. `just test tests/` is
+# the escape hatch: the whole suite, serially, to reproduce a parallel-only failure.
 #
 # Shebang + "$@" rather than a plain line + {{ ARGS }}, because {{ ARGS }} flattens to
 # one space-joined string: `just test -k "spotify or youtube"` reached pytest as
@@ -246,13 +261,13 @@ types: (_tools 'pyright')
 # body costs on macOS is noise against a 13s suite. See `set positional-arguments`.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
-[doc('Run the test suite (~13s); coverage gates the no-args run, subset runs skip it')]
+[doc('Run the test suite; the whole-suite run is parallel and gated, a subset is neither')]
 [group('check')]
 test *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
     if [ $# -eq 0 ] || [ "${COVERAGE_GATE:-0}" = "1" ]; then
-        {{ PYTEST }} --tb=short -q "$@"
+        {{ PYTEST }} --tb=short -q -n auto "$@"
     else
         {{ PYTEST }} --tb=short -q --no-cov "$@"
     fi
@@ -268,12 +283,21 @@ test *ARGS: (_tools 'pytest')
 # --no-cov, and not as a shortcut: this tier drives SQL against a real server
 # rather than exercising src/ branches, so measuring it under the 80% gate would
 # fail the run on a coverage number that means nothing for what it tests.
+#
+# -p no:xdist is a GUARD, not a preference, and it prevents a failure rather than
+# waste. An xdist worker is its own process running its own session, so with
+# testcontainers `just test-pg -n 4` starts FOUR Postgres containers; worse, with
+# POSTGRES_TEST_URL set — the CI path, where no container starts at all — every
+# worker shares one server while raw_pg_dsn's database counter restarts at t1 in
+# each, so they collide: measured, -n 2 fails with a DuplicateDatabaseError per
+# test. Disabling the plugin makes -n an unrecognized argument (exit 4) instead.
+# The tiers are 99 and 49 tests behind a container start; nothing to parallelize.
 [doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
 [group('check')]
 test-pg *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_PG_TESTS=1 {{ PYTEST }} -m pg --no-cov --tb=short -q "$@"
+    RUN_PG_TESTS=1 {{ PYTEST }} -p no:xdist -m pg --no-cov --tb=short -q "$@"
 
 # Opt-in real-Redis tier (testcontainers; needs Docker)
 #
@@ -289,7 +313,7 @@ test-pg *ARGS: (_tools 'pytest')
 test-redis *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_REDIS_TESTS=1 {{ PYTEST }} -m redis --no-cov --tb=short -q "$@"
+    RUN_REDIS_TESTS=1 {{ PYTEST }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
 
 # Check this file's own formatting (~0.01s)
 [group('check')]
@@ -561,6 +585,18 @@ check-heavy: (_tools 'pyright') (_tools 'pytest')
 [group('check')]
 check: fmt-justfile pins fmt-check lint check-heavy
 
+# Measurements behind `test`'s -n auto, back-to-back, full suite, 6-core/12-thread
+# macOS. Parallel wins at every worker count, including the small ones CI runs on:
+#
+#     serial, coverage on    97.5s      -n 4, coverage on    35.1s
+#     -n 2,   coverage on    52.4s      -n 8, coverage on    46.4s
+#
+# The worker count is a PLATEAU, not a tuned optimum: swept 2x each, -n 4 is 33.9s and
+# 6/8/10/12 are 28.8/28.9/28.7/29.2 — indistinguishable. Below the physical core count
+# costs ~20%; above it costs nothing. --dist worksteal was measured and rejected (29.8s
+# median against load's 27.7s): it rebalances long tails and there is none, the slowest
+# single test being 1.90s against a 5.17s per-worker slice.
+#
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
 # a second definition of the gate — only reporting flags differ, and they never affect

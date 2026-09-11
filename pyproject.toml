@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.35.7"
+version = "2.36.2"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -80,6 +80,10 @@ pytest-asyncio = ">=0.25"
 # the declared floor had not moved, so a fresh resolve could have gone under it.
 fakeredis = ">=2.37.1"
 pytest-cov = "^7.1.0"
+# Parallel runs, OPT-IN: no -n in addopts, so `just test` and `just check` are
+# unchanged. `just test-fast` is the inner loop and carries the measurements for
+# why it pins -n 8 and drops coverage.
+pytest-xdist = "^3.8.0"
 # A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
 # several guards here are asyncio.timeout() calls, and a regression that removes
 # one makes the test HANG rather than fail — three such mutations were measured
