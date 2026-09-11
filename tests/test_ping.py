@@ -3,6 +3,7 @@ collectors, the embed rendering, and the optimistic-send + live-edit loop."""
 
 import asyncio
 import tomllib
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -819,14 +820,28 @@ class TestVersions:
         assert ping.bot_version() == expected
         assert ping.bot_version() != "unknown"
 
-    def test_bot_version_falls_back_when_pyproject_missing(
+    def test_bot_version_falls_back_to_dist_metadata(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rung two of the ladder. The container installs --no-root, so this only
+        answers for a wheel install — and only a patched metadata call can tell it
+        from rung three, since neither is present in the test env."""
+        ping._bot_version_cache = None
+        monkeypatch.setattr(ping, "_PYPROJECT", tmp_path / "nope.toml")
+        monkeypatch.setattr(ping.metadata, "version", lambda _: "9.9.9")
+        assert ping.bot_version() == "9.9.9"
+
+    def test_bot_version_is_unknown_when_neither_source_answers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         ping._bot_version_cache = None
         monkeypatch.setattr(ping, "_PYPROJECT", tmp_path / "nope.toml")
-        # No pyproject and no installed dist metadata in the test env → "unknown",
-        # never a crash.
-        assert ping.bot_version() in {"unknown"} or ping.bot_version()
+        monkeypatch.setattr(
+            ping.metadata,
+            "version",
+            MagicMock(side_effect=metadata.PackageNotFoundError()),
+        )
+        assert ping.bot_version() == "unknown"
 
     def test_ytdlp_version_is_non_empty(self) -> None:
         assert ping.ytdlp_version()
