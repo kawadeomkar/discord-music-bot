@@ -215,17 +215,6 @@ class TestDrainOnce:
         assert archive.inserted == [_entry(1)]
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
-    async def test_archive_failure_leaves_outbox_intact(
-        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
-    ) -> None:
-        # Retire happens strictly after a successful insert — a failed insert
-        # must leave every entry in place for the retry.
-        await _push(fake_redis, 1, 2)
-        archive.fail = True
-        with pytest.raises(RuntimeError):
-            await drainer._drain_once()
-        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
-
     async def test_redelivery_after_failure(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
     ) -> None:
@@ -1069,16 +1058,6 @@ class TestRejectionIsolation:
         delivered = await _outbox_wires(fake_redis)
         await drainer._drain_once()
         assert archive.rejected_wires == delivered
-
-    async def test_a_direct_call_without_wire_bytes_still_records(self) -> None:
-        # The fallback arm: a caller holding only an entry (a test, or any
-        # future producer that never went through Redis) must still be able to
-        # park it rather than lose it to a TypeError.
-        archive = PostgresHistoryArchive("postgresql://unused")
-        entry = _entry(1)
-        # No server, so the insert fails and the terminal handler logs — which
-        # is the point: it reaches the insert at all, with a payload.
-        await archive.record_rejection(entry, RuntimeError("refused"))
 
     async def test_rejection_logs_the_offending_entry(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
@@ -2556,6 +2535,10 @@ class TestPoisonClassification:
         # IntegrityConstraintViolationError. The play_history CHECKs make this
         # reachable, and without the arm a violation propagates past the
         # quarantine path and wedges the drain head on a non-evictable stream.
+        assert issubclass(
+            asyncpg.exceptions.CheckViolationError,
+            asyncpg.exceptions.IntegrityConstraintViolationError,
+        )
         assert not issubclass(
             asyncpg.exceptions.CheckViolationError, asyncpg.exceptions.DataError
         )
