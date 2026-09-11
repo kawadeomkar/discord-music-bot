@@ -88,7 +88,10 @@ def admin_dsn() -> Iterator[str]:
         yield external
         return
 
-    from testcontainers.postgres import PostgresContainer
+    # testcontainers.community, not the top-level shim: 4.15 deprecated the old
+    # path, and filterwarnings=error turns that into 98 collection ERRORS. CI
+    # never saw it — POSTGRES_TEST_URL returns above this line.
+    from testcontainers.community.postgres import PostgresContainer
 
     pg = PostgresContainer(_PG_IMAGE, username="test", password="test")
     bind_loopback_only(pg, 5432)
