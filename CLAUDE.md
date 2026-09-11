@@ -1125,8 +1125,22 @@ can spend the whole placement budget before the insert begins.
   in `_run_extract` specifically to keep those patches working — don't capture them.
   Consequence: no test spawns worker processes; the pickle contract is asserted directly
   (`TestProcessBoundaryContract`), and one dedicated test spawns a real worker.
+- **Every env var `src/` reads is DELETED before the suite imports it**, by
+  `tests/__init__.py` at module scope — the package is imported ahead of `conftest`,
+  which is where `src` first lands, and `config.py` plus `-debug`'s
+  `_CONFIG_ALLOWLIST` resolve the environment at IMPORT, before any fixture can run.
+  `just test` does not load `.env`, so without this the suite reads whatever the
+  developer exported: fourteen of the thirty names failed a clean tree, including
+  `DISCORD_TOKEN`, `REDIS_URL` and `OTEL_SDK_DISABLED=true`. The `SCRUBBED_ENV`
+  tuple is asserted complete in BOTH directions by
+  `TestEveryEnvVarIsScrubbed` (test_config.py), which walks `src/` by AST for the
+  four shapes an env read takes — so adding a knob to `config.py` fails the suite
+  until it is listed. `POSTGRES_TEST_URL`/`REDIS_TEST_URL` are held out by name:
+  they are read by `tests/helpers.py`, and exporting one is how a tier is enabled.
+  `conftest`'s autouse fixture repeats the delete so a test that sets one through
+  `monkeypatch` still has it undone.
 - **The suite runs archive-ENABLED, inverting the ship default**: a conftest autouse
-  fixture pins `HISTORY_ARCHIVE_ENABLED=true` (next to the `POSTGRES_URL` scrub),
+  fixture pins `HISTORY_ARCHIVE_ENABLED=true` (alongside that scrub),
   because the enabled configuration exercises strictly more code and hundreds of
   existing assertions encode it. Disabled-mode behavior is covered by explicit tests
   that monkeypatch the flag per case — which wins over the fixture (same MonkeyPatch
