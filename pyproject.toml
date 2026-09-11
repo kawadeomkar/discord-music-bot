@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.36.1"
+version = "2.36.2"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -241,9 +241,6 @@ markers = [
 ]
 filterwarnings = [
     "error",
-    # audioop was removed in Python 3.13 but discord.py's Ogg/Opus parser still
-    # imports it at module load time. Suppress until discord.py drops the reference.
-    "ignore:'audioop' is deprecated:DeprecationWarning",
     # discord.py's Command.__init__ still calls asyncio.iscoroutinefunction, deprecated
     # in Python 3.14. Suppress until discord.py switches to inspect.iscoroutinefunction.
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
