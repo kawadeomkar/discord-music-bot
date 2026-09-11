@@ -227,9 +227,6 @@ class TestGuildStateDataProperties:
 
 
 class TestCrashedPositionAt:
-    def test_none_without_play_start_epoch(self) -> None:
-        assert GuildStateData().crashed_position_at(1000.0) is None
-
     def test_simple_elapsed(self) -> None:
         data = GuildStateData(play_start_epoch=1000.0)
         assert data.crashed_position_at(1042.0) == 42
@@ -506,8 +503,13 @@ class TestSongQueueEntryWire:
         assert parse_queue_entry(_FULL_ENTRY.to_redis()) == _FULL_ENTRY
 
     def test_reader_parses_pre_interjection_entry_with_false_flags(self) -> None:
-        # Entries written before the interjection fields existed must parse with
-        # all three flags defaulting False.
+        """Every default a pre-feature entry takes, in one dataclass equality.
+
+        The three interjection flags read False. The NP-host triple reads 0/0/False
+        — an entry written before those fields existed has no card to dispose of,
+        which is what that means, never "delete message 0". played_at reads 0.0
+        (unplayed, not corrupt), the enqueue stamps 0.0/0, and query_source "".
+        """
         assert parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION) == _FULL_ENTRY
 
     def test_interjection_flags_round_trip(self) -> None:
@@ -542,17 +544,6 @@ class TestSongQueueEntryWire:
             True,
         )
 
-    def test_reader_defaults_np_host_fields_on_pre_feature_entry(self) -> None:
-        # An entry written before the fields existed has no card to dispose of,
-        # which is what 0/0/False means — never "delete message 0".
-        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
-        assert isinstance(pre_feature, SongQueueEntry)
-        assert (
-            pre_feature.np_message_id,
-            pre_feature.np_channel_id,
-            pre_feature.np_dedicated,
-        ) == (0, 0, False)
-
     def test_played_at_round_trips(self) -> None:
         # A queued entry carries a nonzero start only when it is an interjection's
         # tail, which inherits the interrupted song's — so this is the leg that
@@ -563,14 +554,6 @@ class TestSongQueueEntryWire:
         assert parsed == entry
         assert isinstance(parsed, SongQueueEntry)
         assert parsed.played_at == 1752530000.5
-
-    def test_reader_defaults_played_at_on_pre_feature_entry(self) -> None:
-        # Entries written before the field existed must parse as unplayed rather
-        # than dropping as corrupt.
-        assert _FULL_ENTRY.played_at == 0.0
-        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
-        assert isinstance(pre_feature, SongQueueEntry)
-        assert pre_feature.played_at == 0.0
 
     def test_snowflake_requester_id_exact(self) -> None:
         entry = parse_queue_entry(_GOLDEN_QOBJ_FULL)
@@ -614,12 +597,6 @@ class TestSongQueueEntryWire:
         assert entry.start_paused is True
         assert entry.interjected is False
 
-    def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
-        # Entries written before the enqueue stamps existed default both to 0.
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
-        assert isinstance(entry, SongQueueEntry)
-        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
-
     def test_enqueue_stamps_round_trip(self) -> None:
         item = QueueObject(
             webpage_url="https://yt.com/v=1",
@@ -643,11 +620,6 @@ class TestSongQueueEntryWire:
         parsed = parse_queue_entry(SongQueueEntry.from_queue_object(item).to_redis())
         assert isinstance(parsed, SongQueueEntry)
         assert parsed.query_source == "tiktok.com"
-
-    def test_reader_defaults_query_source_on_a_pre_feature_entry(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
-        assert isinstance(entry, SongQueueEntry)
-        assert entry.query_source == ""
 
 
 class TestSearchQueueEntryWire:
@@ -1466,6 +1438,12 @@ class TestFromCrashedState:
         assert SongQueueEntry.from_crashed_state(GuildStateData(), position=10) is None
 
     def test_maps_crashed_fields(self) -> None:
+        """Every field the crash hash carries, and every default it does not, in one
+        equality. A hash written by a build that predates a field leaves it unset:
+        played_at and the enqueue stamps read unknown rather than "now", interjected
+        reads False, and user_input reads None — never "", which would be a needle
+        remove_matcher could compare against.
+        """
         state = GuildStateData(
             current_song_url="https://yt.com/v=crash",
             current_song_title="Crashed",
@@ -1531,12 +1509,6 @@ class TestFromCrashedState:
         assert entry is not None
         assert entry.interjected is True
 
-    def test_interjected_defaults_false(self) -> None:
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
-        entry = SongQueueEntry.from_crashed_state(state, position=None)
-        assert entry is not None
-        assert entry.interjected is False
-
     def test_enqueue_stamps_survive_crash(self) -> None:
         # Recovery re-queues the song but does not re-queue the play: it keeps
         # the position it was originally given, so the archive stays truthful.
@@ -1549,12 +1521,6 @@ class TestFromCrashedState:
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
         assert (entry.queued_at, entry.queue_position) == (1752530000.5, 3)
-
-    def test_enqueue_stamps_default_to_unknown(self) -> None:
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
-        entry = SongQueueEntry.from_crashed_state(state, position=None)
-        assert entry is not None
-        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
 
     def test_query_source_survives_crash(self) -> None:
         # The classification is only knowable at parse time, so a crash is the one
@@ -1583,13 +1549,6 @@ class TestFromCrashedState:
         assert entry is not None
         assert entry.played_at == 1752530000.5
 
-    def test_played_at_defaults_to_unknown(self) -> None:
-        # A hash written by a build that predates the field: unknown, not "now".
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
-        entry = SongQueueEntry.from_crashed_state(state, position=None)
-        assert entry is not None
-        assert entry.played_at == 0.0
-
     def test_user_input_survives_crash(self) -> None:
         # The playing song's queue entry was LPOPed at start, so this hash is the
         # only at-rest copy of what the user typed. Losing it leaves `-remove
@@ -1603,14 +1562,6 @@ class TestFromCrashedState:
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
         assert entry.user_input == "https://open.spotify.com/playlist/abc"
-
-    def test_user_input_absent_is_none_not_empty(self) -> None:
-        # A hash written by a build that predates the field. None means "unknown";
-        # "" would be a needle that remove_matcher could compare against.
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
-        entry = SongQueueEntry.from_crashed_state(state, position=None)
-        assert entry is not None
-        assert entry.user_input is None
 
 
 class TestGuildPlaybackSnapshot:

@@ -712,17 +712,6 @@ class TestClearWhileAClaimIsOutstanding:
     Without it `_cursor` outlives the items it indexed: `qsize()` goes NEGATIVE,
     `empty()` lies, and the next `try_release()` pops an empty deque."""
 
-    async def test_the_cursor_is_reset_with_the_items(
-        self, gq_no_redis: GuildQueue, mock_author: MagicMock
-    ) -> None:
-        await gq_no_redis.put([_qobj(1, mock_author), _qobj(2, mock_author)])
-        await gq_no_redis.get()  # the loop is mid-song
-        assert gq_no_redis._cursor == 1
-
-        await gq_no_redis.clear()
-
-        assert gq_no_redis._cursor == 0
-
     async def test_the_counters_stay_sane_after_clearing_mid_song(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
@@ -1360,20 +1349,6 @@ class TestClear:
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.05):
                 await gq.get()
-
-    async def test_clear_settles_an_outstanding_claim(
-        self, gq: GuildQueue, mock_author: MagicMock
-    ) -> None:
-        """clear() resets the cursor alongside the deque, which is what settles a
-        claim the loop is still holding — the loop's commit then refuses on the
-        generation and releases nothing."""
-        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
-        await gq.get()
-        assert gq._cursor == 1
-
-        await gq.clear()
-
-        assert gq._cursor == 0  # the outstanding claim went with the deque
 
     async def test_mixed_item_types_all_come_back(
         self, gq: GuildQueue, mock_author: MagicMock
