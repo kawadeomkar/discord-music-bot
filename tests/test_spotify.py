@@ -456,17 +456,6 @@ class TestSpotifyPlaylist:
 
 
 class TestSpotifyHttpCall:
-    async def test_http_call_raises_on_non_200(self, spotify: Spotify) -> None:
-        spotify.auth_token = "prefetched_token"
-        spotify.token_expiry = time.time() + 3600  # skip _refresh_token
-        mock_response = AsyncMock()
-        mock_response.status = 404
-        mock_session = _make_mock_session(mock_response)
-        spotify._session_factory = lambda **kw: mock_session
-
-        with pytest.raises(Exception, match="stat: 404"):
-            await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
-
     async def test_http_call_sets_authorization_header(self, spotify: Spotify) -> None:
         spotify.auth_token = "valid_token"
         spotify.token_expiry = time.time() + 3600

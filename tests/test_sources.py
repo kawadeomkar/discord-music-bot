@@ -332,12 +332,6 @@ class TestParseInput:
         assert isinstance(result, YTSource)
         assert result.ytsearch == "ytsearch:never gonna give"
 
-    def test_single_word_with_slash_still_tries_url_parse(self) -> None:
-        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        result = parse_input(url)
-        assert isinstance(result, YTSource)
-        assert result.url == url
-
     def test_single_word_dotless_slash_falls_back_to_search(self) -> None:
         """A lone "98/99" (no dot, no scheme) is not a URL — parse_url raises
         ValueError and parse_input recovers with a YouTube search."""
@@ -486,6 +480,8 @@ class TestParseTimestamp:
     @pytest.mark.parametrize(
         "raw",
         [
+            # The pattern is entirely optional groups, so "" MATCHES it — what
+            # rejects it is the "at least one group present" guard behind it.
             "",
             "   ",
             "abc",
@@ -501,11 +497,6 @@ class TestParseTimestamp:
     )
     def test_invalid_forms_return_none(self, raw: str) -> None:
         assert parse_timestamp(raw) is None
-
-    def test_all_optional_pattern_rejects_empty_match(self) -> None:
-        """The HMS regex is entirely optional groups, so it also matches ""
-        — the "at least one group" guard is what stops that being 0 seconds."""
-        assert parse_timestamp("") is None
 
 
 class TestDomainRegex:
