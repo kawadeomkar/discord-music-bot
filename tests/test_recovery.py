@@ -19,9 +19,9 @@ from discord.ext import commands
 from redis.asyncio import Redis
 
 from src.musicbot import MusicBot
-from src.recovery import join_succeeded, restore_guild
+from src.recovery import ALONE_DISCONNECT_SECS, join_succeeded, restore_guild
 from src.redis_client import GuildRedisStore
-from tests.helpers import make_mock_task, mocked, stub_create_task
+from tests.helpers import described, make_mock_task, mocked, stub_create_task
 
 
 class TestEagerRestore:
@@ -641,13 +641,16 @@ class TestAloneCountdown:
         vc.channel.members = members
         return vc
 
-    def _setup_mp(self, music_bot: MusicBot, mock_guild: MagicMock) -> MagicMock:
-        text_channel = MagicMock(spec=discord.TextChannel)
-        text_channel.send = AsyncMock()
+    def _setup_mp(self, music_bot: MusicBot, mock_guild: MagicMock) -> AsyncMock:
+        """Returns the seam the notice actually goes through. send_with_np, not
+        _channel.send: the countdown can fire mid-song, and a bare send would bury
+        the NP host. Awaitable, or every case here would exercise the failure arm —
+        `await` on an auto-vivified Mock raises TypeError, which the notice's own
+        `except Exception` swallows."""
         mp = MagicMock()
-        mp._channel = text_channel
+        mp.send_with_np = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
-        return text_channel
+        return mp.send_with_np
 
     async def test_calls_cleanup_when_still_alone(
         self, music_bot: MusicBot, mock_guild: MagicMock
@@ -693,14 +696,31 @@ class TestAloneCountdown:
 
         mock_cleanup.assert_not_awaited()
 
+    async def test_the_notice_names_the_countdown(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The notice itself, which nothing else pins: it must reach the channel and
+        say how long the guild has to rejoin."""
+        send_with_np = self._setup_mp(music_bot, mock_guild)
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        mock_guild.voice_client = self._make_vc([bot_member])
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()):
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        embed = send_with_np.await_args.kwargs["embed"]
+        assert embed.title == "No users remaining in voice channel"
+        assert str(ALONE_DISCONNECT_SECS) in described(embed)
+
     async def test_send_failure_does_not_abort_countdown(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """A failed text_channel.send is swallowed; the countdown still fires cleanup."""
-        text_channel = self._setup_mp(music_bot, mock_guild)
-        text_channel.send = AsyncMock(
-            side_effect=discord.HTTPException(MagicMock(), "forbidden")
-        )
+        """A failed notice is swallowed; the countdown still fires cleanup."""
+        send_with_np = self._setup_mp(music_bot, mock_guild)
+        send_with_np.side_effect = discord.HTTPException(MagicMock(), "forbidden")
 
         bot_member = MagicMock(spec=discord.Member)
         bot_member.bot = True
