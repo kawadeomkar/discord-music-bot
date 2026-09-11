@@ -284,12 +284,14 @@ test *ARGS: (_tools 'pytest')
 # rather than exercising src/ branches, so measuring it under the 80% gate would
 # fail the run on a coverage number that means nothing for what it tests.
 #
-# -p no:xdist is a GUARD, not a preference. Both container fixtures are
-# session-scoped, and an xdist worker is its own process running its own session
-# — so `just test-pg -n 4` would start FOUR Postgres containers, one per worker,
-# and lose to the serial run it was meant to beat. Disabling the plugin makes -n
-# an unrecognized argument (exit 4) instead of a slow surprise. The tiers are 99
-# and 49 tests behind a container start; there is nothing here to parallelize.
+# -p no:xdist is a GUARD, not a preference, and it prevents a failure rather than
+# waste. An xdist worker is its own process running its own session, so with
+# testcontainers `just test-pg -n 4` starts FOUR Postgres containers; worse, with
+# POSTGRES_TEST_URL set — the CI path, where no container starts at all — every
+# worker shares one server while raw_pg_dsn's database counter restarts at t1 in
+# each, so they collide: measured, -n 2 fails with a DuplicateDatabaseError per
+# test. Disabling the plugin makes -n an unrecognized argument (exit 4) instead.
+# The tiers are 99 and 49 tests behind a container start; nothing to parallelize.
 [doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
 [group('check')]
 test-pg *ARGS: (_tools 'pytest')
