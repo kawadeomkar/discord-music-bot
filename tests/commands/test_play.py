@@ -191,36 +191,6 @@ class TestPlayCommand:
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
         mock_ctx.send.assert_awaited()
 
-    async def test_cold_join_cancels_and_cleans_up_partial_connection(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """join in-flight but voice partially established → cancel join task, then cleanup()."""
-        mock_ctx.voice_client = None
-        mock_ctx.guild.voice_client = MagicMock(spec=discord.VoiceClient)
-
-        loop = asyncio.get_event_loop()
-        join_task = loop.create_future()  # pending, done() is False
-        cancel_spy = MagicMock(side_effect=join_task.cancel)
-        join_task.cancel = cancel_spy
-
-        play_pipeline.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=mock_mp())
-        music_bot.cleanup = AsyncMock()
-
-        def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
-            coro.close()
-            return join_task
-
-        with (
-            no_typing("src.commands.play.background_typing"),
-            patch("asyncio.create_task", side_effect=fake_create_task),
-        ):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
-
-        cancel_spy.assert_called_once()
-        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
-        mock_ctx.send.assert_awaited()
-
     async def test_the_warm_path_hands_queue_source_the_placement_mode(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

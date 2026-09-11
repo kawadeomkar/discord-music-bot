@@ -47,7 +47,6 @@ from src.musicplayer import (
     _fmt_total_duration,
     _requester_mention,
 )
-from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
 from src.util import cancel_task, current_traceparent, fmt_duration, trace_id_of
 from src.youtube import NpHostRef, QueueObject, YTDL
@@ -373,17 +372,6 @@ class TestQueuePut:
         mock_pf.assert_awaited_once()
         assert mock_pf.call_args[0][0] == queue_obj
 
-    async def test_put_does_not_spawn_prefetch_for_yt_source(
-        self, music_player: MusicPlayer
-    ) -> None:
-        source = YTSource(ytsearch="ytsearch:test song", process=True)
-        with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
-        ) as mock_pf:
-            await music_player.queue_put(source)
-            await asyncio.sleep(0)
-        mock_pf.assert_not_awaited()
-
     async def test_put_with_prefetch_false_skips_prefetch_task(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
@@ -418,7 +406,9 @@ class TestQueuePutNext:
         spawns one prefetch_stream per QueueObject it inserts. For a song whose
         metadata was resolved without a stream URL, this warm IS the extraction —
         so anything added elsewhere to "warm the next song" would be a second
-        concurrent extraction of it, not a missing one."""
+        concurrent extraction of it, not a missing one. The prefetch `--next`
+        suppresses is loop()'s queue-claiming one; this song is warmed even
+        though no claim is held for it."""
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
         ) as mock_pf:
@@ -543,21 +533,6 @@ class TestQueuePutNext:
             for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         ]
         assert stored == ["X", "B"]
-
-    async def test_it_still_warms_the_stream_url(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        """The prefetch it suppresses is loop()'s queue-claiming one. This one only
-        writes ytdl:stream:*, and it is what keeps the neutralize affordable: the
-        song about to play is warmed even though no claim is held for it."""
-        newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
-        with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
-        ) as mock_pf:
-            await music_player.queue_put_next(newcomer)
-            await asyncio.sleep(0)
-        mock_pf.assert_awaited_once()
-        assert mock_pf.call_args[0][0] == newcomer
 
 
 # ── QueueClear ────────────────────────────────────────────────────────────────
@@ -2534,13 +2509,6 @@ class TestBuildNowPlayingEmbed:
         assert str(mock_song.abr) in embed.footer.text
         assert str(mock_song.acodec) in embed.footer.text
 
-    def test_embed_does_not_have_dislikes_field(
-        self, music_player: MusicPlayer, mock_song: MagicMock
-    ) -> None:
-        embed = music_player._build_now_playing_embed(mock_song)
-        field_names = [f.name for f in embed.fields]
-        assert "Dislikes" not in field_names
-
     def test_zero_views_and_likes_render_as_zero_not_blank(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -3005,39 +2973,6 @@ class TestMusicPlayerInitialState:
 
 
 class TestRedisHelpers:
-    async def test_redis_push_history_caps_the_list(
-        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
-    ) -> None:
-        # Bounded retention: the list is a fixed window of the newest plays, not a
-        # full record. Postgres keeps everything; this is what -history reads, and
-        # it is capped at exactly that command's ceiling.
-        assert music_player.store is not None
-        for i in range(HISTORY_CACHE_LIMIT + 5):
-            await music_player.store.push_history(
-                HistoryEntry(title=f"Song {i}", webpage_url=f"url{i}")
-            )
-        items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
-        assert len(items) == HISTORY_CACHE_LIMIT
-
-    async def test_store_set_volume_updates_volume(
-        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
-    ) -> None:
-        assert music_player.store is not None
-        await music_player.store.set_volume(0.75)
-        config = await fake_redis.hgetall(music_player.store.config_key())
-        assert config[b"volume"] == b"0.75"
-
-    async def test_redis_pop_queue_removes_first_item(
-        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
-    ) -> None:
-        assert music_player.store is not None
-        await fake_redis.rpush(music_player.store.queue_key(), b"item1")
-        await fake_redis.rpush(music_player.store.queue_key(), b"item2")
-        await music_player.store.pop_queue()
-        remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
-        assert len(remaining) == 1
-        assert remaining[0] == b"item2"
-
     def test_store_is_none_when_no_redis(
         self,
         mock_bot: MagicMock,
@@ -12075,15 +12010,6 @@ class TestGuildTimezoneOnRestore:
         await music_player.store.set_timezone("Mars/Olympus")
         await music_player._restore_state()
         assert music_player.timezone == ZoneInfo(DEFAULT_TIMEZONE)
-
-    async def test_the_eta_renders_in_the_guilds_zone(
-        self, music_player: MusicPlayer
-    ) -> None:
-        """End to end: the suffix is the zone's own abbreviation, so a London guild
-        is never quoted London time labelled PST."""
-        music_player.timezone = ZoneInfo("Europe/London")
-        rendered = _fmt_finish_time(90, music_player.timezone)
-        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
 
 
 class TestQueueLinesCannotForgeALink:

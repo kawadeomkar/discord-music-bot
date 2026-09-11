@@ -2,7 +2,7 @@
 
 import contextlib
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -956,28 +956,6 @@ class TestQuerySourceClassification:
         assert "ValueError" not in embed.description
         assert "EmptyPlaylistError" not in embed.description
 
-    async def test_an_interjection_honours_the_playlist_index(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """`--now` starts at the track the link was copied at, not track 1 — and
-        the rest of the collection follows it rather than being discarded."""
-        url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
-        source = parse_input(url)
-        tracks = self._yt_tracks(mock_ctx.author, 5)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
-            result = await play_pipeline._resolve_interjection_source(
-                mock_ctx, source, origin=_ORIGIN, cog=music_bot
-            )
-        head, follow_on = result
-        assert head.title == "T2"
-        # The tail is kept now: `--now` takes the whole collection, and the
-        # interrupted song returns after the last of it.
-        assert [cast(QueueObject, t).title for t in follow_on] == ["T3", "T4"]
-        notice = mock_ctx.send.await_args.kwargs["embed"].description
-        assert "#3" in notice
-
     async def test_interjection_index_past_the_end_reports_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -1032,37 +1010,6 @@ class TestQuerySourceClassification:
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
         assert self._passed_query_source(spy) == "youtube.com"
-
-    async def test_interjection_indexed_playlist_rebases_only_the_track_it_keeps(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """The head lands at 0, the depth an interjection actually has, and every
-        track kept behind it is rebased off that — the dropped ones never enqueue,
-        so an `&index=N` link must not record the survivors N-1 too deep."""
-        url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
-        source = parse_input(url)
-        tracks = [
-            QueueObject(
-                f"https://yt.com/watch?v=v{i}",
-                f"T{i}",
-                mock_ctx.author,
-                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
-            )
-            for i in range(6)
-        ]
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
-            kept = await play_pipeline._resolve_interjection_source(
-                mock_ctx, source, origin=_ORIGIN, cog=music_bot
-            )
-
-        head, follow_on = kept
-        assert head is tracks[3]
-        assert head.analytics.queue_position == 0
-        # Rebased kept-relative, so the tail reads 1, 2 rather than 4, 5.
-        assert follow_on == tracks[4:]
-        assert [t.analytics.queue_position for t in follow_on] == [1, 2]
 
     async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1336,12 +1283,12 @@ class TestInterjectionCollectionHandling:
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
 
-    async def test_interjection_indexed_playlist_rebases_every_kept_track(
+    async def test_interjection_indexed_playlist_rebases_only_the_track_it_keeps(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """The head lands at 0 — the depth an interjection actually has — and the
-        tracks behind it count up from there. Without the rebase an `&index=4` link
-        would file every track three deeper than it played."""
+        """The head lands at 0, the depth an interjection actually has, and every
+        track kept behind it is rebased off that — the dropped ones never enqueue,
+        so an `&index=N` link must not record the survivors N-1 too deep."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
         source = parse_input(url)
         tracks = [
@@ -1356,13 +1303,16 @@ class TestInterjectionCollectionHandling:
         with patch(
             "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
         ):
-            head, rest = await play_pipeline._resolve_interjection_source(
+            kept = await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
 
+        head, follow_on = kept
         assert head is tracks[3]
         assert head.analytics.queue_position == 0
-        assert [queue_object(item).analytics.queue_position for item in rest] == [1, 2]
+        # Rebased kept-relative, so the tail reads 1, 2 rather than 4, 5.
+        assert follow_on == tracks[4:]
+        assert [t.analytics.queue_position for t in follow_on] == [1, 2]
 
 
 class TestPlaylistPositionsAreMintedAtTheInsert:
