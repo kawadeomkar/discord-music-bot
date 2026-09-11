@@ -1,6 +1,7 @@
 """Tests for src/config.py — the Spotify toggle, environment resolution, the
 Postgres knobs, and the default-credential detector."""
 
+import ast
 import importlib
 import os
 import re
@@ -9,13 +10,14 @@ import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
 from unittest.mock import MagicMock
 
 import src.config
+import tests as tests_pkg
 from src import config
 from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
@@ -1180,3 +1182,78 @@ class TestDebugPrometheusUrl:
     def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
         assert debug_prometheus_url() == "http://localhost:9090"
+
+
+class TestEveryEnvVarIsScrubbed:
+    """The suite asserts the SHIPPED defaults of these knobs, and `just test` does
+    not load .env — so anything a developer exported is read instead. Fourteen of
+    them were measured turning a clean tree red, DISCORD_TOKEN and REDIS_URL
+    included. conftest's autouse fixture deletes them; this is what keeps that list
+    from falling behind src/, since a variable added there fails nothing until the
+    one person who exports it runs the suite."""
+
+    _HELPERS = {"_float_env", "_int_env", "_parse_bool_env"}
+    _DIRECT = {"os.getenv", "os.environ.get", "environ.get", "getenv"}
+
+    @staticmethod
+    def _literal(node: ast.expr) -> Optional[str]:
+        return (
+            node.value
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            else None
+        )
+
+    @classmethod
+    def _env_names_read_by_src(cls) -> set[str]:
+        """Every literal environment-variable name src/ reads, by AST rather than by
+        grep: the four shapes are os.environ[...], the os.getenv/os.environ.get
+        calls, config's three _*_env helpers, and -debug's _ConfigVar rows."""
+        found: set[str] = set()
+        src_dir = Path(__file__).resolve().parent.parent / "src"
+        for path in sorted(src_dir.rglob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Subscript) and ast.unparse(node.value) in {
+                    "os.environ",
+                    "environ",
+                }:
+                    if (name := cls._literal(node.slice)) is not None:
+                        found.add(name)
+                if not isinstance(node, ast.Call):
+                    continue
+                func = ast.unparse(node.func)
+                if func == "_ConfigVar":
+                    for kw in node.keywords:
+                        if kw.arg == "name" and (n := cls._literal(kw.value)):
+                            found.add(n)
+                elif node.args and (
+                    func in cls._DIRECT or func.rsplit(".", 1)[-1] in cls._HELPERS
+                ):
+                    if (name := cls._literal(node.args[0])) is not None:
+                        found.add(name)
+        return found
+
+    def test_the_scrub_list_covers_every_name_src_reads(self) -> None:
+        handled = set(tests_pkg.SCRUBBED_ENV) | {"HISTORY_ARCHIVE_ENABLED"}
+        missing = self._env_names_read_by_src() - handled
+        assert not missing, (
+            f"read by src/ but neither scrubbed nor pinned: {sorted(missing)}. "
+            f"Add them to tests_pkg.SCRUBBED_ENV, or pin them in scrub_config_flags "
+            f"if the suite needs a specific value."
+        )
+
+    def test_the_scrub_list_has_nothing_src_stopped_reading(self) -> None:
+        stale = set(tests_pkg.SCRUBBED_ENV) - self._env_names_read_by_src()
+        assert not stale, f"scrubbed but no longer read by src/: {sorted(stale)}"
+
+    def test_the_tier_switches_are_left_alone(self) -> None:
+        """They are read by tests/helpers.py, not src/, and are the one thing an
+        operator is meant to export into a run — scrubbing them would silently
+        disable the pg and redis tiers."""
+        assert not set(tests_pkg.PRESERVED_ENV) & set(tests_pkg.SCRUBBED_ENV)
+
+    def test_the_fixture_actually_deletes_them(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The autouse fixture has already run for this test, so a name it claims
+        # to scrub cannot still be in the environment.
+        assert [n for n in tests_pkg.SCRUBBED_ENV if n in os.environ] == []

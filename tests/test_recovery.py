@@ -711,6 +711,9 @@ class TestAloneCountdown:
             with patch.object(music_bot, "cleanup", new=AsyncMock()):
                 await music_bot.voice_watchdog._countdown(mock_guild)
 
+        assert send_with_np.await_args is not None, (
+            "the notice never reached the channel"
+        )
         embed = send_with_np.await_args.kwargs["embed"]
         assert embed.title == "No users remaining in voice channel"
         assert str(ALONE_DISCONNECT_SECS) in described(embed)

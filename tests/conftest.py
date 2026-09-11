@@ -29,6 +29,7 @@ from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
+from tests import SCRUBBED_ENV
 from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
 
 # Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
@@ -211,6 +212,9 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     `just test` does not load .env, so the exposure is an EXPORTED variable: a
     shell carrying a real POSTGRES_URL silently disables every default-credential
     test, one exporting the default flips them the other way (setenv still wins).
+    The delete itself also runs at tests/__init__.py import, because config and
+    -debug's allowlist resolve these before any fixture can. Repeated here so a
+    test that sets one through monkeypatch has it undone afterwards.
 
     HISTORY_ARCHIVE_ENABLED is pinned TRUE, deliberately INVERTING the ship
     default: the enabled path exercises strictly more code (outbox XADD, notify,
@@ -223,8 +227,8 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     sends grows a debug footer — command responses, the Now Playing block at every
     render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
     """
-    monkeypatch.delenv("POSTGRES_URL", raising=False)
-    monkeypatch.delenv("DEBUG_MODE", raising=False)
+    for name in SCRUBBED_ENV:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
