@@ -9,9 +9,10 @@ because nothing outside this pipeline constructs them.
 """
 
 import asyncio
+import contextlib
 from dataclasses import dataclass, replace
 from itertools import islice
-from typing import TYPE_CHECKING, Optional, Union, assert_never
+from typing import TYPE_CHECKING, Any, Optional, Union, assert_never
 from collections.abc import Awaitable, Callable, Sequence
 
 import discord
@@ -297,7 +298,7 @@ async def queue_source(
     analytics: Analytics,
     origin: str,
     mode: ResolveMode,
-    pool_slot: Optional[asyncio.Semaphore] = None,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
     """Resolve a parsed source into something enqueueable. `analytics` is the
@@ -584,7 +585,7 @@ async def _resolve_interjection_source(
     source: Union[SpotifySource, YTSource, SoundcloudSource],
     *,
     origin: str,
-    pool_slot: Optional[asyncio.Semaphore] = None,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     cog: MusicBot,
 ) -> tuple[QueueObject, list[QueueItem]]:
     """Resolve an interjection's input into (head, everything behind it). The

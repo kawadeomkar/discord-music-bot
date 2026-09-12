@@ -10,14 +10,18 @@ import orjson
 import redis.asyncio as aioredis
 
 import pytest
+import discord
 from discord.ext import commands
 
 from src.musicbot import MusicBot
+from src.config import PLAY_RESOLVE_CONCURRENCY
 from src.play_placement import (
     PlayArgs,
     _GuildPlays,
     PlayMode,
+    ResolveWaitExpired,
     play_key,
+    slow_resolve_notice,
     split_play_args,
 )
 from tests.helpers import (
@@ -459,3 +463,133 @@ class TestPlacedMeansLanded:
             assert verdict.placed
 
         assert req.placed
+
+
+class TestResolveSlot:
+    """The guild's resolve bound, with a deadline on the WAIT for it. The
+    extraction it guards stays unbounded — the slot exists to queue expensive work,
+    so a bound covering it would cancel the resolve it was sized for."""
+
+    async def test_a_free_slot_is_entered_without_waiting(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        slot = music_bot._plays.resolve_slot(req)
+        async with slot:
+            pass  # released on exit; a second entry proves it
+
+        async with music_bot._plays.resolve_slot(req):
+            pass
+
+    async def test_the_extraction_holding_a_slot_is_not_bounded(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The whole point of the split: a 5,547-track playlist runs 99s inside the
+        slot and must not be cut off by the bound on queueing FOR one."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
+            async with music_bot._plays.resolve_slot(req):
+                # Comfortably past the wait bound, inside the slot.
+                await asyncio.sleep(0.15)
+
+    async def test_a_slot_that_never_frees_expires_the_wait(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        # Take every slot and never give one back.
+        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+            await plays.resolves.acquire()
+
+        with (
+            patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05),
+            recording_span() as span,
+            pytest.raises(ResolveWaitExpired),
+        ):
+            async with music_bot._plays.resolve_slot(req):
+                pass  # pragma: no cover - the acquire above never returns
+        span.set_attribute.assert_any_call("play.resolve_wait_expired", True)
+
+    async def test_an_expired_wait_releases_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """__aexit__ does not run for an __aenter__ that raised. A release here
+        would hand out a permit the guild never held, uncapping the bound."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+            await plays.resolves.acquire()
+
+        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
+            with pytest.raises(ResolveWaitExpired):
+                async with music_bot._plays.resolve_slot(req):
+                    pass  # pragma: no cover
+        assert plays.resolves.locked()
+
+    async def test_a_slot_freed_inside_the_bound_is_taken(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+            await plays.resolves.acquire()
+
+        async def _free() -> None:
+            await asyncio.sleep(0.02)
+            plays.resolves.release()
+
+        freeing = asyncio.create_task(_free())
+        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 5.0):
+            async with music_bot._plays.resolve_slot(req):
+                entered = True
+        await freeing
+        assert entered
+
+
+class TestSlowResolveNotice:
+    """A request that outlives the delay says so, and takes the message back when
+    it lands. Silence is what the concurrent resolve costs the user: nothing is
+    serialized, so there is no queue position to report — only that work is on."""
+
+    async def test_a_fast_resolve_says_nothing(self, mock_ctx: MagicMock) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 5.0):
+            async with slow_resolve_notice(mock_ctx):
+                pass
+        mock_ctx.channel.send.assert_not_awaited()
+
+    async def test_a_slow_resolve_posts_and_retracts(self, mock_ctx: MagicMock) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx):
+                await asyncio.sleep(0.08)
+        mock_ctx.channel.send.assert_awaited_once()
+        mock_ctx.channel.send.return_value.delete.assert_awaited_once()
+
+    async def test_the_notice_never_becomes_the_now_playing_host(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the
+        NP host, and deleting it would drag the live progress bar onto it."""
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx):
+                await asyncio.sleep(0.08)
+        mock_ctx.send.assert_not_awaited()
+
+    async def test_a_send_that_fails_leaves_the_request_alone(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.channel.send.side_effect = discord.HTTPException(
+            MagicMock(), "no perms"
+        )
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx):
+                await asyncio.sleep(0.08)
+
+    async def test_the_body_raising_still_retracts_the_notice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            with pytest.raises(RuntimeError):
+                async with slow_resolve_notice(mock_ctx):
+                    await asyncio.sleep(0.08)
+                    raise RuntimeError("resolve failed")
+        mock_ctx.channel.send.return_value.delete.assert_awaited_once()

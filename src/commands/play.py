@@ -16,7 +16,9 @@ from src.play_placement import (
     NEXT_FLAG,
     NOW_FLAG,
     PlaceStalled,
+    ResolveWaitExpired,
     resolve_mode_for,
+    slow_resolve_notice,
     Placement,
     PlayArgs,
     PlayMode,
@@ -89,6 +91,11 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
         # The interject route only: _resolve_and_place reports its own, and
         # there is no gate hold to unwind here and nothing to abandon.
         await ctx.send(embed=_place_stalled_notice(before_the_put=stall.before_the_put))
+    except ResolveWaitExpired:
+        # Reported here rather than at the resolve: the cold path's handler around
+        # queue_source unwinds a join, and reporting a full pool as a failed join
+        # would name the wrong subsystem.
+        await ctx.send(embed=_resolve_wait_notice())
     finally:
         cog._plays.retire(req)
 
@@ -198,6 +205,10 @@ async def _resolve_and_place(
     be followed by an await before the gate hold is released."""
     qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
     async with contextlib.AsyncExitStack() as stack:
+        # Entered before the gate hold so it unwinds AFTER it: retracting the
+        # notice awaits its poster, and an await between the teardown decision and
+        # the hold release is exactly what this path may not have.
+        await stack.enter_async_context(slow_resolve_notice(ctx))
         # The cold-start gate hold lives on its own stack, so the path that PLACES
         # can release it the moment the put lands rather than holding the first note
         # behind a confirmation embed. aclose() is idempotent — an already-unwound
@@ -378,6 +389,17 @@ def _restore_unreachable_notice() -> discord.Embed:
     return notice_embed(
         "Couldn't reach this server's saved queue, so your song wasn't queued — "
         "try again in a moment.",
+        discord.Color.red(),
+    )
+
+
+def _resolve_wait_notice() -> discord.Embed:
+    """What a request that never reached yt-dlp may claim. It queued for a slot and
+    gave up before any extraction began, so nothing was searched and nothing was
+    queued — unlike a stalled place, "try again" here cannot duplicate a song."""
+    return notice_embed(
+        "This server has too many songs being looked up right now, so yours "
+        "wasn't queued — try again in a moment.",
         discord.Color.red(),
     )
 

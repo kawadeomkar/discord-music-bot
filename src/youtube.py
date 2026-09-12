@@ -1040,7 +1040,7 @@ def _inflight_key(cache_key: str, profile: str) -> str:
 
 
 def _held(
-    slot: Optional[asyncio.Semaphore],
+    slot: Optional[contextlib.AbstractAsyncContextManager[Any]],
 ) -> contextlib.AbstractAsyncContextManager[Any]:
     """`slot` as an async context manager, or nothing to hold. A resolve reached
     outside a command (a lazy entry at dequeue, a test) passes None."""
@@ -1048,7 +1048,8 @@ def _held(
 
 
 async def _gated_extract(
-    request: ExtractRequest, pool_slot: Optional[asyncio.Semaphore]
+    request: ExtractRequest,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]],
 ) -> Optional[YTDLExtractResult]:
     """One extraction, holding the requesting guild's pool slot for as long as it
     runs. The wait for the slot belongs to the job rather than to _extract_once, so
@@ -1058,7 +1059,10 @@ async def _gated_extract(
 
 
 async def _extract_once(
-    key: str, request: ExtractRequest, *, pool_slot: Optional[asyncio.Semaphore] = None
+    key: str,
+    request: ExtractRequest,
+    *,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
 ) -> Optional[YTDLExtractResult]:
     """One extraction per distinct query at a time, process-wide: N users pasting the
     same link are N identical jobs against a four-worker pool, racing to write one
@@ -1092,7 +1096,7 @@ async def _extract_for_source(
     request: ExtractRequest,
     search: str,
     *,
-    pool_slot: Optional[asyncio.Semaphore] = None,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
 ) -> Optional[YTDLExtractResult]:
     """yt_source's extraction, shared by its two request profiles so that an input
     yt-dlp refuses fails identically whichever one asked."""
@@ -1538,7 +1542,7 @@ class YTDL(discord.FFmpegOpusAudio):
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
         flat: bool = False,
-        pool_slot: Optional[asyncio.Semaphore] = None,
+        pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject, from the source cache
         when present. flat=True answers a SEARCH from one search POST when the
@@ -1710,7 +1714,7 @@ class YTDL(discord.FFmpegOpusAudio):
         analytics: Analytics,
         user_input: str,
         redis: Optional[aioredis.Redis] = None,
-        pool_slot: Optional[asyncio.Semaphore] = None,
+        pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist.
 

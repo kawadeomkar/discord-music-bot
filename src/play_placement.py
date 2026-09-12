@@ -17,9 +17,14 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
-from src.config import PLAY_INFLIGHT_MAX, PLAY_RESOLVE_CONCURRENCY
+from src.config import (
+    PLAY_INFLIGHT_MAX,
+    PLAY_RESOLVE_CONCURRENCY,
+    PLAY_RESOLVE_WAIT_SECS,
+    PLAY_SLOW_NOTICE_SECS,
+)
 from src.musicplayer import MusicPlayer
-from src.util import get_logger, record_span_error, spawn_background
+from src.util import get_logger, notice_embed, record_span_error, spawn_background
 
 log = get_logger(__name__)
 
@@ -221,6 +226,93 @@ class PlaceStalled(Exception):
         self.before_the_put = before_the_put
 
 
+class ResolveWaitExpired(Exception):
+    """PLAY_RESOLVE_WAIT_SECS elapsed queueing for one of the guild's resolve
+    slots, before any yt-dlp work began. Raised in place of a wait with no end:
+    the caller renders it, so the request that never started says so."""
+
+    def __init__(self) -> None:
+        super().__init__(f"resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
+
+
+class ResolveSlot:
+    """One guild's resolve bound, entered per extraction, with a deadline on the
+    WAIT alone — the extraction inside is deliberately unbounded. Stateless per
+    entry, because one resolve can enter it more than once: the count lives in the
+    semaphore, and each `async with` owns only its own acquire.
+    See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait."""
+
+    __slots__ = ("_sem",)
+
+    def __init__(self, sem: asyncio.Semaphore) -> None:
+        self._sem = sem
+
+    async def __aenter__(self) -> None:
+        waited = time.monotonic()
+        try:
+            async with asyncio.timeout(PLAY_RESOLVE_WAIT_SECS):
+                await self._sem.acquire()
+        except TimeoutError as e:
+            # Nothing was acquired, and __aexit__ does not run for an __aenter__
+            # that raised — so releasing here would hand out a permit the guild
+            # never held and uncap the bound.
+            span = trace.get_current_span()
+            span.set_attribute("play.resolve_wait_expired", True)
+            record_span_error(span, e)
+            log.warning(f"Resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
+            raise ResolveWaitExpired() from e
+        trace.get_current_span().set_attribute(
+            "play.resolve_wait_secs", round(time.monotonic() - waited, 3)
+        )
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self._sem.release()
+
+
+@contextlib.asynccontextmanager
+async def slow_resolve_notice(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Say that a request is still being looked up once it outlives
+    PLAY_SLOW_NOTICE_SECS, and take the message back when it lands.
+
+    ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the Now
+    Playing host, so deleting it would drag the live progress bar onto it.
+    See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait."""
+    posted: Optional[discord.Message] = None
+    settled = asyncio.Event()
+
+    async def _post() -> None:
+        nonlocal posted
+        try:
+            async with asyncio.timeout(PLAY_SLOW_NOTICE_SECS):
+                await settled.wait()
+        except TimeoutError:
+            pass
+        else:
+            # Landed inside the delay, which is the common case: say nothing.
+            return
+        with contextlib.suppress(discord.HTTPException):
+            posted = await ctx.channel.send(
+                embed=notice_embed(
+                    "Still looking that one up — it will be queued as soon as it "
+                    "resolves.",
+                    discord.Color.orange(),
+                )
+            )
+
+    notice = asyncio.create_task(_post())
+    try:
+        yield
+    finally:
+        settled.set()
+        # Awaited, not abandoned: the task owns `posted`, so a delete racing its
+        # send would read None and leave the notice standing forever.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await notice
+        if posted is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await posted.delete()
+
+
 @dataclass(slots=True, eq=False)
 class PlayRequest:
     """One -play between dispatch and reply. `mp` and `generation` are the world at
@@ -321,9 +413,11 @@ class PlayRegistry:
         if plays.idle():
             self._guilds.pop(req.guild_id, None)
 
-    def resolve_slot(self, req: PlayRequest) -> asyncio.Semaphore:
-        """The guild's bound on how many of its requests hold a yt-dlp worker."""
-        return self._guilds[req.guild_id].resolves
+    def resolve_slot(self, req: PlayRequest) -> ResolveSlot:
+        """The guild's bound on how many of its requests hold a yt-dlp worker, with
+        the deadline on queueing for it. A fresh wrapper per call: it holds the
+        semaphore alone, and every acquire is owned by its own `async with`."""
+        return ResolveSlot(self._guilds[req.guild_id].resolves)
 
     def sibling_placed(self, req: PlayRequest) -> bool:
         """Whether another of this guild's in-flight -plays has already landed — what
