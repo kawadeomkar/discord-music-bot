@@ -842,13 +842,14 @@ class TestRealWorkerProcess:
 
 class TestDefaults:
     def test_worker_count_defaults_from_the_environment(self) -> None:
-        """YTDLP_POOL_WORKERS is read once at import; the constructor default carries
-        it, so a pool built with no arguments is the env-configured one."""
-        import src.ytdlp_pool as module
+        """YTDLP_POOL_WORKERS is read once, by config at import; the constructor
+        default carries it, so a pool built with no arguments is the env-configured
+        one."""
+        from src import config
 
         pool = YtdlpPool()
 
-        assert pool._max_workers == module._DEFAULT_WORKERS
+        assert pool._max_workers == config.YTDLP_POOL_WORKERS
 
     def test_explicit_worker_count_overrides_the_default(self) -> None:
         assert YtdlpPool(max_workers=7)._max_workers == 7

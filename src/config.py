@@ -29,17 +29,9 @@ def infer_environment_from_git() -> Optional[str]:
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
-# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
-# default outside Docker) skips the task.
-LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
-LIVENESS_INTERVAL_SECS: float = float(os.environ.get("LIVENESS_INTERVAL_SECS", "15.0"))
-
-NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
-    os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
-)
-
-
-def _float_env(name: str, default: float, *, minimum: float) -> float:
+def _float_env(
+    name: str, default: float, *, minimum: float, maximum: Optional[float] = None
+) -> float:
     """Float knob from the environment; empty reads as unset. Non-finite is
     refused separately from the floor: `inf` never expires a dashboard deadline
     (the command then holds its concurrency slot forever) and a tick of 0 turns
@@ -58,6 +50,8 @@ def _float_env(name: str, default: float, *, minimum: float) -> float:
         raise ValueError(f"{name} must be a finite number; got {raw!r}")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}; got {value}")
     return value
 
 
@@ -133,6 +127,41 @@ HEARTBEAT_INTERVAL_SECS: float = _float_env(
     "HEARTBEAT_INTERVAL_SECS", 3.0, minimum=_MIN_HEARTBEAT_SECS
 )
 
+# Every playing tick is a real edit on the channel's 5-edits-per-5s bucket, which the
+# bar shares with every other message the bot edits there.
+_MIN_NOW_PLAYING_SECS: Final[float] = 1.0
+
+# How often the Now Playing card's progress bar is edited.
+NOW_PLAYING_UPDATE_INTERVAL_SECS: float = _float_env(
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0, minimum=_MIN_NOW_PLAYING_SECS
+)
+
+# A probe that does not finish is UNCONFIRMED, so a near-zero cap confirms nothing,
+# and three in a row mark the probe path itself as the fault.
+_MIN_STREAM_PROBE_SECS: Final[float] = 0.1
+
+# Cap on the pre-playback URL probe. Short because a resolve can pay it twice
+# and exceeding it costs a cache entry, not only a verdict; an unconfirmed URL
+# still plays, so firing early is cheap.
+STREAM_PROBE_TIMEOUT_SECS: float = _float_env(
+    "STREAM_PROBE_TIMEOUT_SECS", 2.0, minimum=_MIN_STREAM_PROBE_SECS
+)
+
+# The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
+# is capped well under that; the floor keeps the touch a cadence, not a spin.
+_MIN_LIVENESS_SECS: Final[float] = 1.0
+_MAX_LIVENESS_SECS: Final[float] = 60.0
+
+# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
+# default outside Docker) skips the task.
+LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
+LIVENESS_INTERVAL_SECS: float = _float_env(
+    "LIVENESS_INTERVAL_SECS",
+    15.0,
+    minimum=_MIN_LIVENESS_SECS,
+    maximum=_MAX_LIVENESS_SECS,
+)
+
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     """Integer knob from the environment; empty reads as unset. Negatives are
@@ -151,6 +180,10 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return value
 
 
+# Extraction worker processes (src/ytdlp_pool.py), ~80–120 MB RSS each. The pool is
+# sized when it spawns, so this is read once and never changes at runtime.
+YTDLP_POOL_WORKERS: int = _int_env("YTDLP_POOL_WORKERS", 4, minimum=1)
+
 # Opt-in ceiling on the history outbox, in entries; 0 is unbounded (the
 # durability contract). A cap destroys the OLDEST entries, which exist nowhere
 # else, so every drop logs ERROR. Enforced after each drain batch and against
@@ -162,21 +195,35 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 # PgBouncer, where each transaction lands on a backend that never saw the handle.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
+# Zero admits nothing: every -play declined, or every resolve waiting on a slot
+# that never opens, with no error to say why.
+_MIN_PLAY_COUNT: Final[int] = 1
+# A shorter wait declines a request whenever every slot is busy at all.
+_MIN_PLAY_RESOLVE_WAIT_SECS: Final[float] = 1.0
+# Below it the notice posts, and is taken back, for nearly every -play.
+_MIN_PLAY_SLOW_NOTICE_SECS: Final[float] = 0.5
+
 # Per-guild ceiling on -play requests ADMITTED at once. Its unit is one coroutine,
 # one open span and one typing keepalive — memory, not pool time, which
 # PLAY_RESOLVE_CONCURRENCY below bounds instead.
-PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=1)
+PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=_MIN_PLAY_COUNT)
 # How many admitted requests may hold a yt-dlp worker at once. The pool is
 # process-wide and FIFO, so a paste burst in one guild queues every other guild's
 # in-band extractions behind it. Half the default pool.
-PLAY_RESOLVE_CONCURRENCY: int = _int_env("PLAY_RESOLVE_CONCURRENCY", 2, minimum=1)
+PLAY_RESOLVE_CONCURRENCY: int = _int_env(
+    "PLAY_RESOLVE_CONCURRENCY", 2, minimum=_MIN_PLAY_COUNT
+)
 # Bound on the WAIT for one of those slots, never on the extraction holding it: a
 # 5,547-track playlist legitimately runs 99s, and cutting it off would fail the
 # request it is serving. See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait.
-PLAY_RESOLVE_WAIT_SECS: float = _float_env("PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=1.0)
+PLAY_RESOLVE_WAIT_SECS: float = _float_env(
+    "PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=_MIN_PLAY_RESOLVE_WAIT_SECS
+)
 # How long a request resolves before it says so. Above the 1–4s a warm resolve
 # takes, so the notice marks the unusual rather than narrating every -play.
-PLAY_SLOW_NOTICE_SECS: float = _float_env("PLAY_SLOW_NOTICE_SECS", 6.0, minimum=0.5)
+PLAY_SLOW_NOTICE_SECS: float = _float_env(
+    "PLAY_SLOW_NOTICE_SECS", 6.0, minimum=_MIN_PLAY_SLOW_NOTICE_SECS
+)
 
 
 def _parse_bool_env(name: str) -> bool:

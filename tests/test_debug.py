@@ -3224,3 +3224,28 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
         assert literal_rows == [], (
             f"hardcoded fallbacks that must read config.py: {literal_rows}"
         )
+
+    def test_every_env_knob_config_parses_has_a_row(self) -> None:
+        """A knob config.py parses from the environment but -debug does not list is
+        a value the operator cannot see from chat. Discovered from the parse calls
+        themselves, so a knob added later without a row fails here."""
+        import ast
+        import inspect
+
+        from src import config
+        from src.debug import _CONFIG_ALLOWLIST
+
+        parsed: set[str] = set()
+        for node in ast.walk(ast.parse(inspect.getsource(config))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("_float_env", "_int_env")
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                parsed.add(str(node.args[0].value))
+
+        assert "NOW_PLAYING_UPDATE_INTERVAL_SECS" in parsed, "discovery found nothing"
+        rows = {var.name for var in _CONFIG_ALLOWLIST}
+        assert sorted(parsed - rows) == []

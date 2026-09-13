@@ -308,7 +308,11 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         kind=_ConfigKind.VALUE,
         fallback=str(config.POSTGRES_STATEMENT_CACHE),
     ),
-    _ConfigVar(name="YTDLP_POOL_WORKERS", kind=_ConfigKind.VALUE, fallback="4"),
+    _ConfigVar(
+        name="YTDLP_POOL_WORKERS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.YTDLP_POOL_WORKERS),
+    ),
     _ConfigVar(
         name="PLAY_INFLIGHT_MAX",
         kind=_ConfigKind.VALUE,
@@ -338,6 +342,22 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         name="HEARTBEAT_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
         fallback=str(config.HEARTBEAT_INTERVAL_SECS),
+    ),
+    _ConfigVar(
+        name="STREAM_PROBE_TIMEOUT_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.STREAM_PROBE_TIMEOUT_SECS),
+    ),
+    _ConfigVar(
+        name="ANALYTICS_RENDER_DEADLINE_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.ANALYTICS_RENDER_DEADLINE_SECS),
+    ),
+    _ConfigVar(name="LIVENESS_FILE", kind=_ConfigKind.VALUE),
+    _ConfigVar(
+        name="LIVENESS_INTERVAL_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.LIVENESS_INTERVAL_SECS),
     ),
     _ConfigVar(
         name="PING_TICK_SECS",

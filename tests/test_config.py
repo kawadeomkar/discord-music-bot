@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -431,6 +431,28 @@ class TestFloatEnv:
         with pytest.raises(ValueError, match="KNOB must be a number"):
             _float_env("KNOB", 1.0, minimum=0.05)
 
+    def test_above_the_maximum_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", "60.5")
+        with pytest.raises(ValueError, match="KNOB must be <= 60.0"):
+            _float_env("KNOB", 1.0, minimum=1.0, maximum=60.0)
+
+    @pytest.mark.parametrize("raw", ["1.0", "60.0"])
+    def test_both_bounds_are_inclusive(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        assert _float_env("KNOB", 5.0, minimum=1.0, maximum=60.0) == float(raw)
+
+    def test_no_maximum_leaves_the_top_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Optional, so the existing minimum-only knobs keep accepting any finite
+        value above their floor."""
+        monkeypatch.setenv("KNOB", "1e9")
+        assert _float_env("KNOB", 1.0, minimum=0.05) == 1e9
+
 
 class TestPlayBounds:
     """The two -play knobs, and the floor that keeps them meaningful."""
@@ -462,6 +484,95 @@ class TestPlayBounds:
         monkeypatch.setenv(name, "0")
         with pytest.raises(ValueError, match=name):
             importlib.reload(config)
+
+
+class TestEnvFloors:
+    """The knobs that used to be raw float()/int() reads, now refused at import
+    below their floor instead of reaching a loop that spins or a pool of zero."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload, as TestPlayBounds does: teardown runs ahead of
+        monkeypatch's own, so a reload here would re-read the value under test."""
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    @staticmethod
+    def _reload(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        return importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        ("name", "default"),
+        [
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0),
+            ("STREAM_PROBE_TIMEOUT_SECS", 2.0),
+            ("LIVENESS_INTERVAL_SECS", 15.0),
+            ("YTDLP_POOL_WORKERS", 4),
+        ],
+    )
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_is_the_default(
+        self,
+        name: str,
+        default: float,
+        raw: Optional[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, raw)
+        assert getattr(self._reload(monkeypatch), name) == default
+
+    @pytest.mark.parametrize(
+        ("name", "raw", "message"),
+        [
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", "0.5", ">= 1.0"),
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", "0", ">= 1.0"),
+            ("STREAM_PROBE_TIMEOUT_SECS", "0.05", ">= 0.1"),
+            ("LIVENESS_INTERVAL_SECS", "0.5", ">= 1.0"),
+            ("LIVENESS_INTERVAL_SECS", "61", "<= 60.0"),
+            ("YTDLP_POOL_WORKERS", "0", ">= 1"),
+        ],
+    )
+    def test_outside_the_bounds_refuses_startup(
+        self, name: str, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(name, raw)
+        with pytest.raises(ValueError, match=f"{name} must be {re.escape(message)}"):
+            self._reload(monkeypatch)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "NOW_PLAYING_UPDATE_INTERVAL_SECS",
+            "STREAM_PROBE_TIMEOUT_SECS",
+            "LIVENESS_INTERVAL_SECS",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            ("nan", "a finite number"),
+            ("inf", "a finite number"),
+            ("3s", "a number"),
+        ],
+    )
+    def test_non_finite_or_garbage_names_the_variable(
+        self, name: str, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(name, raw)
+        with pytest.raises(ValueError, match=f"{name} must be {message}"):
+            self._reload(monkeypatch)
+
+    def test_a_fractional_worker_count_names_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YTDLP_POOL_WORKERS", "2.5")
+        with pytest.raises(ValueError, match="YTDLP_POOL_WORKERS must be an integer"):
+            self._reload(monkeypatch)
 
 
 class TestArchiveTunables:

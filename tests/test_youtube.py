@@ -3098,7 +3098,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
     async def test_yt_source_returns_before_the_probe_finishes(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
-        """The probe is a network round trip bounded only by _STREAM_PROBE_TIMEOUT,
+        """The probe is a network round trip bounded only by STREAM_PROBE_TIMEOUT_SECS,
         and the reply needs identity, not a probed URL."""
         release = asyncio.Event()
 
@@ -4376,10 +4376,11 @@ class TestProbeSessionSharing:
         a dropped timeout would leave every probe on aiohttp's 5-minute default,
         stalling a song start behind a CDN that never answers."""
         import src.youtube as youtube
+        from src import config
 
         session = youtube._get_probe_session()
         try:
-            assert session.timeout.total == youtube._STREAM_PROBE_TIMEOUT
+            assert session.timeout.total == config.STREAM_PROBE_TIMEOUT_SECS
         finally:
             await youtube.close_probe_session()
 

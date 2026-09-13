@@ -511,13 +511,13 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox — meaningful only while the archive is enabled (disabled, the outbox is never written). `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. A drop here is unrecoverable: the Redis history list is capped at 50 entries per guild, so anything older that the cap discards existed only in the outbox. See [Operating the play-history archive](#operating-the-play-history-archive) |
 | `ENVIRONMENT` | | `development`; inferred from the git branch (`main` → `production`) when unset and a repo is present | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
-| `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
+| `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck. Floored at 1 |
 | `PLAY_INFLIGHT_MAX` | | `16` | Per-server ceiling on `-play` requests admitted at once; past it a request is declined. One admitted request is one coroutine, one open span and one typing keepalive, so this bounds memory — pool time is `PLAY_RESOLVE_CONCURRENCY` below. Floored at 1 |
 | `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused, for as long as `PLAY_RESOLVE_WAIT_SECS` allows. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
 | `PLAY_RESOLVE_WAIT_SECS` | | `120.0` | How long a request waits for one of those slots before giving up. Bounds the WAIT alone, never the lookup holding the slot — a 5,547-track playlist legitimately runs 99s, and cutting that off would fail the request it is serving. Waiting is the half that produces nothing, so leaving it unbounded is what makes a busy bot look like a stopped one. Generous on purpose: every second of it can be another member's legitimate lookup, and expiring early is a refusal nobody needed. A request that expires is declined having looked up and queued nothing, so trying again cannot double-queue the song. Floored at 1.0 |
 | `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a single-track `-play` takes before the bot says it is still looking the song up; a playlist shows the live progress card instead. One notice per channel at a time, and the message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5 |
-| `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
-| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
+| `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine. Floored at 0.1 |
+| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card. Floored at 1.0: every edit counts against the channel's rate limit, which the bot's other messages share |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
 | `QUEUE_PROGRESS_DELAY_SECS` | | `2.5` | How long a playlist enqueue resolves before the live progress card appears. Above the ~2.0s a ten-track collection takes end to end, so the common case still sees exactly what it saw before. One card per channel. Floored at 0.05 |
 | `QUEUE_PROGRESS_TICK_SECS` | | `5.0` | How often that card is re-rendered. Higher than the dashboards' 1.0s because it shares a channel with the Now Playing bar's 3.0s edits, and Discord allows ~5 edits per 5s per channel. The card only edits when the render actually changes: a card with a bar costs at most ten edits for a whole enqueue, while one with no total (a YouTube Mix) edits every 5s. Floored at 2.0 |
@@ -531,10 +531,28 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `DEBUG_DEADLINE_SECS` | | `8.0` | `-debug` snapshot: how long a block may collect before it renders `timed out`. Longer than `-ping`'s because each block does strictly more work (a Postgres stats query, a Prometheus round trip) and a straggler is not retried |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | | `20.0` | `-analytics`: how long to wait for the chart before sending the card without one. Sized for the COLD path, which dominates. Expiry is **silent** — the card still sends, just without its chart — so raise this rather than lower it if charts go missing |
 | `LIVENESS_FILE` | | — (`/tmp/bot-alive` in the image) | Path a loop-resident task touches every `LIVENESS_INTERVAL_SECS`, read by the container `HEALTHCHECK`. A stale mtime (>90s) means the event loop wedged while the process stayed up — something `restart: always` cannot see, because it only observes the process exiting. It **reports**; Compose takes no action on an unhealthy container. Not a dependency probe: a Redis blip must not mark the bot dead. Unset outside Docker, where the task never starts |
-| `LIVENESS_INTERVAL_SECS` | | `15.0` | How often that file is touched. Must stay well under the healthcheck's 90s staleness window |
+| `LIVENESS_INTERVAL_SECS` | | `15.0` | How often that file is touched. Must stay well under the healthcheck's 90s staleness window, so it is accepted between 1 and 60 |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.39.0
+
+**Four settings now refuse startup when they are out of range**, the way the other
+tunables already did. Each used to be read with no check at all, so a typo reached the
+loop that uses it:
+
+| Variable | Accepted | What an out-of-range value used to do |
+|---|---|---|
+| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | 1.0 or more | `0` edited the Now Playing card back to back, spending the rate limit the channel's other messages share |
+| `STREAM_PROBE_TIMEOUT_SECS` | 0.1 or more | `0` or a negative value removed the timeout entirely, so a stream host that never answered held a song's start |
+| `LIVENESS_INTERVAL_SECS` | 1 to 60 | above 90, a healthy container reported unhealthy between touches |
+| `YTDLP_POOL_WORKERS` | 1 or more | `0` failed every lookup, each time the pool tried to start |
+
+A value outside its range, `nan`, `inf`, or something that is not a number now stops the
+bot at startup with an error naming the variable, instead of starting. If yours start as
+before, nothing changes: every default is inside its range. Rolling back is only a
+redeploy.
 
 ## Upgrading to 2.37.0
 
