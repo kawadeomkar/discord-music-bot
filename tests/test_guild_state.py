@@ -20,8 +20,16 @@ from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     Analytics,
+    BotConfigField,
+    BotConfigFieldName,
+    CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
+    OFF_SECS,
+    ConfigDomain,
     ConfigField,
+    ConfigFieldName,
+    ResettableConfigField,
+    is_config_field,
     GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -1963,3 +1971,79 @@ class TestUnusableZoneCache:
             assert len(guild_state._UNUSABLE_ZONES) == guild_state._MAX_UNUSABLE_ZONES
         finally:
             guild_state._UNUSABLE_ZONES.clear()
+
+
+def _members(cls: type) -> set[str]:
+    return {v for k, v in vars(cls).items() if k.isupper()}
+
+
+class TestConfigFieldNames:
+    """The Literal aliases type every call that names a config field, so they must
+    not drift from the constants spelled out on the classes."""
+
+    def test_the_alias_is_the_config_field_members(self) -> None:
+        from typing import get_args
+
+        assert set(get_args(ConfigFieldName.__value__)) == _members(ConfigField)
+
+    def test_every_field_but_volume_is_resettable_by_name(self) -> None:
+        """volume has its own reset, which also clears the legacy :state copy."""
+        from typing import get_args
+
+        resettable = set(get_args(ResettableConfigField.__value__))
+        assert resettable == _members(ConfigField) - {ConfigField.VOLUME}
+
+    def test_the_bot_alias_is_the_bot_field_members(self) -> None:
+        from typing import get_args
+
+        assert set(get_args(BotConfigFieldName.__value__)) == _members(BotConfigField)
+
+    def test_is_config_field(self) -> None:
+        assert is_config_field("slow_notice_secs")
+        assert not is_config_field("heartbeat_interval_secs")
+        assert not is_config_field("writer_app_id")
+
+
+class TestConfigDomain:
+    @pytest.mark.parametrize(
+        ("value", "admitted"),
+        [
+            (4.0, True),
+            (60.0, True),
+            (3.99, False),
+            (60.01, False),
+            (float("nan"), False),
+            (float("inf"), False),
+        ],
+    )
+    def test_bounds_are_inclusive_and_nan_is_refused(
+        self, value: float, admitted: bool
+    ) -> None:
+        assert ConfigDomain(4.0, 60.0).admits(value) is admitted
+
+    def test_off_is_admitted_only_where_the_domain_says_so(self) -> None:
+        assert ConfigDomain(4.0, 60.0, off=True).admits(OFF_SECS)
+        assert not ConfigDomain(4.0, 60.0).admits(OFF_SECS)
+
+    def test_every_numeric_config_field_has_a_domain(self) -> None:
+        numeric = _members(ConfigField) - {ConfigField.DEBUG_MODE, ConfigField.TIMEZONE}
+        assert set(CONFIG_DOMAIN) == numeric
+
+    def test_np_refresh_floor_is_the_bot_knob_env_floor(self) -> None:
+        """The lowest bot value an operator can run; guild_state cannot import config
+        to read it, so the two are pinned here."""
+        from src import config
+
+        assert CONFIG_DOMAIN[ConfigField.NP_REFRESH].lo == config.env_floor(
+            "NOW_PLAYING_UPDATE_INTERVAL_SECS"
+        )
+
+    def test_the_timeout_defaults_are_their_domain_floors(self) -> None:
+        assert (
+            CONFIG_DOMAIN[ConfigField.IDLE_TIMEOUT].lo
+            == guild_state.DEFAULT_IDLE_TIMEOUT_SECS
+        )
+        assert (
+            CONFIG_DOMAIN[ConfigField.ALONE_TIMEOUT].lo
+            == guild_state.DEFAULT_ALONE_TIMEOUT_SECS
+        )

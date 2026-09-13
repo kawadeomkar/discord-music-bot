@@ -1303,3 +1303,47 @@ class TestDebugPrometheusUrl:
     def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
         assert debug_prometheus_url() == "http://localhost:9090"
+
+
+class TestBotKnobDeclarations:
+    """The names -settings may override, and what the registry asserts against."""
+
+    def test_every_knob_names_a_parsed_constant_of_its_type(self) -> None:
+        for knob in config.FLOAT_KNOBS:
+            assert type(getattr(config, knob)) is float, knob
+            assert type(config.baseline(knob)) is float, knob
+        for knob in config.INT_KNOBS:
+            assert type(getattr(config, knob)) is int, knob
+            assert type(config.baseline(knob)) is int, knob
+
+    def test_the_two_sets_are_disjoint(self) -> None:
+        assert not config.FLOAT_KNOBS & config.INT_KNOBS
+
+    def test_is_int_knob(self) -> None:
+        assert config.is_int_knob("PLAY_INFLIGHT_MAX")
+        assert not config.is_int_knob("PING_TICK_SECS")
+
+    def test_baseline_is_read_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(config, "PING_TICK_SECS", 2.5)
+        assert config.baseline("PING_TICK_SECS") == 2.5
+
+    @pytest.mark.parametrize(
+        ("knob", "floor"),
+        [
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", 1.0),
+            ("HEARTBEAT_INTERVAL_SECS", 0.5),
+            ("STREAM_PROBE_TIMEOUT_SECS", 0.1),
+            ("PING_TICK_SECS", 0.05),
+            ("PLAY_INFLIGHT_MAX", 1),
+        ],
+    )
+    def test_env_floor_is_the_minimum_the_parse_enforced(
+        self, knob: config.FloatKnob | config.IntKnob, floor: float
+    ) -> None:
+        assert config.env_floor(knob) == floor
+
+    def test_every_knob_has_a_recorded_floor(self) -> None:
+        for knob in config.FLOAT_KNOBS | config.INT_KNOBS:
+            assert config.env_floor(knob) >= 0, knob

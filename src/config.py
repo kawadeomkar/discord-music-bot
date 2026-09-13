@@ -2,7 +2,7 @@ import math
 import os
 import subprocess
 from enum import Enum
-from typing import Final, Optional
+from typing import Final, Literal, Optional, TypeIs, cast, get_args, overload
 from urllib.parse import unquote, urlsplit
 
 # Read from the environment alone so importing runs no subprocess. main() may
@@ -29,6 +29,12 @@ def infer_environment_from_git() -> Optional[str]:
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
+# The `minimum=` each _float_env/_int_env call enforced, by variable. The -settings
+# registry holds every chat minimum against it, so the floor it checks is the one the
+# parse applied.
+_ENV_FLOORS: Final[dict[str, float]] = {}
+
+
 def _float_env(
     name: str, default: float, *, minimum: float, maximum: Optional[float] = None
 ) -> float:
@@ -36,6 +42,7 @@ def _float_env(
     refused separately from the floor: `inf` never expires a dashboard deadline
     (the command then holds its concurrency slot forever) and a tick of 0 turns
     the driver's timed wait into a hot spin."""
+    _ENV_FLOORS[name] = minimum
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         # Checked too: a floor derived from other knobs can rise past a default.
@@ -146,6 +153,9 @@ _MIN_STREAM_PROBE_SECS: Final[float] = 0.1
 STREAM_PROBE_TIMEOUT_SECS: float = _float_env(
     "STREAM_PROBE_TIMEOUT_SECS", 2.0, minimum=_MIN_STREAM_PROBE_SECS
 )
+# Not a knob: the most `-settings bot stream-probe-timeout` accepts. A resolve can
+# pay the probe twice, so this is already up to 10s of silence before a song starts.
+STREAM_PROBE_TIMEOUT_MAX_SECS: Final[float] = 5.0
 
 # The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
 # is capped well under that; the floor keeps the touch a cadence, not a spin.
@@ -168,6 +178,7 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     refused: `-1` reads as "no limit" but `if not OUTBOX_MAX` is truthy for it
     and `depth <= OUTBOX_MAX` never holds, so the drainer would trim the whole
     outbox. The message names the variable because it surfaces with no logger."""
+    _ENV_FLOORS[name] = minimum
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -224,6 +235,45 @@ PLAY_RESOLVE_WAIT_SECS: float = _float_env(
 PLAY_SLOW_NOTICE_SECS: float = _float_env(
     "PLAY_SLOW_NOTICE_SECS", 6.0, minimum=_MIN_PLAY_SLOW_NOTICE_SECS
 )
+
+# The tunables `-settings bot` may override, by the name of the constant holding
+# each one's environment value. Literal strings rather than an Enum: a reload of
+# this module would mint new enum classes that a registry built earlier fails
+# isinstance against.
+type FloatKnob = Literal[
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS",
+    "HEARTBEAT_INTERVAL_SECS",
+    "PLAY_SLOW_NOTICE_SECS",
+    "PLAY_RESOLVE_WAIT_SECS",
+    "STREAM_PROBE_TIMEOUT_SECS",
+    "PING_TICK_SECS",
+    "PING_DEADLINE_SECS",
+    "DEBUG_TICK_SECS",
+    "DEBUG_DEADLINE_SECS",
+    "ANALYTICS_RENDER_DEADLINE_SECS",
+]
+type IntKnob = Literal["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"]
+FLOAT_KNOBS: Final[frozenset[FloatKnob]] = frozenset(get_args(FloatKnob.__value__))
+INT_KNOBS: Final[frozenset[IntKnob]] = frozenset(get_args(IntKnob.__value__))
+
+
+def is_int_knob(knob: FloatKnob | IntKnob) -> TypeIs[IntKnob]:
+    return knob in INT_KNOBS
+
+
+@overload
+def baseline(knob: IntKnob) -> int: ...
+@overload
+def baseline(knob: FloatKnob) -> float: ...
+def baseline(knob: FloatKnob | IntKnob) -> float:
+    """The knob's value as parsed from the environment, read at call time so a
+    reload of this module is what it returns."""
+    return cast(float, globals()[knob])
+
+
+def env_floor(knob: FloatKnob | IntKnob) -> float:
+    """The `minimum=` the environment parse enforced for this knob."""
+    return _ENV_FLOORS[knob]
 
 
 def _parse_bool_env(name: str) -> bool:

@@ -1,5 +1,6 @@
 """
-Guild state schema — single source of truth for all Redis state stored per guild.
+Guild state schema — single source of truth for all Redis state stored per guild,
+and for the one bot-wide hash, bot:{application_id}:config.
 
 Each Redis hash and list has a frozen value object here; GuildRedisStore reads
 and writes through them and GuildQueue converts between at-rest entries and live
@@ -13,9 +14,11 @@ import logging
 import math
 import re
 from zoneinfo import ZoneInfo, available_timezones
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Final, Self, Union
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, Self, TypeIs, Union, get_args
 
 import orjson
 
@@ -167,18 +170,121 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
 
 
+type ConfigFieldName = Literal[
+    "debug_mode",
+    "volume",
+    "timezone",
+    "idle_timeout_secs",
+    "alone_timeout_secs",
+    "np_refresh_secs",
+    "slow_notice_secs",
+]
+# volume has its own reset, which also clears the legacy :state copy.
+type ResettableConfigField = Literal[
+    "debug_mode",
+    "timezone",
+    "idle_timeout_secs",
+    "alone_timeout_secs",
+    "np_refresh_secs",
+    "slow_notice_secs",
+]
+
+
 class ConfigField:
     """Wire field names for guild:{id}:config, spelled out so renaming a Python
-    attribute can never silently rename a Redis field."""
+    attribute can never silently rename a Redis field. Bare Final, so each member
+    is typed as its own Literal."""
 
-    DEBUG_MODE: Final[str] = "debug_mode"
-    VOLUME: Final[str] = "volume"
-    TIMEZONE: Final[str] = "timezone"
+    DEBUG_MODE: Final = "debug_mode"
+    VOLUME: Final = "volume"
+    TIMEZONE: Final = "timezone"
+    IDLE_TIMEOUT: Final = "idle_timeout_secs"
+    ALONE_TIMEOUT: Final = "alone_timeout_secs"
+    NP_REFRESH: Final = "np_refresh_secs"
+    SLOW_NOTICE: Final = "slow_notice_secs"  # OFF_SECS is off
+
+
+_CONFIG_FIELD_NAMES: Final[frozenset[str]] = frozenset(
+    get_args(ConfigFieldName.__value__)
+)
+
+
+def is_config_field(name: str) -> TypeIs[ConfigFieldName]:
+    return name in _CONFIG_FIELD_NAMES
+
+
+type BotConfigFieldName = Literal[
+    "now_playing_update_interval_secs",
+    "heartbeat_interval_secs",
+    "play_slow_notice_secs",
+    "play_inflight_max",
+    "play_resolve_concurrency",
+    "play_resolve_wait_secs",
+    "stream_probe_timeout_secs",
+    "ping_tick_secs",
+    "ping_deadline_secs",
+    "debug_tick_secs",
+    "debug_deadline_secs",
+    "analytics_render_deadline_secs",
+]
+
+
+class BotConfigField:
+    """Wire field names for bot:{application_id}:config: each is its env var in
+    lower case, so an override, its config accessor and its variable share a name."""
+
+    NOW_PLAYING_UPDATE_INTERVAL: Final = "now_playing_update_interval_secs"
+    HEARTBEAT_INTERVAL: Final = "heartbeat_interval_secs"
+    PLAY_SLOW_NOTICE: Final = "play_slow_notice_secs"
+    PLAY_INFLIGHT_MAX: Final = "play_inflight_max"
+    PLAY_RESOLVE_CONCURRENCY: Final = "play_resolve_concurrency"
+    PLAY_RESOLVE_WAIT: Final = "play_resolve_wait_secs"
+    STREAM_PROBE_TIMEOUT: Final = "stream_probe_timeout_secs"
+    PING_TICK: Final = "ping_tick_secs"
+    PING_DEADLINE: Final = "ping_deadline_secs"
+    DEBUG_TICK: Final = "debug_tick_secs"
+    DEBUG_DEADLINE: Final = "debug_deadline_secs"
+    ANALYTICS_RENDER_DEADLINE: Final = "analytics_render_deadline_secs"
 
 
 # The zone every guild renders ETAs in until it picks one; the schema layer
 # validates against the same default it hands back.
 DEFAULT_TIMEZONE: Final[str] = "America/Los_Angeles"
+
+# Beside DEFAULT_TIMEZONE because the -settings registry, the playback loop and the
+# voice watchdog all read them, and this module imports nothing from src at runtime.
+DEFAULT_IDLE_TIMEOUT_SECS: Final = 300.0
+DEFAULT_ALONE_TIMEOUT_SECS: Final = 10.0
+# slow_notice_secs' stored "off". Falsy, and still a set value: never test it for
+# truthiness.
+OFF_SECS: Final = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigDomain:
+    """The values a numeric guild:{id}:config field may hold."""
+
+    lo: float
+    hi: float
+    off: bool = False  # OFF_SECS is admitted too, outside [lo, hi]
+
+    def admits(self, value: float) -> bool:
+        # Chained comparison: False for NaN, where `not (v < lo or v > hi)` is True.
+        return (self.off and value == OFF_SECS) or self.lo <= value <= self.hi
+
+
+# guild:{id}:config's numeric domain. The -settings registry's server specs take
+# their static bounds from here. np_refresh_secs' lo is the bot knob's env floor:
+# the lowest bot value an operator can run.
+CONFIG_DOMAIN: Final[Mapping[ConfigFieldName, ConfigDomain]] = MappingProxyType(
+    {
+        ConfigField.VOLUME: ConfigDomain(0.0, 1.0),
+        ConfigField.IDLE_TIMEOUT: ConfigDomain(DEFAULT_IDLE_TIMEOUT_SECS, 1800.0),
+        ConfigField.ALONE_TIMEOUT: ConfigDomain(DEFAULT_ALONE_TIMEOUT_SECS, 120.0),
+        ConfigField.NP_REFRESH: ConfigDomain(1.0, 30.0),
+        ConfigField.SLOW_NOTICE: ConfigDomain(4.0, 60.0, off=True),
+    }
+)
 
 # Zone names already proven unusable on this host. ZoneInfo caches successful
 # lookups only; a failed one is a filesystem miss plus a log line on every

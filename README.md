@@ -1092,6 +1092,7 @@ src/
 ├── help.py             # custom man-page-style -help command
 ├── telemetry.py        # OpenTelemetry + structlog setup
 ├── config.py           # ENVIRONMENT detection, tunables
+├── settings.py         # -settings: what chat may change, its ranges and its grammar
 └── util.py             # logging factory, embed helpers, task helpers
 
 tests/                  # one test_*.py per src/ module, plus:

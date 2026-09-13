@@ -339,10 +339,13 @@ src/
 │                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
 ├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus, tunables
-└── util.py           # logger factory, embed helpers (safe_label, verbatim_code), fmt_duration,
-                      # progress_bar/progress_line (the NP bar and the card's), task helpers
-                      # (spawn_background, cancel_task, join_task, set_within), channel_claim,
-                      # ProgressFn, PoolSlotUnavailable
+├── settings.py       # the -settings machinery: the registry of what chat may set (bounds,
+│                     # rendering) and the grammar that parses a request. Pure. What the
+│                     # environment holds is config.py; this module decides what chat may change
+└── util.py           # logger factory, embed helpers (safe_label, verbatim_code),
+                      # fmt_duration/fmt_seconds, progress_bar/progress_line (the NP bar and
+                      # the card's), task helpers (spawn_background, cancel_task, join_task,
+                      # set_within), channel_claim, ProgressFn, PoolSlotUnavailable
 
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
@@ -1361,7 +1364,9 @@ test_redis_client.py.
 `ConfigField` → `Optional` field on `GuildConfig` (Optional is not optional — absent
 must keep meaning "follow the host default", or "never chose" collapses into "chose
 the default") → `to_redis` writes it only when set → `from_redis` reads an
-unrecognised value as unset → write method on `GuildRedisStore` that PERSISTs and
+unrecognised value as unset → a numeric field also gets a `CONFIG_DOMAIN` entry in
+`guild_state.py`, which the `-settings` registry's static bounds must equal (a test
+compares them) → write method on `GuildRedisStore` that PERSISTs and
 **encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
 single-field config serializes to exactly that field, so the wire format has one
 definition and a setter cannot drift from what `from_redis` expects) → **validate at

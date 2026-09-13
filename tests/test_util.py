@@ -26,6 +26,7 @@ from src.util import (
     cancel_task,
     codeblock_fields,
     fmt_duration,
+    fmt_seconds,
     get_logger,
     join_footer,
     pluralize,
@@ -274,6 +275,29 @@ class TestFmtDuration:
 
     def test_minute_rollover_pads_seconds(self) -> None:
         assert fmt_duration(61) == "1:01"
+
+
+class TestFmtSeconds:
+    """The seconds renderer the -settings registry uses: it must read back as the
+    same float, so nothing a card prints is refused when typed back."""
+
+    @pytest.mark.parametrize(
+        ("secs", "text"),
+        [
+            (3, "3s"),
+            (3.0, "3s"),
+            (0.5, "0.5s"),
+            (0.25, "0.25s"),
+            (0.05, "0.05s"),
+            (120, "120s"),
+        ],
+    )
+    def test_renders_the_shortest_form(self, secs: float, text: str) -> None:
+        assert fmt_seconds(secs) == text
+
+    @pytest.mark.parametrize("secs", [0.05, 0.1, 0.25, 0.5, 3, 60, 120, 600])
+    def test_reads_back_as_the_same_float(self, secs: float) -> None:
+        assert float(fmt_seconds(secs).removesuffix("s")) == secs
 
 
 class TestCodeblockFields:
