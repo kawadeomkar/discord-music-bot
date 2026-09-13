@@ -39,6 +39,7 @@ from src.redis_client import GuildRedisStore, outbox_depth, read_guild_configs
 from src.util import (
     FOOTER_SUFFIX_SEP,
     cancel_task,
+    codeblock_fields,
     fmt_duration,
     get_logger,
     join_footer,
@@ -115,9 +116,6 @@ _OPERATOR_NOTICE = (
     "-# Host details (configuration, storage, runtime) are shown to the bot owner "
     "only. Run `-ping` for dependency health."
 )
-
-# Discord's cap on an embed field value; util.py's FOOTER_LIMIT is its footer sibling.
-_FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
 
@@ -1461,30 +1459,6 @@ async def _outbox_check(
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
-    """Lines as one or more codeblock fields within Discord's 1024-char field
-    cap. Splits rather than truncates: a silently clipped config listing reads
-    as a complete one."""
-    fence = 8  # "```\n" + "\n```"
-    fields: list[tuple[str, str]] = []
-    chunk: list[str] = []
-    size = 0
-    for line in lines:
-        line = truncate(line, _FIELD_LIMIT - fence)
-        if chunk and size + len(line) + 1 + fence > _FIELD_LIMIT:
-            fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
-            chunk, size = [], 0
-        chunk.append(line)
-        size += len(line) + 1
-    if chunk:
-        fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
-    return fields
-
-
-def _fence(lines: list[str]) -> str:
-    return "```\n" + "\n".join(lines) + "\n```"
-
-
 def mode_source(overridden: bool, *, persisted: bool = True) -> str:
     """Why debug mode is in its current state, rendered inside "Debug mode is
     **on** for this server (...)". "saved here" is a stored choice; "host default"
@@ -1631,7 +1605,7 @@ def render_snapshot_embed(
         lines = blocks.get(name)
         if lines is None:
             continue
-        for field_name, value in _codeblock_fields(name, lines):
+        for field_name, value in codeblock_fields(name, lines):
             embed.add_field(name=field_name, value=value, inline=False)
     # Published to everyone while the same value is an operator-gated row above;
     # -ping prints this identical footer to every caller, so gating it hides nothing.

@@ -20,6 +20,7 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
+from src.util import DASHES
 from src.config import (
     PLAY_INFLIGHT_MAX,
     PLAY_RESOLVE_CONCURRENCY,
@@ -103,13 +104,10 @@ def resolve_mode_for(placement: Placement) -> ResolveMode:
     return ResolveMode.FLAT_OK
 
 
-# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`.
-# iOS turns a typed `--` into a single em dash.
-_DASHES: Final[str] = "-‐‑‒–—―−"
 # Built from _FLAG_MODES' keys, so a renamed flag cannot leave a stale near-miss.
 # The group is the flag minus its dashes; split_play_args re-attaches them.
 _NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
-    f"[{_DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
+    f"[{DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
 )
 
 

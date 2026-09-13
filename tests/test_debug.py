@@ -35,7 +35,6 @@ from src.debug import (
     DebugInputs,
     _CONFIG_ALLOWLIST,
     _ConfigKind,
-    _codeblock_fields,
     run_debug_dashboard,
     config_lines,
     discord_lines,
@@ -305,24 +304,6 @@ class TestConfigAllowlist:
     def test_no_duplicate_rows(self) -> None:
         names = [v.name for v in _CONFIG_ALLOWLIST]
         assert len(names) == len(set(names))
-
-
-class TestCodeblockFields:
-    def test_short_block_is_one_field(self) -> None:
-        fields = _codeblock_fields("Config", ["a", "b"])
-        assert fields == [("Config", "```\na\nb\n```")]
-
-    def test_long_block_splits_rather_than_truncating(self) -> None:
-        """Discord's field cap is 1024. A config listing clipped in place would
-        read as a complete one, which is worse than showing none."""
-        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
-        fields = _codeblock_fields("Config", lines)
-        assert len(fields) > 1
-        assert all(len(value) <= 1024 for _, value in fields)
-        assert fields[1][0] == "Config (cont.)"
-        rendered = "".join(value for _, value in fields)
-        for line in lines:
-            assert line in rendered
 
 
 class TestDiscordBlock:
@@ -1092,7 +1073,7 @@ class TestSnapshotEmbed:
         )
         names = [f.name for f in embed.fields]
         # Config outgrew Discord's 1024-char field cap once it carried -debug's own
-        # loop tunables, so _codeblock_fields splits it — the continuation keeps the
+        # loop tunables, so codeblock_fields splits it — the continuation keeps the
         # block's position rather than moving to the end.
         assert names == [
             "Build",
