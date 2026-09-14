@@ -1743,6 +1743,122 @@ class TestSeedWrite:
         assert guild_settings.is_persisted(_GUILD, "volume")
 
 
+class TestOrphanSweep:
+    """A guild removed while the bot was offline leaves a key with no TTL. The
+    sweep deletes it only when the guild is gone AND this application stamped it:
+    a dev and a prod bot can share one Redis, and guild:{id}:config carries no
+    application id of its own."""
+
+    @staticmethod
+    async def _key(
+        redis: aioredis.Redis, guild_id: int, *, writer: int | None
+    ) -> GuildRedisStore:
+        store = GuildRedisStore(redis, guild_id)
+        await store.set_debug_mode(True, writer=writer)
+        return store
+
+    async def test_only_a_departed_guild_stamped_by_this_application_goes(
+        self,
+        guild_cog: Any,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        orphan = await self._key(fake_redis, 1, writer=_APP_ID)
+        unstamped = await self._key(fake_redis, 2, writer=None)
+        other_app = await self._key(fake_redis, 3, writer=999)
+        member = await self._key(fake_redis, 4, writer=_APP_ID)
+        guild_cog.bot.is_closed = MagicMock(return_value=False)
+
+        await GuildSettings(guild_cog).sweep_orphans(
+            is_member=lambda g: g == 4, application_id=_APP_ID
+        )
+
+        assert await fake_redis.exists(orphan.config_key()) == 0
+        for kept in (unstamped, other_app, member):
+            assert await fake_redis.exists(kept.config_key()) == 1
+        assert "removed 1; skipped 2" in caplog.text
+
+    async def test_a_guild_rejoined_since_the_listing_keeps_its_config(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        store = await self._key(fake_redis, 1, writer=_APP_ID)
+        guild_cog.bot.is_closed = MagicMock(return_value=False)
+        checks = 0
+
+        def rejoins(guild_id: int) -> bool:
+            nonlocal checks
+            checks += 1
+            return checks > 1  # gone when listed, back by the delete
+
+        await GuildSettings(guild_cog).sweep_orphans(
+            is_member=rejoins, application_id=_APP_ID
+        )
+        assert await fake_redis.exists(store.config_key()) == 1
+
+    async def test_the_per_run_cap_holds(
+        self,
+        guild_cog: Any,
+        fake_redis: aioredis.Redis,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings, "_ORPHAN_SWEEP_MAX", 2)
+        for guild_id in (1, 2, 3):
+            await self._key(fake_redis, guild_id, writer=_APP_ID)
+        guild_cog.bot.is_closed = MagicMock(return_value=False)
+
+        await GuildSettings(guild_cog).sweep_orphans(
+            is_member=lambda g: False, application_id=_APP_ID
+        )
+
+        assert len(await redis_client_scan(fake_redis)) == 1
+
+    async def test_it_stops_at_the_first_unconfirmed_delete(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        for guild_id in (1, 2, 3):
+            await self._key(fake_redis, guild_id, writer=_APP_ID)
+        guild_cog.bot.is_closed = MagicMock(return_value=False)
+        with patch.object(
+            GuildRedisStore, "clear_config", new=AsyncMock(return_value=False)
+        ) as clear:
+            await GuildSettings(guild_cog).sweep_orphans(
+                is_member=lambda g: False, application_id=_APP_ID
+            )
+        assert clear.await_count == 1
+
+    async def test_it_stops_when_the_bot_closes(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        for guild_id in (1, 2):
+            await self._key(fake_redis, guild_id, writer=_APP_ID)
+        guild_cog.bot.is_closed = MagicMock(return_value=True)
+        await GuildSettings(guild_cog).sweep_orphans(
+            is_member=lambda g: False, application_id=_APP_ID
+        )
+        assert len(await redis_client_scan(fake_redis)) == 2
+
+    async def test_an_unlistable_redis_removes_nothing(
+        self,
+        guild_cog: Any,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await self._key(fake_redis, 1, writer=_APP_ID)
+        with patch.object(fake_redis, "scan", side_effect=RuntimeError("down")):
+            await GuildSettings(guild_cog).sweep_orphans(
+                is_member=lambda g: False, application_id=_APP_ID
+            )
+        assert len(await redis_client_scan(fake_redis)) == 1
+        assert "could not list the config keys" in caplog.text
+
+
+async def redis_client_scan(redis: aioredis.Redis) -> list[int]:
+    from src.redis_client import scan_guild_config_ids
+
+    return await scan_guild_config_ids(redis, timeout=1.0) or []
+
+
 class TestGuildConfigHasOneWriter:
     """Every store method that writes guild:{id}:config is called from
     src/settings.py alone. A shortcut writing Redis directly would desynchronize

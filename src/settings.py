@@ -54,7 +54,9 @@ from src.redis_client import (
     BOT_CONFIG_KEY,
     BotConfigStore,
     GuildRedisStore,
+    read_config_writers,
     read_guild_configs,
+    scan_guild_config_ids,
 )
 from src.util import DASHES, fmt_duration, fmt_seconds, get_logger
 
@@ -1374,6 +1376,8 @@ _KNOWN_SHAPES: Final[dict[frozenset[str], frozenset[str]]] = {
 _UNSET_CONFIG: Final = GuildConfig()
 _HYDRATE_RETRY_FIRST_SECS: Final[float] = 1.0
 _HYDRATE_RETRY_MAX_SECS: Final[float] = 60.0
+# Keys the orphan sweep deletes per start at most; the rest wait for the next.
+_ORPHAN_SWEEP_MAX: Final[int] = 500
 
 
 class WriteMode(Enum):
@@ -1414,6 +1418,7 @@ class _GuildLock:
 class _SettingsBot(Protocol):
     @property
     def application_id(self) -> Optional[int]: ...
+    def is_closed(self) -> bool: ...
 
 
 class _SettingsPlayer(Protocol):
@@ -1825,6 +1830,49 @@ class GuildSettings:
                 zone = value if isinstance(value, str) else None
                 target.timezone = GuildConfig(timezone=zone).tzinfo()
         self._prune()
+
+    async def sweep_orphans(
+        self, *, is_member: Callable[[int], bool], application_id: int
+    ) -> None:
+        """Forget the config of every guild this bot is no longer in and whose
+        writer_app_id stamp is this application's: a guild removed while the bot
+        was offline never raised on_guild_remove, and its key has no TTL. An
+        unstamped key, or another application's sharing this Redis, is never
+        deleted. Every call is bounded; at most _ORPHAN_SWEEP_MAX per run, and
+        it stops at the first unconfirmed DELETE or when the bot closes. The
+        caller runs it once per process, when the guild cache is complete.
+        See docs/ARCHITECTURE.md#settings-resolution."""
+        redis = self._cog.redis
+        if redis is None:
+            return
+        listed = await scan_guild_config_ids(redis, timeout=CONFIG_IO_TIMEOUT_SECS)
+        if listed is None:
+            log.warning(
+                "orphan config sweep: could not list the config keys; nothing "
+                "removed, the next start retries"
+            )
+            return
+        candidates = [guild_id for guild_id in listed if not is_member(guild_id)]
+        writers = await read_config_writers(
+            redis, candidates, batch_timeout=CONFIG_IO_TIMEOUT_SECS
+        )
+        owned = [g for g in candidates if writers.get(g) == application_id]
+        removed = rejoined = 0
+        for guild_id in owned[:_ORPHAN_SWEEP_MAX]:
+            if self._cog.bot.is_closed():
+                break
+            # Re-checked at the delete: a guild re-added since the listing keeps it.
+            if is_member(guild_id):
+                rejoined += 1
+                continue
+            if not await self.forget(guild_id):
+                break
+            removed += 1
+        log.info(
+            f"orphan config sweep: removed {removed}; skipped "
+            f"{len(candidates) - len(owned)} (no stamp, another application's, or "
+            f"unread); {len(owned) - removed - rejoined} left for the next start"
+        )
 
     async def aclose(self) -> None:
         """Cancel every load in flight: a merge landing after the cog unloads would

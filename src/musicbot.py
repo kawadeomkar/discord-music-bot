@@ -167,6 +167,8 @@ class MusicBot(commands.Cog):
         self.guild_settings = GuildSettings(self)
         # The latest hydrate retry, for the guilds a pass could not read.
         self._hydrate_retry: Optional[asyncio.Task] = None
+        # Claimed by the first on_ready: the orphan sweep runs once per process.
+        self._orphan_sweep_claimed = False
 
     async def cog_load(self) -> None:
         """Spawn the settings hydration and the Spotify credential probe.
@@ -1202,15 +1204,37 @@ class MusicBot(commands.Cog):
         recovery task per guild."""
         if self.redis is None:
             return
-        spawn_background(self._recover_after_ready(), self._restore_tasks)
+        # Claimed synchronously, so two READYs in quick succession cannot both
+        # sweep. A later READY could find no new orphan: a reconnect never shrinks
+        # discord.py's guild cache.
+        sweep = not self._orphan_sweep_claimed
+        self._orphan_sweep_claimed = True
+        spawn_background(self._recover_after_ready(sweep=sweep), self._restore_tasks)
 
-    async def _recover_after_ready(self) -> None:
+    async def _recover_after_ready(self, *, sweep: bool = False) -> None:
         """The hydrate pass before the restores: its batches hold one pool
         connection at a time, and the per-guild fan-out after it is what reaches
-        the pool's cap, which raises rather than queueing."""
+        the pool's cap, which raises rather than queueing. Then, when `sweep`, the
+        orphan config sweep, once every restore has returned. It runs only in a
+        process that owns every shard (shard_ids None): a subset sees a subset of
+        guilds, and every other guild would look departed."""
         await self._hydrate_configs()
-        for guild in self.bot.guilds:
+        restores = [
             spawn_background(restore_guild(self, guild), self._restore_tasks)
+            for guild in self.bot.guilds
+        ]
+        application_id = self.bot.application_id
+        # getattr: shard_ids is AutoShardedBot's; a plain Bot runs every shard.
+        shard_ids = getattr(self.bot, "shard_ids", None)
+        if not sweep or shard_ids is not None or application_id is None:
+            return
+        if restores:
+            # asyncio.wait, not gather: cancelling this task must not cancel them.
+            await asyncio.wait(restores)
+        await self.guild_settings.sweep_orphans(
+            is_member=lambda guild_id: self.bot.get_guild(guild_id) is not None,
+            application_id=application_id,
+        )
 
     @commands.Cog.listener()
     async def on_voice_state_update(

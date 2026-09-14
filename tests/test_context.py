@@ -44,6 +44,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog.debug_settings._default = False
     cog.guild_settings = GuildSettings(cog)
     cog._hydrate_retry = None
+    cog._orphan_sweep_claimed = False
     return cog
 
 

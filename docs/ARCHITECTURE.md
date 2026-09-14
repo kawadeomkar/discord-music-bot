@@ -931,7 +931,7 @@ Two independent triggers, both handled in `musicbot.py`:
 
 ### Crash Recovery
 
-On `on_ready` (cold start or session loss — **not** WebSocket resume, which fires `on_resumed`), `MusicBot` spawns a `_restore_guild` task per guild (skipped if the guild already has a player):
+On `on_ready` (cold start or session loss — **not** WebSocket resume, which fires `on_resumed`), `MusicBot._recover_after_ready` runs one settings hydrate pass, then spawns a `_restore_guild` task per guild (skipped if the guild already has a player). After the first `on_ready` of a process, once those tasks return, it runs the orphan config sweep ([Settings resolution](#settings-resolution)):
 
 ```mermaid
 sequenceDiagram
@@ -1034,7 +1034,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
-| `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` | **none, ever** |
+| `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
@@ -2478,6 +2478,32 @@ each guild's config and is the only writer of the key.
   stamps and marks are dropped and the guild is marked forgotten, so a read that began
   earlier merges nothing and a write queued behind it is refused rather than recreating a
   no-TTL key.
+
+**The orphan sweep.** A guild removed while the bot is offline raises no
+`on_guild_remove`, and its key has no TTL. Once per process, after the first
+`on_ready`'s restores have all returned, `GuildSettings.sweep_orphans` forgets a key
+only when both hold:
+
+1. **Its guild is not in `bot.guilds`**, checked when the key is listed and again,
+   synchronously, just before its `forget`. At that point the cache is complete:
+   discord.py dispatches `on_ready` only after every shard in `shard_ids` received READY,
+   READY's guild list (unavailable guilds included, as stubs) is cached synchronously, an
+   outage's `GUILD_DELETE` keeps the guild cached, and a reconnect never clears the
+   cache — so a later `on_ready` could find no new orphan, and a stale extra guild errs
+   toward keeping its key.
+2. **Its `writer_app_id` is this application's id.** `guild:{id}:config` carries no
+   application id of its own, and a dev bot and a prod bot can share one Redis, so
+   membership alone would let a dev bot delete the config of every prod guild it is not
+   in. An unstamped key — written by an older build, or by a new build rolled out
+   elsewhere first — is never a candidate.
+
+It is skipped in a process given a subset of shards (`shard_ids` set: it sees a subset of
+guilds) and while `application_id` is None. The listing is a `SCAN` loop with every call
+bounded (a failure deletes nothing and logs one WARNING), the stamps are read in pipelined
+batches, and the deletes run one at a time through `forget` — at most 500 per start,
+stopping at the first unconfirmed DELETE or when the bot closes — ending in one INFO
+counting what was removed, skipped and left. A guild re-added between the re-check and
+its DELETE loses the stale config, the same outcome as a removal the bot saw live.
 
 ## Design Decisions
 
