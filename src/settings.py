@@ -1338,6 +1338,21 @@ def parse_settings_args(arg: str, *, tail: str) -> SettingsRequest | Refusal:
     return replace(result, scope=scope) if isinstance(result, Refusal) else result
 
 
+def _unbracketed(words: list[str]) -> list[str]:
+    """A value copied off a card with its `<…>` still around it: one pair, opening
+    on the first word and closing on that word or a later one. Words after the
+    pair stay, so a value with words left over is still refused as too much."""
+    if not words or not words[0].startswith("<"):
+        return words
+    close = next((i for i, word in enumerate(words) if word.endswith(">")), None)
+    if close is None:
+        return words
+    inside = words[: close + 1]
+    inside[0] = inside[0][1:]
+    inside[close] = inside[close][:-1]
+    return [word for word in inside if word] + words[close + 1 :]
+
+
 def _parse_scoped(tokens: list[str], scope: SettingScope) -> SettingsRequest | Refusal:
     """The words after the scope: a key, then nothing, a reset word or a value."""
     if not tokens:
@@ -1377,6 +1392,7 @@ def _parse_scoped(tokens: list[str], scope: SettingScope) -> SettingsRequest | R
         return SettingsRequest(scope=scope, action=SettingsAction.RESET, spec=spec)
 
     joiner = "_" if spec.kind is SettingKind.TIMEZONE else " "
+    rest = _unbracketed(rest)
     result = parse_value(spec, joiner.join(rest))
     if isinstance(result, Parsed):
         return SettingsRequest(

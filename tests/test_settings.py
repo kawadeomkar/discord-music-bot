@@ -791,6 +791,7 @@ class TestParseSettingsArgs:
             ("volume 80 x", None),
             ("volume 150 x", None),
             ("volume reset now", None),
+            ("volume <80> please", None),
             ("reset volume now", None),
             ("timezone Europe/London please", None),
             ("volume " + "8" * 94, None),
@@ -812,6 +813,14 @@ class TestParseSettingsArgs:
         assert _request(arg) == SettingsRequest(
             scope=SettingScope.SERVER, action=SettingsAction.RESET, spec=_spec("volume")
         )
+
+    @pytest.mark.parametrize(
+        "arg", ["volume <<50>>", "volume <50", "volume 50>", "volume <>"]
+    )
+    def test_one_pair_of_brackets_comes_off(self, arg: str) -> None:
+        result = _request(arg)
+        assert isinstance(result, Refusal)
+        assert result.reason is RefusalReason.BAD_SHAPE
 
     @pytest.mark.parametrize(
         ("arg", "expected"),
@@ -838,6 +847,13 @@ class TestParseSettingsArgs:
             ("leave-when-alone 2m", _set("alone-timeout", 120.0)),
             ("Progress-Bar 5s", _set("np-refresh", 5.0)),
             ("lookup-notice off", _set("slow-notice", OFF_SECS)),
+            # A command copied off a card with its placeholder's brackets.
+            ("volume <50>", _set("volume", 50)),
+            ("volume=<50>", _set("volume", 50)),
+            ("leave-when-idle <10:00>", _set("idle-timeout", 600.0)),
+            ("leave-when-idle < 10:00 >", _set("idle-timeout", 600.0)),
+            ("timezone <America/New York>", _set("timezone", "America/New_York")),
+            ("bot heartbeat <5s>", _set("heartbeat", 5.0, SettingScope.BOT)),
             ("slow-notice=10.5s", _set("slow-notice", 10.5)),
         ],
     )
