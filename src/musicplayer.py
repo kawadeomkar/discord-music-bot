@@ -458,7 +458,8 @@ class MusicPlayer:
         self._retired = False
         # Set by whoever calls vc.stop() on the live song, cleared at each vc.play().
         # Zero frames alone cannot tell a stream that never opened from one we stopped
-        # before its first frame; this is the half that says which.
+        # before its first frame; this is the half that says which. Also a liveness
+        # term: see _still_live().
         self._stopped_deliberately = False
         # The gate stays shut until a command establishes a voice connection, so a
         # player built by a command that never connects cannot walk the queue and
@@ -1649,7 +1650,9 @@ class MusicPlayer:
         race: a song ending naturally while put_front awaits still gets its resume
         entry, replaying its final seconds."""
         current = self.current_song
-        if current is None:
+        # Before the neutralize as well as after it: the neutralize destroys the
+        # next song's resolved source, and a song already gone needs neither.
+        if current is None or not self._still_live(current):
             return None
         span = trace.get_current_span()
         span.set_attribute("discord.guild_id", str(self._guild.id))
@@ -1660,9 +1663,8 @@ class MusicPlayer:
         await self._neutralize_prefetch()
 
         # Re-check after those awaits (a cancel can block up to yt-dlp's socket
-        # timeout): a song that ended, or one stopped and still current_song, gets
-        # no resume tail.
-        if self.current_song is not current or self._stopped_deliberately:
+        # timeout): a song no longer live gets no resume tail.
+        if not self._still_live(current):
             return None
 
         was_paused = vc.is_paused()
@@ -1734,11 +1736,7 @@ class MusicPlayer:
                     self._pending_resume_tail = None
             raise
 
-        # Only if the song we measured is still playing: if the loop moved on,
-        # stopping would kill the NEXT song.
-        if self.current_song is current:
-            self.note_deliberate_stop()
-            vc.stop()
+        self._stop_if_live(current, vc)
 
         # After the insert, so the tail just built is counted.
         span.set_attribute("interject.depth", self.queue.resume_tail_depth())
@@ -1904,11 +1902,33 @@ class MusicPlayer:
             )
             return None
 
+    def _still_live(self, song: YTDL) -> bool:
+        """Is `song` still the song the loop is playing? Each term is a window a
+        command can wake up in: play_next is set before current_song is cleared,
+        a -skip or --now may already have stopped it, and a finished loop task
+        is a torn-down player."""
+        return (
+            self.current_song is song
+            and not self.play_next.is_set()
+            and not self._stopped_deliberately
+            and not (self._player is not None and self._player.done())
+        )
+
+    def _stop_if_live(self, song: YTDL, vc: discord.VoiceClient) -> bool:
+        """Stop `song` only while it is still live: the front-inserted entries play
+        next either way, and stopping a song the loop moved past kills the NEXT one.
+        Records the stop, which the loop clears at its next vc.play()."""
+        if not self._still_live(song):
+            return False
+        self.note_deliberate_stop()
+        vc.stop()
+        return True
+
     def note_deliberate_stop(self) -> None:
         """Record that the live song is about to be stopped by us, not by ffmpeg.
         Call BEFORE vc.stop(); the loop clears it at each vc.play(). A stop we
         initiate reaches `after` as error=None — indistinguishable, on frame count
-        alone, from a dead stream."""
+        alone, from a dead stream — and _still_live() refuses a song stopped here."""
         self._stopped_deliberately = True
 
     async def _drop_unplayable_stream_cache(self, song: YTDL) -> None:

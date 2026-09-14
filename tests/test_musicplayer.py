@@ -11162,6 +11162,8 @@ class TestHistorySkipMarker:
             )
             await record_marker()
             # The loop plays the song that cut in, clearing the marker as it goes.
+            # Standing in for that is what lets one live_song object play the part
+            # of the three a real stack has.
             music_player._skip_history_for = None
 
         # Every round set the marker to the song it actually stopped.
@@ -11423,6 +11425,28 @@ class TestInterjectPostNeutralizeRecheck:
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
 
+    async def test_a_bail_at_dispatch_leaves_the_prefetch_alone(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """Neutralizing before the liveness check spends the next song's resolved
+        source to reach a refusal that did not need it, and the fallback enqueue then
+        pays a cold extraction already paid for."""
+        music_player.current_song = live_song
+        music_player.note_deliberate_stop()  # already stopped by -skip
+        prefetch = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = prefetch
+
+        try:
+            assert await music_player.interject(interject_obj, mock_vc) is None
+            assert not prefetch.done()
+            assert music_player._prefetch_task is prefetch
+        finally:
+            prefetch.cancel()
+
     async def test_bailing_leaves_an_existing_stack_untouched(
         self,
         music_player: MusicPlayer,
@@ -11595,6 +11619,46 @@ class TestInterjectStoppedSong:
         outcome = await music_player.interject(interject_obj, mock_vc)
 
         assert outcome is None
+        assert music_player.queue.display_items() == []
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
+
+
+class TestInterjectOverASongThatIsOver:
+    """current_song outlives its song in two windows: the audio thread sets play_next
+    before the loop clears it, and cleanup() never clears it. Interjecting there parks
+    a resume tail for a play that has ended and stops a client with nothing on it."""
+
+    async def test_a_song_that_signalled_its_end_is_not_interjected_over(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        music_player.play_next.set()
+
+        assert await music_player.interject(interject_obj, mock_vc) is None
+        assert music_player.queue.display_items() == []
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
+
+    async def test_a_torn_down_player_is_not_interjected_over(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        music_player._player = finished
+
+        assert await music_player.interject(interject_obj, mock_vc) is None
         assert music_player.queue.display_items() == []
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
