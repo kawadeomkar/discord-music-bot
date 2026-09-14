@@ -376,7 +376,7 @@ async def queue_source(
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
             raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-        tracks = await YTDL.yt_playlist(
+        playlist = await YTDL.yt_playlist(
             source.playlist_url,
             ctx.author,
             query_source=query_source_of(source),
@@ -386,7 +386,7 @@ async def queue_source(
             on_progress=on_progress,
             pool_slot=pool_slot,
         )
-        tracks, skipped = _apply_playlist_index(tracks, source.index)
+        tracks, skipped = _apply_playlist_index(playlist.tracks, source.index)
         _apply_playlist_timestamp(tracks, source)
         return ResolvedYoutubePlaylist(tracks, skipped=skipped)
     ts: Optional[int] = None
@@ -684,7 +684,7 @@ async def _resolve_interjection_source(
         )
         return head, list(yts[1:])
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
-        tracks = await YTDL.yt_playlist(
+        playlist = await YTDL.yt_playlist(
             source.playlist_url,
             ctx.author,
             query_source=query_source_of(source),
@@ -696,7 +696,7 @@ async def _resolve_interjection_source(
         )
         # Indexed here too: `--now` on a link copied mid-playlist starts at the
         # track the user was looking at, not the playlist's first.
-        tracks, skipped = _apply_playlist_index(tracks, source.index)
+        tracks, skipped = _apply_playlist_index(playlist.tracks, source.index)
         _apply_playlist_timestamp(tracks, source)
         if skipped:
             await ctx.send(

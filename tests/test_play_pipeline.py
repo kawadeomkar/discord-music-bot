@@ -53,6 +53,7 @@ from tests.helpers import (
     no_typing,
     mock_mp,
     queue_object,
+    stub_yt_playlist,
 )
 
 
@@ -829,7 +830,7 @@ class TestQuerySourceClassification:
             QueueObject(f"https://yt.com/v={i}", f"T{i}", mock_ctx.author)
             for i in range(3)
         ]
-        spy = AsyncMock(return_value=tracks)
+        spy = stub_yt_playlist(tracks)
         with patch("src.play_pipeline.YTDL.yt_playlist", new=spy):
             result = await play_pipeline.queue_source(
                 mock_ctx,
@@ -856,9 +857,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 6)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -889,9 +888,7 @@ class TestQuerySourceClassification:
             )
             for i in range(6)
         ]
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -923,9 +920,7 @@ class TestQuerySourceClassification:
             )
             for i in range(5)
         ]
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -945,9 +940,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/watch?v=v0&list=PLabc&index=1"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 3)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -969,9 +962,7 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with (
-            patch(
-                "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-            ),
+            patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)),
             pytest.raises(PlaylistIndexError) as excinfo,
         ):
             await play_pipeline.queue_source(
@@ -992,7 +983,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
         with (
-            patch("src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=[])),
+            patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist([])),
             pytest.raises(EmptyPlaylistError),
         ):
             await play_pipeline.queue_source(
@@ -1012,9 +1003,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4&t=90"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 6)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -1036,9 +1025,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&t=30"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 6)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -1096,9 +1083,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             result = await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
@@ -1119,9 +1104,7 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with (
-            patch(
-                "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-            ),
+            patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)),
             pytest.raises(PlaylistIndexError) as excinfo,
         ):
             await play_pipeline._resolve_interjection_source(
@@ -1166,7 +1149,7 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
         tracks = [QueueObject("https://yt.com/v=1", "T", mock_ctx.author)]
-        spy = AsyncMock(return_value=tracks)
+        spy = stub_yt_playlist(tracks)
         with patch("src.play_pipeline.YTDL.yt_playlist", new=spy):
             await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
@@ -1190,9 +1173,7 @@ class TestQuerySourceClassification:
             )
             for i in range(6)
         ]
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             kept = await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
@@ -1369,7 +1350,7 @@ class TestSpotifyDisabled:
             QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
         ]
         with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
+            "src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(fake_qobjs)
         ) as mock_playlist:
             result = await play_pipeline.queue_source(
                 mock_ctx,
@@ -1427,7 +1408,7 @@ class TestSpotifyDisabled:
             QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)
         ]
         with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
+            "src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(fake_qobjs)
         ) as mock_playlist:
             await play_pipeline.queue_source(
                 mock_ctx,
@@ -1466,9 +1447,7 @@ class TestInterjectionCollectionHandling:
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             head, rest = await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
@@ -1495,9 +1474,7 @@ class TestInterjectionCollectionHandling:
             )
             for i in range(6)
         ]
-        with patch(
-            "src.play_pipeline.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)
-        ):
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(tracks)):
             head, rest = await play_pipeline._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )

@@ -17,7 +17,7 @@ from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
 from src.play_placement import PlayMode, PlayRequest
-from src.youtube import QueueObject
+from src.youtube import QueueObject, YoutubePlaylist
 
 if TYPE_CHECKING:
     from src.musicbot import MusicBot
@@ -124,6 +124,18 @@ def stub_create_task(return_value: Optional[Any] = None) -> MagicMock:
         return return_value if return_value is not None else MagicMock()
 
     return MagicMock(side_effect=_impl)
+
+
+def stub_yt_playlist(
+    tracks: list[QueueObject], *, title: Optional[str] = None, unavailable: int = 0
+) -> AsyncMock:
+    """A stand-in for YTDL.yt_playlist resolving to `tracks`, untitled and with
+    nothing unavailable unless the test says otherwise."""
+    return AsyncMock(
+        return_value=YoutubePlaylist(
+            title=title, tracks=tracks, unavailable=unavailable
+        )
+    )
 
 
 def make_mock_task() -> MagicMock:
