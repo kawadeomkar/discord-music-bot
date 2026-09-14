@@ -222,7 +222,7 @@ just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment cons
 just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~38s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
-just container-test # build test image, run suite inside it       ~1min
+just container-test # build test image, run suite inside it (spec cache OFF) ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
 # Test selection (args forward to pytest). ANY argument means a subset run, so it runs
@@ -343,7 +343,7 @@ src/
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
 tests/                # one test_<module>.py per src module, commands/ mirroring src/commands/,
-                      # + conftest.py (seams) + helpers.py
+                      # + conftest.py (seams) + helpers.py + mock_spec_cache.py
                       # test_pg_integration.py / test_redis_integration.py are the opt-in tiers
 justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh compose them
 Dockerfile            # 3 stages: builder (deps) → test (adds test+lint groups) → runtime (ffmpeg, no poetry)
@@ -1172,7 +1172,16 @@ can spend the whole placement budget before the insert begins.
   existing assertions encode it. Disabled-mode behavior is covered by explicit tests
   that monkeypatch the flag per case — which wins over the fixture (same MonkeyPatch
   instance, later call). Don't "fix" the fixture to match the ship default.
-- Redis in tests is `fakeredis`; Discord objects are `MagicMock(spec=...)` doubles.
+- Redis in tests is `fakeredis`; Discord objects are `MagicMock(spec=...)` doubles,
+  built through the spec cache `tests/conftest.py` installs at import — so **a spec
+  class must not be mutated once it has been used as a spec** (`functools.wraps` on
+  the replacement keeps a class-level patch payload-neutral). It is the one file
+  outside `src/` the coverage gate measures. **The container tier runs with the cache
+  OFF** (`MOCK_SPEC_CACHE_DISABLE=1` in the Dockerfile's test stage), so
+  `container-test` is a reference run against stock `unittest.mock` and the two tiers
+  disagree if the cache ever answers what upstream would not; the cache's own tests
+  skip themselves there and run in the venv tier. See
+  `docs/ARCHITECTURE.md#the-mock-spec-cache`.
   **fakeredis executes every stream command the outbox uses and gets five of them
   wrong**, all in the safe-looking direction (green tests, broken production): the
   `xtrim(approximate=True)` default trims exactly here and nothing on a real small
@@ -1233,7 +1242,8 @@ rule could only ever fail it. Nothing else enforces the per-PR bump —
 from `build`'s `needs`: a job `if`-skipped on push would skip `build` with it, and it
 blocks a merge only once branch protection lists it as required) → **lint**
 (justfile fmt/parse, pin agreement, ruff, pyright) and **test** (coverage + PR comment) and **container-test**
-(suite inside the test image; deliberately runs with a read-only token — it executes PR
+(suite inside the test image, with the mock spec cache OFF so it is the reference run
+against stock `unittest.mock`; deliberately runs with a read-only token — it executes PR
 code) and **pg-integration** (the `pg` tier against a postgres service container) and
 **redis-integration** (the `redis` tier against a redis service container) — both real
 merge gates, `build` needs them → **build** (runtime stage; on branches it only validates the build; on main it
