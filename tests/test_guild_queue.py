@@ -28,7 +28,7 @@ from src.guild_queue import (
     remove_matcher,
 )
 from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
-from src.redis_client import GuildRedisStore
+from src.redis_client import GUILD_TTL, GuildRedisStore
 from src.sources import YTSource
 from src.youtube import QueueObject
 from tests.helpers import queue_object, seed_queue
@@ -3342,3 +3342,37 @@ class TestACutShortLremMarksTheMirrorStale:
             await gq.remove(remove_matcher("https://yt.com/v=1"))
 
         assert gq.mirror_dirty
+
+
+class TestTheQueueKeyOutlivesALongSession:
+    """queue_ttl_probe.py as a regression. A guild playing one long queue writes
+    nothing else to the queue key, so only its song starts keep it alive; without
+    that the list lapsed while memory played on, and a later -play's RPUSH was
+    LPOPed by the next start."""
+
+    async def test_a_queue_played_past_its_enqueue_ttl_keeps_its_list(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        await gq.put([_qobj(n, mock_author) for n in range(1, 6)], batch=True)
+        for _ in range(3):
+            # Most of a day since the enqueue, with no queue write in between.
+            await fake_redis.expire(store.queue_key(), 600)
+            item = gq.get_nowait()
+            assert isinstance(item, QueueObject)
+            async with gq.commit_dequeue(gq.generation) as committed:
+                assert committed
+                landed = await store.pop_queue_and_start_song(
+                    SongQueueEntry.from_queue_object(item), 1000.0
+                )
+                gq.note_mirror_write(landed=landed, retired=True)
+            assert await fake_redis.ttl(store.queue_key()) == GUILD_TTL
+
+        await gq.put([_qobj(9, mock_author)], batch=True)
+
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [entry.to_redis() for entry in gq.mirror_entries()]
+        assert len(stored) == 3
