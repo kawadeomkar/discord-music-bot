@@ -1511,6 +1511,28 @@ class TestGuildSettingsStamps:
         assert guild_cog.debug_settings.enabled(_GUILD) is True
         assert guild_settings._stamps == {}
 
+    async def test_a_write_during_a_load_is_kept(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        """The same rule for the command's reader: the load resolves with the
+        older stored value, and skips the field the write stamped meanwhile."""
+        await _guild_store(fake_redis).update_config(GuildConfig(np_refresh_secs=5.0))
+        await _guild_store(fake_redis).update_config(
+            GuildConfig(alone_timeout_secs=30.0)
+        )
+        guild_settings = GuildSettings(guild_cog)
+        real = GuildRedisStore.read_config
+
+        async def read_then_write(store: GuildRedisStore) -> Any:
+            stored = await real(store)
+            await guild_settings.write(_GUILD, GuildConfig(np_refresh_secs=10.0))
+            return stored
+
+        with patch.object(GuildRedisStore, "read_config", new=read_then_write):
+            loaded = await guild_settings.load(_GUILD)
+
+        assert loaded == GuildConfig(np_refresh_secs=10.0, alone_timeout_secs=30.0)
+
     async def test_an_unsaved_write_outlives_every_later_read(
         self, guild_cog: Any, fake_redis: aioredis.Redis
     ) -> None:
