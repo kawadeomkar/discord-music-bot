@@ -2061,8 +2061,9 @@ class TestGuildConfigTimezone:
         "name", ["Mars/Olympus", "not a zone", "PST", "../../etc/passwd", ""]
     )
     def test_an_unusable_name_falls_back_rather_than_raising(self, name: str) -> None:
-        """The eventual `-options timezone <name>` feeds this user input, and a
-        render path that raises would take the whole embed down. Includes a
+        """A stored name comes back from Redis, where a hand edit or a host whose tz
+        database lacks it can leave one this cannot resolve, and a render path that
+        raises would take the whole embed down. Includes a
         traversal-shaped string: ZoneInfo resolves names against the tz database
         by path, so it must not be handed one that escapes it.
         """
@@ -2104,7 +2105,7 @@ class TestValidTimezone:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Membership alone would reject it, so the length guard only earns its keep
-        by short-circuiting FIRST: `-options` will hand this arbitrary user text, and
+        by short-circuiting FIRST: GuildSettings.write hands it user text, and
         hashing a megabyte string to look it up in a set is work an unauthenticated
         command should not be able to ask for."""
 
@@ -2127,9 +2128,9 @@ class TestUnusableZoneCache:
     def test_a_bad_name_is_only_resolved_and_logged_once(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A failed ZoneInfo lookup is a filesystem miss and it logs. Once -options
-        puts a stored name on a render path, an unresolvable one would pay both on
-        every single render."""
+        """A failed ZoneInfo lookup is a filesystem miss and it logs. A stored name
+        is read on a render path, so an unresolvable one would pay both on every
+        single render."""
         guild_state._UNUSABLE_ZONES.discard("Mars/Olympus")
         config = GuildConfig(timezone="Mars/Olympus")
         with caplog.at_level(logging.WARNING):

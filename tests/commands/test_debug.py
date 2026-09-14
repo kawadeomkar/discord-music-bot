@@ -273,7 +273,9 @@ class TestDebugObservesWithoutCreating:
         assert MusicBot.analytics.extras.get("skips_player_setup") is True
 
     @pytest.mark.parametrize(
-        "command", [MusicBot.debug, MusicBot.analytics], ids=lambda c: c.name
+        "command",
+        [MusicBot.debug, MusicBot.analytics, MusicBot.settings],
+        ids=lambda c: c.name,
     )
     async def test_a_flagged_command_does_not_create_a_player(
         self,

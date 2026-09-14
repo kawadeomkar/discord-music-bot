@@ -1752,6 +1752,16 @@ class DebugSettings:
         return self._default
 
     @property
+    def host_default(self) -> bool:
+        """DEBUG_MODE, as read at startup."""
+        return self._default
+
+    @property
+    def default_override(self) -> Optional[bool]:
+        """The operator's session default, or None while DEBUG_MODE applies."""
+        return self._default_override
+
+    @property
     def snapshot(self) -> Optional[RuntimeSnapshot]:
         """The rolling runtime metrics the footer prints, or None before the
         sampler's first tick. Read by MusicContext.send."""

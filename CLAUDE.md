@@ -349,6 +349,8 @@ src/
 │                     # GuildSettings, the cache and ONLY writer of guild:{id}:config; and
 │                     # BotSettings, which applies the operator's stored bot overrides. What the
 │                     # environment holds is config.py; this module decides what chat may change
+├── settings_card.py  # -settings' embeds (pure): server card, bot card, detail, every reply;
+│                     # the command body is commands/settings.py
 └── util.py           # logger factory, embed helpers (safe_label, verbatim_code),
                       # fmt_duration/fmt_seconds, progress_bar/progress_line (the NP bar and
                       # the card's), task helpers (spawn_background, cancel_task, join_task,
@@ -1081,7 +1083,7 @@ Per-guild synchronization primitives and what they protect:
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
-| `GuildSettings` per-guild write lock (src/settings.py) | `guild:{id}:config`: it is the ONLY writer (`-volume`, `-debug --enable/--disable`, restore's volume migration, guild removal), each write a bounded store call then a synchronous commit that stamps (guild, field) from one sequence counter. A read (restore's `seed`, the startup `hydrate`, `load`) never locks: it skips any field stamped after it began, so a read straddling a write never undoes it. The locks are refcounted and dropped when idle, and `reading()` registrations bound how long stamps and forget marks live. `DebugSettings` is its projection of `debug_mode`. `docs/ARCHITECTURE.md#settings-resolution` |
+| `GuildSettings` per-guild write lock (src/settings.py) | `guild:{id}:config`: it is the ONLY writer (`-settings`, `-volume`, `-debug --enable/--disable`, restore's volume migration, guild removal), each write a bounded store call then a synchronous commit that stamps (guild, field) from one sequence counter. A read (restore's `seed`, the startup `hydrate`, `load`) never locks: it skips any field stamped after it began, so a read straddling a write never undoes it. The locks are refcounted and dropped when idle, and `reading()` registrations bound how long stamps and forget marks live. `DebugSettings` is its projection of `debug_mode`. `docs/ARCHITECTURE.md#settings-resolution` |
 | `Spotify._auth_lock` | token refresh double-fire |
 | `PostgresHistoryArchive._analytics_slot` | one -analytics aggregate in flight per process. Deliberately NOT `_read_slots`: that budget is two against a max_size=4 pool, sized when leaderboard was its only taker, and this is the heaviest of the three readers |
 | `chart_pool` (1 worker) | matplotlib off the event loop AND off the GIL. A thread is no better than no thread — figure construction is pure Python and contends with discord.py's audio player thread; measured loop lag spikes to 108ms threaded, against 4.23ms frame lateness in a process. Warmed at `setup_hook` **only when the archive is enabled**, after the yt-dlp prewarm that brings the forkserver up — the cold first render is 688ms warmed against 2,976ms not |
@@ -1154,13 +1156,17 @@ can spend the whole placement budget before the insert begins.
   waiting out, mid-cleanup. Never swallow your own
   coroutine's CancelledError (see `_typing_keepalive`'s comment for the pattern).
 - **Command definitions** carry their own help copy: `brief`, `usage`, `help`, and
-  `extras={"category", "examples", "note"}` — help.py renders from these, so a new
-  command documents itself. Add it to `CATEGORY_COMMANDS` in help.py for ordering
+  `extras={"category", "examples", "note", "sections"}` — help.py renders from these,
+  so a new command documents itself. `sections` is `(name, entries)` pairs a command
+  builds from its own data, rendered after EXAMPLES (`-settings` lists its settings
+  from the registry). Add it to `CATEGORY_COMMANDS` in help.py for ordering
   (unlisted commands land under "Other").
 - **Durations** render via `fmt_duration` (`3:45`, `1:02:05`) everywhere — mixed clock
-  formats between the bar, presence, and embeds was a real bug. Embed titles through
-  `truncate_embed_title` (Discord 400s the whole send at >256 chars).
-- ETA timestamps render in `America/Los_Angeles` (`_PST` in musicplayer.py).
+  formats between the bar, presence, and embeds was a real bug. The exception is a
+  `-settings` seconds-kind value, which renders through `util.fmt_seconds` (`3s`); every
+  setting value renders through the registry's `format_value` and parses back through
+  its one grammar. Embed titles through `truncate_embed_title` (Discord 400s the whole
+  send at >256 chars).
 
 ## Testing
 
@@ -1299,7 +1305,7 @@ duplicated.
 | Variable | Default | Notes |
 |---|---|---|
 | `DISCORD_TOKEN` | — | required; startup fails without it |
-| `OWNER_IDS` | — | the bot's operator, as Discord user ids (comma- or space-separated, each 17–20 ASCII digits; anything else refuses startup). Passed as discord.py's `owner_ids`, so set it IS the list and `is_owner` makes no REST call. Unset, discord.py looks it up with `application_info()`: the application's owner, or every team member whose role is Admin or Developer, cached until restart — a developer removed from the team keeps the operator's reach until then. `util.is_operator` fails closed and remembers a failed lookup for 60s |
+| `OWNER_IDS` | — | the bot's operator, as Discord user ids (comma- or space-separated, each 17–20 ASCII digits; anything else refuses startup). The operator may change any server's settings (`-settings`, `-debug --enable/--disable`) and alone sees the bot-wide ones and `-debug`'s host blocks. Passed as discord.py's `owner_ids`, so set it IS the list and `is_owner` makes no REST call. Unset, discord.py looks it up with `application_info()`: the application's owner, or every team member whose role is Admin or Developer, cached until restart — a developer removed from the team keeps the operator's reach until then. `util.is_operator` fails closed and remembers a failed lookup for 60s |
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | both or neither; validated live at startup |
 | `REDIS_URL` | `redis://localhost:6379` | bot runs degraded (no persistence/recovery) without Redis |
 | `HISTORY_ARCHIVE_ENABLED` | `false` | **the consent gate for long-term storage** — `true` enables the Postgres archive tier (outbox writes, drainer, `POSTGRES_URL` requirement). Strict parse (`true/1/yes` / `false/0/no`, case-insensitive; unset/empty → false; garbage aborts startup, and `setup_hook` reads it FIRST so the ValueError cannot be swallowed by `@_guild_op`). Set together with `COMPOSE_PROFILES=archive` — the pair is documented in `.env.example` |
@@ -1313,7 +1319,7 @@ duplicated.
 | `POSTGRES_STATEMENT_CACHE` | `100` | asyncpg `statement_cache_size`; set `0` behind a statement-rewriting pooler |
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
 | `ENVIRONMENT` | `development` | `main()` infers `production`/the branch slug from git when unset and a repo is present; set explicitly in CI/Docker |
-| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every embed the bot sends with a trace/timing/runtime footer. Four seams apply it, because "every embed" is sent from four places: `MusicContext.send` (command responses), `MusicPlayer._decorate_for_debug` (the NP block at every render site — refreshed on each progress tick — plus the player's own notices), `restore_guild` (the channels-deleted notice, which has no player), and a pre-rendered `debug_suffix` threaded into the four sends that bypass `MusicContext.send` (`-ping`, `-debug`, the queue-progress card and the slow-resolve notice). Every seam routes through `DebugSettings.decorate()`, which owns the enabled check, the strip fallback, the shard and the sampler's runtime figures; the environment leading the suffix is read by `debug_footer` itself, since it is a property of the process rather than of the request. A seam passes only the span it names and, for command responses, elapsed-ms. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
+| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every embed the bot sends with a trace/timing/runtime footer. Four seams apply it, because "every embed" is sent from four places: `MusicContext.send` (command responses), `MusicPlayer._decorate_for_debug` (the NP block at every render site — refreshed on each progress tick — plus the player's own notices), `restore_guild` (the channels-deleted notice, which has no player), and a pre-rendered `debug_suffix` threaded into the four sends that bypass `MusicContext.send` (`-ping`, `-debug`, the queue-progress card and the slow-resolve notice). Every seam routes through `DebugSettings.decorate()`, which owns the enabled check, the strip fallback, the shard and the sampler's runtime figures; the environment leading the suffix is read by `debug_footer` itself, since it is a property of the process rather than of the request. A seam passes only the span it names and, for command responses, elapsed-ms. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` and `-settings debug on`/`off`/`reset` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or the bot's operator); both write through `GuildSettings`, so they are one choice with two spellings. The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
 | `DEBUG_PROMETHEUS_URL` | — | Prometheus query API `-debug` reads the **postgres container's** CPU/memory from (the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL). Compose sets `http://localhost:9090`; the series come from the `otelcol-metrics` `docker_stats` receiver, selected by `container_name="discord-postgres"`. **That collector is behind the `metrics` compose profile**, so on a default `up` it does not run and the cpu/mem rows render `n/a (no metrics source)` even though the URL is set and Prometheus answers — set `COMPOSE_PROFILES=metrics` (or `docker compose --profile metrics up -d`) as well. Unset URL → the same `n/a`. Only those two rows depend on it: the block's load/throughput/mem-signal rows are native SQL over the archive's own pool and render regardless. The container name is a hand-checked cross-file pin (see golden rule 6) |
 | `PROMETHEUS_HOST_PORT` | `9090` | host-side published port for the metrics stack's Prometheus, loopback-bound. Also the port `DEBUG_PROMETHEUS_URL` defaults to — the two are written separately in compose (golden rule 6c) |
 | `GIT_SHA` | — | the deploy tag, baked into the runtime image as an `ENV` (and a label). The ENV is the one the process can read, which is what lets `-debug` report the commit it is running; outside a container `-debug` shells out to `git rev-parse` instead |
@@ -1346,7 +1352,7 @@ duplicated.
 | youtube.py `yt_source` / `_first_video_entry` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results (the marker moved to `_first_video_entry` with the loop it describes) |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | musicbot.py `play` (playlist branch) | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
-| musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but no command WRITES it (`GuildSettings.write` can; no command calls it for `timezone`), so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a command that writes it, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
+| musicplayer.py ETA zone | TODO | `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, which `-settings timezone` writes; a guild that never set one renders `DEFAULT_TIMEZONE` (US/Pacific). The `%Z` suffix fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Still owed: per-VIEWER rendering, since a guild-wide zone is one clock for everyone in the guild. Fix: Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
 | commands/jump.py `run` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
@@ -1358,7 +1364,7 @@ duplicated.
 brief=..., usage=..., help=..., extras={"category": ..., "examples": [...], "note": ...})`;
 add `@commands.before_invoke(validate_commands)` if it needs the author in voice; open a
 span with `@_tracer.start_as_current_span("bot.<name>")`; every reply an embed; list it
-in help.py's `CATEGORY_COMMANDS`; tests in tests/test_musicbot.py.
+in help.py's `CATEGORY_COMMANDS`; tests in `tests/commands/test_<command>.py`.
 
 **The body belongs in the command's own module, not on the cog.** The cog keeps only
 what discord.py owns — registration, converters, checks, cooldowns — and one

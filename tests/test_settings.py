@@ -759,6 +759,26 @@ class TestParseSettingsArgs:
         text = wrong_scope_text(_spec("heartbeat"), operator=True)
         assert "`-settings bot heartbeat`" in text
 
+    @pytest.mark.parametrize(
+        ("arg", "scope"),
+        [
+            ("volume 150", SettingScope.SERVER),
+            ("heartbeet", SettingScope.SERVER),
+            ("bot heartbeet", SettingScope.BOT),
+            ("bot heartbeat 1s", SettingScope.BOT),
+            ("bot reset", SettingScope.BOT),
+            ("volume " + "8" * 94, None),
+        ],
+    )
+    def test_a_refusal_names_the_scope_it_was_made_in(
+        self, arg: str, scope: SettingScope | None
+    ) -> None:
+        """The command keeps a refusal made after `bot` from a non-operator: its
+        text can name a bot setting or its range."""
+        result = _request(arg)
+        assert isinstance(result, Refusal)
+        assert result.scope is scope
+
     def test_a_value_the_kind_refuses_keeps_its_own_refusal(self) -> None:
         result = _request("volume loud")
         assert isinstance(result, Refusal)

@@ -98,10 +98,9 @@ class EtaWalk:
         return replace(self, cumulative_secs=self.cumulative_secs + remaining)
 
 
-# TODO: every guild's ETAs still render in DEFAULT_TIMEZONE, and in one zone per
-# guild rather than per viewer. queue_embed()'s "Est. playing at" and the NP
-# "Estimated finish" read GuildConfig.timezone, but no command writes it
-# (GuildSettings.write can). Owed: a command, then per-viewer rendering (<t:epoch:R>).
+# TODO: ETAs render in one zone per guild, never per viewer: queue_embed()'s
+# "Est. playing at" and the NP "Estimated finish" read GuildConfig.timezone, which
+# -settings timezone sets. Owed: per-viewer rendering (<t:epoch:R>).
 
 
 def _fmt_total_duration(secs: int) -> str:

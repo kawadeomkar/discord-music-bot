@@ -19,6 +19,7 @@ from src.config import (
     spotify_enabled,
 )
 from src import debug as debug_mode
+from src import settings as settings_registry
 from src.commands import analytics as analytics_cmd
 from src.commands import clear as clear_cmd
 from src.commands import debug as debug_cmd
@@ -33,6 +34,7 @@ from src.commands import play as play_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import resume as resume_cmd
+from src.commands import settings as settings_cmd
 from src.commands import shuffle as shuffle_cmd
 from src.commands import skip as skip_cmd
 from src.commands import stop as stop_cmd
@@ -182,6 +184,11 @@ class MusicBot(commands.Cog):
         # re-syncs once the stored choices land.
         self.debug_settings.sync_sampler()
         spawn_background(self._hydrate_configs(), self._restore_tasks)
+        # Off the loop: the first -settings timezone would otherwise walk the tz
+        # database on it.
+        spawn_background(
+            asyncio.to_thread(settings_registry.warm_timezones), self._restore_tasks
+        )
         if self.spotify is None:
             return
         spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
@@ -1080,7 +1087,8 @@ class MusicBot(commands.Cog):
             "Sets playback volume as a percentage between 0 and 100.\n\n"
             "The new level takes effect on the **next** song, not the one "
             "currently playing. It is saved per server, so it still applies "
-            "after a restart."
+            "after a restart. `-settings volume` shows and changes the same saved "
+            "level."
         ),
         extras={"category": "Playback", "examples": ["-volume 50", "-vol 100"]},
     )
@@ -1194,6 +1202,50 @@ class MusicBot(commands.Cog):
     async def debug(self, ctx: commands.Context, *, arg: str = "") -> None:
         try:
             await debug_cmd.run(ctx, arg, cog=self)
+        except Exception as e:
+            await self._command_error(ctx, e)
+
+    @commands.command(
+        name="settings",
+        aliases=["config", "cfg", "prefs"],
+        brief="view or change this server's settings",
+        usage="[bot] [<setting> [<value> | reset]]",
+        help=(
+            "`-settings` shows this server's settings: each one's value and whether "
+            "it was set here or is the default. `-settings <setting>` shows one in "
+            "full: what it does, its default, what it accepts and when a change "
+            "applies. `-settings <setting> <value>` changes it for this server, and "
+            "`-settings <setting> reset` returns it to the default. A setting's "
+            "name on the card works with dashes for spaces.\n\n"
+            "One setting per message, on one line. `-settings bot` shows the "
+            "bot-wide settings, to the bot's operator only."
+        ),
+        extras={
+            "category": "Utility",
+            # cog_before_invoke neither builds nor re-homes a player for it.
+            "skips_player_setup": True,
+            "examples": [
+                "-settings",
+                "-settings timezone Europe/London",
+                "-settings volume 80",
+                "-settings debug-footer reset",
+                "-settings bot",
+            ],
+            "note": (
+                "Anyone can view. Changing a server setting needs Manage Server; "
+                "volume can also be changed by anyone in the bot's voice channel, "
+                "as with `-volume`. The bot's operator can change them too, and "
+                "bot-wide settings are the operator's alone."
+            ),
+            "sections": settings_registry.help_sections(),
+        },
+    )
+    # No max_concurrency: writes serialize on GuildSettings' per-guild lock, and
+    # every Redis call is bounded, so a wait=True bucket would only queue views.
+    @_tracer.start_as_current_span("bot.settings")
+    async def settings(self, ctx: commands.Context, *, arg: str = "") -> None:
+        try:
+            await settings_cmd.run(ctx, arg, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
 

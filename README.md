@@ -64,7 +64,7 @@ details, aliases, and examples.
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
 | `-stop` | `st` | Stop playback and disconnect, keeping the queue for `-resume` (24h) |
-| `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (applies from the next song; saved per server) |
+| `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (applies from the next song; saved per server). `-settings volume` changes the same saved level |
 
 ### Queue
 
@@ -85,6 +85,7 @@ details, aliases, and examples.
 | Command | Aliases | Description |
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
+| `-settings [<setting> [<value>\|reset]]` | `config`, `cfg`, `prefs` | This server's settings: `-settings` lists them, `-settings timezone` shows one in full, `-settings timezone Europe/London` changes it and `-settings timezone reset` puts it back. Anyone can look; changing one needs Manage Server, except `volume`, which anyone in the bot's voice channel can change, as with `-volume`. `-help settings` lists every setting and what it accepts. The bot's operator also sees `-settings bot`, the bot-wide settings |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
 | `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer on every embed the bot sends there, the live Now Playing card included, carrying the trace id, timing and the bot process's runtime load — and need **Manage Server** |
 | `-help [command]` | — | Full command manual |
@@ -497,7 +498,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DISCORD_TOKEN` | ✅ | — | Discord bot token |
-| `OWNER_IDS` | | — | Discord user ids (comma- or space-separated) of the bot's operator: who may turn any server's debug mode on or off without Manage Server, and who sees `-debug`'s host details. Unset, it is the application's owner, or every member of its team with the Admin or Developer role, looked up once and kept until restart; set, it is exactly this list. A malformed id refuses startup |
+| `OWNER_IDS` | | — | Discord user ids (comma- or space-separated) of the bot's operator: who may change any server's settings without Manage Server, and who sees the bot-wide settings and `-debug`'s host details. Unset, it is the application's owner, or every member of its team with the Admin or Developer role, looked up once and kept until restart; set, it is exactly this list. A malformed id refuses startup |
 | `SPOTIFY_CLIENT_ID` | | — | Spotify app client ID (Client Credentials flow). Enables Spotify links; omit both Spotify vars to run without Spotify support |
 | `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
@@ -526,7 +527,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `QUEUE_PROGRESS_MAX_SECS` | | `300.0` | How long the card keeps editing before it settles on "still working" and stops. Not a timeout: the enqueue carries on, and the card is still deleted when it lands. `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a slot, this bounds the editing. Must be at least `QUEUE_PROGRESS_DELAY_SECS` + `QUEUE_PROGRESS_TICK_SECS` (7.5 by default); below that the bot refuses to start |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
 | `PING_DEADLINE_SECS` | | `3.0` | `-ping` health dashboard: how long a probe may run before the row is marked failed |
-| `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-debug --enable`/`--disable` persists to Redis and wins over this value from then on, across restarts. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
+| `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-settings debug on`/`off` (or `-debug --enable`/`--disable`, the same choice) persists to Redis and wins over this value from then on, across restarts, until `-settings debug reset`. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
 | `BOT_SETTINGS_OVERRIDES` | | `apply` | Set `ignore` to run the bot on its environment and code values, ignoring the bot-wide overrides stored in Redis, and to stop them being changed from chat. The stored values stay: remove the variable and restart to use them again. Anything but `apply` or `ignore` refuses startup. `just bot-settings reset <application_id>` deletes them instead |
 | `DEBUG_PROMETHEUS_URL` | | — (Compose sets `http://localhost:9090`) | Where `-debug` reads the Postgres container's CPU/memory from — the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL. The series come from the `otelcol-metrics` sidecar, which is **opt-in via the `metrics` Compose profile** because it mounts the Docker socket, so on a default `up` that one row reads `n/a (no metrics source)` even though this URL is set and Prometheus answers. Unset, the same row and nothing else changes |
 | `PROMETHEUS_HOST_PORT` | | `9090` | Host port the metrics stack's Prometheus publishes on (loopback only). Read by Compose, never by the bot; `DEBUG_PROMETHEUS_URL`'s default follows it. Change it when something on this machine already owns 9090 — a collision fails the whole `docker compose up`, not just the metrics row |
@@ -1096,6 +1097,7 @@ src/
 ├── telemetry.py        # OpenTelemetry + structlog setup
 ├── config.py           # ENVIRONMENT detection, tunables
 ├── settings.py         # -settings: what chat may change, its ranges and its grammar
+├── settings_card.py    # -settings' cards and replies
 └── util.py             # logging factory, embed helpers, task helpers
 
 tests/                  # one test_*.py per src/ module, plus:

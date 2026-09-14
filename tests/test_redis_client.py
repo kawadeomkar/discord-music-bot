@@ -1733,8 +1733,8 @@ class TestSetVolume:
 
 
 class TestSetTimezone:
-    """Write half of the planned `-options timezone`. No command calls it yet, so
-    these are the only thing holding its contract."""
+    """Write half of `-settings timezone`, which reaches it through
+    GuildSettings.write."""
 
     async def test_a_real_zone_is_stored(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

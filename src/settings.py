@@ -500,7 +500,8 @@ def in_bounds(spec: SettingSpec, value: SettingValue) -> bool:
 
 
 class RefusalReason(Enum):
-    """Recorded on the span as `settings.refused`; the text never is."""
+    """Recorded on the span as `settings.refused`; the text never is. The parse
+    returns the first eight; the command adds the rest."""
 
     TOO_MUCH = "too_much"
     BAD_SHAPE = "bad_shape"
@@ -510,6 +511,13 @@ class RefusalReason(Enum):
     WRONG_SCOPE = "wrong_scope"
     TIMEZONE_REDIRECT = "timezone_redirect"
     FIXED_OFFSET = "fixed_offset"
+    DM_NEEDS_BOT = "dm_needs_bot"
+    NO_PERMISSION = "no_permission"
+    OPERATOR_ONLY = "operator_only"
+    OPERATOR_UNCONFIRMED = "operator_unconfirmed"
+    BOT_WRITE_UNAVAILABLE = "bot_write_unavailable"
+    # A bullet-shaped message whose parse was refused: nothing is sent.
+    BULLET_SHAPE = "bullet_shape"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -519,6 +527,8 @@ class Refusal:
     spec: SettingSpec | None = None
     # Which bound an out-of-range value missed.
     side: Literal["minimum", "maximum"] | None = None
+    # The scope the request named; None when it was refused before the scope word.
+    scope: SettingScope | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1114,6 +1124,12 @@ def parse_settings_args(arg: str, *, tail: str) -> SettingsRequest | Refusal:
     scope = SettingScope.SERVER
     if tokens and _undash(tokens[0]).casefold() == "bot":
         scope, tokens = SettingScope.BOT, tokens[1:]
+    result = _parse_scoped(tokens, scope)
+    return replace(result, scope=scope) if isinstance(result, Refusal) else result
+
+
+def _parse_scoped(tokens: list[str], scope: SettingScope) -> SettingsRequest | Refusal:
+    """The words after the scope: a key, then nothing, a reset word or a value."""
     if not tokens:
         return SettingsRequest(scope=scope, action=SettingsAction.SHOW)
 
