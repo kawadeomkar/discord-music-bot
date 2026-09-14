@@ -22,6 +22,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.debug import DebugSettings, RuntimeSnapshot
+from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
@@ -1083,6 +1084,64 @@ class TestQueueShuffle:
         music_player.current_song = None
         assert await music_player.queue_shuffle() == "Shuffled!"
         assert music_player._prefetch_task is None
+
+    async def test_a_shuffle_during_a_song_start_is_the_only_prefetch(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """Between vc.play() and the loop's own prefetch sits the Now Playing send, a
+        Discord round trip a -shuffle can land in. Its prefetch fills the slot, and a
+        second task started over it leaves two claims the loop settles one of."""
+        await music_player.queue.put(
+            [
+                QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+                for i in range(6)
+            ]
+        )
+        music_player._restore_complete.set()
+        music_player.open_playback_gate()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.loop = asyncio.get_running_loop()
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        vc.is_paused = MagicMock(return_value=False)
+        mocked(music_player._guild).voice_client = vc
+        shuffled: list[object] = []
+        in_slot: list[object] = []
+
+        async def _shuffle_during_the_send(*_: Any, **__: Any) -> None:
+            assert await music_player.queue_shuffle() == "Shuffled!"
+            shuffled.append(music_player._prefetch_task)
+
+        async def _song_plays() -> None:
+            in_slot.append(music_player._prefetch_task)
+            await asyncio.sleep(0.05)  # the prefetch claims and resolves its head
+
+        music_player.play_next.wait = AsyncMock(side_effect=_song_plays)
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(side_effect=lambda s: s)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(
+                MusicPlayer,
+                "_send_now_playing",
+                new=AsyncMock(side_effect=_shuffle_during_the_send),
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(GuildHistory, "add", new=AsyncMock()),
+        ):
+            async with asyncio.timeout(5):
+                await music_player.loop()
+
+        assert shuffled[0] is not None and in_slot == shuffled
+        queue = music_player.queue
+        assert queue.display_size() - queue.qsize() == 1
 
     async def test_shuffle_empty_queue_returns_error(
         self, music_player: MusicPlayer
@@ -6695,6 +6754,12 @@ class TestQueueEntryCard:
 
 
 class TestPrefetchNextSong:
+    def test_the_prefetch_span_wraps_the_prefetch_itself(self) -> None:
+        """On _ensure_prefetch the span would cover only creating the task: it ends
+        before the resolve starts, and the resolve's spans report under an ended one."""
+        assert hasattr(MusicPlayer._prefetch_next_song, "__wrapped__")
+        assert not hasattr(MusicPlayer._ensure_prefetch, "__wrapped__")
+
     async def test_returns_none_when_queue_empty(
         self, music_player: MusicPlayer
     ) -> None:
@@ -11097,6 +11162,8 @@ class TestHistorySkipMarker:
             )
             await record_marker()
             # The loop plays the song that cut in, clearing the marker as it goes.
+            # Standing in for that is what lets one live_song object play the part
+            # of the three a real stack has.
             music_player._skip_history_for = None
 
         # Every round set the marker to the song it actually stopped.
@@ -11358,6 +11425,28 @@ class TestInterjectPostNeutralizeRecheck:
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
 
+    async def test_a_bail_at_dispatch_leaves_the_prefetch_alone(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """Neutralizing before the liveness check spends the next song's resolved
+        source to reach a refusal that did not need it, and the fallback enqueue then
+        pays a cold extraction already paid for."""
+        music_player.current_song = live_song
+        music_player.note_deliberate_stop()  # already stopped by -skip
+        prefetch = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = prefetch
+
+        try:
+            assert await music_player.interject(interject_obj, mock_vc) is None
+            assert not prefetch.done()
+            assert music_player._prefetch_task is prefetch
+        finally:
+            prefetch.cancel()
+
     async def test_bailing_leaves_an_existing_stack_untouched(
         self,
         music_player: MusicPlayer,
@@ -11530,6 +11619,46 @@ class TestInterjectStoppedSong:
         outcome = await music_player.interject(interject_obj, mock_vc)
 
         assert outcome is None
+        assert music_player.queue.display_items() == []
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
+
+
+class TestInterjectOverASongThatIsOver:
+    """current_song outlives its song in two windows: the audio thread sets play_next
+    before the loop clears it, and cleanup() never clears it. Interjecting there parks
+    a resume tail for a play that has ended and stops a client with nothing on it."""
+
+    async def test_a_song_that_signalled_its_end_is_not_interjected_over(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        music_player.play_next.set()
+
+        assert await music_player.interject(interject_obj, mock_vc) is None
+        assert music_player.queue.display_items() == []
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
+
+    async def test_a_torn_down_player_is_not_interjected_over(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        music_player._player = finished
+
+        assert await music_player.interject(interject_obj, mock_vc) is None
         assert music_player.queue.display_items() == []
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
