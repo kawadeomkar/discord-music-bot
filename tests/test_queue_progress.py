@@ -10,6 +10,7 @@ test that wants a fast card sets them with `config.set_override` before entering
 import asyncio
 import contextlib
 import logging
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 
@@ -588,14 +589,21 @@ class TestTheCardsOwnBounds:
         assert card_ceiling(10.0, 5.0, max_secs) == expected
 
     async def test_a_ceiling_the_delay_outlasts_still_gets_an_ordinary_edit(
-        self, card_ctx: MagicMock
+        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The delay and the ceiling are set separately, so a ceiling can end
         before the card appears. The card still makes one ordinary edit first:
-        a card that only ever says "still working" is the feature doing nothing."""
+        a card that only ever says "still working" is the feature doing nothing.
+
+        The card's clock is held past the max and short of delay + 2 ticks, so
+        only the ceiling decides whether its first check stalls, however late
+        that check runs."""
+        clock = [1000.0]
+        monkeypatch.setattr(
+            queue_progress, "time", SimpleNamespace(monotonic=lambda: clock[0])
+        )
         _fast()
-        config.set_override("QUEUE_PROGRESS_TICK_SECS", 0.05)
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.01)
+        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.001)
         message = card_ctx.channel.send.return_value
         titles: list[str] = []
 
@@ -604,12 +612,17 @@ class TestTheCardsOwnBounds:
 
         message.edit = AsyncMock(side_effect=_edit)
 
-        async with enqueue_progress(card_ctx, _yt_playlist(), delay=0.05) as progress:
-            progress.update(1, 10)
+        # Ceiling: max(0.001, 0.01 + 2 * 0.01) = 0.03 past the card's start.
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=0.01) as progress:
+            clock[0] = 1000.02
+            async with asyncio.timeout(2):
+                while not titles:
+                    progress.update(progress.done + 1, 10)
+                    await asyncio.sleep(0.005)
+            clock[0] = 1000.05
             async with asyncio.timeout(2):
                 while not any("Still working" in t for t in titles):
-                    progress.update(progress.done + 1, 10)
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.005)
 
         assert titles[0] == queue_progress._TITLE
 
