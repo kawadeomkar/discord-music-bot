@@ -2468,7 +2468,9 @@ it. Until the read lands, every knob runs on its environment value.
 - One INFO lists every override applied, and each override that shadows a **set**
   environment variable draws a WARNING naming all three ways back: `-settings bot <key>
   reset`, `just bot-settings reset <application_id>` and `BOT_SETTINGS_OVERRIDES=ignore`.
-- A knob that `apply` or `reset` changed while the read was in flight keeps that value.
+- A knob that `apply` or `reset` changed while the read was in flight keeps that value,
+  and so does a knob whose last write or reset did not reach Redis: a read after a
+  failed one would otherwise put the older stored value back.
 
 **Bot writes.** `-settings bot <setting> <value>` and `-settings bot <setting> reset`,
 for the operator alone, go through `BotSettings.write`/`write_reset`: one at a time under

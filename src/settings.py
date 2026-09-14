@@ -1611,9 +1611,11 @@ class BotSettings:
     async def hydrate(self) -> None:
         """Apply every stored override, reading under CONFIG_IO_TIMEOUT_SECS.
         Never raises. A failed read leaves every knob on its environment value
-        and `hydrated` False, for on_ready to retry. A stored value outside the
-        registry's current bounds is skipped with a WARNING, never applied: the
-        key outlives builds, and its bounds can change between them."""
+        and `hydrated` False, for on_ready to retry. A knob changed while the read
+        ran, or whose last write or reset did not reach Redis, keeps its value. A
+        stored value outside the registry's current bounds is skipped with a
+        WARNING, never applied: the key outlives builds, and its bounds can change
+        between them."""
         application_id = self._bot.application_id
         if self.hydrated or self._redis is None or application_id is None:
             return
@@ -1642,7 +1644,11 @@ class BotSettings:
             if spec.field is None or spec.attr is None or spec.env is None:
                 continue
             value: Optional[float] = getattr(stored, spec.field)
-            if value is None or self._changed_at.get(spec.attr, 0) > started:
+            if (
+                value is None
+                or self._changed_at.get(spec.attr, 0) > started
+                or spec.attr in self._unpersisted
+            ):
                 continue
             if not in_bounds(spec, value):
                 log.warning(

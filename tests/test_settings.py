@@ -1206,6 +1206,49 @@ class TestBotSettingsWrite:
         await bot_settings.write(spec, 5.0)
         assert bot_settings.is_persisted(spec)
 
+    async def test_a_later_hydrate_keeps_an_unsaved_write(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Hydration failed, so a later READY reads again. A write made between the
+        two did not reach Redis, and that read must not put the stored 4s back."""
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=4.0))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(return_value=None)
+        ):
+            await bot_settings.hydrate()
+        with patch.object(
+            BotConfigStore, "update_config", new=AsyncMock(return_value=False)
+        ):
+            await bot_settings.write(spec, 10.0)
+
+        await bot_settings.hydrate()
+
+        assert bot_settings.hydrated is True
+        assert config.heartbeat_interval_secs() == 10.0
+        assert not bot_settings.is_persisted(spec)
+
+    async def test_a_later_hydrate_keeps_an_unsaved_reset(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("play-inflight-max")
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(return_value=None)
+        ):
+            await bot_settings.hydrate()
+        with patch.object(
+            BotConfigStore, "reset_config_fields", new=AsyncMock(return_value=False)
+        ):
+            await bot_settings.write_reset(spec)
+
+        await bot_settings.hydrate()
+
+        assert config.override("PLAY_INFLIGHT_MAX") is None
+        assert not bot_settings.is_persisted(spec)
+
     async def test_a_stalled_store_reports_not_saved_within_the_timeout(
         self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
