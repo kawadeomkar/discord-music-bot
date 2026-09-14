@@ -5,6 +5,7 @@ format_value, so a value copied off a card parses back. See src/settings.py for
 the registry itself."""
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Optional
 
@@ -25,6 +26,7 @@ from src.settings import (
     in_bounds,
 )
 from src.util import (
+    EMBED_FIELD_LIMIT,
     codeblock_fields,
     notice_embed,
     safe_label,
@@ -47,7 +49,11 @@ _BOT_SPECS: Final = tuple(s for s in SETTINGS if s.scope is SettingScope.BOT)
 _CARD_INTRO: Final = (
     "Anyone can view these. Changing one needs Manage Server; volume can also be "
     "changed by anyone in the bot's voice channel. The bot's operator can change "
-    "them too."
+    "them too. To change one, run the command under it with a value from its range."
+)
+_SERVER_FOOTER: Final = (
+    "-settings <setting> reset puts one back to its default · -settings <setting> "
+    "shows one in full"
 )
 _CARD_UNREAD: Final = (
     "⚠️ Couldn't read this server's saved settings just now, so these are the "
@@ -153,12 +159,41 @@ def bot_shown(
 # ── Cards ────────────────────────────────────────────────────────────────────
 
 
-def _hint_name(specs: tuple[SettingSpec, ...]) -> str:
-    """A name typed with dashes, read off the card: the first label with a space."""
-    for spec in specs:
-        if " " in spec.label:
-            return spec.label.casefold().replace(" ", "-")
-    return specs[0].key
+def _row(spec: SettingSpec, shown: Shown, command: str) -> str:
+    """One setting on a card: its value and source, what it does, and the command
+    that changes it with the range that command accepts now."""
+    return (
+        f"**{spec.label}** · {format_value(spec, shown.value)} · {shown.source}\n"
+        f"{spec.summary}\n"
+        f"`{command} <value>` · {allowed_text(spec, now=True)}"
+    )
+
+
+def _add_rows(
+    embed: discord.Embed,
+    rows: list[tuple[SettingSpec, Shown]],
+    command: Callable[[SettingSpec], str],
+) -> None:
+    """One field per group in registry order, spilling into "(cont.)" before a
+    field outgrows Discord's limit."""
+    for group in dict.fromkeys(spec.group for spec, _ in rows):
+        name, value = group.value, ""
+        for spec, shown in rows:
+            if spec.group is not group:
+                continue
+            entry = _row(spec, shown, command(spec))
+            joined = f"{value}\n\n{entry}" if value else entry
+            if value and len(joined) > EMBED_FIELD_LIMIT:
+                embed.add_field(name=name, value=value, inline=False)
+                name, value = f"{group.value} (cont.)", entry
+            else:
+                value = joined
+        embed.add_field(name=name, value=value, inline=False)
+
+
+def _server_command(spec: SettingSpec) -> str:
+    # The label with dashes, which invariant 12 makes a name for this setting.
+    return f"-settings {spec.label.casefold().replace(' ', '-')}"
 
 
 def server_card(
@@ -168,8 +203,9 @@ def server_card(
     read_failed: bool,
     operator: bool,
 ) -> discord.Embed:
-    """This server's settings, one prose line each under its group. `rows` is in
-    registry order; the operator's card ends with a pointer to -settings bot."""
+    """This server's settings under their groups, each with the command that
+    changes it. `rows` is in registry order; the operator's card ends with a
+    pointer to -settings bot."""
     description = f"{_CARD_UNREAD}\n\n{_CARD_INTRO}" if read_failed else _CARD_INTRO
     if operator:
         description += "\n`-settings bot` shows bot-wide settings."
@@ -178,20 +214,8 @@ def server_card(
         description=description,
         color=DEGRADED_COLOR if read_failed else CHANGE_COLOR,
     )
-    for group in dict.fromkeys(spec.group for spec, _ in rows):
-        lines = [
-            f"**{spec.label}** · {format_value(spec, shown.value)} · {shown.source}"
-            for spec, shown in rows
-            if spec.group is group
-        ]
-        embed.add_field(name=group.value, value="\n".join(lines), inline=False)
-    name = _hint_name(tuple(spec for spec, _ in rows))
-    embed.set_footer(
-        text=(
-            f"Names work with dashes: -settings {name} to see one · "
-            f"-settings {name} <value> · -settings {name} reset"
-        )
-    )
+    _add_rows(embed, rows, _server_command)
+    embed.set_footer(text=_SERVER_FOOTER)
     return embed
 
 

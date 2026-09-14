@@ -1,6 +1,8 @@
 """Tests for src/settings_card.py — the -settings cards, detail view and replies.
 Which of them reaches the channel, and for whom, is tests/commands/test_settings.py."""
 
+import re
+
 import pytest
 
 from src import config
@@ -9,9 +11,15 @@ from src.guild_state import DEFAULT_TIMEZONE, OFF_SECS, GuildConfig
 from src.settings import (
     SETTINGS,
     Parsed,
+    SettingKind,
     SettingScope,
+    SettingsAction,
     SettingSpec,
+    SettingsRequest,
+    bound,
     find,
+    format_value,
+    parse_settings_args,
     parse_value,
 )
 
@@ -210,7 +218,7 @@ class TestServerCard:
         assert all(len(field.value or "") <= FIELD_LIMIT for field in embed.fields)
         assert len(embed) <= CARD_BUDGET
 
-    def test_groups_in_registry_order_one_prose_line_each(self) -> None:
+    def test_each_setting_shows_its_value_summary_and_command(self) -> None:
         embed = card.server_card(
             guild_name="Lo-fi Lounge",
             rows=_server_rows(GuildConfig(volume=0.8)),
@@ -218,35 +226,75 @@ class TestServerCard:
             operator=False,
         )
         assert embed.title == "Server settings · Lo-fi Lounge"
-        assert [(f.name, f.value) for f in embed.fields] == [
-            (
-                "Playback",
-                "**Volume** · 80% · set here\n"
-                "**Timezone** · America/Los_Angeles · default",
-            ),
-            (
-                "Leaving voice",
-                "**Leave when idle** · 5:00 · default\n"
-                "**Leave when alone** · 0:10 · default",
-            ),
-            (
-                "Messages",
-                "**Progress bar refresh** · 3s · default\n"
-                "**Lookup notice** · 6s · default\n"
-                "**Playlist card** · 2.5s · default",
-            ),
-            ("Diagnostics", "**Debug footer** · off · default"),
+        assert [f.name for f in embed.fields] == [
+            "Playback",
+            "Leaving voice",
+            "Messages",
+            "Diagnostics",
         ]
+        assert embed.fields[0].value == (
+            "**Volume** · 80% · set here\n"
+            "Playback level.\n"
+            "`-settings volume <value>` · 0%–100%\n"
+            "\n"
+            "**Timezone** · America/Los_Angeles · default\n"
+            "Time zone for estimated play times.\n"
+            "`-settings timezone <value>` · a city like Europe/London, or UTC"
+        )
+        assert (embed.description or "").endswith(
+            "To change one, run the command under it with a value from its range."
+        )
         assert embed.footer.text == (
-            "Names work with dashes: -settings leave-when-idle to see one · "
-            "-settings leave-when-idle <value> · -settings leave-when-idle reset"
+            "-settings <setting> reset puts one back to its default · "
+            "-settings <setting> shows one in full"
         )
 
-    def test_every_name_on_the_card_is_typeable(self) -> None:
-        """A label read with dashes for spaces is its key or an alias."""
-        for spec, _ in _server_rows(None):
-            typed = spec.label.casefold().replace(" ", "-")
-            assert find(typed, SettingScope.SERVER) == spec
+    def test_a_range_that_follows_the_bot_is_quoted_as_it_stands(self) -> None:
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        embed = card.server_card(
+            guild_name="g", rows=_server_rows(None), read_failed=False, operator=False
+        )
+        assert "`-settings progress-bar-refresh <value>` · 5s–30s" in str(
+            embed.to_dict()
+        )
+
+    def test_every_command_on_the_card_sets_its_own_setting(self) -> None:
+        """Copied off the card with its brackets, and a value from its range."""
+        rows = _server_rows(None)
+        embed = card.server_card(
+            guild_name="g", rows=rows, read_failed=False, operator=False
+        )
+        text = "\n".join(f.value or "" for f in embed.fields)
+        names = re.findall(r"`-settings (\S+) <value>`", text)
+        assert len(names) == len(rows)
+        for name, (spec, _) in zip(names, rows, strict=True):
+            arg = f"{name} <{_lowest(spec)}>"
+            request = parse_settings_args(arg, tail=f"settings {arg}")
+            assert isinstance(request, SettingsRequest), (arg, request)
+            assert (request.spec, request.action) == (spec, SettingsAction.SET), arg
+
+    def test_a_group_past_the_field_limit_continues_in_another_field(self) -> None:
+        rows = _server_rows(None)[:1] * 30
+        embed = card.server_card(
+            guild_name="g", rows=rows, read_failed=False, operator=False
+        )
+        names = [f.name for f in embed.fields]
+        assert len(names) > 1
+        assert names == ["Playback"] + ["Playback (cont.)"] * (len(names) - 1)
+        assert all(len(f.value or "") <= FIELD_LIMIT for f in embed.fields)
+        assert sum((f.value or "").count("**Volume**") for f in embed.fields) == 30
+
+
+def _lowest(spec: SettingSpec) -> str:
+    """A value the setting accepts right now, as someone would type it."""
+    if spec.kind is SettingKind.SWITCH:
+        return "on"
+    if spec.kind is SettingKind.TIMEZONE:
+        return "UTC"
+    lowest = bound(spec.minimum) or 0.0
+    if spec.write_minimum is not None:
+        lowest = max(lowest, spec.write_minimum())
+    return format_value(spec, lowest)
 
 
 class TestBotCard:

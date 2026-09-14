@@ -708,14 +708,21 @@ class TestReplies:
 class TestCard:
     async def test_defaults(self, cog: MusicBot, settings_ctx: MagicMock) -> None:
         await _invoke(cog, settings_ctx)
-        values = [field.value for field in _embed(settings_ctx).fields]
-        assert values == [
-            "**Volume** · 100% · default\n**Timezone** · America/Los_Angeles · default",
-            "**Leave when idle** · 5:00 · default\n**Leave when alone** · 0:10 · default",
-            "**Progress bar refresh** · 3s · default\n**Lookup notice** · 6s · default"
-            "\n**Playlist card** · 2.5s · default",
+        values = [field.value or "" for field in _embed(settings_ctx).fields]
+        states = [
+            line for value in values for line in value.split("\n") if line[:2] == "**"
+        ]
+        assert states == [
+            "**Volume** · 100% · default",
+            "**Timezone** · America/Los_Angeles · default",
+            "**Leave when idle** · 5:00 · default",
+            "**Leave when alone** · 0:10 · default",
+            "**Progress bar refresh** · 3s · default",
+            "**Lookup notice** · 6s · default",
+            "**Playlist card** · 2.5s · default",
             "**Debug footer** · off · default",
         ]
+        assert sum(value.count("`-settings ") for value in values) == len(states)
 
     async def test_stored_values_are_read_before_rendering(
         self, cog: MusicBot, settings_ctx: MagicMock, fake_redis_bot: Redis
