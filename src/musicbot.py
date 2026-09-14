@@ -336,9 +336,10 @@ class MusicBot(commands.Cog):
         try:
             if ctx.guild is None:
                 return
-            # get_mp() CREATES a player: an observation-only command would report
-            # one it just manufactured and leave a 300s gate timeout behind.
-            if ctx.command is not None and ctx.command.extras.get("observation_only"):
+            # get_mp() CREATES a player, and re-homes an existing one to this
+            # channel. A flagged command must do neither: it would act on a player
+            # it just manufactured and leave a 300s gate timeout behind.
+            if ctx.command is not None and ctx.command.extras.get("skips_player_setup"):
                 return
             old_channel = (
                 self.mps[ctx.guild.id].home_channel
@@ -997,7 +998,7 @@ class MusicBot(commands.Cog):
         extras={
             "category": "Queue",
             # cog_before_invoke skips get_mp() for it: never touches voice.
-            "observation_only": True,
+            "skips_player_setup": True,
             "examples": ["-analytics", "-an", "-analytics --days 90"],
             "note": (
                 "Available only when this server's host has enabled the "
@@ -1178,7 +1179,7 @@ class MusicBot(commands.Cog):
         extras={
             "category": "Utility",
             # cog_before_invoke skips get_mp() for it: it reports on the player.
-            "observation_only": True,
+            "skips_player_setup": True,
             "examples": ["-debug", "-debug --enable", "-debug --disable"],
             "note": (
                 "Debug mode is per server and only changes what is DISPLAYED — "

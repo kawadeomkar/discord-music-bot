@@ -475,7 +475,7 @@ def mock_ctx(
     # Explicit, for the same reason mock_author pins guild_permissions: a bare
     # MagicMock answers `.extras.get("anything")` with a truthy mock, so every
     # command would look like it carried every flag. cog_before_invoke reads
-    # `extras["observation_only"]` to decide whether to skip get_mp(), and an
+    # `extras["skips_player_setup"]` to decide whether to skip get_mp(), and an
     # auto-mock there silently exempts the whole suite.
     ctx.command.extras = {}
     # A real name, not a MagicMock: check_voice_permissions keys its same-channel
