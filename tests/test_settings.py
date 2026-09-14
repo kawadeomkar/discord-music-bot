@@ -1225,6 +1225,22 @@ class TestBotSettingsWrite:
         await bot_settings.write(spec, 5.0)
         assert bot_settings.is_persisted(spec)
 
+    async def test_an_unconfirmed_reset_is_marked_until_one_lands(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        await bot_settings.write(spec, 5.0)
+        with patch.object(
+            BotConfigStore, "reset_config_fields", new=AsyncMock(return_value=False)
+        ):
+            result = await bot_settings.write_reset(spec)
+        assert (result.applied, result.persisted) == (True, False)
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert not bot_settings.is_persisted(spec)
+        await bot_settings.write_reset(spec)
+        assert bot_settings.is_persisted(spec)
+
     async def test_a_later_hydrate_keeps_an_unsaved_write(
         self, fake_redis: aioredis.Redis
     ) -> None:
