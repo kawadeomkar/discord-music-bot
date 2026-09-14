@@ -1648,6 +1648,19 @@ class TestGuildSettingsAccessors:
         await guild_settings.reset(_GUILD, ConfigField.SLOW_NOTICE)
         assert guild_settings.slow_notice_secs(_GUILD) == 8.0
 
+    async def test_the_playlist_card_delay_is_the_bots_while_unset(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        assert guild_settings.queue_progress_delay_secs(_GUILD) == 2.5
+        config.set_override("QUEUE_PROGRESS_DELAY_SECS", 4.0)
+        assert guild_settings.queue_progress_delay_secs(_GUILD) == 4.0
+        await guild_settings.write(_GUILD, GuildConfig(queue_progress_delay_secs=45.0))
+        assert guild_settings.queue_progress_delay_secs(_GUILD) == 45.0
+        assert guild_settings.queue_progress_delay_secs(_GUILD + 1) == 4.0
+        await guild_settings.reset(_GUILD, ConfigField.QUEUE_PROGRESS_DELAY)
+        assert guild_settings.queue_progress_delay_secs(_GUILD) == 4.0
+
     async def test_off_survives_every_read_back(
         self, guild_cog: Any, fake_redis: aioredis.Redis
     ) -> None:
@@ -2350,6 +2363,7 @@ class TestHotPathsNeverAwaitSettings:
             "alone_timeout_secs",
             "np_refresh_secs",
             "slow_notice_secs",
+            "queue_progress_delay_secs",
         ],
     )
     def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:

@@ -712,7 +712,8 @@ class TestCard:
         assert values == [
             "**Volume** · 100% · default\n**Timezone** · America/Los_Angeles · default",
             "**Leave when idle** · 5:00 · default\n**Leave when alone** · 0:10 · default",
-            "**Progress bar refresh** · 3s · default\n**Lookup notice** · 6s · default",
+            "**Progress bar refresh** · 3s · default\n**Lookup notice** · 6s · default"
+            "\n**Playlist card** · 2.5s · default",
             "**Debug footer** · off · default",
         ]
 

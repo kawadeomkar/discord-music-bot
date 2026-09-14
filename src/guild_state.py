@@ -191,6 +191,7 @@ type ConfigFieldName = Literal[
     "alone_timeout_secs",
     "np_refresh_secs",
     "slow_notice_secs",
+    "queue_progress_delay_secs",
 ]
 # volume has its own reset, which also clears the legacy :state copy.
 type ResettableConfigField = Literal[
@@ -200,6 +201,7 @@ type ResettableConfigField = Literal[
     "alone_timeout_secs",
     "np_refresh_secs",
     "slow_notice_secs",
+    "queue_progress_delay_secs",
 ]
 
 
@@ -215,6 +217,7 @@ class ConfigField:
     ALONE_TIMEOUT: Final = "alone_timeout_secs"
     NP_REFRESH: Final = "np_refresh_secs"
     SLOW_NOTICE: Final = "slow_notice_secs"  # OFF_SECS is off
+    QUEUE_PROGRESS_DELAY: Final = "queue_progress_delay_secs"
 
 
 _CONFIG_FIELD_NAMES: Final[frozenset[str]] = frozenset(
@@ -318,6 +321,7 @@ CONFIG_DOMAIN: Final[Mapping[ConfigFieldName, ConfigDomain]] = MappingProxyType(
         ConfigField.ALONE_TIMEOUT: ConfigDomain(DEFAULT_ALONE_TIMEOUT_SECS, 120.0),
         ConfigField.NP_REFRESH: ConfigDomain(1.0, 30.0),
         ConfigField.SLOW_NOTICE: ConfigDomain(4.0, 60.0, off=True),
+        ConfigField.QUEUE_PROGRESS_DELAY: ConfigDomain(2.0, 60.0),
     }
 )
 
@@ -378,6 +382,7 @@ class GuildConfig:
     np_refresh_secs: float | None = None
     # OFF_SECS is a set value meaning off: compare with ==, never truthiness.
     slow_notice_secs: float | None = None
+    queue_progress_delay_secs: float | None = None
 
     def __post_init__(self) -> None:
         """A numeric field CONFIG_DOMAIN does not admit becomes unset, so no
@@ -408,6 +413,10 @@ class GuildConfig:
             mapping[ConfigField.NP_REFRESH] = str(self.np_refresh_secs)
         if self.slow_notice_secs is not None:
             mapping[ConfigField.SLOW_NOTICE] = str(self.slow_notice_secs)
+        if self.queue_progress_delay_secs is not None:
+            mapping[ConfigField.QUEUE_PROGRESS_DELAY] = str(
+                self.queue_progress_delay_secs
+            )
         return mapping
 
     def tzinfo(self) -> ZoneInfo:
@@ -441,6 +450,7 @@ class GuildConfig:
             alone_timeout_secs=_b_float(raw, ConfigField.ALONE_TIMEOUT),
             np_refresh_secs=_b_float(raw, ConfigField.NP_REFRESH),
             slow_notice_secs=_b_float(raw, ConfigField.SLOW_NOTICE),
+            queue_progress_delay_secs=_b_float(raw, ConfigField.QUEUE_PROGRESS_DELAY),
         )
 
 

@@ -4801,6 +4801,45 @@ class TestQueueProgressCard:
 
         assert "nterrupt" in card.last_kwargs["placement_note"]
 
+    async def test_each_entry_point_hands_the_card_its_servers_delay(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """Read from the cache as the card is entered, at both places a playlist
+        can enter one: a plain -play and an interjection over a live song."""
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        self._warm(music_bot, mock_ctx)
+        card = _CardSpy()
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=[first])):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+        assert card.last_kwargs["delay"] == 2.5
+
+        await music_bot.guild_settings.write(
+            mock_ctx.guild.id, GuildConfig(queue_progress_delay_secs=45.0)
+        )
+        card = _CardSpy()
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=[first])):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+        assert card.last_kwargs["delay"] == 45.0
+
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(return_value=[first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+        assert card.last_kwargs["delay"] == 45.0
+
     @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
     async def test_the_cards_handle_reaches_the_extraction(
         self, music_bot: MusicBot, mock_ctx: MagicMock, cold: bool

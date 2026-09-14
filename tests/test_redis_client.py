@@ -1812,6 +1812,7 @@ class TestConfigWritesUseTheSchemaEncoder:
             GuildConfig(alone_timeout_secs=120.0),
             GuildConfig(np_refresh_secs=1.5),
             GuildConfig(slow_notice_secs=0.0),
+            GuildConfig(queue_progress_delay_secs=45.0),
         ],
         ids=lambda c: next(iter(c.to_redis())),
     )

@@ -78,8 +78,11 @@ def _details(**kwargs: Any) -> CardDetails:
     return CardDetails(requester="<@1>", **kwargs)
 
 
-def _fast(monkeypatch: pytest.MonkeyPatch, *, delay: float = 0.01) -> None:
-    config.set_override("QUEUE_PROGRESS_DELAY_SECS", delay)
+# The delay a fast card is entered with; _fast() makes its tick as short.
+_FAST_DELAY = 0.01
+
+
+def _fast() -> None:
     config.set_override("QUEUE_PROGRESS_TICK_SECS", 0.01)
 
 
@@ -334,53 +337,50 @@ class TestIsCollection:
 
 
 class TestTheDelayThreshold:
-    async def test_a_fast_enqueue_sends_nothing(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_a_fast_enqueue_sends_nothing(self, card_ctx: MagicMock) -> None:
         """A cache-hit playlist is one Redis GET; the channel must see exactly
         what it sees today."""
-        config.set_override("QUEUE_PROGRESS_DELAY_SECS", 30.0)
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=30.0):
             pass
 
         card_ctx.channel.send.assert_not_called()
 
     async def test_a_slow_enqueue_sends_exactly_one_card(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """Without this, setting the delay to infinity — the card never appears
         for anyone — would make the suite greener."""
-        _fast(monkeypatch)
+        _fast()
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             await asyncio.sleep(0.08)
 
         card_ctx.channel.send.assert_awaited_once()
 
     async def test_the_card_never_goes_through_ctx_send(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """MusicContext.send would adopt it as the Now Playing host, and the
         progress updater would then rewrite it every 3s."""
-        _fast(monkeypatch)
+        _fast()
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             await asyncio.sleep(0.08)
 
         card_ctx.send.assert_not_called()
 
 
 class TestTheCardMoves:
-    async def test_an_indeterminate_card_still_edits(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_an_indeterminate_card_still_edits(self, card_ctx: MagicMock) -> None:
         """The test that dies if the elapsed line is made static — which would
         leave a card `embeds_changed` never edits, i.e. slow_resolve_notice with
         extra machinery."""
-        _fast(monkeypatch)
+        _fast()
 
-        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY
+        ) as progress:
             await asyncio.sleep(0.05)
             # Ten seconds of resolve without waiting them out: the elapsed line
             # is what has to move, not the wall clock.
@@ -390,11 +390,13 @@ class TestTheCardMoves:
         assert card_ctx.channel.send.return_value.edit.await_count >= 1
 
     async def test_a_determinate_card_edits_when_a_cell_moves(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
-        _fast(monkeypatch)
+        _fast()
 
-        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY
+        ) as progress:
             progress.update(0, 100)
             await asyncio.sleep(0.05)
             before = card_ctx.channel.send.return_value.edit.await_count
@@ -406,25 +408,25 @@ class TestTheCardMoves:
 
 class TestTeardown:
     async def test_the_card_is_deleted_when_the_enqueue_lands(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """Every exit path deletes it: the confirmation still goes out through
         ctx.send and still re-hosts the Now Playing block."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             await asyncio.sleep(0.05)
 
         message.delete.assert_awaited_once()
 
     async def test_nothing_is_edited_after_the_delete(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             await asyncio.sleep(0.05)
         after_exit = message.edit.await_count
         await asyncio.sleep(0.05)
@@ -432,15 +434,17 @@ class TestTeardown:
         assert message.edit.await_count == after_exit
 
     async def test_a_card_the_user_deletes_stops_the_loop(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """Otherwise the driver spends the rest of a 99-second enqueue editing into
         404s, in the bucket the Now Playing bar shares."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         message.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
 
-        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY
+        ) as progress:
             await asyncio.sleep(0.05)
             progress.started_at -= 10.0
             await asyncio.sleep(0.1)
@@ -450,45 +454,47 @@ class TestTeardown:
         message.delete.assert_not_awaited()
 
     async def test_a_raise_inside_the_block_still_takes_the_card_back(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
 
         with pytest.raises(RuntimeError):
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(0.05)
                 raise RuntimeError("extraction failed")
 
         message.delete.assert_awaited_once()
 
     async def test_a_404_on_the_delete_does_not_replace_the_real_error(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """The delete runs inside AsyncExitStack.__aexit__ while an
         ExtractionError may be propagating, and the user's own error embed must
         not become a 404 about a card they deleted themselves."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         message.delete = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
 
         with pytest.raises(RuntimeError, match="extraction failed"):
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(0.05)
                 raise RuntimeError("extraction failed")
 
     async def test_a_send_discord_refuses_leaves_the_enqueue_alone(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """Missing Send Messages, or a 429 the client gave up on: the card is
         advisory and must never take the command down."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         card_ctx.channel.send = AsyncMock(
             side_effect=discord.HTTPException(MagicMock(), "forbidden")
         )
 
-        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY
+        ) as progress:
             await asyncio.sleep(0.05)
             progress.update(1, 2)
 
@@ -500,12 +506,12 @@ class TestTeardown:
         assert not util._CLAIMED_CHANNELS.get(_CARD_CLAIM)
 
     async def test_a_cancel_during_the_send_still_takes_the_card_back(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """The driver is stopped by a signal and AWAITED, never cancelled: there
         is a window where the message exists on Discord and the local handle does
         not, and a cancel inside it would leave the card standing forever."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         sending, release = asyncio.Event(), asyncio.Event()
 
@@ -517,7 +523,7 @@ class TestTeardown:
         card_ctx.channel.send = AsyncMock(side_effect=_send)
 
         async def _body() -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(3600)
 
         task = asyncio.create_task(_body())
@@ -532,14 +538,14 @@ class TestTeardown:
         message.delete.assert_awaited_once()
 
     async def test_a_cancel_while_joining_the_driver_still_takes_the_card_back(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """The cancel that matters lands INSIDE the teardown, at the join —
         shutdown cancels a command already unwinding, and join_task re-raises
         that rather than swallowing it. The driver deletes what it sent in its
         own finally, so the card still comes back from a join that never
         returns."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         sending, release = asyncio.Event(), asyncio.Event()
 
@@ -551,7 +557,7 @@ class TestTeardown:
         card_ctx.channel.send = AsyncMock(side_effect=_send)
 
         async def _body() -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 async with asyncio.timeout(2):
                     await sending.wait()
 
@@ -582,12 +588,12 @@ class TestTheCardsOwnBounds:
         assert card_ceiling(10.0, 5.0, max_secs) == expected
 
     async def test_a_ceiling_the_delay_outlasts_still_gets_an_ordinary_edit(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """The delay and the ceiling are set separately, so a ceiling can end
         before the card appears. The card still makes one ordinary edit first:
         a card that only ever says "still working" is the feature doing nothing."""
-        _fast(monkeypatch, delay=0.05)
+        _fast()
         config.set_override("QUEUE_PROGRESS_TICK_SECS", 0.05)
         config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.01)
         message = card_ctx.channel.send.return_value
@@ -598,7 +604,7 @@ class TestTheCardsOwnBounds:
 
         message.edit = AsyncMock(side_effect=_edit)
 
-        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=0.05) as progress:
             progress.update(1, 10)
             async with asyncio.timeout(2):
                 while not any("Still working" in t for t in titles):
@@ -613,7 +619,7 @@ class TestTheCardsOwnBounds:
         """A -play unwinds through this join, so an unbounded wait on a Discord
         round trip is the command hanging. Past the bound the retraction is left
         to the driver's own finally."""
-        _fast(monkeypatch)
+        _fast()
         monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_JOIN_SECS", 0.05)
         wedged = asyncio.Event()
 
@@ -624,7 +630,7 @@ class TestTheCardsOwnBounds:
         card_ctx.channel.send = AsyncMock(side_effect=_never)
 
         async with asyncio.timeout(2):
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(0.05)
         wedged.set()
         await settle()
@@ -671,24 +677,24 @@ class TestTheCardsOwnBounds:
 
 class TestOneCardPerChannel:
     async def test_two_concurrent_enqueues_share_one_edit_loop(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """PLAY_INFLIGHT_MAX is 16 and requests resolve concurrently, so a pasted
         burst would otherwise be sixteen edit loops on one channel's bucket —
         eight times Discord's budget. PLAY_RESOLVE_CONCURRENCY cannot throttle
         them: it is taken inside the extraction, below where the card is entered.
         """
-        _fast(monkeypatch)
+        _fast()
         second_settled = asyncio.Event()
 
         # The first card stays up until the second request settles. A loser re-asks
         # every tick, so a card that came down first would rightly hand it the claim.
         async def _first() -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await second_settled.wait()
 
         async def _second() -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(0.08)
             second_settled.set()
 
@@ -698,19 +704,19 @@ class TestOneCardPerChannel:
         card_ctx.channel.send.assert_awaited_once()
 
     async def test_a_fast_enqueue_does_not_hold_the_slot(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """The claim is taken when the card is about to be sent, not at entry: a
         cache hit that finished inside the delay must not deny the slot to the
         99-second sibling beside it."""
-        _fast(monkeypatch)
+        _fast()
 
         async def _cache_hit() -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 pass
 
         async def _slow() -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(0.08)
 
         await asyncio.gather(_cache_hit(), _slow())
@@ -720,16 +726,16 @@ class TestOneCardPerChannel:
 
 class TestAClaimLostToAnotherCard:
     async def test_the_card_appears_once_the_other_is_taken_back(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """One card per channel, not one card per burst: a 5,547-track playlist
         pasted a second after a Mix otherwise runs ~70s with nothing on screen
         once the Mix's card goes."""
-        _fast(monkeypatch)
+        _fast()
         shown: list[int] = []
 
         async def _one(secs: float) -> None:
-            async with enqueue_progress(card_ctx, _yt_playlist()):
+            async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
                 await asyncio.sleep(secs)
                 shown.append(card_ctx.channel.send.await_count)
 
@@ -757,11 +763,10 @@ class TestCardTelemetry:
     async def test_the_span_says_what_the_card_did(
         self,
         card_ctx: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         outcome: str,
     ) -> None:
-        _fast(monkeypatch)
+        _fast()
         if outcome == "stalled":
             config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         if outcome == "send_failed":
@@ -774,7 +779,9 @@ class TestCardTelemetry:
             if outcome == "claimed_elsewhere":
                 held.enter_context(util.channel_claim(_CARD_CLAIM, card_ctx.channel.id))
             with tracer.start_as_current_span("bot.play"):
-                async with enqueue_progress(card_ctx, _yt_playlist()):
+                async with enqueue_progress(
+                    card_ctx, _yt_playlist(), delay=_FAST_DELAY
+                ):
                     await asyncio.sleep(0.1)
 
         (span,) = exporter.get_finished_spans()
@@ -785,13 +792,13 @@ class TestCardTelemetry:
 
 class TestTheCeiling:
     async def test_past_the_ceiling_it_says_so_once_and_stops_editing(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """Nothing else bounds the work: PLAY_RESOLVE_WAIT_SECS bounds the wait
         for a slot and not the extraction, and yt-dlp's own socket_timeout x
         retries lets one page hold 300s with no aggregate bound across 56 of them.
         """
-        _fast(monkeypatch)
+        _fast()
         config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         message = card_ctx.channel.send.return_value
 
@@ -801,7 +808,7 @@ class TestTheCeiling:
                 call.kwargs["embeds"][0].title or ""
             )
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             # Waited for rather than slept past: a slow loop would otherwise land
             # the STALLED edit after the count below is read.
             async with asyncio.timeout(2):
@@ -822,14 +829,14 @@ class TestTheCeiling:
         assert not util._CLAIMED_CHANNELS.get(_CARD_CLAIM)
 
     async def test_a_stalled_card_the_user_deleted_releases_the_claim(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
-        _fast(monkeypatch)
+        _fast()
         config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         message = card_ctx.channel.send.return_value
         message.edit.side_effect = discord.NotFound(MagicMock(status=404), "gone")
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             await asyncio.sleep(0.12)
             assert not util._CLAIMED_CHANNELS.get(_CARD_CLAIM)
         message.delete.assert_not_awaited()
@@ -837,12 +844,12 @@ class TestTheCeiling:
 
 class TestAFailedEdit:
     async def test_a_transient_edit_failure_still_takes_the_card_back(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
         """Only a 404 means the user deleted the card. Anything else read as gone
         drops the handle, the finally deletes nothing, and "Working on that
         playlist…" stays in the channel permanently."""
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         message.id = 5150
         message.edit.side_effect = [
@@ -851,7 +858,9 @@ class TestAFailedEdit:
             None,
         ]
 
-        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY
+        ) as progress:
             await asyncio.sleep(0.03)
             progress.update(5, 10)
             await asyncio.sleep(0.05)
@@ -865,13 +874,15 @@ class TestADroppedRequest:
     stamp only once the resolve returns — ~90 s later for a 5,547-track playlist."""
 
     async def test_the_card_is_taken_back_before_the_resolve_returns(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
-        _fast(monkeypatch)
+        _fast()
         message = card_ctx.channel.send.return_value
         dropped = asyncio.Event()
 
-        async with enqueue_progress(card_ctx, _yt_playlist(), dropped=dropped):
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY, dropped=dropped
+        ):
             await asyncio.sleep(0.05)
             card_ctx.channel.send.assert_awaited_once()
             dropped.set()
@@ -881,11 +892,13 @@ class TestADroppedRequest:
         message.delete.assert_awaited_once()
 
     async def test_a_request_dropped_inside_the_delay_sends_nothing(
-        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, card_ctx: MagicMock
     ) -> None:
-        _fast(monkeypatch, delay=0.05)
+        _fast()
         dropped = asyncio.Event()
-        async with enqueue_progress(card_ctx, _yt_playlist(), dropped=dropped):
+        async with enqueue_progress(
+            card_ctx, _yt_playlist(), delay=0.05, dropped=dropped
+        ):
             dropped.set()
             await asyncio.sleep(0.1)
         card_ctx.channel.send.assert_not_awaited()
@@ -899,14 +912,14 @@ class TestTheStalledRender:
         which ignores the floor between edits. Through tick() it is suppressed
         whenever the previous edit was recent, and the card never says it stalled.
         """
-        _fast(monkeypatch)
+        _fast()
         config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         monkeypatch.setattr(
             queue_progress, "LiveMessage", lambda _tick: LiveMessage(3600.0)
         )
         message = card_ctx.channel.send.return_value
 
-        async with enqueue_progress(card_ctx, _yt_playlist()):
+        async with enqueue_progress(card_ctx, _yt_playlist(), delay=_FAST_DELAY):
             await asyncio.sleep(0.1)
 
         message.edit.assert_awaited_once()

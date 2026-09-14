@@ -286,6 +286,23 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         ),
     ),
     SettingSpec(
+        key="queue-progress-delay",
+        aliases=("playlist-card",),
+        scope=SettingScope.SERVER,
+        kind=SettingKind.SECONDS,
+        group=SettingGroup.MESSAGES,
+        label="Playlist card",
+        summary="How long a playlist lookup runs before its live progress card appears.",
+        applies="from the next -play",
+        field=ConfigField.QUEUE_PROGRESS_DELAY,
+        minimum=_server_bound(ConfigField.QUEUE_PROGRESS_DELAY, "lo"),
+        maximum=_server_bound(ConfigField.QUEUE_PROGRESS_DELAY, "hi"),
+        why_minimum=(
+            "A ten-track playlist queues in about 2s, so a shorter delay would put "
+            "the card up for ordinary ones."
+        ),
+    ),
+    SettingSpec(
         key="debug",
         aliases=("debug-footer",),
         scope=SettingScope.SERVER,
@@ -1830,6 +1847,13 @@ class GuildSettings:
             return config.play_slow_notice_secs()
         # OFF_SECS is falsy and set: compare, never test truthiness.
         return None if value == OFF_SECS else value
+
+    def queue_progress_delay_secs(self, guild_id: int) -> float:
+        """How long a playlist lookup runs before its card appears. The bot's
+        value, read at the call, while unset."""
+        stored = self.peek(guild_id)
+        value = stored.queue_progress_delay_secs if stored is not None else None
+        return config.queue_progress_delay_secs() if value is None else value
 
     # ── Stamps and registrations ──────────────────────────────────────────────
 

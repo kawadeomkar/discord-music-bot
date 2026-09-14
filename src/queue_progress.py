@@ -200,12 +200,14 @@ async def enqueue_progress(
     ctx: commands.Context,
     source: Source,
     *,
+    delay: float,
     placement_note: str = "",
     debug_suffix: Optional[str] = None,
     dropped: Optional[asyncio.Event] = None,
 ) -> AsyncGenerator[EnqueueProgress]:
-    """Show a live card while a collection resolves, and take it back when the
-    enqueue lands or when `dropped` is set.
+    """Show a live card once a collection has resolved for `delay`, and take it
+    back when the enqueue lands or when `dropped` is set. `delay` is required, so
+    every call site reads the server's queue-progress-delay when it enters.
 
     The card is a SECOND message, deleted on every exit path; it never becomes
     the confirmation. `_reply` sends that through MusicContext.send, which adopts
@@ -218,7 +220,6 @@ async def enqueue_progress(
     """
     progress = EnqueueProgress(started_at=time.monotonic())
     # Read once: every wait and the stall log name the values this card ran with.
-    delay = config.queue_progress_delay_secs()
     tick = config.queue_progress_tick_secs()
     ceiling = card_ceiling(delay, tick, config.queue_progress_max_secs())
     details = CardDetails(

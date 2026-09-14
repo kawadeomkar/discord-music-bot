@@ -585,6 +585,7 @@ class TestTheSettingsLine:
             alone_timeout_secs=120.0,
             np_refresh_secs=30.0,
             slow_notice_secs=60.0,
+            queue_progress_delay_secs=60.0,
             debug_mode=True,
         )
         rows = _rows(stored, unsaved=frozenset(stored.to_redis()))
@@ -604,7 +605,7 @@ class TestTheSettingsLine:
         )
         server = [f for f in embed.fields if (f.name or "").startswith("This server")]
         assert len(server) == 1 and len(server[0].value or "") <= 1024
-        assert "(7 changed; stored values not read yet)" in (server[0].value or "")
+        assert "(8 changed; stored values not read yet)" in (server[0].value or "")
 
     async def test_a_change_reaches_the_card(
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock

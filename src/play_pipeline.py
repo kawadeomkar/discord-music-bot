@@ -749,10 +749,12 @@ async def interject_flow(
     async with contextlib.AsyncExitStack() as stack:
         progress = None
         if is_collection(source):
+            delay = cog.guild_settings.queue_progress_delay_secs(req.guild_id)
             progress = await stack.enter_async_context(
                 enqueue_progress(
                     ctx,
                     source,
+                    delay=delay,
                     placement_note="Interrupts the current song once it's queued.",
                     debug_suffix=cog.debug_suffix(ctx),
                     dropped=req.dropped,

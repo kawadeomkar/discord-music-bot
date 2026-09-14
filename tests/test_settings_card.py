@@ -46,6 +46,7 @@ class TestServerValues:
             card.Shown(10.0, "default"),
             card.Shown(3.0, "default"),
             card.Shown(6.0, "default"),
+            card.Shown(2.5, "default"),
             card.Shown(False, "default"),
         ]
 
@@ -57,6 +58,7 @@ class TestServerValues:
             alone_timeout_secs=120.0,
             np_refresh_secs=10.0,
             slow_notice_secs=OFF_SECS,
+            queue_progress_delay_secs=45.0,
             debug_mode=False,
         )
         assert [shown for _, shown in _server_rows(stored)] == [
@@ -66,6 +68,7 @@ class TestServerValues:
             card.Shown(120.0, "set here"),
             card.Shown(10.0, "set here"),
             card.Shown(OFF_SECS, "set here"),
+            card.Shown(45.0, "set here"),
             card.Shown(False, "set here"),
         ]
 
@@ -163,6 +166,7 @@ class TestServerCard:
                 alone_timeout_secs=120.0,
                 np_refresh_secs=30.0,
                 slow_notice_secs=60.0,
+                queue_progress_delay_secs=60.0,
                 debug_mode=True,
             ),
             unsaved=frozenset(
@@ -173,6 +177,7 @@ class TestServerCard:
                     "alone_timeout_secs",
                     "np_refresh_secs",
                     "slow_notice_secs",
+                    "queue_progress_delay_secs",
                     "debug_mode",
                 }
             ),
@@ -207,7 +212,8 @@ class TestServerCard:
             (
                 "Messages",
                 "**Progress bar refresh** · 3s · default\n"
-                "**Lookup notice** · 6s · default",
+                "**Lookup notice** · 6s · default\n"
+                "**Playlist card** · 2.5s · default",
             ),
             ("Diagnostics", "**Debug footer** · off · default"),
         ]
