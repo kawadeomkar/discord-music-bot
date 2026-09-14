@@ -18,11 +18,13 @@ from src import config
 from src import settings_card as card
 from src.guild_state import DEFAULT_VOLUME, GuildConfig
 from src.musicbot import MusicBot
-from src.redis_client import GuildRedisStore
+from src.redis_client import BotConfigStore, GuildRedisStore
+from src.settings import BotSettings
 from tests.helpers import command_callback
 
 GUILD = 111111111111111111
 MENTION = "<@222222222222222222>"
+APP_ID = 333333333333333333
 
 
 @pytest.fixture
@@ -44,6 +46,21 @@ def settings_ctx(mock_ctx: MagicMock) -> MagicMock:
 @pytest.fixture
 def cog(music_bot_with_redis: MusicBot) -> MusicBot:
     return music_bot_with_redis
+
+
+@pytest.fixture
+def bot_settings(cog: MusicBot, fake_redis_bot: Redis) -> BotSettings:
+    """What setup_hook builds on MusicBotApp, on the cog's fake Redis."""
+    bot = cast(Any, cog.bot)
+    bot.application_id = APP_ID
+    # debug-default reaches the cog's DebugSettings the way production finds it.
+    bot.get_cog = MagicMock(return_value=cog)
+    bot.bot_settings = BotSettings(bot, redis=fake_redis_bot, ignore_stored=False)
+    return bot.bot_settings
+
+
+async def _stored_bot(redis: Redis) -> Any:
+    return await BotConfigStore(redis, APP_ID).read_config()
 
 
 @pytest.fixture
@@ -209,12 +226,22 @@ class TestDirectMessages:
         await _invoke(cog, dm, "volume 50")
         assert _text(dm) == card.DM_NEEDS_BOT
 
-    async def test_a_bot_write_is_not_available_yet(
-        self, cog: MusicBot, dm: MagicMock
+    async def test_the_operator_changes_a_bot_setting_from_a_dm(
+        self,
+        cog: MusicBot,
+        dm: MagicMock,
+        bot_settings: BotSettings,
+        fake_redis_bot: Redis,
     ) -> None:
         await _invoke(cog, _as_operator(dm), "bot heartbeat 5s")
-        assert _text(dm) == card.BOT_WRITE_UNAVAILABLE
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert _text(dm) == (
+            "**Heartbeat** is now **5s** for every server (was **3s**, the default). "
+            "It applies from the next tick. It is saved, and wins over the "
+            f"environment until it is reset. Changed by {MENTION}."
+        )
+        assert config.heartbeat_interval_secs() == 5.0
+        stored = await _stored_bot(fake_redis_bot)
+        assert stored is not None and stored.heartbeat_interval_secs == 5.0
 
     async def test_a_bot_detail_is_shown(self, cog: MusicBot, dm: MagicMock) -> None:
         await _invoke(cog, _as_operator(dm), "bot heartbeat")
@@ -258,7 +285,16 @@ class TestScopes:
         assert "`volume` is set per server" in _text(settings_ctx)
 
     @pytest.mark.parametrize(
-        "arg", ["bot", "bot heartbeat", "bot heartbeet", "bot heartbeat 1s"]
+        "arg",
+        [
+            "bot",
+            "bot heartbeat",
+            "bot heartbeet",
+            "bot heartbeat 1s",
+            "bot heartbeat 5s",
+            "bot heartbeat reset",
+            "bot debug-default on",
+        ],
     )
     async def test_a_member_sees_nothing_bot_wide(
         self, cog: MusicBot, settings_ctx: MagicMock, arg: str
@@ -269,12 +305,18 @@ class TestScopes:
         assert _text(settings_ctx) == card.OPERATOR_ONLY
         _denied_by_the_operator_check(settings_ctx)
 
+    @pytest.mark.parametrize("arg", ["bot", "bot heartbeat 5s"])
     async def test_an_unconfirmed_operator_is_told_so(
-        self, cog: MusicBot, settings_ctx: MagicMock
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        arg: str,
     ) -> None:
         settings_ctx.bot.is_owner = AsyncMock(side_effect=RuntimeError("503"))
-        await _invoke(cog, settings_ctx, "bot")
+        await _invoke(cog, settings_ctx, arg)
         assert _text(settings_ctx) == card.OPERATOR_UNCONFIRMED
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
 
     async def test_the_operator_gets_the_bot_typo_suggestion(
         self, cog: MusicBot, settings_ctx: MagicMock
@@ -282,11 +324,189 @@ class TestScopes:
         await _invoke(cog, _as_operator(settings_ctx), "bot heartbeet 5s")
         assert "did you mean `heartbeat`?" in _text(settings_ctx)
 
-    async def test_a_bot_write_in_a_server_is_not_available_yet(
-        self, cog: MusicBot, settings_ctx: MagicMock
+    async def test_the_operator_resets_a_bot_setting_in_a_server(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        fake_redis_bot: Redis,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        await _invoke(cog, _as_operator(settings_ctx), "bot heartbeat reset")
-        assert _text(settings_ctx) == card.BOT_WRITE_UNAVAILABLE
+        monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4")
+        monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 4.0)
+        ctx = _as_operator(settings_ctx)
+        await _invoke(cog, ctx, "bot heartbeat 5s")
+        assert "(was **4s**, from `HEARTBEAT_INTERVAL_SECS`)" in _text(ctx)
+        await _invoke(cog, ctx, "bot heartbeat 6s")
+        assert "(was **5s**, set by the bot's operator)" in _text(ctx)
+        await _invoke(cog, ctx, "bot heartbeat reset")
+        assert _text(ctx) == (
+            "**Heartbeat** is back to **4s**, from `HEARTBEAT_INTERVAL_SECS`. It is "
+            f"saved. Changed by {MENTION}."
+        )
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        stored = await _stored_bot(fake_redis_bot)
+        assert stored is not None and stored.heartbeat_interval_secs is None
+
+    async def test_a_count_is_written_as_a_whole_number(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        fake_redis_bot: Redis,
+    ) -> None:
+        await _invoke(cog, _as_operator(settings_ctx), "bot play-inflight-max 8")
+        assert config.play_inflight_max() == 8
+        stored = await _stored_bot(fake_redis_bot)
+        assert stored is not None and stored.play_inflight_max == 8
+
+    async def test_an_unsaved_bot_write_applies_and_says_so(
+        self, cog: MusicBot, settings_ctx: MagicMock, bot_settings: BotSettings
+    ) -> None:
+        ctx = _as_operator(settings_ctx)
+        with patch.object(
+            BotConfigStore, "update_config", new=AsyncMock(return_value=False)
+        ):
+            await _invoke(cog, ctx, "bot heartbeat 5s")
+        assert _text(ctx).endswith(
+            "⚠️ It could not be saved (Redis is unavailable), so it applies until "
+            f"the bot restarts. Changed by {MENTION}."
+        )
+        assert config.heartbeat_interval_secs() == 5.0
+        await _invoke(cog, ctx, "bot")
+        playback = next(
+            f.value or "" for f in _embed(ctx).fields if f.name == "Playback"
+        )
+        assert "heartbeat                 5s (not saved)" in playback
+
+    async def test_while_stored_settings_are_ignored_a_write_is_refused_unsent(
+        self, cog: MusicBot, settings_ctx: MagicMock, bot_settings: BotSettings
+    ) -> None:
+        bot_settings.ignore_stored = True
+        ctx = _as_operator(settings_ctx)
+        update = AsyncMock(return_value=True)
+        reset = AsyncMock(return_value=True)
+        with (
+            patch.object(BotConfigStore, "update_config", new=update),
+            patch.object(BotConfigStore, "reset_config_fields", new=reset),
+        ):
+            await _invoke(cog, ctx, "bot heartbeat 5s")
+            assert _text(ctx) == card.OVERRIDES_IGNORED
+            await _invoke(cog, ctx, "bot heartbeat reset")
+            assert _text(ctx) == card.OVERRIDES_IGNORED
+            await _invoke(cog, ctx, "bot debug-default on")
+        update.assert_not_awaited()
+        reset.assert_not_awaited()
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert cog.debug_settings.default_override is True
+
+    @pytest.mark.parametrize(
+        ("operator", "manage", "arg", "pointer"),
+        [
+            (True, False, "np-refresh 5", True),
+            (True, True, "slow-notice 10", True),
+            (False, True, "np-refresh 5", False),
+            (True, False, "volume 50", False),
+        ],
+    )
+    async def test_a_server_write_names_the_bot_form_to_the_operator(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        operator: bool,
+        manage: bool,
+        arg: str,
+        pointer: bool,
+    ) -> None:
+        """A key in both scopes without `bot` is the server's; the operator, who
+        could have meant every server, is told how to do that instead."""
+        settings_ctx.bot.is_owner = AsyncMock(return_value=operator)
+        settings_ctx.author.guild_permissions.manage_guild = manage
+        await _invoke(cog, settings_ctx, arg)
+        assert " for this server " in _text(settings_ctx)
+        key = arg.split()[0]
+        assert (
+            f"To change it for every server, use `-settings bot {key}`."
+            in _text(settings_ctx)
+        ) is pointer
+
+
+class TestDebugDefault:
+    """Session-only, so it names what it costs, who it reaches and when it ends."""
+
+    @pytest.fixture
+    def servers(self, cog: MusicBot) -> list[MagicMock]:
+        guilds = [MagicMock(id=GUILD + n) for n in range(3)]
+        cast(Any, cog.bot).guilds = guilds
+        cog.debug_settings.apply_choices({GUILD + 2: False}, persisted=True)
+        return guilds
+
+    async def test_on_names_the_servers_it_reaches_and_what_they_show(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        servers: list[MagicMock],
+    ) -> None:
+        await _invoke(cog, _as_operator(settings_ctx), "bot debug-default on")
+        assert _text(settings_ctx) == (
+            "**Debug footer** is now **on** by default, for the **2** of this bot's "
+            "**3** servers that have not chosen for themselves. Every embed in them — "
+            "including the live Now Playing card — shows the bot process's CPU, "
+            "memory, event-loop lag, task count and worker count to anyone who can "
+            "read the channel. It lasts until the bot restarts, which returns to "
+            "`DEBUG_MODE` (**off**); set `DEBUG_MODE=true` to keep it on. Changed by "
+            f"{MENTION}."
+        )
+        assert cog.debug_settings.enabled(GUILD) is True
+        assert cog.debug_settings.enabled(GUILD + 2) is False
+
+    async def test_on_under_a_host_default_already_on_offers_no_variable(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        servers: list[MagicMock],
+    ) -> None:
+        cog.debug_settings._default = True
+        await _invoke(cog, _as_operator(settings_ctx), "bot debug-default on")
+        assert _text(settings_ctx).endswith(
+            f"returns to `DEBUG_MODE` (**on**). Changed by {MENTION}."
+        )
+
+    async def test_off_and_reset(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        servers: list[MagicMock],
+    ) -> None:
+        cog.debug_settings._default = True
+        ctx = _as_operator(settings_ctx)
+        await _invoke(cog, ctx, "bot debug-default off")
+        assert _text(ctx) == (
+            "**Debug footer** is now **off** by default, for the **2** servers that "
+            "have not chosen for themselves; the other **1** keep their own choice. "
+            "It lasts until the bot restarts, which returns to `DEBUG_MODE` (**on**). "
+            f"Changed by {MENTION}."
+        )
+        await _invoke(cog, ctx, "bot debug-default reset")
+        assert _text(ctx) == (
+            "**Debug footer**'s default is back to `DEBUG_MODE`: **on**, for the "
+            f"**2** servers that have not chosen for themselves. Changed by {MENTION}."
+        )
+        assert cog.debug_settings.default_override is None
+
+    async def test_nothing_is_stored(
+        self,
+        cog: MusicBot,
+        settings_ctx: MagicMock,
+        bot_settings: BotSettings,
+        fake_redis_bot: Redis,
+        servers: list[MagicMock],
+    ) -> None:
+        await _invoke(cog, _as_operator(settings_ctx), "bot debug-default on")
+        assert await fake_redis_bot.keys("bot:*") == []
 
 
 class TestReplies:
@@ -682,9 +902,9 @@ class TestBulletShapedMessages:
 
 class TestEverySend:
     async def test_mentions_nobody_and_changes_name_their_author(
-        self, cog: MusicBot, settings_ctx: MagicMock
+        self, cog: MusicBot, settings_ctx: MagicMock, bot_settings: BotSettings
     ) -> None:
-        ctx = _with_manage_server(settings_ctx)
+        ctx = _as_operator(_with_manage_server(settings_ctx))
         changes = [
             "volume 40",
             "volume reset",
@@ -692,6 +912,9 @@ class TestEverySend:
             "tz reset",
             "debug on",
             "debug reset",
+            "bot heartbeat 5s",
+            "bot heartbeat reset",
+            "bot debug-default on",
         ]
         views = ["", "volume", "bot", "nope", "volume 150"]
         for arg in (*changes, *views):

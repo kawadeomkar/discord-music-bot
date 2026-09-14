@@ -999,20 +999,21 @@ class GuildRedisStore:
     # History operations
 
     # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
-    # Three kinds of key carry no TTL (guild:{id}:history, guild:{id}:config,
-    # HISTORY_OUTBOX_KEY), so under volatile-lru they are never evicted; once
-    # they fill maxmemory Redis rejects every write with OOM, and each store
-    # method swallows it, so persistence degrades silently. Only the OUTBOX can
-    # get there by growing: history lists are capped per guild (~24 KB each)
-    # and config is a handful of fields, but the outbox grows for the whole of
-    # a Postgres outage at ~625 B per play (256mb holds ~429k; see
-    # HistoryOutboxDrainer.CAP_PAGE for the listpack cliff behind that figure).
-    # HISTORY_OUTBOX_MAX is the opt-in bound and dropping there is real data
-    # loss. The history trim is lazy — it runs inside push_history only — so a
-    # dormant guild keeps whatever oversized list it already had until its next
-    # play or a manual DEL. A memory/eviction alarm is still owed. Do not switch
-    # to allkeys-lru: an evicted outbox entry is a play that vanishes with no
-    # error and no log line. See docs/ARCHITECTURE.md#redis-memory-bounds.
+    # Four kinds of key carry no TTL (guild:{id}:history, guild:{id}:config,
+    # BOT_CONFIG_KEY, HISTORY_OUTBOX_KEY), so under volatile-lru they are never
+    # evicted; once they fill maxmemory Redis rejects every write with OOM, and
+    # each store method swallows it, so persistence degrades silently. Only the
+    # OUTBOX can get there by growing: history lists are capped per guild (~24
+    # KB each) and both config hashes are a handful of fields, but the outbox
+    # grows for the whole of a Postgres outage at ~625 B per play (256mb holds
+    # ~429k; see HistoryOutboxDrainer.CAP_PAGE for the listpack cliff behind
+    # that figure). HISTORY_OUTBOX_MAX is the opt-in bound and dropping there is
+    # real data loss. The history trim is lazy — it runs inside push_history
+    # only — so a dormant guild keeps whatever oversized list it already had
+    # until its next play or a manual DEL. A memory/eviction alarm is still
+    # owed. Do not switch to allkeys-lru: an evicted outbox entry is a play that
+    # vanishes with no error and no log line. See
+    # docs/ARCHITECTURE.md#redis-memory-bounds.
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
         """LPUSH one entry, cap and PERSIST the list, and — while the archive is

@@ -125,6 +125,16 @@ class TestBotValues:
         )
         assert shown == expected
 
+    def test_an_unsaved_knob_says_so(self) -> None:
+        config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
+        shown = card.bot_shown(
+            _spec("heartbeat", SettingScope.BOT),
+            host_debug_default=False,
+            debug_default_override=None,
+            persisted=False,
+        )
+        assert shown == card.Shown(5.0, "not saved")
+
     @pytest.mark.parametrize(
         ("override", "expected"),
         [

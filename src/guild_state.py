@@ -247,6 +247,15 @@ type BotConfigFieldName = Literal[
 ]
 
 
+_BOT_CONFIG_FIELD_NAMES: Final[frozenset[str]] = frozenset(
+    get_args(BotConfigFieldName.__value__)
+)
+
+
+def is_bot_config_field(name: str) -> TypeIs[BotConfigFieldName]:
+    return name in _BOT_CONFIG_FIELD_NAMES
+
+
 class BotConfigField:
     """Wire field names for bot:{application_id}:config: each is its env var in
     lower case, so an override, its config accessor and its variable share a name."""

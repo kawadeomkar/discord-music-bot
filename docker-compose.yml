@@ -118,7 +118,7 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Three kinds of key deliberately carry NO TTL
+    # volatile-lru, NOT allkeys-lru. Four kinds of key deliberately carry NO TTL
     # and must never become eviction candidates:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
@@ -146,6 +146,11 @@ services:
     #                       while the bot was offline, by the startup orphan
     #                       sweep), so it scales with guild count and not with
     #                       runtime.
+    #   bot:{application_id}:config
+    #                       the operator's bot-wide -settings bot overrides, one
+    #                       hash per application. Evicting it returns every
+    #                       overridden knob to its environment value at the next
+    #                       start. Bounded by the number of bot settings.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
     # so volatile-lru preserves cache-eviction behavior for them.

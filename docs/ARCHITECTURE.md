@@ -126,7 +126,7 @@ Five containers are defined in [docker-compose.yml](../docker-compose.yml):
 
 Redis is configured with:
 - `appendonly yes` + `appendfsync everysec` — data survives container restarts with at most 1 second of loss
-- `maxmemory 256mb` + `maxmemory-policy volatile-lru` — **only TTL-carrying keys are eviction candidates**. Caches (`ytdl:*`, `spotify:*`) and the `guild:{id}:{state,queue,now_playing}` keys carry TTLs and are reconstructible or re-creatable. **Three kinds of key deliberately carry none** and must never become candidates: `history:outbox` (plays not yet durable in Postgres), `guild:{id}:history` (the capped, PERSISTed window `-history` reads) and `guild:{id}:config` (a guild's durable choices — evicting one silently reverts a setting the guild made). Never switch to `allkeys-*` — see [Redis memory bounds](#redis-memory-bounds)
+- `maxmemory 256mb` + `maxmemory-policy volatile-lru` — **only TTL-carrying keys are eviction candidates**. Caches (`ytdl:*`, `spotify:*`) and the `guild:{id}:{state,queue,now_playing}` keys carry TTLs and are reconstructible or re-creatable. **Four kinds of key deliberately carry none** and must never become candidates: `history:outbox` (plays not yet durable in Postgres), `guild:{id}:history` (the capped, PERSISTed window `-history` reads), `guild:{id}:config` (a guild's durable choices — evicting one silently reverts a setting the guild made) and `bot:{application_id}:config` (the operator's bot-wide overrides). Never switch to `allkeys-*` — see [Redis memory bounds](#redis-memory-bounds)
 
 ```mermaid
 graph LR
@@ -315,8 +315,8 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-analytics` | `an` | `[--days N]` | Six-panel chart of this server's listening (plays per day by source, weekday x hour heatmap, listening time, per-play completion by source, song-length mix, queue-wait percentiles) plus top listeners/artists/songs. Postgres-only, like `-leaderboard`, and gated on the archive the same way. `--days` is an **allowlist** of 7/30/90/365 — a free-form range would defeat its own cache; the window is N COMPLETE UTC days, so today is excluded and the answer is immutable until midnight, which is when the Redis cache expires. Rendered in a worker process; every render failure degrades to the embed-only card. One in flight per guild, and one run per guild per 30 s — the two cover different axes, so neither substitutes for the other. See [Analytics rendering](#analytics-rendering). |
 | `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to Redis. `-settings volume` shows and changes the same saved level, and accepts the same voice gate. |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | — | Live-editing service-health dashboard: probes Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, and reports the bot / yt-dlp / FFmpeg versions. One in flight per guild. |
-| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing/runtime footer to every embed the bot sends in that guild, the live Now Playing card included) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
-| `-settings` | `config`, `cfg`, `prefs` | `[bot] [<setting> [<value> \| reset]]` | This server's settings (volume, timezone, the debug footer): the card, one setting in detail, a change or a reset. Anyone can view; a change needs **Manage Server**, or for `volume` `-volume`'s voice gate, or the bot's operator. `-settings bot` shows the bot-wide settings to the operator alone, and a bot-wide change is refused until bot writes land. Key first, one line, every word used: `-settings debug on for the staging bot` is refused rather than read as `debug on`. Writes go through `GuildSettings` under its per-guild lock, each Redis call bounded at 2 s, so there is no `max_concurrency`. |
+| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing/runtime footer to every embed the bot sends in that guild, the live Now Playing card included) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`, or the operator's `-settings bot debug-default` until restart. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
+| `-settings` | `config`, `cfg`, `prefs` | `[bot] [<setting> [<value> \| reset]]` | This server's settings (volume, timezone, the debug footer): the card, one setting in detail, a change or a reset. Anyone can view; a change needs **Manage Server**, or for `volume` `-volume`'s voice gate, or the bot's operator. `-settings bot` shows and changes the bot-wide settings, for the operator alone, and a server write of a key that is also bot-wide (`np-refresh`, `slow-notice`) names the bot form to the operator. Key first, one line, every word used: `-settings debug on for the staging bot` is refused rather than read as `debug on`. Writes go through `GuildSettings` under its per-guild lock, each Redis call bounded at 2 s, so there is no `max_concurrency`. |
 | `-jump` | `j` | — | Stub; replies "currently in development". |
 | `-help` | `commands` | `[command]` | Man-page-styled embed help: the full command list, or detailed help for one command (`-help play`). Aliases resolve too (`-help np`). Rendered by `MusicHelpCommand` (`help.py`). |
 
@@ -351,7 +351,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 
 ## Configuration
 
-**Environment variables:**
+**Environment variables.** The operator can override the knobs [Settings resolution](#settings-resolution) lists with `-settings bot`, at runtime and within a chat range; a stored override wins over the variable until it is reset.
 
 | Variable | Required | Description |
 |---|---|---|
@@ -1050,6 +1050,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
+| `bot:{application_id}:config` | Hash | `BotConfig`: one field per `-settings bot` knob, named as its env var in lower case; absent runs the knob on its environment value. Written only by `BotSettings.write`/`write_reset`, applied at startup by `BotSettings.hydrate`, skipped while `BOT_SETTINGS_OVERRIDES=ignore`. One per application, so bots sharing a Redis cannot retune each other; `debug-default` is never stored | **none, ever** |
 | `guild:{id}:config` | Hash | 7 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
@@ -1668,8 +1669,10 @@ socket read timeout. A slow tier must cost depth, never an error embed.
 
 ### Redis memory bounds
 
-Three kinds of key carry no TTL and are therefore never eviction candidates under
-`volatile-lru`: `guild:{id}:history`, `guild:{id}:config` and `history:outbox`. Once they fill
+Four kinds of key carry no TTL and are therefore never eviction candidates under
+`volatile-lru`: `guild:{id}:history`, `guild:{id}:config`, `bot:{application_id}:config`
+and `history:outbox`. The bot hash is one per application and bounded by the number of
+bot settings, so it cannot grow. Once they fill
 `maxmemory` with no TTL-bearing key left to evict, Redis rejects **every** write
 with OOM — state, queue and cache alike — and each store method swallows it and
 logs, so persistence degrades silently rather than crashing.
@@ -2456,6 +2459,15 @@ it. Until the read lands, every knob runs on its environment value.
   environment variable draws a WARNING naming all three ways back: `-settings bot <key>
   reset`, `just bot-settings reset <application_id>` and `BOT_SETTINGS_OVERRIDES=ignore`.
 - A knob that `apply` or `reset` changed while the read was in flight keeps that value.
+
+**Bot writes.** `-settings bot <setting> <value>` and `-settings bot <setting> reset`,
+for the operator alone, go through `BotSettings.write`/`write_reset`: one at a time under
+its write lock, the store call first, under `CONFIG_IO_TIMEOUT_SECS`, then the override,
+so Redis and the process end on the same last write. An unconfirmed store call still
+applies, and the card marks the setting `not saved` until a later write lands. While
+`BOT_SETTINGS_OVERRIDES=ignore` is set, the command refuses before any store call. A server
+write of a key that is also a bot setting (`np-refresh`, `slow-notice`) stays the server's,
+and the operator's reply names the bot form.
 - Hydration is skipped while `application_id` is None: discord.py sets it in `login()`,
   before `setup_hook`, so only a bot that never logged in (a unit test) lacks one.
 
@@ -2619,7 +2631,7 @@ Discord requires sharding at 2500+ guilds. `AutoShardedBot` negotiates shards au
 
 ### `volatile-lru` eviction policy
 
-With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction candidates — all caches and all `guild:*` runtime keys, every one reconstructible (caches) or re-creatable (runtime state). Three kinds of key are deliberately TTL-less and must never be evicted: `history:outbox`, which holds played-song entries not yet drained to Postgres; `guild:{id}:history`, the capped window `-history` reads and the only source it has; and `guild:{id}:config`, which holds each guild's durable choices, where an eviction is a setting silently reverting with no log line. An `allkeys-*` policy would let memory pressure destroy not-yet-durable history or a guild's settings, which is why the compose file pins the policy with a do-not-change comment.
+With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction candidates — all caches and all `guild:*` runtime keys, every one reconstructible (caches) or re-creatable (runtime state). Four kinds of key are deliberately TTL-less and must never be evicted: `history:outbox`, which holds played-song entries not yet drained to Postgres; `guild:{id}:history`, the capped window `-history` reads and the only source it has; `guild:{id}:config`, which holds each guild's durable choices, where an eviction is a setting silently reverting with no log line; and `bot:{application_id}:config`, the operator's bot-wide overrides, where an eviction returns every overridden knob to its environment value at the next start. An `allkeys-*` policy would let memory pressure destroy not-yet-durable history or a guild's settings, which is why the compose file pins the policy with a do-not-change comment.
 
 ### Two-tier data architecture (Redis + Postgres)
 

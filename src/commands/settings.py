@@ -3,7 +3,7 @@ or (for the bot's operator) the bot-wide settings. The grammar and the registry
 are src/settings.py; the embeds are src/settings_card.py."""
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Optional
 
 import discord
 from discord.ext import commands
@@ -14,6 +14,8 @@ from src.guild_state import ConfigField, ConfigFieldName, GuildConfig, is_config
 from src.play_placement import check_voice_permissions
 from src.settings import (
     ALL_CONFIG_FIELDS,
+    SETTINGS,
+    BotSettings,
     Refusal,
     RefusalReason,
     SettingScope,
@@ -21,6 +23,7 @@ from src.settings import (
     SettingSpec,
     SettingsRequest,
     SettingValue,
+    find,
     format_value,
     is_bullet_shaped,
     parse_settings_args,
@@ -140,12 +143,26 @@ async def _in_dm(
         await _refuse(ctx, parsed.reason, parsed.text)
 
 
+def _bot_settings(cog: MusicBot) -> Optional[BotSettings]:
+    """MusicBotApp's, built in setup_hook; None only on a bot that never ran it."""
+    found = getattr(cog.bot, "bot_settings", None)
+    return found if isinstance(found, BotSettings) else None
+
+
 def _bot_card(cog: MusicBot) -> discord.Embed:
-    bot_settings = getattr(cog.bot, "bot_settings", None)
+    bot_settings = _bot_settings(cog)
+    unsaved = frozenset(
+        spec.key
+        for spec in SETTINGS
+        if bot_settings is not None
+        and spec.scope is SettingScope.BOT
+        and not bot_settings.is_persisted(spec)
+    )
     return card.bot_card(
         rows=card.bot_rows(
             host_debug_default=cog.debug_settings.host_default,
             debug_default_override=cog.debug_settings.default_override,
+            unsaved=unsaved,
         ),
         ignored=bot_settings is not None and bot_settings.ignore_stored,
     )
@@ -162,19 +179,86 @@ async def _bot_scope(
     if not (operator or await is_operator(ctx)):
         await _refuse_operator(ctx)
         return
+    spec = request.spec
+    bot_settings = _bot_settings(cog)
     if request.action is SettingsAction.SHOW:
         await _send(ctx, _bot_card(cog))
-    elif request.action is SettingsAction.DETAIL and request.spec is not None:
+        return
+    assert spec is not None  # the parse sets a detail's, a set's and a reset's
+    if request.action is SettingsAction.DETAIL:
         shown = card.bot_shown(
-            request.spec,
+            spec,
             host_debug_default=cog.debug_settings.host_default,
             debug_default_override=cog.debug_settings.default_override,
+            persisted=bot_settings is None or bot_settings.is_persisted(spec),
         )
-        await _send(ctx, card.detail(request.spec, shown, default=None))
+        await _send(ctx, card.detail(spec, shown, default=None))
+        return
+    if bot_settings is None:
+        raise RuntimeError("bot settings are not set up on this bot")
+    if spec.field is None:
+        await _change_debug_default(ctx, request, cog=cog, bot_settings=bot_settings)
+        return
+    if bot_settings.ignore_stored:
+        await _refuse(ctx, RefusalReason.OVERRIDES_IGNORED, card.OVERRIDES_IGNORED)
+        return
+    if request.action is SettingsAction.SET:
+        assert request.value is not None  # the parse sets a SET's value
+        result = await bot_settings.write(spec, request.value)
+        embed = card.bot_set_reply(
+            spec,
+            request.value,
+            previous=result.previous,
+            persisted=result.persisted,
+            mention=ctx.author.mention,
+        )
     else:
-        await _refuse(
-            ctx, RefusalReason.BOT_WRITE_UNAVAILABLE, card.BOT_WRITE_UNAVAILABLE
+        result = await bot_settings.write_reset(spec)
+        embed = card.bot_reset_reply(
+            spec, persisted=result.persisted, mention=ctx.author.mention
         )
+    trace.get_current_span().set_attribute("settings.persisted", result.persisted)
+    before = "env" if result.previous is None else format_value(spec, result.previous)
+    after = "env" if request.value is None else format_value(spec, request.value)
+    log.info(
+        f"settings: bot {spec.key} {before} -> {after}",
+        action=request.action.value,
+        persisted=result.persisted,
+    )
+    await _send(ctx, embed)
+
+
+async def _change_debug_default(
+    ctx: commands.Context,
+    request: SettingsRequest,
+    *,
+    cog: MusicBot,
+    bot_settings: BotSettings,
+) -> None:
+    """debug-default is session-only: nothing is stored, so it changes even while
+    stored bot settings are ignored."""
+    spec = request.spec
+    assert spec is not None
+    value = request.value if isinstance(request.value, bool) else None
+    if request.action is SettingsAction.SET and value is not None:
+        bot_settings.apply(spec, value)
+    else:
+        bot_settings.reset(spec)
+    debug_settings = cog.debug_settings
+    guilds = cog.bot.guilds
+    following = sum(1 for guild in guilds if not debug_settings.has_override(guild.id))
+    shown = "DEBUG_MODE" if value is None else format_value(spec, value)
+    log.info(f"settings: bot debug-default -> {shown}")
+    await _send(
+        ctx,
+        card.debug_default_reply(
+            value,
+            host_default=debug_settings.host_default,
+            following=following,
+            total=len(guilds),
+            mention=ctx.author.mention,
+        ),
+    )
 
 
 def _field(spec: SettingSpec) -> ConfigFieldName:
@@ -286,12 +370,16 @@ async def _change_server(
         persisted=result.persisted,
     )
     if request.action is SettingsAction.SET:
+        # The operator can change either scope, so their server write names the
+        # bot-wide one; a server admin's does not.
+        dual = isinstance(find(spec.key, SettingScope.BOT), SettingSpec)
         embed = card.set_reply(
             spec,
             value,
             previous=previous,
             persisted=result.persisted,
             mention=ctx.author.mention,
+            bot_form=dual and await is_operator(ctx),
         )
     else:
         embed = card.reset_reply(

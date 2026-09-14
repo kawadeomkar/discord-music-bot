@@ -3558,8 +3558,8 @@ class TestAnalyticsPngCache:
 
     async def test_the_entry_carries_a_ttl(self, fake_redis: Redis) -> None:
         """It must stay an eviction CANDIDATE — golden rule 12's non-evictable keys
-        are the outbox, the history lists and the per-guild config, and a persistent
-        chart blob has no business joining them."""
+        are the outbox, the history lists and the per-guild and bot config hashes,
+        and a persistent chart blob has no business joining them."""
         await analytics_png_set(fake_redis, "analytics:png:v1:1:30:ttl", b"x", 120)
         assert 0 < await fake_redis.ttl("analytics:png:v1:1:30:ttl") <= 120
 

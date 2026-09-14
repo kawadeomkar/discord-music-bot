@@ -1176,10 +1176,11 @@ class MusicBot(commands.Cog):
             "which refreshes its numbers alongside the progress bar. A reply's "
             "footer carries the trace id: paste it to the operator and they can find "
             "the exact request in the logs. (The Now Playing card shows the runtime "
-            "numbers but no trace id — it is re-rendered under a different request "
-            "every few seconds, so any one id there would be misleading.) `--disable` "
-            "turns it back off. The choice is saved for this server and survives "
-            "restarts; a server that has never set it follows the host's default. "
+            "numbers but no trace id: it re-renders under a new request every few "
+            "seconds.) `--disable` turns it back off. The choice is saved for this "
+            "server and survives restarts; a server that has never set it follows "
+            "the host's default, or the bot owner's `-settings bot debug-default` "
+            "until restart. "
             "Toggling needs the **Manage Server** permission.\n\n"
             'Where `-ping` answers "are my dependencies up, and how fast?", this '
             'answers "what is running, and is it configured the way it should be?".'
@@ -1218,7 +1219,8 @@ class MusicBot(commands.Cog):
             "`-settings <setting> reset` returns it to the default. A setting's "
             "name on the card works with dashes for spaces.\n\n"
             "One setting per message, on one line. `-settings bot` shows the "
-            "bot-wide settings, to the bot's operator only."
+            "bot-wide settings and `-settings bot <setting> <value>` changes one, for "
+            "the bot's operator only."
         ),
         extras={
             "category": "Utility",

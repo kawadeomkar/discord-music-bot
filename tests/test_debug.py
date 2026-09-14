@@ -3250,6 +3250,19 @@ class TestDebugModeIsPerGuildAndDurable:
         assert inputs.debug_persisted is False
         assert debug.mode_source(True, persisted=False) == "this session only"
 
+    async def test_a_server_following_the_operators_session_default_says_so(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.id = 42
+        music_bot_with_redis.debug_settings.set_default_override(True)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
+        assert inputs.debug_default_overridden is True
+        assert (
+            debug.mode_source(False, default_overridden=True)
+            == "bot owner default, until restart"
+        )
+        assert debug.mode_source(True, default_overridden=True) == "saved here"
+
     async def test_a_write_that_lands_reports_as_saved(
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:

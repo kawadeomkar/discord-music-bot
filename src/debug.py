@@ -511,6 +511,8 @@ class DebugInputs:
     # False only when a toggle's Redis write failed, so the snapshot can say
     # "this session only" rather than claim a durability that did not happen.
     debug_persisted: bool = True
+    # The operator's session debug-default is set (-settings bot debug-default).
+    debug_default_overridden: bool = False
     players: int
     player: Optional[MusicPlayer] = None
     redis: Optional[aioredis.Redis] = None
@@ -1461,13 +1463,19 @@ async def _outbox_check(
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def mode_source(overridden: bool, *, persisted: bool = True) -> str:
+def mode_source(
+    overridden: bool, *, persisted: bool = True, default_overridden: bool = False
+) -> str:
     """Why debug mode is in its current state, rendered inside "Debug mode is
     **on** for this server (...)". "saved here" is a stored choice; "host default"
-    means the guild never chose and follows DEBUG_MODE; "this session only" is a
-    toggle whose Redis write failed, which the toggle already reported."""
+    means the guild never chose and follows DEBUG_MODE, and "bot owner default,
+    until restart" that it follows the operator's session default instead; "this
+    session only" is a toggle whose Redis write failed, which the toggle already
+    reported."""
     if not overridden:
-        return "host default"
+        return (
+            "bot owner default, until restart" if default_overridden else "host default"
+        )
     return "saved here" if persisted else "this session only"
 
 
@@ -1633,7 +1641,11 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
     stragglers rather than failing the card. A non-operator has no deferred
     blocks, so the driver degrades to a single send with no loop."""
     span = trace.get_current_span()
-    source = mode_source(inputs.debug_overridden, persisted=inputs.debug_persisted)
+    source = mode_source(
+        inputs.debug_overridden,
+        persisted=inputs.debug_persisted,
+        default_overridden=inputs.debug_default_overridden,
+    )
     blocks = instant_blocks(ctx, inputs, source=source)
 
     # Counted before the driver creates its probe tasks — see runtime_lines.

@@ -126,6 +126,7 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
         debug_enabled=cog.debug_settings.enabled(guild_id),
         debug_overridden=cog.debug_settings.has_override(guild_id),
         debug_persisted=cog.debug_settings.is_persisted(guild_id),
+        debug_default_overridden=cog.debug_settings.default_override is not None,
         players=len(cog.mps),
         player=cog.mps.get(guild_id) if guild_id is not None else None,
         redis=cog.redis,

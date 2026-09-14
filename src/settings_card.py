@@ -122,9 +122,11 @@ def bot_shown(
     *,
     host_debug_default: bool,
     debug_default_override: Optional[bool],
+    persisted: bool = True,
 ) -> Shown:
     """A bot setting as the operator's views render it: the value in force, and
-    where it comes from — `bot owner; env 3s` for an override."""
+    where it comes from — `bot owner; env 3s` for an override, `not saved` for one
+    whose write did not reach Redis."""
     origin = "env" if _env_set(spec) else "default"
     if spec.attr is None:
         base = format_value(spec, host_debug_default)
@@ -135,6 +137,8 @@ def bot_shown(
         )
     override = config.override(spec.attr)
     baseline = config.baseline(spec.attr)
+    if not persisted:
+        return Shown(baseline if override is None else override, NOT_SAVED)
     if override is None:
         return Shown(baseline, origin)
     return Shown(override, f"bot owner; {origin} {format_value(spec, baseline)}")
@@ -189,12 +193,14 @@ def bot_card(*, rows: list[tuple[SettingSpec, Shown]], ignored: bool) -> discord
     """The bot-wide settings, for the operator only, as code-block rows in
     -debug's Config form."""
     description = (
-        "Bot-wide: each applies in every server. They can't be changed from chat yet."
+        "Bot-wide: each applies in every server. `-settings bot <setting> <value>` "
+        "changes one, and `-settings bot <setting> reset` returns it to the "
+        "environment."
     )
     if ignored:
         description = (
-            "Stored bot settings are ignored (`BOT_SETTINGS_OVERRIDES=ignore`).\n\n"
-            + description
+            "Stored bot settings are ignored (`BOT_SETTINGS_OVERRIDES=ignore`). While "
+            "it is set, only debug-default can be changed from chat.\n\n" + description
         )
     embed = discord.Embed(
         title="Bot settings", description=description, color=CHANGE_COLOR
@@ -264,9 +270,11 @@ def set_reply(
     previous: Optional[Shown],
     persisted: bool,
     mention: str,
+    bot_form: bool = False,
 ) -> discord.Embed:
     """A server setting changed. `previous` is None when this server's stored
-    values could not be read, so what it replaced is unknown."""
+    values could not be read, so what it replaced is unknown. `bot_form` names the
+    bot-wide setting of the same key, for the operator, who can change either."""
     text = f"**{spec.label}** is now **{format_value(spec, value)}** for this server"
     if previous is not None:
         was = "the default" if previous.source == DEFAULT else previous.source
@@ -276,7 +284,10 @@ def set_reply(
         text += f" {_DEBUG_DISCLOSURE}"
     else:
         text += f" It applies {spec.applies}."
-    text += f" {_SAVED if persisted else _NOT_SAVED} {_changed_by(mention)}"
+    text += f" {_SAVED if persisted else _NOT_SAVED}"
+    if bot_form:
+        text += f" To change it for every server, use `-settings bot {spec.key}`."
+    text += f" {_changed_by(mention)}"
     return notice_embed(text, CHANGE_COLOR)
 
 
@@ -306,6 +317,98 @@ def not_applied() -> discord.Embed:
     )
 
 
+_BOT_SAVED: Final = "It is saved, and wins over the environment until it is reset."
+_BOT_RESET_NOT_SAVED: Final = (
+    "⚠️ The stored value could not be removed (Redis is unavailable), so it returns "
+    "when the bot restarts."
+)
+_DEBUG_FOOTER_LABEL: Final = next(
+    s.label for s in _SERVER_SPECS if s.field == ConfigField.DEBUG_MODE
+)
+
+
+def _baseline(spec: SettingSpec) -> tuple[SettingValue, Optional[str]]:
+    """A knob's environment value, and the variable it came from, if one is set."""
+    if spec.attr is None:
+        raise ValueError(f"{spec.key} names no config knob")
+    return config.baseline(spec.attr), spec.env if _env_set(spec) else None
+
+
+def bot_set_reply(
+    spec: SettingSpec,
+    value: SettingValue,
+    *,
+    previous: Optional[float],
+    persisted: bool,
+    mention: str,
+) -> discord.Embed:
+    """A bot setting changed for every server. `previous` is the override it
+    replaced, or None when the knob ran on its environment value."""
+    if previous is not None:
+        was = f"**{format_value(spec, previous)}**, set by the bot's operator"
+    else:
+        baseline, env = _baseline(spec)
+        source = f"from `{env}`" if env else "the default"
+        was = f"**{format_value(spec, baseline)}**, {source}"
+    text = (
+        f"**{spec.label}** is now **{format_value(spec, value)}** for every server "
+        f"(was {was}). It applies {spec.applies}. "
+        f"{_BOT_SAVED if persisted else _NOT_SAVED} {_changed_by(mention)}"
+    )
+    return notice_embed(text, CHANGE_COLOR)
+
+
+def bot_reset_reply(
+    spec: SettingSpec, *, persisted: bool, mention: str
+) -> discord.Embed:
+    """A bot setting back on its environment value."""
+    baseline, env = _baseline(spec)
+    shown = format_value(spec, baseline)
+    if env:
+        text = f"**{spec.label}** is back to **{shown}**, from `{env}`."
+    else:
+        text = f"**{spec.label}** is back to the default, **{shown}**."
+    text += f" {'It is saved.' if persisted else _BOT_RESET_NOT_SAVED} {_changed_by(mention)}"
+    return notice_embed(text, CHANGE_COLOR)
+
+
+def debug_default_reply(
+    value: Optional[bool],
+    *,
+    host_default: bool,
+    following: int,
+    total: int,
+    mention: str,
+) -> discord.Embed:
+    """debug-default set (`value`) or reset (None). `following` counts the servers
+    with no choice of their own, which render the default now."""
+    host = "on" if host_default else "off"
+    label = _DEBUG_FOOTER_LABEL
+    if value is None:
+        text = (
+            f"**{label}**'s default is back to `DEBUG_MODE`: **{host}**, for the "
+            f"**{following}** servers that have not chosen for themselves."
+        )
+    elif value:
+        keep = "" if host_default else "; set `DEBUG_MODE=true` to keep it on"
+        text = (
+            f"**{label}** is now **on** by default, for the **{following}** of this "
+            f"bot's **{total}** servers that have not chosen for themselves. Every "
+            "embed in them — including the live Now Playing card — shows the bot "
+            "process's CPU, memory, event-loop lag, task count and worker count to "
+            "anyone who can read the channel. It lasts until the bot restarts, which "
+            f"returns to `DEBUG_MODE` (**{host}**){keep}."
+        )
+    else:
+        text = (
+            f"**{label}** is now **off** by default, for the **{following}** servers "
+            f"that have not chosen for themselves; the other **{total - following}** "
+            "keep their own choice. It lasts until the bot restarts, which returns to "
+            f"`DEBUG_MODE` (**{host}**)."
+        )
+    return notice_embed(f"{text} {_changed_by(mention)}", CHANGE_COLOR)
+
+
 def refusal(text: str) -> discord.Embed:
     return notice_embed(text, REFUSAL_COLOR)
 
@@ -332,7 +435,10 @@ OPERATOR_UNCONFIRMED: Final = (
     "Couldn't confirm the bot's operator just now, so bot-wide settings can't be "
     "changed. Try again in a minute."
 )
-BOT_WRITE_UNAVAILABLE: Final = "Bot settings can't be changed from chat yet."
+OVERRIDES_IGNORED: Final = (
+    "Bot settings can't be changed from chat right now: `BOT_SETTINGS_OVERRIDES=ignore` "
+    "is set, so stored ones are ignored. Remove it and restart to change them here."
+)
 
 
 def server_rows(
@@ -357,9 +463,13 @@ def server_rows(
 
 
 def bot_rows(
-    *, host_debug_default: bool, debug_default_override: Optional[bool]
+    *,
+    host_debug_default: bool,
+    debug_default_override: Optional[bool],
+    unsaved: frozenset[str] = frozenset(),
 ) -> list[tuple[SettingSpec, Shown]]:
-    """Every bot setting with the value it renders, in registry order."""
+    """Every bot setting with the value it renders, in registry order. `unsaved`
+    holds the keys whose last write did not reach Redis."""
     return [
         (
             spec,
@@ -367,6 +477,7 @@ def bot_rows(
                 spec,
                 host_debug_default=host_debug_default,
                 debug_default_override=debug_default_override,
+                persisted=spec.key not in unsaved,
             ),
         )
         for spec in _BOT_SPECS

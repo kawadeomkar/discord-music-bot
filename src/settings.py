@@ -44,11 +44,13 @@ from src.guild_state import (
     DEFAULT_TIMEZONE,
     DEFAULT_VOLUME,
     OFF_SECS,
+    BotConfig,
     BotConfigField,
     BotConfigFieldName,
     ConfigField,
     ConfigFieldName,
     GuildConfig,
+    is_bot_config_field,
     is_config_field,
     valid_timezone,
 )
@@ -605,7 +607,7 @@ class RefusalReason(Enum):
     NO_PERMISSION = "no_permission"
     OPERATOR_ONLY = "operator_only"
     OPERATOR_UNCONFIRMED = "operator_unconfirmed"
-    BOT_WRITE_UNAVAILABLE = "bot_write_unavailable"
+    OVERRIDES_IGNORED = "overrides_ignored"
     # A bullet-shaped message whose parse was refused: nothing is sent.
     BULLET_SHAPE = "bullet_shape"
 
@@ -1352,12 +1354,25 @@ def _set_knob(attr: config.FloatKnob | config.IntKnob, value: SettingValue) -> N
         config.set_override(attr, value)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BotWriteResult:
+    # False: stored bot settings are ignored, and nothing changed.
+    applied: bool
+    # The store call returned True inside CONFIG_IO_TIMEOUT_SECS. False is "not
+    # confirmed", not "not written": a pipeline sends before it reads replies.
+    persisted: bool
+    # The override in force immediately before this write; None while the knob
+    # ran on its environment baseline.
+    previous: Optional[float]
+
+
 class BotSettings:
     """The operator's bot-wide settings for this process. hydrate() applies what
-    bot:{application_id}:config holds; apply() and reset() change one setting in
-    memory. debug-default is never stored: it is held here, so a cog reload can
-    hand it to the new cog's DebugSettings. The one src/ caller of
-    config.set_override and config.clear_override. Built in setup_hook.
+    bot:{application_id}:config holds; write() and write_reset() store one setting
+    there and apply it, and apply() and reset() change one in memory alone.
+    debug-default is never stored: it is held here, so a cog reload can hand it to
+    the new cog's DebugSettings. The one src/ caller of config.set_override and
+    config.clear_override. Built in setup_hook.
     See docs/ARCHITECTURE.md#settings-resolution."""
 
     def __init__(
@@ -1379,6 +1394,11 @@ class BotSettings:
         # one leaves that knob as the command set it.
         self._seq = 0
         self._changed_at: dict[str, int] = {}
+        # One stored write at a time, so Redis and the override end on the same
+        # last write.
+        self._write_lock = asyncio.Lock()
+        # Knobs whose last write or reset did not reach Redis.
+        self._unpersisted: set[str] = set()
 
     def _debug_settings(self) -> Optional[DebugSettings]:
         # Looked up at call time, so a reloaded cog is the one that receives it.
@@ -1426,6 +1446,76 @@ class BotSettings:
         config.clear_override(spec.attr)
         self._stamp(spec.attr)
         return True
+
+    def is_persisted(self, spec: SettingSpec) -> bool:
+        """False while the setting's last write or reset had not reached Redis."""
+        return spec.attr not in self._unpersisted
+
+    async def _store_io(
+        self, call: Callable[[BotConfigStore], Awaitable[bool]]
+    ) -> bool:
+        application_id = self._bot.application_id
+        if self._redis is None or application_id is None:
+            return False
+        try:
+            async with asyncio.timeout(CONFIG_IO_TIMEOUT_SECS):
+                return await call(BotConfigStore(self._redis, application_id))
+        except TimeoutError:
+            log.warning("bot config write timed out; not confirmed")
+            return False
+
+    def _stored_field(self, spec: SettingSpec) -> BotConfigFieldName:
+        if (
+            spec.scope is not SettingScope.BOT
+            or spec.field is None
+            or not is_bot_config_field(spec.field)
+        ):
+            raise ValueError(f"{spec.key} is not a stored bot setting")
+        return spec.field
+
+    def _mark(self, spec: SettingSpec, *, persisted: bool) -> None:
+        if spec.attr is None:
+            return
+        if persisted:
+            self._unpersisted.discard(spec.attr)
+        else:
+            self._unpersisted.add(spec.attr)
+
+    async def write(self, spec: SettingSpec, value: SettingValue) -> BotWriteResult:
+        """Store `value` in bot:{application_id}:config, then apply it. The store
+        call comes first, under CONFIG_IO_TIMEOUT_SECS; one that is not confirmed
+        still applies, marked unsaved until a later write or reset lands. While
+        stored settings are ignored it makes no store call and changes nothing."""
+        field = self._stored_field(spec)
+        if not in_bounds(spec, value) or isinstance(value, (bool, str)):
+            raise ValueError(f"{spec.key}={value!r} is not a bot setting value")
+        previous = config.override(spec.attr) if spec.attr is not None else None
+        if self.ignore_stored:
+            return BotWriteResult(applied=False, persisted=False, previous=previous)
+        async with self._write_lock:
+            previous = config.override(spec.attr) if spec.attr is not None else None
+            change = replace(BotConfig(), **{field: value})
+            persisted = await self._store_io(lambda store: store.update_config(change))
+            self.apply(spec, value)
+            self._mark(spec, persisted=persisted)
+            return BotWriteResult(applied=True, persisted=persisted, previous=previous)
+
+    async def write_reset(self, spec: SettingSpec) -> BotWriteResult:
+        """Delete the stored value, then return the knob to its environment
+        value, in write()'s order. An unconfirmed delete still resets this process;
+        the stored value can return at the next start."""
+        field = self._stored_field(spec)
+        previous = config.override(spec.attr) if spec.attr is not None else None
+        if self.ignore_stored:
+            return BotWriteResult(applied=False, persisted=False, previous=previous)
+        async with self._write_lock:
+            previous = config.override(spec.attr) if spec.attr is not None else None
+            persisted = await self._store_io(
+                lambda store: store.reset_config_fields(field)
+            )
+            self.reset(spec)
+            self._mark(spec, persisted=persisted)
+            return BotWriteResult(applied=True, persisted=persisted, previous=previous)
 
     def reapply_debug_default(self, debug_settings: DebugSettings) -> None:
         """Give a newly loaded cog this session's debug-default."""
