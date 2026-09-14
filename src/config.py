@@ -66,8 +66,8 @@ def _float_env(
 # enough that the driver's wait is always a real suspension.
 _MIN_DASHBOARD_SECS: Final[float] = 0.05
 
-# -ping's live-edit loop (src/dashboard.py). Constants because the driver reads
-# them every tick.
+# -ping's live-edit loop (src/dashboard.py). Env baselines: -ping reads them through
+# ping_tick_secs() and ping_deadline_secs(), once per invocation.
 PING_TICK_SECS: float = _float_env("PING_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
 PING_DEADLINE_SECS: float = _float_env(
     "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
