@@ -793,7 +793,9 @@ def _get_probe_session() -> aiohttp.ClientSession:
             # limit=0: the default 100 would queue the 101st probe against its
             # own 2s budget and report a healthy URL as UNCONFIRMED.
             connector=aiohttp.TCPConnector(limit=0),
-            timeout=aiohttp.ClientTimeout(total=config.STREAM_PROBE_TIMEOUT_SECS),
+            # A backstop only: every probe passes its own timeout, which replaces
+            # this one. Without one, a request passing none waits aiohttp's 300s.
+            timeout=aiohttp.ClientTimeout(total=config.STREAM_PROBE_TIMEOUT_MAX_SECS),
             cookie_jar=aiohttp.DummyCookieJar(),
             # The Location header is parsed as URL(loc, encoded=not this): a redirect
             # gets the same pre-encoded treatment _probe_target gives the first hop.
@@ -829,7 +831,11 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
         # read_bufsize=0 + close(), not release(): only the status line matters,
         # read_bufsize=0 + close(), not release(): only the status line matters,
         # and aiohttp otherwise buffers audio from the moment headers land.
-        async with session.get(_probe_target(stream_url), read_bufsize=0) as response:
+        # Per request, read at the call: a bot-setting change reaches the next probe.
+        timeout = aiohttp.ClientTimeout(total=config.stream_probe_timeout_secs())
+        async with session.get(
+            _probe_target(stream_url), read_bufsize=0, timeout=timeout
+        ) as response:
             # Only a definite client-side refusal is DEAD: 429 and 5xx say "not
             # right now", as a timeout does, and ffmpeg's -reconnect would very
             # likely have played the song.
@@ -1902,7 +1908,7 @@ class YTDL(discord.FFmpegOpusAudio):
             # Warms the stream cache from the same extraction, so queue_put's
             # prefetch_stream is a cache hit. STARTED, not awaited: the reply needs
             # identity, and the probe behind that write is a network round trip
-            # bounded only by config.STREAM_PROBE_TIMEOUT_SECS. Whoever reaches the
+            # bounded only by the probe's timeout. Whoever reaches the
             # cache first joins the same job through _stream_cache_get.
             _start_stream_warm(redis, _stream_cache_key(webpage_url), video_data)
             trace.get_current_span().set_attribute("ytdl.stream_warm_started", True)

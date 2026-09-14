@@ -702,7 +702,7 @@ It now goes through `_extract_once` under the `"playlist"` profile and caches th
 
 ### Warming the stream cache
 
-A full Phase 1 extraction yields a selected stream URL alongside the identity, and that URL is worth caching — but only once it has been **probed**, which is a network round trip bounded by `config.STREAM_PROBE_TIMEOUT_SECS` (2 s). The reply needs the identity alone, so `yt_source` **starts** the probe-and-cache and returns without awaiting it (`_start_stream_warm`). Every link's `-play` gets its confirmation that much sooner.
+A full Phase 1 extraction yields a selected stream URL alongside the identity, and that URL is worth caching — but only once it has been **probed**, which is a network round trip bounded by `config.stream_probe_timeout_secs()` (2 s by default), passed per request. The reply needs the identity alone, so `yt_source` **starts** the probe-and-cache and returns without awaiting it (`_start_stream_warm`). Every link's `-play` gets its confirmation that much sooner.
 
 **The warm is registered, not fired blindly.** `_INFLIGHT_STREAM_WARMS` holds the job under its cache key, and every reader of that cache goes through `_stream_cache_get`, which joins a warm in flight rather than treating the miss as a miss. Without that join the enqueue-time `prefetch_stream` — spawned by `queue_put` moments later — would find nothing and pay a **second full extraction** of the URL the warm is about to write, and a cold start's playback loop would do the same on its way to audio. The join is shielded: the warm is shared, and a cancelled prefetch (every bulk queue mutation cancels one) must leave it running for whoever else is waiting.
 
@@ -1932,6 +1932,13 @@ throughput one, and do not restore the handshake claim a comment here once carri
 The residual real benefit is the connector's 10 s `ttl_dns_cache`, which helps inside
 one resolve and not across songs.
 
+**The timeout is per request.** Each probe passes
+`ClientTimeout(total=config.stream_probe_timeout_secs())`, which replaces the session's
+timeout wholesale, so a bot-setting change reaches the next probe without rebuilding the
+session. The session keeps `config.STREAM_PROBE_TIMEOUT_MAX_SECS` (5 s, the chat maximum)
+as a backstop for any request that passes none: with no session timeout aiohttp would wait
+its 300 s default.
+
 **`DummyCookieJar` is load-bearing.** A default `CookieJar` would be process-wide and
 attacker-writable: `parse_url` hands any dotted domain to yt-dlp, whose generic
 extractor returns the input URL for the probe to fetch, so one `-play` reaches this
@@ -2400,8 +2407,12 @@ through `_float_env`/`_int_env`, which record the floor each enforced
   for either kind, a non-int for an int knob, raise `TypeError` — and nothing else:
   bounds belong to the registry, and `BotSettings` checks `in_bounds` before it calls.
   `override`, `baseline` and `effective` are read-only views, open to any module.
-- **Consumers still read the baselines.** No consumer calls an accessor yet, so an
-  applied override changes only what the accessors return.
+- **Consumers call the accessor when the value applies**, never the baseline and never
+  at import. When that is differs by consumer: a per-tick read (the heartbeat, the
+  runtime sampler) lands after the tick in progress, a per-invocation read (`-ping`,
+  `-debug`, `-analytics`, each `-play`'s admission and resolve wait, each stream probe) at
+  the next one, and a value built into a long-lived object at its rebuild — a guild's
+  resolve semaphore, once its in-flight requests have all retired.
 - **Two maps, `Literal` keys.** Each accessor's return type is its map's value type, with
   no `cast`. The keys are `Literal` strings rather than an `Enum` because
   `importlib.reload(config)` would mint new enum classes, and a registry built before

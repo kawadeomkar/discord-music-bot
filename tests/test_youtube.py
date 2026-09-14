@@ -3125,8 +3125,8 @@ class TestTheStreamWarmIsSharedNotAwaited:
     async def test_yt_source_returns_before_the_probe_finishes(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
-        """The probe is a network round trip bounded only by STREAM_PROBE_TIMEOUT_SECS,
-        and the reply needs identity, not a probed URL."""
+        """The probe is a network round trip bounded only by its timeout, and the
+        reply needs identity, not a probed URL."""
         release = asyncio.Event()
 
         async def _stalled_probe(_url: str) -> StreamProbe:
@@ -4397,19 +4397,39 @@ class TestProbeSessionSharing:
         await youtube.close_probe_session()
         assert await _probe_stream_url("https://cdn/x") is StreamProbe.UNCONFIRMED
 
-    async def test_probe_session_carries_the_configured_timeout(self) -> None:
-        """STREAM_PROBE_TIMEOUT_SECS is baked into the session once, at first use,
-        rather than passed per call — so nothing else exercises the constructor and
-        a dropped timeout would leave every probe on aiohttp's 5-minute default,
+    async def test_probe_session_carries_a_backstop_timeout(self) -> None:
+        """Nothing else exercises the constructor, and a session with no timeout
+        would leave any request that passes none on aiohttp's 5-minute default,
         stalling a song start behind a CDN that never answers."""
         import src.youtube as youtube
         from src import config
 
         session = youtube._get_probe_session()
         try:
-            assert session.timeout.total == config.STREAM_PROBE_TIMEOUT_SECS
+            assert session.timeout.total == config.STREAM_PROBE_TIMEOUT_MAX_SECS
         finally:
             await youtube.close_probe_session()
+
+    async def test_each_probe_passes_the_current_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Per request, so a bot-setting change reaches the next probe without
+        rebuilding the process-wide session."""
+        import src.youtube as youtube
+        from src import config
+
+        response = MagicMock(status=200)
+        session = MagicMock()
+        session.get = MagicMock()
+        session.get.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(youtube, "_get_probe_session", lambda: session)
+
+        assert await _probe_stream_url("https://cdn/x") is StreamProbe.PLAYABLE
+        config.set_override("STREAM_PROBE_TIMEOUT_SECS", 0.7)
+        assert await _probe_stream_url("https://cdn/x") is StreamProbe.PLAYABLE
+        totals = [c.kwargs["timeout"].total for c in session.get.call_args_list]
+        assert totals == [config.STREAM_PROBE_TIMEOUT_SECS, 0.7]
 
     async def test_probe_connector_is_unbounded(self) -> None:
         """One connector serves every guild now. aiohttp's default limit of 100
