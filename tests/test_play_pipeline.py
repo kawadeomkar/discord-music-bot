@@ -554,6 +554,28 @@ class TestEnqueuePlaylist:
         assert "Queued playlist" in embed.title
         assert "Song A" in embed.description
 
+    async def test_a_spotify_playlist_stamps_who_queued_every_track(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """These resolve at dequeue, when _last_author is whoever typed most
+        recently: each track has to carry the requester from here."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=["Song A", "Song B"]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        queued = mp.queue_put.call_args[0][0]
+        assert [y.requester_id for y in queued] == [mock_ctx.author.id] * 2
+
     async def test_a_spotify_playlist_says_how_many_it_queued(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -1853,6 +1875,32 @@ class TestSpotifyDisabled:
 class TestInterjectionCollectionHandling:
     """`--now` takes the whole collection: the head interrupts, the tail follows."""
 
+    async def test_a_spotify_tail_stamps_who_queued_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=SpotifyPlaylist(
+                name=None,
+                titles=["Head", "Two", "Three"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
+        )
+        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        with patch(
+            "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
+        ):
+            _, rest = await play_pipeline._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN, cog=music_bot
+            )
+
+        assert [cast(YTSource, y).requester_id for y in rest] == [
+            mock_ctx.author.id
+        ] * 2
+
     @staticmethod
     def _yt_tracks(author: MagicMock, count: int) -> list[QueueObject]:
         return [
@@ -2293,6 +2341,7 @@ class TestSearchesForAPlaylist:
                 [f"T{n}" for n in range(5)],
                 analytics=Analytics(queued_at=1.0, queue_position=7),
                 origin="https://open.spotify.com/playlist/x",
+                requester_id=7,
             )
         finally:
             ticker.cancel()

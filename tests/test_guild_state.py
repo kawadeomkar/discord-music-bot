@@ -655,6 +655,25 @@ class TestSearchQueueEntryWire:
         entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
         assert entry.to_redis() == _GOLDEN_YTSOURCE
 
+    def test_the_requester_round_trips_through_the_lazy_resolve(self) -> None:
+        source = YTSource(ytsearch="ytsearch:x", requester_id=424242424242424242)
+        parsed = parse_queue_entry(SearchQueueEntry.from_ytsource(source).to_redis())
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.requester_id == 424242424242424242
+
+    def test_an_unknown_requester_writes_no_key(self) -> None:
+        """An entry queued before searches carried a requester must serialize to the
+        bytes already on the list, or removing it misses LREM and rebuilds."""
+        entry = SearchQueueEntry.from_ytsource(YTSource(ytsearch="ytsearch:x"))
+        assert entry.requester_id is None
+        assert b"requester_id" not in entry.to_redis()
+
+    def test_a_pre_requester_entry_parses_as_none(self) -> None:
+        # Not 0: None routes to the fallback requester, 0 to member 0, nobody.
+        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
+        assert isinstance(entry, SearchQueueEntry)
+        assert entry.requester_id is None
+
     def test_origin_survives_the_wire(self) -> None:
         """An unresolved Spotify-playlist track is the only place that link still
         exists: its ytsearch is a title the expansion generated, and the resolved

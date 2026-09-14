@@ -4652,6 +4652,56 @@ class TestResolveSource:
         assert result.title == "Resolved"
 
 
+class TestResolveRequester:
+    """A playlist's lazy tracks resolve minutes to an hour after the command that
+    queued them returned, when _last_author is whoever typed most recently."""
+
+    async def test_the_stored_requester_beats_the_last_author(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        queuer = MagicMock(spec=discord.Member)
+        queuer.id = 424242424242424242
+        music_player._guild.get_member = MagicMock(return_value=queuer)
+        music_player._last_author = mock_author
+        yt_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Resolved", queuer)
+        )
+
+        with patch("src.musicplayer.YTDL.yt_source", new=yt_source):
+            await music_player._resolve_source(
+                YTSource(ytsearch="ytsearch:test", requester_id=424242424242424242)
+            )
+
+        assert yt_source.await_args is not None
+        assert yt_source.await_args.args[0] is queuer
+
+    def test_no_stored_id_falls_back_to_the_last_author(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player._last_author = mock_author
+        assert music_player._resolve_requester(None) is mock_author
+
+    def test_a_member_who_left_resolves_through_the_user_cache(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        gone = MagicMock(spec=discord.User)
+        gone.id = 424242424242424242
+        music_player._guild.get_member = MagicMock(return_value=None)
+        mocked(music_player.bot).get_user = MagicMock(return_value=gone)
+        music_player._last_author = mock_author
+
+        assert music_player._resolve_requester(424242424242424242) is gone
+
+    def test_an_id_nobody_answers_to_falls_back(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player._guild.get_member = MagicMock(return_value=None)
+        mocked(music_player.bot).get_user = MagicMock(return_value=None)
+        music_player._last_author = mock_author
+
+        assert music_player._resolve_requester(424242424242424242) is mock_author
+
+
 # ── StreamSource ──────────────────────────────────────────────────────────────
 
 
