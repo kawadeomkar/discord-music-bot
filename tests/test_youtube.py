@@ -19,6 +19,9 @@ import aiohttp
 import discord
 import orjson
 from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from yarl import URL
 import pytest
 from redis.asyncio import Redis
@@ -47,6 +50,7 @@ from src.youtube import (
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
+    _playlist_tracks,
     _record_serving_format,
     _run_extract,
     ExtractRequest,
@@ -3447,6 +3451,118 @@ class TestYtPlaylistEntries:
         assert qobj.title == "Song live"
 
 
+class TestMixRepeats:
+    """yt-dlp walks a Mix one window at a time and can yield a video it already
+    yielded: one walk returned 1,671 entries for 492 videos. A Mix keeps each video
+    once; a playlist keeps what its owner put there."""
+
+    @staticmethod
+    def _entries(*ids: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": video_id,
+                "title": f"Song {video_id}",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": 100,
+            }
+            for video_id in ids
+        ]
+
+    @staticmethod
+    def _urls(queued: list[QueueObject]) -> list[str]:
+        return [q.webpage_url.rsplit("=", 1)[1] for q in queued]
+
+    async def _fetch(
+        self,
+        ctx: MagicMock,
+        list_id: str,
+        ids: tuple[str, ...],
+        redis: Optional[aioredis.Redis] = None,
+    ) -> list[QueueObject]:
+        url = f"https://www.youtube.com/watch?v={ids[0]}&list={list_id}"
+        data = {"_type": "playlist", "id": list_id, "entries": self._entries(*ids)}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            return await YTDL.yt_playlist(
+                url,
+                ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=url,
+                redis=redis,
+            )
+
+    @pytest.mark.parametrize("list_id", ["RDa", "RDAMVMa"])
+    async def test_a_mix_keeps_each_video_once_in_first_seen_order(
+        self, mock_ctx: MagicMock, list_id: str
+    ) -> None:
+        """RDAMVM is the same Mix reached through YouTube Music."""
+        queued = await self._fetch(mock_ctx, list_id, ("a", "b", "c", "a", "b", "d"))
+        assert self._urls(queued) == ["a", "b", "c", "d"]
+        # Positions come from the kept tracks, so a dropped repeat leaves no gap.
+        assert [q.analytics.queue_position for q in queued] == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("list_id", ["PLmine", "RDCLAK5uy_kmPRjHDECIcuVwnKsx2Ng"])
+    async def test_a_playlist_keeps_a_video_its_owner_added_twice(
+        self, mock_ctx: MagicMock, list_id: str
+    ) -> None:
+        """A curated RDCLAK5uy_ list shares the Mix prefix and is a playlist: the tab
+        extractor walks it with a header count and never repeats itself."""
+        queued = await self._fetch(mock_ctx, list_id, ("a", "b", "a"))
+        assert self._urls(queued) == ["a", "b", "a"]
+
+    async def test_the_cache_holds_the_mix_without_its_repeats(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Deduplicated before the write, so a paste inside the window does not
+        bring the repeats back."""
+        await self._fetch(mock_ctx, "RDa", ("a", "b", "a"), fake_redis)
+        with patch("src.youtube._ytdlp_extract") as extract:
+            url = "https://www.youtube.com/watch?v=a&list=RDa"
+            again = await YTDL.yt_playlist(
+                url,
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=url,
+                redis=fake_redis,
+            )
+        extract.assert_not_called()
+        assert self._urls(again) == ["a", "b"]
+
+    def test_the_repeat_count_rides_the_span(self) -> None:
+        """The walk's own size and what was queued disagree for a repeating Mix,
+        and the trace is where that has to be visible. A real span, never a patched
+        get_current_span: that function is OpenTelemetry's global, and the log line
+        beside the attribute reads it too."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        url = "https://www.youtube.com/watch?v=a&list=RDa"
+        with tracer.start_as_current_span("unique"):
+            _playlist_tracks(
+                cast(Any, {"id": "RDa", "entries": self._entries("a", "b")}), url
+            )
+        with tracer.start_as_current_span("repeats"):
+            tracks = _playlist_tracks(
+                cast(Any, {"id": "RDa", "entries": self._entries("a", "a", "b", "a")}),
+                url,
+            )
+        with tracer.start_as_current_span("kept"):
+            kept = _playlist_tracks(
+                cast(Any, {"id": "PLx", "entries": self._entries("a", "a")}), url
+            )
+        unique, repeats, owned = exporter.get_finished_spans()
+        assert len(tracks) == 2
+        assert "ytdl.playlist_repeats" not in (unique.attributes or {})
+        assert (repeats.attributes or {})["ytdl.playlist_repeats"] == 2
+        assert (repeats.attributes or {})["ytdl.playlist_repeats_dropped"] is True
+        # A playlist's repeats are counted and kept.
+        assert len(kept) == 2
+        assert (owned.attributes or {})["ytdl.playlist_repeats"] == 1
+        assert (owned.attributes or {})["ytdl.playlist_repeats_dropped"] is False
+
+
 class TestPlaylistCache:
     """The most expensive resolve in the system, cached and single-flighted. The
     entry list is stored; the requester, analytics and user_input are per request."""
@@ -3493,7 +3609,7 @@ class TestPlaylistCache:
         assert mock_extract.call_count == 1
         assert [q.webpage_url for q in first] == [q.webpage_url for q in second]
         assert [q.title for q in second] == ["Song a1", "Song a2"]
-        assert await fake_redis.ttl("ytdl:playlist:PLcache") == _YT_PLAYLIST_TTL
+        assert await fake_redis.ttl("ytdl:playlist:v2:PLcache") == _YT_PLAYLIST_TTL
 
     async def test_every_entry_point_to_one_collection_shares_the_entry(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3515,11 +3631,11 @@ class TestPlaylistCache:
             )
 
         assert mock_extract.call_count == 1
-        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:PLsame"]
+        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:v2:PLsame"]
 
     def test_a_url_with_no_list_id_keys_on_itself(self) -> None:
         assert youtube._playlist_cache_key("https://sc.com/set/x") == (
-            "ytdl:playlist:https://sc.com/set/x"
+            "ytdl:playlist:v2:https://sc.com/set/x"
         )
 
     async def test_two_users_pasting_one_collection_run_one_extraction(

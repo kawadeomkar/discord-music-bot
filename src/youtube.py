@@ -23,6 +23,7 @@ from opentelemetry.trace import StatusCode
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
+from src.sources import is_mix
 from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
@@ -689,9 +690,10 @@ def _playlist_cache_key(url: str) -> str:
     """Keyed on the playlist's `list=` id rather than the pasted URL: one collection
     arrives as /playlist?list=X, as a watch link carrying `&index=`, and with a `&t=`
     on it, and those must share an entry rather than fragmenting the cache per entry
-    point. A URL carrying no `list=` falls back to itself."""
+    point. A URL carrying no `list=` falls back to itself. Versioned with the value:
+    v2 entries hold a Mix without its repeats."""
     list_id = parse_qs(urlparse(url).query).get("list", [""])[0]
-    return f"ytdl:playlist:{list_id or url}"
+    return f"ytdl:playlist:v2:{list_id or url}"
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -1282,6 +1284,12 @@ def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
     # declaring it non-optional excluded that case.
     entries: list[Optional[YTDLEntry]] = data.get("entries") or []
     tracks: list[SourceIdentity] = []
+    # A Mix keeps each video's first occurrence: yt-dlp's window walk can repeat a
+    # video. A playlist may repeat one on purpose, so it keeps every entry and only
+    # the count is recorded. See docs/ARCHITECTURE.md#the-playlist-cache.
+    mix = is_mix(data.get("id", ""))
+    seen: set[str] = set()
+    repeats = 0
     for i, entry in enumerate(entries):
         if not entry:
             log.warning("Skipping null entry at playlist index %d for %s", i, url)
@@ -1295,6 +1303,11 @@ def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
                 url,
             )
             continue
+        if video_id in seen:
+            repeats += 1
+            if mix:
+                continue
+        seen.add(video_id)
         # A flat entry already carries what the card shows. duration is None on a
         # live entry; uploader falls back to channel on lockupViewModel entries.
         raw_duration = entry.get("duration")
@@ -1310,6 +1323,12 @@ def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
                 thumbnail=entry.get("thumbnail"),
             )
         )
+    if repeats:
+        span = trace.get_current_span()
+        span.set_attribute("ytdl.playlist_repeats", repeats)
+        span.set_attribute("ytdl.playlist_repeats_dropped", mix)
+        if mix:
+            log.info("Dropped %d repeated entries from the mix at %s", repeats, url)
     return tracks
 
 

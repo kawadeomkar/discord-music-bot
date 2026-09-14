@@ -661,7 +661,7 @@ It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` tak
 
 `yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
 
-It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
+It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v2:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
 
 **Fifteen minutes, not the source cache's day.** A playlist is editable, and its entry count and order are what the callers' `&index=` handling and every "Queued playlist — N songs" line are built from. What the window has to cover is the two cases that actually hurt: the same collection pasted twice in a burst, and a re-paste soon after.
 
@@ -670,6 +670,8 @@ It now goes through `_extract_once` under the `"playlist"` profile and caches th
 **Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. Entries yt-dlp could not describe (a null entry for a deleted video, one with no `id`) are dropped in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps.
 
 **An empty result is not cached.** A private or unavailable playlist extracts to no entries too, and a quarter of an hour is a long time to answer a retry with the same nothing.
+
+**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key carries a `v2` because this changed what an entry holds: an unversioned key would serve a pre-dedupe Mix for its remaining TTL.
 
 ---
 

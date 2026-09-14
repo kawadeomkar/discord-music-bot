@@ -104,6 +104,11 @@ https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported si
 never gonna give you up                          # plain text searches YouTube
 ```
 
+A video link carrying `&list=` queues that whole list, not just the video. The link
+YouTube's player hands you for a song you reached through a Mix carries
+`&list=RD…`, and a Mix is hundreds of songs, each queued once. Delete the
+`&list=…` part to queue only the video, or `-remove` the link to take the Mix back out.
+
 YouTube, Spotify, and SoundCloud get first-class handling (timestamps, playlist
 expansion, Spotify→YouTube matching). Any other link is handed straight to
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) — if it's one of the ~1800 sites yt-dlp
