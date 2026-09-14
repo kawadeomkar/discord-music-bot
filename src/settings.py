@@ -1383,8 +1383,11 @@ def _parse_scoped(tokens: list[str], scope: SettingScope) -> SettingsRequest | R
         return SettingsRequest(
             scope=scope, action=SettingsAction.SET, spec=spec, value=result.value
         )
-    # A value that parses once trailing words are dropped had words left over.
-    if any(_shape_accepted(spec, joiner.join(rest[:n])) for n in range(1, len(rest))):
+    # Not a value, but one once trailing words are dropped: words left over. A
+    # whole value refused for its range or its zone keeps that refusal.
+    if result.reason is RefusalReason.BAD_SHAPE and any(
+        _shape_accepted(spec, joiner.join(rest[:n])) for n in range(1, len(rest))
+    ):
         return _TOO_MUCH
     return result
 

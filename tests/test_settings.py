@@ -805,6 +805,25 @@ class TestParseSettingsArgs:
         assert isinstance(result, Refusal)
         assert result.reason is RefusalReason.TOO_MUCH
 
+    @pytest.mark.parametrize(
+        ("arg", "reason"),
+        [
+            ("idle 45 minutes", RefusalReason.OUT_OF_RANGE),
+            ("alone-timeout 5 minutes", RefusalReason.OUT_OF_RANGE),
+            ("idle 1 h", RefusalReason.OUT_OF_RANGE),
+            ("slow-notice 90 s", RefusalReason.OUT_OF_RANGE),
+            ("timezone UTC +5", RefusalReason.FIXED_OFFSET),
+        ],
+    )
+    def test_a_spaced_value_keeps_its_own_refusal(
+        self, arg: str, reason: RefusalReason
+    ) -> None:
+        """Every word belongs to the value, so its range or zone refusal stands:
+        its first word alone parsing does not make the rest left over."""
+        result = _request(arg)
+        assert isinstance(result, Refusal)
+        assert result.reason is reason
+
     def test_extra_spaces_are_one_separator(self) -> None:
         assert _request("bot play-resolve-wait  1m   30s") == _set(
             "play-resolve-wait", 90.0, SettingScope.BOT
