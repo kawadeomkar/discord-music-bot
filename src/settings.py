@@ -157,6 +157,29 @@ def _play_resolve_concurrency_max() -> float:
     return max(1, config.YTDLP_POOL_WORKERS - 1)
 
 
+def _longest_card_delay() -> float:
+    """The longest delay a playlist card can run with: the most any
+    queue-progress-delay setting accepts, or the environment's value if longer."""
+    maxima = [
+        bound(spec.maximum) or 0.0
+        for spec in SETTINGS
+        if spec.key == "queue-progress-delay"
+    ]
+    return max([config.baseline("QUEUE_PROGRESS_DELAY_SECS"), *maxima])
+
+
+def _queue_progress_max_floor() -> float:
+    # queue_progress.card_ceiling's rule: the longest delay, then two ticks.
+    return max(
+        config.env_floor("QUEUE_PROGRESS_MAX_SECS"),
+        _longest_card_delay() + 2 * config.queue_progress_tick_secs(),
+    )
+
+
+def _queue_progress_tick_ceiling() -> float:
+    return max(0.0, (config.queue_progress_max_secs() - _longest_card_delay()) / 2)
+
+
 SETTINGS: Final[tuple[SettingSpec, ...]] = (
     SettingSpec(
         key="volume",
@@ -337,6 +360,74 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         ),
         env="PLAY_SLOW_NOTICE_SECS",
         attr="PLAY_SLOW_NOTICE_SECS",
+    ),
+    SettingSpec(
+        key="queue-progress-delay",
+        aliases=("playlist-card",),
+        scope=SettingScope.BOT,
+        kind=SettingKind.SECONDS,
+        group=SettingGroup.MESSAGES,
+        label="Playlist card",
+        summary=(
+            "How long a playlist lookup runs before its live progress card appears, "
+            "in every server."
+        ),
+        applies="from the next -play",
+        field=BotConfigField.QUEUE_PROGRESS_DELAY,
+        minimum=2.0,
+        maximum=60.0,
+        why_minimum=(
+            "A ten-track playlist queues in about 2s, so a shorter delay would put "
+            "the card up for ordinary ones."
+        ),
+        env="QUEUE_PROGRESS_DELAY_SECS",
+        attr="QUEUE_PROGRESS_DELAY_SECS",
+    ),
+    SettingSpec(
+        key="queue-progress-tick",
+        aliases=("playlist-card-tick",),
+        scope=SettingScope.BOT,
+        kind=SettingKind.SECONDS,
+        group=SettingGroup.MESSAGES,
+        label="Playlist card tick",
+        summary="The shortest gap between the playlist card's edits, in every server.",
+        applies="from the next card",
+        field=BotConfigField.QUEUE_PROGRESS_TICK,
+        minimum=3.0,
+        maximum=30.0,
+        write_maximum=_queue_progress_tick_ceiling,
+        why_minimum=(
+            "The card shares the channel's rate limit with the Now Playing bar's edits."
+        ),
+        env="QUEUE_PROGRESS_TICK_SECS",
+        attr="QUEUE_PROGRESS_TICK_SECS",
+    ),
+    SettingSpec(
+        key="queue-progress-max",
+        aliases=("playlist-card-max",),
+        scope=SettingScope.BOT,
+        kind=SettingKind.SECONDS,
+        group=SettingGroup.MESSAGES,
+        label="Playlist card max",
+        summary=(
+            'How long the playlist card keeps updating before it says "still '
+            'working" and stops, in every server.'
+        ),
+        applies="from the next card",
+        field=BotConfigField.QUEUE_PROGRESS_MAX,
+        minimum=120.0,
+        maximum=900.0,
+        write_minimum=_queue_progress_max_floor,
+        why_minimum=(
+            "A 5,000-track playlist takes about 100s to look up, so a shorter limit "
+            "would stall the card on a lookup that is still working."
+        ),
+        why_write_minimum=(
+            "a card waits up to its longest delay and then needs two ticks, "
+            "{bound}, before it can stop"
+        ),
+        env="QUEUE_PROGRESS_MAX_SECS",
+        attr="QUEUE_PROGRESS_MAX_SECS",
     ),
     SettingSpec(
         key="play-inflight-max",
@@ -1289,21 +1380,26 @@ _HELP_INDENT: Final = "    "
 
 def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
     """What a spec accepts, as the help and the detail view print it. A write-time
-    minimum follows the bot, so only `now` (a render at the call) quotes its value;
-    the help is built once, at import, and names it instead."""
+    bound follows another setting, so only `now` (a render at the call) applies
+    it. Otherwise a server spec names the bot value it follows, and a bot spec
+    prints its static range."""
     match spec.kind:
         case SettingKind.SWITCH:
             return "on or off"
         case SettingKind.TIMEZONE:
             return "a city like Europe/London, or UTC"
     static_lo = bound(spec.minimum) or 0
-    if spec.write_minimum is None:
-        lo = format_value(spec, static_lo)
-    elif now:
+    static_hi = bound(spec.maximum) or 0
+    if spec.write_minimum is not None and now:
         lo = format_value(spec, max(static_lo, spec.write_minimum()))
-    else:
+    elif spec.write_minimum is not None and spec.scope is SettingScope.SERVER:
         lo = "the bot's value"
-    hi = format_value(spec, bound(spec.maximum) or 0)
+    else:
+        lo = format_value(spec, static_lo)
+    if spec.write_maximum is not None and now:
+        hi = format_value(spec, min(static_hi, spec.write_maximum()))
+    else:
+        hi = format_value(spec, static_hi)
     return f"{lo}–{hi}" + (" or off" if spec.kind is SettingKind.SECONDS_OR_OFF else "")
 
 

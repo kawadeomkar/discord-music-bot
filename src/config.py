@@ -114,9 +114,9 @@ QUEUE_PROGRESS_TICK_SECS: float = _float_env(
 # extraction inside it, and PLACE_TIMEOUT_SECS bounds 0.01s of a 29s command.
 # Past it the card says so once and stops editing; it is still deleted when the
 # enqueue settles.
-# Floored at delay + tick, the two knobs above it: under the delay the card is born
-# stalled, and under delay + tick it never renders a second frame. Below the floor
-# startup is refused, default included.
+# Floored at delay + tick, the two knobs above it: a lower ceiling has passed by the
+# card's first tick. Below the floor startup is refused, default included. Each card
+# also sets its own ceiling from the values it runs with (queue_progress.card_ceiling).
 QUEUE_PROGRESS_MAX_SECS: float = _float_env(
     "QUEUE_PROGRESS_MAX_SECS",
     300.0,
@@ -251,6 +251,9 @@ type FloatKnob = Literal[
     "DEBUG_TICK_SECS",
     "DEBUG_DEADLINE_SECS",
     "ANALYTICS_RENDER_DEADLINE_SECS",
+    "QUEUE_PROGRESS_DELAY_SECS",
+    "QUEUE_PROGRESS_TICK_SECS",
+    "QUEUE_PROGRESS_MAX_SECS",
 ]
 type IntKnob = Literal["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"]
 FLOAT_KNOBS: Final[frozenset[FloatKnob]] = frozenset(get_args(FloatKnob.__value__))
@@ -334,6 +337,18 @@ def analytics_render_deadline_secs() -> float:
     return _FLOAT_OVERRIDES.get(
         "ANALYTICS_RENDER_DEADLINE_SECS", ANALYTICS_RENDER_DEADLINE_SECS
     )
+
+
+def queue_progress_delay_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_DELAY_SECS", QUEUE_PROGRESS_DELAY_SECS)
+
+
+def queue_progress_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_TICK_SECS", QUEUE_PROGRESS_TICK_SECS)
+
+
+def queue_progress_max_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_MAX_SECS", QUEUE_PROGRESS_MAX_SECS)
 
 
 @overload

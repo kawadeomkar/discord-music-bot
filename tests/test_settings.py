@@ -535,6 +535,39 @@ class TestOutOfRange:
             == "**Progress bar refresh** has to be between **5s** and **30s**."
         )
 
+    def test_the_card_max_leaves_the_longest_delay_two_ticks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Chat's own ranges never meet this bound; an environment delay longer than
+        any setting accepts does, and a write must not undercut it."""
+        spec = _spec("queue-progress-max")
+        assert parse_value(spec, "120s") == Parsed(120.0)
+        monkeypatch.setattr(config, "QUEUE_PROGRESS_DELAY_SECS", 100.0)
+        config.set_override("QUEUE_PROGRESS_TICK_SECS", 15.0)
+        result = parse_value(spec, "125s")
+        assert isinstance(result, Refusal)
+        assert result.side == "minimum"
+        assert result.text == (
+            "**Playlist card max** has to be between **130s** and **900s** here: a "
+            "card waits up to its longest delay and then needs two ticks, **130s**, "
+            "before it can stop."
+        )
+        assert settings.allowed_text(spec, now=True) == "130s–900s"
+        assert settings.allowed_text(spec) == "120s–900s"
+
+    def test_the_card_tick_fits_twice_between_the_longest_delay_and_the_max(
+        self,
+    ) -> None:
+        spec = _spec("queue-progress-tick")
+        assert parse_value(spec, "25s") == Parsed(25.0)
+        config.set_override("QUEUE_PROGRESS_MAX_SECS", 100.0)
+        result = parse_value(spec, "25s")
+        assert isinstance(result, Refusal)
+        assert result.side == "maximum"
+        assert "between **3s** and **20s**" in result.text
+        assert parse_value(spec, "20s") == Parsed(20.0)
+        assert settings.allowed_text(spec, now=True) == "3s–20s"
+
     @pytest.mark.parametrize("value", ["0", "0s", "0:00"])
     def test_a_server_slow_notice_of_zero_names_off(self, value: str) -> None:
         result = parse_value(_spec("slow-notice"), value)

@@ -884,7 +884,7 @@ A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card 
 
 **The wait is in the resolve, not in the enqueue.** Measured on a YouTube Mix whose walk yielded 1,671 entries — 492 distinct videos, see [The playlist cache](#the-playlist-cache): 28.98 s of a 29.60 s command is `queue_source`, and the insert is 0.01 s. A bar counting songs added to the queue would sit at 0 for 29 seconds and then jump to 100 % in one frame, which is worse than no bar. So the card reports the resolve, and its numbers come from the source walking its own pages.
 
-**Two phases, because the others are unreachable.** `FETCHING`, and `STALLED` once the card passes `QUEUE_PROGRESS_MAX_SECS`. A "queued" or "done" render would exist for less than a frame — the insert is 0.01 s and the card is deleted immediately after — and every failure path deletes the card before anything could render one.
+**Two phases, because the others are unreachable.** `FETCHING`, and `STALLED` once the card passes its ceiling. A "queued" or "done" render would exist for less than a frame — the insert is 0.01 s and the card is deleted immediately after — and every failure path deletes the card before anything could render one.
 
 **Where the numbers come from.** A Spotify collection is easy: the pager reads `total` from page 1 and reports after every page, so its bar is determinate from the first tick. A YouTube collection has no such channel — `YTDL.yt_playlist` awaits one `extract_info` that returns after the whole continuation walk, so the track count and the tracks would arrive in the same tick, milliseconds before the card is deleted. It gets one built for it (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). A collection with no header count at all — a Mix (`RD…`, other than a curated `RDCLAK5uy_` list), a channel tab — still renders indeterminate: an elapsed line rounded to 5 s and no bar. That is a steady state, not a transient one.
 
@@ -902,13 +902,13 @@ A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card 
 
 **The edit budget is per channel.** Discord allows 5 edits / 5 s per channel and every `PATCH /channels/{cid}/messages/{mid}` there shares one bucket, which the NP progress bar already spends a third of at its 3 s cadence. A 429 never reaches `safe_edit` — `HTTPClient.request` logs it and sleeps the bucket internally — so the symptom is the NP bar silently freezing, invisible in our logs. Three things keep the card inside the budget:
 
-- `QUEUE_PROGRESS_TICK_SECS` defaults to **5.0 s** with its own floor of 2.0 s, not the dashboards' 0.05 s: `-ping` and `-debug` can share that floor because their deadlines cap the damage at ~8 edits, and this card has no such cap.
+- `QUEUE_PROGRESS_TICK_SECS` defaults to **5.0 s** with its own floor of 2.0 s, not the dashboards' 0.05 s: `-ping` and `-debug` can share that floor because their deadlines cap the damage at ~8 edits, and this card has no such cap. `-settings bot queue-progress-tick` goes no lower than 3 s, so the card and the NP bar at their fastest chat cadences are 0.67 edits/s.
 - **One card per channel.** `PLAY_INFLIGHT_MAX` is 16 and requests resolve concurrently, so a pasted burst would otherwise arm sixteen edit loops on one bucket. `PLAY_RESOLVE_CONCURRENCY` cannot throttle them — it is taken inside `_extract_once`, below where the card is entered, so requests 3..16 park there and are *guaranteed* to cross the display threshold. The claim is taken when a card is about to be sent rather than at entry, so a cache hit that finished inside the delay never denies the slot to a slow sibling. A request that loses it asks again every tick, so its card appears once the other is taken back rather than never. The span records `play.progress_card` (`shown`, `claimed_elsewhere`, `stalled`, `send_failed`), and a stall also logs a WARNING with the counts it reached.
 - **The count is quantized to the bar's cells.** The bar is the Now Playing bar (`util.progress_line`), labelled `` `done` … `total` songs `` where the NP card puts clock times. A Spotify page landing every ~300 ms moves the raw count six times per tick, so `embeds_changed` would suppress nothing. The number rendered is the smallest count that fills the cells the bar draws, so the two never disagree and a whole enqueue costs at most `BAR_WIDTH` edits. This is also why a determinate card shows no elapsed line: the elapsed step moves every tick by construction, which would undo the quantization and put the card back to one edit per tick.
 
 **What the card does NOT fix is the composite.** Card + NP bar is 0.2/s + 0.333/s, comfortably inside the 1.0/s the bucket allows. Add a `-debug` at its 1 s tick and the channel is at **1.533/s — 7.67 edits per 5 s against 5**, for the dashboard's whole 8 s deadline. That overlap is already 33 % over budget on `main` without the card, so the card worsens an existing problem rather than creating one; the honest statement is that the per-feature budgets hold and the composite does not, and the thing that gives way is the NP bar, silently. Anyone adding a fifth edit loop to a channel should fix the composite rather than size against the remainder.
 
-**The card owns its own deadline.** Nothing else bounds the work it watches: `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a resolve slot and deliberately not the extraction inside it, `PLACE_TIMEOUT_SECS` bounds 0.01 s of a 29 s command, and yt-dlp's own `socket_timeout` × `retries` lets a single page hold 300 s with no aggregate bound across 56 of them. Past `QUEUE_PROGRESS_MAX_SECS` the card renders its terminal state once and stops editing; the exit stack still deletes it when the enqueue finally settles.
+**The card owns its own deadline.** Nothing else bounds the work it watches: `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a resolve slot and deliberately not the extraction inside it, `PLACE_TIMEOUT_SECS` bounds 0.01 s of a 29 s command, and yt-dlp's own `socket_timeout` × `retries` lets a single page hold 300 s with no aggregate bound across 56 of them. Past its ceiling the card renders its terminal state once and stops editing; the exit stack still deletes it when the enqueue finally settles. The ceiling is `card_ceiling(delay, tick, max)`: `QUEUE_PROGRESS_MAX_SECS`, or the delay plus two ticks if that is longer. The card sends after its delay and checks the ceiling only after each tick, so a shorter ceiling stalls it at its first check without one ordinary edit. All three are bot settings, read once as the card is entered, and `-settings bot` moves them separately; its write bounds keep a chat change clear of the rule (a max of at least the longest delay a server can set plus two ticks, and a tick that fits twice between them), and the per-card rule covers what the environment sets.
 
 **The typing indicator keeps running under it.** `background_typing` is refcounted per channel, so suppressing it for a collection would drop it for every other `-play` in flight there.
 
@@ -2397,7 +2397,7 @@ one real gap — the ~2.0 s first invocation in a process.
 `-settings` holds values at two scopes: bot-wide knobs, owned by the operator, and
 per-server settings. Each scope has one writer.
 
-**Bot settings: override, else environment, else code default.** Twelve knobs
+**Bot settings: override, else environment, else code default.** Fifteen knobs
 (`config.FLOAT_KNOBS`, `config.INT_KNOBS`) keep their environment parse unchanged: the
 UPPER_CASE constant (`config.PING_TICK_SECS`) is the **baseline**, parsed at import
 through `_float_env`/`_int_env`, which record the floor each enforced
@@ -2414,7 +2414,8 @@ through `_float_env`/`_int_env`, which record the floor each enforced
   at import. When that is differs by consumer: a per-tick read (the heartbeat, the
   runtime sampler) lands after the tick in progress, a per-invocation read (`-ping`,
   `-debug`, `-analytics`, each `-play`'s admission and resolve wait, each stream probe) at
-  the next one, and a value built into a long-lived object at its rebuild — a guild's
+  the next one (a playlist card reads its delay, tick and ceiling as it is entered), and a
+  value built into a long-lived object at its rebuild — a guild's
   resolve semaphore, once its in-flight requests have all retired.
 - **`TestBotKnobsAreReadAtCallTime`** holds that rule over every `src/` module in one AST
   pass, matching identifiers by name, so an aliased import is caught without tracking it.

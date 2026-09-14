@@ -244,6 +244,9 @@ type BotConfigFieldName = Literal[
     "debug_tick_secs",
     "debug_deadline_secs",
     "analytics_render_deadline_secs",
+    "queue_progress_delay_secs",
+    "queue_progress_tick_secs",
+    "queue_progress_max_secs",
 ]
 
 
@@ -272,6 +275,9 @@ class BotConfigField:
     DEBUG_TICK: Final = "debug_tick_secs"
     DEBUG_DEADLINE: Final = "debug_deadline_secs"
     ANALYTICS_RENDER_DEADLINE: Final = "analytics_render_deadline_secs"
+    QUEUE_PROGRESS_DELAY: Final = "queue_progress_delay_secs"
+    QUEUE_PROGRESS_TICK: Final = "queue_progress_tick_secs"
+    QUEUE_PROGRESS_MAX: Final = "queue_progress_max_secs"
 
 
 # The zone every guild renders ETAs in until it picks one; the schema layer
@@ -458,6 +464,9 @@ class BotConfig:
     debug_tick_secs: float | None = None
     debug_deadline_secs: float | None = None
     analytics_render_deadline_secs: float | None = None
+    queue_progress_delay_secs: float | None = None
+    queue_progress_tick_secs: float | None = None
+    queue_progress_max_secs: float | None = None
 
     def to_redis(self) -> dict[str, str]:
         """Only fields with a value, as GuildConfig.to_redis."""
@@ -480,6 +489,9 @@ class BotConfig:
                 BotConfigField.ANALYTICS_RENDER_DEADLINE,
                 self.analytics_render_deadline_secs,
             ),
+            (BotConfigField.QUEUE_PROGRESS_DELAY, self.queue_progress_delay_secs),
+            (BotConfigField.QUEUE_PROGRESS_TICK, self.queue_progress_tick_secs),
+            (BotConfigField.QUEUE_PROGRESS_MAX, self.queue_progress_max_secs),
         )
         return {name: str(value) for name, value in wire if value is not None}
 
@@ -508,6 +520,11 @@ class BotConfig:
             analytics_render_deadline_secs=_b_float(
                 raw, BotConfigField.ANALYTICS_RENDER_DEADLINE
             ),
+            queue_progress_delay_secs=_b_float(
+                raw, BotConfigField.QUEUE_PROGRESS_DELAY
+            ),
+            queue_progress_tick_secs=_b_float(raw, BotConfigField.QUEUE_PROGRESS_TICK),
+            queue_progress_max_secs=_b_float(raw, BotConfigField.QUEUE_PROGRESS_MAX),
         )
 
 

@@ -23,11 +23,7 @@ import discord
 from discord.ext import commands
 from opentelemetry import trace
 
-from src.config import (
-    QUEUE_PROGRESS_DELAY_SECS,
-    QUEUE_PROGRESS_MAX_SECS,
-    QUEUE_PROGRESS_TICK_SECS,
-)
+from src import config
 from src.dashboard import LiveMessage
 from src.sources import (
     SoundcloudSource,
@@ -81,7 +77,7 @@ class EnqueuePhase(Enum):
     """What the card can show while the resolve runs."""
 
     FETCHING = "fetching"
-    STALLED = "stalled"  # past QUEUE_PROGRESS_MAX_SECS; the card stops editing
+    STALLED = "stalled"  # past the card's ceiling; the card stops editing
 
 
 @dataclass(slots=True, kw_only=True)
@@ -142,7 +138,7 @@ def render_progress_card(
         bar = progress_line(shown, total, label=_count)
         lines.append(f"{bar} {pluralize(total, 'song')}")
     else:
-        # The card is QUEUE_PROGRESS_DELAY_SECS old at its first render, so the
+        # The card is its delay old at its first render, so the
         # step rounds: "0:00" on a message that took 2.5s to appear reads as
         # broken. Not round() — that is banker's, and sends exactly 2.5 to zero.
         step = int(elapsed_secs / _ELAPSED_STEP_SECS + 0.5) * _ELAPSED_STEP_SECS
@@ -166,6 +162,14 @@ def render_progress_card(
     if details.debug_suffix:
         embed.set_footer(text=details.debug_suffix)
     return [embed]
+
+
+def card_ceiling(delay: float, tick: float, max_secs: float) -> float:
+    """How long a card edits before it stalls. The card sends after its delay and
+    checks the ceiling after each tick, so under delay + 2 ticks it stalls at its
+    first check without one ordinary edit. The three are set separately, so no
+    one of them can hold this."""
+    return max(max_secs, delay + 2 * tick)
 
 
 def is_collection(source: Source) -> bool:
@@ -213,6 +217,10 @@ async def enqueue_progress(
     decision and the hold release.
     """
     progress = EnqueueProgress(started_at=time.monotonic())
+    # Read once: every wait and the stall log name the values this card ran with.
+    delay = config.queue_progress_delay_secs()
+    tick = config.queue_progress_tick_secs()
+    ceiling = card_ceiling(delay, tick, config.queue_progress_max_secs())
     details = CardDetails(
         requester=ctx.author.mention,
         playlist_label=_playlist_label(source),
@@ -230,7 +238,7 @@ async def enqueue_progress(
         )
 
     async def _run_card() -> None:
-        if await set_within(settled, QUEUE_PROGRESS_DELAY_SECS):
+        if await set_within(settled, delay):
             # The common case: the enqueue landed inside the delay and the
             # channel sees exactly what it sees today.
             return
@@ -246,11 +254,11 @@ async def enqueue_progress(
             # Another request's card holds the channel. Asked again each tick, so
             # this card appears once that one is taken back.
             span.set_attribute("play.progress_card", "claimed_elsewhere")
-            if await set_within(settled, QUEUE_PROGRESS_TICK_SECS):
+            if await set_within(settled, tick):
                 return
 
     async def _show_card(span: trace.Span) -> None:
-        live = LiveMessage(QUEUE_PROGRESS_TICK_SECS)
+        live = LiveMessage(tick)
         try:
             try:
                 await live.start(ctx, _render)
@@ -261,16 +269,16 @@ async def enqueue_progress(
                 log.warning("queue progress card send failed", error=repr(e))
                 return
             span.set_attribute("play.progress_card", "shown")
-            deadline = progress.started_at + QUEUE_PROGRESS_MAX_SECS
+            deadline = progress.started_at + ceiling
             while True:
-                if await set_within(settled, QUEUE_PROGRESS_TICK_SECS):
+                if await set_within(settled, tick):
                     return
                 if time.monotonic() >= deadline:
                     progress.phase = EnqueuePhase.STALLED
                     span.set_attribute("play.progress_card", "stalled")
                     log.warning(
                         "queue progress card stalled",
-                        max_secs=QUEUE_PROGRESS_MAX_SECS,
+                        max_secs=ceiling,
                         done=progress.done,
                         total=progress.total,
                     )

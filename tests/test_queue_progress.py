@@ -3,9 +3,8 @@
 The renderer is pure and asserted as goldens; the driver owns a delay, a send, N
 edits and a delete, and is asserted through a ctx double.
 
-The knobs are read from this module's own globals, so a test that wants a fast
-card patches `src.queue_progress.QUEUE_PROGRESS_*` — patching `src.config` does
-nothing here, and would leave the threshold tests passing vacuously.
+The delay, tick and ceiling are bot settings each card reads once on entry, so a
+test that wants a fast card sets them with `config.set_override` before entering it.
 """
 
 import asyncio
@@ -22,8 +21,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from src import queue_progress, util
 from src.dashboard import LiveMessage
-from src.config import NOW_PLAYING_UPDATE_INTERVAL_SECS
-from src.config import QUEUE_PROGRESS_DELAY_SECS
 from src.queue_progress import (
     _CARD_CLAIM,
     _ELAPSED_STEP_SECS,
@@ -31,6 +28,7 @@ from src.queue_progress import (
     Source,
     EnqueuePhase,
     EnqueueProgress,
+    card_ceiling,
     enqueue_progress,
     is_collection,
     render_progress_card,
@@ -45,6 +43,7 @@ from src.sources import (
 )
 from src.util import BAR_WIDTH, progress_line
 from src import config
+from src.settings import SETTINGS, SettingScope
 from tests.helpers import settle
 
 _DONE, _REMAINING = "\U0001f7e6", "⬜"
@@ -80,8 +79,8 @@ def _details(**kwargs: Any) -> CardDetails:
 
 
 def _fast(monkeypatch: pytest.MonkeyPatch, *, delay: float = 0.01) -> None:
-    monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_DELAY_SECS", delay)
-    monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_TICK_SECS", 0.01)
+    config.set_override("QUEUE_PROGRESS_DELAY_SECS", delay)
+    config.set_override("QUEUE_PROGRESS_TICK_SECS", 0.01)
 
 
 def _text(embeds: list[discord.Embed]) -> str:
@@ -125,13 +124,13 @@ class TestRenderProgressCard:
         assert len(renders) == span_secs // _ELAPSED_STEP_SECS + 1
 
     def test_the_first_render_does_not_claim_no_time_has_passed(self) -> None:
-        """The card is QUEUE_PROGRESS_DELAY_SECS old the first time it renders.
+        """The card is its delay old the first time it renders.
         Flooring made a message that took 2.5s to appear open with `0:00`, which
         reads as a card that is not working."""
         body = _text(
             render_progress_card(
                 EnqueueProgress(),
-                elapsed_secs=QUEUE_PROGRESS_DELAY_SECS,
+                elapsed_secs=config.queue_progress_delay_secs(),
                 details=_details(),
             )
         )
@@ -340,7 +339,7 @@ class TestTheDelayThreshold:
     ) -> None:
         """A cache-hit playlist is one Redis GET; the channel must see exactly
         what it sees today."""
-        monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_DELAY_SECS", 30.0)
+        config.set_override("QUEUE_PROGRESS_DELAY_SECS", 30.0)
 
         async with enqueue_progress(card_ctx, _yt_playlist()):
             pass
@@ -572,14 +571,41 @@ class TestTeardown:
 
 
 class TestTheCardsOwnBounds:
-    def test_the_ceiling_cannot_sit_under_the_delay_and_a_tick(self) -> None:
-        """A ceiling under the delay means the card is born stalled; one under
-        delay + tick means it never renders a second frame. Both are the feature
-        present and doing nothing."""
-        assert (
-            config.QUEUE_PROGRESS_MAX_SECS
-            >= config.QUEUE_PROGRESS_DELAY_SECS + config.QUEUE_PROGRESS_TICK_SECS
-        )
+    @pytest.mark.parametrize(
+        ("max_secs", "expected"),
+        [(1.0, 20.0), (15.0, 20.0), (20.0, 20.0), (300.0, 300.0)],
+        ids=["under-the-delay", "under-two-ticks", "at-the-rule", "above"],
+    )
+    def test_the_ceiling_is_the_delay_and_two_ticks_at_least(
+        self, max_secs: float, expected: float
+    ) -> None:
+        assert card_ceiling(10.0, 5.0, max_secs) == expected
+
+    async def test_a_ceiling_the_delay_outlasts_still_gets_an_ordinary_edit(
+        self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The delay and the ceiling are set separately, so a ceiling can end
+        before the card appears. The card still makes one ordinary edit first:
+        a card that only ever says "still working" is the feature doing nothing."""
+        _fast(monkeypatch, delay=0.05)
+        config.set_override("QUEUE_PROGRESS_TICK_SECS", 0.05)
+        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.01)
+        message = card_ctx.channel.send.return_value
+        titles: list[str] = []
+
+        async def _edit(**kwargs: Any) -> None:
+            titles.append(kwargs["embeds"][0].title or "")
+
+        message.edit = AsyncMock(side_effect=_edit)
+
+        async with enqueue_progress(card_ctx, _yt_playlist()) as progress:
+            progress.update(1, 10)
+            async with asyncio.timeout(2):
+                while not any("Still working" in t for t in titles):
+                    progress.update(progress.done + 1, 10)
+                    await asyncio.sleep(0.01)
+
+        assert titles[0] == queue_progress._TITLE
 
     async def test_a_teardown_does_not_wait_on_a_wedged_driver(
         self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -737,7 +763,7 @@ class TestCardTelemetry:
     ) -> None:
         _fast(monkeypatch)
         if outcome == "stalled":
-            monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_MAX_SECS", 0.03)
+            config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         if outcome == "send_failed":
             card_ctx.channel.send.side_effect = discord.HTTPException(
                 MagicMock(status=403), "Missing Permissions"
@@ -766,7 +792,7 @@ class TestTheCeiling:
         retries lets one page hold 300s with no aggregate bound across 56 of them.
         """
         _fast(monkeypatch)
-        monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_MAX_SECS", 0.03)
+        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         message = card_ctx.channel.send.return_value
 
         def _stalled() -> bool:
@@ -799,7 +825,7 @@ class TestTheCeiling:
         self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _fast(monkeypatch)
-        monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_MAX_SECS", 0.03)
+        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         message = card_ctx.channel.send.return_value
         message.edit.side_effect = discord.NotFound(MagicMock(status=404), "gone")
 
@@ -874,7 +900,7 @@ class TestTheStalledRender:
         whenever the previous edit was recent, and the card never says it stalled.
         """
         _fast(monkeypatch)
-        monkeypatch.setattr(queue_progress, "QUEUE_PROGRESS_MAX_SECS", 0.03)
+        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
         monkeypatch.setattr(
             queue_progress, "LiveMessage", lambda _tick: LiveMessage(3600.0)
         )
@@ -895,9 +921,18 @@ class TestTheEditBudget:
         shares one bucket. A 429 never reaches safe_edit — discord.py sleeps it
         internally — so the symptom is the NP bar silently freezing, invisible in
         our logs."""
-        card = 1.0 / queue_progress.QUEUE_PROGRESS_TICK_SECS
-        now_playing = 1.0 / NOW_PLAYING_UPDATE_INTERVAL_SECS
+        card = 1.0 / config.queue_progress_tick_secs()
+        now_playing = 1.0 / config.now_playing_update_interval_secs()
         assert card + now_playing < 1.0
+
+    def test_the_fastest_cadences_chat_allows_still_fit(self) -> None:
+        """The bot settings' chat minimums, both at once."""
+        tick, bar = (
+            next(s for s in SETTINGS if s.scope is SettingScope.BOT and s.key == key)
+            for key in ("queue-progress-tick", "np-refresh")
+        )
+        assert isinstance(tick.minimum, float) and isinstance(bar.minimum, float)
+        assert 1.0 / tick.minimum + 1.0 / bar.minimum < 1.0
 
     def test_the_tick_floor_is_higher_than_the_dashboards(self) -> None:
         """-ping and -debug can share a 0.05s floor because their deadlines cap
