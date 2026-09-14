@@ -1985,6 +1985,33 @@ class TestGuildSettingsStamps:
 
         assert loaded == GuildConfig(np_refresh_secs=10.0, alone_timeout_secs=30.0)
 
+    async def test_a_seed_does_not_project_a_debug_choice_written_during_it(
+        self, guild_cog: Any
+    ) -> None:
+        """seed() projects debug_mode apart from the cache merge, so the footer
+        needs its own check: a restore snapshot holding the older choice must not
+        turn it back on."""
+        guild_settings = GuildSettings(guild_cog)
+        with guild_settings.reading() as started:
+            await guild_settings.write(_GUILD, GuildConfig(debug_mode=False))
+            accepted = guild_settings.seed(
+                _GUILD, GuildConfig(debug_mode=True), started=started
+            )
+        assert "debug_mode" not in accepted
+        assert guild_cog.debug_settings.enabled(_GUILD) is False
+
+    async def test_a_seed_does_not_project_over_an_unsaved_debug_choice(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        with patch.object(
+            GuildRedisStore, "set_debug_mode", new=AsyncMock(return_value=False)
+        ):
+            await guild_settings.write(_GUILD, GuildConfig(debug_mode=False))
+        with guild_settings.reading() as started:
+            guild_settings.seed(_GUILD, GuildConfig(debug_mode=True), started=started)
+        assert guild_cog.debug_settings.enabled(_GUILD) is False
+
     async def test_an_unsaved_write_outlives_every_later_read(
         self, guild_cog: Any, fake_redis: aioredis.Redis
     ) -> None:
