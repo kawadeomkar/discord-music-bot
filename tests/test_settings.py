@@ -170,7 +170,10 @@ class TestRegistryInvariants:
 
     def test_4_copy_is_present_and_short(self) -> None:
         for spec in SETTINGS:
-            assert 0 < len(spec.summary) <= 200, spec.key
+            # Every row of both cards prints it.
+            assert 0 < len(spec.summary) <= 60, spec.key
+            if spec.more is not None:
+                assert 0 < len(spec.more) <= 200 and spec.more.endswith("."), spec.key
             assert spec.applies, spec.key
             if spec.why_write_minimum is not None:
                 assert spec.write_minimum is not None, spec.key

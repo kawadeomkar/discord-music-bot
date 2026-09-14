@@ -275,12 +275,14 @@ class TestBotCard:
 
 class TestDetail:
     def test_a_server_setting_that_follows_the_bot(self) -> None:
+        """Its caveat, which the cards have no room for, follows the summary."""
         spec = _spec("debug")
         embed = card.detail(spec, card.Shown(True, "set here"), default=False)
         assert embed.description == (
-            "**Debug footer** (`debug`; also `debug-footer`) — "
-            f"{spec.summary} Current **on** (set here) · Default off (the bot's "
-            "default) · Takes on or off · Applies immediately."
+            "**Debug footer** (`debug`; also `debug-footer`) — Adds trace and "
+            "bot-load details to every embed here. Anyone who can read the channel "
+            "sees it. Current **on** (set here) · Default off (the bot's default) · "
+            "Takes on or off · Applies immediately."
         )
 
     def test_a_duration_setting(self) -> None:
@@ -288,7 +290,7 @@ class TestDetail:
         embed = card.detail(spec, card.Shown(600.0, "set here"), default=300.0)
         assert embed.description == (
             "**Leave when idle** (`idle-timeout`; also `idle`, `leave-when-idle`) — "
-            "How long the bot stays in voice with nothing queued. Current **10:00** "
+            "How long to stay in voice with nothing queued. Current **10:00** "
             "(set here) · Default 5:00 · Allowed 5:00–30:00 · Applies the next time "
             "the queue runs empty."
         )
@@ -308,10 +310,9 @@ class TestDetail:
         spec = _spec("slow-notice")
         embed = card.detail(spec, card.Shown(OFF_SECS, "set here"), default=6.0)
         assert embed.description == (
-            "**Lookup notice** (`slow-notice`; also `lookup-notice`) — How long a "
-            'lookup for one song runs before "still looking it up" appears. Current '
-            "**off** (set here) · Default 6s (the bot's default) · Allowed 4s–60s or "
-            "off · Applies from the next -play."
+            "**Lookup notice** (`slow-notice`; also `lookup-notice`) — Wait before a "
+            "slow song lookup posts a notice. Current **off** (set here) · Default 6s "
+            "(the bot's default) · Allowed 4s–60s or off · Applies from the next -play."
         )
 
     def test_a_bot_setting_names_its_baseline_in_the_source(self) -> None:

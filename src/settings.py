@@ -113,7 +113,10 @@ class SettingSpec:
     group: SettingGroup
     # Read off the card; with spaces as "-" it is the key or one of the aliases.
     label: str
+    # One clause: the cards print it on every row.
     summary: str
+    # A caveat the summary has no room for; only the one-setting view shows it.
+    more: str | None = None
     # Completes "It applies ...".
     applies: str
     # None only for debug-default, which is never stored.
@@ -202,7 +205,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.TIMEZONE,
         group=SettingGroup.PLAYBACK,
         label="Timezone",
-        summary='The clock "Est. playing at" and "Estimated finish" are shown in.',
+        summary="Time zone for estimated play times.",
         applies="from the next time a card is drawn",
         field=ConfigField.TIMEZONE,
         minimum=None,
@@ -216,7 +219,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.DURATION,
         group=SettingGroup.LEAVING_VOICE,
         label="Leave when idle",
-        summary="How long the bot stays in voice with nothing queued.",
+        summary="How long to stay in voice with nothing queued.",
         applies="the next time the queue runs empty",
         field=ConfigField.IDLE_TIMEOUT,
         minimum=_server_bound(ConfigField.IDLE_TIMEOUT, "lo"),
@@ -238,10 +241,8 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.DURATION,
         group=SettingGroup.LEAVING_VOICE,
         label="Leave when alone",
-        summary=(
-            "How long the bot waits alone in voice before leaving. Music keeps playing "
-            "while it waits, and those songs count toward history."
-        ),
+        summary="How long to stay in voice once everyone leaves.",
+        more="Music keeps playing while it waits, and those songs count toward history.",
         applies="the next time the channel empties",
         field=ConfigField.ALONE_TIMEOUT,
         minimum=_server_bound(ConfigField.ALONE_TIMEOUT, "lo"),
@@ -275,7 +276,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS_OR_OFF,
         group=SettingGroup.MESSAGES,
         label="Lookup notice",
-        summary='How long a lookup for one song runs before "still looking it up" appears.',
+        summary="Wait before a slow song lookup posts a notice.",
         applies="from the next -play",
         field=ConfigField.SLOW_NOTICE,
         minimum=_server_bound(ConfigField.SLOW_NOTICE, "lo"),
@@ -292,7 +293,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.MESSAGES,
         label="Playlist card",
-        summary="How long a playlist lookup runs before its live progress card appears.",
+        summary="Wait before a slow playlist shows a progress card.",
         applies="from the next -play",
         field=ConfigField.QUEUE_PROGRESS_DELAY,
         minimum=_server_bound(ConfigField.QUEUE_PROGRESS_DELAY, "lo"),
@@ -309,10 +310,8 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SWITCH,
         group=SettingGroup.DIAGNOSTICS,
         label="Debug footer",
-        summary=(
-            "A footer on every embed here with the trace id, timing and the bot "
-            "process's load, readable by anyone in the channel."
-        ),
+        summary="Adds trace and bot-load details to every embed here.",
+        more="Anyone who can read the channel sees it.",
         applies="immediately",
         field=ConfigField.DEBUG_MODE,
         minimum=None,
@@ -325,7 +324,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.MESSAGES,
         label="Progress bar refresh",
-        summary="How often the Now Playing bar moves, in every server.",
+        summary="How often the Now Playing bar moves.",
         applies="from the next tick",
         field=BotConfigField.NOW_PLAYING_UPDATE_INTERVAL,
         minimum=3.0,
@@ -344,10 +343,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.PLAYBACK,
         label="Heartbeat",
-        summary=(
-            "How often a playing server records its position; a crash replays at "
-            "most this much."
-        ),
+        summary="How often a playing server saves its position.",
         applies="from the next tick",
         field=BotConfigField.HEARTBEAT_INTERVAL,
         minimum=2.0,
@@ -363,10 +359,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.MESSAGES,
         label="Lookup notice",
-        summary=(
-            'How long a lookup for one song runs before "still looking it up" '
-            "appears, in every server."
-        ),
+        summary="Wait before a slow song lookup posts a notice.",
         applies="from the next -play",
         field=BotConfigField.PLAY_SLOW_NOTICE,
         minimum=4.0,
@@ -385,10 +378,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.MESSAGES,
         label="Playlist card",
-        summary=(
-            "How long a playlist lookup runs before its live progress card appears, "
-            "in every server."
-        ),
+        summary="Wait before a slow playlist shows a progress card.",
         applies="from the next -play",
         field=BotConfigField.QUEUE_PROGRESS_DELAY,
         minimum=2.0,
@@ -407,7 +397,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.MESSAGES,
         label="Playlist card tick",
-        summary="The shortest gap between the playlist card's edits, in every server.",
+        summary="Shortest gap between the playlist card's edits.",
         applies="from the next card",
         field=BotConfigField.QUEUE_PROGRESS_TICK,
         minimum=3.0,
@@ -426,10 +416,8 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.MESSAGES,
         label="Playlist card max",
-        summary=(
-            'How long the playlist card keeps updating before it says "still '
-            'working" and stops, in every server.'
-        ),
+        summary="How long the playlist card updates before it stops.",
+        more='Past it the card says "still working" and stops editing.',
         applies="from the next card",
         field=BotConfigField.QUEUE_PROGRESS_MAX,
         minimum=120.0,
@@ -453,7 +441,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.COUNT,
         group=SettingGroup.LIMITS,
         label="Inflight max",
-        summary="How many -play requests one server may have in progress at once.",
+        summary="How many -play requests a server can run at once.",
         applies="from the next -play",
         field=BotConfigField.PLAY_INFLIGHT_MAX,
         minimum=1,
@@ -468,7 +456,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.COUNT,
         group=SettingGroup.LIMITS,
         label="Resolve concurrency",
-        summary="How many of one server's -play requests may use a lookup worker at once.",
+        summary="Lookup workers one server can use at once.",
         applies="once a server's lookups in progress have all finished",
         field=BotConfigField.PLAY_RESOLVE_CONCURRENCY,
         minimum=1,
@@ -486,7 +474,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.LIMITS,
         label="Resolve wait",
-        summary="How long a -play waits for a lookup worker before giving up.",
+        summary="How long a -play waits for a lookup worker.",
         applies="from the next wait",
         field=BotConfigField.PLAY_RESOLVE_WAIT,
         minimum=30.0,
@@ -505,7 +493,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.PLAYBACK,
         label="Probe timeout",
-        summary="How long the check that a song's stream still works may take.",
+        summary="Time limit for checking a song's stream.",
         applies="from the next check",
         field=BotConfigField.STREAM_PROBE_TIMEOUT,
         minimum=0.5,
@@ -521,7 +509,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.DIAGNOSTICS,
         label="Ping tick",
-        summary="The shortest gap between -ping's edits as its checks come back.",
+        summary="Shortest gap between -ping's edits.",
         applies="from the next -ping",
         field=BotConfigField.PING_TICK,
         minimum=1.0,
@@ -536,7 +524,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.DIAGNOSTICS,
         label="Ping deadline",
-        summary="How long -ping waits for a check before marking it failed.",
+        summary="How long -ping waits before marking a check failed.",
         applies="from the next -ping",
         field=BotConfigField.PING_DEADLINE,
         minimum=1.0,
@@ -551,7 +539,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.DIAGNOSTICS,
         label="Debug tick",
-        summary="The longest -debug's card goes without an edit while its blocks arrive.",
+        summary="Longest gap between -debug's edits.",
         applies="from the next -debug",
         field=BotConfigField.DEBUG_TICK,
         minimum=1.0,
@@ -566,7 +554,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.DIAGNOSTICS,
         label="Debug deadline",
-        summary='How long a -debug block may collect before it shows "timed out".',
+        summary='How long a -debug block collects before "timed out".',
         applies="from the next -debug",
         field=BotConfigField.DEBUG_DEADLINE,
         minimum=5.0,
@@ -582,7 +570,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SECONDS,
         group=SettingGroup.DIAGNOSTICS,
         label="Analytics deadline",
-        summary="How long -analytics waits for its chart before sending the card without one.",
+        summary="How long -analytics waits for its chart.",
         applies="from the next -analytics",
         field=BotConfigField.ANALYTICS_RENDER_DEADLINE,
         minimum=10.0,
@@ -598,10 +586,8 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         kind=SettingKind.SWITCH,
         group=SettingGroup.DIAGNOSTICS,
         label="Debug default",
-        summary=(
-            "The debug footer for every server that has not chosen for itself. It "
-            "lasts until the bot restarts."
-        ),
+        summary="Debug footer for servers that haven't chosen.",
+        more="It lasts until the bot restarts.",
         applies="immediately",
         field=None,
         minimum=None,

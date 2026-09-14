@@ -255,7 +255,8 @@ def detail(
         parts.append(
             "Can be changed with Manage Server, or by anyone in the bot's voice channel"
         )
-    text = f"**{spec.label}** ({_names(spec)}) — {spec.summary} " + " · ".join(parts)
+    about = f"{spec.summary} {spec.more}" if spec.more else spec.summary
+    text = f"**{spec.label}** ({_names(spec)}) — {about} " + " · ".join(parts)
     return discord.Embed(
         description=f"{_CARD_UNREAD}\n\n{text}." if read_failed else f"{text}.",
         color=DEGRADED_COLOR if read_failed else CHANGE_COLOR,
