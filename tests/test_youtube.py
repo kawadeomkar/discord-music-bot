@@ -1018,7 +1018,7 @@ class TestExtractSingleflight:
             async def __aenter__(self) -> None:
                 blocked.set()
                 await expire.wait()
-                raise ResolveWaitExpired
+                raise ResolveWaitExpired(120.0)
 
             async def __aexit__(self, *_: Any) -> None:
                 return None

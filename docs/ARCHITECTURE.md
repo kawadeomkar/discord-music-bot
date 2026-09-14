@@ -1291,7 +1291,11 @@ dead-stream re-extraction — which is dead air between songs in a guild that di
 nothing. Half the pool is the default so one guild can never hold all of it. Requests
 wait on the semaphore rather than being refused: within a guild the order is fair, and
 the bound is what keeps it fair between guilds. A collection is one extraction job, not
-one per track, so a `--now` sits behind at most a couple of them.
+one per track, so a `--now` sits behind at most a couple of them. The semaphore is sized
+when the guild's `_GuildPlays` is built, from `config.play_resolve_concurrency()`: a built
+semaphore cannot be resized safely (an extra `release()` uncaps it), so a bot-setting
+override reaches a guild once its in-flight requests have all retired and the next one
+builds it again. The in-flight cap and the wait's deadline are read per request.
 
 It bounds the *resolve*, which is only half of what a `-play` costs the pool. A search
 resolves flat and leaves the stream to `prefetch_stream`, spawned per enqueued song and

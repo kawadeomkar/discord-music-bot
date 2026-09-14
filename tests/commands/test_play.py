@@ -4532,7 +4532,7 @@ class TestResolveWaitExpiredReply:
             no_typing("src.commands.play.background_typing"),
             patch(
                 "src.play_pipeline.queue_source",
-                new=AsyncMock(side_effect=ResolveWaitExpired()),
+                new=AsyncMock(side_effect=ResolveWaitExpired(120.0)),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -4575,7 +4575,7 @@ class TestResolveWaitExpiredReply:
             no_typing("src.commands.play.background_typing"),
             patch(
                 "src.play_pipeline._resolve_interjection_source",
-                new=AsyncMock(side_effect=ResolveWaitExpired()),
+                new=AsyncMock(side_effect=ResolveWaitExpired(120.0)),
             ),
         ):
             # --now: a plain -play over a PLAYING song does not interject.
