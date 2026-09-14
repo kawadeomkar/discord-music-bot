@@ -855,6 +855,26 @@ class TestValidateCommands:
             await music_bot.validate_commands(mock_ctx)
         mock_ctx.send.assert_awaited_once()
 
+    async def test_a_refusal_hands_back_the_cooldown_prepare_charged(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """discord.py's prepare() charges cooldowns BEFORE before-invoke hooks, so a
+        -rp from outside voice spent -replay's one guild token and locked the whole
+        guild out for five seconds. Against the real command's real bucket."""
+        mock_ctx.voice_client = None
+        mock_ctx.author.voice = None
+        mock_ctx.send = AsyncMock()
+        mock_ctx.command = MusicBot.replay
+        charged = MusicBot.replay._buckets.get_bucket(mock_ctx)
+        assert charged is not None
+        charged.update_rate_limit()  # what prepare() did
+        assert charged.get_tokens() == 0
+
+        with pytest.raises(commands.CommandError):
+            await music_bot.validate_commands(mock_ctx)
+
+        assert charged.get_tokens() == 1
+
     async def test_passes_when_member_in_voice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -881,9 +901,12 @@ class TestMaxConcurrencyNotice:
     async def test_a_cooldown_says_how_long_is_left(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-analytics is the only command with a cooldown, and this arm is the only
-        place a user learns why they were refused. Deleting it falls through to the
-        generic handler, and zeroing retry_after reads as "try again now"."""
+        """This arm is the only place a user learns why they were refused. Deleting
+        it falls through to the generic handler, and zeroing retry_after reads as
+        "try again now". It names the command because -analytics and -replay both
+        carry a cooldown now, so an unnamed refusal does not say which one it
+        answers — and the copy was unpinned until two branches wrote two different
+        strings for it."""
         mock_ctx.command = MagicMock()
         mock_ctx.command.name = "analytics"
         await music_bot.cog_command_error(
@@ -894,6 +917,7 @@ class TestMaxConcurrencyNotice:
         )
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "12" in embed.description
+        assert "analytics" in embed.description
 
 
 def _running(cog: MusicBot, coro_name: str) -> bool:

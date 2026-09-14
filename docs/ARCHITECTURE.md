@@ -290,6 +290,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
 | `-resume` | `r` | — | Resume paused playback; re-hosts the Now Playing block so the pause confirmation becomes plain history. |
+| `-replay` | `rp`, `restart` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`MusicPlayer.replay_current()` → `ReplayOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `_MIN_REPLAY_POSITION_SECS`. See [-replay](#-replay). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
@@ -525,9 +526,11 @@ Key properties:
 
 ### -replay
 
-`MusicPlayer.replay_current()` plays the live song again from `0:00`. It reuses
+`-replay` (`rp`, `restart`) plays the live song again from `0:00`. The body is
+`src/commands/replay.py`, as every command body is; the cog keeps the declaration,
+the decorators and the `except` that renders the failure embed. It reuses
 `--now`'s skeleton — neutralize the prefetch, front-insert, stop the live song,
-let the loop's ordinary dequeue do the rest — and differs in these decided ways.
+let the loop's ordinary dequeue do the rest — and differs in four decided ways.
 
 - **The interrupted play keeps its own history entry.** `--now` suppresses the
   parked fragment's entry via `_skip_history_for` because its resume tail spans the
