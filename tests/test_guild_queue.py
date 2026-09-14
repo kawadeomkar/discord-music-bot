@@ -18,6 +18,7 @@ from src.guild_queue import (
     _to_entry,
     _LREM_MAX_ENTRIES,
     _LREM_MAX_SHARE,
+    _PUT_CHUNK,
     GuildQueue,
     RemoveMode,
     ShuffleOutcome,
@@ -179,6 +180,63 @@ class TestPut:
         store.push_queue = spy_single
         await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)], batch=True)
         assert recorded == ["batch:2"]
+
+    async def test_a_large_batch_is_pushed_in_chunks_that_yield(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Each chunk is its own round trip, so other coroutines run between them —
+        every guild's song handoff and Now Playing edit included — and the list
+        still ends up whole and in order."""
+        monkeypatch.setattr("src.guild_queue._PUT_CHUNK", 3)
+        sizes: list[int] = []
+        original = store.push_queue_batch
+
+        async def spy(entries: Any) -> bool:
+            sizes.append(len(entries))
+            return await original(entries)
+
+        store.push_queue_batch = spy
+        ticks = 0
+
+        async def _tick() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(_tick())
+        await asyncio.sleep(0)
+        started = ticks
+        try:
+            await gq.put([_qobj(n, mock_author) for n in range(8)], batch=True)
+        finally:
+            ticker.cancel()
+        assert sizes == [3, 3, 2]
+        assert ticks - started >= 2
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_failed_chunk_stops_the_rest_and_marks_the_mirror(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """What landed is a prefix of the list; the flag makes the next enqueue or
+        song start rebuild it rather than append to a list of the wrong shape."""
+        calls = 0
+
+        async def fail_second(entries: Any) -> bool:
+            del entries
+            nonlocal calls
+            calls += 1
+            return calls != 2
+
+        store.push_queue_batch = fail_second
+        await gq.put([_qobj(n, mock_author) for n in range(_PUT_CHUNK * 3)], batch=True)
+        assert calls == 2
+        assert gq.mirror_dirty
 
     async def test_non_batch_pushes_per_item(
         self,

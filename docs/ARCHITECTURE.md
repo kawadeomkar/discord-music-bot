@@ -22,6 +22,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
    - [Now Playing Host Model](#now-playing-host-model)
+   - [Queue progress card](#queue-progress-card)
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
    - [Crash Recovery](#crash-recovery)
@@ -40,6 +41,8 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
 15. [Subsystem Invariants](#subsystem-invariants)
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
+    - [Spotify playlist paging](#spotify-playlist-paging)
+    - [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
@@ -370,10 +373,13 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 **Extraction pool** (`ytdlp_pool.py`, instantiated in `youtube.py`):
 
 ```python
-ytdlp_pool = YtdlpPool()   # max_workers from YTDLP_POOL_WORKERS, default 4
+ytdlp_pool = YtdlpPool(progress_sink=lambda message: _publish_progress(message))
+#                      max_workers from YTDLP_POOL_WORKERS, default 4
 ```
 
 Extraction runs in **worker processes**, not threads: JSON parsing, signature decryption and format selection are GIL-bound Python, so threads would contend for the GIL and steal time from the event loop serving voice heartbeats.
+
+The sink is the opt-in half: a pool built with one carries a second queue and a thread draining it, so a worker can report progress while `extract_info` is still running (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). Built without one, neither exists.
 
 `YtdlpPool` owns the lifecycle and nothing else — the callable is passed per call (`ytdlp_pool.run(_ytdlp_extract, ...)`), which is what keeps it free of yt-dlp knowledge and keeps `patch("src.youtube._ytdlp_extract")` working in tests. Lifecycle: created lazily (so importing the module never spawns children), prewarmed from `setup_hook`, rebuilt once if a worker dies (`BrokenProcessPool`), and closed from `close()` via `aclose()`, which bounds the join at 10 s. A submit after close raises `PoolClosedError` rather than silently spawning a pool nothing would join.
 
@@ -638,13 +644,19 @@ On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases n
 
 `pool_slot` is typed as `AbstractAsyncContextManager` rather than `asyncio.Semaphore` throughout `src/youtube.py`, so the slot can carry the deadline without that module learning anything about guilds. A resolve reached outside a command still passes `None`.
 
+**One guild's exhausted budget is never another's.** `ResolveWaitExpired` is a `util.PoolSlotUnavailable`, the contract between whoever owns a slot and the extraction that holds one: the bound belongs to the CALLER that supplied the slot, never to the shared job that caller happened to start. `_extract_once` single-flights on the URL and the key carries no guild, so publishing a leader's expired wait to its joiners would fail another guild's song — including the playback loop's own in-band resolve, which supplies no slot at all. A joiner that sees it re-elects instead, and retires the failed job at that point rather than leaving it to the job's done callback: that runs through `call_soon`, and a caller joining an already-failed job never suspends, so it would read the same job straight back and spin.
+
 #### Saying so while it waits
 
-`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands. It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
+`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands or the request is dropped (see [Queue progress card](#queue-progress-card)). It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
 
 No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
 
-It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits its poster, and an await between the teardown decision and the hold release is exactly what that path may not have.
+It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. Bypassing it also skips debug-mode decoration, so the footer arrives pre-rendered as `debug_suffix`, like the dashboards'. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits a Discord call, and an await between the teardown decision and the hold release is exactly what that path may not have.
+
+**Single tracks only, and one per channel.** A collection shows the [queue progress card](#queue-progress-card) instead — two messages for one `-play` is worse than either — and both entry points take the same `if`, the interjection route included. Because `PLAY_INFLIGHT_MAX` is 16 and `PLAY_RESOLVE_CONCURRENCY` guarantees the tail of a pasted burst crosses the delay, `util.channel_claim` gives a channel to one notice at a time. The claim is exclusive and keyed by KIND (a channel showing a card can still show a notice for a different request), and it is taken at the SEND, so a request that settles inside its own delay never denies the slot to a slow sibling. A request that loses the claim asks again every `_NOTICE_RETRY_SECS` until it settles, so its notice posts once the other is taken back; each notice names its query and its requester, so the one on screen is never mistaken for someone else's. The span records `play.slow_notice` (`shown`, `claimed_elsewhere`, `send_failed`).
+
+**The task that posts it is the task that retracts it**, in its own `finally`. A caller cancelled while the send is in flight never learns the message handle, so a delete anywhere else would leave the notice standing with nothing that knows its id. The caller only signals and joins, through `util.join_task`, which re-raises a cancellation aimed at the caller and shields the joined task: `await task` makes the joined task the canceller's `_fut_waiter`, so an unshielded join would cancel the very task it is waiting out, mid-cleanup.
 
 ---
 
@@ -652,7 +664,7 @@ It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` tak
 
 `yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
 
-It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
+It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v2:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
 
 **Fifteen minutes, not the source cache's day.** A playlist is editable, and its entry count and order are what the callers' `&index=` handling and every "Queued playlist — N songs" line are built from. What the window has to cover is the two cases that actually hurt: the same collection pasted twice in a burst, and a re-paste soon after.
 
@@ -662,6 +674,8 @@ It now goes through `_extract_once` under the `"playlist"` profile and caches th
 
 **An empty result is not cached.** A private or unavailable playlist extracts to no entries too, and a quarter of an hour is a long time to answer a retry with the same nothing.
 
+**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key carries a `v2` because this changed what an entry holds: an unversioned key would serve a pre-dedupe Mix for its remaining TTL.
+
 ---
 
 ### Warming the stream cache
@@ -669,6 +683,8 @@ It now goes through `_extract_once` under the `"playlist"` profile and caches th
 A full Phase 1 extraction yields a selected stream URL alongside the identity, and that URL is worth caching — but only once it has been **probed**, which is a network round trip bounded by `_STREAM_PROBE_TIMEOUT` (2 s). The reply needs the identity alone, so `yt_source` **starts** the probe-and-cache and returns without awaiting it (`_start_stream_warm`). Every link's `-play` gets its confirmation that much sooner.
 
 **The warm is registered, not fired blindly.** `_INFLIGHT_STREAM_WARMS` holds the job under its cache key, and every reader of that cache goes through `_stream_cache_get`, which joins a warm in flight rather than treating the miss as a miss. Without that join the enqueue-time `prefetch_stream` — spawned by `queue_put` moments later — would find nothing and pay a **second full extraction** of the URL the warm is about to write, and a cold start's playback loop would do the same on its way to audio. The join is shielded: the warm is shared, and a cancelled prefetch (every bulk queue mutation cancels one) must leave it running for whoever else is waiting.
+
+**It runs under a span of its own**, `ytdl.stream_warm`, a child of the resolve that started it. The resolve returns without awaiting it, so its span has ended by the time the probe answers, and an ended span drops every attribute written to it — the serving format and the probe verdict among them.
 
 **Nobody is obliged to await it**, so the done-callback retrieves any exception itself and logs it. An unretrieved one would surface at collection time in a task with no caller left to name. The callback also pops the key before any joiner resumes, so a later miss starts a fresh warm instead of joining a settled one — the same ordering `_extract_once` depends on.
 
@@ -835,6 +851,44 @@ is opt-in per guild and off by default.
 
 ---
 
+### Queue progress card
+
+A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card in the channel saying how far it has got (`src/queue_progress.py`). It is deleted the moment the enqueue lands, or the moment `-stop`, `-clear`, `-remove` or a teardown drops the request.
+
+**A drop is heard mid-resolve.** Those commands stamp `PlayRequest.dropped_by`, and `place()` reads the stamp only once the resolve returns — about 90 s after the stamp for a 5,547-track playlist. So the stamp also sets `PlayRequest.dropped`, an `asyncio.Event` handed to the card and to the slow-resolve notice, and `retire_player` sets it for every unplaced request on the player it retires (a kick or the alone-watchdog calls no command). The message comes down at once; the resolve itself runs to completion and its result is discarded at `place()`, which is where the "dropped" reply is sent.
+
+**The wait is in the resolve, not in the enqueue.** Measured on a YouTube Mix whose walk yielded 1,671 entries — 492 distinct videos, see [The playlist cache](#the-playlist-cache): 28.98 s of a 29.60 s command is `queue_source`, and the insert is 0.01 s. A bar counting songs added to the queue would sit at 0 for 29 seconds and then jump to 100 % in one frame, which is worse than no bar. So the card reports the resolve, and its numbers come from the source walking its own pages.
+
+**Two phases, because the others are unreachable.** `FETCHING`, and `STALLED` once the card passes `QUEUE_PROGRESS_MAX_SECS`. A "queued" or "done" render would exist for less than a frame — the insert is 0.01 s and the card is deleted immediately after — and every failure path deletes the card before anything could render one.
+
+**Where the numbers come from.** A Spotify collection is easy: the pager reads `total` from page 1 and reports after every page, so its bar is determinate from the first tick. A YouTube collection has no such channel — `YTDL.yt_playlist` awaits one `extract_info` that returns after the whole continuation walk, so the track count and the tracks would arrive in the same tick, milliseconds before the card is deleted. It gets one built for it (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). A collection with no header count at all — a Mix (`RD…`, other than a curated `RDCLAK5uy_` list), a channel tab — still renders indeterminate: an elapsed line rounded to 5 s and no bar. That is a steady state, not a transient one.
+
+**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null and ID-less entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
+
+**The card is a SECOND message and never becomes the confirmation.** `play_pipeline._reply` sends the confirmation through `MusicContext.send`, which prepends the Now Playing block and adopts that message as the NP host. A card sent with `ctx.channel.send` — which it must be, or the progress updater rewrites it every 3 s — can never do that, so merging the two would stop every playlist enqueue from re-hosting the NP card at the channel bottom. The cost of not merging is that the existing host sits *above* the card, edited invisibly, for the card's whole life: one of the documented exceptions to the host model, listed under [Now Playing host invariants](#now-playing-host-invariants), bounded by the delete, and NOT by the ceiling below — that stops the card EDITING, it does not take it down, so a resolve that outlives it leaves the host buried until the enqueue finally settles.
+
+**Two entry points.** `commands/play.py::_resolve_and_place` covers `-play`, `-playnext` and the cold start; `play_pipeline.interject_flow` covers `-playnow <playlist>` and plain `-play <playlist>` over a paused song, which return one level above `_resolve_and_place` and would otherwise get nothing. Only the first has a playback gate hold, so only the first is subject to the ordering rule below.
+
+**Ordering, at the first entry point.** The card is entered on the outer `AsyncExitStack` **before** the gate hold, so LIFO unwinds it after: taking the card back awaits a Discord call, and on a cold start no await may sit between `abandon_cold_start`'s hold-count read and the hold's release, or two participants each read the other's hold and neither tears the player down.
+
+**The driver is stopped by a signal and awaited, never cancelled.** The send is deferred past the delay, so it is owned by a task — the command body is blocked inside `queue_source` and cannot wait it out. That task both sends and then edits, so there is a recurring window in which the message exists on Discord and the local handle does not; cancelling inside it orphans the card permanently, because the teardown reads `None` and deletes nothing while the POST lands anyway. So the task that sent the card deletes it in its own `finally`, and the teardown sets the settled signal and joins the task, bounded by `QUEUE_PROGRESS_JOIN_SECS`. The delete suppresses `HTTPException` — it runs while an `ExtractionError` may be propagating, and a 404 about a card the user deleted must not replace the real error.
+
+**Nothing edits under the place lock.** `PlayRegistry.place()`'s body is the put alone, bounded by `PLACE_TIMEOUT_SECS`; the card's state object takes a plain attribute store and the driver renders on its own cadence.
+
+**The edit budget is per channel.** Discord allows 5 edits / 5 s per channel and every `PATCH /channels/{cid}/messages/{mid}` there shares one bucket, which the NP progress bar already spends a third of at its 3 s cadence. A 429 never reaches `safe_edit` — `HTTPClient.request` logs it and sleeps the bucket internally — so the symptom is the NP bar silently freezing, invisible in our logs. Three things keep the card inside the budget:
+
+- `QUEUE_PROGRESS_TICK_SECS` defaults to **5.0 s** with its own floor of 2.0 s, not the dashboards' 0.05 s: `-ping` and `-debug` can share that floor because their deadlines cap the damage at ~8 edits, and this card has no such cap.
+- **One card per channel.** `PLAY_INFLIGHT_MAX` is 16 and requests resolve concurrently, so a pasted burst would otherwise arm sixteen edit loops on one bucket. `PLAY_RESOLVE_CONCURRENCY` cannot throttle them — it is taken inside `_extract_once`, below where the card is entered, so requests 3..16 park there and are *guaranteed* to cross the display threshold. The claim is taken when a card is about to be sent rather than at entry, so a cache hit that finished inside the delay never denies the slot to a slow sibling. A request that loses it asks again every tick, so its card appears once the other is taken back rather than never. The span records `play.progress_card` (`shown`, `claimed_elsewhere`, `stalled`, `send_failed`), and a stall also logs a WARNING with the counts it reached.
+- **The count is quantized to the bar's cells.** The bar is the Now Playing bar (`util.progress_line`), labelled `` `done` … `total` songs `` where the NP card puts clock times. A Spotify page landing every ~300 ms moves the raw count six times per tick, so `embeds_changed` would suppress nothing. The number rendered is the smallest count that fills the cells the bar draws, so the two never disagree and a whole enqueue costs at most `BAR_WIDTH` edits. This is also why a determinate card shows no elapsed line: the elapsed step moves every tick by construction, which would undo the quantization and put the card back to one edit per tick.
+
+**What the card does NOT fix is the composite.** Card + NP bar is 0.2/s + 0.333/s, comfortably inside the 1.0/s the bucket allows. Add a `-debug` at its 1 s tick and the channel is at **1.533/s — 7.67 edits per 5 s against 5**, for the dashboard's whole 8 s deadline. That overlap is already 33 % over budget on `main` without the card, so the card worsens an existing problem rather than creating one; the honest statement is that the per-feature budgets hold and the composite does not, and the thing that gives way is the NP bar, silently. Anyone adding a fifth edit loop to a channel should fix the composite rather than size against the remainder.
+
+**The card owns its own deadline.** Nothing else bounds the work it watches: `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a resolve slot and deliberately not the extraction inside it, `PLACE_TIMEOUT_SECS` bounds 0.01 s of a 29 s command, and yt-dlp's own `socket_timeout` × `retries` lets a single page hold 300 s with no aggregate bound across 56 of them. Past `QUEUE_PROGRESS_MAX_SECS` the card renders its terminal state once and stops editing; the exit stack still deletes it when the enqueue finally settles.
+
+**The typing indicator keeps running under it.** `background_typing` is refcounted per channel, so suppressing it for a collection would drop it for every other `-play` in flight there.
+
+---
+
 ### Pause / Resume
 
 `-pause` / `-resume` funnel through single entry points on `MusicPlayer` so no call site can forget a side effect:
@@ -980,7 +1034,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist:v2:{id}` | String | JSON array of track titles | 1 h (user-editable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1302,7 +1356,7 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
+| `playlist(id)` | `spotify:playlist:v2:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -1766,6 +1820,44 @@ format requires a token, so it costs nothing while `visionos` is healthy; YouTub
 PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
 provisioned ahead of enforcement rather than after it.
 
+### Spotify playlist paging
+
+`playlist()` follows the API's `next` cursor to the end. That turns one request per playlist into up to a hundred, so three things bound what it can cost.
+
+**The walk is bounded twice.** `_PLAYLIST_PAGE_TIMEOUT_SECS` (20 s) covers one request, which is the thing that can hang — `_HTTP_TIMEOUT` does not reach a page spending three 429 retries at up to `_MAX_RETRY_AFTER_SECS` each. Neither bound is allowed to cut a 429 sleep short: the walk hands `http_call` the earlier of the two as a `deadline`, and a retry that would sleep past it raises `SpotifyRateLimitError` at once. Expired, either bound would raise `SpotifyPlaylistTooSlowError`, whose advice for a stalled page is to try again — the one thing a rate limit must never be answered with, since the retry re-sends every request that earned the 429. `_PLAYLIST_WALK_TIMEOUT_SECS` (120 s) covers the whole walk and is sized against the WORK: `_MAX_PLAYLIST_PAGES` is derived from Spotify's own 10,000-item ceiling, so the budget allows ~1.2 s a page where a healthy call is ~0.2 s. A single bound could not tell a stalled request from a large playlist, and only one of those is worth retrying — `SpotifyPlaylistTooSlowError.whole_walk` is which deadline expired.
+
+**The pages are issued sequentially, and that is a choice.** `total` is known after page 1, so pages 2..N could go out together. They do not: a walk already meets Spotify's per-application rate limiter a hundred times more often than a track lookup did, and the 120 s budget absorbs about one fully-retried page. Concurrency would spend exactly the thing that is scarce. If this ever needs to be faster, raise the budget before adding parallelism.
+
+**Two process-wide bounds, not per guild**, because the limiter is per application. `_playlist_slot()` (2, rebuilt per event loop) caps concurrent walks, and the wait for it is bounded by `PLAY_RESOLVE_WAIT_SECS` — the walk budget starts only once the slot is held, so without that bound a small playlist behind two 10,000-track walks waits minutes having sent nothing, and it answers `SpotifyBusyError` instead. `_INFLIGHT_PLAYLISTS` single-flights on the cache key, so N users pasting one link is one walk rather than N identical hundred-request ones. `PLAY_RESOLVE_CONCURRENCY` covers neither — it guards yt-dlp workers, and a Spotify walk holds none. The slot is taken INSIDE the single flight, around the requests alone, for the reason `_extract_once` takes its pool slot there: a joiner issues no request and must not queue for a slot it will not use.
+
+**The walk belongs to no caller.** Every caller awaiting it — the one that started it and every joiner — subscribes to `_PLAYLIST_SUBSCRIBERS` under the cache key for as long as it waits, and each page's report goes to all of them, so a second guild's card moves with the walk it joined. The cache write is the job's own, after the walk: a caller cancelled mid-walk (a `-stop`) neither takes the walk from the others, which await it through `asyncio.shield`, nor throws away a hundred requests nobody is left to cache.
+
+**A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
+
+**A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
+
+### Progress out of a yt-dlp worker
+
+A YouTube playlist resolve is one `extract_info` call in a pool worker that returns once, after every continuation page has been fetched. The queue-progress card needs increments before then, so there is a second worker queue beside the log one.
+
+**`lazy_playlist: True` is what makes the hook a stream rather than a burst.** Without it `YoutubeDL.py:2100` runs `entries = resolved_entries = list(entries)` — every continuation page fetched — before the per-entry loop at `:2144` begins, so the loop is pure CPU and the hook fires in one ~50 ms burst after the 29 s of network is over. A bar driven from that sits at 0 for the whole fetch and then jumps to 100 % in one tick, which is the failure the card exists to avoid. Under `lazy` the loop iterates the live generator and drives the fetches itself. It also removes a second call site: `utils/_utils.py:2491` is gated on `not lazy_playlist`, so the callback goes from 2N+1 calls per playlist to N+1 (measured: 9 calls for 4 entries without it, 5 with).
+
+**The hook is `match_filter`, and it MUST return `None` on every path.** `_match_entry` tests `if reason is not None` (`YoutubeDL.py:1664`), so any other value — `""` and `0` included — silently drops that entry: measured on a 4-entry playlist, `return ""` kept 0 of 4 while the command still reported success, and `return 0` raises a bare `TypeError` at `:1666` that is not a `YoutubeDLError` and so is never classified. Worse, `match_filter` is also called once at `:2088` with the playlist infodict, where a non-`None` return makes `__process_playlist` return with the *entire playlist* gone. So `_count_entry` has exactly one unconditional `return None` and no conditional return paths, and its tests assert `is None` — `assert not ret` passes while every song is gone.
+
+**The index is the progress value.** Of the three sites `_match_entry` is reachable from, only `:2161` carries `playlist_index`, so reading it rather than counting calls is what stops a naive counter reporting 3,343/1,671. The `:2088` call has no index and carries `playlist_count`, which `_tab.py:793` read off page 1 — that is the first message and the only way the total reaches the parent before the walk ends.
+
+**Everything the callback does is wrapped, and the wrap logs.** yt-dlp does not wrap `match_filter`, so a `queue.Full`, a closed queue or a `BrokenPipeError` would escape `extract_info` as a `RemoteCallError` and tell the user the playlist could not be fetched. The opposite failure is silent: `YoutubeDL.py:1625-1628` catches a `TypeError` from the callback and substitutes `None` "for backward compatibility", so a signature mismatch or a bad argument vanishes into a card that never moves. Hence the warning.
+
+**Messages are absolute, never deltas.** The parent takes `max()`, so a dropped message self-corrects on the next one and a `BrokenProcessPool` heal — which re-runs the extraction from entry 0 — is idempotent rather than reporting 2×N. Entries are coalesced one message per 25 in the worker; the bar has ten cells, so at 1,671 tracks one cell is 167 entries.
+
+**The queue is bounded, drained on a thread, and stopped after the workers are gone.** `multiprocessing.Queue()` defaults to `maxsize=0`, which sizes its semaphore at `SEM_VALUE_MAX` (32,767): 30,000 `put_nowait` calls raised no `Full` at all, so the drop-on-full this design relies on would never happen and the worker would buffer without bound instead. The parent drains on a thread like the log `QueueListener` — `get_nowait` measured at 38.4 µs/op and a playlist's messages arrive in a burst, which on the event loop delays every other guild's Now Playing edit and the playback loop's song handoff. Two shutdown rules are load-bearing, both the reverse of the tempting order: the worker calls `cancel_join_thread()` (at worker exit `Queue._finalize_join` joins the feeder thread, which is blocked in `send_bytes` once the parent stops reading, so the worker cannot exit and shutdown burns its full 10 s timeout), and the drain stops **after** the join rather than before. Stopping is a flag the drain polls, not a sentinel message: after `terminate_workers()` the queue's `_wlock` is a POSIX semaphore a worker SIGTERMed mid-write never released.
+
+**Progress is keyed on the extraction, not the requester.** `_extract_once` single-flights on the URL, so the second caller of one playlist issues no `ExtractRequest` and would otherwise watch a frozen card beside a moving one. `_PROGRESS_SUBSCRIBERS` maps the inflight key to every callback watching it. A message from a superseded extraction of the same playlist can still arrive; counts are absolute and readers take `max()`, so the worst it does is run the bar slightly ahead.
+
+**`process=False` was considered and rejected.** It returns the extractor's raw `ie_result` (`YoutubeDL.py:1886-1890`), whose `entries` is a live generator the worker could iterate with no `match_filter` at all — and therefore none of the drop-an-entry failure mode above. The reason it loses is blast radius: the worker would have to reproduce what `__process_playlist` does (the `orderedSet` dedup at `:2093`, `playlist_items` selection, null handling, the per-entry normalisation that fills `thumbnail` and `duration`) and would return a differently shaped dict, so `_playlist_tracks`, the `ytdl:playlist:` cache format and the error classification would all need re-verifying against a shape no test in this repo can produce — the suite's autouse fixture runs extraction on a thread pool and never calls yt-dlp for real. `match_filter` changes nothing about what `extract_info` returns; its one new failure mode is a return value, which an unconditional `return None` and a test asserting `is None` close completely.
+
+**What the suite cannot see, and why.** `[tool.coverage.run]` is `branch = true` with `source = ["src"]` and no `concurrency = "multiprocessing"`, so lines executed in a worker earn zero coverage. The autouse `use_thread_ytdlp_pool` fixture supplies its own `executor_factory`, so `_worker_init` never runs and **nothing is pickled** — an unpicklable callback would pass `just check` and break only inside a container, which is why `_count_entry` is module-level with the request id bound by `functools.partial`, and why one test pickles that partial directly. "Extracted count == input count" needs yt-dlp's real `_match_entry` loop and has no offline form; the callable is covered directly for every entry shape, and one real round trip through the progress queue sits beside `tests/test_ytdlp_pool.py`'s spawned-worker tests.
+
 ### yt-dlp process boundary
 
 Four things cross into the worker processes, each with its own contract:
@@ -1852,6 +1944,19 @@ awaiting a commit-time LPOP. Delete the branch as "unreachable" and that path si
 eats the new head.
 
 ### Now Playing host invariants
+
+**Four sends are exceptions to the host model**, for two distinct reasons. A message
+an edit LOOP owns must not be the host, or the progress updater rewrites it every 3s:
+that covers `-ping`, `-debug` and the queue-progress card, all three through
+`dashboard.LiveMessage`. A message we DELETE must not be the host either, or the
+retraction drags the live bar onto a message that is about to vanish: that covers
+`play_placement.slow_resolve_notice`. All four send with `ctx.channel.send` rather
+than `MusicContext.send`, so they neither carry an NP block nor retire the current
+host, which stays above them — edited invisibly — until the next ordinary `ctx.send`
+adopts a new one. They also miss debug-mode decoration, which is why all four are
+handed a pre-rendered `debug_suffix`. Add a fifth and it belongs
+in this list, in CLAUDE.md's host section, and on whichever of the two reasons it
+takes.
 
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the
 pointer swap is synchronous, retirement is fire-and-forget under `_np_edit_lock`.

@@ -14,7 +14,7 @@ import discord
 import fakeredis
 import pytest
 
-from src import play_pipeline
+from src import play_pipeline, util
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -82,6 +82,34 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def no_leaked_progress_subscribers() -> Iterator[None]:
+    """Assert every progress subscription was released, then clear.
+
+    Same shape as the channel claim below: module state whose leak is silent. A
+    stranded subscriber keeps receiving a later extraction's counts and moves a
+    card nobody is looking at. One test asserted the dict empty; every other one
+    could leave it dirty."""
+    yield
+    leaked = {k: len(v) for k, v in youtube_mod._PROGRESS_SUBSCRIBERS.items() if v}
+    youtube_mod._PROGRESS_SUBSCRIBERS.clear()
+    assert not leaked, f"progress subscribers not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_channel_claims() -> Iterator[None]:
+    """Assert every per-channel claim was released, then clear.
+
+    Process-wide state, like _TYPING_HOLDS: a leaked channel id silently
+    suppresses that kind of message in that channel for the life of the process,
+    and only an assertion can tell a released claim from a cleared one. Cleared
+    before the assert so one leak cannot cascade into every later test."""
+    yield
+    leaked = {k: set(v) for k, v in util._CLAIMED_CHANNELS.items() if v}
+    util._CLAIMED_CHANNELS.clear()
+    assert not leaked, f"channel claims not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
 def reset_probe_streak() -> Iterator[None]:
     """Zero the process-wide unconfirmed-probe streak between tests.
 
@@ -100,6 +128,20 @@ def reset_probe_streak() -> Iterator[None]:
     yield
     youtube._INFLIGHT_EXTRACTS.clear()
     youtube._unconfirmed_streak = 0
+
+
+@pytest.fixture(autouse=True)
+def reset_spotify_walks() -> Iterator[None]:
+    """The Spotify walk registry holds futures bound to the loop that created them,
+    as _INFLIGHT_EXTRACTS does, and a left subscriber would feed a later test's
+    card from an earlier test's walk."""
+    import src.spotify as spotify
+
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
+    yield
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
 
 
 @pytest.fixture(autouse=True)

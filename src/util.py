@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import re
 from typing import Any, Final, Optional
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
 
 import discord
 import structlog
@@ -11,6 +11,15 @@ from opentelemetry.trace import Span, SpanContext, StatusCode, get_current_span
 from opentelemetry.trace.propagation.tracecontext import (
     TraceContextTextMapPropagator,
 )
+
+
+# (done_so_far, total_if_known) — what a long resolve reports as it walks. `done`
+# is ABSOLUTE, never a delta, so a dropped report self-corrects on the next one.
+# MAY BE CALLED OFF THE EVENT LOOP: Spotify calls it on the loop, the yt-dlp
+# transport from YtdlpPool's drain thread, so an implementation must be
+# synchronous and non-blocking. Declared here because spotify.py and youtube.py
+# know nothing about guilds and must not import what renders it.
+ProgressFn = Callable[[int, Optional[int]], None]
 
 
 # Discord's embed field-value cap; it rejects the WHOLE send past it.
@@ -91,6 +100,44 @@ async def cancel_task(task: Optional[asyncio.Task]) -> None:
                 raise
 
 
+async def set_within(event: asyncio.Event, secs: float) -> bool:
+    """True when `event` was set inside `secs`. A cancellation aimed at this
+    coroutine still propagates — asyncio.timeout only converts its own."""
+    try:
+        async with asyncio.timeout(secs):
+            await event.wait()
+    except TimeoutError:
+        return False
+    return True
+
+
+async def set_when_set(source: asyncio.Event, target: asyncio.Event) -> None:
+    """Set `target` once `source` is set. Run as a task and cancelled by its
+    owner; it holds nothing, so an unawaited cancel is enough."""
+    await source.wait()
+    target.set()
+
+
+async def join_task(task: asyncio.Task[Any]) -> None:
+    """Wait out a task that was told to stop by a SIGNAL rather than cancelled,
+    swallowing what it raises — never this coroutine's own cancellation, for the
+    reason cancel_task spells out. Cancelling instead would orphan whatever the
+    task cleans up in its own finally.
+
+    Shielded, because a bare `await task` is itself a cancellation vector into
+    that task: Task.cancel() cancels whatever the task is waiting ON, and
+    awaiting a task directly makes it the _fut_waiter. So a caller cancelled
+    here would cancel the very task it is waiting out, mid-cleanup."""
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception as e:
+        log.warning(f"joined background task failed: {e!r}")
+
+
 def spawn_background(
     coro: Coroutine[Any, Any, Any], tasks: set[asyncio.Task[Any]]
 ) -> asyncio.Task[Any]:
@@ -109,6 +156,45 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
     # CancelledError would mark the task completed and stall a shutdown here.
     except Exception:
         pass  # cosmetic — never let typing failures surface
+
+
+class PoolSlotUnavailable(Exception):
+    """A `pool_slot` context manager could not be entered in time.
+
+    The contract between whoever owns a slot and the extraction that holds one.
+    The bound belongs to the CALLER that supplied the slot, never to the shared
+    job that caller happened to start, so the extraction single-flight re-elects
+    a leader on this rather than failing every joiner: a joiner holds no worker
+    of its own, and may have supplied no slot at all.
+    See docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
+
+
+# One transient message per channel per KIND, exclusive: a card and a
+# slow-resolve notice are different kinds and coexist, but sixteen cards do not.
+# PLAY_INFLIGHT_MAX is 16 and requests resolve concurrently, and discord.py
+# sleeps a throttled channel bucket internally — so the cost lands on the
+# confirmations, not here. See docs/ARCHITECTURE.md#queue-progress-card.
+_CLAIMED_CHANNELS: dict[str, set[int]] = {}
+
+
+@contextlib.contextmanager
+def channel_claim(kind: str, channel_id: int) -> Iterator[bool]:
+    """Take exclusive use of a channel for one kind of transient message.
+
+    Yields False when another holder has it, and then holds nothing: the loser
+    says nothing rather than queueing behind the winner, because two identical
+    messages tell the user less than one. Claim at the moment of SENDING, never
+    at entry — a request that settles inside its own delay never sends, and must
+    not hold the slot a slow sibling needs."""
+    held = _CLAIMED_CHANNELS.setdefault(kind, set())
+    claimed = channel_id not in held
+    if claimed:
+        held.add(channel_id)
+    try:
+        yield claimed
+    finally:
+        if claimed:
+            held.discard(channel_id)
 
 
 # Refcounted per channel: concurrent -play requests enter this once per link, and
@@ -227,6 +313,47 @@ def fmt_duration(secs: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# Square emoji blocks: the done portion renders in a different colour from the
+# remainder. Width is low because each block glyph is much wider than a dash.
+# Public, because the queue-progress card quantizes its count against it.
+BAR_WIDTH = 10
+_BAR_FILL_DONE = "🟦"
+_BAR_FILL_REMAINING = "⬜"
+_BAR_HEAD = "🔘"
+
+
+def progress_bar(ratio: float, *, width: int = BAR_WIDTH) -> str:
+    """The glyph run for a ratio, clamped to 0..1: filled cells, then a head marking
+    the position reached, then what remains. A width of 0 renders nothing."""
+    if width <= 0:
+        return ""
+    ratio = max(0.0, min(1.0, ratio))
+    # One short of the end, so the head has a cell at 100% and never renders with
+    # filled cells behind it.
+    filled = min(width - 1, int(ratio * width))
+    return (
+        _BAR_FILL_DONE * filled + _BAR_HEAD + _BAR_FILL_REMAINING * (width - filled - 1)
+    )
+
+
+def progress_line(
+    position: float,
+    total: float,
+    *,
+    label: Callable[[float], str],
+    width: int = BAR_WIDTH,
+) -> str:
+    """`label(position)` <bar> `label(total)` — the Now Playing bar, for anything
+    with a position and a known end. The position is clamped to 0..total before it
+    is labelled, so the left label never reads past the right one. "" without a
+    positive total."""
+    if total <= 0:
+        return ""
+    position = max(0.0, min(position, total))
+    bar = progress_bar(position / total, width=width)
+    return f"`{label(position)}` {bar} `{label(total)}`"
+
+
 def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
     """The noun form matching `count`: pluralize(1, "song") → "song",
     pluralize(3, "song") → "songs". `plural` overrides the default `+ "s"`."""
@@ -265,6 +392,16 @@ def safe_label(text: str, limit: int) -> str:
     clipped = truncate(flattened, limit)
     neutralized = clipped.replace("[", "(").replace("]", ")").replace("`", "'")
     return discord.utils.escape_markdown(neutralized, ignore_links=False)
+
+
+def verbatim_code(text: str, limit: int) -> Optional[str]:
+    """`text` as an inline code span a user can copy back exactly, or None when no
+    span can hold it: past `limit`, or carrying a backtick or a control character.
+    Unescaped because Discord shows a code span's content literally, so
+    safe_label's backslashes would be copied along with the text."""
+    if len(text) > limit or "`" in text or _LABEL_UNSAFE.search(text):
+        return None
+    return f"`{text}`"
 
 
 def truncate(text: str, limit: int) -> str:

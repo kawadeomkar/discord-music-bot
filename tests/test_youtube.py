@@ -1,6 +1,7 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import pathlib
 import contextlib
 import logging
 import redis.asyncio as aioredis
@@ -18,14 +19,19 @@ import aiohttp
 import discord
 import orjson
 from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from yarl import URL
 import pytest
 from redis.asyncio import Redis
 from yt_dlp.utils import DownloadError, UnsupportedError
 
+from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
 from src.guild_state import Analytics
 from src import youtube
+from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -44,6 +50,7 @@ from src.youtube import (
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
+    _playlist_tracks,
     _record_serving_format,
     _run_extract,
     ExtractRequest,
@@ -64,7 +71,7 @@ from src.youtube import (
     YTDLVideoInfo,
     YTDLVideoMetadata,
 )
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, settle
 
 # Ask-time analytics for direct yt_source/yt_playlist calls — the command paths
 # mint this at dispatch; both params are REQUIRED so a call site cannot forget.
@@ -626,13 +633,12 @@ class TestYTSource:
         failure) is re-raised untouched as the classified ExtractionError — only a
         genuine UnsupportedError is remapped to the friendly message. _command_error
         renders the ExtractionError via its user_message."""
-        from src.youtube import ExtractionError
 
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.side_effect = DownloadError(
                 "ERROR: unable to download webpage"
             )
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 await YTDL.yt_source(
                     mock_ctx.author,
                     "ytsearch:test",
@@ -989,6 +995,61 @@ class TestExtractSingleflight:
         assert not joiner.cancelled()
         assert result == {"title": "shared"}
 
+    # A joiner that re-reads a job that already failed never suspends, so a
+    # regression spins the loop, which only pytest-timeout can interrupt.
+    @pytest.mark.timeout(10)
+    async def test_a_leaders_exhausted_slot_does_not_fail_its_joiners(
+        self,
+    ) -> None:
+        """The key carries no guild, so the leader's guild budget is routinely not
+        the joiner's. A joiner holds no worker and may hold no slot at all — the
+        playback loop's own in-band resolve passes None — so inheriting the
+        leader's refusal is one guild's paste burst killing another guild's song
+        while every worker sits idle."""
+        from src.youtube import _extract_once
+
+        blocked = asyncio.Event()
+        # Held until the joiners are parked on the leader's job: failing sooner,
+        # the first joiner finds an empty registry and simply leads.
+        expire = asyncio.Event()
+        calls: list[int] = []
+
+        class _FullSlot:
+            async def __aenter__(self) -> None:
+                blocked.set()
+                await expire.wait()
+                raise ResolveWaitExpired
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        async def _extract(_request: Any) -> dict[str, Any]:
+            calls.append(1)
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            leader = asyncio.create_task(
+                _extract_once("k", MagicMock(), pool_slot=_FullSlot())
+            )
+            async with asyncio.timeout(2):
+                await blocked.wait()
+            # Three, not one: with a single joiner, re-electing every joiner in
+            # turn and re-electing one are the same count.
+            joiners = [
+                asyncio.create_task(_extract_once("k", MagicMock())) for _ in range(3)
+            ]
+            await settle()
+            expire.set()
+            with pytest.raises(ResolveWaitExpired):
+                await leader
+            async with asyncio.timeout(2):
+                results = await asyncio.gather(*joiners)
+            assert results == [{"title": "shared"}] * 3
+
+        # The leader never reached yt-dlp, so the one re-elected joiner is the only
+        # extraction that ran, and the other two joined it.
+        assert calls == [1]
+
     async def test_an_abandoned_job_still_answers_the_callers_that_stayed(
         self,
     ) -> None:
@@ -1038,9 +1099,9 @@ class TestExtractSingleflight:
             joiner = asyncio.create_task(_extract_once("k", MagicMock()))
             await asyncio.sleep(0)
             gate.set()
-            with pytest.raises(ExtractionError):
+            with pytest.raises(youtube.ExtractionError):
                 await joiner
-            with pytest.raises(ExtractionError):
+            with pytest.raises(youtube.ExtractionError):
                 await leader
 
     async def test_identical_concurrent_queries_extract_once(self) -> None:
@@ -1085,7 +1146,7 @@ class TestExtractSingleflight:
 
         with patch("src.youtube._run_extract", new=_boom):
             for _ in range(2):
-                with pytest.raises(ExtractionError):
+                with pytest.raises(youtube.ExtractionError):
                     await _extract_once("k", MagicMock())
 
         assert calls == 2
@@ -1247,6 +1308,63 @@ class TestYTSourceUnifiedExtraction:
         cached = orjson.loads(stream_entry)
         assert cached["url"] == fake_data["url"]
         assert cached["title"] == "Test Song"
+
+    @pytest.mark.parametrize("flat", [False, True], ids=["full", "flat"])
+    async def test_a_search_with_no_video_is_refused_and_not_cached(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, flat: bool
+    ) -> None:
+        """A search whose extraction holds no video hands back its wrapper, whose
+        webpage_url is the `ytsearch:` string. Cached as a song, every play of it
+        fails for 24h and blames YouTube's stream (seen live)."""
+        wrapper = {
+            "_type": "playlist",
+            "webpage_url": "ytsearch:Fantasy Snow Strippers",
+            "title": "Fantasy Snow Strippers",
+            "entries": [],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=wrapper):
+            with pytest.raises(youtube.ExtractionError) as excinfo:
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "ytsearch:Fantasy Snow Strippers",
+                    redis=fake_redis,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                    flat=flat,
+                )
+
+        assert "playable" in excinfo.value.user_message
+        assert await fake_redis.keys("ytdl:source:*") == []
+        await _settle_stream_warms()
+        assert await fake_redis.keys("ytdl:stream:*") == []
+
+    def test_a_wrapper_with_no_video_has_no_first_entry(self) -> None:
+        """Every caller reads None as "nothing usable"; the wrapper itself would be
+        a song whose page URL is the search string."""
+        wrapper: Any = {
+            "webpage_url": "ytsearch:x",
+            "entries": [None, {"_type": "playlist"}],
+        }
+        assert youtube._first_video_entry(wrapper) is None
+        video: Any = {"webpage_url": "https://www.youtube.com/watch?v=a"}
+        assert youtube._first_video_entry(video) is video
+
+    async def test_an_entry_without_a_page_url_is_refused(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        fake_data = _fake_ytdl_data(webpage_url="ytsearch:odd")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            with pytest.raises(youtube.ExtractionError):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "odd",
+                    redis=fake_redis,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+        assert await fake_redis.keys("ytdl:source:*") == []
 
     async def test_stream_cache_hit_for_prefetch_after_yt_source(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3042,6 +3160,40 @@ class TestTheStreamWarmIsSharedNotAwaited:
             assert await prefetch is True
         mock_extract.assert_not_called()
 
+    async def test_the_warm_records_onto_a_span_that_is_still_open(
+        self, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """yt_source does not await the warm, so the resolve's span has ended by
+        the time the probe answers, and an ended span drops the serving format and
+        the probe verdict (103 warnings in one day of production logs)."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        release = asyncio.Event()
+
+        async def _slow_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _slow_probe
+        data = cast(Any, _fake_ytdl_data(webpage_url="https://yt.com/v=spanned"))
+        with patch.object(youtube, "_tracer", tracer):
+            with tracer.start_as_current_span("ytdl.yt_source"):
+                warm = youtube._start_stream_warm(
+                    fake_redis, "ytdl:stream:https://yt.com/v=spanned", data
+                )
+            release.set()
+            assert await warm is True
+
+        spans = {span.name: span for span in exporter.get_finished_spans()}
+        assert "ytdl.stream_probe" not in (spans["ytdl.yt_source"].attributes or {})
+        warm_span = spans["ytdl.stream_warm"]
+        assert (warm_span.attributes or {})["ytdl.stream_probe"] == "playable"
+        resolve_context = spans["ytdl.yt_source"].context
+        assert warm_span.parent is not None and resolve_context is not None
+        assert warm_span.parent.span_id == resolve_context.span_id
+
     async def test_a_cancelled_joiner_leaves_the_warm_running(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
@@ -3389,6 +3541,154 @@ class TestYtPlaylistEntries:
         assert qobj.title == "Song live"
 
 
+class TestCacheWritability:
+    def test_an_unwritable_cache_directory_is_named_at_startup(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A volume created root-owned stays root-owned for uid 10001: seen live,
+        with yt-dlp's own PermissionError the only trace, once per store."""
+        sigfuncs = tmp_path / "yt-dlp" / "youtube-sigfuncs"
+        sigfuncs.mkdir(parents=True)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            youtube.os, "access", lambda path, _mode: path != str(sigfuncs)
+        )
+
+        with caplog.at_level(logging.WARNING):
+            youtube.warn_if_cache_unwritable()
+
+        assert "not writable" in caplog.text
+        assert "youtube-sigfuncs" in caplog.text
+
+    def test_a_writable_or_absent_cache_says_nothing(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        with caplog.at_level(logging.WARNING):
+            youtube.warn_if_cache_unwritable()
+            (tmp_path / "yt-dlp").mkdir()
+            youtube.warn_if_cache_unwritable()
+        assert "not writable" not in caplog.text
+
+
+class TestMixRepeats:
+    """yt-dlp walks a Mix one window at a time and can yield a video it already
+    yielded: one walk returned 1,671 entries for 492 videos. A Mix keeps each video
+    once; a playlist keeps what its owner put there."""
+
+    @staticmethod
+    def _entries(*ids: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": video_id,
+                "title": f"Song {video_id}",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": 100,
+            }
+            for video_id in ids
+        ]
+
+    @staticmethod
+    def _urls(queued: list[QueueObject]) -> list[str]:
+        return [q.webpage_url.rsplit("=", 1)[1] for q in queued]
+
+    async def _fetch(
+        self,
+        ctx: MagicMock,
+        list_id: str,
+        ids: tuple[str, ...],
+        redis: Optional[aioredis.Redis] = None,
+    ) -> list[QueueObject]:
+        url = f"https://www.youtube.com/watch?v={ids[0]}&list={list_id}"
+        data = {"_type": "playlist", "id": list_id, "entries": self._entries(*ids)}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            return await YTDL.yt_playlist(
+                url,
+                ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=url,
+                redis=redis,
+            )
+
+    @pytest.mark.parametrize("list_id", ["RDa", "RDAMVMa"])
+    async def test_a_mix_keeps_each_video_once_in_first_seen_order(
+        self, mock_ctx: MagicMock, list_id: str
+    ) -> None:
+        """RDAMVM is the same Mix reached through YouTube Music."""
+        queued = await self._fetch(mock_ctx, list_id, ("a", "b", "c", "a", "b", "d"))
+        assert self._urls(queued) == ["a", "b", "c", "d"]
+        # Positions come from the kept tracks, so a dropped repeat leaves no gap.
+        assert [q.analytics.queue_position for q in queued] == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("list_id", ["PLmine", "RDCLAK5uy_kmPRjHDECIcuVwnKsx2Ng"])
+    async def test_a_playlist_keeps_a_video_its_owner_added_twice(
+        self, mock_ctx: MagicMock, list_id: str
+    ) -> None:
+        """A curated RDCLAK5uy_ list shares the Mix prefix and is a playlist: the tab
+        extractor walks it with a header count and never repeats itself."""
+        queued = await self._fetch(mock_ctx, list_id, ("a", "b", "a"))
+        assert self._urls(queued) == ["a", "b", "a"]
+
+    async def test_the_cache_holds_the_mix_without_its_repeats(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Deduplicated before the write, so a paste inside the window does not
+        bring the repeats back."""
+        await self._fetch(mock_ctx, "RDa", ("a", "b", "a"), fake_redis)
+        with patch("src.youtube._ytdlp_extract") as extract:
+            url = "https://www.youtube.com/watch?v=a&list=RDa"
+            again = await YTDL.yt_playlist(
+                url,
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=url,
+                redis=fake_redis,
+            )
+        extract.assert_not_called()
+        assert self._urls(again) == ["a", "b"]
+
+    def test_the_repeat_count_rides_the_span(self) -> None:
+        """The walk's own size and what was queued disagree for a repeating Mix,
+        and the trace is where that has to be visible. A real span, never a patched
+        get_current_span: that function is OpenTelemetry's global, and the log line
+        beside the attribute reads it too."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        url = "https://www.youtube.com/watch?v=a&list=RDa"
+        with tracer.start_as_current_span("unique"):
+            _playlist_tracks(
+                cast(Any, {"id": "RDa", "entries": self._entries("a", "b")}), url
+            )
+        with tracer.start_as_current_span("repeats"):
+            tracks = _playlist_tracks(
+                cast(Any, {"id": "RDa", "entries": self._entries("a", "a", "b", "a")}),
+                url,
+            )
+        with tracer.start_as_current_span("kept"):
+            kept = _playlist_tracks(
+                cast(Any, {"id": "PLx", "entries": self._entries("a", "a")}), url
+            )
+        unique, repeats, owned = exporter.get_finished_spans()
+        assert len(tracks) == 2
+        assert "ytdl.playlist_repeats" not in (unique.attributes or {})
+        assert (repeats.attributes or {})["ytdl.playlist_repeats"] == 2
+        assert (repeats.attributes or {})["ytdl.playlist_repeats_dropped"] is True
+        # A playlist's repeats are counted and kept.
+        assert len(kept) == 2
+        assert (owned.attributes or {})["ytdl.playlist_repeats"] == 1
+        assert (owned.attributes or {})["ytdl.playlist_repeats_dropped"] is False
+
+
 class TestPlaylistCache:
     """The most expensive resolve in the system, cached and single-flighted. The
     entry list is stored; the requester, analytics and user_input are per request."""
@@ -3435,7 +3735,7 @@ class TestPlaylistCache:
         assert mock_extract.call_count == 1
         assert [q.webpage_url for q in first] == [q.webpage_url for q in second]
         assert [q.title for q in second] == ["Song a1", "Song a2"]
-        assert await fake_redis.ttl("ytdl:playlist:PLcache") == _YT_PLAYLIST_TTL
+        assert await fake_redis.ttl("ytdl:playlist:v2:PLcache") == _YT_PLAYLIST_TTL
 
     async def test_every_entry_point_to_one_collection_shares_the_entry(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3457,11 +3757,11 @@ class TestPlaylistCache:
             )
 
         assert mock_extract.call_count == 1
-        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:PLsame"]
+        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:v2:PLsame"]
 
     def test_a_url_with_no_list_id_keys_on_itself(self) -> None:
         assert youtube._playlist_cache_key("https://sc.com/set/x") == (
-            "ytdl:playlist:https://sc.com/set/x"
+            "ytdl:playlist:v2:https://sc.com/set/x"
         )
 
     async def test_two_users_pasting_one_collection_run_one_extraction(
@@ -3736,14 +4036,14 @@ class TestExtractionErrorClassification:
             )
 
     def test_downloaderror_is_reclassified_with_its_fields_mined(self) -> None:
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         real_error = self._real_downloaderror()
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = real_error
 
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
 
         err = caught.value
@@ -3800,7 +4100,7 @@ class TestExtractionErrorClassification:
         inner error so the flag survives the (otherwise unpicklable) boundary."""
         import sys
 
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         try:
             raise UnsupportedError("https://example.com/not-media")
@@ -3810,19 +4110,19 @@ class TestExtractionErrorClassification:
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = wrapped
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is True
 
     def test_non_unsupported_error_is_not_flagged_unsupported(self) -> None:
         """A garden-variety DownloadError (network failure, video unavailable) must
         classify with unsupported=False — only genuine UnsupportedError sets it."""
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = self._real_downloaderror()
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is False
 
@@ -4252,3 +4552,467 @@ class TestTheProbeTargetIsEncodedOnlyWhenItIsAlreadyValid:
 
         assert " " not in str(_probe_target("https://host.example/a b/c"))
         assert str(_probe_target("https://host.example/\u00fcni")).isascii()
+
+
+class _FakeProgressQueue:
+    """Stands in for the worker's multiprocessing.Queue."""
+
+    def __init__(self, error: Optional[Exception] = None) -> None:
+        self.puts: list[Any] = []
+        self._error = error
+
+    def put_nowait(self, item: Any) -> None:
+        if self._error is not None:
+            raise self._error
+        self.puts.append(item)
+
+
+@pytest.fixture
+def worker_queue(monkeypatch: pytest.MonkeyPatch) -> _FakeProgressQueue:
+    queue = _FakeProgressQueue()
+    monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", queue)
+    return queue
+
+
+class TestCountEntry:
+    """yt-dlp's match_filter, as a progress hook.
+
+    The failure to pin hardest: a return value that is not None makes yt-dlp SKIP
+    that entry — falsy values included, because _match_entry tests `is not None`
+    (YoutubeDL.py:1664). Measured on a 4-entry playlist: `return ""` kept 0 of 4
+    while the command still reported success. Every assertion here is `is None`;
+    `assert not ret` passes while every song is silently gone.
+    """
+
+    @pytest.mark.parametrize(
+        "info",
+        [
+            {},
+            {"_type": "url", "url": "https://yt.com/v=1", "playlist_index": 1},
+            {"id": "abc", "title": "T", "playlist_index": 40},
+            {"playlist_count": 1671, "playlist": "Mix"},
+            {"playlist_index": None},
+        ],
+        ids=["empty", "flat-entry", "counted-entry", "playlist-infodict", "no-index"],
+    )
+    def test_it_returns_none_for_every_entry_shape(
+        self, info: dict[str, Any], worker_queue: _FakeProgressQueue
+    ) -> None:
+        assert youtube._count_entry("rid", info, incomplete=True) is None
+
+    def test_the_playlist_infodict_carries_the_header_count(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """YoutubeDL.py:2088, once, before any entry. It is the only way the count
+        _tab.py:793 read off page 1 reaches the parent before the walk ends — the
+        pool future does not return until every continuation has been fetched."""
+        youtube._count_entry("rid", {"playlist_count": 1671}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, 1671)]
+
+    def test_a_collection_with_no_header_count_reports_none(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """Mixes, radio lists and channel tabs have no count at all, so `total is
+        None` is a supported steady state rather than a transient one."""
+        youtube._count_entry("rid", {"playlist": "Mix"}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, None)]
+
+    def test_only_every_nth_entry_is_reported(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """The bar has ten cells, so at 1,671 tracks one cell is 167 entries and
+        nothing on screen can tell 25 from 1 — while the queue's _wlock is shared
+        across workers and one write per entry is 1,671 of them."""
+        for index in range(1, 76):
+            youtube._count_entry("rid", {"playlist_index": index}, incomplete=True)
+
+        assert worker_queue.puts == [
+            ("rid", 25, None),
+            ("rid", 50, None),
+            ("rid", 75, None),
+        ]
+
+    def test_the_index_is_the_progress_value_not_a_call_count(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """_match_entry is reachable from three sites for one playlist, and only
+        :2161 carries an index. Reading the index rather than counting calls is
+        what keeps a naive counter from reporting 3,343/1,671."""
+        youtube._count_entry("rid", {"playlist_index": 100}, incomplete=True)
+        youtube._count_entry("rid", {"playlist_index": 100}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 100, None), ("rid", 100, None)]
+
+    def test_a_zero_entry_playlist_counts_zero(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        youtube._count_entry("rid", {"playlist_count": 0}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, 0)]
+
+    def test_a_queue_that_raises_still_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """yt-dlp does not wrap match_filter, so a queue.Full or a closed queue
+        would escape extract_info as a RemoteCallError and tell the user the
+        playlist could not be fetched — by a progress bug."""
+        monkeypatch.setattr(
+            ytdlp_pool_module, "_PROGRESS_Q", _FakeProgressQueue(RuntimeError("full"))
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert (
+                youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True)
+                is None
+            )
+
+        assert "progress queue put failed" in caplog.text
+        assert "RuntimeError('full')" in caplog.text
+
+    def test_a_wedged_queue_warns_once_not_once_per_entry(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A queue whose write lock died with a worker fails every later put of
+        the walk — ~220 puts for one large playlist."""
+        wedged = _FakeProgressQueue(RuntimeError("full"))
+        monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", wedged)
+
+        with caplog.at_level(logging.WARNING):
+            for index in (25, 50, 75):
+                youtube._count_entry("rid", {"playlist_index": index}, incomplete=True)
+            monkeypatch.setattr(
+                ytdlp_pool_module, "_PROGRESS_Q", _FakeProgressQueue(RuntimeError("x"))
+            )
+            youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True)
+
+        # One for the wedged queue, one for the next generation's.
+        assert caplog.text.count("progress queue put failed") == 2
+
+    def test_without_a_queue_it_is_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The suite's autouse fixture supplies its own executor_factory, so
+        _worker_init never runs and the global is never set."""
+        monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", None)
+
+        assert (
+            youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True) is None
+        )
+
+
+class TestPlaylistOpts:
+    def test_without_a_card_the_shared_constant_is_handed_through_untouched(
+        self,
+    ) -> None:
+        """No card watching, no behaviour change: the extraction is byte-for-byte
+        what it has always been."""
+        assert youtube._playlist_opts(None) is youtube._YTDL_PLAYLIST_OPTS
+
+    def test_with_a_card_it_is_a_copy_carrying_the_streaming_hook(self) -> None:
+        opts = youtube._playlist_opts("rid")
+
+        assert opts is not youtube._YTDL_PLAYLIST_OPTS
+        assert opts["lazy_playlist"] is True
+        assert callable(opts["match_filter"])
+        # The constant is a module-level shared dict: mutating it would leak one
+        # guild's callback into another guild's extraction.
+        assert "match_filter" not in youtube._YTDL_PLAYLIST_OPTS
+        assert "lazy_playlist" not in youtube._YTDL_PLAYLIST_OPTS
+
+    def test_lazy_playlist_is_required_not_optional(self) -> None:
+        """Without it YoutubeDL.py:2100 materialises the generator — every
+        continuation page fetched — before the per-entry loop runs, so the hook
+        fires in one burst after the network is over and the bar jumps 0 to 100%
+        in a single frame. It also removes the second, indexless call site."""
+        assert youtube._playlist_opts("rid").get("lazy_playlist") is True
+
+    def test_none_of_the_flags_that_fight_lazy_are_set(self) -> None:
+        """playlistreverse/playlistrandom warn under lazy, and 'playlist-index' in
+        compat_opts changes indexing. Re-check this if the opts profile grows."""
+        opts = youtube._playlist_opts("rid")
+        assert not opts.get("playlistreverse")
+        assert not opts.get("playlistrandom")
+        assert "playlist-index" not in (opts.get("compat_opts") or ())
+
+    def test_the_callback_survives_pickling(self) -> None:
+        """Nothing in the suite pickles — the autouse fixture runs extraction on a
+        thread pool — so an unpicklable callable (a lambda, a closure, a bound
+        method) would pass `just check` and break only inside a container."""
+        restored = pickle.loads(
+            pickle.dumps(youtube._playlist_opts("rid")["match_filter"])
+        )
+
+        assert restored.func is youtube._count_entry
+        assert restored.args == ("rid",)
+
+
+class TestProgressSubscription:
+    """Progress is keyed on the EXTRACTION, not the requester: _extract_once
+    single-flights on the URL, so the second caller of one playlist issues no
+    request of its own and would otherwise watch a frozen card beside a moving
+    one — identical inputs, opposite experience."""
+
+    def test_every_card_on_one_extraction_gets_the_report(self) -> None:
+        first: list[Any] = []
+        second: list[Any] = []
+
+        with (
+            youtube._progress_subscription("key", lambda d, t: first.append((d, t))),
+            youtube._progress_subscription("key", lambda d, t: second.append((d, t))),
+        ):
+            youtube._publish_progress(("key", 25, 1671))
+
+        assert first == [(25, 1671)] == second
+
+    def test_leaving_unsubscribes_and_the_registry_empties(self) -> None:
+        seen: list[Any] = []
+        with youtube._progress_subscription("key", lambda d, t: seen.append(d)):
+            pass
+
+        youtube._publish_progress(("key", 25, None))
+
+        assert seen == []
+        assert "key" not in youtube._PROGRESS_SUBSCRIBERS
+
+    def test_one_failing_subscriber_does_not_stop_the_others(self) -> None:
+        seen: list[Any] = []
+
+        def _boom(done: int, total: Optional[int]) -> None:
+            raise RuntimeError("card is gone")
+
+        with (
+            youtube._progress_subscription("key", _boom),
+            youtube._progress_subscription("key", lambda d, t: seen.append(d)),
+        ):
+            youtube._publish_progress(("key", 7, None))
+
+        assert seen == [7]
+
+    def test_a_malformed_message_is_dropped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            youtube._publish_progress("not a tuple")
+            youtube._publish_progress(("key", 1))
+
+        assert caplog.text.count("malformed progress message") == 2
+
+    def test_a_message_for_nobody_is_dropped(self) -> None:
+        youtube._publish_progress(("nobody", 1, None))
+
+
+class TestYtPlaylistProgress:
+    async def test_the_worker_key_and_the_subscription_key_are_the_same(
+        self, mock_author: MagicMock
+    ) -> None:
+        """The whole phase-3 chain in one assertion. The key the opts hand the
+        worker through match_filter and the key the card subscribes under are
+        minted separately, so a mismatch is silent: extraction succeeds, the
+        playlist queues, and the bar never moves."""
+        seen: list[tuple[int, Optional[int]]] = []
+
+        async def _extract(request: Any) -> dict[str, Any]:
+            # What the worker would carry: _count_entry is armed with the key.
+            request_id = request.opts["match_filter"].args[0]
+            youtube._publish_progress((request_id, 7, 100))
+            return {"entries": []}
+
+        with patch.object(youtube, "_run_extract", new=_extract):
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PLkeymatch",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PLkeymatch",
+                on_progress=lambda done, total: seen.append((done, total)),
+            )
+
+        assert seen == [(7, 100)]
+
+    def test_count_entry_through_a_real_youtubedl(self) -> None:
+        """The two load-bearing facts live only in comments citing yt-dlp line
+        numbers, and both are silent when wrong: a non-None return drops entries,
+        and the per-entry site fires only for an entry check_filter() calls
+        is_single_video. Driven through the real YoutubeDL, offline."""
+        from yt_dlp import YoutubeDL
+
+        published: list[tuple[str, int, Optional[int]]] = []
+
+        class _Q:
+            def put_nowait(self, message: Any) -> None:
+                published.append(message)
+
+        entries = [
+            {
+                "_type": "url",
+                # ie_key selects the extractor check_filter asks, and the URL is
+                # what it parses. An eleven-char id, or _VALID_URL rejects it.
+                "ie_key": "Youtube",
+                "id": "abcdefghijk",
+                "url": "https://www.youtube.com/watch?v=abcdefghijk",
+                "title": f"T{n}",
+            }
+            for n in range(60)
+        ]
+        playlist: Any = {
+            "_type": "playlist",
+            "id": "PLreal",
+            "title": "Real",
+            "entries": entries,
+            "playlist_count": 60,
+            "extractor": "youtube:tab",
+            "extractor_key": "YoutubeTab",
+            "webpage_url": "https://www.youtube.com/playlist?list=PLreal",
+        }
+
+        with patch.object(
+            ytdlp_pool_module, "worker_progress_queue", return_value=_Q()
+        ):
+            # Any at the yt-dlp boundary, like every other call into it here.
+            opts: Any = {
+                **youtube._playlist_opts("rid"),
+                "quiet": True,
+                "extract_flat": True,
+            }
+            with YoutubeDL(opts) as ydl:
+                result: Any = ydl.process_ie_result(playlist, download=False)
+
+        # Nothing was dropped: a non-None return would silently eat entries, and
+        # a non-None at the PLAYLIST-level call eats the whole playlist.
+        assert len(result["entries"]) == 60
+        # The header count arrives first, indexless, before any entry.
+        assert published[0] == ("rid", 0, 60)
+        # Then every _PROGRESS_EVERY-th index, in walk order.
+        assert [d for _, d, _ in published[1:]] == [25, 50]
+
+    def test_the_per_entry_hook_needs_a_video_shaped_id(self) -> None:
+        """is_single_video parses the id against _VALID_URL, so an entry shape
+        yt-dlp stops recognising zeroes the bar with extraction still green. This
+        is the failure mode; the test above is the working one."""
+        from yt_dlp import YoutubeDL
+
+        published: list[Any] = []
+
+        class _Q:
+            def put_nowait(self, message: Any) -> None:
+                published.append(message)
+
+        entries = [
+            {
+                "_type": "url",
+                "ie_key": "Youtube",
+                "id": "short",
+                "url": "https://x/y",
+                "title": f"T{n}",
+            }
+            for n in range(60)
+        ]
+        playlist: Any = {
+            "_type": "playlist",
+            "id": "PLshort",
+            "entries": entries,
+            "extractor": "youtube:tab",
+            "extractor_key": "YoutubeTab",
+            "webpage_url": "https://www.youtube.com/playlist?list=PLshort",
+        }
+        with patch.object(
+            ytdlp_pool_module, "worker_progress_queue", return_value=_Q()
+        ):
+            # Any at the yt-dlp boundary, like every other call into it here.
+            opts: Any = {
+                **youtube._playlist_opts("rid"),
+                "quiet": True,
+                "extract_flat": True,
+            }
+            with YoutubeDL(opts) as ydl:
+                result: Any = ydl.process_ie_result(playlist, download=False)
+
+        assert len(result["entries"]) == 60  # still all queued
+        assert [d for _, d, _ in published[1:]] == []  # and no per-entry report
+
+    async def test_a_subscriber_leaving_mid_publish_does_not_break_the_rest(
+        self,
+    ) -> None:
+        """_publish_progress runs on the drain thread and the subscriber list is
+        mutated from the event loop, so it iterates a copy."""
+        seen: list[int] = []
+        first_report: list[Any] = []
+
+        def _leaver(done: int, _total: Optional[int]) -> None:
+            youtube._PROGRESS_SUBSCRIBERS["k"].remove(first_report[0])
+
+        def _stayer(done: int, _total: Optional[int]) -> None:
+            seen.append(done)
+
+        first_report.append(_leaver)
+        with youtube._progress_subscription("k", _leaver):
+            with youtube._progress_subscription("k", _stayer):
+                youtube._publish_progress(("k", 3, 9))
+        assert seen == [3]
+
+    def test_a_malformed_request_id_is_refused(self) -> None:
+        """The guard has to cover the LOOKUP, not just the unpack: an unhashable
+        id raises TypeError out of dict.get, on the drain thread, where it kills
+        progress for the life of the executor."""
+        youtube._publish_progress(([], 1, 2))
+        youtube._publish_progress(("only-two", 1))
+
+    def test_the_module_pool_is_built_with_a_progress_sink(self) -> None:
+        """Asserted against the source, because the autouse seam swaps the pool
+        for a thread-backed one before any test sees it. Without the sink the
+        worker's queue is drained into nothing and every bar is indeterminate."""
+        import ast
+
+        tree = ast.parse(pathlib.Path(youtube.__file__).read_text())
+        calls = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "ytdlp_pool" for t in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+        ]
+        assert calls, "module-level ytdlp_pool assignment not found"
+        assert any(kw.arg == "progress_sink" for kw in calls[0].keywords)
+
+    async def test_no_card_means_the_extraction_is_unchanged(
+        self, mock_author: MagicMock
+    ) -> None:
+        with patch.object(
+            youtube, "_extract_once", new=AsyncMock(return_value={"entries": []})
+        ) as extract:
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PL1",
+            )
+
+        opts = extract.call_args.args[1].opts
+        assert opts is youtube._YTDL_PLAYLIST_OPTS
+
+    async def test_a_card_arms_the_hook_and_subscribes_to_it(
+        self, mock_author: MagicMock
+    ) -> None:
+        seen: list[Any] = []
+
+        async def _extract(key: str, request: Any, **_: Any) -> dict[str, Any]:
+            # The worker's messages, replayed from where the drain thread would.
+            youtube._publish_progress((key, 0, 1671))
+            youtube._publish_progress((key, 25, None))
+            return {"entries": []}
+
+        with patch.object(youtube, "_extract_once", new=_extract):
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PL1",
+                on_progress=lambda d, t: seen.append((d, t)),
+            )
+
+        assert seen == [(0, 1671), (25, None)]
+        assert youtube._PROGRESS_SUBSCRIBERS == {}

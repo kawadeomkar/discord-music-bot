@@ -1,8 +1,12 @@
 """Tests for the -play pipeline (src/play_pipeline.py)."""
 
+import ast
+import asyncio
+import pathlib
 import contextlib
+import inspect
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -19,13 +23,16 @@ from src.play_placement import (
     ResolveMode,
     resolve_mode_for,
 )
+from src.guild_queue import RemoveMode, remove_matcher
 from src.play_pipeline import (
     EmptyPlaylistError,
     PlaylistIndexError,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
     _rebase_positions,
+    collection_note,
 )
+from src.util import ECHO_MAX
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -281,6 +288,122 @@ class TestEnqueuePlaylist:
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Queued playlist" in embed.title
         assert "Song A" in embed.description
+
+    async def test_a_spotify_playlist_says_how_many_it_queued(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The card shows ten titles and an ellipsis whatever the size, so the
+        count is the only thing that tells 300 songs from 12 — and it is the only
+        place a user can see that a playlist over 100 tracks no longer stops
+        there. The YouTube branch has always said it."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(300)]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        assert "300 songs" in mock_ctx.send.call_args[1]["embed"].title
+
+    async def test_one_queued_song_is_not_pluralized(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=["Song A"]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        assert "1 song" in mock_ctx.send.call_args[1]["embed"].title
+        assert "1 songs" not in mock_ctx.send.call_args[1]["embed"].title
+
+    async def test_a_long_playlist_confirmation_ends_in_the_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """queue_message appends its "..." only while `len(lines) < len(songs)`,
+        so handing it exactly ten silently drops the one thing that says there
+        are more. Both branches slice; both must slice to eleven."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(300)]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        description = mock_ctx.send.call_args[1]["embed"].description
+        assert "..." in description
+        assert "Song 9" in description and "Song 10" not in description
+
+    async def test_a_short_playlist_confirmation_does_not(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(3)]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        assert "..." not in mock_ctx.send.call_args[1]["embed"].description
+
+    async def test_only_the_shown_titles_are_escaped(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """safe_label over all 10,000 titles to render ten measured 53ms of
+        uninterrupted event-loop time, right before the place lock. Counting the
+        calls is the only way to see it: the embed is identical either way."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+        seen: list[str] = []
+
+        def _spy(text: str, width: int) -> str:
+            seen.append(text)
+            return text
+
+        with patch.object(play_pipeline, "safe_label", side_effect=_spy):
+            await play_pipeline.enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(500)]),
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                cog=music_bot,
+            )
+
+        # Eleven, not five hundred: ten rendered plus the one that only exists
+        # so queue_message knows there are more.
+        assert len(seen) == 11
 
     async def test_spotify_calls_queue_put_with_prefetch_false(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1248,6 +1371,7 @@ class TestSpotifyDisabled:
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
             redis=music_bot.redis,
+            on_progress=None,
             pool_slot=None,
         )
         assert result == ResolvedYoutubePlaylist(tracks=fake_qobjs)
@@ -1303,6 +1427,7 @@ class TestSpotifyDisabled:
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
             redis=music_bot.redis,
+            on_progress=None,
             pool_slot=None,
         )
 
@@ -1620,3 +1745,144 @@ class TestTheResumeNoticeDescribesARestoredQueue:
         )
 
         mp.build_resume_notice_embed.assert_called_once()
+
+
+class TestSpanDecoratorsNameTheirOwnFunction:
+    """`bot.queue_source` once decorated `plays_after_note`, a microsecond string
+    helper inserted directly beneath it, while the 29s resolve it was written for
+    emitted no span at all. A decorator naming one function and sitting on another
+    is invisible to every behavioural test, so it is asserted from the source."""
+
+    # Every module that decorates a function with a span name. The bug is not
+    # specific to play_pipeline — it is what a same-signature insert above a
+    # decorated function does anywhere — so the guard covers all of them.
+    _MODULES = (
+        "src/play_pipeline.py",
+        "src/play_placement.py",
+        "src/musicplayer.py",
+        "src/queue_progress.py",
+        "src/youtube.py",
+        "src/spotify.py",
+    )
+
+    @staticmethod
+    def _decorations(source: Optional[str] = None) -> list[tuple[str, str]]:
+        """(span name, decorated function) for every tracer decorator in a module."""
+        tree = ast.parse(
+            source if source is not None else inspect.getsource(play_pipeline)
+        )
+        found: list[tuple[str, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                called = decorator.func
+                if (
+                    not isinstance(called, ast.Attribute)
+                    or called.attr != "start_as_current_span"
+                ):
+                    continue
+                (name,) = decorator.args
+                assert isinstance(name, ast.Constant)
+                span_name = name.value
+                assert isinstance(span_name, str)
+                found.append((span_name, node.name))
+        return found
+
+    def test_the_resolve_is_the_one_bot_queue_source_wraps(self) -> None:
+        assert ("bot.queue_source", "queue_source") in self._decorations()
+
+    def test_every_span_name_matches_the_function_under_it(self) -> None:
+        decorations = self._decorations()
+        assert len(decorations) >= 5
+        for span_name, func_name in decorations:
+            assert span_name == f"bot.{func_name.lstrip('_')}"
+
+    def test_no_module_decorates_a_function_it_does_not_name(self) -> None:
+        """Same rule, every module. The prefix differs per module — `bot.`,
+        `player.`, `spotify.` — and a tail may abbreviate (`player.prefetch` over
+        `_prefetch_next_song`), so what is asserted is that one NAMES the other:
+        either is a substring of the other. `bot.queue_source` sitting on
+        `plays_after_note`, the bug this encodes, shares nothing either way."""
+        checked = 0
+        for path in self._MODULES:
+            for span_name, func_name in self._decorations(
+                pathlib.Path(path).read_text()
+            ):
+                checked += 1
+                tail = span_name.split(".")[-1]
+                func = func_name.lstrip("_")
+                assert tail in func or func in tail, (path, span_name, func_name)
+        assert checked >= 10
+
+
+class TestCollectionNote:
+    """The undo a --now playlist offers has to work when copied: -remove compares
+    links literally, and every Mix link carries an underscore in `start_radio`."""
+
+    @staticmethod
+    def _copied(note: str) -> str:
+        return note.split("`-remove ", 1)[1].split("`", 1)[0]
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ&start_radio=1",
+            "https://open.spotify.com/playlist/37i9dQZF1DX*0XUsuxWHRQ",
+            "https://www.youtube.com/playlist?list=PL_a_b~c|d",
+        ],
+    )
+    def test_the_copied_command_removes_the_playlist(
+        self, mock_ctx: MagicMock, url: str
+    ) -> None:
+        note = collection_note(url, 483, head_playing=False)
+        track = QueueObject(
+            "https://www.youtube.com/watch?v=x", "X", mock_ctx.author, user_input=url
+        )
+        assert remove_matcher(self._copied(note))(track) is RemoveMode.ORIGIN
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/" + "a" * ECHO_MAX,
+            "https://example.com/`-skip`",
+            "https://example.com/a\nb",
+        ],
+    )
+    def test_a_link_no_code_span_can_hold_is_named_instead(self, url: str) -> None:
+        note = collection_note(url, 2, head_playing=False)
+        assert "`-remove` followed by the link you pasted" in note
+        assert url not in note
+
+
+class TestSearchesForAPlaylist:
+    async def test_built_a_chunk_per_loop_turn_with_positions_that_count_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A chunk per loop turn, numbering the tracks as one call would."""
+        monkeypatch.setattr(play_pipeline, "_SEARCH_BUILD_CHUNK", 2)
+        ticks = 0
+
+        async def _tick() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(_tick())
+        await asyncio.sleep(0)
+        started = ticks
+        try:
+            tracks = await play_pipeline._searches_for(
+                [f"T{n}" for n in range(5)],
+                analytics=Analytics(queued_at=1.0, queue_position=7),
+                origin="https://open.spotify.com/playlist/x",
+            )
+        finally:
+            ticker.cancel()
+
+        assert [t.analytics.queue_position for t in tracks] == [7, 8, 9, 10, 11]
+        assert [t.ytsearch for t in tracks] == [f"ytsearch:T{n}" for n in range(5)]
+        assert ticks - started >= 2

@@ -60,6 +60,9 @@ from src.musicplayer import MusicPlayer
 from src.spotify import (
     Spotify,
     SpotifyAuthError,
+    SpotifyBusyError,
+    SpotifyPlaylistForbiddenError,
+    SpotifyPlaylistTooSlowError,
     SpotifyRateLimitError,
     SpotifyRequestError,
 )
@@ -460,6 +463,9 @@ class MusicBot(commands.Cog):
                 (
                     ExtractionError,
                     PlaylistInputError,
+                    SpotifyBusyError,
+                    SpotifyPlaylistForbiddenError,
+                    SpotifyPlaylistTooSlowError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
                 ),
@@ -537,12 +543,12 @@ class MusicBot(commands.Cog):
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
-                "Spotify links are matched to YouTube audio one title at a time, so a "
-                "long playlist takes a few seconds to finish queueing. Requests sent "
-                "meanwhile are looked up alongside it and land as each one is ready — "
-                "a `--now` sent behind a long playlist interrupts as soon as its own "
-                "song resolves. `-clear` and `-stop` also drop requests still being "
-                "looked up."
+                "A large playlist or Mix can take from 30 seconds to two minutes to "
+                "read, and shows a live card while it does. Requests sent meanwhile "
+                "are looked up alongside it and land as each one is ready — a "
+                "`--now` sent behind a long playlist interrupts as soon as its own "
+                "song resolves. `-remove <the link>` cancels one still being read; "
+                "`-clear` and `-stop` drop every request still being looked up."
             ),
         },
     )

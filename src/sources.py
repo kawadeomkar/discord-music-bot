@@ -94,6 +94,13 @@ class SpotifyType(Enum):
     PLAYLIST = "playlist"
 
 
+def is_mix(list_id: str) -> bool:
+    """A YouTube Mix, which yt-dlp walks one window at a time. A curated
+    `RDCLAK5uy_` list shares the prefix but has a page and a header count, and the
+    tab extractor walks it without repeating itself."""
+    return list_id.startswith("RD") and not list_id.startswith("RDCLAK5uy_")
+
+
 class YTType(Enum):
     TRACK = "track"
     PLAYLIST = "playlist"

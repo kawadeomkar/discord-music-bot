@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from opentelemetry import trace as trace_api
 
+from src import util
+from tests.helpers import settle
 from src.util import (
+    verbatim_code,
+    BAR_WIDTH,
     FOOTER_LIMIT,
     current_traceparent,
     traceparent_context,
@@ -24,6 +28,8 @@ from src.util import (
     get_logger,
     join_footer,
     pluralize,
+    progress_bar,
+    progress_line,
     queue_message,
 )
 
@@ -534,3 +540,190 @@ class TestTypingKeepaliveCancellation:
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
         assert keepalive.cancelled()
+
+
+class TestJoinTask:
+    """The signal-and-await join. cancel_task has a class for the same contract;
+    this one shipped with both of its exception arms unexecuted."""
+
+    async def test_a_task_that_raises_is_logged_and_swallowed(self) -> None:
+        """A background task's failure must not become the joiner's, which is
+        already unwinding — often inside a finally, often with a real error
+        already propagating."""
+
+        async def _boom() -> None:
+            raise RuntimeError("background boom")
+
+        task = asyncio.create_task(_boom())
+        with patch.object(util.log, "warning") as warned:
+            await util.join_task(task)
+        assert "background boom" in str(warned.call_args)
+
+    async def test_a_task_cancelled_from_elsewhere_is_not_the_joiners_problem(
+        self,
+    ) -> None:
+        """Someone else cancelled the joined task. The joiner was not cancelled,
+        so it carries on: swallowing here is the point of the helper."""
+
+        async def _park() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_park())
+        await asyncio.sleep(0)
+        task.cancel()
+        await util.join_task(task)
+        assert task.cancelled()
+
+    async def test_the_joiners_own_cancellation_is_re_raised(self) -> None:
+        """The other arm, and the one that matters: a joiner that swallows its own
+        cancellation returns normally from a cancelled task, which stalls the
+        shutdown gather that cancelled it."""
+        started = asyncio.Event()
+
+        async def _park() -> None:
+            await asyncio.sleep(3600)
+
+        async def _joiner() -> None:
+            task = asyncio.create_task(_park())
+            started.set()
+            await util.join_task(task)
+
+        joining = asyncio.create_task(_joiner())
+        async with asyncio.timeout(2):
+            await started.wait()
+        await settle()
+        joining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joining
+        assert joining.cancelled()
+
+    async def test_the_joined_task_is_shielded_from_the_joiners_cancellation(
+        self,
+    ) -> None:
+        """Task.cancel() cancels whatever the task is waiting ON, and `await task`
+        makes the joined task the _fut_waiter — so an unshielded join cancels the
+        very task it promises not to cancel, mid-cleanup."""
+        started = asyncio.Event()
+        joined: list[asyncio.Task[None]] = []
+
+        async def _work() -> None:
+            await asyncio.sleep(0.05)
+
+        async def _joiner() -> None:
+            task = asyncio.create_task(_work())
+            joined.append(task)
+            started.set()
+            await util.join_task(task)
+
+        joining = asyncio.create_task(_joiner())
+        async with asyncio.timeout(2):
+            await started.wait()
+        await settle()
+        joining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joining
+        # Finished rather than cancelled: a flag set in a finally runs on either
+        # ending, so only the task's own outcome tells the two apart.
+        async with asyncio.timeout(2):
+            await asyncio.wait(joined)
+        assert not joined[0].cancelled()
+
+
+class TestProgressBar:
+    @pytest.mark.parametrize(
+        "ratio,expected",
+        [
+            (0.0, "🔘" + "⬜" * 9),
+            (0.5, "🟦" * 5 + "🔘" + "⬜" * 4),
+            (11 / 12, "🟦" * 9 + "🔘"),
+            (1.0, "🟦" * 9 + "🔘"),
+        ],
+    )
+    def test_head_reserves_the_last_cell(self, ratio: float, expected: str) -> None:
+        assert progress_bar(ratio) == expected
+
+    @pytest.mark.parametrize("width,expected", [(0, ""), (1, "🔘"), (3, "🟦🟦🔘")])
+    def test_narrow_widths(self, width: int, expected: str) -> None:
+        """width=0 renders rather than raising, and a width of one is the head."""
+        assert progress_bar(1.0, width=width) == expected
+
+    @pytest.mark.parametrize("ratio", [-0.5, 1.5, 12.0])
+    def test_a_ratio_outside_zero_to_one_is_clamped(self, ratio: float) -> None:
+        """A replayed progress stream reports past its own total, and the
+        renderer must not run off the end of the bar."""
+        bar = progress_bar(ratio)
+        assert len(bar) == BAR_WIDTH
+        assert bar in ("🔘" + "⬜" * 9, "🟦" * 9 + "🔘")
+
+    def test_the_default_width_is_the_shared_constant(self) -> None:
+        assert len(progress_bar(0.5)) == BAR_WIDTH
+
+
+def _clock(secs: float) -> str:
+    return fmt_duration(int(secs))
+
+
+def _cells(line: str) -> str:
+    """The glyph run between the two backticked labels."""
+    return line.split("`")[2].strip()
+
+
+class TestProgressLine:
+    """The Now Playing bar's shape, shared by the NP card (clock labels) and the
+    queue-progress card (song counts)."""
+
+    def test_empty_string_without_a_positive_total(self) -> None:
+        assert progress_line(0.0, 0, label=_clock) == ""
+        assert progress_line(10.0, -1, label=_clock) == ""
+
+    def test_labels_both_ends_around_the_bar(self) -> None:
+        assert progress_line(65.0, 200, label=_clock) == (
+            "`1:05` " + progress_bar(65 / 200) + " `3:20`"
+        )
+
+    def test_head_at_start_when_the_position_is_zero(self) -> None:
+        line = progress_line(0.0, 200, label=_clock)
+        assert line.startswith("`0:00`")
+        assert _cells(line) == "🔘" + "⬜" * 9
+
+    def test_head_at_end_when_the_position_equals_the_total(self) -> None:
+        assert _cells(progress_line(200.0, 200, label=_clock)) == "🟦" * 9 + "🔘"
+
+    def test_head_roughly_midpoint_at_half(self) -> None:
+        assert _cells(progress_line(100.0, 200, label=_clock)) == (
+            "🟦" * 5 + "🔘" + "⬜" * 4
+        )
+
+    def test_a_position_past_the_total_is_clamped_bar_and_label(self) -> None:
+        """Imprecise duration metadata plus a -ss start offset can push the raw
+        position past the reported duration; the left label must never read past
+        the right one (e.g. `4:05 … 4:02`)."""
+        line = progress_line(250.0, 200, label=_clock)
+        assert line.startswith("`3:20`")
+        assert "`4:10`" not in line
+        assert _cells(line) == "🟦" * 9 + "🔘"
+
+    def test_a_negative_position_is_clamped_bar_and_label(self) -> None:
+        line = progress_line(-5.0, 200, label=_clock)
+        assert line.startswith("`0:00`")
+        assert _cells(line).startswith("🔘")
+
+    def test_width_is_customizable_and_defaults_to_the_shared_constant(self) -> None:
+        assert len(_cells(progress_line(0.0, 200, label=_clock, width=5))) == 5
+        assert len(_cells(progress_line(0.0, 200, label=_clock))) == BAR_WIDTH
+
+    def test_a_count_label_formats_both_ends(self) -> None:
+        """The queue-progress card's label: nothing clock-shaped leaks in."""
+        assert progress_line(335, 1671, label=lambda n: str(int(n))) == (
+            "`335` " + progress_bar(335 / 1671) + " `1671`"
+        )
+
+
+class TestVerbatimCode:
+    def test_the_text_is_not_escaped(self) -> None:
+        """Discord shows a code span literally, so an escape is copied with it."""
+        assert verbatim_code("a_b*c", 20) == "`a_b*c`"
+
+    @pytest.mark.parametrize("text", ["a`b", "a\nb", "a\x00b", "x" * 21])
+    def test_what_a_span_cannot_hold_is_refused(self, text: str) -> None:
+        assert verbatim_code(text, 20) is None

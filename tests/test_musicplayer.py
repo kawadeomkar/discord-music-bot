@@ -38,9 +38,7 @@ from src import musicplayer
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
-    _BAR_WIDTH,
     _START_WRITE_TIMEOUT,
-    _build_progress_bar,
     _reached_end,
     _fmt_eta,
     _fmt_finish_time,
@@ -49,7 +47,12 @@ from src.musicplayer import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
-from src.util import cancel_task, current_traceparent, fmt_duration, trace_id_of
+from src.util import (
+    cancel_task,
+    current_traceparent,
+    fmt_duration,
+    trace_id_of,
+)
 from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
 
@@ -2339,80 +2342,6 @@ class TestEtaWalkTo:
 
 
 # ── BuildNowPlayingEmbed ──────────────────────────────────────────────────────
-
-
-class TestBuildProgressBar:
-    def test_empty_string_when_duration_unknown(self) -> None:
-        assert _build_progress_bar(0.0, 0) == ""
-        assert _build_progress_bar(10.0, -1) == ""
-
-    def test_head_at_start_when_elapsed_zero(self) -> None:
-        bar = _build_progress_bar(0.0, 200, width=10)
-        assert bar.count("🔘") == 1
-        # head is the first bar character after the leading `elapsed` code span
-        assert "`0:00`" in bar
-
-    def test_head_at_end_when_elapsed_equals_duration(self) -> None:
-        bar = _build_progress_bar(200.0, 200, width=10)
-        assert bar.count("🔘") == 1
-        # clamped to width - 1: fully "done" up to the head, nothing remaining
-        assert bar.count("🟦") == 9
-        assert bar.count("⬜") == 0
-
-    def test_head_roughly_midpoint_at_half_duration(self) -> None:
-        bar = _build_progress_bar(100.0, 200, width=10)
-        # head_pos = int(0.5 * 10) = 5 done blocks before the head, 4 remaining after
-        middle = bar.split("`")[2]  # text between the two backtick-wrapped times
-        head_index = middle.index("🔘")
-        assert middle[:head_index].count("🟦") == 5
-        assert middle[head_index + 1 :].count("⬜") == 4
-
-    def test_clamped_when_elapsed_exceeds_duration(self) -> None:
-        """Involuntary drift (e.g. a stale duration_secs) must not overflow the bar."""
-        bar = _build_progress_bar(500.0, 200, width=10)
-        assert bar.count("🔘") == 1
-        assert bar.count("🟦") == 9
-        assert bar.count("⬜") == 0
-
-    def test_head_clamped_to_start_when_elapsed_negative(self) -> None:
-        """elapsed_secs is never negative in practice (the read()-counter
-        starts at 0 and only increments), but ratio clamping must not crash or
-        push the head off the bar if it ever were."""
-        bar = _build_progress_bar(-5.0, 200, width=10)
-        assert bar.count("🔘") == 1
-        assert bar.count("🟦") == 0
-        middle = bar.split("`")[2].strip()
-        assert middle.startswith(
-            "🔘"
-        )  # head pinned to the start, no done blocks before it
-
-    def test_width_is_customizable(self) -> None:
-        bar = _build_progress_bar(0.0, 200, width=5)
-        assert bar.count("🟦") + bar.count("🔘") + bar.count("⬜") == 5
-
-    def test_default_width_is_bar_width_constant(self) -> None:
-        # Pins the default to the constant rather than a literal, so changing
-        # _BAR_WIDTH stays a one-line edit but an accidental drift in the
-        # signature's default doesn't go unnoticed.
-        bar = _build_progress_bar(0.0, 200)
-        assert bar.count("🟦") + bar.count("🔘") + bar.count("⬜") == _BAR_WIDTH
-
-    def test_includes_formatted_elapsed_and_duration(self) -> None:
-        bar = _build_progress_bar(65.0, 200)
-        assert "`1:05`" in bar
-        assert "`3:20`" in bar
-
-    def test_elapsed_label_clamped_to_duration(self) -> None:
-        """The left time label must never overshoot the right one — imprecise
-        duration metadata plus a -ss start offset can push the raw position
-        past the reported duration (e.g. `4:05 … 4:02`)."""
-        bar = _build_progress_bar(250.0, 200, width=10)
-        assert bar.startswith("`3:20`")
-        assert "`4:10`" not in bar
-
-    def test_elapsed_label_clamped_to_zero_when_negative(self) -> None:
-        bar = _build_progress_bar(-5.0, 200, width=10)
-        assert bar.startswith("`0:00`")
 
 
 class TestBuildNowPlayingEmbed:

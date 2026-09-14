@@ -89,8 +89,8 @@ services:
       # Docker seeds ownership only into an EMPTY volume, so a ytdlp-cache
       # carried over from the root-owned path stays root:root and uid 10001
       # cannot write it: yt-dlp logs `PermissionError: [Errno 13]` per store and
-      # nothing persists. Discard it once —
-      #   docker compose down && docker volume rm discord-music-bot_ytdlp-cache
+      # nothing persists, which startup logs as a warning. Repair it in place —
+      #   docker exec -u 0 discord-music-bot chown -R 10001:10001 /home/app/.cache/yt-dlp
       - ytdlp-cache:/home/app/.cache/yt-dlp
     depends_on:
       redis:

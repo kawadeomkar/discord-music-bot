@@ -3150,6 +3150,28 @@ class TestDebugModeIsPerGuildAndDurable:
         assert (await GuildRedisStore(redis, 111).get_config()).debug_mode is None
 
 
+class TestEveryPlayTunableIsObservable:
+    """-debug's config block is the operator's only in-band view of what the
+    process is running with. The sibling class checks that rows PRESENT are
+    derived from config; nothing checked that a knob HAS a row, so two shipped
+    invisible — one of them a 120s bound, and CLAUDE.md defined it by reference
+    from another row's prose while having no row of its own."""
+
+    def test_every_play_and_card_knob_has_a_row(self) -> None:
+        import src.config as config_mod
+
+        rows = {var.name for var in _CONFIG_ALLOWLIST}
+        knobs = {
+            name
+            for name in vars(config_mod)
+            if name.startswith(("PLAY_", "QUEUE_PROGRESS_"))
+            and name.isupper()
+            and not name.startswith("_")
+        }
+        assert knobs, "no tunables found — the naming convention moved"
+        assert knobs <= rows, f"no -debug row for: {sorted(knobs - rows)}"
+
+
 class TestTheConfigAllowlistFallbacksTrackTheDefaults:
     """`-debug` renders the fallback when a variable is unset, so a hardcoded copy
     that drifts from config.py reports a default the process is not running with."""

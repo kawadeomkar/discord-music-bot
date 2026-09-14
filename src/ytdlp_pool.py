@@ -10,6 +10,7 @@ Pickle contract for what crosses the boundary: docs/ARCHITECTURE.md#yt-dlp-proce
 """
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import os
@@ -24,6 +25,7 @@ from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from logging.handlers import QueueListener
+from queue import Empty
 from typing import Any, Optional, TypeVar
 
 import structlog
@@ -41,6 +43,28 @@ _DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
 # with retries=10 can outlive any shutdown.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
 
+# Explicit, because multiprocessing.Queue() defaults to maxsize=0 and sizes its
+# semaphore at SEM_VALUE_MAX (32,767 here): 30,000 put_nowait calls were measured
+# to raise no Full at all, so the drop-on-full a progress producer relies on would
+# never happen and the worker would buffer without bound instead.
+_PROGRESS_QUEUE_MAX = 256
+# The drain polls rather than blocking, so stopping it never writes to a queue a
+# SIGTERMed worker may have left holding _wlock.
+_PROGRESS_POLL_SECS = 0.2
+_PROGRESS_JOIN_SECS = 2.0
+
+# Set in each worker by _worker_init. None in the parent, and None under the test
+# seam, where an executor_factory is supplied and the initializer never runs.
+_PROGRESS_Q: Optional[Any] = None
+
+
+def worker_progress_queue() -> Optional[Any]:
+    """The worker's progress transport, or None when the pool was built without
+    one. Read per call rather than captured: a worker's module globals are set by
+    the initializer, after import. This module owns the transport and knows
+    nothing about what rides it."""
+    return _PROGRESS_Q
+
 
 def _warmup_noop() -> None:
     """Submitted by prewarm() to force a worker to spawn and import yt-dlp.
@@ -48,11 +72,21 @@ def _warmup_noop() -> None:
     return None
 
 
-def _worker_init(log_queue: Optional[Any] = None) -> None:
+def _worker_init(
+    log_queue: Optional[Any] = None, progress_queue: Optional[Any] = None
+) -> None:
     """Per-worker setup that can never raise: an initializer that raises makes
     every pending and future submit raise BrokenProcessPool, and the heal-once
     retry runs the same initializer. Reported on stderr, because what just
     failed is the logging configuration."""
+    global _PROGRESS_Q
+    _PROGRESS_Q = progress_queue
+    if progress_queue is not None:
+        # Progress is advisory, so dropping the tail is correct — and it has to
+        # be dropped: at worker exit Queue._finalize_join JOINS the feeder thread,
+        # which is blocked in send_bytes once the parent stops reading, so the
+        # worker cannot exit and shutdown burns its full timeout every time.
+        progress_queue.cancel_join_thread()
     try:
         configure_worker_logging(log_queue)
     except Exception:
@@ -142,9 +176,17 @@ class YtdlpPool:
         max_workers: int = _DEFAULT_WORKERS,
         executor_factory: Optional[Callable[[], Executor]] = None,
         name: str = "yt-dlp extraction",
+        progress_sink: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self._max_workers = max_workers
         self._name = name
+        # What a worker's progress messages are handed to, on the drain THREAD.
+        # It must not block and must not touch the event loop. None (the default,
+        # and the chart pool's) builds no queue and no drain at all.
+        self._progress_sink = progress_sink
+        self._progress_queue: Optional[Any] = None
+        self._progress_thread: Optional[threading.Thread] = None
+        self._progress_stop = threading.Event()
         self._executor_factory = executor_factory or self._spawn_process_pool
         self._executor: Optional[Executor] = None
         self._closed = False
@@ -175,11 +217,82 @@ class YtdlpPool:
                 self._log_queue, *logging.root.handlers, respect_handler_level=True
             )
             self._log_listener.start()
+        self._start_progress_drain()
         return ProcessPoolExecutor(
             max_workers=self._max_workers,
             initializer=_worker_init,
-            initargs=(self._log_queue,),
+            initargs=(self._log_queue, self._progress_queue),
         )
+
+    def _start_progress_drain(self) -> None:
+        """Build the progress queue and the thread that drains it.
+
+        Rebuilt on a break-heal, unlike the log listener beside it, and for a
+        reason the log queue does not share: a worker SIGKILLed between
+        Queue._feed's wacquire() and wrelease() holds the write lock forever.
+        _sem never drains, and after _PROGRESS_QUEUE_MAX puts every put_nowait
+        raises Full — silently, permanently, for the life of the process. Reusing
+        the queue across a heal is exactly the case where that has happened."""
+        if self._progress_sink is None:
+            return
+        # Not joined: this runs under _lock, from _acquire on the event loop, and
+        # the old drain leaves on its own within _PROGRESS_POLL_SECS of the flag.
+        self._stop_progress_drain(join=False)
+        self._progress_queue = multiprocessing.Queue(maxsize=_PROGRESS_QUEUE_MAX)
+        # A fresh flag, not a cleared one: _stop_progress_drain set the old one,
+        # and the thread below must not start already told to stop.
+        self._progress_stop = threading.Event()
+        self._progress_thread = threading.Thread(
+            target=self._drain_progress,
+            args=(self._progress_queue, self._progress_stop),
+            name=f"{self._name}-progress",
+            daemon=True,
+        )
+        self._progress_thread.start()
+
+    def _drain_progress(self, queue: Any, stop: threading.Event) -> None:
+        """Drain worker progress on a THREAD, like the QueueListener beside it.
+        get_nowait measured at 38.4 µs/op and a playlist's messages arrive in a
+        burst — on the event loop that is starvation, delaying every other guild's
+        Now Playing edit and the playback loop's song handoff."""
+        while not stop.is_set():
+            try:
+                message = queue.get(timeout=_PROGRESS_POLL_SECS)
+            except Empty:
+                continue
+            except Exception as e:
+                # A closed queue at shutdown is expected and says nothing; any
+                # other cause ends progress for the life of this executor, so it
+                # must not be the one failure that leaves no line anywhere.
+                if not stop.is_set():
+                    log.warning(f"{self._name} progress drain stopped: {e!r}")
+                return
+            sink = self._progress_sink
+            if sink is None:
+                continue
+            try:
+                sink(message)
+            except Exception as e:
+                log.warning(f"{self._name} progress sink failed: {e!r}")
+
+    def _stop_progress_drain(self, *, join: bool = True) -> None:
+        """Stop the drain and drop the queue. Stopping is a FLAG rather than a
+        sentinel message, which makes the workers' state irrelevant: after
+        terminate_workers() the queue's _wlock is a POSIX semaphore a worker
+        SIGTERMed mid-write never released, so a parent write could block here
+        forever. Idempotent, because a break-heal calls it before rebuilding.
+
+        close() releases the parent's own handle and feeder thread. It does NOT
+        stop the drain — this side reads, and closing a queue does not interrupt
+        a blocked get — so it is cleanup rather than a backstop for the flag."""
+        thread, queue = self._progress_thread, self._progress_queue
+        self._progress_thread = self._progress_queue = None
+        self._progress_stop.set()
+        if thread is not None and join:
+            thread.join(timeout=_PROGRESS_JOIN_SECS)
+        if queue is not None:
+            with contextlib.suppress(Exception):
+                queue.close()
 
     def _stop_log_listener(self) -> None:
         """Drain and stop the listener. Only after the workers are gone: stop()
@@ -311,6 +424,7 @@ class YtdlpPool:
         # the executor while leaving the listener running, and an early return
         # would leak that thread for the life of the process.
         self._stop_log_listener()
+        self._stop_progress_drain()
 
     def shutdown(self, wait: bool = True) -> None:
         """Synchronous close for a caller with no event loop (tests; production
@@ -321,3 +435,4 @@ class YtdlpPool:
         if executor is not None:
             executor.shutdown(wait=wait, cancel_futures=True)
         self._stop_log_listener()
+        self._stop_progress_drain()

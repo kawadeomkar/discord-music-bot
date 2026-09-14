@@ -41,6 +41,7 @@ from src.util import (
     notice_embed,
 )
 from src.commands._common import echo
+from src.queue_progress import EnqueueProgress, enqueue_progress, is_collection
 from src.youtube import QueueObject
 
 # Stage functions resolve through the module per call: the test seam is the name
@@ -205,10 +206,29 @@ async def _resolve_and_place(
     be followed by an await before the gate hold is released."""
     qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
     async with contextlib.AsyncExitStack() as stack:
-        # Entered before the gate hold so it unwinds AFTER it: retracting the
-        # notice awaits its poster, and an await between the teardown decision and
-        # the hold release is exactly what this path may not have.
-        await stack.enter_async_context(slow_resolve_notice(ctx))
+        # Entered before the gate hold so it unwinds AFTER it: taking either of
+        # these back awaits a Discord call, and an await between the teardown
+        # decision and the hold release is exactly what this path may not have.
+        progress: Optional[EnqueueProgress] = None
+        if is_collection(source):
+            progress = await stack.enter_async_context(
+                enqueue_progress(
+                    ctx,
+                    source,
+                    placement_note=_placement_note(args.mode),
+                    debug_suffix=cog.debug_suffix(ctx),
+                    dropped=req.dropped,
+                )
+            )
+        else:
+            await stack.enter_async_context(
+                slow_resolve_notice(
+                    ctx,
+                    query=req.query,
+                    debug_suffix=cog.debug_suffix(ctx),
+                    dropped=req.dropped,
+                )
+            )
         # The cold-start gate hold lives on its own stack, so the path that PLACES
         # can release it the moment the put lands rather than holding the first note
         # behind a confirmation embed. aclose() is idempotent — an already-unwound
@@ -253,6 +273,7 @@ async def _resolve_and_place(
                     analytics=analytics,
                     origin=url,
                     mode=resolve_mode_for(placement),
+                    on_progress=progress.update if progress else None,
                     pool_slot=cog._plays.resolve_slot(req),
                     cog=cog,
                 )
@@ -303,6 +324,7 @@ async def _resolve_and_place(
                 analytics=analytics,
                 origin=url,
                 mode=resolve_mode_for(placement),
+                on_progress=progress.update if progress else None,
                 pool_slot=cog._plays.resolve_slot(req),
                 cog=cog,
             )
@@ -365,6 +387,13 @@ async def _resolve_and_place(
                 await abandon_cold_start(cog, ctx, mp)
             return None
     return None
+
+
+def _placement_note(mode: PlayMode) -> str:
+    """What the card says about where the songs will land. `--now` reaches
+    _resolve_and_place only with nothing to interrupt, so both flags mean the
+    same thing here."""
+    return "" if mode is PlayMode.NORMAL else "Plays next once it's queued."
 
 
 def _cold_start_left_something_playable(ctx: commands.Context, mp: MusicPlayer) -> bool:
@@ -446,9 +475,11 @@ async def _interject(
             require_paused=require_paused,
             cog=cog,
         )
-    except PlaceStalled:
-        # A stall is not a failed interjection: run() reports it as a busy queue,
-        # and wrapping it here would title that "Failed to play song now".
+    except PlaceStalled, ResolveWaitExpired:
+        # Neither is a failed interjection. run() reports a stall as a busy queue
+        # and an expired slot wait as a full pool; wrapping either here would
+        # title it "Failed to play song now" and render the class name, since
+        # nothing reached yt-dlp and there is no cause to show.
         raise
     except Exception as e:
         raise InterjectionFailed(e) from e

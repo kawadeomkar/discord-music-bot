@@ -1,13 +1,16 @@
-"""How a `-play` is parsed, gated, admitted and placed: the flag grammar, the
-voice gate, and the per-guild registry whose lock makes "check, then insert"
-atomic against `-clear`/`-stop`. See docs/ARCHITECTURE.md#play-placement.
+"""How a `-play` is parsed, gated, admitted, bounded and placed: the flag
+grammar, the voice gate, the two bounds on the resolve — `ResolveSlot`'s deadline
+on the WAIT for a guild's slot, and `slow_resolve_notice` saying so once a
+request outlives the display threshold — and the per-guild registry whose lock
+makes "check, then insert" atomic against `-clear`/`-stop`.
+See docs/ARCHITECTURE.md#play-placement and #where-the-resolve-bound-is-taken.
 """
 
 import asyncio
 import contextlib
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Final, Optional, Union
 from collections.abc import AsyncGenerator, Callable, Coroutine
@@ -24,7 +27,19 @@ from src.config import (
     PLAY_SLOW_NOTICE_SECS,
 )
 from src.musicplayer import MusicPlayer
-from src.util import get_logger, notice_embed, record_span_error, spawn_background
+from src.util import (
+    ECHO_ROW_MAX,
+    get_logger,
+    PoolSlotUnavailable,
+    channel_claim,
+    join_task,
+    notice_embed,
+    record_span_error,
+    safe_label,
+    set_when_set,
+    set_within,
+    spawn_background,
+)
 
 log = get_logger(__name__)
 
@@ -226,10 +241,13 @@ class PlaceStalled(Exception):
         self.before_the_put = before_the_put
 
 
-class ResolveWaitExpired(Exception):
+class ResolveWaitExpired(PoolSlotUnavailable):
     """PLAY_RESOLVE_WAIT_SECS elapsed queueing for one of the guild's resolve
     slots, before any yt-dlp work began. Raised in place of a wait with no end:
-    the caller renders it, so the request that never started says so."""
+    the caller renders it, so the request that never started says so.
+
+    PoolSlotUnavailable, so the extraction single-flight can tell this guild's
+    exhausted budget from a failure of the extraction itself and re-elect."""
 
     def __init__(self) -> None:
         super().__init__(f"resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
@@ -269,48 +287,87 @@ class ResolveSlot:
         self._sem.release()
 
 
+# The claim kind. A card and a notice are different kinds, so a channel showing
+# one can still show the other: they describe different requests.
+_NOTICE_CLAIM = "slow-resolve-notice"
+
+# How often a notice that lost its channel asks for it again.
+_NOTICE_RETRY_SECS = 1.0
+
+
 @contextlib.asynccontextmanager
-async def slow_resolve_notice(ctx: commands.Context) -> AsyncGenerator[None]:
-    """Say that a request is still being looked up once it outlives
-    PLAY_SLOW_NOTICE_SECS, and take the message back when it lands.
+async def slow_resolve_notice(
+    ctx: commands.Context,
+    *,
+    query: str,
+    debug_suffix: Optional[str] = None,
+    dropped: Optional[asyncio.Event] = None,
+) -> AsyncGenerator[None]:
+    """Say that `query` is still being looked up once it outlives
+    PLAY_SLOW_NOTICE_SECS, and take the message back when it lands or when
+    `dropped` is set.
 
     ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the Now
     Playing host, so deleting it would drag the live progress bar onto it.
+    Bypassing it also skips debug-mode decoration, hence `debug_suffix`.
     See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait."""
-    posted: Optional[discord.Message] = None
     settled = asyncio.Event()
 
     async def _post() -> None:
-        nonlocal posted
-        try:
-            async with asyncio.timeout(PLAY_SLOW_NOTICE_SECS):
-                await settled.wait()
-        except TimeoutError:
-            pass
-        else:
+        if await set_within(settled, PLAY_SLOW_NOTICE_SECS):
             # Landed inside the delay, which is the common case: say nothing.
             return
-        with contextlib.suppress(discord.HTTPException):
-            posted = await ctx.channel.send(
-                embed=notice_embed(
-                    "Still looking that one up — it will be queued as soon as it "
-                    "resolves.",
-                    discord.Color.orange(),
-                )
+        span = trace.get_current_span()
+        while True:
+            with channel_claim(_NOTICE_CLAIM, ctx.channel.id) as claimed:
+                if claimed:
+                    await _post_and_retract(span)
+                    return
+            # A sibling's notice holds the channel. This one names its own request,
+            # so it posts once that one is taken back.
+            span.set_attribute("play.slow_notice", "claimed_elsewhere")
+            if await set_within(settled, _NOTICE_RETRY_SECS):
+                return
+
+    async def _post_and_retract(span: trace.Span) -> None:
+        posted: Optional[discord.Message] = None
+        try:
+            embed = notice_embed(
+                f"Still looking up **{safe_label(query, ECHO_ROW_MAX)}** for "
+                f"{ctx.author.mention}…",
+                discord.Color.orange(),
             )
+            if debug_suffix:
+                embed.set_footer(text=debug_suffix)
+            try:
+                posted = await ctx.channel.send(embed=embed)
+            except discord.HTTPException as e:
+                span.set_attribute("play.slow_notice", "send_failed")
+                log.warning("slow resolve notice send failed", error=repr(e))
+                return
+            span.set_attribute("play.slow_notice", "shown")
+            await settled.wait()
+        finally:
+            # The task that sent the notice takes it back, in its own finally:
+            # a caller cancelled mid-send never learns the handle, and nothing
+            # else knows the id. OSError and RuntimeError cover a connection
+            # reset and a session closed at shutdown.
+            if posted is not None:
+                with contextlib.suppress(discord.HTTPException, OSError, RuntimeError):
+                    await posted.delete()
 
     notice = asyncio.create_task(_post())
+    relay = asyncio.create_task(set_when_set(dropped, settled)) if dropped else None
     try:
         yield
     finally:
         settled.set()
-        # Awaited, not abandoned: the task owns `posted`, so a delete racing its
-        # send would read None and leave the notice standing forever.
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await notice
-        if posted is not None:
-            with contextlib.suppress(discord.HTTPException):
-                await posted.delete()
+        if relay is not None:
+            relay.cancel()
+        # A cancellation aimed at this coroutine is re-raised, never swallowed:
+        # a command that returns normally from its own cancellation stalls the
+        # shutdown gather that cancelled it.
+        await join_task(notice)
 
 
 @dataclass(slots=True, eq=False)
@@ -330,6 +387,9 @@ class PlayRequest:
     # after the resolve, where a -pause landing in between would change the answer.
     queue_control: bool = False
     dropped_by: str = ""
+    # Set with `dropped_by` and by retire_player. place() reads the drop only once
+    # the resolve returns; this takes the request's card or notice back now.
+    dropped: asyncio.Event = field(default_factory=asyncio.Event)
     # Set under the place lock. A placed request is past the point any command can
     # drop it, but it stays in the registry until its reply is sent.
     placed: bool = False
@@ -447,6 +507,10 @@ class PlayRegistry:
                 mp.mark_retired()
         except TimeoutError:
             mp.mark_retired()
+        # place() refuses every unplaced request on a retired player.
+        for req in plays.inflight:
+            if req.mp is mp and not req.placed:
+                req.dropped.set()
 
     def inflight(
         self,
@@ -465,6 +529,7 @@ class PlayRegistry:
         dropped = [r for r in plays.inflight if not r.placed and matches(r)]
         for req in dropped:
             req.dropped_by = by
+            req.dropped.set()
         return dropped
 
     def cold_join(

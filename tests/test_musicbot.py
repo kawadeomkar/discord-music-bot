@@ -72,6 +72,42 @@ class TestCommandErrorRendering:
         assert "github.com" not in detail
         assert "unexpected error" in detail
 
+    async def test_a_slow_spotify_playlist_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Its own type exists so the channel gets a sentence rather than
+        `**SpotifyPlaylistTooSlowError:** spotify playlist walk exceeded 120.0s`.
+        Dropping it from the user-safe tuple is silent: the command still fails,
+        just unreadably."""
+        from src.spotify import SpotifyPlaylistTooSlowError
+
+        err = SpotifyPlaylistTooSlowError(100, 4200, whole_walk=True)
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == err.user_message
+        assert "SpotifyPlaylistTooSlowError" not in detail
+
+    async def test_a_stalled_spotify_page_renders_the_other_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.spotify import SpotifyPlaylistTooSlowError
+
+        err = SpotifyPlaylistTooSlowError(1, 0, whole_walk=False)
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        assert call.args[2] == err.user_message
+
     async def test_a_plain_exception_still_renders_type_and_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

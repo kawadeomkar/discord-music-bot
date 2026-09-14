@@ -57,13 +57,13 @@ details, aliases, and examples.
 
 | Command | Aliases | Description |
 |---|---|---|
-| `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything |
+| `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything. A playlist that takes more than a couple of seconds to read shows a live card with its progress, which disappears when the songs land |
 | `-playnow <url\|search>` | `pn` | The same request as `-play --now`, kept as its own command |
 | `-playnext <url\|search>` | `pnx` | The same request as `-play --next`, kept as its own command |
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
-| `-stop` | `st` | Stop playback, drop the queue, and disconnect |
+| `-stop` | `st` | Stop playback and disconnect, keeping the queue for `-resume` (24h) |
 | `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (applies from the next song; saved per server) |
 
 ### Queue
@@ -104,6 +104,11 @@ https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported si
 never gonna give you up                          # plain text searches YouTube
 ```
 
+A video link carrying `&list=` queues that whole list, not just the video. The link
+YouTube's player hands you for a song you reached through a Mix carries
+`&list=RD…`, and a Mix is hundreds of songs, each queued once. Delete the
+`&list=…` part to queue only the video, or `-remove` the link to take the Mix back out.
+
 YouTube, Spotify, and SoundCloud get first-class handling (timestamps, playlist
 expansion, Spotify→YouTube matching). Any other link is handed straight to
 [yt-dlp](https://github.com/yt-dlp/yt-dlp) — if it's one of the ~1800 sites yt-dlp
@@ -118,7 +123,7 @@ replies that the link isn't from a site it can play.
 **To run the bot** — Docker, plus credentials:
 
 - A [Discord bot token](https://discord.com/developers/applications)
-- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work. When credentials are provided, the bot validates them against the Spotify API on startup — invalid credentials are logged as an error and Spotify links are declined (everything else keeps working). Run `-ping` to see the current Spotify status.
+- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work. When credentials are provided, the bot validates them against the Spotify API on startup — invalid credentials are logged as an error and Spotify links are declined (everything else keeps working). Run `-ping` to see the current Spotify status. Spotify limits what a Development Mode app may read, and it can refuse such an app another user's playlist tracks even while its credentials work; the bot then answers "Spotify won't share that playlist's tracks" and logs which playlist.
 
 The Docker Compose stack contains its own Redis to enable persistence, caching, and crash recovery.
 Credentials *must* be set in a `.env` file at the project root before starting anything:
@@ -509,11 +514,14 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
 | `PLAY_INFLIGHT_MAX` | | `16` | Per-server ceiling on `-play` requests admitted at once; past it a request is declined. One admitted request is one coroutine, one open span and one typing keepalive, so this bounds memory — pool time is `PLAY_RESOLVE_CONCURRENCY` below. Floored at 1 |
 | `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused, for as long as `PLAY_RESOLVE_WAIT_SECS` allows. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
-| `PLAY_RESOLVE_WAIT_SECS` | | `120.0` | How long a request waits for one of those slots before giving up. Bounds the WAIT alone, never the lookup holding the slot — a 5,547-track playlist legitimately runs 99s, and cutting that off would fail the request it is serving. Waiting is the half that produces nothing, so leaving it unbounded is what makes a busy bot look like a stopped one. A request that expires is declined having looked up and queued nothing, so trying again cannot double-queue the song. Floored at 1.0 |
-| `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a `-play` takes before the bot says it is still looking the song up. The message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5 |
+| `PLAY_RESOLVE_WAIT_SECS` | | `120.0` | How long a request waits for one of those slots before giving up. Bounds the WAIT alone, never the lookup holding the slot — a 5,547-track playlist legitimately runs 99s, and cutting that off would fail the request it is serving. Waiting is the half that produces nothing, so leaving it unbounded is what makes a busy bot look like a stopped one. Generous on purpose: every second of it can be another member's legitimate lookup, and expiring early is a refusal nobody needed. A request that expires is declined having looked up and queued nothing, so trying again cannot double-queue the song. Floored at 1.0 |
+| `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a single-track `-play` takes before the bot says it is still looking the song up; a playlist shows the live progress card instead. One notice per channel at a time, and the message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5 |
 | `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
+| `QUEUE_PROGRESS_DELAY_SECS` | | `2.5` | How long a playlist enqueue resolves before the live progress card appears. Above the ~2.0s a ten-track collection takes end to end, so the common case still sees exactly what it saw before. One card per channel. Floored at 0.05 |
+| `QUEUE_PROGRESS_TICK_SECS` | | `5.0` | How often that card is re-rendered. Higher than the dashboards' 1.0s because it shares a channel with the Now Playing bar's 3.0s edits, and Discord allows ~5 edits per 5s per channel. The card only edits when the render actually changes: a card with a bar costs at most ten edits for a whole enqueue, while one with no total (a YouTube Mix) edits every 5s. Floored at 2.0 |
+| `QUEUE_PROGRESS_MAX_SECS` | | `300.0` | How long the card keeps editing before it settles on "still working" and stops. Not a timeout: the enqueue carries on, and the card is still deleted when it lands. `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a slot, this bounds the editing. Must be at least `QUEUE_PROGRESS_DELAY_SECS` + `QUEUE_PROGRESS_TICK_SECS` (7.5 by default); below that the bot refuses to start |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
 | `PING_DEADLINE_SECS` | | `3.0` | `-ping` health dashboard: how long a probe may run before the row is marked failed |
 | `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-debug --enable`/`--disable` persists to Redis and wins over this value from then on, across restarts. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
@@ -527,6 +535,31 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.37.0
+
+**A Spotify playlist over 100 tracks now queues in full.** Only the first page was ever
+read — the `next` cursor was never followed — so a 300-track playlist queued 100 and
+reported success, with nothing to say the other 200 had been dropped. If you have been
+working around that by splitting playlists up, stop: `-play <playlist link>` takes the
+whole thing, up to Spotify's own 10,000-item ceiling.
+
+Two consequences worth knowing before you paste a big one. The lookup takes longer,
+because it is one HTTPS round trip per 100 tracks: a 1,000-track playlist is ten
+sequential requests, typically a second or two, against the ~150 ms a truncated one used
+to take. And it is bounded twice — 20 seconds for any single request, 120 seconds for the
+whole walk — past which the command fails and queues **nothing**, rather than queueing a
+part of a playlist you would have to work out the shape of yourself. The two are reported
+differently, because only one is worth retrying: a stalled request says so and invites a
+retry, while a playlist that used the whole budget tells you to queue it in parts. Items a playlist
+can hold with no title of their own — removed or region-dropped tracks, and podcast
+episodes that carry none — are skipped, so "Queued N songs" can be lower than the
+playlist's own item count. A local file is kept: its name is exactly what a YouTube
+search wants.
+
+Already-cached playlists are not stale for an hour after the upgrade: the cache key moved,
+so the first `-play` after deploy re-reads from Spotify. Nothing to configure, no data
+touched, and rolling back is only a redeploy.
 
 ## Upgrading to 2.35.1
 
