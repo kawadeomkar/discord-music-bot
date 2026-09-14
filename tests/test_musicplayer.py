@@ -6555,6 +6555,136 @@ class TestBuildNextUpEmbed:
 # ── QueueEntryCard ────────────────────────────────────────────────────────────
 
 
+class TestPrefetchedHeadIsShownResolved:
+    """The prefetch claims the next entry and resolves it, but the queue keeps the
+    claimed LAZY entry until loop() settles it, so every card read "resolving..."
+    for a Spotify track until it started. The cards show what it resolved to."""
+
+    @staticmethod
+    def _lazy() -> YTSource:
+        return YTSource(ytsearch="ytsearch:changes ayris", process=True)
+
+    @staticmethod
+    def _resolved(author: MagicMock) -> QueueObject:
+        return QueueObject(
+            "https://yt.com/v=changes",
+            "changes",
+            author,
+            duration=91,
+            uploader="AYRIS - Topic",
+            thumbnail="https://img.example/changes.jpg",
+        )
+
+    async def test_the_up_next_card_shows_the_song_the_prefetch_resolved(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        lazy = self._lazy()
+        seed_queue(music_player.queue, lazy)
+        resolved = self._resolved(mock_author)
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=resolved)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=MagicMock())
+            ),
+        ):
+            assert await music_player._prefetch_next_song() is not None
+
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        body = described(embed)
+        assert "resolving" not in body
+        assert "[**changes**](https://yt.com/v=changes)" in body
+        assert "Channel: AYRIS - Topic" in body
+        assert "`1:31`" in body
+        assert mock_author.mention in body
+        assert "Est. playing at" in body
+        assert embed.thumbnail.url == "https://img.example/changes.jpg"
+        # Display only: the claim the loop settles is still the entry it took.
+        assert music_player.queue.peek_next() is lazy
+        assert music_player.queue.claim_outstanding()
+
+    async def test_it_still_reads_resolving_until_the_resolve_lands(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        seed_queue(music_player.queue, self._lazy())
+        release = asyncio.Event()
+        resolved = self._resolved(mock_author)
+
+        async def _slow_resolve(_self: Any, _source: Any) -> QueueObject:
+            await release.wait()
+            return resolved
+
+        with (
+            patch.object(MusicPlayer, "_resolve_source", new=_slow_resolve),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=MagicMock())
+            ),
+        ):
+            prefetch = asyncio.create_task(music_player._prefetch_next_song())
+            await asyncio.sleep(0)
+            embed = music_player._build_next_up_embed()
+            assert embed is not None and "resolving..." in described(embed)
+            release.set()
+            async with asyncio.timeout(2):
+                await prefetch
+
+        embed = music_player._build_next_up_embed()
+        assert embed is not None and "resolving" not in described(embed)
+
+    def test_a_resolution_for_an_entry_no_longer_at_the_head_is_ignored(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Matched by identity: a -clear, -shuffle or failed stream moves the entry,
+        and the next head must not borrow its title."""
+        stale = self._lazy()
+        seed_queue(
+            music_player.queue, YTSource(ytsearch="ytsearch:other", process=True)
+        )
+        music_player._prefetched_head = (stale, self._resolved(mock_author))
+
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "other" in described(embed)
+        assert "changes" not in described(embed)
+
+    def test_a_song_queued_behind_it_gets_an_exact_eta(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The -play confirmation's ETA walks the head through _eta_walk_to."""
+        music_player.current_song = mock_song
+        lazy = self._lazy()
+        behind = QueueObject("https://yt.com/v=b", "Behind", mock_author, duration=60)
+        seed_queue(music_player.queue, lazy, behind)
+        music_player._prefetched_head = (lazy, self._resolved(mock_author))
+
+        body = described(music_player.build_queued_song_embed(behind))
+        assert "Est. playing at **" in body
+        assert "Est. playing at ~" not in body
+
+    def test_the_queue_card_row_and_the_etas_behind_it_use_the_resolution(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        lazy = self._lazy()
+        seed_queue(
+            music_player.queue,
+            lazy,
+            QueueObject("https://yt.com/v=b", "After", mock_author, duration=60),
+        )
+        music_player._prefetched_head = (lazy, self._resolved(mock_author))
+
+        body = described(music_player.queue_embed())
+        assert "[**changes**](https://yt.com/v=changes)" in body
+        assert "resolving" not in body
+        # The row behind it walks a known length, so its ETA is not approximate.
+        assert "Est. playing at ~" not in body
+        assert "Total Duration: **2m 31s**" in body
+
+
 class TestQueueEntryCard:
     """The block's "Up next" and the -play confirmation are one renderer. The
     -queue page keeps _format_queue_line: a row and a card are different jobs."""

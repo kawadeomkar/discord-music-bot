@@ -323,6 +323,7 @@ class MusicPlayer:
         "timezone",
         "_player",
         "_prefetch_task",
+        "_prefetched_head",
         "store",
         "_restore_task",
         "_restore_complete",
@@ -365,6 +366,7 @@ class MusicPlayer:
     # this task's result, and a bare Task makes result() Any — so a field YTDL
     # does not carry would raise at runtime with pyright reporting nothing.
     _prefetch_task: Optional[asyncio.Task[Optional[YTDL]]]
+    _prefetched_head: Optional[tuple[QueueItem, QueueObject]]
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
@@ -444,6 +446,9 @@ class MusicPlayer:
         # fields off its result, and a bare Task makes result() Any.
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task[Optional[YTDL]]] = None
+        # (the entry the prefetch claimed, what it resolved to): the queue keeps the
+        # claimed lazy entry until loop() settles it. See _displayed().
+        self._prefetched_head: Optional[tuple[QueueItem, QueueObject]] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._progress_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -666,14 +671,30 @@ class MusicPlayer:
         `index`. An index past the queue walks all of it — the ETA a song appended
         now would earn."""
         now_pst, walk = self._queue_eta_seed()
-        for earlier in self.queue.display_items()[: index - 1]:
+        for earlier in self._displayed_items()[: index - 1]:
             walk = walk.advance(
                 _remaining_secs(earlier) if isinstance(earlier, QueueObject) else None
             )
         return now_pst, walk
 
-    def queue_embed(self) -> discord.Embed:
+    def _displayed(self, item: QueueItem) -> QueueItem:
+        """`item` as the cards show it: the song the prefetch resolved it to while
+        it is still the queue's head, else itself. A lazy Spotify entry otherwise
+        reads "resolving..." until the song starts."""
+        head = self._prefetched_head
+        if head is not None and item is head[0] and self.queue.peek_next() is item:
+            return head[1]
+        return item
+
+    def _displayed_items(self) -> list[QueueItem]:
+        """display_items() with its head as the cards show it (_displayed)."""
         items = self.queue.display_items()
+        if items:
+            items[0] = self._displayed(items[0])
+        return items
+
+    def queue_embed(self) -> discord.Embed:
+        items = self._displayed_items()
         total = len(items)
 
         total_secs, duration_partial = _queue_runtime(items)
@@ -1334,7 +1355,9 @@ class MusicPlayer:
         item = self.queue.peek_next()
         if item is None:
             return None
-        return self._build_queue_entry_embed(item, index=1, title="Up next")
+        return self._build_queue_entry_embed(
+            self._displayed(item), index=1, title="Up next"
+        )
 
     # ── Now-playing host management ───────────────────────────────────────────
     # The NP block lives in exactly one "host" message at a time — always the newest
@@ -2230,8 +2253,11 @@ class MusicPlayer:
         except asyncio.QueueEmpty:
             return None
         trace.get_current_span().set_attribute("discord.guild_id", str(self._guild.id))
+        claimed = source
         try:
             source = await self._resolve_source(source)
+            if source is not claimed:
+                self._prefetched_head = (claimed, source)
             # No re-extraction here: _cancel_prefetch() awaits this task, and an
             # executor job cannot be interrupted. The play-time resolve decides.
             song = await self._stream_source(source, allow_reextract=False)
