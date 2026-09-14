@@ -849,12 +849,24 @@ class MusicPlayer:
 
     # ── State restore ─────────────────────────────────────────────────────────
 
+    def _adopt_cached_settings(self) -> None:
+        """The volume and zone the settings cache holds, taken before any read. The
+        cache keeps a write that did not reach Redis, which seed() never replaces,
+        and it is all a player has without a store or a readable snapshot."""
+        cached = self._cog.guild_settings.peek(self._guild.id)
+        if cached is None:
+            return
+        if cached.volume is not None:
+            self.volume = cached.volume
+        self.timezone = cached.tzinfo()
+
     async def _restore_state(self) -> None:
         """Restore queue, history, and volume from Redis after a restart. Runs as a
         background task; waits for bot ready so guild members are cached. loop()
         waits on _restore_complete before its first queue_get(): the crash-recovered
         head injected here was never on the Redis list, so an LPOP for it would
         delete an unrelated, still-queued song."""
+        self._adopt_cached_settings()
         if self.store is None:
             self._restore_read_failed = True
             self._restore_complete.set()

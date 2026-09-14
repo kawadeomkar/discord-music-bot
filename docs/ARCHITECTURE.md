@@ -2547,8 +2547,10 @@ each guild's config and is the only writer of the key.
   lowest open one (or the counter, with none open): an absent stamp compares as never
   set, which is already the answer for every such read. With no read in flight both
   maps are empty.
-- **Restore ordering.** `_restore_state` registers immediately before its snapshot read
-  and stays registered through the SEED write. `seed`'s accepted set gates the zone,
+- **Restore ordering.** `_restore_state` first takes the volume and zone the cache holds,
+  so a player built after a write that did not reach Redis plays that write, as does a
+  player with no store or no readable snapshot. It then registers immediately before
+  its snapshot read and stays registered through the SEED write. `seed`'s accepted set gates the zone,
   the volume and the legacy migration alike, and the migration re-checks the stamp
   under the guild's lock, because a `volume reset` can commit while it waits.
 - **Forget.** `on_guild_remove` calls `forget`: a bounded `clear_config`, then the entry,

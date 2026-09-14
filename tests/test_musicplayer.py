@@ -12831,6 +12831,65 @@ class TestRestoreOrdersAgainstSettingsWrites:
         seed.assert_not_awaited()
 
 
+class TestRestoreAdoptsAnUnsavedSetting:
+    """A write that did not reach Redis stays in the settings cache, and seed()
+    leaves that field alone. A player built after it plays the cached value, not
+    the default and not the older stored one."""
+
+    async def test_an_unsaved_volume_plays_over_the_stored_one(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await store.set_volume(0.8)
+        with patch.object(
+            GuildRedisStore, "set_volume", new=AsyncMock(return_value=False)
+        ):
+            result = await mock_ctx.cog.guild_settings.write(
+                music_player._guild.id, GuildConfig(volume=0.3)
+            )
+        assert result.persisted is False
+
+        await music_player._restore_state()
+
+        assert music_player.volume == 0.3
+        assert await store.read_config() == GuildConfig(volume=0.8)
+
+    async def test_an_unsaved_zone_is_used_over_the_stored_one(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await store.set_timezone("Asia/Tokyo")
+        with patch.object(
+            GuildRedisStore, "set_timezone", new=AsyncMock(return_value=False)
+        ):
+            await mock_ctx.cog.guild_settings.write(
+                music_player._guild.id, GuildConfig(timezone="Europe/London")
+            )
+
+        await music_player._restore_state()
+
+        assert music_player.timezone == ZoneInfo("Europe/London")
+
+    async def test_without_redis_the_cached_values_still_apply(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+    ) -> None:
+        guild_settings = mock_ctx.cog.guild_settings
+        await guild_settings.write(mock_guild.id, GuildConfig(volume=0.3))
+        await guild_settings.write(mock_guild.id, GuildConfig(timezone="Europe/London"))
+        player = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog)
+
+        await player._restore_state()
+
+        assert player.volume == 0.3
+        assert player.timezone == ZoneInfo("Europe/London")
+
+
 class TestGuildTimezoneOnRestore:
     """ETAs follow the guild's stored zone instead of a hardcoded Pacific."""
 
