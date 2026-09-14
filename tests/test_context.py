@@ -18,6 +18,7 @@ from src.debug import DebugSettings
 from src.main import MusicBotApp, MusicContext
 from src.musicbot import MusicBot
 from src.recovery import VoiceWatchdog
+from src.settings import GuildSettings
 from tests.helpers import mocked
 
 
@@ -41,6 +42,8 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     # exactly how the cog's old __slots__ fell three attributes behind.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    cog.guild_settings = GuildSettings(cog)
+    cog._hydrate_retry = None
     return cog
 
 

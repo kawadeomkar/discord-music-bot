@@ -93,32 +93,51 @@ class TestOnReady:
         music_bot.redis = None
         await music_bot.on_ready()  # must not raise, no tasks created
 
-    async def test_creates_restore_task_per_guild(
+    async def test_spawns_one_recovery_task(
+        self, music_bot_with_redis: MusicBot
+    ) -> None:
+        stub = stub_create_task()
+        with (
+            patch("asyncio.create_task", stub),
+            patch.object(music_bot_with_redis, "_recover_after_ready") as recover,
+        ):
+            await music_bot_with_redis.on_ready()
+        assert stub.call_count == 1
+        recover.assert_called_once_with()
+
+    async def test_recovery_hydrates_before_the_first_restore(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
+        """The hydrate's batches hold one pool connection at a time; the restore
+        fan-out is what reaches the pool's cap, so it starts only after the pass."""
         guilds = list(music_bot_with_redis.bot.guilds)
-        stub = stub_create_task()
+        order: list[str] = []
         passed_guilds = []
+
+        async def _hydrate(ids: Any = None) -> None:
+            # Suspends, as the real read does: spawned restores would run here.
+            await asyncio.sleep(0)
+            order.append("hydrate")
 
         async def _noop() -> None:
             pass
 
-        # Patched where on_ready LOOKS IT UP — musicbot's module globals — not where
-        # it is defined, or the cog keeps calling the real one. Capture happens
-        # synchronously in the spy (before stub_create_task closes the coroutine,
-        # which would prevent the body running).
-        def _spy(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+        def _restore(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+            # Recorded when the task is spawned, not when it runs.
+            order.append("restore")
             passed_guilds.append(guild)
             return _noop()
 
+        # Patched where the cog LOOKS IT UP — musicbot's module globals — not
+        # where it is defined, or the cog keeps calling the real one.
         with (
-            patch("asyncio.create_task", stub),
-            patch("src.musicbot.restore_guild", _spy),
+            patch.object(music_bot_with_redis, "_hydrate_configs", _hydrate),
+            patch("src.musicbot.restore_guild", _restore),
         ):
-            await music_bot_with_redis.on_ready()
+            await music_bot_with_redis._recover_after_ready()
+            await asyncio.gather(*music_bot_with_redis._restore_tasks)
 
-        # One per guild, plus the one-off config hydration.
-        assert stub.call_count == len(guilds) + 1
+        assert order == ["hydrate", *["restore"] * len(guilds)]
         assert passed_guilds == guilds
 
 

@@ -582,15 +582,22 @@ async def _read_config_batches(
 
 
 async def read_guild_configs(
-    redis: aioredis.Redis, guild_ids: Sequence[int]
+    redis: aioredis.Redis,
+    guild_ids: Sequence[int],
+    *,
+    batch_timeout: Optional[float] = None,
 ) -> dict[int, GuildConfig]:
     """Read many guilds' stored configs, batched onto pipelines. Returns an
     entry ONLY for a guild whose read happened: a missing guild means "could
-    not read", not the all-unset GuildConfig an absent hash yields, and a
-    caller that caches this must not treat the two alike or a Redis blink reads
-    as every guild un-choosing everything."""
+    not read" (its batch failed, or outlived `batch_timeout`), not the all-unset
+    GuildConfig an absent hash yields, and a caller that caches this must not
+    treat the two alike or a Redis blink reads as every guild un-choosing
+    everything."""
     replies = await _read_config_batches(
-        redis, guild_ids, lambda pipe, key: pipe.hgetall(key), batch_timeout=None
+        redis,
+        guild_ids,
+        lambda pipe, key: pipe.hgetall(key),
+        batch_timeout=batch_timeout,
     )
     return {
         guild_id: GuildConfig.from_redis(cast(dict[bytes, bytes], raw))
@@ -1352,11 +1359,10 @@ class GuildRedisStore:
     async def set_timezone(self, name: str, *, writer: Optional[int] = None) -> bool:
         """Persist the IANA zone this guild renders ETAs in. True when it
         landed. Stores the name as given (GuildConfig.tzinfo resolves at read
-        time). No caller yet: the write half of the planned `-options` command.
-        Validated here because an unusable name stored in a PERSISTed,
-        non-evictable key fails silently; `-options` should still call
-        valid_timezone itself so it can tell the user WHY, since False here
-        cannot say whether the name was bad or Redis was down."""
+        time). Validated here because an unusable name stored in a PERSISTed,
+        non-evictable key fails silently; a command should still validate first
+        so it can tell the user WHY, since False here cannot say whether the name
+        was bad or Redis was down."""
         if not valid_timezone(name):
             log.warning(f"[guild:{self.guild_id}] refusing unusable timezone {name!r}")
             return False

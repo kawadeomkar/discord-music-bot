@@ -26,7 +26,7 @@ from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
 from src.musicbot import MusicBot as MusicBotCog
-from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, spawn_background
+from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, cancel_task, spawn_background
 from src.guild_queue import QueueObject
 from tests.helpers import command_callback, seed_queue
 from src.musicplayer import MusicPlayer
@@ -2814,7 +2814,7 @@ class TestDebugSamplerLifecycle:
     async def test_unload_cancels_an_in_flight_hydration(
         self, music_bot_with_redis: MusicBotCog
     ) -> None:
-        """_hydrate_debug ends in sync_sampler, and nothing else
+        """_hydrate_configs ends in sync_sampler, and nothing else
         ever cancels _restore_tasks. Parked mid-read across cog_unload it resumed
         afterwards and started a FRESH sampler task holding the dead cog — a
         permanent leak per reload_extension."""
@@ -2830,8 +2830,8 @@ class TestDebugSamplerLifecycle:
             await released.wait()
             return {42: GuildConfig(debug_mode=True)}
 
-        with patch("src.debug.read_guild_configs", new=parks_until_released):
-            task = spawn_background(cog._hydrate_debug(), cog._restore_tasks)
+        with patch("src.settings.read_guild_configs", new=parks_until_released):
+            task = spawn_background(cog._hydrate_configs(), cog._restore_tasks)
             await reading.wait()
             await cog.cog_unload()
             # Would resume the hydration if it had survived the unload.
@@ -3008,7 +3008,7 @@ class TestDebugModeIsPerGuildAndDurable:
         self._guilds(music_bot_with_redis, 111, 222, 333)
         music_bot_with_redis.debug_settings._overrides = {}
 
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
 
         assert music_bot_with_redis.debug_settings._overrides == {111: True, 222: False}
         # 333 never chose, so it is absent rather than cached — caching it would
@@ -3019,7 +3019,7 @@ class TestDebugModeIsPerGuildAndDurable:
         self, music_bot_with_redis: MusicBotCog, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._guilds(music_bot_with_redis, 333)
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
         monkeypatch.setattr(music_bot_with_redis.debug_settings, "_default", True)
         assert music_bot_with_redis.debug_settings.enabled(333) is True
 
@@ -3034,8 +3034,11 @@ class TestDebugModeIsPerGuildAndDurable:
             "pipeline",
             side_effect=RuntimeError("down"),
         ):
-            await music_bot_with_redis._hydrate_debug()
+            await music_bot_with_redis._hydrate_configs()
         assert music_bot_with_redis.debug_settings._overrides == {}
+        retry = music_bot_with_redis._hydrate_retry
+        assert retry is not None and not retry.done()
+        await cancel_task(retry)
 
     async def test_a_failed_read_does_not_discard_a_correct_stored_choice(
         self, music_bot_with_redis: MusicBotCog
@@ -3056,10 +3059,13 @@ class TestDebugModeIsPerGuildAndDurable:
         music_bot_with_redis.debug_settings._overrides = {111: False}
 
         with patch.object(redis, "pipeline", side_effect=RuntimeError("down")):
-            await music_bot_with_redis._hydrate_debug()
+            await music_bot_with_redis._hydrate_configs()
 
         assert music_bot_with_redis.debug_settings._overrides == {111: False}
         assert music_bot_with_redis.debug_settings.enabled(111) is False
+        retry = music_bot_with_redis._hydrate_retry
+        assert retry is not None and not retry.done()
+        await cancel_task(retry)
 
     async def test_a_read_that_succeeds_still_evicts_a_removed_choice(
         self, music_bot_with_redis: MusicBotCog
@@ -3070,7 +3076,7 @@ class TestDebugModeIsPerGuildAndDurable:
         self._guilds(music_bot_with_redis, 111)
         music_bot_with_redis.debug_settings._overrides = {111: True}
 
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
 
         assert 111 not in music_bot_with_redis.debug_settings._overrides
 
@@ -3094,8 +3100,8 @@ class TestDebugModeIsPerGuildAndDurable:
             )
             return {42: GuildConfig(debug_mode=False)}  # what the read saw
 
-        with patch("src.debug.read_guild_configs", new=read_then_user_toggles):
-            await music_bot_with_redis._hydrate_debug()
+        with patch("src.settings.read_guild_configs", new=read_then_user_toggles):
+            await music_bot_with_redis._hydrate_configs()
 
         assert music_bot_with_redis.debug_settings.enabled(42) is True
 
@@ -3160,7 +3166,7 @@ class TestDebugModeIsPerGuildAndDurable:
         self._guilds(music_bot_with_redis, 111)
         music_bot_with_redis.debug_settings._unpersisted.add(111)
 
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
 
         assert 111 not in music_bot_with_redis.debug_settings._unpersisted
 
@@ -3174,6 +3180,28 @@ class TestDebugModeIsPerGuildAndDurable:
         description = mock_ctx.send.await_args.kwargs["embed"].description
         assert "saved for this server" in description
         assert "could not be saved" not in description
+
+    async def test_racing_writers_agree_in_redis_the_cache_and_the_footer(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """-debug --enable and another debug_mode write in the same guild serialize
+        on GuildSettings' lock, so the last commit is what all three hold."""
+        mock_ctx.guild.id = 42
+        guild_settings = music_bot_with_redis.guild_settings
+        await asyncio.gather(
+            debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
+            ),
+            guild_settings.write(42, GuildConfig(debug_mode=False)),
+        )
+        stored = await GuildRedisStore(
+            cast(Any, music_bot_with_redis.redis), 42
+        ).read_config()
+        assert stored is not None
+        cached = guild_settings.peek(42)
+        assert cached is not None
+        assert stored.debug_mode == cached.debug_mode
+        assert music_bot_with_redis.debug_settings.enabled(42) is cached.debug_mode
 
     async def test_leaving_a_guild_drops_the_stored_choice(
         self, music_bot_with_redis: MusicBotCog

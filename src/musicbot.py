@@ -6,7 +6,7 @@ from typing import (
     Any,
     Optional,
 )
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
 import discord
 from discord.ext import commands
@@ -75,6 +75,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
 from src.recovery import VoiceWatchdog, restore_guild
+from src.settings import GuildSettings
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -162,10 +163,14 @@ class MusicBot(commands.Cog):
         # Read directly by MusicContext.send and MusicPlayer. Not named `debug`:
         # that is the -debug command.
         self.debug_settings = debug_mode.DebugSettings()
+        # Every guild's stored settings, and the one writer of guild:{id}:config.
+        self.guild_settings = GuildSettings(self)
+        # The latest hydrate retry, for the guilds a pass could not read.
+        self._hydrate_retry: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
-        """Spawn the debug hydration and the Spotify credential probe. discord.py
-        awaits this inside setup_hook, so nothing here blocks."""
+        """Spawn the settings hydration and the Spotify credential probe.
+        discord.py awaits this inside setup_hook, so nothing here blocks."""
         # A reloaded cog starts from DEBUG_MODE; the operator's session default
         # outlives it. getattr: a bot built without setup_hook has no BotSettings.
         bot_settings = getattr(self.bot, "bot_settings", None)
@@ -174,15 +179,16 @@ class MusicBot(commands.Cog):
         # At load, not only on toggles (see RuntimeSampler.apply); the hydration
         # re-syncs once the stored choices land.
         self.debug_settings.sync_sampler()
-        spawn_background(self._hydrate_debug(), self._restore_tasks)
+        spawn_background(self._hydrate_configs(), self._restore_tasks)
         if self.spotify is None:
             return
         spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
 
     async def cog_unload(self) -> None:
         """Stop the sampler and the shared sessions, or a reload leaks them.
-        Background tasks go first: the hydration ends in sync_sampler, so one in
-        flight would restart the sampler after aclose(). Every step is guarded
+        Background tasks and settings loads go first: both can end in
+        sync_sampler, so one in flight would restart the sampler after aclose().
+        Every step is guarded
         individually — Cog._eject only logs a raise, so an early failure would
         silently skip the rest."""
         spotify = self.spotify
@@ -194,6 +200,7 @@ class MusicBot(commands.Cog):
         # early exit is an un-awaited warning.
         steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
             ("background tasks", _cancel_background),
+            ("settings loads", self.guild_settings.aclose),
             ("runtime sampler", self.debug_settings.aclose),
             ("prometheus session", debug_mode.close_prometheus_session),
         ]
@@ -1078,7 +1085,9 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.volume")
     async def volume(self, ctx: commands.Context, volume: str) -> None:
         try:
-            await volume_cmd.run(ctx, volume, mp=self.get_mp(ctx))
+            await volume_cmd.run(
+                ctx, volume, mp=self.get_mp(ctx), guild_settings=self.guild_settings
+            )
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1113,16 +1122,34 @@ class MusicBot(commands.Cog):
         """The dashboards' debug footer, for a ctx rather than a guild."""
         return self.debug_settings.footer(ctx.guild, host_metrics=host_metrics)
 
-    async def _hydrate_debug(self) -> None:
-        """Feed DebugSettings.hydrate this bot's redis handle and guild list.
-        bot.guilds is empty until READY, so cog_load's pass covers an extension
-        reload and on_ready's a cold start."""
-        await self.debug_settings.hydrate(self.redis, self.bot.guilds)
+    async def _hydrate_configs(self, ids: Optional[Sequence[int]] = None) -> None:
+        """One bounded GuildSettings.hydrate pass over `ids` (default: every guild),
+        then a background retry for any guild it could not read, so a caller
+        awaiting this returns after one pass even while Redis stays down. A full
+        pass supersedes the previous retry. bot.guilds is empty until READY, so
+        cog_load's pass covers an extension reload and on_ready's a cold start."""
+        full = ids is None
+        omitted = await self.guild_settings.hydrate(
+            [guild.id for guild in self.bot.guilds] if ids is None else ids
+        )
+        if not omitted:
+            return
+        if full and self._hydrate_retry is not None:
+            self._hydrate_retry.cancel()
+        self._hydrate_retry = spawn_background(
+            self.guild_settings.retry_hydrate(omitted), self._restore_tasks
+        )
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """Read a joined guild's stored settings into the cache, as the startup pass
+        does for the guilds present at READY."""
+        await self._hydrate_configs([guild.id])
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
-        """Registration only — see DebugSettings.forget."""
-        await self.debug_settings.forget(self.redis, guild.id)
+        """Registration only — see GuildSettings.forget."""
+        await self.guild_settings.forget(guild.id)
 
     @commands.command(
         name="debug",
@@ -1171,11 +1198,17 @@ class MusicBot(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        """Cold start or session loss (not a WebSocket resume): one recovery
-        task per guild."""
+        """Cold start or session loss (not a WebSocket resume): hydrate, then one
+        recovery task per guild."""
         if self.redis is None:
             return
-        spawn_background(self._hydrate_debug(), self._restore_tasks)
+        spawn_background(self._recover_after_ready(), self._restore_tasks)
+
+    async def _recover_after_ready(self) -> None:
+        """The hydrate pass before the restores: its batches hold one pool
+        connection at a time, and the per-guild fan-out after it is what reaches
+        the pool's cap, which raises rather than queueing."""
+        await self._hydrate_configs()
         for guild in self.bot.guilds:
             spawn_background(restore_guild(self, guild), self._restore_tasks)
 

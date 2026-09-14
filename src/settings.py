@@ -6,7 +6,8 @@ config.py reads the environment and holds each tunable's parsed value; this modu
 decides what chat may set, in what shape and within what range. The registry and
 the grammar do no IO, and every refusal carries the text a reply shows, none of it
 quoting the input. BotSettings applies the operator's stored overrides to config's
-accessors.
+accessors; GuildSettings caches every server's guild:{id}:config and is its only
+writer.
 """
 
 import asyncio
@@ -15,13 +16,22 @@ import math
 import os
 import re
 import textwrap
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+)
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, replace
 from enum import Enum
 from fractions import Fraction
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, Optional
+from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol, get_args
+from zoneinfo import ZoneInfo
 
 import redis.asyncio as aioredis
 from discord.ext import commands
@@ -30,14 +40,22 @@ from src import config, guild_state
 from src.guild_state import (
     CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
+    DEFAULT_VOLUME,
     OFF_SECS,
     BotConfigField,
     BotConfigFieldName,
     ConfigField,
     ConfigFieldName,
+    GuildConfig,
     is_config_field,
+    valid_timezone,
 )
-from src.redis_client import BOT_CONFIG_KEY, BotConfigStore
+from src.redis_client import (
+    BOT_CONFIG_KEY,
+    BotConfigStore,
+    GuildRedisStore,
+    read_guild_configs,
+)
 from src.util import DASHES, fmt_duration, fmt_seconds, get_logger
 
 if TYPE_CHECKING:
@@ -143,7 +161,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         field=ConfigField.VOLUME,
         minimum=_server_bound(ConfigField.VOLUME, "lo") * 100,
         maximum=_server_bound(ConfigField.VOLUME, "hi") * 100,
-        default=100.0,
+        default=DEFAULT_VOLUME * 100,
     ),
     SettingSpec(
         key="timezone",
@@ -1342,3 +1360,476 @@ class BotSettings:
         if applied:
             log.info(f"bot settings applied from {key}: {', '.join(applied)}")
         self.hydrated = True
+
+
+# ── Server settings: the guild:{id}:config cache and its one writer ──────────
+
+ALL_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
+    get_args(ConfigFieldName.__value__)
+)
+# One frozenset per shape of known fields (at most 2**7), shared by every entry.
+_KNOWN_SHAPES: Final[dict[frozenset[str], frozenset[str]]] = {
+    ALL_CONFIG_FIELDS: ALL_CONFIG_FIELDS
+}
+_UNSET_CONFIG: Final = GuildConfig()
+_HYDRATE_RETRY_FIRST_SECS: Final[float] = 1.0
+_HYDRATE_RETRY_MAX_SECS: Final[float] = 60.0
+
+
+class WriteMode(Enum):
+    SET = "set"  # overwrite the field
+    SEED = "seed"  # volume only, HSETNX: restore's one-release legacy migration
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WriteResult:
+    # False: refused (the guild was forgotten, a SEED was superseded or did not
+    # persist), and nothing changed.
+    applied: bool
+    # The store call returned True inside CONFIG_IO_TIMEOUT_SECS. False is "not
+    # confirmed", not "not written": a pipeline sends before it reads replies.
+    persisted: bool
+    # The cached config immediately before this commit.
+    previous: Optional[GuildConfig]
+
+
+@dataclass(frozen=True, slots=True)
+class _Entry:
+    config: GuildConfig
+    # The fields a successful read or a write has covered; the rest read as unset.
+    known: frozenset[str]
+
+
+_EMPTY: Final = _Entry(_UNSET_CONFIG, ALL_CONFIG_FIELDS)
+
+
+class _GuildLock:
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+class _SettingsBot(Protocol):
+    @property
+    def application_id(self) -> Optional[int]: ...
+
+
+class _SettingsPlayer(Protocol):
+    volume: float
+    timezone: ZoneInfo
+
+
+class _SettingsCog(Protocol):
+    """What GuildSettings reads off the cog, each at call time."""
+
+    @property
+    def redis(self) -> Optional[aioredis.Redis]: ...
+    @property
+    def mps(self) -> Mapping[int, _SettingsPlayer]: ...
+    @property
+    def debug_settings(self) -> DebugSettings: ...
+    @property
+    def bot(self) -> _SettingsBot: ...
+
+
+class GuildSettings:
+    """Every server's guild:{id}:config, cached, and the only writer of that key.
+
+    Hot paths read synchronously (peek and the accessors) and never await. Three
+    readers fill the cache — a restore's snapshot (seed), the startup pass
+    (hydrate) and the -settings command (load) — and every write, reset and forget
+    goes through here, serialized per guild. One sequence counter stamps each
+    committed (guild, field), and a read skips a field stamped after it began, so a
+    read that straddles a write never undoes it. debug_mode is projected into
+    DebugSettings. See docs/ARCHITECTURE.md#settings-resolution."""
+
+    def __init__(self, cog: _SettingsCog) -> None:
+        self._cog = cog
+        self._entries: dict[int, _Entry] = {}
+        self._seq = 0
+        self._stamps: dict[tuple[int, str], int] = {}
+        self._forgotten_at: dict[int, int] = {}
+        # (guild, field) pairs whose last write did not reach Redis.
+        self._unpersisted: set[tuple[int, str]] = set()
+        # The `started` value of every open reading(), counted.
+        self._readers: dict[int, int] = {}
+        self._locks: dict[int, _GuildLock] = {}
+        self._loads: dict[int, asyncio.Task[Optional[GuildConfig]]] = {}
+
+    # ── Synchronous reads ─────────────────────────────────────────────────────
+
+    def peek(self, guild_id: int) -> Optional[GuildConfig]:
+        """The cached config, or None when nothing is cached. A field no read or
+        write has covered reads as unset."""
+        entry = self._entries.get(guild_id)
+        return entry.config if entry is not None else None
+
+    def is_complete(self, guild_id: int) -> bool:
+        """True once a successful read has covered every field."""
+        entry = self._entries.get(guild_id)
+        return entry is not None and entry.known == ALL_CONFIG_FIELDS
+
+    def is_persisted(self, guild_id: int, field: str) -> bool:
+        """False while the field's last write had not reached Redis."""
+        return (guild_id, field) not in self._unpersisted
+
+    # ── Stamps and registrations ──────────────────────────────────────────────
+
+    @contextmanager
+    def reading(self) -> Iterator[int]:
+        """Register a read. Yields `started`, the counter's value now: a write that
+        commits later stamps above it. Enter it immediately before the read and
+        stay inside until the last use of `started`, so pruning keeps every stamp
+        it will be compared with."""
+        started = self._seq
+        self._readers[started] = self._readers.get(started, 0) + 1
+        try:
+            yield started
+        finally:
+            if (remaining := self._readers[started] - 1) > 0:
+                self._readers[started] = remaining
+            else:
+                del self._readers[started]
+            self._prune()
+
+    def _prune(self) -> None:
+        """Drop the stamps and forgets no registered read could see: an absent one
+        compares as never set, which is what `stamp > started` already answers for
+        every stamp at or below the lowest open `started`, and for any later read."""
+        low = min(self._readers, default=self._seq)
+        if self._stamps:
+            self._stamps = {k: v for k, v in self._stamps.items() if v > low}
+        if self._forgotten_at:
+            self._forgotten_at = {
+                g: v for g, v in self._forgotten_at.items() if v > low
+            }
+
+    def _require_open(self, started: int) -> None:
+        if started not in self._readers:
+            raise ValueError(f"{started} is not an open reading() registration")
+
+    def _store_entry(
+        self, guild_id: int, config: GuildConfig, known: frozenset[str]
+    ) -> None:
+        known = _KNOWN_SHAPES.setdefault(known, known)
+        if known is ALL_CONFIG_FIELDS and config == _UNSET_CONFIG:
+            self._entries[guild_id] = _EMPTY
+        else:
+            self._entries[guild_id] = _Entry(config, known)
+
+    # ── Reads into the cache ──────────────────────────────────────────────────
+
+    def _merge(
+        self, guild_id: int, config: GuildConfig, started: int
+    ) -> frozenset[str]:
+        """The merge every reader shares. Nothing for a guild forgotten since the
+        read began; otherwise every field not stamped since, and not marked
+        unpersisted — an unsaved write keeps its value until a later write reaches
+        Redis. Returns the accepted fields; the caller projects debug_mode."""
+        if self._forgotten_at.get(guild_id, 0) > started:
+            return frozenset()
+        accepted = frozenset(
+            field
+            for field in ALL_CONFIG_FIELDS
+            if self._stamps.get((guild_id, field), 0) <= started
+            and (guild_id, field) not in self._unpersisted
+        )
+        if not accepted:
+            return accepted
+        entry = self._entries.get(guild_id)
+        base = entry.config if entry is not None else _UNSET_CONFIG
+        merged = replace(base, **{field: getattr(config, field) for field in accepted})
+        known = accepted if entry is None else entry.known | accepted
+        self._store_entry(guild_id, merged, known)
+        return accepted
+
+    def seed(
+        self, guild_id: int, config: GuildConfig, *, started: int
+    ) -> frozenset[str]:
+        """Merge a restore snapshot's config, read inside reading() as `started`.
+        Returns the accepted fields: restore assigns volume and timezone, and
+        migrates the legacy volume, only for those."""
+        self._require_open(started)
+        accepted = self._merge(guild_id, config, started)
+        if ConfigField.DEBUG_MODE in accepted:
+            self._cog.debug_settings.apply_choices(
+                {guild_id: config.debug_mode}, persisted=True
+            )
+        return accepted
+
+    async def hydrate(self, guild_ids: Iterable[int]) -> set[int]:
+        """One bounded read of every guild's config, merged. Returns the guilds it
+        could not read (a failed or timed-out batch); none without Redis."""
+        redis = self._cog.redis
+        ids = list(guild_ids)
+        if redis is None or not ids:
+            return set()
+        with self.reading() as started:
+            configs = await read_guild_configs(
+                redis, ids, batch_timeout=CONFIG_IO_TIMEOUT_SECS
+            )
+            choices: dict[int, Optional[bool]] = {}
+            for guild_id, stored in configs.items():
+                if ConfigField.DEBUG_MODE in self._merge(guild_id, stored, started):
+                    choices[guild_id] = stored.debug_mode
+            if choices:
+                self._cog.debug_settings.apply_choices(choices, persisted=True)
+        return set(ids) - configs.keys()
+
+    async def retry_hydrate(self, omitted: set[int]) -> None:
+        """Re-read the guilds a hydrate left out, backing off, until none is left.
+        A guild a seed or load completed meanwhile, or one forgotten since this
+        began, drops out: re-reading a departed guild would re-cache it."""
+        pending = set(omitted)
+        delay = _HYDRATE_RETRY_FIRST_SECS
+        with self.reading() as created:
+            while pending:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _HYDRATE_RETRY_MAX_SECS)
+                pending = {
+                    guild_id
+                    for guild_id in pending
+                    if not self.is_complete(guild_id)
+                    and self._forgotten_at.get(guild_id, 0) <= created
+                }
+                if pending:
+                    pending = await self.hydrate(pending)
+
+    async def load(self, guild_id: int) -> Optional[GuildConfig]:
+        """The guild's merged config, read now; None when the read failed or timed
+        out, which caches nothing. For the -settings command only. Concurrent
+        callers share one read, and cancelling one does not cancel it for the rest."""
+        job = self._loads.get(guild_id)
+        if job is None:
+            job = asyncio.ensure_future(self._load(guild_id))
+            self._loads[guild_id] = job
+            job.add_done_callback(lambda done: self._finish_load(guild_id, done))
+        return await asyncio.shield(job)
+
+    def _finish_load(
+        self, guild_id: int, done: asyncio.Task[Optional[GuildConfig]]
+    ) -> None:
+        if self._loads.get(guild_id) is done:
+            del self._loads[guild_id]
+
+    async def _load(self, guild_id: int) -> Optional[GuildConfig]:
+        redis = self._cog.redis
+        if redis is None:
+            return None
+        with self.reading() as started:
+            try:
+                async with asyncio.timeout(CONFIG_IO_TIMEOUT_SECS):
+                    stored = await GuildRedisStore(redis, guild_id).read_config()
+            except TimeoutError:
+                stored = None
+            if stored is None:
+                return None
+            if ConfigField.DEBUG_MODE in self._merge(guild_id, stored, started):
+                self._cog.debug_settings.apply_choices(
+                    {guild_id: stored.debug_mode}, persisted=True
+                )
+        return self.peek(guild_id)
+
+    # ── The write path ────────────────────────────────────────────────────────
+
+    @asynccontextmanager
+    async def _guild_lock(self, guild_id: int) -> AsyncIterator[None]:
+        """Per-guild, created on demand and dropped when its last user leaves. Every
+        waiter holds the same Lock: an entry deleted under a waiter would let the
+        next caller build a second Lock and run beside it."""
+        entry = self._locks.get(guild_id)
+        if entry is None:
+            entry = self._locks[guild_id] = _GuildLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0:
+                del self._locks[guild_id]
+
+    async def _store_io(
+        self, guild_id: int, call: Callable[[GuildRedisStore], Awaitable[bool]]
+    ) -> bool:
+        """One store call under CONFIG_IO_TIMEOUT_SECS; False without Redis or on
+        a timeout. The store itself never raises (@_guild_op)."""
+        redis = self._cog.redis
+        if redis is None:
+            return False
+        try:
+            async with asyncio.timeout(CONFIG_IO_TIMEOUT_SECS):
+                return await call(GuildRedisStore(redis, guild_id))
+        except TimeoutError:
+            log.warning(f"[guild:{guild_id}] config write timed out; not confirmed")
+            return False
+
+    async def write(
+        self,
+        guild_id: int,
+        change: GuildConfig,
+        *,
+        mode: WriteMode = WriteMode.SET,
+        since: Optional[int] = None,
+        player: Optional[_SettingsPlayer] = None,
+    ) -> WriteResult:
+        """Set the one field `change` sets: the store call, then a synchronous
+        commit that stamps it, updates the cache, marks it unpersisted when the
+        call was not confirmed, projects debug_mode and assigns the live player's
+        volume or timezone. `player` defaults to the guild's registered player.
+
+        SEED (volume only) is restore's migration: `since` is restore's open
+        registration, and a volume write or reset stamped after it refuses the
+        seed. A SEED that did not persist changes nothing, so the next restore
+        retries it. `change` setting anything but exactly one field raises."""
+        stored = change.to_redis()
+        name = next(iter(stored), None)
+        if len(stored) != 1 or name is None or not is_config_field(name):
+            raise ValueError(f"a write sets exactly one config field; got {stored}")
+        if mode is WriteMode.SEED:
+            if name != ConfigField.VOLUME or since is None:
+                raise ValueError("SEED writes volume, with `since`")
+            self._require_open(since)
+        elif since is not None:
+            raise ValueError("`since` is for SEED")
+        if name == ConfigField.TIMEZONE and not valid_timezone(stored[name]):
+            raise ValueError(f"{stored[name]!r} is not a zone this host knows")
+        writer = self._cog.bot.application_id
+        with self.reading() as started:
+            async with self._guild_lock(guild_id):
+                previous = self.peek(guild_id)
+                if self._forgotten_at.get(guild_id, 0) > started or (
+                    since is not None
+                    and self._stamps.get((guild_id, ConfigField.VOLUME), 0) > since
+                ):
+                    return WriteResult(
+                        applied=False, persisted=False, previous=previous
+                    )
+                persisted = await self._store_io(
+                    guild_id,
+                    lambda store: self._dispatch(store, change, mode, writer),
+                )
+                if mode is WriteMode.SEED and not persisted:
+                    return WriteResult(
+                        applied=False, persisted=False, previous=previous
+                    )
+                self._commit(
+                    guild_id,
+                    name,
+                    getattr(change, name),
+                    persisted=persisted,
+                    live=mode is WriteMode.SET,
+                    player=player,
+                )
+                return WriteResult(applied=True, persisted=persisted, previous=previous)
+
+    async def reset(
+        self,
+        guild_id: int,
+        field: ConfigFieldName,
+        *,
+        player: Optional[_SettingsPlayer] = None,
+    ) -> WriteResult:
+        """Delete one stored choice, on write's order. volume also clears the legacy
+        :state copy. The live player returns to the default volume or zone."""
+        with self.reading() as started:
+            async with self._guild_lock(guild_id):
+                previous = self.peek(guild_id)
+                if self._forgotten_at.get(guild_id, 0) > started:
+                    return WriteResult(
+                        applied=False, persisted=False, previous=previous
+                    )
+                persisted = await self._store_io(
+                    guild_id, lambda store: self._dispatch_reset(store, field)
+                )
+                self._commit(
+                    guild_id, field, None, persisted=persisted, live=True, player=player
+                )
+                return WriteResult(applied=True, persisted=persisted, previous=previous)
+
+    async def forget(self, guild_id: int) -> bool:
+        """Delete a departed guild's config and everything cached for it, under the
+        guild's lock. Returns whether the DELETE was confirmed. A read that began
+        before this, and a write queued behind it, are refused."""
+        async with self._guild_lock(guild_id):
+            persisted = await self._store_io(
+                guild_id, lambda store: store.clear_config()
+            )
+            self._seq += 1
+            self._forgotten_at[guild_id] = self._seq
+            self._entries.pop(guild_id, None)
+            self._stamps = {k: v for k, v in self._stamps.items() if k[0] != guild_id}
+            self._unpersisted = {k for k in self._unpersisted if k[0] != guild_id}
+            self._cog.debug_settings.drop(guild_id)
+            self._prune()
+            return persisted
+
+    @staticmethod
+    async def _dispatch(
+        store: GuildRedisStore,
+        change: GuildConfig,
+        mode: WriteMode,
+        writer: Optional[int],
+    ) -> bool:
+        """The one store method each field writes through."""
+        if change.volume is not None:
+            if mode is WriteMode.SEED:
+                return await store.migrate_volume(change.volume, writer=writer)
+            return await store.set_volume(change.volume, writer=writer)
+        if change.timezone is not None:
+            return await store.set_timezone(change.timezone, writer=writer)
+        if change.debug_mode is not None:
+            return await store.set_debug_mode(change.debug_mode, writer=writer)
+        return await store.update_config(change, writer=writer)
+
+    @staticmethod
+    async def _dispatch_reset(store: GuildRedisStore, field: ConfigFieldName) -> bool:
+        if field == ConfigField.VOLUME:
+            return await store.reset_volume()
+        return await store.reset_config_fields(field)
+
+    def _commit(
+        self,
+        guild_id: int,
+        field: str,
+        value: Optional[bool | float | str],
+        *,
+        persisted: bool,
+        live: bool,
+        player: Optional[_SettingsPlayer],
+    ) -> None:
+        """Synchronous, so nothing interleaves: a restore's gate reads the stamp,
+        and the live assignment lands with it."""
+        self._seq += 1
+        self._stamps[(guild_id, field)] = self._seq
+        entry = self._entries.get(guild_id)
+        base = entry.config if entry is not None else _UNSET_CONFIG
+        known = (entry.known if entry is not None else frozenset()) | {field}
+        self._store_entry(guild_id, replace(base, **{field: value}), known)
+        if persisted:
+            self._unpersisted.discard((guild_id, field))
+        else:
+            self._unpersisted.add((guild_id, field))
+        if field == ConfigField.DEBUG_MODE:
+            self._cog.debug_settings.apply_choices(
+                {guild_id: value if isinstance(value, bool) else None},
+                persisted=persisted,
+            )
+        if live:
+            target = player if player is not None else self._cog.mps.get(guild_id)
+            if target is not None and field == ConfigField.VOLUME:
+                target.volume = value if isinstance(value, float) else DEFAULT_VOLUME
+            elif target is not None and field == ConfigField.TIMEZONE:
+                zone = value if isinstance(value, str) else None
+                target.timezone = GuildConfig(timezone=zone).tzinfo()
+        self._prune()
+
+    async def aclose(self) -> None:
+        """Cancel every load in flight: a merge landing after the cog unloads would
+        project debug_mode into a DebugSettings whose sampler already stopped."""
+        jobs = list(self._loads.values())
+        for job in jobs:
+            job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)

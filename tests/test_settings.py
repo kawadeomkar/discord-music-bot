@@ -25,13 +25,15 @@ from src.guild_state import (
     BotConfig,
     BotConfigField,
     ConfigField,
+    GuildConfig,
 )
-from src.redis_client import BotConfigStore
+from src.redis_client import BotConfigStore, GuildRedisStore
 from src.musicplayer import _fmt_total_duration
 from src.settings import (
     SETTINGS,
     TIMEZONE_REDIRECTS,
     BotSettings,
+    GuildSettings,
     Parsed,
     Refusal,
     RefusalReason,
@@ -1116,3 +1118,732 @@ class TestDebugDefaultIsSessionOnly:
             assert late.default is True
         finally:
             await late.aclose()
+
+
+# ── GuildSettings ─────────────────────────────────────────────────────────────
+
+_GUILD = 424242424242424242
+
+
+@pytest.fixture
+async def guild_cog(fake_redis: aioredis.Redis) -> Any:
+    """The cog GuildSettings reads, at call time: a real DebugSettings, a player
+    registry, the bot's application id and the Redis handle."""
+    cog = MagicMock()
+    cog.redis = fake_redis
+    cog.mps = {}
+    cog.bot.application_id = _APP_ID
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
+    yield cog
+    await cog.debug_settings.aclose()
+
+
+def _guild_store(redis: aioredis.Redis, guild_id: int = _GUILD) -> GuildRedisStore:
+    return GuildRedisStore(redis, guild_id)
+
+
+class TestGuildSettingsReads:
+    async def test_nothing_is_cached_until_a_read_or_write(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        assert guild_settings.peek(_GUILD) is None
+        assert guild_settings.is_complete(_GUILD) is False
+        assert guild_settings.is_persisted(_GUILD, "volume") is True
+
+    async def test_a_hydrate_caches_what_it_read_and_projects_debug_mode(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        await _guild_store(fake_redis).update_config(
+            GuildConfig(idle_timeout_secs=600.0)
+        )
+        await _guild_store(fake_redis).set_debug_mode(True)
+        guild_settings = GuildSettings(guild_cog)
+
+        assert await guild_settings.hydrate([_GUILD]) == set()
+
+        assert guild_settings.peek(_GUILD) == GuildConfig(
+            idle_timeout_secs=600.0, debug_mode=True
+        )
+        assert guild_settings.is_complete(_GUILD)
+        assert guild_cog.debug_settings.enabled(_GUILD) is True
+
+    async def test_guilds_that_never_chose_share_one_empty_entry(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        await guild_settings.hydrate([1, 2, 3])
+        entries = [guild_settings._entries[g] for g in (1, 2, 3)]
+        assert all(entry is settings._EMPTY for entry in entries)
+        assert guild_settings.is_complete(1)
+
+    async def test_a_write_replaces_only_its_guilds_shared_entry(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        await guild_settings.hydrate([1, 2])
+        await guild_settings.write(1, GuildConfig(alone_timeout_secs=30.0))
+        assert guild_settings._entries[1] is not settings._EMPTY
+        assert guild_settings._entries[2] is settings._EMPTY
+        assert guild_settings.is_complete(1)
+
+    async def test_a_failed_batch_is_returned_and_caches_nothing(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        with patch.object(fake_redis, "pipeline", side_effect=RuntimeError("down")):
+            assert await guild_settings.hydrate([1, 2]) == {1, 2}
+        assert guild_settings.peek(1) is None
+
+    async def test_a_hydrate_without_redis_reads_nothing(self, guild_cog: Any) -> None:
+        guild_cog.redis = None
+        assert await GuildSettings(guild_cog).hydrate([1]) == set()
+
+    async def test_a_stalled_hydrate_gives_up_within_the_timeout(
+        self,
+        guild_cog: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(settings, "CONFIG_IO_TIMEOUT_SECS", 0.05)
+        guild_settings = GuildSettings(guild_cog)
+
+        async def stalled(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        with patch("redis.asyncio.client.Pipeline.execute", new=stalled):
+            async with asyncio.timeout(5):
+                assert await guild_settings.hydrate([1]) == {1}
+        assert guild_settings.peek(1) is None
+        assert "config read failed" in caplog.text
+
+    async def test_seed_needs_an_open_registration(self, guild_cog: Any) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        with pytest.raises(ValueError):
+            guild_settings.seed(_GUILD, GuildConfig(), started=0)
+        with guild_settings.reading() as started:
+            assert guild_settings.seed(_GUILD, GuildConfig(), started=started) == (
+                settings.ALL_CONFIG_FIELDS
+            )
+
+    async def test_concurrent_loads_share_one_read(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        """Fifty -settings in one guild cost one HGETALL and one connection."""
+        await _guild_store(fake_redis).update_config(GuildConfig(np_refresh_secs=5.0))
+        guild_settings = GuildSettings(guild_cog)
+        real = GuildRedisStore.read_config
+        release = asyncio.Event()
+        calls = 0
+
+        async def counted(store: GuildRedisStore) -> Any:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return await real(store)
+
+        with patch.object(GuildRedisStore, "read_config", new=counted):
+            callers = [
+                asyncio.create_task(guild_settings.load(_GUILD)) for _ in range(50)
+            ]
+            await asyncio.sleep(0)
+            callers[0].cancel()
+            release.set()
+            results = await asyncio.gather(*callers[1:])
+
+        assert calls == 1
+        assert all(r == GuildConfig(np_refresh_secs=5.0) for r in results)
+        assert guild_settings._loads == {}
+
+    async def test_a_failed_or_stalled_load_is_none_and_caches_nothing(
+        self, guild_cog: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "CONFIG_IO_TIMEOUT_SECS", 0.05)
+        guild_settings = GuildSettings(guild_cog)
+
+        async def stalled(_: object) -> None:
+            await asyncio.Event().wait()
+
+        with patch.object(GuildRedisStore, "read_config", new=stalled):
+            async with asyncio.timeout(5):
+                assert await guild_settings.load(_GUILD) is None
+        with patch.object(
+            GuildRedisStore, "read_config", new=AsyncMock(return_value=None)
+        ):
+            assert await guild_settings.load(_GUILD) is None
+        assert guild_settings.peek(_GUILD) is None
+
+    async def test_aclose_cancels_a_load_in_flight(self, guild_cog: Any) -> None:
+        guild_settings = GuildSettings(guild_cog)
+
+        async def stalled(_: object) -> None:
+            await asyncio.Event().wait()
+
+        with patch.object(GuildRedisStore, "read_config", new=stalled):
+            caller = asyncio.create_task(guild_settings.load(_GUILD))
+            await asyncio.sleep(0)
+            await guild_settings.aclose()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        assert guild_settings._loads == {}
+
+
+class TestGuildSettingsWritePath:
+    async def test_each_write_reaches_redis_the_cache_and_the_stamp(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        result = await guild_settings.write(_GUILD, GuildConfig(volume=0.4))
+        assert result.applied and result.persisted and result.previous is None
+        assert await _guild_store(fake_redis).read_config() == GuildConfig(volume=0.4)
+        assert guild_settings.peek(_GUILD) == GuildConfig(volume=0.4)
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            GuildConfig(volume=0.5),
+            GuildConfig(timezone="Europe/London"),
+            GuildConfig(debug_mode=True),
+            GuildConfig(idle_timeout_secs=600.0),
+        ],
+        ids=lambda c: next(iter(c.to_redis())),
+    )
+    async def test_every_set_dispatch_stamps_the_application(
+        self, guild_cog: Any, fake_redis: aioredis.Redis, change: GuildConfig
+    ) -> None:
+        await GuildSettings(guild_cog).write(_GUILD, change)
+        stamp = await fake_redis.hget(
+            _guild_store(fake_redis).config_key(), "writer_app_id"
+        )
+        assert stamp == str(_APP_ID).encode()
+
+    async def test_a_write_on_an_uncached_guild_is_partial_until_loaded(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        """The other fields read as their defaults, as before the write, and a
+        load completes the entry without losing either value."""
+        await _guild_store(fake_redis).update_config(
+            GuildConfig(alone_timeout_secs=120.0)
+        )
+        guild_settings = GuildSettings(guild_cog)
+
+        await guild_settings.write(_GUILD, GuildConfig(idle_timeout_secs=900.0))
+        assert guild_settings.peek(_GUILD) == GuildConfig(idle_timeout_secs=900.0)
+        assert guild_settings.is_complete(_GUILD) is False
+
+        loaded = await guild_settings.load(_GUILD)
+        assert loaded == GuildConfig(idle_timeout_secs=900.0, alone_timeout_secs=120.0)
+        assert guild_settings.is_complete(_GUILD)
+
+    async def test_the_commit_assigns_the_live_player(self, guild_cog: Any) -> None:
+        player = MagicMock()
+        guild_cog.mps[_GUILD] = player
+        guild_settings = GuildSettings(guild_cog)
+
+        await guild_settings.write(_GUILD, GuildConfig(volume=0.3))
+        await guild_settings.write(_GUILD, GuildConfig(timezone="Europe/London"))
+        assert player.volume == 0.3
+        assert player.timezone == ZoneInfo("Europe/London")
+
+        await guild_settings.reset(_GUILD, ConfigField.VOLUME)
+        await guild_settings.reset(_GUILD, ConfigField.TIMEZONE)
+        assert player.volume == guild_state.DEFAULT_VOLUME
+        assert player.timezone == ZoneInfo(guild_state.DEFAULT_TIMEZONE)
+
+    async def test_a_volume_reset_clears_both_copies(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        await guild_settings.write(_GUILD, GuildConfig(volume=0.3))
+        result = await guild_settings.reset(_GUILD, ConfigField.VOLUME)
+        assert result.persisted and result.previous == GuildConfig(volume=0.3)
+        store = _guild_store(fake_redis)
+        assert not await fake_redis.hexists(store.config_key(), "volume")
+        assert not await fake_redis.hexists(store.state_key(), "volume")
+
+    async def test_a_debug_write_projects_into_debug_settings(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        await guild_settings.write(_GUILD, GuildConfig(debug_mode=True))
+        assert guild_cog.debug_settings.enabled(_GUILD) is True
+        await guild_settings.reset(_GUILD, ConfigField.DEBUG_MODE)
+        assert guild_cog.debug_settings.has_override(_GUILD) is False
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            GuildConfig(),
+            GuildConfig(volume=0.5, debug_mode=True),
+            GuildConfig(idle_timeout_secs=5.0),  # out of domain: already unset
+            GuildConfig(timezone="Mars/Olympus"),
+        ],
+        ids=["none", "two", "out-of-domain", "bad-zone"],
+    )
+    async def test_a_change_that_is_not_one_valid_field_raises(
+        self, guild_cog: Any, change: GuildConfig
+    ) -> None:
+        """A registry range wider than CONFIG_DOMAIN fails loudly, not silently."""
+        with pytest.raises(ValueError):
+            await GuildSettings(guild_cog).write(_GUILD, change)
+
+    async def test_since_belongs_to_seed_alone(self, guild_cog: Any) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        with pytest.raises(ValueError):
+            await guild_settings.write(
+                _GUILD, GuildConfig(volume=0.5), mode=settings.WriteMode.SEED
+            )
+        with guild_settings.reading() as started:
+            with pytest.raises(ValueError):
+                await guild_settings.write(
+                    _GUILD, GuildConfig(volume=0.5), since=started
+                )
+            with pytest.raises(ValueError):
+                await guild_settings.write(
+                    _GUILD,
+                    GuildConfig(debug_mode=True),
+                    mode=settings.WriteMode.SEED,
+                    since=started,
+                )
+
+    async def test_a_stalled_store_reports_not_saved_within_the_timeout(
+        self, guild_cog: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "CONFIG_IO_TIMEOUT_SECS", 0.05)
+
+        async def stalled(*_: object, **__: object) -> bool:
+            await asyncio.Event().wait()
+            return True
+
+        guild_settings = GuildSettings(guild_cog)
+        with patch.object(GuildRedisStore, "set_volume", new=stalled):
+            async with asyncio.timeout(5):
+                result = await guild_settings.write(_GUILD, GuildConfig(volume=0.5))
+        assert result.applied and not result.persisted
+        assert not guild_settings.is_persisted(_GUILD, "volume")
+
+    async def test_without_redis_a_write_applies_unsaved(self, guild_cog: Any) -> None:
+        guild_cog.redis = None
+        guild_settings = GuildSettings(guild_cog)
+        result = await guild_settings.write(_GUILD, GuildConfig(debug_mode=True))
+        assert result.applied and not result.persisted
+        assert guild_cog.debug_settings.is_persisted(_GUILD) is False
+
+
+class TestGuildSettingsStamps:
+    """One counter orders every read against every write and forget."""
+
+    async def test_forget_during_a_parked_load_recaches_nothing(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        await _guild_store(fake_redis).set_debug_mode(True)
+        guild_settings = GuildSettings(guild_cog)
+        reading, release = asyncio.Event(), asyncio.Event()
+        real = GuildRedisStore.read_config
+
+        async def parked(store: GuildRedisStore) -> Any:
+            config = await real(store)
+            reading.set()
+            await release.wait()
+            return config
+
+        with patch.object(GuildRedisStore, "read_config", new=parked):
+            load = asyncio.create_task(guild_settings.load(_GUILD))
+            await reading.wait()
+            assert await guild_settings.forget(_GUILD) is True
+            release.set()
+            await load
+
+        assert guild_settings.peek(_GUILD) is None
+        assert guild_cog.debug_settings.has_override(_GUILD) is False
+
+    async def test_a_write_queued_behind_forget_is_refused(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        """It cannot recreate a no-TTL key for a departed guild."""
+        await _guild_store(fake_redis).set_debug_mode(True)
+        guild_settings = GuildSettings(guild_cog)
+        clearing, release = asyncio.Event(), asyncio.Event()
+        real = GuildRedisStore.clear_config
+
+        async def parked(store: GuildRedisStore) -> bool:
+            clearing.set()
+            await release.wait()
+            return await real(store)
+
+        with patch.object(GuildRedisStore, "clear_config", new=parked):
+            forget = asyncio.create_task(guild_settings.forget(_GUILD))
+            await clearing.wait()
+            write = asyncio.create_task(
+                guild_settings.write(_GUILD, GuildConfig(idle_timeout_secs=600.0))
+            )
+            await asyncio.sleep(0)
+            # An unrelated read finishing must not prune the forget away.
+            await guild_settings.hydrate([7])
+            release.set()
+            await forget
+            result = await write
+
+        assert result.applied is False
+        assert await fake_redis.exists(_guild_store(fake_redis).config_key()) == 0
+        assert guild_settings.peek(_GUILD) is None
+
+    async def test_a_debug_write_during_a_hydrate_is_kept_and_the_rest_applies(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        await _guild_store(fake_redis).set_volume(0.3)
+        await _guild_store(fake_redis).set_debug_mode(False)
+        guild_settings = GuildSettings(guild_cog)
+        real = settings.read_guild_configs
+
+        async def read_then_write(*args: Any, **kwargs: Any) -> Any:
+            configs = await real(*args, **kwargs)
+            await guild_settings.write(_GUILD, GuildConfig(debug_mode=True))
+            # The hydrate is still registered, so the stamp is still there.
+            assert (_GUILD, "debug_mode") in guild_settings._stamps
+            return configs
+
+        with patch("src.settings.read_guild_configs", new=read_then_write):
+            await guild_settings.hydrate([_GUILD])
+
+        assert guild_settings.peek(_GUILD) == GuildConfig(volume=0.3, debug_mode=True)
+        assert guild_cog.debug_settings.enabled(_GUILD) is True
+        assert guild_settings._stamps == {}
+
+    async def test_an_unsaved_write_outlives_every_later_read(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        """Its reply promised it applies until restart; a read of the older stored
+        value must not quietly undo that."""
+        await _guild_store(fake_redis).set_volume(0.3)
+        guild_settings = GuildSettings(guild_cog)
+        with patch.object(
+            GuildRedisStore, "set_volume", new=AsyncMock(return_value=False)
+        ):
+            await guild_settings.write(_GUILD, GuildConfig(volume=0.8))
+
+        await guild_settings.hydrate([_GUILD])
+        await guild_settings.load(_GUILD)
+        with guild_settings.reading() as started:
+            accepted = guild_settings.seed(
+                _GUILD, GuildConfig(volume=0.3), started=started
+            )
+        assert "volume" not in accepted
+        assert guild_settings.peek(_GUILD) == GuildConfig(volume=0.8)
+
+        await guild_settings.write(_GUILD, GuildConfig(volume=0.6))
+        assert guild_settings.is_persisted(_GUILD, "volume")
+        await guild_settings.hydrate([_GUILD])
+        assert guild_settings.peek(_GUILD) == GuildConfig(volume=0.6)
+
+    async def test_nothing_registered_leaves_no_stamps_behind(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        await guild_settings.write(_GUILD, GuildConfig(volume=0.5))
+        await guild_settings.forget(_GUILD)
+        assert guild_settings._stamps == {}
+        assert guild_settings._forgotten_at == {}
+        assert guild_settings._readers == {}
+
+    async def test_a_retry_rereads_only_what_was_omitted_and_stops(
+        self,
+        guild_cog: Any,
+        fake_redis: aioredis.Redis,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(settings, "_HYDRATE_RETRY_FIRST_SECS", 0.001)
+        await _guild_store(fake_redis, 1).set_debug_mode(True)
+        guild_settings = GuildSettings(guild_cog)
+        read: list[list[int]] = []
+        real = settings.read_guild_configs
+
+        async def recording(redis: Any, ids: Any, **kwargs: Any) -> Any:
+            read.append(sorted(ids))
+            if len(read) == 1:
+                return {}
+            return await real(redis, ids, **kwargs)
+
+        with patch("src.settings.read_guild_configs", new=recording):
+            async with asyncio.timeout(5):
+                await guild_settings.retry_hydrate({1, 2})
+
+        assert read == [[1, 2], [1, 2]]
+        assert guild_settings.is_complete(1) and guild_settings.is_complete(2)
+
+    async def test_a_retry_drops_guilds_completed_or_forgotten_meanwhile(
+        self, guild_cog: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "_HYDRATE_RETRY_FIRST_SECS", 0.01)
+        guild_settings = GuildSettings(guild_cog)
+        read: list[list[int]] = []
+
+        async def recording(redis: Any, ids: Any, **kwargs: Any) -> Any:
+            read.append(sorted(ids))
+            return {}
+
+        with patch("src.settings.read_guild_configs", new=recording):
+            retry = asyncio.create_task(guild_settings.retry_hydrate({1, 2, 3}))
+            await asyncio.sleep(0)
+            await guild_settings.forget(2)
+            with guild_settings.reading() as started:
+                guild_settings.seed(3, GuildConfig(), started=started)
+            await asyncio.sleep(0.05)
+            retry.cancel()
+
+        assert read and all(ids == [1] for ids in read)
+
+    async def test_writes_to_one_guild_never_overlap_and_leave_no_lock(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        active = 0
+        peak = 0
+        real = GuildRedisStore.set_debug_mode
+
+        async def measured(store: GuildRedisStore, enabled: bool, **kw: Any) -> bool:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            try:
+                return await real(store, enabled, **kw)
+            finally:
+                active -= 1
+
+        async def clear(store: GuildRedisStore) -> bool:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return True
+
+        with (
+            patch.object(GuildRedisStore, "set_debug_mode", new=measured),
+            patch.object(GuildRedisStore, "clear_config", new=clear),
+        ):
+            await asyncio.gather(
+                *(
+                    guild_settings.write(_GUILD, GuildConfig(debug_mode=bool(i % 2)))
+                    for i in range(10)
+                ),
+                guild_settings.forget(_GUILD),
+                *(
+                    guild_settings.write(_GUILD, GuildConfig(debug_mode=True))
+                    for _ in range(5)
+                ),
+            )
+        assert peak == 1
+        assert guild_settings._locks == {}
+
+
+class TestGuildLockOutlivesItsFirstHolder:
+    async def test_a_caller_arriving_after_the_first_release_waits_its_turn(
+        self, guild_cog: Any
+    ) -> None:
+        """The entry survives while anyone waits on it. Dropped on the first
+        release, the next caller would build a second Lock and run beside the
+        waiter already holding the first."""
+        guild_settings = GuildSettings(guild_cog)
+        first_in, release_first = asyncio.Event(), asyncio.Event()
+        active = peak = calls = 0
+
+        async def measured(store: GuildRedisStore, enabled: bool, **kw: Any) -> bool:
+            nonlocal active, peak, calls
+            calls += 1
+            active += 1
+            peak = max(peak, active)
+            try:
+                if calls == 1:
+                    first_in.set()
+                    await release_first.wait()
+                else:
+                    await asyncio.sleep(0.02)
+                return True
+            finally:
+                active -= 1
+
+        with patch.object(GuildRedisStore, "set_debug_mode", new=measured):
+            first = asyncio.create_task(
+                guild_settings.write(_GUILD, GuildConfig(debug_mode=True))
+            )
+            await first_in.wait()
+            waiter = asyncio.create_task(
+                guild_settings.write(_GUILD, GuildConfig(debug_mode=False))
+            )
+            await asyncio.sleep(0)
+            release_first.set()
+            await first
+            late = asyncio.create_task(
+                guild_settings.write(_GUILD, GuildConfig(debug_mode=True))
+            )
+            await asyncio.gather(waiter, late)
+
+        assert peak == 1
+        assert guild_settings._locks == {}
+
+
+class TestSeedWrite:
+    """Restore's one-release volume migration, on the write path."""
+
+    async def test_a_volume_write_since_the_snapshot_supersedes_the_seed(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        with guild_settings.reading() as started:
+            await guild_settings.write(_GUILD, GuildConfig(volume=0.8))
+            result = await guild_settings.write(
+                _GUILD,
+                GuildConfig(volume=0.3),
+                mode=settings.WriteMode.SEED,
+                since=started,
+            )
+        assert result.applied is False
+        assert await _guild_store(fake_redis).read_config() == GuildConfig(volume=0.8)
+
+    async def test_a_seed_caches_without_touching_the_live_player(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        player = MagicMock()
+        player.volume = 0.3
+        guild_cog.mps[_GUILD] = player
+        guild_settings = GuildSettings(guild_cog)
+        with guild_settings.reading() as started:
+            result = await guild_settings.write(
+                _GUILD,
+                GuildConfig(volume=0.3),
+                mode=settings.WriteMode.SEED,
+                since=started,
+            )
+        assert result.applied and result.persisted
+        assert guild_settings.peek(_GUILD) == GuildConfig(volume=0.3)
+        assert player.volume == 0.3
+
+    async def test_a_seed_that_did_not_persist_changes_nothing(
+        self, guild_cog: Any
+    ) -> None:
+        """The legacy field survives, so the next restore retries."""
+        guild_settings = GuildSettings(guild_cog)
+        with (
+            patch.object(
+                GuildRedisStore, "migrate_volume", new=AsyncMock(return_value=False)
+            ),
+            guild_settings.reading() as started,
+        ):
+            result = await guild_settings.write(
+                _GUILD,
+                GuildConfig(volume=0.3),
+                mode=settings.WriteMode.SEED,
+                since=started,
+            )
+        assert result.applied is False
+        assert guild_settings.peek(_GUILD) is None
+        assert guild_settings.is_persisted(_GUILD, "volume")
+
+
+class TestGuildConfigHasOneWriter:
+    """Every store method that writes guild:{id}:config is called from
+    src/settings.py alone. A shortcut writing Redis directly would desynchronize
+    the cache from its first call."""
+
+    _WRITERS = frozenset(
+        {
+            "set_volume",
+            "migrate_volume",
+            "set_debug_mode",
+            "set_timezone",
+            "update_config",
+            "reset_config_fields",
+            "reset_volume",
+            "clear_config",
+        }
+    )
+
+    def test_only_settings_calls_them(self) -> None:
+        offenders = []
+        for path in sorted(Path("src").rglob("*.py")):
+            if path.name == "settings.py" and path.parent.name == "src":
+                continue
+            for node in ast.walk(ast.parse(path.read_text())):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in self._WRITERS
+                ):
+                    offenders.append(f"{path}:{node.lineno} {node.func.attr}")
+        assert not offenders
+
+    def test_the_walk_sees_the_writers_it_exempts(self) -> None:
+        tree = ast.parse(Path("src/settings.py").read_text())
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert self._WRITERS <= called
+
+
+def _awaits_reaching_guild_settings(tree: ast.AST) -> list[tuple[str, int]]:
+    """(function, line) for each await on guild_settings, directly or through a
+    local name bound to an expression that mentions it."""
+    found: list[tuple[str, int]] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        aliases = {
+            target.id
+            for node in ast.walk(func)
+            if isinstance(node, ast.Assign)
+            and "guild_settings" in ast.unparse(node.value)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Await):
+                continue
+            text = ast.unparse(node.value)
+            if "guild_settings" in text or any(
+                text.startswith(f"{alias}.") for alias in aliases
+            ):
+                found.append((func.name, node.lineno))
+    return found
+
+
+class TestHotPathsNeverAwaitSettings:
+    """The pool has no socket_timeout, so a hot path that awaited a settings read
+    would hang for as long as Redis stalls. Hot paths read synchronously."""
+
+    @pytest.mark.parametrize(
+        "name", ["peek", "is_complete", "is_persisted", "reading", "seed"]
+    )
+    def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:
+        import inspect
+
+        assert not inspect.iscoroutinefunction(getattr(GuildSettings, name))
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "src/recovery.py",
+            "src/commands/play.py",
+            "src/play_pipeline.py",
+            "src/play_placement.py",
+        ],
+    )
+    def test_no_hot_path_module_awaits_it(self, path: str) -> None:
+        assert _awaits_reaching_guild_settings(ast.parse(Path(path).read_text())) == []
+
+    def test_debug_build_inputs_does_not_await_it(self) -> None:
+        tree = ast.parse(Path("src/commands/debug.py").read_text())
+        assert [
+            hit
+            for hit in _awaits_reaching_guild_settings(tree)
+            if hit[0] == "build_inputs"
+        ] == []
+
+    def test_the_player_awaits_it_once_for_the_restore_seed(self) -> None:
+        tree = ast.parse(Path("src/musicplayer.py").read_text())
+        hits = _awaits_reaching_guild_settings(tree)
+        assert [name for name, _ in hits] == ["_restore_state"]

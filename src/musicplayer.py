@@ -34,11 +34,15 @@ from src.guild_queue import (
 )
 from src.guild_state import (
     DEFAULT_TIMEZONE,
+    DEFAULT_VOLUME,
+    ConfigField,
+    GuildConfig,
     HistoryEntry,
     NowPlayingData,
     SongQueueEntry,
 )
 from src.redis_client import GuildRedisStore
+from src.settings import WriteMode
 from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
@@ -96,8 +100,8 @@ class EtaWalk:
 
 # TODO: every guild's ETAs still render in DEFAULT_TIMEZONE, and in one zone per
 # guild rather than per viewer. queue_embed()'s "Est. playing at" and the NP
-# "Estimated finish" read GuildConfig.timezone, but nothing writes it (set_timezone
-# has no caller). Owed: a write path, then per-viewer rendering (<t:epoch:R>).
+# "Estimated finish" read GuildConfig.timezone, but no command writes it
+# (GuildSettings.write can). Owed: a command, then per-viewer rendering (<t:epoch:R>).
 
 
 def _fmt_total_duration(secs: int) -> str:
@@ -420,7 +424,7 @@ class MusicPlayer:
         self._last_stream_error: Optional[StreamFailure] = None
         self.play_next = asyncio.Event()
         self.play_message: Optional[discord.Embed] = None
-        self.volume = 1.0
+        self.volume = DEFAULT_VOLUME
         # Replaced at restore from GuildConfig.
         self.timezone = ZoneInfo(DEFAULT_TIMEZONE)
 
@@ -851,6 +855,7 @@ class MusicPlayer:
             self._restore_read_failed = True
             self._restore_complete.set()
             return
+        settings = self._cog.guild_settings
         try:
             await self.bot.wait_until_ready()
             with _tracer.start_as_current_span(
@@ -858,35 +863,45 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    # One pipelined read: state hash, pending queue, now-playing
-                    # snapshot, newest history.
-                    snapshot = await self.store.get_playback_snapshot()
-                    if snapshot is None:
-                        # Read failed — abort rather than proceed with fabricated
-                        # defaults. `finally` still sets _restore_complete.
-                        self._restore_read_failed = True
-                        log.warning(
-                            f"State restore aborted for guild {self._guild.id}: "
-                            f"Redis unavailable"
+                    # Registered from immediately before the read through the SEED
+                    # write: a settings write committing after `started` stamps
+                    # above it, and seed() leaves that field alone.
+                    with settings.reading() as started:
+                        # One pipelined read: state hash, pending queue, now-playing
+                        # snapshot, newest history.
+                        snapshot = await self.store.get_playback_snapshot()
+                        if snapshot is None:
+                            # Read failed — abort rather than proceed with fabricated
+                            # defaults. `finally` still sets _restore_complete.
+                            self._restore_read_failed = True
+                            log.warning(
+                                f"State restore aborted for guild {self._guild.id}: "
+                                f"Redis unavailable"
+                            )
+                            return
+                        # The one stamp check, gating the zone, the volume and the
+                        # migration alike. Nothing is awaited from here to the SEED.
+                        accepted = settings.seed(
+                            self._guild.id, snapshot.config, started=started
                         )
-                        return
+                        if ConfigField.TIMEZONE in accepted:
+                            # tzinfo() degrades an unset or unusable name.
+                            self.timezone = snapshot.config.tzinfo()
+                        # Config, then the legacy :state copy; both are in domain.
+                        stored_volume = snapshot.stored_volume
+                        if ConfigField.VOLUME in accepted and stored_volume is not None:
+                            self.volume = stored_volume
+                            if snapshot.config.volume is None:
+                                # Seed the legacy value into config, once. The write
+                                # path re-checks `started` under the guild's lock: a
+                                # volume write or reset can commit while it waits.
+                                await settings.write(
+                                    self._guild.id,
+                                    GuildConfig(volume=stored_volume),
+                                    mode=WriteMode.SEED,
+                                    since=started,
+                                )
                     guild_state = snapshot.state
-
-                    # Unconditional: tzinfo() already degrades to the default for
-                    # an unset or unusable name.
-                    self.timezone = snapshot.config.tzinfo()
-
-                    stored_volume = snapshot.stored_volume
-                    # Only when a value was stored: an unconditional assign would
-                    # clobber a concurrent -volume with the default.
-                    if stored_volume is not None:
-                        self.volume = stored_volume
-                        # Seed a pre-move value from the 24h-TTL state hash into
-                        # config, once. migrate_volume (HSETNX), NOT set_volume: a
-                        # -volume that landed since this snapshot was read must not
-                        # be overwritten by the older value.
-                        if snapshot.config.volume is None and self.store is not None:
-                            await self.store.migrate_volume(stored_volume)
 
                     # Display snapshot, so -now works if a song was playing.
                     if snapshot.now_playing is not None:

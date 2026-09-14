@@ -343,7 +343,8 @@ src/
 ├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus,
 │                     # tunables and their override accessors
 ├── settings.py       # the -settings machinery: the registry of what chat may set (bounds,
-│                     # rendering) and the grammar that parses a request, both pure; and
+│                     # rendering) and the grammar that parses a request, both pure;
+│                     # GuildSettings, the cache and ONLY writer of guild:{id}:config; and
 │                     # BotSettings, which applies the operator's stored bot overrides. What the
 │                     # environment holds is config.py; this module decides what chat may change
 └── util.py           # logger factory, embed helpers (safe_label, verbatim_code),
@@ -699,7 +700,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
-| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. A numeric value outside `CONFIG_DOMAIN` reads as unset. Excluded from every TTL path; deleted on `on_guild_remove` |
+| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds, through `GuildSettings.write(mode=SEED)` (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it), and the seed is refused when a volume write or reset committed after the snapshot read began. Every writer of this hash goes through `GuildSettings` (`docs/ARCHITECTURE.md#settings-resolution`). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. A numeric value outside `CONFIG_DOMAIN` reads as unset. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `ytdl:source:{query}` | string | 24h | search → {webpage_url, title, duration, uploader, thumbnail, cached_at}. The query is case-folded, EXCEPT for a URL — YouTube video ids are case-sensitive and two would share an entry. Past `_YT_SOURCE_FRESH_SECS` (1h) a hit is served as-is and a SEARCH is refreshed behind the reply (`_revalidate_source`, one flat POST); a link is not, since what ages is the ranking a search resolved through. An entry with no `cached_at` is from the build before the stamp and reads as fresh — it carries that build's 1h TTL |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata, plus a `traceparent` naming the extraction that minted the URL — the only record of where a serving URL came from, and what the playback span links back to — and `probed_at` when the verdict was PLAYABLE: inside `_PROBE_REUSE_SECS` (10s) the playback loop reuses that verdict instead of re-probing a URL the resolve just confirmed. An UNCONFIRMED entry is never stamped |
 | `ytdl:playlist:v2:{list id}` | string | 15m | a YouTube playlist's kept entries, in order, as the five identity fields a queue entry needs. Keyed on the `list=` id, so the playlist page, a watch link carrying `&index=`, and a `&t=` copy share one entry. Entries yt-dlp could not describe are dropped BEFORE the write, so a hit cannot resurrect them; an empty result is not written at all. TTL'd, so eviction-safe |
@@ -775,8 +776,9 @@ on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is
             _restore_state():
               • get_playback_snapshot(): ONE pipeline = state + full queue + now_playing
                 + newest-50 history (all-or-nothing on failure)
-              • volume restored only if a value was stored (never clobber a concurrent
-                -volume with a fabricated default)
+              • GuildSettings.seed(snapshot.config): volume and timezone are restored,
+                and a legacy volume migrated, only for the fields it accepted — a
+                settings write that committed after the read began keeps its value
               • crashed song: crashed_position_at() returns the RECORDED
                 last_position_secs (no clock read), capped at the snapshot's own
                 current_song_duration − 10s (EOF guard, no IO), rebuilt via
@@ -1071,6 +1073,7 @@ Per-guild synchronization primitives and what they protect:
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
+| `GuildSettings` per-guild write lock (src/settings.py) | `guild:{id}:config`: it is the ONLY writer (`-volume`, `-debug --enable/--disable`, restore's volume migration, guild removal), each write a bounded store call then a synchronous commit that stamps (guild, field) from one sequence counter. A read (restore's `seed`, the startup `hydrate`, `load`) never locks: it skips any field stamped after it began, so a read straddling a write never undoes it. The locks are refcounted and dropped when idle, and `reading()` registrations bound how long stamps and forget marks live. `DebugSettings` is its projection of `debug_mode`. `docs/ARCHITECTURE.md#settings-resolution` |
 | `Spotify._auth_lock` | token refresh double-fire |
 | `PostgresHistoryArchive._analytics_slot` | one -analytics aggregate in flight per process. Deliberately NOT `_read_slots`: that budget is two against a max_size=4 pool, sized when leaderboard was its only taker, and this is the heaviest of the three readers |
 | `chart_pool` (1 worker) | matplotlib off the event loop AND off the GIL. A thread is no better than no thread — figure construction is pure Python and contends with discord.py's audio player thread; measured loop lag spikes to 108ms threaded, against 4.23ms frame lateness in a process. Warmed at `setup_hook` **only when the archive is enabled**, after the yt-dlp prewarm that brings the forkserver up — the cold first render is 688ms warmed against 2,976ms not |
@@ -1334,7 +1337,7 @@ duplicated.
 | youtube.py `yt_source` / `_first_video_entry` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results (the marker moved to `_first_video_entry` with the loop it describes) |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | musicbot.py `play` (playlist branch) | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
-| musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but nothing WRITES it: `set_timezone` has no caller in `src/` and the `-options` command it was built for does not exist, so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a write path, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
+| musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but no command WRITES it (`GuildSettings.write` can; no command calls it for `timezone`), so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a command that writes it, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
 | commands/jump.py `run` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
@@ -1375,20 +1378,23 @@ the default") → `to_redis` writes it only when set → `from_redis` reads an
 unrecognised value as unset → a numeric field also gets a `CONFIG_DOMAIN` entry in
 `guild_state.py`, which the `-settings` registry's static bounds must equal (a test
 compares them) and outside which `GuildConfig.__post_init__` reads a value as unset →
-write it with `GuildRedisStore.update_config`, which PERSISTs and takes `writer=`; a
-field that needs a write-boundary check or a second copy (as `timezone` and `volume`
-do) gets a dedicated writer instead, added to the set `update_config` refuses, that
-PERSISTs, takes `writer=` and
+the store writes it with `GuildRedisStore.update_config`, which PERSISTs and takes
+`writer=`; a field that needs a write-boundary check or a second copy (as `timezone`
+and `volume` do) gets a dedicated writer instead, added to the set `update_config`
+refuses, that PERSISTs, takes `writer=` and
 **encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
 single-field config serializes to exactly that field, so the wire format has one
-definition and a setter cannot drift from what `from_redis` expects) → **validate at
-the write boundary if the value is user-typed** (see `valid_timezone`: a bad value
-stored here fails silently — the write succeeds, the command reports success, and the
-guild keeps the default forever) → if a hot path reads it, cache it in memory and
-hydrate in `_load_debug_overrides`'s shape rather than adding Redis IO to every send;
-a multi-guild hydration must read through `read_guild_configs`, whose omission-on-
-failure contract is what stops a Redis blink from deleting stored choices → tests in
-test_guild_state.py and test_redis_client.py. It goes in `guild:{id}:config`, NOT
+definition and a setter cannot drift from what `from_redis` expects) → a row in
+`GuildSettings._dispatch` (src/settings.py), the ONLY caller of those store methods
+(`TestGuildConfigHasOneWriter` fails any other); everything writes through
+`GuildSettings.write`/`reset`, never the store → **validate at the write boundary if
+the value is user-typed** (see `valid_timezone`: a bad value stored here fails
+silently — the write succeeds, the command reports success, and the guild keeps the
+default forever) → a hot path reads it synchronously from `GuildSettings`' cache,
+never by awaiting Redis on a send → a registry `SettingSpec` in the commit that wires
+the code reading it, whose `ConfigField` value is the key with `-` → `_`, plus `_secs`
+for a time value (registry invariants 2 and 10) → tests in test_guild_state.py,
+test_redis_client.py and test_settings.py. It goes in `guild:{id}:config`, NOT
 `guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
 any guild idle for a day.
 

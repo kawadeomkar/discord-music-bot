@@ -29,6 +29,8 @@ from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
     DEFAULT_TIMEZONE,
+    ConfigField,
+    GuildConfig,
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
@@ -12203,6 +12205,114 @@ class TestVolumeMigratesForwardOnRestore:
         before = music_player.volume
         await music_player._restore_state()
         assert music_player.volume == before
+
+
+class TestRestoreOrdersAgainstSettingsWrites:
+    """A settings write or reset can commit at any await of the restore. One stamp
+    check, seed()'s accepted set, gates the zone, the volume and the migration,
+    and the migration re-checks it under the guild's lock."""
+
+    async def test_a_volume_write_after_the_read_is_kept_and_not_migrated(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await fake_redis.hset(store.state_key(), b"volume", b"0.30")
+        guild_settings = mock_ctx.cog.guild_settings
+        real_snapshot = type(store).get_playback_snapshot
+
+        async def snapshot_then_volume(self_: object) -> object:
+            snapshot = await real_snapshot(self_)  # pyright: ignore[reportArgumentType]
+            await guild_settings.write(
+                music_player._guild.id, GuildConfig(volume=0.8), player=music_player
+            )
+            return snapshot
+
+        with patch.object(
+            type(store), "get_playback_snapshot", new=snapshot_then_volume
+        ):
+            await music_player._restore_state()
+
+        assert music_player.volume == 0.8
+        assert await store.read_config() == GuildConfig(volume=0.8)
+
+    async def test_a_timezone_write_after_the_read_survives_restore(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await store.set_timezone("Asia/Tokyo")
+        guild_settings = mock_ctx.cog.guild_settings
+        real_snapshot = type(store).get_playback_snapshot
+
+        async def snapshot_then_zone(self_: object) -> object:
+            snapshot = await real_snapshot(self_)  # pyright: ignore[reportArgumentType]
+            await guild_settings.write(
+                music_player._guild.id,
+                GuildConfig(timezone="Europe/London"),
+                player=music_player,
+            )
+            return snapshot
+
+        with patch.object(type(store), "get_playback_snapshot", new=snapshot_then_zone):
+            await music_player._restore_state()
+
+        assert music_player.timezone == ZoneInfo("Europe/London")
+
+    async def test_a_volume_reset_during_the_migrations_lock_wait_is_not_undone(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis, mock_ctx: MagicMock
+    ) -> None:
+        """A guild with only a legacy volume resets it while the migration waits
+        for the lock. The migration then finds the reset's stamp and writes
+        nothing, so both copies stay deleted."""
+        store = music_player.store
+        assert store is not None
+        await fake_redis.hset(store.state_key(), b"volume", b"0.30")
+        guild_settings = mock_ctx.cog.guild_settings
+        guild_id = music_player._guild.id
+        release = asyncio.Event()
+        real_reset = GuildRedisStore.reset_volume
+        real_snapshot = type(store).get_playback_snapshot
+        reset_task: list[asyncio.Task[Any]] = []
+
+        async def parked_reset(self_: GuildRedisStore) -> bool:
+            await release.wait()
+            return await real_reset(self_)
+
+        async def snapshot_then_reset_takes_the_lock(self_: object) -> object:
+            snapshot = await real_snapshot(self_)  # pyright: ignore[reportArgumentType]
+            reset_task.append(
+                asyncio.create_task(guild_settings.reset(guild_id, ConfigField.VOLUME))
+            )
+            await asyncio.sleep(0)
+            asyncio.get_running_loop().call_later(0.01, release.set)
+            return snapshot
+
+        with (
+            patch.object(GuildRedisStore, "reset_volume", new=parked_reset),
+            patch.object(
+                type(store),
+                "get_playback_snapshot",
+                new=snapshot_then_reset_takes_the_lock,
+            ),
+        ):
+            await music_player._restore_state()
+            await reset_task[0]
+
+        assert not await fake_redis.hexists(store.config_key(), "volume")
+        assert not await fake_redis.hexists(store.state_key(), "volume")
+
+    async def test_an_out_of_domain_volume_in_both_hashes_plays_at_the_default(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await fake_redis.hset(store.state_key(), b"volume", b"1.5")
+        await fake_redis.hset(store.config_key(), b"volume", b"1.5")
+        with patch.object(GuildRedisStore, "migrate_volume", new=AsyncMock()) as seed:
+            await music_player._restore_state()
+        assert music_player.volume == 1.0
+        seed.assert_not_awaited()
 
 
 class TestGuildTimezoneOnRestore:

@@ -236,7 +236,7 @@ graph TD
 | Module | Responsibility |
 |---|---|
 | `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when **`HISTORY_ARCHIVE_ENABLED` is true** (`PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`) — the flag is the consent gate, never URL presence: enabled without `POSTGRES_URL` **raises**, and disabled ignores a set one with an INFO, leaving bit-identical pre-Postgres behavior, and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
-| `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-play --now`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, the per-guild alone-disconnect timers, and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect) and crash recovery via `on_ready`. |
+| `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-play --now`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, `debug_settings`, `guild_settings` (the settings cache and only writer of `guild:{id}:config`), and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect), crash recovery via `on_ready` (`_recover_after_ready`: the settings hydrate pass, then one restore per guild), and `on_guild_join`/`on_guild_remove` (hydrate / `GuildSettings.forget`). |
 | `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, and `--now` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
 | `guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns **one deque plus a cursor into it** (`_items[:_cursor]` claimed, `_items[_cursor:]` pending) and the Redis mirror, along with the bulk-mutation mutex, the generation counter, and the `_wake` Event whose sole writer is `_sync_wake()`. Every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. This replaced an `asyncio.Queue` plus a parallel display `deque` whose agreement had to be maintained by hand — see [Queue invariant](#queue-invariant). |
 | `guild_history.py` | `GuildHistory` — played-song history domain class. Two legs, both bounded at `HISTORY_CACHE_LIMIT` (50): the PERSISTed `guild:{id}:history` Redis list and an in-memory deque of the same window. `recent()` merges those two and **never reads Postgres** — see [History read path](#history-read-path). Writes additionally XADD the outbox while the archive is enabled. |
@@ -255,11 +255,11 @@ graph TD
 | `chart_pool.py` | The chart pool's only home: one lazily-spawned `YtdlpPool(max_workers=1, name="chart render")`, plus `chart_available()` (a `find_spec` lookup, so it never pays matplotlib's import). Exists so there IS a stable name for `main.py` to close, `debug.py` to read and `conftest.py` to patch; imports only `ytdlp_pool`. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
 | `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0, floor 1.0), `STREAM_PROBE_TIMEOUT_SECS` (2.0, floor 0.1), `LIVENESS_INTERVAL_SECS` (15.0, between 1 and 60), the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0), and `ANALYTICS_RENDER_DEADLINE_SECS` (20.0) — read through `_float_env`, which names each floor in a `_MIN_*` constant beside its knob and refuses non-finite values separately from that floor (and from an optional maximum) because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. `YTDLP_POOL_WORKERS` (4, floor 1) and the other integer knobs go through `_int_env`. Each `-settings bot` knob also has an accessor named as the knob in lower case (`ping_tick_secs()`), returning an override from `_FLOAT_OVERRIDES`/`_INT_OVERRIDES`, else the baseline; `set_override`/`clear_override` write them and `override`/`baseline`/`effective`/`env_floor` read them ([Settings resolution](#settings-resolution)). Plus the call-time accessors: `bot_settings_overrides_ignored()` (`BOT_SETTINGS_OVERRIDES`: `apply` or `ignore`, garbage raises), `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
-| `settings.py` | The `-settings` machinery. Pure: `SETTINGS`, one `SettingSpec` per setting chat may show or change (scope, kind, label, bounds, the env var and `config` knob a bot setting overrides), and the functions every surface shares — `parse_value` (each kind's grammar matched in full with `re.ASCII`, then the bounds), `format_value` (one rendering per kind, each parsing back), `in_bounds`/`check_write`, `find`, and `parse_settings_args`, which reads one line of chat into a `SettingsRequest` or a `Refusal` whose text never quotes the input. A server setting's bounds are its field's `CONFIG_DOMAIN`; a bot setting's chat minimum sits above the floor `config.env_floor` recorded. Timezones are accepted only as `Area/City`, `UTC` or `GMT`, with a redirect table for the rest, built on first use because it walks the tz database. `config.py` reads the environment; this module decides what chat may set. `BotSettings` (on `MusicBotApp`) applies the operator's stored overrides from `bot:{application_id}:config` to `config`'s accessors, holds the session-only `debug-default`, and honours `BOT_SETTINGS_OVERRIDES=ignore` ([Settings resolution](#settings-resolution)). |
+| `settings.py` | The `-settings` machinery. Pure: `SETTINGS`, one `SettingSpec` per setting chat may show or change (scope, kind, label, bounds, the env var and `config` knob a bot setting overrides), and the functions every surface shares — `parse_value` (each kind's grammar matched in full with `re.ASCII`, then the bounds), `format_value` (one rendering per kind, each parsing back), `in_bounds`/`check_write`, `find`, and `parse_settings_args`, which reads one line of chat into a `SettingsRequest` or a `Refusal` whose text never quotes the input. A server setting's bounds are its field's `CONFIG_DOMAIN`; a bot setting's chat minimum sits above the floor `config.env_floor` recorded. Timezones are accepted only as `Area/City`, `UTC` or `GMT`, with a redirect table for the rest, built on first use because it walks the tz database. `config.py` reads the environment; this module decides what chat may set. `GuildSettings` (on the cog) caches every server's `guild:{id}:config` and is the only writer of it ([Settings resolution](#settings-resolution)). `BotSettings` (on `MusicBotApp`) applies the operator's stored overrides from `bot:{application_id}:config` to `config`'s accessors, holds the session-only `debug-default`, and honours `BOT_SETTINGS_OVERRIDES=ignore` ([Settings resolution](#settings-resolution)). |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
 | `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver `-ping` and `-debug` share. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row, a block of rendered lines) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. Both callers reply through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
 | `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
-| `debug.py` | `-debug`: the snapshot's collectors and rendering, plus `--enable`/`--disable` argument parsing. **Observation-only by rule** — nothing here changes playback, caching, queueing or persistence, which is what keeps "test with debug on, ship with debug off" a valid methodology. Every collector degrades to a labeled `unknown`/`n/a` rather than raising (`_safe_block`): a debug tool that crashes is worse than no debug tool. The host blocks are gated on bot ownership at **collection**, not at render, so a non-owner's `-debug` launches no probe at all — the public surface is versions plus this server's own player/voice state. The `Config` block renders a deny-by-default allowlist: `SECRET` variables show `set`/`unset` and never a value, `URL` variables lose userinfo, credential-bearing query params and the host itself. `musicbot.py` owns the command registration and the per-guild override cache. |
+| `debug.py` | `-debug`: the snapshot's collectors and rendering, plus `--enable`/`--disable` argument parsing. **Observation-only by rule** — nothing here changes playback, caching, queueing or persistence, which is what keeps "test with debug on, ship with debug off" a valid methodology. Every collector degrades to a labeled `unknown`/`n/a` rather than raising (`_safe_block`): a debug tool that crashes is worse than no debug tool. The host blocks are gated on bot ownership at **collection**, not at render, so a non-owner's `-debug` launches no probe at all — the public surface is versions plus this server's own player/voice state. The `Config` block renders a deny-by-default allowlist: `SECRET` variables show `set`/`unset` and never a value, `URL` variables lose userinfo, credential-bearing query params and the host itself. `musicbot.py` owns the command registration. `DebugSettings` holds each guild's debug-mode choice as a projection of `debug_mode` that `GuildSettings` writes (`apply_choices`, `drop`) — it has no writer of its own — and the operator's session `debug-default` (`set_default_override`). |
 | `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `fmt_duration`/`fmt_seconds` (the clock, and the shortest seconds text that parses back to the same float), `DASHES` (every dash a keyboard substitutes for `-`), `codeblock_fields` (lines split across 1024-char code-block fields), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`. |
 
 **Key types:**
@@ -951,7 +951,7 @@ sequenceDiagram
     MusicBot->>MP: MusicPlayer(...) + start() → loop() + _restore_state()
 
     MP->>Redis: get_playback_snapshot() — one round-trip for state +<br/>queue + now_playing + history
-    MP->>MP: restore volume (only if stored)
+    MP->>MP: GuildSettings.seed(snapshot.config) → restore volume/timezone<br/>(only accepted fields; a legacy volume migrates via a SEED write)
     MP->>MP: crashed song → SongQueueEntry.from_crashed_state()<br/>→ queue.restore_crashed() (persisted=False)
     MP->>Redis: clear current_song_url immediately (at-most-once)
     MP->>MP: queue.restore_entries(pending) + history.restore()
@@ -1128,6 +1128,7 @@ flowchart TD
 | `GuildQueue._mutex: asyncio.Lock` | `GuildQueue` (private) | Bulk queue mutations + the loop's dequeue commit (`commit_dequeue()` holds it across the start transaction's dispatch) |
 | `GuildQueue._wake: asyncio.Event` | `GuildQueue` (private) | The pending-item signal a parked `get()` waits on. Set iff `_cursor < len(_items)`; `_sync_wake()` is its ONLY writer, because a stale set leaves the wait loop with no suspension point and stalls the whole event loop (I3) |
 | `_np_edit_lock: asyncio.Lock` | `MusicPlayer` | Old-host edits vs retire (strip/delete is always the final write) |
+| per-guild write lock (refcounted, dropped when idle) | `GuildSettings` | Every write, reset and forget of `guild:{id}:config`, one store call at a time per guild. Reads take no lock: one sequence counter stamps each commit, and a read skips fields stamped after it began ([Settings resolution](#settings-resolution)) |
 | `Spotify._auth_lock: asyncio.Lock` | `Spotify` | Double-checked locking for token refresh |
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
@@ -2426,6 +2427,58 @@ deleted.
   `just bot-settings reset <application_id>` deletes one. The running bot keeps its
   in-memory overrides until it restarts.
 
+**Server settings: stored choice, else registry default.** `guild:{id}:config`
+(`GuildConfig`) holds what a server chose; an absent field means "never chose". Every
+stored numeric value is inside `CONFIG_DOMAIN`, because `GuildConfig.__post_init__`
+reads anything else as unset wherever a `GuildConfig` is built, the legacy `:state`
+volume included. `MusicBot.guild_settings` (`GuildSettings`, `src/settings.py`) caches
+each guild's config and is the only writer of the key.
+
+- **Hot paths never await it.** They read synchronously (`peek`), because the Redis pool
+  has no `socket_timeout` and an awaited read against a stalled Redis would hang the
+  playback loop or a send. `TestHotPathsNeverAwaitSettings` fails an await on
+  `guild_settings` in the hot-path modules, allowing exactly one: restore's SEED write.
+- **Three readers fill the cache.** A restoring player seeds it from the snapshot it
+  already reads (`seed`); `on_ready` hydrates every guild before recovery
+  (`_recover_after_ready` awaits one `hydrate` pass, then spawns the restores, so the
+  pass's batches — one pool connection at a time — finish before the per-guild fan-out
+  reaches the pool's cap), with a retry that backs off from 1s to 60s for any guild a
+  failed or timed-out batch left out; and `load` reads one guild on demand,
+  single-flight, for a command. A read that fails caches nothing: an unread guild
+  keeps its current entry and falls back to defaults for what it does not know.
+- **A write on an uncached guild creates a partial entry** holding only that field. The
+  others read as unset, exactly as before the write, and `is_complete` stays False
+  until a read covers every field. Guilds that never chose share one `_EMPTY` entry.
+- **One writer, one order.** `write`, `reset` and `forget` take a per-guild lock
+  (refcounted, dropped when idle), make one store call under `CONFIG_IO_TIMEOUT_SECS`
+  (each field maps to exactly one store method, and a SET passes the bot's
+  `application_id` as the `writer_app_id` stamp), then commit synchronously: stamp,
+  cache, the unpersisted mark, the `debug_mode` projection into `DebugSettings`, and
+  the live player's `volume` or `timezone`. The store call comes before the stamp, so a
+  read resolves either before the commit, which overwrites it, or after, when the stamp
+  makes it skip the field. The live assignment is in the commit because restore's gate
+  reads the stamp. `TestGuildConfigHasOneWriter` fails any other caller of the store's
+  config writers. `persisted=False` means *not confirmed*: a pipeline sends before it
+  reads, so a timed-out write can still land, and the reply says it applies until the
+  bot restarts.
+- **The merge rule** (`seed`, `hydrate`, `load`): nothing for a guild forgotten since
+  the read began; otherwise every field not stamped since it began and not marked
+  unpersisted. An unsaved write keeps its value until a later write reaches Redis,
+  which is what its reply promised.
+- **Stamp pruning.** Stamps and forget marks are compared only with a `started` value
+  from an open `reading()` registration, so each is dropped once it is at or below the
+  lowest open one (or the counter, with none open): an absent stamp compares as never
+  set, which is already the answer for every such read. With no read in flight both
+  maps are empty.
+- **Restore ordering.** `_restore_state` registers immediately before its snapshot read
+  and stays registered through the SEED write. `seed`'s accepted set gates the zone,
+  the volume and the legacy migration alike, and the migration re-checks the stamp
+  under the guild's lock, because a `volume reset` can commit while it waits.
+- **Forget.** `on_guild_remove` calls `forget`: a bounded `clear_config`, then the entry,
+  stamps and marks are dropped and the guild is marked forgotten, so a read that began
+  earlier merges nothing and a write queued behind it is refused rather than recreating a
+  no-TTL key.
+
 ## Design Decisions
 
 ### yt-dlp three-phase pipeline
@@ -2490,7 +2543,7 @@ With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction 
 
 ### Two-tier data architecture (Redis + Postgres)
 
-The durable/runtime boundary is drawn once: data a user would miss a week later lives in Postgres (`play_history` now; future stats/preferences); data that only matters to the running player stays in Redis, permanently — the runtime tier is *correctly placed*, not "not yet migrated". Writes cross the boundary through the `history:outbox` Redis **stream**, drained by one background task (replay pending → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL`), so the playback loop keeps Redis-only latency, Postgres downtime buffers instead of losing entries, and the dedup unique index makes at-least-once delivery and backfill idempotent by the same mechanism. **Reads follow the same rule**: `-history` shows the recent window and is served from the capped Redis list alone — see [History read path](#history-read-path) — while `-leaderboard` needs the permanent record and is the archive's one reader. The archive is opt-in and a default deployment collects nothing long-term.
+The durable/runtime boundary is drawn once: data a user would miss a week later lives in Postgres (`play_history`), except preferences, which live in the Redis config hashes (`guild:{id}:config`), non-evictable and written only by explicit commands; data that only matters to the running player stays in Redis, permanently — the runtime tier is *correctly placed*, not "not yet migrated". Writes cross the boundary through the `history:outbox` Redis **stream**, drained by one background task (replay pending → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL`), so the playback loop keeps Redis-only latency, Postgres downtime buffers instead of losing entries, and the dedup unique index makes at-least-once delivery and backfill idempotent by the same mechanism. **Reads follow the same rule**: `-history` shows the recent window and is served from the capped Redis list alone — see [History read path](#history-read-path) — while `-leaderboard` needs the permanent record and is the archive's one reader. The archive is opt-in and a default deployment collects nothing long-term.
 
 ### The mock spec cache
 

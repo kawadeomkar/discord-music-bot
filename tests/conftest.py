@@ -27,6 +27,7 @@ from src.debug import DebugSettings
 from src.musicbot import MusicBot
 from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
+from src.settings import GuildSettings
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
@@ -452,6 +453,16 @@ def mock_ctx(
     # runtime.
     ctx.cog.debug_settings.enabled = MagicMock(return_value=False)
     ctx.cog.debug_settings.snapshot = None
+    # GuildSettings reads these off the cog at call time, and auto-vivified they
+    # are a truthy redis it would write through and a MagicMock application id
+    # HSET cannot encode. A real GuildSettings, not a spec'd mock: its accessors
+    # then return registry defaults, and a test that needs a stored value seeds
+    # it, so GuildConfig's domain check runs. This mock is the cog of every
+    # player the suite builds, including the ones the real get_mp builds.
+    ctx.cog.redis = None
+    ctx.cog.mps = {}
+    ctx.cog.bot.application_id = None
+    ctx.cog.guild_settings = GuildSettings(ctx.cog)
     ctx.send = AsyncMock()
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
@@ -554,6 +565,9 @@ def music_player(
     here would ever set them (start() and the -join/-play call sites never run),
     so both are set. Tests exercising either race must clear them again first.
     """
+    # The player's store and GuildSettings share cog.redis in production, so the
+    # restore's SEED write lands on the server its tests read.
+    mock_ctx.cog.redis = fake_redis
     mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
     mp._restore_complete.set()
     mp._playback_gate.set()
@@ -654,6 +668,8 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    cog.guild_settings = GuildSettings(cog)
+    cog._hydrate_retry = None
     return cog
 
 
@@ -701,6 +717,8 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    cog.guild_settings = GuildSettings(cog)
+    cog._hydrate_retry = None
     return cog
 
 

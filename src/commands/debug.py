@@ -10,6 +10,7 @@ from src.config import (
     history_archive_enabled,
     using_default_postgres_password,
 )
+from src.guild_state import GuildConfig
 from src.redis_client import GuildRedisStore
 from src.util import notice_embed
 
@@ -75,7 +76,14 @@ async def toggle(ctx: commands.Context, action: DebugAction, *, cog: MusicBot) -
         )
         return
     enabled = action is DebugAction.ENABLE
-    persisted = await cog.debug_settings.toggle(cog.redis, ctx.guild.id, enabled)
+    result = await cog.guild_settings.write(
+        ctx.guild.id, GuildConfig(debug_mode=enabled)
+    )
+    persisted = result.persisted
+    log.info(
+        f"debug mode {'enabled' if enabled else 'disabled'} by command",
+        persisted=persisted,
+    )
     # A degraded write is named, not rounded up to success.
     durability = (
         "The setting is saved for this server."

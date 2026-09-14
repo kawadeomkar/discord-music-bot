@@ -268,6 +268,8 @@ class BotConfigField:
 # The zone every guild renders ETAs in until it picks one; the schema layer
 # validates against the same default it hands back.
 DEFAULT_TIMEZONE: Final[str] = "America/Los_Angeles"
+# A player's volume until its guild's stored one is restored, and after a reset.
+DEFAULT_VOLUME: Final = 1.0
 
 # Beside DEFAULT_TIMEZONE because the -settings registry, the playback loop and the
 # voice watchdog all read them, and this module imports nothing from src at runtime.
