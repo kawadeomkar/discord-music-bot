@@ -626,7 +626,8 @@ test-report *ARGS:
 
 # Mirrors CI's container-test job. Its value is proving the IMAGE runs (a runtime stage
 # missing a dependency is invisible to `just test`), which is why it is not part of
-# `check`.
+# `check`. The image also pins MOCK_SPEC_CACHE_DISABLE=1, so this is the reference run
+# against stock unittest.mock — see docs/ARCHITECTURE.md#the-mock-spec-cache.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Build the test image and run the suite inside it')]
