@@ -2,6 +2,7 @@
 registry whose place lock makes "check, then insert" atomic."""
 
 import asyncio
+import contextlib
 import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,14 +11,20 @@ import orjson
 import redis.asyncio as aioredis
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 import discord
 from discord.ext import commands
 
 from src.musicbot import MusicBot
+from src import util
+from src.util import channel_claim
 from src.config import PLAY_RESOLVE_CONCURRENCY
 from src.play_placement import (
     PlayArgs,
     _GuildPlays,
+    _NOTICE_CLAIM,
     PlayMode,
     ResolveWaitExpired,
     play_key,
@@ -202,6 +209,23 @@ class TestPlayRegistry:
         with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
             admit(music_bot, mock_ctx, mp)
             admit(music_bot, other, mp)  # no raise
+
+    def test_the_drop_stamp_signals_each_request_it_names(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        wanted = admit(music_bot, mock_ctx, mp, query="wanted")
+        kept = admit(music_bot, mock_ctx, mp, query="kept")
+        placed = admit(music_bot, mock_ctx, mp, query="wanted")
+        placed.placed = True
+
+        music_bot._plays.inflight(
+            play_key(mock_ctx), "remove", lambda r: r.query == "wanted"
+        )
+
+        assert wanted.dropped.is_set()
+        assert not kept.dropped.is_set()
+        assert not placed.dropped.is_set()
 
     def test_the_registry_is_dropped_once_idle(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -433,6 +457,23 @@ class TestRetirePlayerFence:
         await music_bot._plays.retire_player(999, cast(Any, mp))
         mp.mark_retired.assert_called_once()
 
+    async def test_it_signals_every_request_the_retired_player_will_refuse(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A kick or the alone-watchdog tears the player down without calling
+        inflight(), so the retire is where their cards and notices learn it."""
+        mp, other = mock_mp(), mock_mp()
+        resolving = admit(music_bot, mock_ctx, mp)
+        placed = admit(music_bot, mock_ctx, mp)
+        placed.placed = True
+        elsewhere = admit(music_bot, mock_ctx, other)
+
+        await music_bot._plays.retire_player(play_key(mock_ctx), cast(Any, mp))
+
+        assert resolving.dropped.is_set()
+        assert not placed.dropped.is_set()
+        assert not elsewhere.dropped.is_set()
+
 
 class TestPlacedMeansLanded:
     """`placed` is what -stop/-clear/-remove read to decide whether a request is
@@ -546,6 +587,23 @@ class TestResolveSlot:
         assert entered
 
 
+class TestResolveSlotTelemetry:
+    async def test_a_successful_acquire_records_what_it_waited(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """play.resolve_wait_secs is the number PLAY_RESOLVE_CONCURRENCY is
+        tuned from — it is emitted on EVERY acquire, not only a slow one, which
+        is what makes a burst diagnosable after the fact rather than only while
+        it is happening."""
+        with patch("src.play_placement.trace.get_current_span") as current:
+            span = current.return_value
+            req = admit(music_bot, mock_ctx, mock_mp())
+            async with music_bot._plays.resolve_slot(req):
+                pass
+        names = [call.args[0] for call in span.set_attribute.call_args_list]
+        assert "play.resolve_wait_secs" in names
+
+
 class TestSlowResolveNotice:
     """A request that outlives the delay says so, and takes the message back when
     it lands. Silence is what the concurrent resolve costs the user: nothing is
@@ -553,13 +611,13 @@ class TestSlowResolveNotice:
 
     async def test_a_fast_resolve_says_nothing(self, mock_ctx: MagicMock) -> None:
         with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 5.0):
-            async with slow_resolve_notice(mock_ctx):
+            async with slow_resolve_notice(mock_ctx, query="a song"):
                 pass
         mock_ctx.channel.send.assert_not_awaited()
 
     async def test_a_slow_resolve_posts_and_retracts(self, mock_ctx: MagicMock) -> None:
         with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx):
+            async with slow_resolve_notice(mock_ctx, query="a song"):
                 await asyncio.sleep(0.08)
         mock_ctx.channel.send.assert_awaited_once()
         mock_ctx.channel.send.return_value.delete.assert_awaited_once()
@@ -570,7 +628,7 @@ class TestSlowResolveNotice:
         """ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the
         NP host, and deleting it would drag the live progress bar onto it."""
         with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx):
+            async with slow_resolve_notice(mock_ctx, query="a song"):
                 await asyncio.sleep(0.08)
         mock_ctx.send.assert_not_awaited()
 
@@ -581,15 +639,202 @@ class TestSlowResolveNotice:
             MagicMock(), "no perms"
         )
         with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx):
+            async with slow_resolve_notice(mock_ctx, query="a song"):
                 await asyncio.sleep(0.08)
+
+    async def test_the_notice_carries_the_debug_footer(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """It sends through ctx.channel.send, which bypasses the decoration
+        MusicContext.send applies — so like the two dashboards and the card, the
+        footer has to be threaded in."""
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(
+                mock_ctx, query="a song", debug_suffix="trace=abc"
+            ):
+                await asyncio.sleep(0.08)
+        embed = mock_ctx.channel.send.await_args.kwargs["embed"]
+        assert embed.footer.text == "trace=abc"
+
+    async def test_no_footer_means_no_footer(self, mock_ctx: MagicMock) -> None:
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx, query="a song"):
+                await asyncio.sleep(0.08)
+        embed = mock_ctx.channel.send.await_args.kwargs["embed"]
+        assert embed.footer.text is None
+
+    async def test_a_burst_in_one_channel_posts_one_notice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """PLAY_INFLIGHT_MAX is 16 and PLAY_RESOLVE_CONCURRENCY is 2, so the tail
+        of a pasted burst is GUARANTEED to cross the delay. Sixteen notices at once
+        would sit on the channel's create bucket ahead of the confirmations the
+        user asked for."""
+
+        async def _one() -> None:
+            with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+                async with slow_resolve_notice(mock_ctx, query="a song"):
+                    await asyncio.sleep(0.08)
+
+        await asyncio.gather(*(_one() for _ in range(16)))
+        mock_ctx.channel.send.assert_awaited_once()
+        mock_ctx.channel.send.return_value.delete.assert_awaited_once()
+
+    async def test_the_notice_names_its_request(self, mock_ctx: MagicMock) -> None:
+        """Unattributed, B reads A's notice as theirs, and it disappears when A
+        lands while B is still resolving."""
+        mock_ctx.author.mention = "<@42>"
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx, query="daft *punk*"):
+                await asyncio.sleep(0.08)
+        description = mock_ctx.channel.send.await_args.kwargs["embed"].description
+        assert "<@42>" in description
+        assert "daft \\*punk\\*" in description  # escaped, not styled
+
+    async def test_a_notice_that_lost_the_channel_posts_once_it_is_free(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        shown: list[int] = []
+
+        async def _one(secs: float) -> None:
+            async with slow_resolve_notice(mock_ctx, query=f"{secs}"):
+                await asyncio.sleep(secs)
+                shown.append(mock_ctx.channel.send.await_count)
+
+        with (
+            patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02),
+            patch("src.play_placement._NOTICE_RETRY_SECS", 0.01),
+        ):
+            await asyncio.gather(_one(0.06), _one(0.3))
+
+        assert shown == [1, 2]
+
+    @pytest.mark.parametrize("outcome", ["shown", "send_failed", "claimed_elsewhere"])
+    async def test_the_span_says_what_the_notice_did(
+        self, mock_ctx: MagicMock, outcome: str
+    ) -> None:
+        if outcome == "send_failed":
+            mock_ctx.channel.send.side_effect = discord.HTTPException(
+                MagicMock(status=403), "Missing Permissions"
+            )
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        with contextlib.ExitStack() as held:
+            if outcome == "claimed_elsewhere":
+                held.enter_context(channel_claim(_NOTICE_CLAIM, mock_ctx.channel.id))
+            with (
+                patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02),
+                provider.get_tracer("test").start_as_current_span("bot.play"),
+            ):
+                async with slow_resolve_notice(mock_ctx, query="a song"):
+                    await asyncio.sleep(0.08)
+
+        (span,) = exporter.get_finished_spans()
+        assert (span.attributes or {})["play.slow_notice"] == outcome
+
+    async def test_a_notice_and_a_card_are_different_kinds(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """One claim per KIND: a channel already showing a card for someone's
+        playlist must still be able to say a different request is slow."""
+        with channel_claim("queue-progress-card", mock_ctx.channel.id) as card:
+            assert card
+            with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+                async with slow_resolve_notice(mock_ctx, query="a song"):
+                    await asyncio.sleep(0.08)
+        mock_ctx.channel.send.assert_awaited_once()
+
+    async def test_a_fast_resolve_does_not_hold_the_slot(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Claimed at the send, not at entry: a request that settles inside the
+        delay never sends, and must not deny the slot to a slow sibling."""
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.05):
+
+            async def _fast() -> None:
+                async with slow_resolve_notice(mock_ctx, query="a song"):
+                    await asyncio.sleep(0.01)
+
+            async def _slow() -> None:
+                async with slow_resolve_notice(mock_ctx, query="a song"):
+                    await asyncio.sleep(0.2)
+
+            await asyncio.gather(_fast(), _slow())
+        mock_ctx.channel.send.assert_awaited_once()
+
+    async def test_a_cancel_while_joining_the_notice_propagates_and_retracts(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Cancelling a -play whose notice is mid-send must not be swallowed —
+        a command that returns normally from its own cancellation stalls the
+        shutdown gather that cancelled it. The task that sent the notice takes
+        it back in its own finally, so the message does not outlive the cancel
+        either."""
+        message = mock_ctx.channel.send.return_value
+        sending, release = asyncio.Event(), asyncio.Event()
+
+        async def _send(**_: Any) -> MagicMock:
+            sending.set()
+            await release.wait()
+            return message
+
+        mock_ctx.channel.send = AsyncMock(side_effect=_send)
+
+        async def _body() -> None:
+            with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+                async with slow_resolve_notice(mock_ctx, query="a song"):
+                    async with asyncio.timeout(2):
+                        await sending.wait()
+
+        task = asyncio.create_task(_body())
+        async with asyncio.timeout(2):
+            await sending.wait()
+        # The body has returned; the context manager is parked on the join.
+        await settle()
+        task.cancel()
+        await settle()
+        release.set()
+        await settle()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        message.delete.assert_awaited_once()
 
     async def test_the_body_raising_still_retracts_the_notice(
         self, mock_ctx: MagicMock
     ) -> None:
         with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
             with pytest.raises(RuntimeError):
-                async with slow_resolve_notice(mock_ctx):
+                async with slow_resolve_notice(mock_ctx, query="a song"):
                     await asyncio.sleep(0.08)
                     raise RuntimeError("resolve failed")
         mock_ctx.channel.send.return_value.delete.assert_awaited_once()
+
+    async def test_a_dropped_request_retracts_before_its_resolve_returns(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """-stop/-clear/-remove stamp the request mid-resolve, and place() reads
+        the stamp only once the resolve returns: the notice would otherwise still
+        say the song "will be queued" beside the reply saying it was dropped."""
+        dropped = asyncio.Event()
+        message = mock_ctx.channel.send.return_value
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
+            async with slow_resolve_notice(mock_ctx, query="a song", dropped=dropped):
+                await asyncio.sleep(0.05)
+                mock_ctx.channel.send.assert_awaited_once()
+                dropped.set()
+                await asyncio.sleep(0.02)
+                message.delete.assert_awaited_once()
+                assert not util._CLAIMED_CHANNELS.get(_NOTICE_CLAIM)
+        message.delete.assert_awaited_once()
+
+    async def test_a_request_dropped_inside_the_delay_posts_nothing(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        dropped = asyncio.Event()
+        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.05):
+            async with slow_resolve_notice(mock_ctx, query="a song", dropped=dropped):
+                dropped.set()
+                await asyncio.sleep(0.1)
+        mock_ctx.channel.send.assert_not_awaited()

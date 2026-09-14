@@ -206,9 +206,16 @@ async def _resolve_and_place(
     qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
     async with contextlib.AsyncExitStack() as stack:
         # Entered before the gate hold so it unwinds AFTER it: retracting the
-        # notice awaits its poster, and an await between the teardown decision and
-        # the hold release is exactly what this path may not have.
-        await stack.enter_async_context(slow_resolve_notice(ctx))
+        # notice awaits a Discord call, and an await between the teardown decision
+        # and the hold release is exactly what this path may not have.
+        await stack.enter_async_context(
+            slow_resolve_notice(
+                ctx,
+                query=req.query,
+                debug_suffix=cog.debug_suffix(ctx),
+                dropped=req.dropped,
+            )
+        )
         # The cold-start gate hold lives on its own stack, so the path that PLACES
         # can release it the moment the put lands rather than holding the first note
         # behind a confirmation embed. aclose() is idempotent — an already-unwound
@@ -446,9 +453,11 @@ async def _interject(
             require_paused=require_paused,
             cog=cog,
         )
-    except PlaceStalled:
-        # A stall is not a failed interjection: run() reports it as a busy queue,
-        # and wrapping it here would title that "Failed to play song now".
+    except PlaceStalled, ResolveWaitExpired:
+        # Neither is a failed interjection. run() reports a stall as a busy queue
+        # and an expired slot wait as a full pool; wrapping either here would
+        # title it "Failed to play song now" and render the class name, since
+        # nothing reached yt-dlp and there is no cause to show.
         raise
     except Exception as e:
         raise InterjectionFailed(e) from e

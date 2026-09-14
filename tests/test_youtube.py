@@ -26,6 +26,7 @@ from yt_dlp.utils import DownloadError, UnsupportedError
 from src.telemetry import configure_worker_logging
 from src.guild_state import Analytics
 from src import youtube
+from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -64,7 +65,7 @@ from src.youtube import (
     YTDLVideoInfo,
     YTDLVideoMetadata,
 )
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, settle
 
 # Ask-time analytics for direct yt_source/yt_playlist calls — the command paths
 # mint this at dispatch; both params are REQUIRED so a call site cannot forget.
@@ -988,6 +989,61 @@ class TestExtractSingleflight:
         assert leader.cancelled()
         assert not joiner.cancelled()
         assert result == {"title": "shared"}
+
+    # A joiner that re-reads a job that already failed never suspends, so a
+    # regression spins the loop, which only pytest-timeout can interrupt.
+    @pytest.mark.timeout(10)
+    async def test_a_leaders_exhausted_slot_does_not_fail_its_joiners(
+        self,
+    ) -> None:
+        """The key carries no guild, so the leader's guild budget is routinely not
+        the joiner's. A joiner holds no worker and may hold no slot at all — the
+        playback loop's own in-band resolve passes None — so inheriting the
+        leader's refusal is one guild's paste burst killing another guild's song
+        while every worker sits idle."""
+        from src.youtube import _extract_once
+
+        blocked = asyncio.Event()
+        # Held until the joiners are parked on the leader's job: failing sooner,
+        # the first joiner finds an empty registry and simply leads.
+        expire = asyncio.Event()
+        calls: list[int] = []
+
+        class _FullSlot:
+            async def __aenter__(self) -> None:
+                blocked.set()
+                await expire.wait()
+                raise ResolveWaitExpired
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        async def _extract(_request: Any) -> dict[str, Any]:
+            calls.append(1)
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            leader = asyncio.create_task(
+                _extract_once("k", MagicMock(), pool_slot=_FullSlot())
+            )
+            async with asyncio.timeout(2):
+                await blocked.wait()
+            # Three, not one: with a single joiner, re-electing every joiner in
+            # turn and re-electing one are the same count.
+            joiners = [
+                asyncio.create_task(_extract_once("k", MagicMock())) for _ in range(3)
+            ]
+            await settle()
+            expire.set()
+            with pytest.raises(ResolveWaitExpired):
+                await leader
+            async with asyncio.timeout(2):
+                results = await asyncio.gather(*joiners)
+            assert results == [{"title": "shared"}] * 3
+
+        # The leader never reached yt-dlp, so the one re-elected joiner is the only
+        # extraction that ran, and the other two joined it.
+        assert calls == [1]
 
     async def test_an_abandoned_job_still_answers_the_callers_that_stayed(
         self,

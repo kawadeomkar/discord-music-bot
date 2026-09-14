@@ -15,6 +15,7 @@ from src import play_pipeline
 from src.guild_state import Analytics
 from src.help import CATEGORY_COMMANDS
 from src.musicbot import MusicBot
+from src.play_placement import ResolveWaitExpired
 from src.commands import play as play_cmd
 from src.recovery import abandon_cold_start
 from src.guild_queue import RemoveMode, RemoveOutcome
@@ -4446,3 +4447,78 @@ class TestPlaynextWrapper:
         cmd = music_bot.playnext
         assert cmd.name == "playnext" and "pnx" in cmd.aliases
         assert "playnext" in CATEGORY_COMMANDS["Playback"]
+
+
+class TestResolveWaitExpiredReply:
+    """The new error a user actually hits under a saturated pool. Its reply had
+    zero coverage: commands/play.py regressed off 100% on exactly these lines."""
+
+    _PLAYLIST = "https://www.youtube.com/playlist?list=PLwaittest"
+
+    async def test_an_expired_slot_wait_tells_the_channel(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Nothing was searched and nothing was queued, so "try again" here is
+        honest in a way it is not for a stalled place."""
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch(
+                "src.play_pipeline.queue_source",
+                new=AsyncMock(side_effect=ResolveWaitExpired()),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://yt.com/v=1"
+            )
+
+        said = " ".join(
+            str(c.kwargs.get("embed").description)
+            for c in mock_ctx.send.call_args_list
+            if c.kwargs.get("embed") is not None
+        )
+        assert "too many songs being looked up" in said
+        # The class name is what it says without a handler.
+        assert "ResolveWaitExpired" not in said
+
+    async def test_the_interject_branch_reports_it_too(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """The interject route has its own handler, because _resolve_and_place's
+        unwinds a join and would name the wrong subsystem."""
+        from src.musicplayer import InterjectOutcome
+
+        mp = mock_mp()
+        mp.current_song = MagicMock()
+        mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Original", resume_position=1, was_paused=False
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=mp)
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.channel = mock_ctx.author.voice.channel
+        mock_ctx.voice_client = vc
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch(
+                "src.play_pipeline._resolve_interjection_source",
+                new=AsyncMock(side_effect=ResolveWaitExpired()),
+            ),
+        ):
+            # --now: a plain -play over a PLAYING song does not interject.
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="--now https://yt.com/v=1"
+            )
+
+        said = " ".join(
+            str(c.kwargs.get("embed").description)
+            for c in mock_ctx.send.call_args_list
+            if c.kwargs.get("embed") is not None
+        )
+        assert "too many songs being looked up" in said
+        assert "ResolveWaitExpired" not in said

@@ -14,7 +14,7 @@ import discord
 import fakeredis
 import pytest
 
-from src import play_pipeline
+from src import play_pipeline, util
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -79,6 +79,20 @@ def pytest_collection_modifyitems(
         file=sys.stderr,
     )
     raise pytest.UsageError(f"{tier} tier selected but not enabled")
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_channel_claims() -> Iterator[None]:
+    """Assert every per-channel claim was released, then clear.
+
+    Process-wide state, like _TYPING_HOLDS: a leaked channel id silently
+    suppresses that kind of message in that channel for the life of the process,
+    and only an assertion can tell a released claim from a cleared one. Cleared
+    before the assert so one leak cannot cascade into every later test."""
+    yield
+    leaked = {k: set(v) for k, v in util._CLAIMED_CHANNELS.items() if v}
+    util._CLAIMED_CHANNELS.clear()
+    assert not leaked, f"channel claims not released: {leaked}"
 
 
 @pytest.fixture(autouse=True)

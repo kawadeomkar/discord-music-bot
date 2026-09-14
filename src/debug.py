@@ -320,6 +320,16 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback=str(config.PLAY_RESOLVE_CONCURRENCY),
     ),
     _ConfigVar(
+        name="PLAY_RESOLVE_WAIT_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PLAY_RESOLVE_WAIT_SECS),
+    ),
+    _ConfigVar(
+        name="PLAY_SLOW_NOTICE_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PLAY_SLOW_NOTICE_SECS),
+    ),
+    _ConfigVar(
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
         fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),

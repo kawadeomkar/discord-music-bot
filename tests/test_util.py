@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from opentelemetry import trace as trace_api
 
+from src import util
+from tests.helpers import settle
 from src.util import (
     BAR_WIDTH,
     FOOTER_LIMIT,
@@ -537,6 +539,93 @@ class TestTypingKeepaliveCancellation:
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
         assert keepalive.cancelled()
+
+
+class TestJoinTask:
+    """The signal-and-await join. cancel_task has a class for the same contract;
+    this one shipped with both of its exception arms unexecuted."""
+
+    async def test_a_task_that_raises_is_logged_and_swallowed(self) -> None:
+        """A background task's failure must not become the joiner's, which is
+        already unwinding — often inside a finally, often with a real error
+        already propagating."""
+
+        async def _boom() -> None:
+            raise RuntimeError("background boom")
+
+        task = asyncio.create_task(_boom())
+        with patch.object(util.log, "warning") as warned:
+            await util.join_task(task)
+        assert "background boom" in str(warned.call_args)
+
+    async def test_a_task_cancelled_from_elsewhere_is_not_the_joiners_problem(
+        self,
+    ) -> None:
+        """Someone else cancelled the joined task. The joiner was not cancelled,
+        so it carries on: swallowing here is the point of the helper."""
+
+        async def _park() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_park())
+        await asyncio.sleep(0)
+        task.cancel()
+        await util.join_task(task)
+        assert task.cancelled()
+
+    async def test_the_joiners_own_cancellation_is_re_raised(self) -> None:
+        """The other arm, and the one that matters: a joiner that swallows its own
+        cancellation returns normally from a cancelled task, which stalls the
+        shutdown gather that cancelled it."""
+        started = asyncio.Event()
+
+        async def _park() -> None:
+            await asyncio.sleep(3600)
+
+        async def _joiner() -> None:
+            task = asyncio.create_task(_park())
+            started.set()
+            await util.join_task(task)
+
+        joining = asyncio.create_task(_joiner())
+        async with asyncio.timeout(2):
+            await started.wait()
+        await settle()
+        joining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joining
+        assert joining.cancelled()
+
+    async def test_the_joined_task_is_shielded_from_the_joiners_cancellation(
+        self,
+    ) -> None:
+        """Task.cancel() cancels whatever the task is waiting ON, and `await task`
+        makes the joined task the _fut_waiter — so an unshielded join cancels the
+        very task it promises not to cancel, mid-cleanup."""
+        started = asyncio.Event()
+        joined: list[asyncio.Task[None]] = []
+
+        async def _work() -> None:
+            await asyncio.sleep(0.05)
+
+        async def _joiner() -> None:
+            task = asyncio.create_task(_work())
+            joined.append(task)
+            started.set()
+            await util.join_task(task)
+
+        joining = asyncio.create_task(_joiner())
+        async with asyncio.timeout(2):
+            await started.wait()
+        await settle()
+        joining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joining
+        # Finished rather than cancelled: a flag set in a finally runs on either
+        # ending, so only the task's own outcome tells the two apart.
+        async with asyncio.timeout(2):
+            await asyncio.wait(joined)
+        assert not joined[0].cancelled()
 
 
 class TestProgressBar:

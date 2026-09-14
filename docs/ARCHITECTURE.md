@@ -638,13 +638,17 @@ On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases n
 
 `pool_slot` is typed as `AbstractAsyncContextManager` rather than `asyncio.Semaphore` throughout `src/youtube.py`, so the slot can carry the deadline without that module learning anything about guilds. A resolve reached outside a command still passes `None`.
 
+**One guild's exhausted budget is never another's.** `ResolveWaitExpired` is a `util.PoolSlotUnavailable`, the contract between whoever owns a slot and the extraction that holds one: the bound belongs to the CALLER that supplied the slot, never to the shared job that caller happened to start. `_extract_once` single-flights on the URL and the key carries no guild, so publishing a leader's expired wait to its joiners would fail another guild's song — including the playback loop's own in-band resolve, which supplies no slot at all. A joiner that sees it re-elects instead, and retires the failed job at that point rather than leaving it to the job's done callback: that runs through `call_soon`, and a caller joining an already-failed job never suspends, so it would read the same job straight back and spin.
+
 #### Saying so while it waits
 
 `slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands. It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
 
 No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
 
-It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits its poster, and an await between the teardown decision and the hold release is exactly what that path may not have.
+It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. Bypassing it also skips debug-mode decoration, so the footer arrives pre-rendered as `debug_suffix`, like the dashboards'. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits a Discord call, and an await between the teardown decision and the hold release is exactly what that path may not have.
+
+**The task that posts it is the task that retracts it**, in its own `finally`. A caller cancelled while the send is in flight never learns the message handle, so a delete anywhere else would leave the notice standing with nothing that knows its id. The caller only signals and joins, through `util.join_task`, which re-raises a cancellation aimed at the caller and shields the joined task: `await task` makes the joined task the canceller's `_fut_waiter`, so an unshielded join would cancel the very task it is waiting out, mid-cleanup.
 
 ---
 

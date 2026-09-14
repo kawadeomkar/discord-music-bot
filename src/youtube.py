@@ -22,7 +22,13 @@ from opentelemetry.trace import StatusCode
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import current_traceparent, fmt_duration, get_logger, spawn_background
+from src.util import (
+    PoolSlotUnavailable,
+    current_traceparent,
+    fmt_duration,
+    get_logger,
+    spawn_background,
+)
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -1074,21 +1080,33 @@ async def _extract_once(
     rather than around the caller's whole resolve: a cache hit and a joined job hold
     no worker, and queueing those behind two extractions is what the bound is meant
     to prevent, not to cause. See docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
-    running = _INFLIGHT_EXTRACTS.get(key)
-    if running is not None:
-        # A joiner holds no worker of its own — the leader's job is the one running.
-        trace.get_current_span().set_attribute("ytdl.extract_shared", True)
-        return await asyncio.shield(running)
-    # The slot is taken INSIDE the job, so nothing is awaited between the read above
-    # and the write below. Awaiting the slot here instead loses the single flight
-    # exactly when it is worth most: with the semaphore full, every caller for one
-    # key reads an empty registry, queues, and starts a job of its own.
-    job = asyncio.ensure_future(_gated_extract(request, pool_slot))
-    _INFLIGHT_EXTRACTS[key] = job
-    # Registered before the shield, so it runs first: the key is gone before any
-    # awaiter resumes, and a re-extraction starts a fresh job.
-    job.add_done_callback(lambda _f: _INFLIGHT_EXTRACTS.pop(key, None))
-    return await asyncio.shield(job)
+    while True:
+        running = _INFLIGHT_EXTRACTS.get(key)
+        if running is not None:
+            # A joiner holds no worker of its own — the leader's job is running.
+            trace.get_current_span().set_attribute("ytdl.extract_shared", True)
+            try:
+                return await asyncio.shield(running)
+            except PoolSlotUnavailable:
+                # The leader's slot budget belongs to ITS caller; this one holds
+                # no worker and may have supplied no slot at all. Going round
+                # leads. Retire the job here: the done callback runs through
+                # call_soon, and a caller joining an already-failed job never
+                # suspends, so it reads the same job back and spins.
+                if _INFLIGHT_EXTRACTS.get(key) is running:
+                    del _INFLIGHT_EXTRACTS[key]
+                trace.get_current_span().set_attribute("ytdl.extract_shared", False)
+                continue
+        # The slot is taken INSIDE the job, so nothing is awaited between the read
+        # above and the write below. Awaiting the slot here instead loses the single
+        # flight exactly when it is worth most: with the semaphore full, every caller
+        # for one key reads an empty registry, queues, and starts a job of its own.
+        job = asyncio.ensure_future(_gated_extract(request, pool_slot))
+        _INFLIGHT_EXTRACTS[key] = job
+        # Registered before the shield, so it runs first: the key is gone before any
+        # awaiter resumes, and a re-extraction starts a fresh job.
+        job.add_done_callback(lambda _f: _INFLIGHT_EXTRACTS.pop(key, None))
+        return await asyncio.shield(job)
 
 
 async def _extract_for_source(

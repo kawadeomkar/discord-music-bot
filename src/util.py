@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import re
 from typing import Any, Final, Optional
-from collections.abc import AsyncGenerator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
 
 import discord
 import structlog
@@ -91,6 +91,44 @@ async def cancel_task(task: Optional[asyncio.Task]) -> None:
                 raise
 
 
+async def set_within(event: asyncio.Event, secs: float) -> bool:
+    """True when `event` was set inside `secs`. A cancellation aimed at this
+    coroutine still propagates — asyncio.timeout only converts its own."""
+    try:
+        async with asyncio.timeout(secs):
+            await event.wait()
+    except TimeoutError:
+        return False
+    return True
+
+
+async def set_when_set(source: asyncio.Event, target: asyncio.Event) -> None:
+    """Set `target` once `source` is set. Run as a task and cancelled by its
+    owner; it holds nothing, so an unawaited cancel is enough."""
+    await source.wait()
+    target.set()
+
+
+async def join_task(task: asyncio.Task[Any]) -> None:
+    """Wait out a task that was told to stop by a SIGNAL rather than cancelled,
+    swallowing what it raises — never this coroutine's own cancellation, for the
+    reason cancel_task spells out. Cancelling instead would orphan whatever the
+    task cleans up in its own finally.
+
+    Shielded, because a bare `await task` is itself a cancellation vector into
+    that task: Task.cancel() cancels whatever the task is waiting ON, and
+    awaiting a task directly makes it the _fut_waiter. So a caller cancelled
+    here would cancel the very task it is waiting out, mid-cleanup."""
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception as e:
+        log.warning(f"joined background task failed: {e!r}")
+
+
 def spawn_background(
     coro: Coroutine[Any, Any, Any], tasks: set[asyncio.Task[Any]]
 ) -> asyncio.Task[Any]:
@@ -109,6 +147,44 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
     # CancelledError would mark the task completed and stall a shutdown here.
     except Exception:
         pass  # cosmetic — never let typing failures surface
+
+
+class PoolSlotUnavailable(Exception):
+    """A `pool_slot` context manager could not be entered in time.
+
+    The contract between whoever owns a slot and the extraction that holds one.
+    The bound belongs to the CALLER that supplied the slot, never to the shared
+    job that caller happened to start, so the extraction single-flight re-elects
+    a leader on this rather than failing every joiner: a joiner holds no worker
+    of its own, and may have supplied no slot at all.
+    See docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
+
+
+# One transient message per channel per KIND, exclusive. PLAY_INFLIGHT_MAX is 16
+# and requests resolve concurrently, and discord.py sleeps a throttled channel
+# bucket internally — so sixteen slow-resolve notices would cost the
+# confirmations. See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait.
+_CLAIMED_CHANNELS: dict[str, set[int]] = {}
+
+
+@contextlib.contextmanager
+def channel_claim(kind: str, channel_id: int) -> Iterator[bool]:
+    """Take exclusive use of a channel for one kind of transient message.
+
+    Yields False when another holder has it, and then holds nothing: the loser
+    says nothing rather than queueing behind the winner, because two identical
+    messages tell the user less than one. Claim at the moment of SENDING, never
+    at entry — a request that settles inside its own delay never sends, and must
+    not hold the slot a slow sibling needs."""
+    held = _CLAIMED_CHANNELS.setdefault(kind, set())
+    claimed = channel_id not in held
+    if claimed:
+        held.add(channel_id)
+    try:
+        yield claimed
+    finally:
+        if claimed:
+            held.discard(channel_id)
 
 
 # Refcounted per channel: concurrent -play requests enter this once per link, and

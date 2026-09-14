@@ -285,7 +285,9 @@ src/
 ├── musicbot.py       # MusicBot cog — command REGISTRATION and one try/except each;
 │                     # per-guild player registry (mps), the discord.py hooks, crash-recovery entry
 ├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP host, ETA, interject
-├── play_placement.py # -play's flag grammar, its voice gate, and PlayRegistry: the per-guild
+├── play_placement.py # -play's flag grammar, its voice gate, the two bounds on the resolve
+│                     # (ResolveSlot's deadline on the WAIT for a slot, and slow_resolve_notice
+│                     # saying so past it), and PlayRegistry: the per-guild
 │                     # in-flight set and the place lock its inserts serialize on (the cog
 │                     # keeps the commands; the grammar and the registry are tested in
 │                     # test_play_placement.py, the placement itself in commands/test_play.py)
@@ -1085,7 +1087,10 @@ can spend the whole placement budget before the insert begins.
   a trace-id footer. `ExtractionError.user_message` is the only yt-dlp text safe to show
   (raw messages can carry yt-dlp's bug-report boilerplate).
 - **Tasks**: fire-and-forget via `spawn_background(coro, tracked_set)` (auto-discard);
-  cancel via `cancel_task()` (awaits, suppresses CancelledError). Never swallow your own
+  cancel via `cancel_task()` (awaits, suppresses CancelledError); **join** a task told to
+  stop by a SIGNAL via `join_task()`, which shields it — `await task` makes the joined
+  task the canceller's `_fut_waiter`, so an unshielded join cancels the very task it is
+  waiting out, mid-cleanup. Never swallow your own
   coroutine's CancelledError (see `_typing_keepalive`'s comment for the pattern).
 - **Command definitions** carry their own help copy: `brief`, `usage`, `help`, and
   `extras={"category", "examples", "note"}` — help.py renders from these, so a new
