@@ -19,7 +19,7 @@ import discord
 import orjson
 import pytest
 
-from src import analytics_card, analytics_render, chart_pool
+from src import analytics_card, analytics_render, chart_pool, config
 from src.analytics_card import ALLOWED_DAYS, TOP_N
 from src.guild_state import (
     WAIT_UNAVAILABLE,
@@ -885,13 +885,13 @@ class TestChartFallback:
             await asyncio.sleep(3600)
             return b""
 
-        with (
-            patch("src.chart_pool.chart_pool.run", AsyncMock(side_effect=_hang)),
-            patch("src.analytics_card.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
-        ):
-            await command_callback(MusicBot.analytics)(
-                self._bot(music_bot), mock_ctx, flags=_flags()
-            )
+        config.set_override("ANALYTICS_RENDER_DEADLINE_SECS", 0.01)
+        # Bounded: at the environment's 20s deadline this would pass, only slower.
+        with patch("src.chart_pool.chart_pool.run", AsyncMock(side_effect=_hang)):
+            async with asyncio.timeout(2):
+                await command_callback(MusicBot.analytics)(
+                    self._bot(music_bot), mock_ctx, flags=_flags()
+                )
         assert "file" not in self._sent_kwargs(mock_ctx)
         assert "Analytics" in self._sent_kwargs(mock_ctx)["embed"].title
 
@@ -1005,9 +1005,9 @@ class TestPngCache:
         music_bot.history_archive = _fake_archive(
             _metrics(today_start_epoch=time.time())
         )
+        config.set_override("ANALYTICS_RENDER_DEADLINE_SECS", 0.01)
         with (
             patch("src.chart_pool.chart_pool.run", _slow),
-            patch("src.analytics_card.ANALYTICS_RENDER_DEADLINE_SECS", 0.01),
             patch("src.analytics_card.analytics_png_get", AsyncMock(return_value=None)),
             patch("src.analytics_card.analytics_png_set", setter),
         ):

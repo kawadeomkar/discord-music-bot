@@ -23,8 +23,7 @@ import orjson
 from discord.ext import commands
 from opentelemetry import trace
 
-from src import analytics_render, chart_pool as chart_pool_mod
-from src.config import ANALYTICS_RENDER_DEADLINE_SECS
+from src import analytics_render, chart_pool as chart_pool_mod, config
 from src.guild_state import (
     WAIT_UNAVAILABLE,
     AnalyticsMetrics,
@@ -393,7 +392,7 @@ async def render_chart(
         )
         try:
             done, _ = await asyncio.wait(
-                {render}, timeout=ANALYTICS_RENDER_DEADLINE_SECS
+                {render}, timeout=config.analytics_render_deadline_secs()
             )
             if not done:
                 # A ProcessPoolExecutor cannot cancel a running call, so the
