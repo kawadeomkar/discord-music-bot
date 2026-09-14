@@ -262,10 +262,6 @@ class MusicHelpCommand(commands.HelpCommand):
         examples: list[str] = extras.get("examples", [])
         if examples:
             embed.add_field(name="EXAMPLES", value=self._fence(examples), inline=False)
-        # (name, entries) pairs a command builds from its own data, as entries.
-        sections: list[tuple[str, list[list[str]]]] = extras.get("sections", [])
-        for name, entries in sections:
-            self._add_entries_field(embed, name, entries)
         note: Optional[str] = extras.get("note")
         if note:
             embed.add_field(name="NOTES", value=note, inline=False)

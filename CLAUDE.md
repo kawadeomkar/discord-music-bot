@@ -1170,10 +1170,8 @@ can spend the whole placement budget before the insert begins.
   waiting out, mid-cleanup. Never swallow your own
   coroutine's CancelledError (see `_typing_keepalive`'s comment for the pattern).
 - **Command definitions** carry their own help copy: `brief`, `usage`, `help`, and
-  `extras={"category", "examples", "note", "sections"}` — help.py renders from these,
-  so a new command documents itself. `sections` is `(name, entries)` pairs a command
-  builds from its own data, rendered after EXAMPLES (`-settings` lists its settings
-  from the registry). Add it to `CATEGORY_COMMANDS` in help.py for ordering
+  `extras={"category", "examples", "note"}` — help.py renders from these, so a new
+  command documents itself. Add it to `CATEGORY_COMMANDS` in help.py for ordering
   (unlisted commands land under "Other").
 - **Durations** render via `fmt_duration` (`3:45`, `1:02:05`) everywhere — mixed clock
   formats between the bar, presence, and embeds was a real bug. The exception is a

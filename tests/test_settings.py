@@ -48,7 +48,6 @@ from src.settings import (
     find,
     format_value,
     from_stored,
-    help_sections,
     in_bounds,
     is_bullet_shaped,
     parse_settings_args,
@@ -996,31 +995,6 @@ class TestRefusalsNeverQuoteTheInput:
         assert any(
             r.reason is RefusalReason.WRONG_SCOPE for r in self._refusals("HeArTbEaT")
         )
-
-
-class TestHelpSections:
-    def test_lists_every_server_key_and_alias_and_no_bot_key(self) -> None:
-        ((name, entries),) = help_sections()
-        assert name == "SETTINGS"
-        text = "\n".join(line for entry in entries for line in entry)
-        server = {s.key for s in SETTINGS if s.scope is SettingScope.SERVER}
-        words = {word.rstrip(",") for word in text.split()}
-        for spec in SETTINGS:
-            names = (spec.key, *spec.aliases)
-            if spec.scope is SettingScope.SERVER:
-                assert all(n in text for n in names), spec.key
-            elif spec.key not in server:
-                assert spec.key not in words, spec.key
-
-    def test_a_range_that_follows_the_bot_names_it(self) -> None:
-        """Built once, when the command is defined: a number there would go stale."""
-        ((_, entries),) = help_sections()
-        text = " ".join(" ".join(entry) for entry in entries)
-        assert "the bot's value–30s" in text
-
-    def test_lines_fit_the_help_code_block(self) -> None:
-        ((_, entries),) = help_sections()
-        assert all(len(line) <= 48 for entry in entries for line in entry)
 
 
 # ── BotSettings ───────────────────────────────────────────────────────────────

@@ -15,7 +15,6 @@ import difflib
 import math
 import os
 import re
-import textwrap
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -1390,18 +1389,13 @@ def _parse_scoped(tokens: list[str], scope: SettingScope) -> SettingsRequest | R
     return result
 
 
-# ── Help ────────────────────────────────────────────────────────────────────────
-
-# help.py's code-block entry layout: wrapped at 48 columns, the summary indented.
-_HELP_WIDTH: Final = 48
-_HELP_INDENT: Final = "    "
+# ── What a setting accepts ──────────────────────────────────────────────────────
 
 
 def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
-    """What a spec accepts, as the help and the detail view print it. A write-time
-    bound follows another setting, so only `now` (a render at the call) applies
-    it. Otherwise a server spec names the bot value it follows, and a bot spec
-    prints its static range."""
+    """What a spec accepts, as the cards and the detail view print it. A write-time
+    bound follows another setting's current value, so only `now` (a render at the
+    call) applies it; otherwise this is the static range."""
     match spec.kind:
         case SettingKind.SWITCH:
             return "on or off"
@@ -1411,8 +1405,6 @@ def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
     static_hi = bound(spec.maximum) or 0
     if spec.write_minimum is not None and now:
         lo = format_value(spec, max(static_lo, spec.write_minimum()))
-    elif spec.write_minimum is not None and spec.scope is SettingScope.SERVER:
-        lo = "the bot's value"
     else:
         lo = format_value(spec, static_lo)
     if spec.write_maximum is not None and now:
@@ -1420,27 +1412,6 @@ def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
     else:
         hi = format_value(spec, static_hi)
     return f"{lo}–{hi}" + (" or off" if spec.kind is SettingKind.SECONDS_OR_OFF else "")
-
-
-def help_sections() -> list[tuple[str, list[list[str]]]]:
-    """The server settings as `-help settings` entries, one per spec: its names and
-    range over its summary. Bot settings are the operator's, so none is listed."""
-    entries = [
-        textwrap.wrap(
-            f"{', '.join((spec.key, *spec.aliases))}  {allowed_text(spec)}",
-            _HELP_WIDTH,
-            subsequent_indent=_HELP_INDENT + "  ",
-        )
-        + textwrap.wrap(
-            spec.summary,
-            _HELP_WIDTH,
-            initial_indent=_HELP_INDENT,
-            subsequent_indent=_HELP_INDENT,
-        )
-        for spec in SETTINGS
-        if spec.scope is SettingScope.SERVER
-    ]
-    return [("SETTINGS", entries)]
 
 
 # ── Bot settings: the operator's overrides of config's accessors ─────────────

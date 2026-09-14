@@ -13,7 +13,7 @@ from src.help import (
     _WIDTH as WIDTH,
 )
 from src.musicbot import MusicBot
-from src.settings import SETTINGS, Parsed, SettingScope, SettingSpec, find, parse_value
+from src.settings import Parsed, SettingScope, SettingSpec, find, parse_value
 
 # Discord's hard caps: an embed field value is 1024 chars, a description 4096.
 FIELD_LIMIT = 1024
@@ -301,44 +301,26 @@ class TestCommandHelp:
             assert note is None or len(note) <= FIELD_LIMIT
 
 
-class TestCommandSections:
-    """extras["sections"]: entries a command builds from its own data, rendered
-    after EXAMPLES. -settings lists its server settings from the registry."""
+class TestTheSettingsPage:
+    """-help settings points at the card, which lists every setting with the
+    command that changes it, instead of repeating that list."""
 
-    async def test_settings_lists_every_server_setting_and_no_bot_one(
+    async def test_it_is_a_short_pointer_with_no_settings_list(
         self, help_command: MusicHelpCommand, ctx: MagicMock
     ) -> None:
         await help_command.command_callback(ctx, command="settings")
         embed = sent_embed(ctx)
-        names = [f.name for f in embed.fields]
-        assert names.index("SETTINGS") == names.index("EXAMPLES") + 1
-        listing = "\n".join(
-            f.value or "" for f in embed.fields if (f.name or "").startswith("SETTINGS")
-        )
-        server = {
-            name
-            for spec in SETTINGS
-            if spec.scope is SettingScope.SERVER
-            for name in (spec.key, *spec.aliases)
-        }
-        assert all(name in listing for name in server)
-        # Entries open their line with the key; a bot key shared with a server
-        # setting is listed as the server's.
-        bot_only = {s.key for s in SETTINGS if s.scope is SettingScope.BOT} - server
-        assert not any(f"\n{key}" in listing for key in bot_only)
-        assert all(len(f.value or "") <= FIELD_LIMIT for f in embed.fields)
-        assert len(embed) <= 6000
-
-    async def test_a_command_without_sections_renders_as_before(
-        self, help_command: MusicHelpCommand, ctx: MagicMock
-    ) -> None:
-        await help_command.command_callback(ctx, command="play")
-        assert [f.name for f in sent_embed(ctx).fields] == [
+        assert [f.name for f in embed.fields] == [
             "SYNOPSIS",
             "DESCRIPTION",
             "EXAMPLES",
             "NOTES",
         ]
+        description = next(
+            f.value or "" for f in embed.fields if f.name == "DESCRIPTION"
+        )
+        assert "the command that changes it" in description
+        assert len(embed) <= 1000
 
 
 class TestErrors:

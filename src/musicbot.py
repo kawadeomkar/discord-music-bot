@@ -1212,15 +1212,9 @@ class MusicBot(commands.Cog):
         brief="view or change this server's settings",
         usage="[bot] [<setting> [<value> | reset]]",
         help=(
-            "`-settings` shows this server's settings: each one's value and whether "
-            "it was set here or is the default. `-settings <setting>` shows one in "
-            "full: what it does, its default, what it accepts and when a change "
-            "applies. `-settings <setting> <value>` changes it for this server, and "
-            "`-settings <setting> reset` returns it to the default. A setting's "
-            "name on the card works with dashes for spaces.\n\n"
-            "One setting per message, on one line. `-settings bot` shows the "
-            "bot-wide settings and `-settings bot <setting> <value>` changes one, for "
-            "the bot's operator only."
+            "Shows this server's settings: each one's value, what it does, and the "
+            "command that changes it. `-settings bot` does the same for the bot-wide "
+            "settings, for the bot's operator."
         ),
         extras={
             "category": "Utility",
@@ -1229,18 +1223,12 @@ class MusicBot(commands.Cog):
             "examples": [
                 "-settings",
                 "-settings leave-when-idle 10:00",
-                "-settings timezone Europe/London",
-                "-settings volume 80",
-                "-settings alone-timeout reset",
-                "-settings bot",
+                "-settings volume reset",
             ],
             "note": (
-                "Anyone can view. Changing a server setting needs Manage Server; "
-                "volume can also be changed by anyone in the bot's voice channel, "
-                "as with `-volume`. The bot's operator can change them too, and "
-                "bot-wide settings are the operator's alone."
+                "Changing a setting needs Manage Server, or being in the bot's voice "
+                "channel for volume."
             ),
-            "sections": settings_registry.help_sections(),
         },
     )
     # No max_concurrency: writes serialize on GuildSettings' per-guild lock, and
