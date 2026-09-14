@@ -8,7 +8,9 @@ import discord
 import pytest
 from discord.ext import commands
 
+from src import settings_card
 from src.commands import debug as debug_cmd
+from src.guild_state import GuildConfig
 from src.musicbot import (
     MusicBot,
 )
@@ -251,6 +253,40 @@ class TestDebugInputs:
         assert inputs.player is None
         assert inputs.store is None
         assert inputs.debug_overridden is False
+        assert inputs.settings == ()
+
+    async def test_the_settings_rows_are_this_servers_cached_values(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        guild_id = mock_ctx.guild.id
+        music_bot.redis = fake_redis
+        await music_bot.guild_settings.hydrate([guild_id, 999])
+        await music_bot.guild_settings.write(guild_id, GuildConfig(volume=0.5))
+        await music_bot.guild_settings.write(999, GuildConfig(timezone="Asia/Tokyo"))
+
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
+
+        changed = {
+            spec.key: shown
+            for spec, shown in inputs.settings
+            if shown.source != settings_card.DEFAULT
+        }
+        assert changed == {"volume": settings_card.Shown(50, settings_card.SET_HERE)}
+        assert inputs.settings_read is True
+
+    async def test_an_unsaved_write_carries_its_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """No Redis: the write applies in memory only, and the cache was never read."""
+        await music_bot.guild_settings.write(
+            mock_ctx.guild.id, GuildConfig(alone_timeout_secs=30.0)
+        )
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
+        shown = {spec.key: shown for spec, shown in inputs.settings}
+        assert shown["alone-timeout"] == settings_card.Shown(
+            30.0, settings_card.NOT_SAVED
+        )
+        assert inputs.settings_read is False
 
 
 class TestDebugObservesWithoutCreating:

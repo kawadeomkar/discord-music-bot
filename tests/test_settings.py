@@ -1771,6 +1771,8 @@ class TestGuildSettingsWritePath:
                 result = await guild_settings.write(_GUILD, GuildConfig(volume=0.5))
         assert result.applied and not result.persisted
         assert not guild_settings.is_persisted(_GUILD, "volume")
+        assert guild_settings.unsaved(_GUILD) == frozenset({"volume"})
+        assert guild_settings.unsaved(_GUILD + 1) == frozenset()
 
     async def test_without_redis_a_write_applies_unsaved(self, guild_cog: Any) -> None:
         guild_cog.redis = None
@@ -2308,6 +2310,7 @@ class TestHotPathsNeverAwaitSettings:
             "peek",
             "is_complete",
             "is_persisted",
+            "unsaved",
             "reading",
             "seed",
             "idle_timeout_secs",

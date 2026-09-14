@@ -32,8 +32,8 @@ from src.config import debug_mode_default
 from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth
-from src.settings import SETTINGS, format_value
-from src.settings_card import bot_shown
+from src.settings import SETTINGS, SettingSpec, format_value
+from src.settings_card import DEFAULT, SET_HERE, Shown, bot_shown
 from src.util import (
     FOOTER_SUFFIX_SEP,
     cancel_task,
@@ -529,6 +529,11 @@ class DebugInputs:
     # Debug mode's footer, rendered once by the cog and constant for the loop.
     # None when the guild has debug mode off.
     debug_suffix: Optional[str] = None
+    # This server's settings as -settings renders them, from the cache: the
+    # snapshot never waits on Redis. `settings_read` is False while a stored
+    # value may be missing from it.
+    settings: tuple[tuple[SettingSpec, Shown], ...] = ()
+    settings_read: bool = True
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
@@ -1012,6 +1017,23 @@ def _fence_safe(text: str) -> str:
     return truncate(text.replace("`", "'"), 60)
 
 
+def settings_line(rows: Sequence[tuple[SettingSpec, Shown]], *, read: bool) -> str:
+    """The server settings changed here, in registry order, with the -settings
+    card's labels past `set here`: `idle-timeout 10:00, volume 50% (not saved)
+    (2 changed)`. Server keys only; the bot's are the operator's Config block."""
+    changed = [
+        f"{spec.key} {format_value(spec, shown.value)}"
+        + ("" if shown.source == SET_HERE else f" ({shown.source})")
+        for spec, shown in rows
+        if shown.source != DEFAULT
+    ]
+    unread = "" if read else "stored values not read yet"
+    if not changed:
+        return f"none known ({unread})" if unread else "none changed"
+    count = f"{len(changed)} changed" + (f"; {unread}" if unread else "")
+    return f"{', '.join(changed)} ({count})"
+
+
 def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> list[str]:
     mp = inputs.player
     lines = [
@@ -1020,6 +1042,7 @@ def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> li
         f"queue        {mp.queue.display_size() if mp is not None else 0} queued",
         f"volume       {round(mp.volume * 100) if mp is not None else 100}%",
         f"debug        {'on' if inputs.debug_enabled else 'off'} ({source})",
+        f"settings     {settings_line(inputs.settings, read=inputs.settings_read)}",
     ]
     vc = guild.voice_client
     if not isinstance(vc, discord.VoiceClient) or vc.channel is None:

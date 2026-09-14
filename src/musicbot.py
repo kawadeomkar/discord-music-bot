@@ -1168,9 +1168,9 @@ class MusicBot(commands.Cog):
         brief="diagnostic snapshot; toggle debug mode",
         usage="[--enable | --disable]",
         help=(
-            "Shows what this bot is running: versions, and Discord/voice state for "
-            "this server. For the bot owner it also fills in host details — build, "
-            "configuration, uptime, storage and health checks.\n\n"
+            "Shows what this bot is running: versions, and this server's voice "
+            "state and changed settings. The bot owner also sees host details — "
+            "build, configuration, uptime, storage and health checks.\n\n"
             "`--enable` turns debug mode on for this server, which adds a footer to "
             "every embed the bot sends here — including the live Now Playing card, "
             "which refreshes its numbers alongside the progress bar. A reply's "

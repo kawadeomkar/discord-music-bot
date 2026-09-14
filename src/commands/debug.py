@@ -10,6 +10,7 @@ from src.config import (
     history_archive_enabled,
     using_default_postgres_password,
 )
+from src import settings_card
 from src.guild_state import GuildConfig
 from src.redis_client import GuildRedisStore
 from src.util import is_operator, notice_embed
@@ -122,6 +123,16 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
     default_password = (
         (using_default_postgres_password() and archive_enabled) if operator else None
     )
+    settings = cog.guild_settings
+    rows = (
+        settings_card.server_rows(
+            settings.peek(guild_id),
+            debug_default=cog.debug_settings.default,
+            unsaved=settings.unsaved(guild_id),
+        )
+        if guild_id is not None
+        else []
+    )
     return DebugInputs(
         debug_enabled=cog.debug_settings.enabled(guild_id),
         debug_overridden=cog.debug_settings.has_override(guild_id),
@@ -141,4 +152,6 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
         default_password=default_password,
         # The card withholds its Runtime block from a non-owner; so must the footer.
         debug_suffix=cog.debug_suffix(ctx, host_metrics=operator),
+        settings=tuple(rows),
+        settings_read=guild_id is None or settings.is_complete(guild_id),
     )

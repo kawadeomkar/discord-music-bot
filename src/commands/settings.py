@@ -13,7 +13,6 @@ from src import settings_card as card
 from src.guild_state import ConfigField, ConfigFieldName, GuildConfig, is_config_field
 from src.play_placement import check_voice_permissions
 from src.settings import (
-    ALL_CONFIG_FIELDS,
     SETTINGS,
     BotSettings,
     Refusal,
@@ -274,15 +273,6 @@ async def _read(cog: MusicBot, guild_id: int) -> bool:
     return settings.is_complete(guild_id) or await settings.load(guild_id) is not None
 
 
-def _unsaved(cog: MusicBot, guild_id: int) -> frozenset[str]:
-    settings = cog.guild_settings
-    return frozenset(
-        field
-        for field in ALL_CONFIG_FIELDS
-        if not settings.is_persisted(guild_id, field)
-    )
-
-
 async def _show_server(
     ctx: commands.Context, request: SettingsRequest, *, cog: MusicBot
 ) -> None:
@@ -292,7 +282,7 @@ async def _show_server(
     rows = card.server_rows(
         cog.guild_settings.peek(guild.id),
         debug_default=cog.debug_settings.default,
-        unsaved=_unsaved(cog, guild.id),
+        unsaved=cog.guild_settings.unsaved(guild.id),
     )
     if request.spec is None:
         embed = card.server_card(

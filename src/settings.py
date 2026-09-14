@@ -1694,6 +1694,14 @@ class GuildSettings:
         """False while the field's last write had not reached Redis."""
         return (guild_id, field) not in self._unpersisted
 
+    def unsaved(self, guild_id: int) -> frozenset[str]:
+        """The guild's fields whose last write had not reached Redis."""
+        return frozenset(
+            field
+            for field in ALL_CONFIG_FIELDS
+            if not self.is_persisted(guild_id, field)
+        )
+
     # The accessors: synchronous and total. An unread or unset field is the
     # default; a stored value already passed CONFIG_DOMAIN when it was parsed.
 

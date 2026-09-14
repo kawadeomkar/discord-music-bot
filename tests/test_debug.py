@@ -20,11 +20,12 @@ from redis.asyncio import Redis
 from discord.ext import commands
 from opentelemetry import trace as trace_api
 
-from src import config, debug
+from src import config, debug, settings_card
 from src.commands import debug as debug_cmd
 from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
+from src.settings import SETTINGS, SettingScope
 from src.musicbot import MusicBot as MusicBotCog
 from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, cancel_task, spawn_background
 from src.guild_queue import QueueObject
@@ -42,6 +43,7 @@ from src.debug import (
     parse_debug_arg,
     redact_url,
     render_config_value,
+    settings_line,
     unknown_arg_message,
 )
 
@@ -511,6 +513,195 @@ class TestGuildBlock:
         assert "voice ws     21 ms (avg 23 ms)" in lines
         assert "connect ✅" in lines
         assert "speak ⚠️" in lines
+
+
+def _rows(
+    stored: GuildConfig, *, unsaved: frozenset[str] = frozenset()
+) -> list[tuple[Any, settings_card.Shown]]:
+    return settings_card.server_rows(stored, debug_default=False, unsaved=unsaved)
+
+
+class TestTheSettingsLine:
+    """ "This server" lists the settings changed here, from the cache, with the
+    -settings card's labels. Everyone sees the block, so it carries server keys only."""
+
+    def test_lists_only_the_changed_keys_in_registry_order(self) -> None:
+        rows = _rows(GuildConfig(idle_timeout_secs=600.0, timezone="Europe/London"))
+        assert (
+            settings_line(rows, read=True)
+            == "timezone Europe/London, idle-timeout 10:00 (2 changed)"
+        )
+
+    def test_nothing_changed(self) -> None:
+        assert settings_line(_rows(GuildConfig()), read=True) == "none changed"
+
+    def test_a_write_that_did_not_reach_redis_is_marked(self) -> None:
+        """A reset that did not persist is a change too: Redis still holds the old
+        value, which returns at the next restart."""
+        rows = _rows(
+            GuildConfig(volume=0.5),
+            unsaved=frozenset({"volume", "idle_timeout_secs"}),
+        )
+        assert settings_line(rows, read=True) == (
+            "volume 50% (not saved), idle-timeout 5:00 (not saved) (2 changed)"
+        )
+
+    def test_a_value_under_the_bots_minimum_names_both(self) -> None:
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        rows = _rows(GuildConfig(np_refresh_secs=2.0))
+        assert settings_line(rows, read=True) == (
+            "np-refresh 5s (bot minimum; set here 2s) (1 changed)"
+        )
+
+    def test_an_unread_cache_is_not_reported_as_unchanged(self) -> None:
+        """-debug is how a Redis outage gets diagnosed, and a boot with Redis down
+        leaves every guild unread: "none changed" would be false exactly then."""
+        assert (
+            settings_line(_rows(GuildConfig()), read=False)
+            == "none known (stored values not read yet)"
+        )
+        assert settings_line(_rows(GuildConfig(volume=0.5)), read=False) == (
+            "volume 50% (1 changed; stored values not read yet)"
+        )
+
+    def test_the_row_is_in_the_guild_block(self, mock_guild: MagicMock) -> None:
+        mock_guild.voice_client = None
+        inputs = DebugInputs(
+            debug_enabled=False,
+            debug_overridden=False,
+            players=0,
+            settings=tuple(_rows(GuildConfig(alone_timeout_secs=30.0))),
+        )
+        lines = guild_lines(mock_guild, inputs, source="host default")
+        assert "settings     alone-timeout 0:30 (1 changed)" in lines
+
+    def test_every_setting_changed_and_unsaved_still_fits_its_field(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        stored = GuildConfig(
+            volume=0.05,
+            timezone="America/Argentina/Buenos_Aires",
+            idle_timeout_secs=1800.0,
+            alone_timeout_secs=120.0,
+            np_refresh_secs=30.0,
+            slow_notice_secs=60.0,
+            debug_mode=True,
+        )
+        rows = _rows(stored, unsaved=frozenset(stored.to_redis()))
+        inputs = DebugInputs(
+            debug_enabled=True,
+            debug_overridden=True,
+            players=0,
+            settings=tuple(rows),
+            settings_read=False,
+        )
+        mock_ctx.guild.voice_client = None
+        embed = debug.render_snapshot_embed(
+            mock_ctx,
+            inputs,
+            blocks=debug.instant_blocks(mock_ctx, inputs, source="saved here"),
+            source="saved here",
+        )
+        server = [f for f in embed.fields if (f.name or "").startswith("This server")]
+        assert len(server) == 1 and len(server[0].value or "") <= 1024
+        assert "(7 changed; stored values not read yet)" in (server[0].value or "")
+
+    async def test_a_change_reaches_the_card(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
+
+        embed = await _snapshot(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        )
+
+        server = next(f for f in embed.fields if f.name == "This server")
+        assert "settings     idle-timeout 10:00 (1 changed)" in (server.value or "")
+
+    async def test_the_card_sends_while_redis_never_answers(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The operator's view, which is how a Redis outage gets diagnosed: the line
+        reads the cache, so the skeleton sends while the Redis probe still waits."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(volume=0.5))
+
+        async def stalled(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        sent = asyncio.Event()
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+
+        async def send(**_: object) -> MagicMock:
+            sent.set()
+            return message
+
+        mock_ctx.channel.send = AsyncMock(side_effect=send)
+        redis = cast(Any, cog.redis)
+        with (
+            patch.object(redis, "execute_command", new=stalled),
+            patch.object(GuildRedisStore, "read_config", new=stalled),
+        ):
+            async with asyncio.timeout(2):
+                inputs = await debug_cmd.build_inputs(mock_ctx, cog=cog)
+            assert inputs.operator
+            task = asyncio.create_task(run_debug_dashboard(mock_ctx, inputs))
+            try:
+                async with asyncio.timeout(2):
+                    await sent.wait()
+            finally:
+                await cancel_task(task)
+
+        call = mock_ctx.channel.send.await_args
+        assert call is not None
+        embed = cast(discord.Embed, call.kwargs["embeds"][0])
+        server = next(f for f in embed.fields if f.name == "This server")
+        assert "settings     volume 50% (1 changed)" in (server.value or "")
+
+    async def test_a_non_operator_sees_this_servers_settings_and_none_of_the_bots(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """Bot values are the operator's Config block. The line leaves out a server
+        key still following the bot, so its value is not disclosed here either."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
+        bot_specs = [s for s in SETTINGS if s.scope is SettingScope.BOT and s.attr]
+        for spec in bot_specs:
+            knob = spec.attr
+            assert knob is not None
+            if config.is_int_knob(knob):
+                config.set_override(knob, config.baseline(knob))
+            else:
+                config.set_override(knob, config.baseline(knob))
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 7.25)
+
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        operator = debug.instant_blocks(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog), source="x"
+        )
+        assert "bot owner;" in "\n".join(operator["Config"])
+
+        mock_ctx.bot.is_owner = AsyncMock(return_value=False)
+        embed = await _snapshot(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        )
+        shown = str(embed.to_dict())
+        assert "idle-timeout 10:00 (1 changed)" in shown
+        assert "bot owner;" not in shown
+        assert "7.25" not in shown
+        for spec in bot_specs:
+            assert spec.env is not None and spec.env not in shown
 
 
 class TestSafeBlock:
