@@ -487,7 +487,8 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   See docs/ARCHITECTURE.md#resolve-mode and #warming-the-stream-cache.
   Spotify track → title search; Spotify playlist → titles → YTSource ytsearch
   entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
-  QueueObjects. Enqueue via GuildQueue.put (batch=one round-trip for playlists).
+  QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
+  playlists, so a 10,000-track paste yields to the event loop between chunks).
   ▼
 PHASE 2 — PREFETCH (background):
   • per-song prefetch_stream task at enqueue (skipped for bulk playlists — N

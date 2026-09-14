@@ -53,6 +53,16 @@ if TYPE_CHECKING:
     from src.musicbot import MusicBot
 
 log = get_logger(__name__)
+
+# One MORE than queue_message renders. It appends its "..." only while
+# `len(lines) < len(songs)`, so handing it exactly ten leaves a 5,000-track
+# playlist looking like a ten-track one — the eleventh is never rendered and
+# exists only to be counted.
+_ECHO_PLUS_ONE = 11
+
+# Searches built per event-loop turn for a Spotify playlist. Measured ~7ms a
+# thousand, which is how long each chunk holds the event loop.
+_SEARCH_BUILD_CHUNK = 1000
 _tracer = get_tracer(__name__)
 
 
@@ -206,6 +216,25 @@ def collection_note(
         f"{returns}\nNot what you wanted? `-remove {safe_label(url, ECHO_MAX)}` "
         f"takes {undo}"
     )
+
+
+async def _searches_for(
+    titles: Sequence[str], *, analytics: Analytics, origin: str
+) -> list[YTSource]:
+    """spotify_playlist_to_ytsearch, a chunk per event-loop turn. Positions count on
+    from `analytics` across chunks, as they would in one call."""
+    tracks: list[YTSource] = []
+    for start in range(0, len(titles), _SEARCH_BUILD_CHUNK):
+        if start:
+            await asyncio.sleep(0)
+        tracks += spotify_playlist_to_ytsearch(
+            list(titles[start : start + _SEARCH_BUILD_CHUNK]),
+            analytics=replace(
+                analytics, queue_position=analytics.queue_position + start
+            ),
+            origin=origin,
+        )
+    return tracks
 
 
 def _rebase_positions(
@@ -403,16 +432,23 @@ async def enqueue_playlist(
     tracks: Sequence[QueueItem]
     if isinstance(qobj, ResolvedSpotifyPlaylist):
         titles = qobj.titles
-        shown_titles = queue_message([safe_label(t, ECHO_ROW_MAX) for t in titles])
+        count = len(titles)
+        # islice, not the whole list: queue_message renders ten, and escaping a
+        # 10,000-title playlist to show ten measured 53ms of event-loop time on
+        # the -play path. The count is what says the playlist was taken in full,
+        # which is the only place a user can see that it no longer stops at 100.
+        shown_titles = queue_message(
+            [safe_label(t, ECHO_ROW_MAX) for t in islice(titles, _ECHO_PLUS_ONE)]
+        )
         embed = build_embed(
-            "Queued playlist" + next_suffix,
+            f"Queued playlist — {count} {pluralize(count, 'song')}{next_suffix}",
             f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}{warning_line}",
             discord.Color.blue(),
         )
         # Built outside the lock: one YTSource per title, and the depth it
         # is minted against is almost always still the depth at the insert.
         provisional = _head_depth(mp, placement)
-        tracks = spotify_playlist_to_ytsearch(
+        tracks = await _searches_for(
             titles,
             analytics=replace(analytics, queue_position=provisional),
             origin=origin,
@@ -443,7 +479,7 @@ async def enqueue_playlist(
             else ""
         )
         shown_titles = queue_message(
-            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, 10)]
+            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, _ECHO_PLUS_ONE)]
         )
         embed = build_embed(
             f"Queued playlist — {count} {pluralize(count, 'song')}{next_suffix}",
@@ -534,6 +570,15 @@ async def enqueue_single(
         # (an executor call is not interruptible), and every sibling -play in the
         # guild spends its place bound waiting on the lock.
         await mp.settle_prefetch()
+    # Minted before the lock, like the playlist branch's: `--now`/`--next` take a
+    # collection in full, so this is up to 9,999 entries of event-loop time every
+    # sibling -play in the guild would spend its place bound waiting out.
+    # _rebase_positions inside is a no-op unless another request placed between.
+    provisional = _head_depth(mp, placement) + 1
+    follow_on = [
+        with_queue_position(item, provisional + offset)
+        for offset, item in enumerate(follow_on)
+    ]
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             depth = _head_depth(mp, placement)
@@ -548,10 +593,7 @@ async def enqueue_single(
                     # Behind the head, in its order, re-minted from the head's
                     # depth: play_history keeps whatever number is on them.
                     await mp.queue_put(
-                        [
-                            with_queue_position(item, depth + offset)
-                            for offset, item in enumerate(follow_on, start=1)
-                        ],
+                        _rebase_positions(follow_on, provisional, depth + 1),
                         prefetch=False,
                     )
             log.info(f"play ({placement.value}) qsize: {mp.queue.qsize()}")
@@ -602,7 +644,7 @@ async def _resolve_interjection_source(
         titles = await cog._require_spotify().playlist(source.id)
         if not titles:
             raise EmptyPlaylistError()
-        yts = spotify_playlist_to_ytsearch(titles, analytics=analytics, origin=origin)
+        yts = await _searches_for(titles, analytics=analytics, origin=origin)
         # The head takes the full path — it has to be playable to interrupt
         # with. The rest stay lazy searches, resolved at dequeue.
         head = await YTDL.yt_source(

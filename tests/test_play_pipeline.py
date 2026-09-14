@@ -1,5 +1,6 @@
 """Tests for the -play pipeline (src/play_pipeline.py)."""
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -281,6 +282,122 @@ class TestEnqueuePlaylist:
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Queued playlist" in embed.title
         assert "Song A" in embed.description
+
+    async def test_a_spotify_playlist_says_how_many_it_queued(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The card shows ten titles and an ellipsis whatever the size, so the
+        count is the only thing that tells 300 songs from 12 — and it is the only
+        place a user can see that a playlist over 100 tracks no longer stops
+        there. The YouTube branch has always said it."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(300)]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        assert "300 songs" in mock_ctx.send.call_args[1]["embed"].title
+
+    async def test_one_queued_song_is_not_pluralized(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=["Song A"]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        assert "1 song" in mock_ctx.send.call_args[1]["embed"].title
+        assert "1 songs" not in mock_ctx.send.call_args[1]["embed"].title
+
+    async def test_a_long_playlist_confirmation_ends_in_the_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """queue_message appends its "..." only while `len(lines) < len(songs)`,
+        so handing it exactly ten silently drops the one thing that says there
+        are more. Both branches slice; both must slice to eleven."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(300)]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        description = mock_ctx.send.call_args[1]["embed"].description
+        assert "..." in description
+        assert "Song 9" in description and "Song 10" not in description
+
+    async def test_a_short_playlist_confirmation_does_not(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(3)]),
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+
+        assert "..." not in mock_ctx.send.call_args[1]["embed"].description
+
+    async def test_only_the_shown_titles_are_escaped(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """safe_label over all 10,000 titles to render ten measured 53ms of
+        uninterrupted event-loop time, right before the place lock. Counting the
+        calls is the only way to see it: the embed is identical either way."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+        seen: list[str] = []
+
+        def _spy(text: str, width: int) -> str:
+            seen.append(text)
+            return text
+
+        with patch.object(play_pipeline, "safe_label", side_effect=_spy):
+            await play_pipeline.enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(500)]),
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                cog=music_bot,
+            )
+
+        # Eleven, not five hundred: ten rendered plus the one that only exists
+        # so queue_message knows there are more.
+        assert len(seen) == 11
 
     async def test_spotify_calls_queue_put_with_prefetch_false(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1620,3 +1737,34 @@ class TestTheResumeNoticeDescribesARestoredQueue:
         )
 
         mp.build_resume_notice_embed.assert_called_once()
+
+
+class TestSearchesForAPlaylist:
+    async def test_built_a_chunk_per_loop_turn_with_positions_that_count_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A chunk per loop turn, numbering the tracks as one call would."""
+        monkeypatch.setattr(play_pipeline, "_SEARCH_BUILD_CHUNK", 2)
+        ticks = 0
+
+        async def _tick() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(_tick())
+        await asyncio.sleep(0)
+        started = ticks
+        try:
+            tracks = await play_pipeline._searches_for(
+                [f"T{n}" for n in range(5)],
+                analytics=Analytics(queued_at=1.0, queue_position=7),
+                origin="https://open.spotify.com/playlist/x",
+            )
+        finally:
+            ticker.cancel()
+
+        assert [t.analytics.queue_position for t in tracks] == [7, 8, 9, 10, 11]
+        assert [t.ytsearch for t in tracks] == [f"ytsearch:T{n}" for n in range(5)]
+        assert ticks - started >= 2

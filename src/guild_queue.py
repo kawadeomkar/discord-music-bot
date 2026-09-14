@@ -54,6 +54,10 @@ QueueItem = Union[QueueObject, YTSource]
 # else. See docs/ARCHITECTURE.md#queue-operations.
 _LREM_MAX_ENTRIES = 16
 
+# Entries serialized and RPUSHed per round trip by a bulk put. Serialization measured
+# ~7.6ms per thousand, which is how long each chunk holds the event loop.
+_PUT_CHUNK = 1000
+
 # Shallow queues rebuild instead: below ~80 survivors a rewrite is under 1ms.
 _LREM_MAX_SHARE = 5
 
@@ -281,7 +285,7 @@ class GuildQueue:
         """Enqueue on the deque, then the mirror, under the bulk-mutation mutex:
         a clear()/shuffle() interleaving while the pushes suspend would rebuild
         the mirror before they land, leaving ghosts the next dequeue LPOPs.
-        batch=True pushes every entry in one round-trip (bulk playlist)."""
+        batch=True pushes _PUT_CHUNK entries per round trip (bulk playlist)."""
         async with self._mutex:
             queued = list(items)
             self._items.extend(queued)
@@ -295,13 +299,22 @@ class GuildQueue:
                 return queued
             # A persisted=False entry written here would never be LPOPed at its
             # dequeue (redis_pop_for skips them), leaving the mirror an entry ahead.
-            entries = [_to_entry(item) for item in queued if is_persisted(item)]
-            if not entries:
+            persisted = [item for item in queued if is_persisted(item)]
+            if not persisted:
                 return queued
             with self._mirror_write():
                 if batch:
-                    landed = await self._store.push_queue_batch(entries)
+                    # In chunks, each its own round trip, under the one mutex hold:
+                    # a failed chunk stops the rest and marks the mirror for rebuild.
+                    landed = True
+                    for start in range(0, len(persisted), _PUT_CHUNK):
+                        chunk = persisted[start : start + _PUT_CHUNK]
+                        entries = [_to_entry(item) for item in chunk]
+                        if not await self._store.push_queue_batch(entries):
+                            landed = False
+                            break
                 else:
+                    entries = [_to_entry(item) for item in persisted]
                     landed = True
                     for entry in entries:
                         if not await self._store.push_queue(entry):
