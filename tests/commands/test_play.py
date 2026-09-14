@@ -2057,6 +2057,56 @@ class TestPlacementInsertsAndConfirmations:
         assert "**3** songs" in note
         assert "-remove" in note
 
+    async def test_a_resume_mid_resolve_is_droppable_until_the_append_places(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The interjection's hold ends without inserting anything, and the append
+        takes the lock again. A -remove landing between the two must still find the
+        request and drop it: marked placed, it saw nothing queued and nothing in
+        flight, and the playlist landed after the reply said it had not."""
+        vc = paused_vc(mock_ctx)
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+        url = "https://www.youtube.com/playlist?list=PLabc"
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        append = play_pipeline.enqueue_single
+        stopped: list[Any] = []
+
+        async def _remove_lands_first(*args: Any, **kwargs: Any) -> None:
+            stopped.extend(music_bot._plays.inflight(play_key(mock_ctx), "remove"))
+            await append(*args, **kwargs)
+
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> bool:
+            vc.is_paused.return_value = False
+            return True
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+            patch.object(
+                YTDL,
+                "yt_playlist",
+                new=AsyncMock(
+                    return_value=YoutubePlaylist(
+                        title=None, tracks=tracks, unavailable=0
+                    )
+                ),
+            ),
+            patch.object(
+                YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
+            ),
+            patch.object(play_pipeline, "enqueue_single", new=_remove_lands_first),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        assert len(stopped) == 1
+        mp.queue_put.assert_not_awaited()
+
     async def test_a_resume_mid_resolve_restamps_the_tail_it_moved(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -2096,10 +2146,10 @@ class TestPlacementInsertsAndConfirmations:
                 music_bot, mock_ctx, url="https://www.youtube.com/playlist?list=PLabc"
             )
 
-        head_call, tail_call = mp.queue_put.await_args_list
-        assert head_call.args[0] is tracks[0]
+        (call,) = mp.queue_put.await_args_list
+        assert call.args[0][0] is tracks[0]
         assert tracks[0].analytics.queue_position == 20
-        assert [item.analytics.queue_position for item in tail_call.args[0]] == [21, 22]
+        assert [item.analytics.queue_position for item in call.args[0][1:]] == [21, 22]
 
     async def test_playlist_interjects_head_first_and_queues_the_rest(
         self, music_bot: MusicBot, mock_ctx: MagicMock

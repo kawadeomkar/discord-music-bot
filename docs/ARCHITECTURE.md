@@ -1279,6 +1279,16 @@ The verdict is one value (`PlaceResult`) rather than a verdict beside fields the
 caller has to remember to read, and a stall carries which half of the budget ran out
 on the exception it raises.
 
+**A request is placed once its checks pass, before the put, and the put is one call.**
+`PlayRequest.placed` is what `-stop`, `-clear` and `-remove` read to decide whether a
+request is still theirs to drop, and a command arriving while the put runs waits on the
+queue mutex behind it and acts on what the put inserted, so it must neither stamp the
+request nor report it stopped. A put that raises gives the request back. A collection's
+head and its `follow_on` go in a single `queue_put`, so a `-remove <the link>` waiting on
+the mutex takes all of it or none. `interject_flow`'s paused fallback, whose hold ends
+without inserting when a `-resume` landed during the resolve, clears `placed` before
+`enqueue_single` takes the lock again, so a command in between can still drop it.
+
 The body under the lock is the put, and the `queue_position` minted on it. Rendering
 is not: an "Est. playing at" walks the whole queue, and the hold is shared, so under it
 one long queue's walk is time every sibling `-play` spends waiting. The confirmation is
