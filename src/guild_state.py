@@ -692,6 +692,9 @@ class SearchQueueEntry:
     # The leg that makes a Spotify playlist track archive as Spotify rather than
     # as the YouTube URL it becomes.
     query_source: str = ""
+    # Who queued it. None, never 0, on an entry written before the field existed:
+    # the resolve at dequeue routes None to the fallback requester.
+    requester_id: int | None = None
 
     @classmethod
     def from_ytsource(cls, source: YTSource) -> Self:
@@ -704,22 +707,26 @@ class SearchQueueEntry:
             queued_at=source.analytics.queued_at,
             queue_position=source.analytics.queue_position,
             query_source=source.query_source,
+            requester_id=source.requester_id,
         )
 
     def to_redis(self) -> bytes:
-        return orjson.dumps(
-            {
-                QueueEntryField.TYPE: _ENTRY_TYPE_SEARCH,
-                QueueEntryField.YTSEARCH: self.ytsearch,
-                QueueEntryField.URL: self.url,
-                QueueEntryField.PROCESS: self.process,
-                QueueEntryField.TS: self.ts,
-                QueueEntryField.USER_INPUT: self.user_input,
-                QueueEntryField.QUEUED_AT: self.queued_at,
-                QueueEntryField.QUEUE_POSITION: self.queue_position,
-                QueueEntryField.QUERY_SOURCE: self.query_source,
-            }
-        )
+        fields = {
+            QueueEntryField.TYPE: _ENTRY_TYPE_SEARCH,
+            QueueEntryField.YTSEARCH: self.ytsearch,
+            QueueEntryField.URL: self.url,
+            QueueEntryField.PROCESS: self.process,
+            QueueEntryField.TS: self.ts,
+            QueueEntryField.USER_INPUT: self.user_input,
+            QueueEntryField.QUEUED_AT: self.queued_at,
+            QueueEntryField.QUEUE_POSITION: self.queue_position,
+            QueueEntryField.QUERY_SOURCE: self.query_source,
+        }
+        # Only when known: an entry queued before the field existed must serialize
+        # to the bytes already on the list, or its LREM misses and rebuilds.
+        if self.requester_id is not None:
+            fields[QueueEntryField.REQUESTER_ID] = self.requester_id
+        return orjson.dumps(fields)
 
 
 QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
@@ -743,6 +750,8 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
                 queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
                 queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
                 query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+                # No default: absent stays None, which is not requester 0.
+                requester_id=d.get(QueueEntryField.REQUESTER_ID),
             )
         return SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],

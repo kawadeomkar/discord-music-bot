@@ -236,7 +236,7 @@ def collection_note(
 
 
 async def _searches_for(
-    titles: Sequence[str], *, analytics: Analytics, origin: str
+    titles: Sequence[str], *, analytics: Analytics, origin: str, requester_id: int
 ) -> list[YTSource]:
     """spotify_playlist_to_ytsearch, a chunk per event-loop turn. Positions count on
     from `analytics` across chunks, as they would in one call."""
@@ -250,6 +250,7 @@ async def _searches_for(
                 analytics, queue_position=analytics.queue_position + start
             ),
             origin=origin,
+            requester_id=requester_id,
         )
     return tracks
 
@@ -519,6 +520,7 @@ async def enqueue_playlist(
             titles,
             analytics=replace(analytics, queue_position=provisional),
             origin=origin,
+            requester_id=ctx.author.id,
         )
         log.info(f"spotify playlist track count: {len(tracks)}")
         async with cog._plays.place(req) as verdict:
@@ -737,7 +739,9 @@ async def _resolve_interjection_source(
         titles = playlist.titles
         if not titles:
             raise EmptyPlaylistError()
-        yts = await _searches_for(titles, analytics=analytics, origin=origin)
+        yts = await _searches_for(
+            titles, analytics=analytics, origin=origin, requester_id=ctx.author.id
+        )
         # The head takes the full path — it has to be playable to interrupt
         # with. The rest stay lazy searches, resolved at dequeue.
         head = await YTDL.yt_source(

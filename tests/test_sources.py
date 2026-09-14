@@ -364,13 +364,14 @@ class TestParseInput:
 
 _ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=3)
 _ORIGIN = "https://open.spotify.com/album/abc123"
+_REQUESTER = 424242424242424242
 
 
 class TestSpotifyPlaylistToYTSearch:
     def test_converts_titles_to_ytsearch(self) -> None:
         titles = ["Never Gonna Give You Up Rick Astley", "Bohemian Rhapsody Queen"]
         result = spotify_playlist_to_ytsearch(
-            titles, analytics=_ANALYTICS, origin=_ORIGIN
+            titles, analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
         )
 
         assert len(result) == 2
@@ -381,25 +382,31 @@ class TestSpotifyPlaylistToYTSearch:
     def test_all_results_have_process_true(self) -> None:
         titles = ["Song A", "Song B", "Song C"]
         result = spotify_playlist_to_ytsearch(
-            titles, analytics=_ANALYTICS, origin=_ORIGIN
+            titles, analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
         )
         assert all(r.process is True for r in result)
 
     def test_empty_list_returns_empty(self) -> None:
         assert (
-            spotify_playlist_to_ytsearch([], analytics=_ANALYTICS, origin=_ORIGIN) == []
+            spotify_playlist_to_ytsearch(
+                [], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
+            )
+            == []
         )
 
     def test_single_title(self) -> None:
         result = spotify_playlist_to_ytsearch(
-            ["Only Song Artist"], analytics=_ANALYTICS, origin=_ORIGIN
+            ["Only Song Artist"],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=_REQUESTER,
         )
         assert len(result) == 1
         assert result[0].ytsearch == "ytsearch:Only Song Artist"
 
     def test_url_field_is_none(self) -> None:
         result = spotify_playlist_to_ytsearch(
-            ["Song"], analytics=_ANALYTICS, origin=_ORIGIN
+            ["Song"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
         )
         assert result[0].url is None
 
@@ -408,10 +415,26 @@ class TestSpotifyPlaylistToYTSearch:
         # positions incrementing from the head's — a playlist behind 3 songs
         # waits at 3, 4, 5.
         result = spotify_playlist_to_ytsearch(
-            ["a", "b", "c"], analytics=_ANALYTICS, origin=_ORIGIN
+            ["a", "b", "c"],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=_REQUESTER,
         )
         assert [r.analytics.queue_position for r in result] == [3, 4, 5]
         assert all(r.analytics.queued_at == 1752530000.5 for r in result)
+
+    def test_every_track_carries_the_requester(self) -> None:
+        """These resolve at dequeue, minutes to an hour after the command returned.
+        Without the ID the resolve attributes each track to whoever ran a command
+        most recently."""
+        result = spotify_playlist_to_ytsearch(
+            ["a", "b"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
+        )
+        assert [r.requester_id for r in result] == [_REQUESTER] * 2
+
+    def test_the_requester_has_no_default(self) -> None:
+        with pytest.raises(TypeError, match="requester_id"):
+            spotify_playlist_to_ytsearch(["a"], analytics=_ANALYTICS, origin=_ORIGIN)  # pyright: ignore[reportCallIssue]
 
 
 class TestYTSourcePlaylistUrl:
@@ -614,7 +637,10 @@ class TestQuerySource:
         """The whole reason the token is captured at parse time: these resolve to
         YouTube URLs at dequeue, so nothing downstream could recover it."""
         sources = spotify_playlist_to_ytsearch(
-            ["song one", "song two"], analytics=_ANALYTICS, origin=_ORIGIN
+            ["song one", "song two"],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=_REQUESTER,
         )
         assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
 

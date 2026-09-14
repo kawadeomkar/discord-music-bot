@@ -1816,6 +1816,29 @@ class TestResumeTailDepth:
 
 
 class TestRestoreEntries:
+    async def test_a_search_entry_keeps_its_requester_through_restore(
+        self, gq: GuildQueue
+    ) -> None:
+        """A restart is when the fallback requester is most wrong: the player that
+        resolves these was built by whoever's command brought the bot back."""
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:abc", requester_id=424242424242424242
+        )
+        assert await gq.restore_entries([entry]) == 1
+        item = gq.display_items()[0]
+        assert isinstance(item, YTSource)
+        assert item.requester_id == 424242424242424242
+
+    async def test_a_search_entry_without_a_requester_is_kept(
+        self, gq: GuildQueue
+    ) -> None:
+        """Unlike a song, a requesterless search is not dropped: it resolves to the
+        fallback at dequeue, as it always has."""
+        assert await gq.restore_entries([SearchQueueEntry(ytsearch="y")]) == 1
+        item = gq.display_items()[0]
+        assert isinstance(item, YTSource)
+        assert item.requester_id is None
+
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:
         return SongQueueEntry(
             webpage_url=f"https://yt.com/v={n}",

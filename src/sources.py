@@ -149,6 +149,10 @@ class YTSource:
     # carries it, because it is the only one that survives into Redis, so a
     # lazily-resolved Spotify track still archives as Spotify.
     query_source: str = ""
+    # Who queued a lazy search, as an ID: this module is discord-free, and the value
+    # has to survive Redis. None on parse-time sources, which resolve inside the
+    # command that built them, and on entries queued before the field existed.
+    requester_id: Optional[int] = None
 
     @property
     def playlist_url(self) -> str:
@@ -181,12 +185,14 @@ def query_source_of(
 
 
 def spotify_playlist_to_ytsearch(
-    titles: list[str], *, analytics: Analytics, origin: str
+    titles: list[str], *, analytics: Analytics, origin: str, requester_id: int
 ) -> list[YTSource]:
     """Spotify playlist tracks as lazy YouTube searches, each resolved at
     dequeue. The Spotify token, the ask-time analytics (the head's; per-track
-    positions derive from it) and `origin` (the pasted collection link) are set
-    here, the last point that knows where these came from."""
+    positions derive from it), `origin` (the pasted collection link) and the
+    requester are set here, the last point that knows where these came from.
+    `requester_id` has no default: a track without one is attributed at dequeue to
+    whoever ran a command most recently."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
@@ -194,6 +200,7 @@ def spotify_playlist_to_ytsearch(
             query_source=QUERY_SOURCE_SPOTIFY,
             analytics=replace(analytics, queue_position=analytics.queue_position + i),
             user_input=origin,
+            requester_id=requester_id,
         )
         for i, title in enumerate(titles)
     ]
