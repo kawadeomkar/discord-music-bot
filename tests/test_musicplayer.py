@@ -12446,6 +12446,29 @@ class TestHeartbeatUpdater:
         store.heartbeat.assert_awaited_once()
         assert store.heartbeat.await_args.args[0] == 42.5
 
+    async def test_the_cadence_follows_the_bot_setting_from_the_next_tick(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        music_player.store = AsyncMock(spec=GuildRedisStore)
+        slept: list[float] = []
+
+        async def _sleep(secs: float) -> None:
+            slept.append(secs)
+            if len(slept) == 1:
+                config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
+            else:
+                raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)
+
+        assert slept == [3.0, 5.0]
+
     async def test_skips_while_paused(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:

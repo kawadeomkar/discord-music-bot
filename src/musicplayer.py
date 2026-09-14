@@ -2220,7 +2220,7 @@ class MusicPlayer:
         _progress_updater, which is display-gated: a song with no visible bar must
         still be recoverable."""
         while True:
-            await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
+            await asyncio.sleep(config.heartbeat_interval_secs())
             vc = self._guild.voice_client
             if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
                 return  # song changed under us; loop() owns cancellation
