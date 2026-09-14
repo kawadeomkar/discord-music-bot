@@ -1,29 +1,37 @@
 """Tests for src/settings.py — the -settings registry, its value grammar and the
 request parser."""
 
+import asyncio
 import ast
 import dataclasses
 import datetime
 import importlib.resources
+import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
+import redis.asyncio as aioredis
 
 from src import config, guild_state, settings
-from src.debug import _CONFIG_ALLOWLIST
+from src.debug import _CONFIG_ALLOWLIST, DebugSettings
 from src.guild_state import (
     CONFIG_DOMAIN,
     OFF_SECS,
+    BotConfig,
     BotConfigField,
     ConfigField,
 )
+from src.redis_client import BotConfigStore
 from src.musicplayer import _fmt_total_duration
 from src.settings import (
     SETTINGS,
     TIMEZONE_REDIRECTS,
+    BotSettings,
     Parsed,
     Refusal,
     RefusalReason,
@@ -829,3 +837,282 @@ class TestHelpSections:
     def test_lines_fit_the_help_code_block(self) -> None:
         ((_, entries),) = help_sections()
         assert all(len(line) <= 48 for entry in entries for line in entry)
+
+
+# ── BotSettings ───────────────────────────────────────────────────────────────
+
+_APP_ID = 123456789012345678
+
+
+def _bot(*, application_id: int | None = _APP_ID, cog: Any = None) -> MagicMock:
+    bot = MagicMock()
+    bot.application_id = application_id
+    bot.get_cog = MagicMock(return_value=cog)
+    return bot
+
+
+def _cog_with_debug_settings() -> MagicMock:
+    cog = MagicMock()
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
+    return cog
+
+
+async def _store(redis: aioredis.Redis, stored: BotConfig) -> None:
+    assert await BotConfigStore(redis, _APP_ID).update_config(stored)
+
+
+class TestBotSettingsHydrate:
+    """The stored overrides reach config's accessors, and only in-bounds ones."""
+
+    async def test_in_bounds_overrides_are_applied_and_listed_once(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        await _store(
+            fake_redis, BotConfig(heartbeat_interval_secs=5.0, play_inflight_max=4)
+        )
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+
+        await bot_settings.hydrate()
+
+        assert config.heartbeat_interval_secs() == 5.0
+        assert config.play_inflight_max() == 4
+        assert bot_settings.hydrated is True
+        assert (
+            f"bot settings applied from bot:{_APP_ID}:config: "
+            "heartbeat=5s, play-inflight-max=4"
+        ) in caplog.text
+
+    async def test_a_value_outside_the_current_bounds_is_skipped_with_a_warning(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The key outlives builds: a stored value from a build with other bounds
+        must neither apply nor abort."""
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=0.5))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+
+        await bot_settings.hydrate()
+
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert "heartbeat=0.5" in caplog.text and "ignored" in caplog.text
+        assert bot_settings.hydrated is True
+
+    async def test_an_override_shadowing_a_set_variable_names_every_way_out(
+        self,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("PLAY_INFLIGHT_MAX", "16")
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+
+        await BotSettings(_bot(), redis=fake_redis, ignore_stored=False).hydrate()
+
+        warning = next(
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "overrides" in r.getMessage()
+        )
+        assert "PLAY_INFLIGHT_MAX=16" in warning
+        assert "-settings bot play-inflight-max reset" in warning
+        assert f"just bot-settings reset {_APP_ID}" in warning
+        assert "BOT_SETTINGS_OVERRIDES=ignore" in warning
+
+    async def test_an_override_of_an_unset_variable_draws_no_warning(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+        await BotSettings(_bot(), redis=fake_redis, ignore_stored=False).hydrate()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    async def test_ignore_makes_no_read_and_warns_once(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=True)
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(side_effect=AssertionError)
+        ) as read:
+            await bot_settings.hydrate()
+            await bot_settings.hydrate()
+
+        read.assert_not_called()
+        assert config.override("PLAY_INFLIGHT_MAX") is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "BOT_SETTINGS_OVERRIDES=ignore" in warnings[0].getMessage()
+        assert f"bot:{_APP_ID}:config" in warnings[0].getMessage()
+
+    async def test_no_application_id_makes_no_read(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Unit tests never log in; the key would otherwise be bot:None:config."""
+        bot_settings = BotSettings(
+            _bot(application_id=None), redis=fake_redis, ignore_stored=False
+        )
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(side_effect=AssertionError)
+        ) as read:
+            await bot_settings.hydrate()
+        read.assert_not_called()
+        assert bot_settings.hydrated is False
+
+    async def test_a_failed_read_runs_on_environment_values_and_can_retry(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=5.0))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        with patch.object(fake_redis, "hgetall", side_effect=RuntimeError("down")):
+            await bot_settings.hydrate()
+
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert bot_settings.hydrated is False
+        assert "running on environment values" in caplog.text
+
+        await bot_settings.hydrate()
+        assert config.heartbeat_interval_secs() == 5.0
+
+    async def test_a_stalled_read_gives_up_within_the_timeout(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "CONFIG_IO_TIMEOUT_SECS", 0.05)
+
+        async def stalled(*_: object) -> None:
+            await asyncio.Event().wait()
+
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        with patch.object(BotConfigStore, "read_config", new=stalled):
+            async with asyncio.timeout(5):
+                await bot_settings.hydrate()
+        assert bot_settings.hydrated is False
+
+    async def test_a_knob_changed_during_the_read_keeps_the_new_value(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        stored = BotConfig(heartbeat_interval_secs=5.0, ping_tick_secs=2.0)
+
+        async def read_then_operator_applies(_: object) -> BotConfig:
+            bot_settings.apply(_spec("heartbeat"), 7.0)
+            return stored
+
+        with patch.object(
+            BotConfigStore, "read_config", new=read_then_operator_applies
+        ):
+            await bot_settings.hydrate()
+
+        assert config.heartbeat_interval_secs() == 7.0
+        assert config.ping_tick_secs() == 2.0
+
+
+class TestBotSettingsApply:
+    def test_apply_and_reset_move_the_accessor(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        assert bot_settings.apply(_spec("heartbeat"), 5.0) is True
+        assert config.heartbeat_interval_secs() == 5.0
+        assert bot_settings.reset(_spec("heartbeat")) is True
+        assert config.heartbeat_interval_secs() == config.HEARTBEAT_INTERVAL_SECS
+
+    def test_a_count_is_applied_as_an_int(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        bot_settings.apply(_spec("play-inflight-max"), 4)
+        assert type(config.play_inflight_max()) is int
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [("heartbeat", 1.0), ("heartbeat", float("nan")), ("play-inflight-max", 2.5)],
+    )
+    def test_a_value_the_registry_refuses_raises(self, key: str, value: float) -> None:
+        """Input is refused before it gets here; reaching apply with one is a bug."""
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        with pytest.raises(ValueError):
+            bot_settings.apply(_spec(key), value)
+
+    def test_a_server_setting_raises(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        with pytest.raises(ValueError):
+            bot_settings.apply(_spec("volume"), 50)
+
+    def test_while_ignored_a_stored_setting_is_refused_and_unchanged(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=True)
+        config.set_override("HEARTBEAT_INTERVAL_SECS", 9.0)
+        assert bot_settings.apply(_spec("heartbeat"), 5.0) is False
+        assert bot_settings.reset(_spec("heartbeat")) is False
+        assert config.heartbeat_interval_secs() == 9.0
+
+
+class TestDebugDefaultIsSessionOnly:
+    """debug-default decides what every server that never chose publishes, so it
+    lasts until a restart and is never stored."""
+
+    async def test_apply_and_reset_reach_the_cogs_debug_settings(self) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=None, ignore_stored=False)
+        try:
+            assert bot_settings.apply(_spec("debug-default"), True) is True
+            assert cog.debug_settings.default is True
+            assert cog.debug_settings.enabled(42) is True
+            assert bot_settings.reset(_spec("debug-default")) is True
+            assert cog.debug_settings.default is False
+        finally:
+            await cog.debug_settings.aclose()
+
+    async def test_it_is_settable_while_stored_settings_are_ignored(self) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=None, ignore_stored=True)
+        try:
+            assert bot_settings.apply(_spec("debug-default"), True) is True
+            assert cog.debug_settings.default is True
+        finally:
+            await cog.debug_settings.aclose()
+
+    async def test_no_path_touches_the_store(self, fake_redis: aioredis.Redis) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=fake_redis, ignore_stored=False)
+        boom = AsyncMock(side_effect=AssertionError("debug-default reached the store"))
+        try:
+            with (
+                patch.object(BotConfigStore, "update_config", new=boom),
+                patch.object(BotConfigStore, "reset_config_fields", new=boom),
+            ):
+                bot_settings.apply(_spec("debug-default"), True)
+                bot_settings.reset(_spec("debug-default"))
+            assert (
+                await BotConfigStore(fake_redis, _APP_ID).read_config() == BotConfig()
+            )
+        finally:
+            await cog.debug_settings.aclose()
+
+    async def test_a_reloaded_cog_gets_the_session_value_and_a_restart_does_not(
+        self,
+    ) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=None, ignore_stored=False)
+        reloaded = DebugSettings()
+        reloaded._default = False
+        restarted = DebugSettings()
+        restarted._default = False
+        try:
+            bot_settings.apply(_spec("debug-default"), True)
+            bot_settings.reapply_debug_default(reloaded)
+            assert reloaded.default is True
+
+            BotSettings(_bot(), redis=None, ignore_stored=False).reapply_debug_default(
+                restarted
+            )
+            assert restarted.default is False
+        finally:
+            for debug_settings in (cog.debug_settings, reloaded, restarted):
+                await debug_settings.aclose()
+
+    async def test_a_value_set_before_the_cog_loads_is_held(self) -> None:
+        bot_settings = BotSettings(_bot(cog=None), redis=None, ignore_stored=False)
+        assert bot_settings.apply(_spec("debug-default"), True) is True
+        late = DebugSettings()
+        late._default = False
+        try:
+            bot_settings.reapply_debug_default(late)
+            assert late.default is True
+        finally:
+            await late.aclose()

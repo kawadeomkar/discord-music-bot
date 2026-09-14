@@ -276,6 +276,112 @@ def env_floor(knob: FloatKnob | IntKnob) -> float:
     return _ENV_FLOORS[knob]
 
 
+# Settable knobs: each accessor returns a stored -settings bot override, else the
+# UPPER_CASE env baseline. set_override's one caller in src/ is src/settings.py.
+# See docs/ARCHITECTURE.md#settings-resolution.
+_FLOAT_OVERRIDES: Final[dict[FloatKnob, float]] = {}
+_INT_OVERRIDES: Final[dict[IntKnob, int]] = {}
+
+
+def now_playing_update_interval_secs() -> float:
+    return _FLOAT_OVERRIDES.get(
+        "NOW_PLAYING_UPDATE_INTERVAL_SECS", NOW_PLAYING_UPDATE_INTERVAL_SECS
+    )
+
+
+def heartbeat_interval_secs() -> float:
+    return _FLOAT_OVERRIDES.get("HEARTBEAT_INTERVAL_SECS", HEARTBEAT_INTERVAL_SECS)
+
+
+def play_slow_notice_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PLAY_SLOW_NOTICE_SECS", PLAY_SLOW_NOTICE_SECS)
+
+
+def play_inflight_max() -> int:
+    return _INT_OVERRIDES.get("PLAY_INFLIGHT_MAX", PLAY_INFLIGHT_MAX)
+
+
+def play_resolve_concurrency() -> int:
+    return _INT_OVERRIDES.get("PLAY_RESOLVE_CONCURRENCY", PLAY_RESOLVE_CONCURRENCY)
+
+
+def play_resolve_wait_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PLAY_RESOLVE_WAIT_SECS", PLAY_RESOLVE_WAIT_SECS)
+
+
+def stream_probe_timeout_secs() -> float:
+    return _FLOAT_OVERRIDES.get("STREAM_PROBE_TIMEOUT_SECS", STREAM_PROBE_TIMEOUT_SECS)
+
+
+def ping_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PING_TICK_SECS", PING_TICK_SECS)
+
+
+def ping_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PING_DEADLINE_SECS", PING_DEADLINE_SECS)
+
+
+def debug_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("DEBUG_TICK_SECS", DEBUG_TICK_SECS)
+
+
+def debug_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get("DEBUG_DEADLINE_SECS", DEBUG_DEADLINE_SECS)
+
+
+def analytics_render_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get(
+        "ANALYTICS_RENDER_DEADLINE_SECS", ANALYTICS_RENDER_DEADLINE_SECS
+    )
+
+
+@overload
+def set_override(knob: IntKnob, value: int) -> None: ...
+@overload
+def set_override(knob: FloatKnob, value: float) -> None: ...
+def set_override(knob: FloatKnob | IntKnob, value: float) -> None:
+    """Make `value` what the knob's accessor returns. Checks the type at run time
+    too — a bool is refused for either kind, a non-int for an int knob — and
+    nothing else: the -settings registry owns the bounds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{knob} override must be a number; got {value!r}")
+    if is_int_knob(knob):
+        if not isinstance(value, int):
+            raise TypeError(f"{knob} override must be an int; got {value!r}")
+        _INT_OVERRIDES[knob] = value
+    else:
+        _FLOAT_OVERRIDES[knob] = float(value)
+
+
+def clear_override(knob: FloatKnob | IntKnob) -> None:
+    """Return the knob's accessor to its environment baseline."""
+    if is_int_knob(knob):
+        _INT_OVERRIDES.pop(knob, None)
+    else:
+        _FLOAT_OVERRIDES.pop(knob, None)
+
+
+@overload
+def override(knob: IntKnob) -> Optional[int]: ...
+@overload
+def override(knob: FloatKnob) -> Optional[float]: ...
+def override(knob: FloatKnob | IntKnob) -> Optional[float]:
+    """The knob's override, or None when it runs on its baseline."""
+    if is_int_knob(knob):
+        return _INT_OVERRIDES.get(knob)
+    return _FLOAT_OVERRIDES.get(knob)
+
+
+@overload
+def effective(knob: IntKnob) -> int: ...
+@overload
+def effective(knob: FloatKnob) -> float: ...
+def effective(knob: FloatKnob | IntKnob) -> float:
+    """What the knob's accessor returns: the override, else the baseline."""
+    value = override(knob)
+    return baseline(knob) if value is None else value
+
+
 def _parse_bool_env(name: str) -> bool:
     """Strict boolean knob: unset and empty are False, a typo (`=on`) raises
     rather than silently reading as off."""
@@ -307,6 +413,23 @@ def debug_mode_default() -> bool:
     choice wins over it. Read once by MusicBot.__init__ so garbage aborts
     startup."""
     return _parse_bool_env("DEBUG_MODE")
+
+
+def bot_settings_overrides_ignored() -> bool:
+    """BOT_SETTINGS_OVERRIDES: `ignore` runs the process on environment and code
+    values, never reading bot:{application_id}:config; unset, empty and `apply`
+    apply what is stored. Anything else raises, so setup_hook reads it before
+    anything that could swallow the error."""
+    raw = os.environ.get("BOT_SETTINGS_OVERRIDES")
+    value = (raw or "").strip().lower()
+    if value in ("", "apply"):
+        return False
+    if value == "ignore":
+        return True
+    raise ValueError(
+        "BOT_SETTINGS_OVERRIDES must be apply or ignore (case-insensitive); "
+        f"got {raw!r}"
+    )
 
 
 def debug_prometheus_url() -> Optional[str]:

@@ -2892,6 +2892,66 @@ class TestDebugSamplerLifecycle:
             await music_bot.debug_settings._sampler.aclose()
 
 
+class TestTheOperatorsSessionDefault:
+    """`-settings bot debug-default` replaces DEBUG_MODE for this process only.
+    `_default` stays the environment's value, so the tests that assign it keep
+    meaning what they meant."""
+
+    async def test_the_override_beats_the_environment_and_none_restores_it(
+        self, music_bot: MusicBotCog
+    ) -> None:
+        settings = music_bot.debug_settings
+        settings.set_default_override(True)
+        assert settings.default is True
+        assert settings.enabled(42) is True
+        assert settings.enabled(None) is True
+        settings.set_default_override(None)
+        assert settings.default is False
+        assert settings.enabled(42) is False
+        await settings.aclose()
+
+    async def test_a_guilds_own_choice_still_wins(self, music_bot: MusicBotCog) -> None:
+        settings = music_bot.debug_settings
+        settings._overrides[42] = False
+        settings.set_default_override(True)
+        assert settings.enabled(42) is False
+        await settings.aclose()
+
+    async def test_the_sampler_follows_it(self, music_bot: MusicBotCog) -> None:
+        settings = music_bot.debug_settings
+        settings.set_default_override(True)
+        assert settings._sampler.running is True
+        settings.set_default_override(None)
+        assert settings._sampler.running is False
+
+    async def test_turning_it_on_in_production_warns(
+        self,
+        music_bot: MusicBotCog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        music_bot.debug_settings.set_default_override(True)
+        assert "debug mode's default is on in production" in caplog.text
+        await music_bot.debug_settings.aclose()
+
+    async def test_a_cog_reload_keeps_it(self, music_bot: MusicBotCog) -> None:
+        """cog_load hands the new cog's DebugSettings what BotSettings holds."""
+        from src.settings import SETTINGS, BotSettings
+
+        spec = next(s for s in SETTINGS if s.key == "debug-default")
+        bot_settings = BotSettings(music_bot.bot, redis=None, ignore_stored=False)
+        cast(Any, music_bot.bot).bot_settings = bot_settings
+        bot_settings.apply(spec, True)
+        music_bot.debug_settings = debug.DebugSettings()
+        music_bot.debug_settings._default = False
+
+        await music_bot.cog_load()
+
+        assert music_bot.debug_settings.default is True
+        await music_bot.cog_unload()
+
+
 class TestDebugModeIsPerGuildAndDurable:
     """DEBUG_MODE is the default every guild starts from; each guild can pin its own
     choice, and that choice now outlives a restart."""

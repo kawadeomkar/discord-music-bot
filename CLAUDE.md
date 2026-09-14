@@ -254,6 +254,7 @@ just db-migrate            # apply pending migrations — REQUIRED before the bo
 just db-backfill [--dry-run] # move pre-archive Redis history into Postgres — see below
 just db-rejects [n]        # list play_history rows Postgres refused (expected: nothing)
 just outbox [idle_ms]      # outbox health: depth, in-flight, stranded, TOMBSTONES (lost plays)
+just bot-settings [reset <application_id>] # list stored bot overrides, or delete one bot's
 just db-backup             # dump to backups/
 just db-restore FILE [DB]  # restore into a SCRATCH db (live needs CONFIRM=1 + a name)
 
@@ -339,9 +340,11 @@ src/
 ├── debug.py          # -debug snapshot machinery and DebugSettings; OBSERVATION-ONLY by rule
 │                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
-├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus, tunables
+├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus,
+│                     # tunables and their override accessors
 ├── settings.py       # the -settings machinery: the registry of what chat may set (bounds,
-│                     # rendering) and the grammar that parses a request. Pure. What the
+│                     # rendering) and the grammar that parses a request, both pure; and
+│                     # BotSettings, which applies the operator's stored bot overrides. What the
 │                     # environment holds is config.py; this module decides what chat may change
 └── util.py           # logger factory, embed helpers (safe_label, verbatim_code),
                       # fmt_duration/fmt_seconds, progress_bar/progress_line (the NP bar and
@@ -413,7 +416,8 @@ Discord gateway/voice                    YouTube / Spotify / SoundCloud CDNs
 (inside `main()` only — see golden rule 10). `setup_hook` reads
 `HISTORY_ARCHIVE_ENABLED` **first** (before anything else can consume it — the parser
 raises on garbage, and the next reader is `@_guild_op`-swallowed `push_history`, so
-startup is the only loud place), creates the Redis pool, then branches. Enabled: it
+startup is the only loud place) and `BOT_SETTINGS_OVERRIDES` second, for the same
+reason; creates the Redis pool and `MusicBotApp.bot_settings`, then branches. Enabled: it
 **requires `POSTGRES_URL`** (it raises otherwise — an enabled bot running without the
 archive would XADD onto an outbox nobody drains), constructs `PostgresHistoryArchive`
 (lazy: no connection is made here, so startup never blocks on Postgres) and starts the
@@ -421,7 +425,9 @@ archive would XADD onto an outbox nobody drains), constructs `PostgresHistoryArc
 stay `None`, one INFO says so, a set `POSTGRES_URL` is explicitly ignored (the flag,
 never URL presence, is consent), and a leftover outbox from an earlier enabled run
 draws a WARNING naming the un-drained depth (never auto-deleted). Either way it then
-loads the `src.musicbot` extension and fire-and-forgets
+loads the `src.musicbot` extension, spawns `BotSettings.hydrate()` without awaiting it
+(every knob runs on its env value until it lands; `on_ready` retries a failed read —
+`docs/ARCHITECTURE.md#settings-resolution`), and fire-and-forgets
 `ytdlp_pool.prewarm(warm_worker)` — then `chart_pool.warm()`, but only while the
 archive is enabled, so a default deployment never spawns the matplotlib worker — so
 the first `-play` doesn't pay worker-spawn, yt-dlp-import or first-`YoutubeDL`
@@ -1285,6 +1291,7 @@ duplicated.
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | both or neither; validated live at startup |
 | `REDIS_URL` | `redis://localhost:6379` | bot runs degraded (no persistence/recovery) without Redis |
 | `HISTORY_ARCHIVE_ENABLED` | `false` | **the consent gate for long-term storage** — `true` enables the Postgres archive tier (outbox writes, drainer, `POSTGRES_URL` requirement). Strict parse (`true/1/yes` / `false/0/no`, case-insensitive; unset/empty → false; garbage aborts startup, and `setup_hook` reads it FIRST so the ValueError cannot be swallowed by `@_guild_op`). Set together with `COMPOSE_PROFILES=archive` — the pair is documented in `.env.example` |
+| `BOT_SETTINGS_OVERRIDES` | `apply` | `ignore` runs the process on env and code values: the bot hash `bot:{application_id}:config` is never read (one WARNING says so), and `BotSettings` refuses to change a stored bot setting (`debug-default` is never stored, so it stays settable). The key is left in place, so removing the variable and restarting brings its values back. Unset, empty and `apply` apply what is stored; anything else aborts startup, and `setup_hook` reads it right after `HISTORY_ARCHIVE_ENABLED`. The other way back from a harmful override is `just bot-settings reset <application_id>` |
 | `COMPOSE_PROFILES` | — | read by Docker Compose from `.env`, not by the bot: `archive` deploys `postgres` + `db-migrate`. `just down` names every profile (`--profile archive --profile metrics`) — a `down` with a profile inactive leaves its containers running; explicitly naming profiled services (`up -d redis postgres db-migrate`) auto-activates the profile. Three profiles exist: `archive` (postgres + db-migrate), `ops` (`db-backfill`, kept out of `up` entirely because it is run by hand — `docker compose run --rm db-backfill`), and `metrics` (`otelcol-metrics`, the docker_stats → Prometheus sidecar `-debug`'s Postgres cpu/mem row reads; it mounts the Docker socket, so it is opt-in) |
 | `POSTGRES_URL` | — | **required while the archive is enabled**; `setup_hook` raises without it. Ignored (with an INFO) when disabled — the flag, never URL presence, is what enables archiving. Compose supplies it; `just run` derives it from the parts below |
 | `POSTGRES_PASSWORD` | `password` | compose defaults it so a token-only archive-enabled `docker compose up` works; the bot warns loudly (startup ERROR + owner-only `-ping` row) while the default is in use AND the archive is enabled (`build_common.sh`'s preflight warns more widely: flag truthy OR the profile in `COMPOSE_PROFILES`, covering the profile-on/flag-off drift case where an idle default-credential postgres runs with the bot's warnings silenced), and `./setup_env.sh` generates a real one. Changing it after the volume is initialized needs `ALTER USER` — Postgres reads it on first init only. **`.env` is the only supported place it is set**; a per-install `POSTGRES_PASSWORD_FILE` was proposed and declined (see the comment above `DEFAULT_POSTGRES_PASSWORD` in config.py), and `using_default_postgres_password()` is scoped to the DSN shape that decision produces — do not re-add asyncpg's full resolution ladder |

@@ -302,9 +302,13 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     the one hundreds of embed assertions encode: with it on, every embed the bot
     sends grows a debug footer — command responses, the Now Playing block at every
     render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
+
+    BOT_SETTINGS_OVERRIDES is scrubbed so a shell exporting `ignore` cannot turn
+    every BotSettings test into a refusal.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
@@ -359,6 +363,18 @@ def settle_youtube_background_jobs() -> Iterator[None]:
         job.cancel()
     youtube._INFLIGHT_STREAM_WARMS.clear()
     youtube._SOURCE_REVALIDATIONS.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_bot_knob_overrides() -> Iterator[None]:
+    """Clear every config knob override after each test, pass or fail. Tests set
+    one with config.set_override, which type-checks the value; an override left
+    behind would reach every later test that reads the knob's accessor."""
+    from src import config
+
+    yield
+    for knob in config.FLOAT_KNOBS | config.INT_KNOBS:
+        config.clear_override(knob)
 
 
 @pytest.fixture
@@ -472,6 +488,11 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
     bot.history_drainer = MagicMock()
+    # None, for the same reason: cog_load hands an existing BotSettings this
+    # session's debug-default, and a MagicMock there would turn debug mode on for
+    # every guild. A bot that never logged in has no application id.
+    bot.bot_settings = None
+    bot.application_id = None
     # start() IS reached now: a command wrapper resolves its player as an argument,
     # so get_mp() runs on every path including the early returns a body used to take
     # before it. Without this the loop() coroutine is created, never scheduled by the

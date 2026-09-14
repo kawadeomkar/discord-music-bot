@@ -24,6 +24,7 @@ from src.redis_client import (
     get_redis,
     outbox_depth,
 )
+from src.settings import BotSettings
 from src.util import get_logger
 
 if TYPE_CHECKING:
@@ -160,6 +161,9 @@ class MusicBotApp(commands.AutoShardedBot):
         # shape (the default) and every consumer handles it.
         self.history_archive: Optional[PostgresHistoryArchive] = None
         self.history_drainer: Optional[HistoryOutboxDrainer] = None
+        # Built in setup_hook, once the pool exists; hydrated in the background.
+        self.bot_settings: Optional[BotSettings] = None
+        self._bot_settings_hydration: Optional[asyncio.Task] = None
         self._teardown_started = False  # close() runs at most once
 
     async def _liveness_heartbeat(self) -> None:
@@ -179,17 +183,25 @@ class MusicBotApp(commands.AutoShardedBot):
         # Read first: the parser raises on garbage, and the next reader would be
         # @_guild_op-wrapped push_history, which swallows it into a warning per song.
         archive_enabled = config.history_archive_enabled()
+        # Same rule: nothing later reports a garbage value this loudly.
+        ignore_bot_overrides = config.bot_settings_overrides_ignored()
         # Before the pool and extensions so the file exists in the start-period.
         if config.LIVENESS_FILE:
             self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
+        self.bot_settings = BotSettings(
+            self, redis=self.redis, ignore_stored=ignore_bot_overrides
+        )
         if archive_enabled:
             await self._setup_history_archive(self.redis)
         else:
             await self._report_archive_disabled()
         for extension in EXTENSIONS:
             await self.load_extension(extension)
+        # Not awaited: every knob runs on its environment value until this lands,
+        # and a stalled Redis must not hold startup.
+        self._bot_settings_hydration = asyncio.create_task(self.bot_settings.hydrate())
         # Fire-and-forget, so the first -play skips spawn + yt-dlp import latency.
         from src.youtube import warn_if_cache_unwritable, warm_worker, ytdlp_pool
 
@@ -373,6 +385,15 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Environment: {config.ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
+        # A hydration that failed at startup gets one more read per READY.
+        bot_settings = self.bot_settings
+        hydration = self._bot_settings_hydration
+        if (
+            bot_settings is not None
+            and not bot_settings.hydrated
+            and (hydration is None or hydration.done())
+        ):
+            self._bot_settings_hydration = asyncio.create_task(bot_settings.hydrate())
         # FIXME: labelled "Bot commands:" but logs the `voice_states` intent flag.
         # Drop it, or log `sorted(c.qualified_name for c in self.walk_commands())`.
         log.info(f"Bot commands: {self.intents.voice_states}")
@@ -392,6 +413,10 @@ class MusicBotApp(commands.AutoShardedBot):
         if liveness is not None:
             liveness.cancel()
             self._liveness_task = None
+        hydration = getattr(self, "_bot_settings_hydration", None)
+        if hydration is not None:
+            hydration.cancel()
+            self._bot_settings_hydration = None
         # Ordering: drainer before archive and Redis (its final drain needs both);
         # super().close() before the Redis pool (it disconnects voice clients and can
         # still dispatch on_voice_state_update, whose cleanup() must reach a live

@@ -26,6 +26,8 @@ def app() -> MusicBotApp:
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
+    instance.bot_settings = None
+    instance._bot_settings_hydration = None
     # history_archive / history_drainer / _liveness_task are deliberately left
     # UNSET: __new__ bypasses __init__ and setup_hook is what assigns them, so
     # unset is exactly the pre-setup_hook state close()'s getattr guard exists
@@ -38,6 +40,8 @@ def app() -> MusicBotApp:
     conn = MagicMock()
     conn.user = None
     conn.guilds = []
+    # Never logged in: BotSettings.hydrate returns at once without an id.
+    conn.application_id = None
     conn.intents = MagicMock()
     conn.intents.voice_states = True
     instance._connection = conn
@@ -203,6 +207,95 @@ class TestSetupHook:
         mock_drainer.start.assert_called_once()
         assert app.history_archive is mock_archive
         assert app.history_drainer is mock_drainer
+
+
+class TestBotSettingsStartup:
+    """BOT_SETTINGS_OVERRIDES is read before the pool, and hydration never holds
+    setup_hook."""
+
+    @pytest.fixture(autouse=True)
+    def archive_disabled(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        app.history_archive = None
+        app.history_drainer = None
+
+    async def test_garbage_aborts_before_the_pool(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", "ignored")
+        with (
+            patch("src.main.create_redis_pool") as create,
+            pytest.raises(ValueError, match="BOT_SETTINGS_OVERRIDES"),
+        ):
+            await app.setup_hook()
+        create.assert_not_called()
+
+    async def test_setup_hook_returns_while_hydration_is_stalled(
+        self, app: MusicBotApp
+    ) -> None:
+        """Every knob runs on its environment value until the read lands."""
+        stalled = asyncio.Event()
+
+        async def never_answers(_: object) -> None:
+            await stalled.wait()
+
+        app._connection.application_id = 123456789012345678
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch("src.settings.BotConfigStore.read_config", new=never_answers),
+        ):
+            async with asyncio.timeout(5):
+                await app.setup_hook()
+            hydration = app._bot_settings_hydration
+            assert hydration is not None and not hydration.done()
+            assert app.bot_settings is not None
+            assert app.bot_settings.hydrated is False
+            assert config.heartbeat_interval_secs() == config.HEARTBEAT_INTERVAL_SECS
+            hydration.cancel()
+
+    async def test_the_flag_reaches_bot_settings(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", "ignore")
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert app.bot_settings is not None
+        assert app.bot_settings.ignore_stored is True
+
+    async def test_on_ready_retries_a_failed_hydration_once_it_has_ended(
+        self, app: MusicBotApp
+    ) -> None:
+        bot_settings = MagicMock()
+        bot_settings.hydrated = False
+        bot_settings.hydrate = AsyncMock()
+        app.bot_settings = bot_settings
+        with patch.object(
+            MusicBotApp, "latency", new_callable=PropertyMock, return_value=0.05
+        ):
+            await app.on_ready()
+            task = app._bot_settings_hydration
+            assert task is not None
+            await task
+            # Still running from the last READY: no second read beside it.
+            parked = asyncio.create_task(asyncio.Event().wait())
+            app._bot_settings_hydration = parked
+            await app.on_ready()
+            assert app._bot_settings_hydration is parked
+            parked.cancel()
+            bot_settings.hydrated = True
+            app._bot_settings_hydration = None
+            await app.on_ready()
+        bot_settings.hydrate.assert_awaited_once()
 
 
 class TestSetupHookDisabledArchive:

@@ -1704,6 +1704,7 @@ class DebugSettings:
 
     __slots__ = (
         "_default",
+        "_default_override",
         "_overrides",
         "_toggle_seq",
         "_toggled_at",
@@ -1714,6 +1715,9 @@ class DebugSettings:
     def __init__(self) -> None:
         # Read ONCE, here, so a garbage value aborts startup inside load_extension.
         self._default: bool = debug_mode_default()
+        # The operator's `-settings bot debug-default`, for this process only: never
+        # stored, so a restart returns every guild that never chose to _default.
+        self._default_override: Optional[bool] = None
         # A guild that never chose is ABSENT and follows _default, including when
         # the env var later changes — absence is not False.
         self._overrides: dict[int, bool] = {}
@@ -1725,7 +1729,7 @@ class DebugSettings:
         self._toggled_at: dict[int, int] = {}
         self._unpersisted: set[int] = set()
         self._sampler = RuntimeSampler()
-        if self._default and config.ENVIRONMENT == "production":
+        if self.default and config.ENVIRONMENT == "production":
             # Observation-only, so an advisory rather than a refusal.
             log.warning(
                 "DEBUG_MODE is on in production: every command response will "
@@ -1740,12 +1744,15 @@ class DebugSettings:
         (and every DM) follows the host default. Synchronous and in-memory:
         MusicContext.send calls this on every reply."""
         if guild_id is None:
-            return self._default
-        return self._overrides.get(guild_id, self._default)
+            return self.default
+        return self._overrides.get(guild_id, self.default)
 
     @property
     def default(self) -> bool:
-        """The host's DEBUG_MODE, which a guild with no stored choice follows."""
+        """What a guild with no stored choice follows: the operator's session
+        override when one is set, else the host's DEBUG_MODE."""
+        if self._default_override is not None:
+            return self._default_override
         return self._default
 
     @property
@@ -1877,12 +1884,24 @@ class DebugSettings:
         if redis is not None:
             await GuildRedisStore(redis, guild_id).clear_config()
 
+    def set_default_override(self, value: Optional[bool]) -> None:
+        """Replace the default for this process; None returns it to DEBUG_MODE.
+        Called by BotSettings, which holds the value across a cog reload."""
+        self._default_override = value
+        if value and config.ENVIRONMENT == "production":
+            log.warning(
+                "debug mode's default is on in production for this process: every "
+                "server that has not chosen for itself shows the debug footer until "
+                "the bot restarts or the default is reset."
+            )
+        self.sync_sampler()
+
     # ── Sampler lifecycle ─────────────────────────────────────────────────────
 
     def sync_sampler(self) -> None:
         """Run the sampler exactly while some guild is effectively debug-enabled.
         Public because cog_load calls it before any toggle has happened."""
-        self._sampler.apply(wanted=self._default or any(self._overrides.values()))
+        self._sampler.apply(wanted=self.default or any(self._overrides.values()))
 
     async def aclose(self) -> None:
         """Stop the sampler, unconditionally."""

@@ -664,33 +664,39 @@ async def _stream_ids(fake_redis: Redis) -> list[bytes]:
 
 
 class TestOperatorRecipeMatchesTheSchema:
-    """`just outbox` hardcodes the key and group names — a shell recipe cannot
-    import them. Drift fails open: rename either constant and the recipe keeps
+    """`just outbox` and `just bot-settings` hardcode key names — a shell recipe
+    cannot import them. Drift fails open: rename a constant and the recipe keeps
     working against a key nothing writes, reporting "nothing buffered, nothing to
-    do" during the incident it exists for.
+    do" (or "no stored bot settings") during the incident it exists for.
     """
 
     @staticmethod
-    def _recipe() -> str:
+    def _recipe(header: str) -> set[str]:
+        """The recipe's lines, stripped. Whole lines, not `in`: the substring form
+        passes for `key=history:outbox_old`, which is precisely the drift guarded."""
         text = (Path(__file__).resolve().parent.parent / "justfile").read_text()
-        start = text.index("\noutbox IDLE_MS=")
+        start = text.index(f"\n{header}")
         # Recipes end at the first line that is neither blank nor indented.
         body: list[str] = []
         for line in text[start + 1 :].splitlines()[1:]:
             if line and not line.startswith((" ", "\t")):
                 break
-            body.append(line)
-        return "\n".join(body)
+            body.append(line.strip())
+        return set(body)
 
     def test_the_recipe_targets_the_key_the_producer_writes(self) -> None:
-        # Whole assignment lines, not `in`: the substring form passes for
-        # `key=history:outbox_old`, which is precisely the drift being guarded.
-        assigned = {ln.strip() for ln in self._recipe().splitlines()}
-        assert f"key={HISTORY_OUTBOX_KEY}" in assigned
+        assert f"key={HISTORY_OUTBOX_KEY}" in self._recipe("outbox IDLE_MS=")
 
     def test_the_recipe_targets_the_group_the_drainer_reads(self) -> None:
-        assigned = {ln.strip() for ln in self._recipe().splitlines()}
-        assert f"group={HISTORY_OUTBOX_GROUP}" in assigned
+        assert f"group={HISTORY_OUTBOX_GROUP}" in self._recipe("outbox IDLE_MS=")
+
+    def test_bot_settings_lists_the_key_the_store_writes(self) -> None:
+        pattern = BOT_CONFIG_KEY.format(application_id="*")
+        assert f"pattern={pattern}" in self._recipe("bot-settings *ARGS:")
+
+    def test_bot_settings_resets_the_key_the_store_writes(self) -> None:
+        key = BOT_CONFIG_KEY.format(application_id="${id}")
+        assert f'key="{key}"' in self._recipe("bot-settings *ARGS:")
 
 
 class TestEnsureOutboxGroup:

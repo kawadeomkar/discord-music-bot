@@ -49,6 +49,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Now Playing host invariants](#now-playing-host-invariants)
     - [Debug footer seams](#debug-footer-seams)
     - [Analytics rendering](#analytics-rendering)
+    - [Settings resolution](#settings-resolution)
 16. [Design Decisions](#design-decisions)
 
 ---
@@ -253,8 +254,8 @@ graph TD
 | `analytics_render.py` | The six-panel figure. Imports matplotlib **inside** `build_figure`, never at module scope, and constructs nothing at module scope at all — a spawned worker re-imports it. `_ascii_safe()` raises on anything the bundled font cannot draw. Imports nothing from `src/` except `guild_state`. |
 | `chart_pool.py` | The chart pool's only home: one lazily-spawned `YtdlpPool(max_workers=1, name="chart render")`, plus `chart_available()` (a `find_spec` lookup, so it never pays matplotlib's import). Exists so there IS a stable name for `main.py` to close, `debug.py` to read and `conftest.py` to patch; imports only `ytdlp_pool`. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
-| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0, floor 1.0), `STREAM_PROBE_TIMEOUT_SECS` (2.0, floor 0.1), `LIVENESS_INTERVAL_SECS` (15.0, between 1 and 60), the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0), and `ANALYTICS_RENDER_DEADLINE_SECS` (20.0) — read through `_float_env`, which names each floor in a `_MIN_*` constant beside its knob and refuses non-finite values separately from that floor (and from an optional maximum) because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. `YTDLP_POOL_WORKERS` (4, floor 1) and the other integer knobs go through `_int_env`. Plus the call-time accessors: `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
-| `settings.py` | The `-settings` machinery, pure: `SETTINGS`, one `SettingSpec` per setting chat may show or change (scope, kind, label, bounds, the env var and `config` knob a bot setting overrides), and the functions every surface shares — `parse_value` (each kind's grammar matched in full with `re.ASCII`, then the bounds), `format_value` (one rendering per kind, each parsing back), `in_bounds`/`check_write`, `find`, and `parse_settings_args`, which reads one line of chat into a `SettingsRequest` or a `Refusal` whose text never quotes the input. A server setting's bounds are its field's `CONFIG_DOMAIN`; a bot setting's chat minimum sits above the floor `config.env_floor` recorded. Timezones are accepted only as `Area/City`, `UTC` or `GMT`, with a redirect table for the rest, built on first use because it walks the tz database. `config.py` reads the environment; this module decides what chat may set. |
+| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0, floor 1.0), `STREAM_PROBE_TIMEOUT_SECS` (2.0, floor 0.1), `LIVENESS_INTERVAL_SECS` (15.0, between 1 and 60), the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0), and `ANALYTICS_RENDER_DEADLINE_SECS` (20.0) — read through `_float_env`, which names each floor in a `_MIN_*` constant beside its knob and refuses non-finite values separately from that floor (and from an optional maximum) because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. `YTDLP_POOL_WORKERS` (4, floor 1) and the other integer knobs go through `_int_env`. Each `-settings bot` knob also has an accessor named as the knob in lower case (`ping_tick_secs()`), returning an override from `_FLOAT_OVERRIDES`/`_INT_OVERRIDES`, else the baseline; `set_override`/`clear_override` write them and `override`/`baseline`/`effective`/`env_floor` read them ([Settings resolution](#settings-resolution)). Plus the call-time accessors: `bot_settings_overrides_ignored()` (`BOT_SETTINGS_OVERRIDES`: `apply` or `ignore`, garbage raises), `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
+| `settings.py` | The `-settings` machinery. Pure: `SETTINGS`, one `SettingSpec` per setting chat may show or change (scope, kind, label, bounds, the env var and `config` knob a bot setting overrides), and the functions every surface shares — `parse_value` (each kind's grammar matched in full with `re.ASCII`, then the bounds), `format_value` (one rendering per kind, each parsing back), `in_bounds`/`check_write`, `find`, and `parse_settings_args`, which reads one line of chat into a `SettingsRequest` or a `Refusal` whose text never quotes the input. A server setting's bounds are its field's `CONFIG_DOMAIN`; a bot setting's chat minimum sits above the floor `config.env_floor` recorded. Timezones are accepted only as `Area/City`, `UTC` or `GMT`, with a redirect table for the rest, built on first use because it walks the tz database. `config.py` reads the environment; this module decides what chat may set. `BotSettings` (on `MusicBotApp`) applies the operator's stored overrides from `bot:{application_id}:config` to `config`'s accessors, holds the session-only `debug-default`, and honours `BOT_SETTINGS_OVERRIDES=ignore` ([Settings resolution](#settings-resolution)). |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
 | `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver `-ping` and `-debug` share. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row, a block of rendered lines) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. Both callers reply through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
 | `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
@@ -410,15 +411,18 @@ sequenceDiagram
     Main->>Main: assert DISCORD_TOKEN / SPOTIFY_* present
     Main->>Bot: bot.run(token) → connect WebSocket
     Discord-->>Bot: setup_hook (before READY)
+    Bot->>Bot: read HISTORY_ARCHIVE_ENABLED, then BOT_SETTINGS_OVERRIDES (garbage aborts)
     Bot->>Redis: create_redis_pool() + get_redis()
+    Bot->>Bot: bot_settings = BotSettings(...)
     Bot->>Bot: HISTORY_ARCHIVE_ENABLED? → archive →<br/>HistoryOutboxDrainer.start() (lazy — no PG connection yet)
     Bot->>Bot: load_extension("src.musicbot")
+    Bot-)Redis: BotSettings.hydrate() — spawned, not awaited (bot:{application_id}:config)
     Discord-->>Bot: on_ready (all guilds cached)
     Bot->>Bot: presence = "Playing music"
     Bot->>Bot: MusicBot.on_ready → create_task(_restore_guild) × N guilds
 ```
 
-`setup_hook` runs after the WebSocket connection is established but before READY is dispatched — Redis is guaranteed available before any command is processed. `setup_telemetry()` runs first in `main()` because it configures structlog before the first `get_logger()` call resolves.
+`setup_hook` runs after the WebSocket connection is established but before READY is dispatched — Redis is guaranteed available before any command is processed. It reads `HISTORY_ARCHIVE_ENABLED` and then `BOT_SETTINGS_OVERRIDES` before anything else, because both parsers raise on garbage and nothing later would report it as loudly. The bot-settings hydration it spawns never holds startup; see [Settings resolution](#settings-resolution). `setup_telemetry()` runs first in `main()` because it configures structlog before the first `get_logger()` call resolves.
 
 ---
 
@@ -2352,6 +2356,75 @@ for "real IO across several services", and this command touches one, with a warm
 ~66 ms of SQL plus ~460 ms of render. And an edit-loop-owned message must bypass
 `MusicContext.send`, which would cost the NP block. `background_typing(ctx)` covers the
 one real gap — the ~2.0 s first invocation in a process.
+
+### Settings resolution
+
+`-settings` holds values at two scopes: bot-wide knobs, owned by the operator, and
+per-server settings. Each scope has one writer.
+
+**Bot settings: override, else environment, else code default.** Twelve knobs
+(`config.FLOAT_KNOBS`, `config.INT_KNOBS`) keep their environment parse unchanged: the
+UPPER_CASE constant (`config.PING_TICK_SECS`) is the **baseline**, parsed at import
+through `_float_env`/`_int_env`, which record the floor each enforced
+(`config.env_floor`). Beside it sits an accessor named as the knob in lower case
+(`config.ping_tick_secs()`), which returns the knob's entry in one of two private maps,
+`_FLOAT_OVERRIDES` or `_INT_OVERRIDES`, else the baseline, both read at call time.
+
+- **One writer.** `config.set_override` and `clear_override` are called in `src/` only by
+  `BotSettings` (`src/settings.py`). `set_override` checks the value's type — a `bool`
+  for either kind, a non-int for an int knob, raise `TypeError` — and nothing else:
+  bounds belong to the registry, and `BotSettings` checks `in_bounds` before it calls.
+  `override`, `baseline` and `effective` are read-only views, open to any module.
+- **Consumers still read the baselines.** No consumer calls an accessor yet, so an
+  applied override changes only what the accessors return.
+- **Two maps, `Literal` keys.** Each accessor's return type is its map's value type, with
+  no `cast`. The keys are `Literal` strings rather than an `Enum` because
+  `importlib.reload(config)` would mint new enum classes, and a registry built before
+  the reload would hold members that fail `isinstance` against them.
+- **Reload.** `importlib.reload(config)` rebinds both maps empty and re-parses every
+  baseline, so a reload drops overrides rather than leaving a captured value stale.
+  A cog reload does not reload `src.config`, so overrides survive
+  `reload_extension("src.musicbot")`.
+
+**Where overrides come from.** `bot:{application_id}:config` (`BotConfig`,
+`BotConfigStore`): one hash per application, so a dev bot and a prod bot sharing a
+Redis cannot retune each other. `setup_hook` builds `MusicBotApp.bot_settings` after the
+Redis pool, and after `load_extension` spawns `BotSettings.hydrate()` without awaiting
+it. Until the read lands, every knob runs on its environment value.
+
+- The read runs under `CONFIG_IO_TIMEOUT_SECS` (2s). A failed or timed-out read logs one
+  WARNING and leaves `hydrated` False; `on_ready` spawns another read while it is False
+  and no read is running.
+- A stored value outside the registry's current bounds is skipped with a WARNING, never
+  applied and never an abort: the key outlives builds, and a build can change bounds.
+- One INFO lists every override applied, and each override that shadows a **set**
+  environment variable draws a WARNING naming all three ways back: `-settings bot <key>
+  reset`, `just bot-settings reset <application_id>` and `BOT_SETTINGS_OVERRIDES=ignore`.
+- A knob that `apply` or `reset` changed while the read was in flight keeps that value.
+- Hydration is skipped while `application_id` is None: discord.py sets it in `login()`,
+  before `setup_hook`, so only a bot that never logged in (a unit test) lacks one.
+
+**`debug-default` is session-only.** It is the debug mode a server that never chose
+follows. `BotSettings.apply` keeps it in memory and passes it to
+`DebugSettings.set_default_override`; `DebugSettings._default` stays the `DEBUG_MODE`
+parse, and `default` returns the override when one is set. `cog_load` hands a reloaded
+cog's new `DebugSettings` the value `BotSettings` holds, and a restart builds a new
+`BotSettings`, which starts from `DEBUG_MODE`. It is never written to the bot hash:
+debug mode publishes the whole process's load figures on every embed in every server
+that follows the default, and a stored `on` would keep doing so after the variable was
+deleted.
+
+**Ways back from a harmful stored override without chat.**
+
+- **`BOT_SETTINGS_OVERRIDES=ignore`.** `setup_hook` reads it immediately after
+  `HISTORY_ARCHIVE_ENABLED`, before the Redis pool, so a garbage value refuses startup
+  (`apply`, empty or unset apply what is stored). With `ignore`, hydration never reads
+  the key and logs one WARNING naming it, and `BotSettings.apply` and `reset` refuse
+  every stored setting; `debug-default` is never stored, so it stays settable. The key is
+  left in place: removing the variable and restarting brings its values back.
+- **`just bot-settings`** lists every `bot:*:config` hash on the compose Redis, and
+  `just bot-settings reset <application_id>` deletes one. The running bot keeps its
+  in-memory overrides until it restarts.
 
 ## Design Decisions
 

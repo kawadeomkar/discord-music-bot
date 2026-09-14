@@ -166,6 +166,11 @@ class MusicBot(commands.Cog):
     async def cog_load(self) -> None:
         """Spawn the debug hydration and the Spotify credential probe. discord.py
         awaits this inside setup_hook, so nothing here blocks."""
+        # A reloaded cog starts from DEBUG_MODE; the operator's session default
+        # outlives it. getattr: a bot built without setup_hook has no BotSettings.
+        bot_settings = getattr(self.bot, "bot_settings", None)
+        if bot_settings is not None:
+            bot_settings.reapply_debug_default(self.debug_settings)
         # At load, not only on toggles (see RuntimeSampler.apply); the hydration
         # re-syncs once the stored choices land.
         self.debug_settings.sync_sampler()
