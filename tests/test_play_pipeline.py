@@ -43,6 +43,7 @@ from src.sources import (
     parse_url,
     timestamp_warning,
 )
+from src.spotify import SpotifyPlaylist
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     admit,
@@ -67,7 +68,15 @@ class TestQueueSource:
     ) -> None:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=SpotifyPlaylist(
+                name=None,
+                titles=["Song A", "Song B"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
+        )
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
@@ -1134,7 +1143,15 @@ class TestQuerySourceClassification:
         # token passed only from queue_source would leave these two unclassified.
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None
-        music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=SpotifyPlaylist(
+                name=None,
+                titles=["Song A", "Song B"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
+        )
         fake_qobj = QueueObject("https://yt.com/v=1", "Song A", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):

@@ -44,6 +44,7 @@ from src.sources import (
     YTType,
 )
 from src.queue_progress import EnqueueProgress
+from src.spotify import SpotifyPlaylist
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     admit,
@@ -1690,7 +1691,15 @@ class TestNowFlag:
         mock_ctx.voice_client = live_vc
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=SpotifyPlaylist(
+                name=None,
+                titles=["First Song", "Second"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
+        )
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
 
         with patch(
@@ -5134,11 +5143,17 @@ class TestQueueProgressCard:
         assert music_bot.spotify is not None
         seen: list[Any] = []
 
-        async def _playlist(_pid: str, *, on_progress: Any = None) -> list[str]:
+        async def _playlist(_pid: str, *, on_progress: Any = None) -> SpotifyPlaylist:
             seen.append(on_progress)
             if on_progress is not None:
                 on_progress(100, 250)
-            return ["One"]
+            return SpotifyPlaylist(
+                name=None,
+                titles=["One"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
 
         music_bot.spotify.playlist = AsyncMock(side_effect=_playlist)
         card = _CardSpy()
@@ -5169,10 +5184,16 @@ class TestQueueProgressCard:
         mock_ctx.voice_client = live_vc
         assert music_bot.spotify is not None
 
-        async def _playlist(_pid: str, *, on_progress: Any = None) -> list[str]:
+        async def _playlist(_pid: str, *, on_progress: Any = None) -> SpotifyPlaylist:
             if on_progress is not None:
                 on_progress(100, 250)
-            return ["One", "Two"]
+            return SpotifyPlaylist(
+                name=None,
+                titles=["One", "Two"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
 
         music_bot.spotify.playlist = AsyncMock(side_effect=_playlist)
         card = _CardSpy()

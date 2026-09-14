@@ -460,7 +460,7 @@ sequenceDiagram
     Sources-->>Bot: YTSource | SpotifySource | SoundcloudSource
 
     alt Spotify playlist
-        Bot->>SP: spotify.playlist(id) → List[str] titles
+        Bot->>SP: spotify.playlist(id) → SpotifyPlaylist, its titles
         Bot->>Sources: spotify_playlist_to_ytsearch(titles) → List[YTSource]
         Bot->>MP: queue_put(items, prefetch=False)
     else YouTube playlist
@@ -550,7 +550,7 @@ flowchart TD
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
-- **Playlist**: `Spotify.playlist(id)` → `List[str]` titles → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
 
 ---
 
@@ -1034,7 +1034,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:v2:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1356,7 +1356,7 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:v2:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
+| `playlist(id)` | `spotify:playlist:v3:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -1835,6 +1835,8 @@ provisioned ahead of enforcement rather than after it.
 **A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
 
 **A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
+
+**The name is a request of its own.** `v1/playlists/{id}/tracks` does not carry the playlist's name, so after the walk, still inside its slot, `_playlist_name` sends one `GET v1/playlists/{id}?fields=name`, bounded by `_PLAYLIST_PAGE_TIMEOUT_SECS`. Folding the name into page 1 — fetching `v1/playlists/{id}` with a nested `tracks(...)` mask — does not work: the `tracks.next` cursor Spotify returns then carries that request's `fields=name,tracks(...)`, and page 2 fetched from it comes back as `{}`, which this walk reads as a refused playlist. The name only decorates the confirmation, so any failure there returns `None` and never fails the walk. The walk's own mask adds `duration_ms`, which costs no extra request: the result sums the kept tracks' milliseconds and divides once, and marks the total `duration_partial` when a kept track carried none. `unavailable` counts items walked and not kept.
 
 ### Progress out of a yt-dlp worker
 

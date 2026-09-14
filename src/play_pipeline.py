@@ -364,9 +364,10 @@ async def queue_source(
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
-        titles = await cog._require_spotify().playlist(
+        playlist = await cog._require_spotify().playlist(
             source.id, on_progress=on_progress
         )
+        titles = playlist.titles
         if not titles:
             # Otherwise the enqueue below confirms "Queued playlist" with 👍
             # over nothing queued, which reads exactly like success.
@@ -663,9 +664,10 @@ async def _resolve_interjection_source(
         queued_at=ctx.message.created_at.timestamp(), queue_position=0
     )
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-        titles = await cog._require_spotify().playlist(
+        playlist = await cog._require_spotify().playlist(
             source.id, on_progress=on_progress
         )
+        titles = playlist.titles
         if not titles:
             raise EmptyPlaylistError()
         yts = await _searches_for(titles, analytics=analytics, origin=origin)

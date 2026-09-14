@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Optional, Union, cast
 from collections.abc import Awaitable, Callable, Iterator
 
@@ -69,6 +70,56 @@ _playlist_gate_loop: Optional[asyncio.AbstractEventLoop] = None
 # between the expiry check and the request that carries the token.
 _TOKEN_EXPIRY_MARGIN_SECS = 60
 
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpotifyPlaylist:
+    """One playlist walk. `titles` is what gets queued; the rest describes the
+    playlist to the confirmation. `unavailable` counts ITEMS walked and not kept,
+    and `duration_secs` sums the kept tracks only, marked `duration_partial` when
+    any of them carried no `duration_ms`."""
+
+    name: Optional[str]
+    titles: list[str]
+    duration_secs: int
+    duration_partial: bool
+    unavailable: int
+
+
+def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
+    """Plain dict for orjson. Keys spelled out so a field rename cannot silently
+    change the cached shape."""
+    return {
+        "name": playlist.name,
+        "titles": playlist.titles,
+        "duration_secs": playlist.duration_secs,
+        "duration_partial": playlist.duration_partial,
+        "unavailable": playlist.unavailable,
+    }
+
+
+def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
+    """Rebuild a cached walk; None is a MISS, for a value with no `titles` list
+    or an unparseable number. The other fields default, and an absent
+    `duration_partial` reads as partial: nothing vouched for that total."""
+    if not isinstance(raw, dict):
+        return None
+    entry = cast(dict[str, Any], raw)
+    titles = entry.get("titles")
+    if not isinstance(titles, list):
+        return None
+    name = entry.get("name")
+    try:
+        return SpotifyPlaylist(
+            name=name if isinstance(name, str) and name else None,
+            titles=cast(list[str], titles),
+            duration_secs=int(entry.get("duration_secs", 0)),
+            duration_partial=bool(entry.get("duration_partial", True)),
+            unavailable=int(entry.get("unavailable", 0)),
+        )
+    except TypeError, ValueError:
+        return None
+
+
 # Every caller awaiting a walk, leader and joiners alike, keyed like the cache: a
 # page's report reaches each of their cards.
 _PLAYLIST_SUBSCRIBERS: dict[str, list[ProgressFn]] = {}
@@ -77,7 +128,7 @@ _PLAYLIST_SUBSCRIBERS: dict[str, list[ProgressFn]] = {}
 # identical 100-request walks racing to write one cache entry; the first starts
 # it and the rest await its outcome. Keyed like the cache, so the joiners are
 # exactly the callers the cache would have served had it been warm.
-_INFLIGHT_PLAYLISTS: dict[str, asyncio.Future[list[str]]] = {}
+_INFLIGHT_PLAYLISTS: dict[str, asyncio.Future[SpotifyPlaylist]] = {}
 
 
 def _publish(key: str, done: int, total: Optional[int]) -> None:
@@ -468,9 +519,9 @@ class Spotify:
     @_tracer.start_as_current_span("spotify.playlist")
     async def playlist(
         self, pid: str, *, on_progress: Optional[ProgressFn] = None
-    ) -> list[str]:
-        """Return "<title> <artist1> <artist2> ..." for every track in a playlist,
-        cached for 1h.
+    ) -> SpotifyPlaylist:
+        """The playlist's name, "<title> <artist1> <artist2> ..." for every track
+        kept, their total length and how many items were unavailable; cached 1h.
 
         `on_progress` reports (items walked, playlist total) after each page. Its
         numerator counts playlist ITEMS, not the titles kept: the two differ by
@@ -479,26 +530,29 @@ class Spotify:
         none. A local file DOES carry a name and is kept, because its name is
         exactly what a YouTube search wants. What the report measures is how far
         the walk has got. The confirmation's
-        "queued N songs" counts what was queued, which is the list returned here.
+        "queued N songs" counts what was queued, which is `titles` on the result.
         A cache hit reports nothing — it never reaches this fetch, and it resolves
         far under the threshold that would show a card anyway. A caller that joins
         a walk already running receives its reports from the next page on.
         """
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
-        # v2: following `next` changes the cached VALUE under a 1h TTL, so an
-        # already-cached playlist would keep answering 100 for an hour after deploy.
-        cache_key = f"spotify:playlist:v2:{pid}"
+        # Versioned by the VALUE's shape: under a 1h TTL, a deploy that changes it
+        # would otherwise be answered from the previous build's entries.
+        cache_key = f"spotify:playlist:v3:{pid}"
 
-        async def fetch() -> tuple[list[str], bool]:
+        async def fetch() -> tuple[SpotifyPlaylist, bool]:
             # Under `fields` Spotify answers with only the keys named, so `next`
             # and `total` have to be asked for: without the first the walk cannot
             # terminate, without the second progress has no denominator.
             url = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
             params: Optional[dict[str, Union[str, int]]] = {
-                "fields": "items(track(name,artists(name))),next,total",
+                "fields": "items(track(name,artists(name),duration_ms)),next,total",
                 "limit": _PLAYLIST_PAGE_SIZE,
             }
             titles: list[str] = []
+            duration_ms = 0
+            duration_partial = False
+            unavailable = 0
             total: Optional[int] = None
             walked = 0
             pages = 0
@@ -534,8 +588,14 @@ class Spotify:
                                 # episode with no name: nothing to search YouTube
                                 # for. Walked, not queued. A local file has a name
                                 # and is kept — the name is what the search wants.
+                                unavailable += 1
                                 continue
                             titles.append(_track_search_title(track))
+                            ms = track.get("duration_ms")
+                            if isinstance(ms, int):
+                                duration_ms += ms
+                            else:
+                                duration_partial = True
                         if total is None:
                             total = resp.get("total")
                         _publish(cache_key, walked, total)
@@ -580,9 +640,20 @@ class Spotify:
                         f"spotify playlist {pid} walked {walked} of {total} items "
                         f"in {pages} pages; {len(titles)} queued"
                     )
-            return titles, complete
+            # Its own request, after the walk and inside its slot: the tracks
+            # endpoint does not carry the name, and the name never fails the walk.
+            # See docs/ARCHITECTURE.md#spotify-playlist-paging.
+            name = await self._playlist_name(pid)
+            playlist = SpotifyPlaylist(
+                name=name,
+                titles=titles,
+                duration_secs=duration_ms // 1000,
+                duration_partial=duration_partial,
+                unavailable=unavailable,
+            )
+            return playlist, complete
 
-        async def bounded() -> list[str]:
+        async def bounded() -> SpotifyPlaylist:
             # The slot is taken INSIDE the single flight, around the requests
             # alone: a joiner issues none and must not queue for a slot it will
             # not use. Same placement, and the same reason, as _extract_once's.
@@ -593,19 +664,22 @@ class Spotify:
             except TimeoutError as e:
                 raise SpotifyBusyError() from e
             try:
-                titles, complete = await fetch()
+                playlist, complete = await fetch()
             finally:
                 slot.release()
             # Written by the job, so a walk whose callers were all cancelled is
             # still kept. A short walk is not: every hit would answer it silently.
             if complete:
-                await cache_set(self._redis, cache_key, titles, _PLAYLIST_TTL)
-            return titles
+                await cache_set(
+                    self._redis, cache_key, _playlist_to_cache(playlist), _PLAYLIST_TTL
+                )
+            return playlist
 
-        cached = await cache_get(self._redis, cache_key)
+        # A malformed entry reads as a miss, and the walk overwrites it.
+        cached = _playlist_from_cache(await cache_get(self._redis, cache_key))
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
-            return cast(list[str], cached)
+            return cached
         job = _INFLIGHT_PLAYLISTS.get(cache_key)
         if job is not None:
             trace.get_current_span().set_attribute("spotify.walk_shared", True)
@@ -619,6 +693,26 @@ class Spotify:
         # it from the others.
         with _subscribed(cache_key, on_progress):
             return await asyncio.shield(job)
+
+    async def _playlist_name(self, pid: str) -> Optional[str]:
+        """The playlist's name, or None when the request fails or carries none:
+        it decorates the confirmation, so it never fails the walk. Bounded like
+        one page, handing http_call the bound as its 429 deadline."""
+        try:
+            async with asyncio.timeout(_PLAYLIST_PAGE_TIMEOUT_SECS) as bound:
+                resp = await self.http_call(
+                    self.spotify_endpoint + f"v1/playlists/{pid}",
+                    params={"fields": "name"},
+                    deadline=bound.when(),
+                )
+        except Exception as e:
+            log.warning(f"spotify playlist {pid}: name request failed: {e!r}")
+            return None
+        name = resp.get("name") if isinstance(resp, dict) else None
+        if not isinstance(name, str) or not name:
+            log.debug(f"spotify playlist {pid}: name response carried no name")
+            return None
+        return name
 
     def _forbidden(self, pid: str, detail: str) -> SpotifyPlaylistForbiddenError:
         """The playlist refusal, logged once for the operator: the credentials work,
