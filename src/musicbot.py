@@ -167,8 +167,9 @@ class MusicBot(commands.Cog):
         self.debug_settings = debug_mode.DebugSettings()
         # Every guild's stored settings, and the one writer of guild:{id}:config.
         self.guild_settings = GuildSettings(self)
-        # The latest hydrate retry, for the guilds a pass could not read.
-        self._hydrate_retry: Optional[asyncio.Task] = None
+        # Every hydrate retry still running, each for the guilds its pass could
+        # not read.
+        self._hydrate_retries: set[asyncio.Task] = set()
         # Claimed by the first on_ready: the orphan sweep runs once per process.
         self._orphan_sweep_claimed = False
 
@@ -1137,19 +1138,23 @@ class MusicBot(commands.Cog):
         """One bounded GuildSettings.hydrate pass over `ids` (default: every guild),
         then a background retry for any guild it could not read, so a caller
         awaiting this returns after one pass even while Redis stays down. A full
-        pass supersedes the previous retry. bot.guilds is empty until READY, so
-        cog_load's pass covers an extension reload and on_ready's a cold start."""
-        full = ids is None
+        pass replaces every retry running when it began, whose guilds it covers; a
+        pass over a joined guild leaves them running. bot.guilds is empty until
+        READY, so cog_load's pass covers an extension reload and on_ready's a cold
+        start."""
+        superseded = list(self._hydrate_retries) if ids is None else []
         omitted = await self.guild_settings.hydrate(
             [guild.id for guild in self.bot.guilds] if ids is None else ids
         )
+        for retry in superseded:
+            retry.cancel()
         if not omitted:
             return
-        if full and self._hydrate_retry is not None:
-            self._hydrate_retry.cancel()
-        self._hydrate_retry = spawn_background(
+        retry = spawn_background(
             self.guild_settings.retry_hydrate(omitted), self._restore_tasks
         )
+        self._hydrate_retries.add(retry)
+        retry.add_done_callback(self._hydrate_retries.discard)
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild) -> None:

@@ -3332,9 +3332,46 @@ class TestDebugModeIsPerGuildAndDurable:
         ):
             await music_bot_with_redis._hydrate_configs()
         assert music_bot_with_redis.debug_settings._overrides == {}
-        retry = music_bot_with_redis._hydrate_retry
-        assert retry is not None and not retry.done()
+        (retry,) = music_bot_with_redis._hydrate_retries
+        assert not retry.done()
         await cancel_task(retry)
+
+    async def test_a_joined_guilds_retry_runs_beside_the_full_one(
+        self, music_bot_with_redis: MusicBotCog
+    ) -> None:
+        """A join during an outage covers one guild; cancelling the full pass's
+        retry for it would leave every other unread guild on defaults for good."""
+        cog = music_bot_with_redis
+        self._guilds(cog, 111, 222)
+        with patch.object(
+            cast(Any, cog.redis), "pipeline", side_effect=RuntimeError("down")
+        ):
+            await cog._hydrate_configs()
+            (full,) = cog._hydrate_retries
+            await cog._hydrate_configs([333])
+        # A cancel() lands at the task's next step.
+        await asyncio.sleep(0)
+        assert not full.done()
+        assert len(cog._hydrate_retries) == 2
+        await asyncio.gather(*(cancel_task(t) for t in list(cog._hydrate_retries)))
+
+    async def test_a_full_pass_replaces_every_earlier_retry(
+        self, music_bot_with_redis: MusicBotCog
+    ) -> None:
+        cog = music_bot_with_redis
+        self._guilds(cog, 111, 222)
+        with patch.object(
+            cast(Any, cog.redis), "pipeline", side_effect=RuntimeError("down")
+        ):
+            await cog._hydrate_configs()
+            await cog._hydrate_configs([333])
+            earlier = set(cog._hydrate_retries)
+            await cog._hydrate_configs()
+        await asyncio.gather(*earlier, return_exceptions=True)
+        assert all(task.cancelled() for task in earlier)
+        (latest,) = cog._hydrate_retries
+        assert latest not in earlier and not latest.done()
+        await cancel_task(latest)
 
     async def test_a_failed_read_does_not_discard_a_correct_stored_choice(
         self, music_bot_with_redis: MusicBotCog
@@ -3359,8 +3396,8 @@ class TestDebugModeIsPerGuildAndDurable:
 
         assert music_bot_with_redis.debug_settings._overrides == {111: False}
         assert music_bot_with_redis.debug_settings.enabled(111) is False
-        retry = music_bot_with_redis._hydrate_retry
-        assert retry is not None and not retry.done()
+        (retry,) = music_bot_with_redis._hydrate_retries
+        assert not retry.done()
         await cancel_task(retry)
 
     async def test_a_read_that_succeeds_still_evicts_a_removed_choice(
