@@ -592,6 +592,8 @@ something at the head:
 | `FAILED` | the resolve returned no song and retired the copy | plays on |
 | `DROPPED` | a `-clear` or `-remove` took the copy out of the queue | plays on |
 
+**A replay is two traces, and they say so.** One song is one trace, so the interrupted play and its replay are separate traces with the same attribute keys. The interrupted iteration records `song.ended_by=replay`; `player.replay` links to it (`link.kind=replayed_song`); the replayed iteration records `song.is_replay` and links back to it (`link.kind=replay_of`), carried on `MusicPlayer._replay_of` from the stop to the replay's start. `bot.replay` records `replay.outcome` on every exit, the refusals that never reach the player included.
+
 **A `--now` during the replay's resolve inserts no resume tail.** It neutralizes the resolve, which hands the copy back to the head, and `interject()` finds a `-replay` copy of the live song next (`_is_replay_of`): the copy already plays the song again after the interjection, so a tail at the interrupt position ahead of it would play the song a third time. The interrupted fragment records its own history row, as with `-skip`, and `--now`'s reply says the song plays again from `0:00` after it. A marker held for the length of `replay_current` could not stand in for this check: the replay's verdict runs as soon as the neutralize cancels its resolve, before `--now` has inserted anything.
 
 Expiring the bound stops nothing: a resolve past it can still fail, and a stop into

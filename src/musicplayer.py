@@ -403,6 +403,7 @@ class MusicPlayer:
         "_skip_history_for",
         "_pending_resume_tail",
         "_retire_np_for",
+        "_replay_of",
         "_ended_song",
         "_last_stream_error",
     )
@@ -449,6 +450,7 @@ class MusicPlayer:
     _skip_history_for: Optional[YTDL]
     _pending_resume_tail: Optional[QueueObject]
     _retire_np_for: Optional[YTDL]
+    _replay_of: Optional[trace.SpanContext]
     _ended_song: Optional[YTDL]
     _last_stream_error: Optional[StreamFailure]
 
@@ -551,6 +553,9 @@ class MusicPlayer:
         # The song whose NP card the loop retires instead of finalizing. Identity,
         # not a flag, like _skip_history_for.
         self._retire_np_for: Optional[YTDL] = None
+        # The trace of the play a -replay stopped, linked from the replay's own
+        # trace when that starts: one song is one trace, and a replay is two.
+        self._replay_of: Optional[trace.SpanContext] = None
         # The song whose playback ended but whose history row is not written yet;
         # keeps the play claimable across the prefetch await — see
         # claim_current_song_for_history.
@@ -2003,6 +2008,9 @@ class MusicPlayer:
             # between them; _retire_np_for is set after the stop for the same reason.
             if result is ReplayResult.REPLAYING and self._stop_if_live(current, vc):
                 self._retire_np_for = current
+                if self._playback_span is not None:
+                    self._replay_of = self._playback_span.get_span_context()
+                    span.add_link(self._replay_of, {"link.kind": "replayed_song"})
         span.set_attribute("replay.position", position)
         span.set_attribute("replay.outcome", result.value)
         span.set_attribute("replay.stopped", result is ReplayResult.REPLAYING)
@@ -2574,6 +2582,11 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
                     _link_stream_provenance(span, self.current_song)
+                    if self.current_song.is_replay:
+                        span.set_attribute("song.is_replay", True)
+                        if self._replay_of is not None:
+                            span.add_link(self._replay_of, {"link.kind": "replay_of"})
+                            self._replay_of = None
                     # Advances with the song, not the iteration: a failed resolve
                     # renders no card, so the previous song's tail keeps naming its
                     # own trace.
@@ -2776,6 +2789,8 @@ class MusicPlayer:
                     # retired instead; identity, cleared either way.
                     retire_np = self._retire_np_for is song
                     self._retire_np_for = None
+                    if retire_np:
+                        span.set_attribute("song.ended_by", "replay")
                     finished_host = self._np_host_message
                     finished_own = self._np_host_own_embeds
                     finished_dedicated = self._np_host_dedicated

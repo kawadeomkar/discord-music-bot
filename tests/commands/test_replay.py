@@ -8,9 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import pytest
 from discord.ext import commands
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.commands._common import NOTHING_PLAYING
 from src.guild_state import Analytics
+from src.commands import replay as replay_cmd
 from src.musicbot import MusicBot
 from src.musicplayer import ReplayOutcome, ReplayResult
 from tests.helpers import (
@@ -266,6 +270,47 @@ class TestReplayCommand:
         assert mock_ctx.message.add_reaction.await_count == (1 if reacts else 0)
         # A copy that still plays writes history; one that does not, does not.
         assert mock_ctx.command.reset_cooldown.call_count == (0 if reacts else 1)
+
+    @pytest.mark.parametrize(
+        "setup,outcome",
+        [
+            pytest.param("replayed", "replaying", id="replayed"),
+            pytest.param("at_beginning", "at_beginning", id="at-beginning"),
+            pytest.param("idle", "idle", id="idle"),
+            pytest.param("not_live", "not_live", id="not-live"),
+        ],
+    )
+    async def test_the_command_span_names_how_it_ended(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+        setup: str,
+        outcome: str,
+    ) -> None:
+        """player.replay records only the replays that reached the player; a refusal
+        left a bare bot.replay span."""
+        if setup == "at_beginning":
+            live_mp.current_song.position_secs = 0.2
+        elif setup == "idle":
+            live_mp.current_song = None
+            live_mp.queue.empty = MagicMock(return_value=True)
+        elif setup == "not_live":
+            live_mp.replay_current = AsyncMock(return_value=None)
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+        # The body, not the cog's callback: its decorator opens bot.replay on the
+        # module's own tracer, which records nothing here.
+        with provider.get_tracer("test").start_as_current_span("bot.replay"):
+            await replay_cmd.run(mock_ctx, mp=live_mp)
+
+        (span,) = exporter.get_finished_spans()
+        assert (span.attributes or {})["replay.outcome"] == outcome
 
     async def test_the_reaction_does_not_wait_for_the_confirmation(
         self,

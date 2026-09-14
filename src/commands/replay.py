@@ -5,6 +5,7 @@ import contextlib
 
 import discord
 from discord.ext import commands
+from opentelemetry import trace
 
 from src.commands._common import NOTHING_PLAYING
 from src.guild_state import Analytics
@@ -67,6 +68,9 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
     Every reply that replayed nothing refunds the guild cooldown: it exists to bound
     history churn, and a refusal writes no history. See docs/ARCHITECTURE.md#-replay.
     """
+    # Every exit names itself here, refusals included: player.replay records only
+    # the replays that reached the player.
+    span = trace.get_current_span()
     async with background_typing(ctx):
         vc = ctx.voice_client
         song = mp.current_song
@@ -82,6 +86,7 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
                 and vc.is_connected()
                 and (mp.queue.claim_outstanding() or not mp.queue.empty())
             )
+            span.set_attribute("replay.outcome", "loading" if loading else "idle")
             refund_cooldown(ctx)
             await ctx.send(
                 embed=notice_embed(
@@ -95,6 +100,7 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
         if int(song.position_secs) < MIN_REPLAY_POSITION_SECS:
             # Nothing to rewind, and a repeat here mints history entries nobody
             # heard.
+            span.set_attribute("replay.outcome", "at_beginning")
             refund_cooldown(ctx)
             await ctx.send(
                 embed=notice_embed(
@@ -116,6 +122,7 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
         if outcome is None:
             # The song stopped being live while the replay resolved — distinct from
             # the guard above, where nothing was playing.
+            span.set_attribute("replay.outcome", "not_live")
             refund_cooldown(ctx)
             await ctx.send(
                 embed=notice_embed(
@@ -124,6 +131,7 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
                 )
             )
             return
+        span.set_attribute("replay.outcome", outcome.result.value)
         title = safe_label(outcome.title, ECHO_MAX)
         if outcome.result in (ReplayResult.FAILED, ReplayResult.DROPPED):
             # Nothing was replayed and nothing is queued, so nothing will be

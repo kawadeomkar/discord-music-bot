@@ -7119,6 +7119,7 @@ class TestLoop:
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
         song.is_resume = False
+        song.is_replay = False
         song.start_paused = False
         # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
         # clamps its fields into the play_history column domain — query_source
@@ -8731,6 +8732,7 @@ class TestLoopAdditional:
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
         song.is_resume = False
+        song.is_replay = False
         song.start_paused = False
         # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
         # clamps its fields into the play_history column domain — query_source
@@ -12728,6 +12730,7 @@ class TestReplayLoopStart:
         song.produced_audio = True
         song.interjected = False
         song.is_resume = False
+        song.is_replay = False
         song.start_paused = False
         song.analytics = ANALYTICS_ZERO
         song.user_input = None
@@ -12746,6 +12749,7 @@ class TestReplayLoopStart:
         waits on it, and the replay plays in the second iteration."""
         first = self._song("https://yt.com/v=a", "Song A", position=42.0)
         replay_song = self._song("https://yt.com/v=a", "Song A", position=0.0)
+        replay_song.is_replay = True  # carried from the copy by yt_stream
 
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
@@ -12804,6 +12808,7 @@ class TestReplayLoopStart:
             patch.object(
                 GuildHistory, "add", new=AsyncMock(side_effect=recorded.append)
             ),
+            _recording_tracer() as exporter,
         ):
             # Bounded: a regression that parks the loop fails here in seconds
             # rather than at pytest-timeout's 120.
@@ -12811,6 +12816,7 @@ class TestReplayLoopStart:
                 await music_player.loop()
 
         return {
+            "exporter": exporter,
             "first": first,
             "replay": replay_song,
             "recorded": recorded,
@@ -12819,6 +12825,22 @@ class TestReplayLoopStart:
             "offset": offset_mock,
             "vc": vc,
         }
+
+    async def test_the_two_traces_of_a_replay_say_so_and_are_linked(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """One song is one trace, so a replay is two, with identical attribute keys
+        otherwise: "why did this song restart" meant matching them by wall clock."""
+        out = await self._run_replay(music_player, queue_obj)
+
+        interrupted, replayed = _iterations(out["exporter"])
+        assert (interrupted.attributes or {})["song.ended_by"] == "replay"
+        assert "song.is_replay" not in (interrupted.attributes or {})
+        assert (replayed.attributes or {})["song.is_replay"] is True
+        assert [link.context.span_id for link in replayed.links] == [
+            interrupted.context.span_id
+        ]
+        assert music_player._replay_of is None
 
     async def test_the_replay_plays_from_the_beginning_and_announces_nothing(
         self, music_player: MusicPlayer, queue_obj: QueueObject
