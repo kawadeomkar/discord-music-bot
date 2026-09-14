@@ -653,12 +653,21 @@ class TestOneCardPerChannel:
         them: it is taken inside the extraction, below where the card is entered.
         """
         _fast(monkeypatch)
+        second_settled = asyncio.Event()
 
-        async def _one() -> None:
+        # The first card stays up until the second request settles. A loser re-asks
+        # every tick, so a card that came down first would rightly hand it the claim.
+        async def _first() -> None:
+            async with enqueue_progress(card_ctx, _yt_playlist()):
+                await second_settled.wait()
+
+        async def _second() -> None:
             async with enqueue_progress(card_ctx, _yt_playlist()):
                 await asyncio.sleep(0.08)
+            second_settled.set()
 
-        await asyncio.gather(_one(), _one())
+        async with asyncio.timeout(2):
+            await asyncio.gather(_first(), _second())
 
         card_ctx.channel.send.assert_awaited_once()
 
