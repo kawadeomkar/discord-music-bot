@@ -1113,7 +1113,7 @@ sequenceDiagram
 
 **The schema is defined in one place: `src/guild_state.py`** — field constants + frozen value objects with `from_redis`/`to_redis` converters; no other module touches raw wire bytes. Wire formats are pinned by golden-fixture tests (rolling restarts mix writers, so serializer changes must keep old entries readable).
 
-All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle expiry), refreshed on writes, restore, and clean shutdown.
+All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle expiry), refreshed on writes, restore, and clean shutdown. Every song start re-arms the queue key after its LPOP, since a guild playing a long queue writes nothing else to it while the heartbeat keeps the state key alive; a lapsed list would leave recovery the playing song alone, and a later RPUSH onto the empty key would be LPOPed by the next start. The heartbeat task re-arms all three keys once per hour of playback, for a single song longer than `GUILD_TTL`.
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|

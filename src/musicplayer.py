@@ -160,6 +160,10 @@ _PLAYBACK_GATE_TIMEOUT = 300
 # the queue notes its mirror as stale (GuildQueue.note_mirror_write).
 _START_WRITE_TIMEOUT = 5.0
 
+# How often a playing song re-arms the TTL-managed guild keys. A song start
+# re-arms them too, so this matters only for one song longer than GUILD_TTL.
+_TTL_REARM_SECS = 3600.0
+
 # How long a command waits for wait_for_restore() before giving up and saying so.
 # Bounded because the pool sets no socket_timeout, so a server that accepts the
 # connection then stalls would hang the command outright.
@@ -2268,7 +2272,9 @@ class MusicPlayer:
     async def _heartbeat_updater(self, song: YTDL) -> None:
         """Record the playback position to Redis on a fixed cadence. Separate from
         _progress_updater, which is display-gated: a song with no visible bar must
-        still be recoverable."""
+        still be recoverable. Also re-arms the guild keys' TTL once per
+        _TTL_REARM_SECS of playback, so a song outliving GUILD_TTL keeps its queue."""
+        rearm_at = time.monotonic() + _TTL_REARM_SECS
         while True:
             await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
             vc = self._guild.voice_client
@@ -2280,6 +2286,9 @@ class MusicPlayer:
             if self.store is not None:
                 try:
                     await self.store.heartbeat(song.position_secs, time.time())
+                    if time.monotonic() >= rearm_at:
+                        await self.store.refresh_ttl()
+                        rearm_at = time.monotonic() + _TTL_REARM_SECS
                 except Exception as e:
                     # @_guild_op already swallows Redis failures, so this is a
                     # defect that would recur every tick; cancel_task never awaits

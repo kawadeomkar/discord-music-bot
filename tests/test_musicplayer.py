@@ -12551,6 +12551,33 @@ class TestHeartbeatUpdater:
             with pytest.raises(asyncio.CancelledError):
                 await music_player._heartbeat_updater(mock_song)  # must not raise
 
+    @pytest.mark.parametrize(("rearm_secs", "refreshes"), [(0.0, 3), (3600.0, 0)])
+    async def test_re_arms_the_guild_keys_once_the_interval_elapses(
+        self,
+        rearm_secs: float,
+        refreshes: int,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A song start re-arms the queue key, so this covers one song longer than
+        GUILD_TTL (a 24-hour livestream with a queue behind it), once per interval
+        rather than on every tick."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        store = AsyncMock(spec=GuildRedisStore)
+        music_player.store = store
+        monkeypatch.setattr(musicplayer, "_TTL_REARM_SECS", rearm_secs)
+
+        with patch("asyncio.sleep", new=self._make_sleep(3)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)
+
+        assert store.heartbeat.await_count == 3
+        assert store.refresh_ttl.await_count == refreshes
+
 
 class TestNowPlayingEditDiffing:
     """A 3s tick re-renders an identical payload most of the time; the bar only
