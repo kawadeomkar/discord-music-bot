@@ -12005,6 +12005,7 @@ class TestReplayCurrent:
         )
         assert music_player.queue.display_items() == []
         mock_vc.stop.assert_not_called()
+        assert music_player._retire_np_for is None
 
     async def test_a_skip_during_the_resolve_is_not_reported_as_a_replay(
         self,
@@ -12032,6 +12033,7 @@ class TestReplayCurrent:
         assert outcome is not None
         assert outcome.result is ReplayResult.STOPPED_ELSEWHERE
         mock_vc.stop.assert_not_called()
+        assert music_player._retire_np_for is None
         assert len(music_player.queue.display_items()) == 1
 
     async def test_a_teardown_during_the_resolve_says_the_copy_waits_for_resume(
@@ -12136,6 +12138,28 @@ class TestReplayCurrent:
 
         assert music_player._skip_history_for is None
 
+    async def test_marks_the_interrupted_card_for_retirement(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        replayer: MagicMock,
+    ) -> None:
+        """Left to finalize, the interrupted bar stays in the channel frozen at its
+        stop position — directly above the replay's own card, naming the same song.
+        Two identical Now Playing cards read as a duplicate queue entry, not as
+        history."""
+        music_player.current_song = live_song
+
+        await music_player.replay_current(
+            mock_vc, requester=replayer, analytics=REPLAY_ASK
+        )
+
+        assert music_player._retire_np_for is live_song
+        # Same stop, recorded for the other axis: a --now landing before the loop
+        # wakes sees a song already stopped and bails to its own fallback.
+        assert music_player._stopped_deliberately
+
     async def test_resolves_the_replay_before_stopping_the_song(
         self,
         music_player: MusicPlayer,
@@ -12199,6 +12223,7 @@ class TestReplayCurrent:
         assert outcome.result is ReplayResult.STILL_LOADING
         assert started.is_set()
         mock_vc.stop.assert_not_called()
+        assert music_player._retire_np_for is None
         # Shielded, so the timeout did not cancel the work the loop will consume.
         assert music_player._prefetch_task is not None
         assert not music_player._prefetch_task.done()
@@ -12231,6 +12256,7 @@ class TestReplayCurrent:
         assert outcome.result is ReplayResult.FAILED
         assert outcome.stopped is False
         mock_vc.stop.assert_not_called()
+        assert music_player._retire_np_for is None
         assert music_player._stopped_deliberately is False
 
     # What each command leaves the copy as: dropped, or still queued behind
@@ -12520,6 +12546,7 @@ class TestReplayCurrent:
         assert outcome is not None
         assert outcome.stopped is False
         mock_vc.stop.assert_not_called()
+        assert music_player._retire_np_for is None
         # The loop has read this slot already; it dequeues the copy on its own.
         assert music_player._prefetch_task is None
 
@@ -12590,7 +12617,8 @@ class TestReplayQueueCard:
 class TestReplayLoopStart:
     """Loop-level behavior for a -replay, the counterpart to
     TestInterjectLoopStart: the replay plays from 0:00, a paused one parks and SAYS
-    so, and the interrupted play is recorded under its own played_at."""
+    so, the interrupted play is recorded under its own played_at, and the card it
+    leaves behind is retired rather than frozen."""
 
     @staticmethod
     def _song(url: str, title: str, *, position: float) -> MagicMock:
@@ -12736,6 +12764,27 @@ class TestReplayLoopStart:
         assert recorded[0].played_secs == 42
         assert recorded[0].webpage_url == recorded[1].webpage_url
         assert recorded[0].played_at != recorded[1].played_at
+
+    async def test_the_interrupted_songs_card_is_retired_not_finalized(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """A bar frozen at 0:42 directly above the replay's own card names the same
+        song twice."""
+        host = MagicMock(spec=discord.Message)
+        host.id = 999
+        host.channel = MagicMock()
+        host.channel.id = 888
+
+        with (
+            patch.object(MusicPlayer, "_retire_np_host", new=AsyncMock()) as retire,
+            patch.object(MusicPlayer, "_fire_finalize_now_playing") as finalize,
+        ):
+            music_player._np_host_message = host
+            await self._run_replay(music_player, queue_obj)
+
+        assert retire.await_count >= 1
+        finalize.assert_not_called()
+        assert music_player._retire_np_for is None
 
 
 class TestReplayAgainstTheRealLoop:

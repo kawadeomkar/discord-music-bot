@@ -399,6 +399,7 @@ class MusicPlayer:
         "_pause_debounce_task",
         "_skip_history_for",
         "_pending_resume_tail",
+        "_retire_np_for",
         "_ended_song",
         "_last_stream_error",
     )
@@ -444,6 +445,7 @@ class MusicPlayer:
     _pause_debounce_task: Optional[asyncio.Task]
     _skip_history_for: Optional[YTDL]
     _pending_resume_tail: Optional[QueueObject]
+    _retire_np_for: Optional[YTDL]
     _ended_song: Optional[YTDL]
     _last_stream_error: Optional[StreamFailure]
 
@@ -543,6 +545,9 @@ class MusicPlayer:
         # iteration end; set and cleared wherever _skip_history_for is.
         self._skip_history_for: Optional[YTDL] = None
         self._pending_resume_tail: Optional[QueueObject] = None
+        # The song whose NP card the loop retires instead of finalizing. Identity,
+        # not a flag, like _skip_history_for.
+        self._retire_np_for: Optional[YTDL] = None
         # The song whose playback ended but whose history row is not written yet;
         # keeps the play claimable across the prefetch await — see
         # claim_current_song_for_history.
@@ -881,7 +886,8 @@ class MusicPlayer:
         if not song.produced_audio:
             # ffmpeg exited without a frame: nobody heard it.
             return None
-        # Captured before cleanup()'s retire_np_host_on_stop() disposes of it.
+        # Captured before cleanup()'s retire_np_host_on_stop() disposes of it: the
+        # row names the host, which a dedicated card no longer outlives.
         host = self._np_host_message
         entry = HistoryEntry.from_song(
             song,
@@ -1987,9 +1993,9 @@ class MusicPlayer:
             await asyncio.wait({resolving}, timeout=_REPLAY_RESOLVE_TIMEOUT)
             result = self._replay_result(current, replay, resolving)
             # Nothing awaits from the verdict to the stop, so the loop cannot move
-            # between them.
-            if result is ReplayResult.REPLAYING:
-                self._stop_if_live(current, vc)
+            # between them; _retire_np_for is set after the stop for the same reason.
+            if result is ReplayResult.REPLAYING and self._stop_if_live(current, vc):
+                self._retire_np_for = current
         span.set_attribute("replay.position", position)
         span.set_attribute("replay.outcome", result.value)
         span.set_attribute("replay.stopped", result is ReplayResult.REPLAYING)
@@ -2759,7 +2765,10 @@ class MusicPlayer:
 
                     # Capture the host, release it (the finished bar stays behind as
                     # a record), then fire one last edit so the bar shows its true
-                    # final state.
+                    # final state. A -replay plays this song again, so its bar is
+                    # retired instead; identity, cleared either way.
+                    retire_np = self._retire_np_for is song
+                    self._retire_np_for = None
                     finished_host = self._np_host_message
                     finished_own = self._np_host_own_embeds
                     finished_dedicated = self._np_host_dedicated
@@ -2771,10 +2780,10 @@ class MusicPlayer:
                         str(finished_host.id) if finished_host is not None else "",
                     )
                     if finished_host is not None:
-                        if stream_failed:
-                            # This song delivered nothing, so dispose of the block
-                            # rather than finalize it to 100% above the failure
-                            # notice.
+                        if stream_failed or retire_np:
+                            # No 100% bar above a failure notice, and an
+                            # interrupted song's bar belongs to its replay's card:
+                            # dispose of the block rather than finalize it.
                             self._spawn_background(
                                 self._retire_np_host(
                                     finished_host, finished_own, finished_dedicated
@@ -2861,9 +2870,9 @@ class MusicPlayer:
                                 song,
                                 guild_id=self._guild.id,
                                 # The host captured at song end, not
-                                # _np_host_message, which was nulled above. Both
-                                # ids come off that one message — never the home
-                                # channel, which commands reassign. 0 = nothing
+                                # _np_host_message, which was nulled above; a
+                                # dedicated one retired above no longer exists.
+                                # Both ids come off that one message. 0 = nothing
                                 # hosted it.
                                 message_id=(
                                     finished_host.id if finished_host is not None else 0
@@ -2938,6 +2947,7 @@ class MusicPlayer:
                     # A tail left holding this slot would receive a LATER fragment's
                     # card ids and delete the wrong message.
                     self._pending_resume_tail = None
+                    self._retire_np_for = None
                     self._ended_song = None
                     self.current_song = None
                     self.play_message = None
