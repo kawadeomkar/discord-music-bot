@@ -356,10 +356,10 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | Variable | Required | Description |
 |---|---|---|
 | `DISCORD_TOKEN` | Yes | Bot token from Discord Developer Portal |
-| `SPOTIFY_CLIENT_ID` | Yes | Spotify app client ID |
-| `SPOTIFY_CLIENT_SECRET` | Yes | Spotify app client secret |
+| `SPOTIFY_CLIENT_ID` | No | Spotify app client ID. Set both or neither: without them Spotify links are refused and everything else works |
+| `SPOTIFY_CLIENT_SECRET` | No | Spotify app client secret |
 | `REDIS_URL` | No | Redis connection URL (defaults to `redis://localhost:6379`) |
-| `POSTGRES_URL` | No | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). Unset → the entire Postgres tier is off (no outbox writes, no drainer, pre-Postgres read behavior) |
+| `POSTGRES_URL` | While the archive is enabled | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). `HISTORY_ARCHIVE_ENABLED` decides whether the Postgres tier runs, never this variable: enabled, startup refuses without it; disabled (the default), it is ignored |
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`, floor `1.0`; sized against Discord's ~5 edits/5 s per-channel bucket). A server's `np-refresh` can only slow it |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
