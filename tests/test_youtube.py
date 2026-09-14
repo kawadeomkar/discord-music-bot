@@ -3160,6 +3160,40 @@ class TestTheStreamWarmIsSharedNotAwaited:
             assert await prefetch is True
         mock_extract.assert_not_called()
 
+    async def test_the_warm_records_onto_a_span_that_is_still_open(
+        self, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """yt_source does not await the warm, so the resolve's span has ended by
+        the time the probe answers, and an ended span drops the serving format and
+        the probe verdict (103 warnings in one day of production logs)."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        release = asyncio.Event()
+
+        async def _slow_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _slow_probe
+        data = cast(Any, _fake_ytdl_data(webpage_url="https://yt.com/v=spanned"))
+        with patch.object(youtube, "_tracer", tracer):
+            with tracer.start_as_current_span("ytdl.yt_source"):
+                warm = youtube._start_stream_warm(
+                    fake_redis, "ytdl:stream:https://yt.com/v=spanned", data
+                )
+            release.set()
+            assert await warm is True
+
+        spans = {span.name: span for span in exporter.get_finished_spans()}
+        assert "ytdl.stream_probe" not in (spans["ytdl.yt_source"].attributes or {})
+        warm_span = spans["ytdl.stream_warm"]
+        assert (warm_span.attributes or {})["ytdl.stream_probe"] == "playable"
+        resolve_context = spans["ytdl.yt_source"].context
+        assert warm_span.parent is not None and resolve_context is not None
+        assert warm_span.parent.span_id == resolve_context.span_id
+
     async def test_a_cancelled_joiner_leaves_the_warm_running(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
@@ -3505,6 +3539,42 @@ class TestYtPlaylistEntries:
         )
         assert qobj.duration is None
         assert qobj.title == "Song live"
+
+
+class TestCacheWritability:
+    def test_an_unwritable_cache_directory_is_named_at_startup(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A volume created root-owned stays root-owned for uid 10001: seen live,
+        with yt-dlp's own PermissionError the only trace, once per store."""
+        sigfuncs = tmp_path / "yt-dlp" / "youtube-sigfuncs"
+        sigfuncs.mkdir(parents=True)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            youtube.os, "access", lambda path, _mode: path != str(sigfuncs)
+        )
+
+        with caplog.at_level(logging.WARNING):
+            youtube.warn_if_cache_unwritable()
+
+        assert "not writable" in caplog.text
+        assert "youtube-sigfuncs" in caplog.text
+
+    def test_a_writable_or_absent_cache_says_nothing(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        with caplog.at_level(logging.WARNING):
+            youtube.warn_if_cache_unwritable()
+            (tmp_path / "yt-dlp").mkdir()
+            youtube.warn_if_cache_unwritable()
+        assert "not writable" not in caplog.text
 
 
 class TestMixRepeats:

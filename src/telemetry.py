@@ -164,6 +164,8 @@ def _configure_structlog() -> None:
             structlog.processors.TimeStamper(fmt="iso"),
             _add_environment,  # environment: production | staging | development
             _add_otel_context,  # trace_id, span_id
+            # Renders a %-style call's args into the event message.
+            structlog.stdlib.PositionalArgumentsFormatter(),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.ExceptionRenderer(),
             structlog.processors.JSONRenderer(),

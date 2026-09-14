@@ -140,6 +140,20 @@ class TestSetupHook:
 
         mock_prewarm.assert_called_once_with(warm_worker)
 
+    async def test_startup_checks_the_ytdlp_cache_is_writable(
+        self, app: MusicBotApp
+    ) -> None:
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+            patch("src.youtube.warn_if_cache_unwritable") as check,
+        ):
+            await app.setup_hook()
+
+        check.assert_called_once_with()
+
     @pytest.mark.parametrize("value", [None, ""])
     async def test_missing_postgres_url_refuses_to_start(
         self,

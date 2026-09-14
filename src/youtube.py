@@ -388,6 +388,22 @@ async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     return await ytdlp_pool.run(_ytdlp_extract, req)
 
 
+def warn_if_cache_unwritable() -> None:
+    """Warn at startup when yt-dlp's cache cannot be written. yt-dlp logs a
+    PermissionError per store and carries on, so an unwritable directory persists
+    nothing and every restart re-derives the player's signature functions."""
+    root = os.path.expanduser(
+        os.path.join(os.getenv("XDG_CACHE_HOME", "~/.cache"), "yt-dlp")
+    )
+    blocked = [d for d, _dirs, _files in os.walk(root) if not os.access(d, os.W_OK)]
+    if blocked:
+        log.warning(
+            "yt-dlp cache is not writable, so it persists nothing",
+            directories=blocked[:5],
+            uid=os.getuid(),
+        )
+
+
 def warm_worker() -> None:
     """Handed to prewarm(), so it runs once per pool worker. The first YoutubeDL a
     process builds discovers plugins and probes for a JS runtime; measured at 136 ms
@@ -928,6 +944,16 @@ async def _probe_and_cache(
 _INFLIGHT_STREAM_WARMS: dict[str, asyncio.Future[bool]] = {}
 
 
+async def _warm_in_its_own_span(
+    redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
+) -> bool:
+    """_probe_and_cache under a span of its own. The warm outlives the resolve that
+    started it, whose span has ended by the time the probe answers, and an ended
+    span drops every attribute written to it."""
+    with _tracer.start_as_current_span("ytdl.stream_warm"):
+        return await _probe_and_cache(redis, cache_key, data)
+
+
 def _start_stream_warm(
     redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
 ) -> asyncio.Future[bool]:
@@ -938,7 +964,7 @@ def _start_stream_warm(
     running = _INFLIGHT_STREAM_WARMS.get(cache_key)
     if running is not None:
         return running
-    job = asyncio.ensure_future(_probe_and_cache(redis, cache_key, data))
+    job = asyncio.ensure_future(_warm_in_its_own_span(redis, cache_key, data))
     _INFLIGHT_STREAM_WARMS[cache_key] = job
 
     # Registered before anything can await the job, so the key is gone by the time a

@@ -560,6 +560,9 @@ class TestCli:
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> CollectingArchive:
         archive = CollectingArchive()
+        # main() configures structlog PROCESS-wide, and nothing restores it: the
+        # production chain would stand for every test that runs after this one.
+        monkeypatch.setattr(backfill_history, "setup_cli_logging", MagicMock())
         monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
         monkeypatch.setattr(backfill_history, "create_redis_pool", lambda: MagicMock())
         monkeypatch.setattr(backfill_history, "get_redis", lambda _pool: fake_redis)
@@ -876,6 +879,7 @@ class TestCli:
         monkeypatch.setattr(sys, "argv", ["backfill_history", "--dry-run"])
         assert backfill_history.main() == 0
         assert seen == [True]
+        cast(Any, backfill_history.setup_cli_logging).assert_called_once_with()
 
     def test_default_is_not_a_dry_run(
         self,
