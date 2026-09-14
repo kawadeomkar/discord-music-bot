@@ -338,6 +338,16 @@ class TestReplies:
         )
         assert cog.guild_settings.idle_timeout_secs(GUILD) == 300.0
 
+    async def test_alone_timeout(self, cog: MusicBot, settings_ctx: MagicMock) -> None:
+        ctx = _with_manage_server(settings_ctx)
+        await _invoke(cog, ctx, "alone 1:30")
+        assert _text(ctx) == (
+            "**Leave when alone** is now **1:30** for this server (was **0:10**, the "
+            "default). It applies the next time the channel empties. It is saved for "
+            f"this server. Changed by {MENTION}."
+        )
+        assert cog.guild_settings.alone_timeout_secs(GUILD) == 90.0
+
     async def test_debug_on_names_what_it_publishes(
         self, cog: MusicBot, settings_ctx: MagicMock
     ) -> None:
@@ -447,7 +457,7 @@ class TestCard:
         values = [field.value for field in _embed(settings_ctx).fields]
         assert values == [
             "**Volume** · 100% · default\n**Timezone** · America/Los_Angeles · default",
-            "**Leave when idle** · 5:00 · default",
+            "**Leave when idle** · 5:00 · default\n**Leave when alone** · 0:10 · default",
             "**Debug footer** · off · default",
         ]
 

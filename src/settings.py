@@ -39,6 +39,7 @@ from discord.ext import commands
 from src import config, guild_state
 from src.guild_state import (
     CONFIG_DOMAIN,
+    DEFAULT_ALONE_TIMEOUT_SECS,
     DEFAULT_IDLE_TIMEOUT_SECS,
     DEFAULT_TIMEZONE,
     DEFAULT_VOLUME,
@@ -201,6 +202,27 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
             "channel plays there."
         ),
         default=DEFAULT_IDLE_TIMEOUT_SECS,
+    ),
+    SettingSpec(
+        key="alone-timeout",
+        aliases=("alone", "leave-when-alone"),
+        scope=SettingScope.SERVER,
+        kind=SettingKind.DURATION,
+        group=SettingGroup.LEAVING_VOICE,
+        label="Leave when alone",
+        summary=(
+            "How long the bot waits alone in voice before leaving. Music keeps playing "
+            "while it waits, and those songs count toward history."
+        ),
+        applies="the next time the channel empties",
+        field=ConfigField.ALONE_TIMEOUT,
+        minimum=_server_bound(ConfigField.ALONE_TIMEOUT, "lo"),
+        maximum=_server_bound(ConfigField.ALONE_TIMEOUT, "hi"),
+        why_maximum=(
+            "Music keeps playing while the bot waits alone, and every song counts "
+            "toward history."
+        ),
+        default=DEFAULT_ALONE_TIMEOUT_SECS,
     ),
     SettingSpec(
         key="debug",
@@ -1527,6 +1549,12 @@ class GuildSettings:
         stored = self.peek(guild_id)
         value = stored.idle_timeout_secs if stored is not None else None
         return DEFAULT_IDLE_TIMEOUT_SECS if value is None else value
+
+    def alone_timeout_secs(self, guild_id: int) -> float:
+        """How long the bot waits alone in its voice channel before leaving."""
+        stored = self.peek(guild_id)
+        value = stored.alone_timeout_secs if stored is not None else None
+        return DEFAULT_ALONE_TIMEOUT_SECS if value is None else value
 
     # ── Stamps and registrations ──────────────────────────────────────────────
 

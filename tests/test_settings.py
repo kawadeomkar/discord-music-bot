@@ -465,6 +465,18 @@ class TestOutOfRange:
             "plays there."
         )
 
+    def test_alone_timeout_says_why_only_above_its_cap(self) -> None:
+        spec = _spec("alone-timeout")
+        low, high = parse_value(spec, "5s"), parse_value(spec, "3m")
+        assert isinstance(low, Refusal) and isinstance(high, Refusal)
+        assert (
+            low.text == "**Leave when alone** has to be between **0:10** and **2:00**."
+        )
+        assert high.text == (
+            "**Leave when alone** has to be between **0:10** and **2:00**. Music keeps "
+            "playing while the bot waits alone, and every song counts toward history."
+        )
+
     def test_a_count_refuses_a_fraction(self) -> None:
         spec = _spec("play-inflight-max")
         assert isinstance(parse_value(spec, "2.5"), Refusal)
@@ -721,6 +733,8 @@ class TestParseSettingsArgs:
             ("Debug-Footer on", _set("debug", True)),
             ("leave-when-idle 10m", _set("idle-timeout", 600.0)),
             ("idle=15 minutes", _set("idle-timeout", 900.0)),
+            ("alone-timeout:1:30", _set("alone-timeout", 90.0)),
+            ("leave-when-alone 2m", _set("alone-timeout", 120.0)),
         ],
     )
     def test_near_misses_normalize(self, arg: str, expected: SettingsRequest) -> None:
@@ -1341,6 +1355,18 @@ class TestGuildSettingsAccessors:
         assert guild_settings.idle_timeout_secs(_GUILD) == 1800.0
         await guild_settings.reset(_GUILD, ConfigField.IDLE_TIMEOUT)
         assert guild_settings.idle_timeout_secs(_GUILD) == 300.0
+
+    async def test_alone_timeout_is_the_stored_value_or_the_default(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        assert guild_settings.alone_timeout_secs(_GUILD) == 10.0
+        await guild_settings.write(_GUILD, GuildConfig(idle_timeout_secs=900.0))
+        assert guild_settings.alone_timeout_secs(_GUILD) == 10.0
+        await guild_settings.write(_GUILD, GuildConfig(alone_timeout_secs=120.0))
+        assert guild_settings.alone_timeout_secs(_GUILD) == 120.0
+        await guild_settings.reset(_GUILD, ConfigField.ALONE_TIMEOUT)
+        assert guild_settings.alone_timeout_secs(_GUILD) == 10.0
 
 
 class TestGuildSettingsWritePath:
@@ -2009,7 +2035,15 @@ class TestHotPathsNeverAwaitSettings:
 
     @pytest.mark.parametrize(
         "name",
-        ["peek", "is_complete", "is_persisted", "reading", "seed", "idle_timeout_secs"],
+        [
+            "peek",
+            "is_complete",
+            "is_persisted",
+            "reading",
+            "seed",
+            "idle_timeout_secs",
+            "alone_timeout_secs",
+        ],
     )
     def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:
         import inspect

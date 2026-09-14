@@ -13,7 +13,7 @@ from src.help import (
     _WIDTH as WIDTH,
 )
 from src.musicbot import MusicBot
-from src.settings import SETTINGS, SettingScope
+from src.settings import SETTINGS, Parsed, SettingScope, SettingSpec, find, parse_value
 
 # Discord's hard caps: an embed field value is 1024 chars, a description 4096.
 FIELD_LIMIT = 1024
@@ -112,6 +112,21 @@ class TestBotHelp:
         body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
         for topic in ("YouTube", "Spotify", "SoundCloud", "Now Playing"):
             assert topic in body
+
+    async def test_the_alone_disconnect_tip_quotes_the_setting(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
+        """Built from the registry, so the tip cannot drift from the default, and
+        the time it quotes can be typed back."""
+        await help_command.command_callback(ctx, command=None)
+        body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
+        assert (
+            "The bot disconnects on its own **0:10** after the last person leaves "
+            "(`-settings alone-timeout` changes it)."
+        ) in body
+        spec = find("alone-timeout", SettingScope.SERVER)
+        assert isinstance(spec, SettingSpec) and spec.default is not None
+        assert parse_value(spec, "0:10") == Parsed(spec.default)
 
     async def test_respects_discord_size_limits(
         self, help_command: MusicHelpCommand, ctx: MagicMock

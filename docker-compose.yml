@@ -135,15 +135,15 @@ services:
     #                       full archive behind it. Bounded by length, never by
     #                       time: ~24 KB per guild, permanently.
     #   guild:{id}:config   a guild's DURABLE choices — debug mode, volume,
-    #                       timezone, idle timeout. Evicting one silently reverts
-    #                       a setting the guild chose, with no log line and no
-    #                       error, which is exactly the failure moving these out
-    #                       of the 24h-TTL state hash was meant to fix. A handful
-    #                       of fields per guild (~160 B), written only by an
-    #                       explicit command and deleted on guild removal (or,
-    #                       for a guild removed while the bot was offline, by the
-    #                       startup orphan sweep), so it scales with guild count
-    #                       and not with runtime.
+    #                       timezone, idle and alone timeouts. Evicting one
+    #                       silently reverts a setting the guild chose, with no
+    #                       log line and no error, which is exactly the failure
+    #                       moving these out of the 24h-TTL state hash was meant
+    #                       to fix. A handful of fields per guild (~160 B),
+    #                       written only by an explicit command and deleted on
+    #                       guild removal (or, for a guild removed while the bot
+    #                       was offline, by the startup orphan sweep), so it
+    #                       scales with guild count and not with runtime.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
     # so volatile-lru preserves cache-eviction behavior for them.

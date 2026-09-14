@@ -1229,7 +1229,7 @@ class MusicBot(commands.Cog):
                 "-settings leave-when-idle 10:00",
                 "-settings timezone Europe/London",
                 "-settings volume 80",
-                "-settings debug-footer reset",
+                "-settings alone-timeout reset",
                 "-settings bot",
             ],
             "note": (

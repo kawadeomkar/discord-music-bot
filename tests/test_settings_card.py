@@ -43,6 +43,7 @@ class TestServerValues:
             card.Shown(100.0, "default"),
             card.Shown(DEFAULT_TIMEZONE, "default"),
             card.Shown(300.0, "default"),
+            card.Shown(10.0, "default"),
             card.Shown(False, "default"),
         ]
 
@@ -51,12 +52,14 @@ class TestServerValues:
             volume=0.29,
             timezone="Asia/Tokyo",
             idle_timeout_secs=600.0,
+            alone_timeout_secs=120.0,
             debug_mode=False,
         )
         assert [shown for _, shown in _server_rows(stored)] == [
             card.Shown(29, "set here"),
             card.Shown("Asia/Tokyo", "set here"),
             card.Shown(600.0, "set here"),
+            card.Shown(120.0, "set here"),
             card.Shown(False, "set here"),
         ]
 
@@ -129,10 +132,17 @@ class TestServerCard:
                 volume=1.0,
                 timezone="America/Argentina/ComodRivadavia",
                 idle_timeout_secs=1800.0,
+                alone_timeout_secs=120.0,
                 debug_mode=True,
             ),
             unsaved=frozenset(
-                {"volume", "timezone", "idle_timeout_secs", "debug_mode"}
+                {
+                    "volume",
+                    "timezone",
+                    "idle_timeout_secs",
+                    "alone_timeout_secs",
+                    "debug_mode",
+                }
             ),
         )
         embed = card.server_card(
@@ -157,7 +167,11 @@ class TestServerCard:
                 "**Volume** · 80% · set here\n"
                 "**Timezone** · America/Los_Angeles · default",
             ),
-            ("Leaving voice", "**Leave when idle** · 5:00 · default"),
+            (
+                "Leaving voice",
+                "**Leave when idle** · 5:00 · default\n"
+                "**Leave when alone** · 0:10 · default",
+            ),
             ("Diagnostics", "**Debug footer** · off · default"),
         ]
         assert embed.footer.text == (
@@ -242,6 +256,7 @@ class TestReplies:
             ("volume", 37),
             ("timezone", "Asia/Tokyo"),
             ("idle-timeout", 630.0),
+            ("alone-timeout", 95.0),
             ("debug", True),
         ):
             spec = _spec(key)
