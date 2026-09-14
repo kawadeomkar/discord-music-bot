@@ -82,6 +82,20 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def no_leaked_progress_subscribers() -> Iterator[None]:
+    """Assert every progress subscription was released, then clear.
+
+    Same shape as the channel claim below: module state whose leak is silent. A
+    stranded subscriber keeps receiving a later extraction's counts and moves a
+    card nobody is looking at. One test asserted the dict empty; every other one
+    could leave it dirty."""
+    yield
+    leaked = {k: len(v) for k, v in youtube_mod._PROGRESS_SUBSCRIBERS.items() if v}
+    youtube_mod._PROGRESS_SUBSCRIBERS.clear()
+    assert not leaked, f"progress subscribers not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
 def no_leaked_channel_claims() -> Iterator[None]:
     """Assert every per-channel claim was released, then clear.
 

@@ -4,7 +4,9 @@ import copy
 import os
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
+from functools import partial
 from enum import Enum
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
@@ -24,11 +26,13 @@ from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
+    ProgressFn,
     current_traceparent,
     fmt_duration,
     get_logger,
     spawn_background,
 )
+from src import ytdlp_pool as ytdlp_pool_module
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -36,7 +40,108 @@ _tracer = get_tracer(__name__)
 
 # The process's one extraction pool; its lifecycle lives on the object. Tests
 # patch this name to swap in a thread-pool-backed instance.
-ytdlp_pool = YtdlpPool()
+# The sink is a lambda because _publish_progress is defined below: a direct
+# reference here is a NameError at import, in every spawned worker too.
+ytdlp_pool = YtdlpPool(progress_sink=lambda message: _publish_progress(message))
+
+
+# One extraction's live progress, by inflight key: _extract_once single-flights on
+# the URL, so the second caller of a playlist issues no request of its own and
+# would otherwise watch a card that never moves while the first one's fills.
+_PROGRESS_SUBSCRIBERS: dict[str, list[ProgressFn]] = {}
+
+# Entries per message. The bar has ten visible cells, so at 1,671 tracks a cell is
+# 167 entries and nothing on screen can tell 25 from 1 — while the queue's _wlock
+# is shared across workers and one write per entry is 1,671 of them per playlist.
+_PROGRESS_EVERY = 25
+
+
+def _publish_progress(message: Any) -> None:
+    """Hand one worker message to every card watching that extraction.
+
+    Runs on YtdlpPool's drain THREAD, so it must not block and must not touch the
+    event loop: every subscriber is an integer store the loop only ever reads.
+    """
+    try:
+        request_id, done, total = message
+        if not isinstance(request_id, str):
+            raise TypeError(f"request id is {type(request_id).__name__}")
+    except TypeError, ValueError:
+        log.warning(f"malformed progress message: {message!r}")
+        return
+    # Copied: a subscriber may unsubscribe from the event loop between iterations
+    # of this loop, which runs on the drain thread.
+    for report in list(_PROGRESS_SUBSCRIBERS.get(request_id, ())):
+        try:
+            report(done, total)
+        except Exception as e:
+            log.warning(f"progress subscriber failed: {e!r}")
+
+
+@contextlib.contextmanager
+def _progress_subscription(request_id: str, report: ProgressFn) -> Iterator[None]:
+    """Watch `request_id` for as long as this resolve runs. A message from a
+    superseded extraction of the same playlist can still land here; counts are
+    absolute and readers take max(), so the worst it does is run the bar slightly
+    ahead of the walk that is actually running. That is also what a break-heal
+    retry looks like: the second attempt restarts at 0 and the bar holds where
+    the first one left it rather than going backwards."""
+    subscribers = _PROGRESS_SUBSCRIBERS.setdefault(request_id, [])
+    subscribers.append(report)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            subscribers.remove(report)
+        if not subscribers:
+            _PROGRESS_SUBSCRIBERS.pop(request_id, None)
+
+
+# The queue a put last failed on. A wedged queue fails every later put of the walk,
+# and it is one per executor generation, so this is one WARNING per generation.
+_PUT_FAILED_ON: Optional[Any] = None
+
+
+def _count_entry(request_id: str, info: dict[str, Any], *, incomplete: bool) -> None:
+    """yt-dlp match_filter, bound to one extraction with functools.partial.
+
+    MUST return None on every path. _match_entry tests `if reason is not None`
+    (YoutubeDL.py:1664), so any other value — "" and 0 included — silently drops
+    the entry, and a non-None return on the PLAYLIST-level call at :2088 drops the
+    whole playlist. Hence one unconditional return and no conditional paths.
+    See docs/ARCHITECTURE.md#progress-out-of-a-yt-dlp-worker.
+    """
+    global _PUT_FAILED_ON
+    queue: Optional[Any] = None
+    try:
+        index = info.get("playlist_index")
+        queue = ytdlp_pool_module.worker_progress_queue()
+        if queue is None:
+            return None
+        if index is None:
+            # YoutubeDL.py:2088, once, before any entry: the playlist infodict,
+            # which carries the header count _tab.py:793 read off page 1. It is
+            # the only way that number reaches the parent before the walk ends.
+            queue.put_nowait((request_id, 0, info.get("playlist_count")))
+        elif index % _PROGRESS_EVERY == 0:
+            # :2161 only, the site carrying an index — and the index IS the
+            # progress value. Reached only for an entry check_filter() (:1587)
+            # resolves through its `ie_key` and whose `url` that extractor's
+            # is_single_video accepts: a flat-entry shape change upstream stops
+            # every per-entry call, silently, with the playlist still queued.
+            queue.put_nowait((request_id, index, None))
+    except Exception as e:
+        # yt-dlp does not wrap match_filter, so a queue.Full or a closed queue
+        # would escape extract_info as a RemoteCallError and tell the user the
+        # playlist could not be fetched, by a progress bug. Logged because the
+        # opposite failure is silent: YoutubeDL.py:1625-1628 catches a TypeError
+        # from this callback and substitutes None for backward compatibility.
+        # log, not _YTDLP_LOGGER: that channel is yt-dlp's own warnings, the
+        # early-warning system for YouTube rule changes, and this is ours.
+        if queue is None or queue is not _PUT_FAILED_ON:
+            _PUT_FAILED_ON = queue
+            log.warning(f"progress queue put failed: {e!r}")
+    return None
 
 
 class ExtractionError(Exception):
@@ -379,6 +484,24 @@ _YTDL_PLAYLIST_OPTS = {
     "noplaylist": False,
     "extract_flat": "in_playlist",
 }
+
+
+def _playlist_opts(request_id: Optional[str]) -> Any:
+    """_YTDL_PLAYLIST_OPTS, plus the streaming hook when a card is watching.
+
+    Built per call: the constant is a shared dict, and mutating it would leak one
+    guild's callback into another guild's extraction. `lazy_playlist` is required
+    rather than optional — without it the hook fires in one burst after every page
+    is already fetched. See docs/ARCHITECTURE.md#progress-out-of-a-yt-dlp-worker.
+    """
+    if request_id is None:
+        return _YTDL_PLAYLIST_OPTS
+    return {
+        **_YTDL_PLAYLIST_OPTS,
+        "lazy_playlist": True,
+        "match_filter": partial(_count_entry, request_id),
+    }
+
 
 # yt_source(flat=True): one search POST answering with id/title/duration/uploader and
 # a thumbnail, with no watch page and no player call. The `process=True` it runs under
@@ -1732,6 +1855,7 @@ class YTDL(discord.FFmpegOpusAudio):
         analytics: Analytics,
         user_input: str,
         redis: Optional[aioredis.Redis] = None,
+        on_progress: Optional[ProgressFn] = None,
         pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist.
@@ -1743,7 +1867,15 @@ class YTDL(discord.FFmpegOpusAudio):
 
         Cached and single-flighted: this is the most expensive resolve in the system
         (99s at 5,547 entries), and two users pasting one collection used to run two
-        of them. See docs/ARCHITECTURE.md#the-playlist-cache."""
+        of them. See docs/ARCHITECTURE.md#the-playlist-cache.
+
+        `on_progress` arms the streaming hook and subscribes to it. Without one the
+        opts are the shared constant — no match_filter, no lazy_playlist. With one,
+        the ENTRY LIST comes back identical and the info-dict does not: lazy
+        extraction drops the top-level playlist_count, which nothing here reads.
+        A caller that JOINS an
+        extraction started without one gets no reports: it issues no request of its
+        own, so there is nothing to arm."""
         span = trace.get_current_span()
         span.set_attribute("ytdl.url", url)
         cache_key = _playlist_cache_key(url)
@@ -1752,11 +1884,20 @@ class YTDL(discord.FFmpegOpusAudio):
         if cached is not None:
             tracks = [_identity_from_wire(entry) for entry in cached]
         else:
-            data = await _extract_once(
-                _inflight_key(cache_key, "playlist"),
-                ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS),
-                pool_slot=pool_slot,
-            )
+            # The extraction is the publisher and the key names it, so two cards
+            # on one playlist both move (see _progress_subscription).
+            key = _inflight_key(cache_key, "playlist")
+            with contextlib.ExitStack() as watching:
+                if on_progress is not None:
+                    watching.enter_context(_progress_subscription(key, on_progress))
+                data = await _extract_once(
+                    key,
+                    ExtractRequest(
+                        url=url,
+                        opts=_playlist_opts(key if on_progress is not None else None),
+                    ),
+                    pool_slot=pool_slot,
+                )
             if data is None:
                 raise Exception(f"Could not fetch YouTube playlist: {url}")
             tracks = _playlist_tracks(data, url)

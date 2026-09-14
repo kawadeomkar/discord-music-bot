@@ -41,6 +41,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
     - [Spotify playlist paging](#spotify-playlist-paging)
+    - [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
@@ -371,10 +372,13 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 **Extraction pool** (`ytdlp_pool.py`, instantiated in `youtube.py`):
 
 ```python
-ytdlp_pool = YtdlpPool()   # max_workers from YTDLP_POOL_WORKERS, default 4
+ytdlp_pool = YtdlpPool(progress_sink=lambda message: _publish_progress(message))
+#                      max_workers from YTDLP_POOL_WORKERS, default 4
 ```
 
 Extraction runs in **worker processes**, not threads: JSON parsing, signature decryption and format selection are GIL-bound Python, so threads would contend for the GIL and steal time from the event loop serving voice heartbeats.
+
+The sink is the opt-in half: a pool built with one carries a second queue and a thread draining it, so a worker can report progress while `extract_info` is still running (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). Built without one, neither exists.
 
 `YtdlpPool` owns the lifecycle and nothing else — the callable is passed per call (`ytdlp_pool.run(_ytdlp_extract, ...)`), which is what keeps it free of yt-dlp knowledge and keeps `patch("src.youtube._ytdlp_extract")` working in tests. Lifecycle: created lazily (so importing the module never spawns children), prewarmed from `setup_hook`, rebuilt once if a worker dies (`BrokenProcessPool`), and closed from `close()` via `aclose()`, which bounds the join at 10 s. A submit after close raises `PoolClosedError` rather than silently spawning a pool nothing would join.
 
@@ -1787,6 +1791,28 @@ provisioned ahead of enforcement rather than after it.
 
 **A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
 
+### Progress out of a yt-dlp worker
+
+A YouTube playlist resolve is one `extract_info` call in a pool worker that returns once, after every continuation page has been fetched. The queue-progress card needs increments before then, so there is a second worker queue beside the log one.
+
+**`lazy_playlist: True` is what makes the hook a stream rather than a burst.** Without it `YoutubeDL.py:2100` runs `entries = resolved_entries = list(entries)` — every continuation page fetched — before the per-entry loop at `:2144` begins, so the loop is pure CPU and the hook fires in one ~50 ms burst after the 29 s of network is over. A bar driven from that sits at 0 for the whole fetch and then jumps to 100 % in one tick, which is the failure the card exists to avoid. Under `lazy` the loop iterates the live generator and drives the fetches itself. It also removes a second call site: `utils/_utils.py:2491` is gated on `not lazy_playlist`, so the callback goes from 2N+1 calls per playlist to N+1 (measured: 9 calls for 4 entries without it, 5 with).
+
+**The hook is `match_filter`, and it MUST return `None` on every path.** `_match_entry` tests `if reason is not None` (`YoutubeDL.py:1664`), so any other value — `""` and `0` included — silently drops that entry: measured on a 4-entry playlist, `return ""` kept 0 of 4 while the command still reported success, and `return 0` raises a bare `TypeError` at `:1666` that is not a `YoutubeDLError` and so is never classified. Worse, `match_filter` is also called once at `:2088` with the playlist infodict, where a non-`None` return makes `__process_playlist` return with the *entire playlist* gone. So `_count_entry` has exactly one unconditional `return None` and no conditional return paths, and its tests assert `is None` — `assert not ret` passes while every song is gone.
+
+**The index is the progress value.** Of the three sites `_match_entry` is reachable from, only `:2161` carries `playlist_index`, so reading it rather than counting calls is what stops a naive counter reporting 3,343/1,671. The `:2088` call has no index and carries `playlist_count`, which `_tab.py:793` read off page 1 — that is the first message and the only way the total reaches the parent before the walk ends.
+
+**Everything the callback does is wrapped, and the wrap logs.** yt-dlp does not wrap `match_filter`, so a `queue.Full`, a closed queue or a `BrokenPipeError` would escape `extract_info` as a `RemoteCallError` and tell the user the playlist could not be fetched. The opposite failure is silent: `YoutubeDL.py:1625-1628` catches a `TypeError` from the callback and substitutes `None` "for backward compatibility", so a signature mismatch or a bad argument vanishes into a card that never moves. Hence the warning.
+
+**Messages are absolute, never deltas.** The parent takes `max()`, so a dropped message self-corrects on the next one and a `BrokenProcessPool` heal — which re-runs the extraction from entry 0 — is idempotent rather than reporting 2×N. Entries are coalesced one message per 25 in the worker; the bar has ten cells, so at 1,671 tracks one cell is 167 entries.
+
+**The queue is bounded, drained on a thread, and stopped after the workers are gone.** `multiprocessing.Queue()` defaults to `maxsize=0`, which sizes its semaphore at `SEM_VALUE_MAX` (32,767): 30,000 `put_nowait` calls raised no `Full` at all, so the drop-on-full this design relies on would never happen and the worker would buffer without bound instead. The parent drains on a thread like the log `QueueListener` — `get_nowait` measured at 38.4 µs/op and a playlist's messages arrive in a burst, which on the event loop delays every other guild's Now Playing edit and the playback loop's song handoff. Two shutdown rules are load-bearing, both the reverse of the tempting order: the worker calls `cancel_join_thread()` (at worker exit `Queue._finalize_join` joins the feeder thread, which is blocked in `send_bytes` once the parent stops reading, so the worker cannot exit and shutdown burns its full 10 s timeout), and the drain stops **after** the join rather than before. Stopping is a flag the drain polls, not a sentinel message: after `terminate_workers()` the queue's `_wlock` is a POSIX semaphore a worker SIGTERMed mid-write never released.
+
+**Progress is keyed on the extraction, not the requester.** `_extract_once` single-flights on the URL, so the second caller of one playlist issues no `ExtractRequest` and would otherwise watch a frozen card beside a moving one. `_PROGRESS_SUBSCRIBERS` maps the inflight key to every callback watching it. A message from a superseded extraction of the same playlist can still arrive; counts are absolute and readers take `max()`, so the worst it does is run the bar slightly ahead.
+
+**`process=False` was considered and rejected.** It returns the extractor's raw `ie_result` (`YoutubeDL.py:1886-1890`), whose `entries` is a live generator the worker could iterate with no `match_filter` at all — and therefore none of the drop-an-entry failure mode above. The reason it loses is blast radius: the worker would have to reproduce what `__process_playlist` does (the `orderedSet` dedup at `:2093`, `playlist_items` selection, null handling, the per-entry normalisation that fills `thumbnail` and `duration`) and would return a differently shaped dict, so `_playlist_tracks`, the `ytdl:playlist:` cache format and the error classification would all need re-verifying against a shape no test in this repo can produce — the suite's autouse fixture runs extraction on a thread pool and never calls yt-dlp for real. `match_filter` changes nothing about what `extract_info` returns; its one new failure mode is a return value, which an unconditional `return None` and a test asserting `is None` close completely.
+
+**What the suite cannot see, and why.** `[tool.coverage.run]` is `branch = true` with `source = ["src"]` and no `concurrency = "multiprocessing"`, so lines executed in a worker earn zero coverage. The autouse `use_thread_ytdlp_pool` fixture supplies its own `executor_factory`, so `_worker_init` never runs and **nothing is pickled** — an unpicklable callback would pass `just check` and break only inside a container, which is why `_count_entry` is module-level with the request id bound by `functools.partial`, and why one test pickles that partial directly. "Extracted count == input count" needs yt-dlp's real `_match_entry` loop and has no offline form; the callable is covered directly for every entry shape, and one real round trip through the progress queue sits beside `tests/test_ytdlp_pool.py`'s spawned-worker tests.
+
 ### yt-dlp process boundary
 
 Four things cross into the worker processes, each with its own contract:
@@ -1873,6 +1899,19 @@ awaiting a commit-time LPOP. Delete the branch as "unreachable" and that path si
 eats the new head.
 
 ### Now Playing host invariants
+
+**Four sends are exceptions to the host model**, for two distinct reasons. A message
+an edit LOOP owns must not be the host, or the progress updater rewrites it every 3s:
+that covers `-ping`, `-debug` and the queue-progress card, all three through
+`dashboard.LiveMessage`. A message we DELETE must not be the host either, or the
+retraction drags the live bar onto a message that is about to vanish: that covers
+`play_placement.slow_resolve_notice`. All four send with `ctx.channel.send` rather
+than `MusicContext.send`, so they neither carry an NP block nor retire the current
+host, which stays above them — edited invisibly — until the next ordinary `ctx.send`
+adopts a new one. They also miss debug-mode decoration, which is why all four are
+handed a pre-rendered `debug_suffix`. Add a fifth and it belongs
+in this list, in CLAUDE.md's host section, and on whichever of the two reasons it
+takes.
 
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the
 pointer swap is synchronous, retirement is fire-and-forget under `_np_edit_lock`.

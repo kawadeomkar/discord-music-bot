@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,600 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): a 99-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~3,800 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): a 99-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -919,7 +919,17 @@ modules under spawn); `prewarm()` from setup_hook; a `BrokenProcessPool` (e.g. O
 worker) is healed by rebuild-and-retry ONCE; worker logs travel a
 multiprocessing Queue → parent `QueueListener` → the parent's handlers (so yt-dlp's
 SABR/PO-token/signature warnings — the early-warning system for YouTube rule changes —
-reach Loki structured, with `worker_id` and propagated `trace_id`). Results are made
+reach Loki structured, with `worker_id` and propagated `trace_id`). A second, OPT-IN queue
+(`progress_sink=`) carries a playlist resolve's per-entry progress out to the
+queue-progress card: bounded, drained on a THREAD, and **rebuilt on a break-heal**, unlike
+the log queue beside it — a worker SIGKILLed mid-write holds the queue's `_wlock` forever,
+so reusing it across a heal is exactly the case where every later `put_nowait` raises
+`Full`, silently and for the life of the process. Two separate rules govern its shutdown:
+`cancel_join_thread()` in the worker, without which every restart during a playlist
+resolve costs the full 10s shutdown timeout; and stopping by a FLAG after the join rather
+than a sentinel, which makes the workers' state irrelevant — after `terminate_workers()`
+that `_wlock` is a POSIX semaphore nothing will release, so a parent write could block
+forever. See docs/ARCHITECTURE.md#progress-out-of-a-yt-dlp-worker. Results are made
 picklable and small in the worker: exceptions flattened to `ExtractionError` (yt-dlp's
 own exceptions carry live tracebacks and can't cross), successes `_slim_info`'d
 (sanitize + drop `formats`/`thumbnails`/etc., commonly 100 KB–1 MB nobody reads).
@@ -1020,6 +1030,7 @@ Per-guild synchronization primitives and what they protect:
 | `_GuildPlays.lock` (`PlayRegistry`, src/play_placement.py) | the insert alone — one Redis round trip, bounded by `PLACE_TIMEOUT_SECS` (7s, deliberately outliving the start write's own 5s hold on the queue mutex). `-play` resolves with no lock and enters `PlayRegistry.place()` for the put, where four checks replace the re-read a serialized body relied on: the player is not `retired` (`-stop`/kick/watchdog since dispatch), `queue.generation` did not move (`-clear`), no command stamped it (`dropped_by` — a `-stop` landing before the join has no player to retire and no queue to bump, so the stamp has to invalidate on its own), the author is still in voice. Under the hold: the put, and the `queue_position` on it. The playlist embeds and the front-insert notices are built BEFORE the lock; the tail confirmation is built AFTER the put and off the lock, so the slot it names is the slot the song took. `_GuildPlays.join` is the cold-start singleflight: one `-join` per guild, awaited through `asyncio.shield` by every request that found no voice client. `docs/ARCHITECTURE.md#play-placement` |
 | `_playlist_slot()` (semaphore, src/spotify.py, process-wide) | how many Spotify playlist walks run at once (2) — Spotify's rate limiter is per application, and a walk is up to 100 requests. The wait is bounded by `PLAY_RESOLVE_WAIT_SECS` (`SpotifyBusyError`), and the semaphore is rebuilt when the running loop changes |
 | `_INFLIGHT_PLAYLISTS` / `_PLAYLIST_SUBSCRIBERS` (src/spotify.py, process-wide) | one walk per playlist, awaited through `asyncio.shield` by every caller, each of whose cards receives the walk's page reports; the job writes the cache itself, so a cancelled caller costs nothing |
+| `_PROGRESS_SUBSCRIBERS` (src/youtube.py, process-wide) | the cards watching a YouTube playlist extraction. Mutated on the event loop, READ on the yt-dlp pool's progress drain thread (`_publish_progress` copies the list before iterating), so a report can never touch the loop |
 | `_TYPING_HOLDS` / `_TYPING_TASKS` (src/util.py, process-wide) | one typing keepalive per CHANNEL, refcounted across the concurrent commands sharing it — per channel, not per guild, because that is what Discord's indicator is scoped to |
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |

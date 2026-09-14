@@ -1,6 +1,7 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import pathlib
 import contextlib
 import logging
 import redis.asyncio as aioredis
@@ -23,6 +24,7 @@ import pytest
 from redis.asyncio import Redis
 from yt_dlp.utils import DownloadError, UnsupportedError
 
+from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
 from src.guild_state import Analytics
 from src import youtube
@@ -4308,3 +4310,467 @@ class TestTheProbeTargetIsEncodedOnlyWhenItIsAlreadyValid:
 
         assert " " not in str(_probe_target("https://host.example/a b/c"))
         assert str(_probe_target("https://host.example/\u00fcni")).isascii()
+
+
+class _FakeProgressQueue:
+    """Stands in for the worker's multiprocessing.Queue."""
+
+    def __init__(self, error: Optional[Exception] = None) -> None:
+        self.puts: list[Any] = []
+        self._error = error
+
+    def put_nowait(self, item: Any) -> None:
+        if self._error is not None:
+            raise self._error
+        self.puts.append(item)
+
+
+@pytest.fixture
+def worker_queue(monkeypatch: pytest.MonkeyPatch) -> _FakeProgressQueue:
+    queue = _FakeProgressQueue()
+    monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", queue)
+    return queue
+
+
+class TestCountEntry:
+    """yt-dlp's match_filter, as a progress hook.
+
+    The failure to pin hardest: a return value that is not None makes yt-dlp SKIP
+    that entry — falsy values included, because _match_entry tests `is not None`
+    (YoutubeDL.py:1664). Measured on a 4-entry playlist: `return ""` kept 0 of 4
+    while the command still reported success. Every assertion here is `is None`;
+    `assert not ret` passes while every song is silently gone.
+    """
+
+    @pytest.mark.parametrize(
+        "info",
+        [
+            {},
+            {"_type": "url", "url": "https://yt.com/v=1", "playlist_index": 1},
+            {"id": "abc", "title": "T", "playlist_index": 40},
+            {"playlist_count": 1671, "playlist": "Mix"},
+            {"playlist_index": None},
+        ],
+        ids=["empty", "flat-entry", "counted-entry", "playlist-infodict", "no-index"],
+    )
+    def test_it_returns_none_for_every_entry_shape(
+        self, info: dict[str, Any], worker_queue: _FakeProgressQueue
+    ) -> None:
+        assert youtube._count_entry("rid", info, incomplete=True) is None
+
+    def test_the_playlist_infodict_carries_the_header_count(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """YoutubeDL.py:2088, once, before any entry. It is the only way the count
+        _tab.py:793 read off page 1 reaches the parent before the walk ends — the
+        pool future does not return until every continuation has been fetched."""
+        youtube._count_entry("rid", {"playlist_count": 1671}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, 1671)]
+
+    def test_a_collection_with_no_header_count_reports_none(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """Mixes, radio lists and channel tabs have no count at all, so `total is
+        None` is a supported steady state rather than a transient one."""
+        youtube._count_entry("rid", {"playlist": "Mix"}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, None)]
+
+    def test_only_every_nth_entry_is_reported(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """The bar has ten cells, so at 1,671 tracks one cell is 167 entries and
+        nothing on screen can tell 25 from 1 — while the queue's _wlock is shared
+        across workers and one write per entry is 1,671 of them."""
+        for index in range(1, 76):
+            youtube._count_entry("rid", {"playlist_index": index}, incomplete=True)
+
+        assert worker_queue.puts == [
+            ("rid", 25, None),
+            ("rid", 50, None),
+            ("rid", 75, None),
+        ]
+
+    def test_the_index_is_the_progress_value_not_a_call_count(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """_match_entry is reachable from three sites for one playlist, and only
+        :2161 carries an index. Reading the index rather than counting calls is
+        what keeps a naive counter from reporting 3,343/1,671."""
+        youtube._count_entry("rid", {"playlist_index": 100}, incomplete=True)
+        youtube._count_entry("rid", {"playlist_index": 100}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 100, None), ("rid", 100, None)]
+
+    def test_a_zero_entry_playlist_counts_zero(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        youtube._count_entry("rid", {"playlist_count": 0}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, 0)]
+
+    def test_a_queue_that_raises_still_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """yt-dlp does not wrap match_filter, so a queue.Full or a closed queue
+        would escape extract_info as a RemoteCallError and tell the user the
+        playlist could not be fetched — by a progress bug."""
+        monkeypatch.setattr(
+            ytdlp_pool_module, "_PROGRESS_Q", _FakeProgressQueue(RuntimeError("full"))
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert (
+                youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True)
+                is None
+            )
+
+        assert "progress queue put failed" in caplog.text
+        assert "RuntimeError('full')" in caplog.text
+
+    def test_a_wedged_queue_warns_once_not_once_per_entry(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A queue whose write lock died with a worker fails every later put of
+        the walk — ~220 puts for one large playlist."""
+        wedged = _FakeProgressQueue(RuntimeError("full"))
+        monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", wedged)
+
+        with caplog.at_level(logging.WARNING):
+            for index in (25, 50, 75):
+                youtube._count_entry("rid", {"playlist_index": index}, incomplete=True)
+            monkeypatch.setattr(
+                ytdlp_pool_module, "_PROGRESS_Q", _FakeProgressQueue(RuntimeError("x"))
+            )
+            youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True)
+
+        # One for the wedged queue, one for the next generation's.
+        assert caplog.text.count("progress queue put failed") == 2
+
+    def test_without_a_queue_it_is_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The suite's autouse fixture supplies its own executor_factory, so
+        _worker_init never runs and the global is never set."""
+        monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", None)
+
+        assert (
+            youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True) is None
+        )
+
+
+class TestPlaylistOpts:
+    def test_without_a_card_the_shared_constant_is_handed_through_untouched(
+        self,
+    ) -> None:
+        """No card watching, no behaviour change: the extraction is byte-for-byte
+        what it has always been."""
+        assert youtube._playlist_opts(None) is youtube._YTDL_PLAYLIST_OPTS
+
+    def test_with_a_card_it_is_a_copy_carrying_the_streaming_hook(self) -> None:
+        opts = youtube._playlist_opts("rid")
+
+        assert opts is not youtube._YTDL_PLAYLIST_OPTS
+        assert opts["lazy_playlist"] is True
+        assert callable(opts["match_filter"])
+        # The constant is a module-level shared dict: mutating it would leak one
+        # guild's callback into another guild's extraction.
+        assert "match_filter" not in youtube._YTDL_PLAYLIST_OPTS
+        assert "lazy_playlist" not in youtube._YTDL_PLAYLIST_OPTS
+
+    def test_lazy_playlist_is_required_not_optional(self) -> None:
+        """Without it YoutubeDL.py:2100 materialises the generator — every
+        continuation page fetched — before the per-entry loop runs, so the hook
+        fires in one burst after the network is over and the bar jumps 0 to 100%
+        in a single frame. It also removes the second, indexless call site."""
+        assert youtube._playlist_opts("rid").get("lazy_playlist") is True
+
+    def test_none_of_the_flags_that_fight_lazy_are_set(self) -> None:
+        """playlistreverse/playlistrandom warn under lazy, and 'playlist-index' in
+        compat_opts changes indexing. Re-check this if the opts profile grows."""
+        opts = youtube._playlist_opts("rid")
+        assert not opts.get("playlistreverse")
+        assert not opts.get("playlistrandom")
+        assert "playlist-index" not in (opts.get("compat_opts") or ())
+
+    def test_the_callback_survives_pickling(self) -> None:
+        """Nothing in the suite pickles — the autouse fixture runs extraction on a
+        thread pool — so an unpicklable callable (a lambda, a closure, a bound
+        method) would pass `just check` and break only inside a container."""
+        restored = pickle.loads(
+            pickle.dumps(youtube._playlist_opts("rid")["match_filter"])
+        )
+
+        assert restored.func is youtube._count_entry
+        assert restored.args == ("rid",)
+
+
+class TestProgressSubscription:
+    """Progress is keyed on the EXTRACTION, not the requester: _extract_once
+    single-flights on the URL, so the second caller of one playlist issues no
+    request of its own and would otherwise watch a frozen card beside a moving
+    one — identical inputs, opposite experience."""
+
+    def test_every_card_on_one_extraction_gets_the_report(self) -> None:
+        first: list[Any] = []
+        second: list[Any] = []
+
+        with (
+            youtube._progress_subscription("key", lambda d, t: first.append((d, t))),
+            youtube._progress_subscription("key", lambda d, t: second.append((d, t))),
+        ):
+            youtube._publish_progress(("key", 25, 1671))
+
+        assert first == [(25, 1671)] == second
+
+    def test_leaving_unsubscribes_and_the_registry_empties(self) -> None:
+        seen: list[Any] = []
+        with youtube._progress_subscription("key", lambda d, t: seen.append(d)):
+            pass
+
+        youtube._publish_progress(("key", 25, None))
+
+        assert seen == []
+        assert "key" not in youtube._PROGRESS_SUBSCRIBERS
+
+    def test_one_failing_subscriber_does_not_stop_the_others(self) -> None:
+        seen: list[Any] = []
+
+        def _boom(done: int, total: Optional[int]) -> None:
+            raise RuntimeError("card is gone")
+
+        with (
+            youtube._progress_subscription("key", _boom),
+            youtube._progress_subscription("key", lambda d, t: seen.append(d)),
+        ):
+            youtube._publish_progress(("key", 7, None))
+
+        assert seen == [7]
+
+    def test_a_malformed_message_is_dropped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            youtube._publish_progress("not a tuple")
+            youtube._publish_progress(("key", 1))
+
+        assert caplog.text.count("malformed progress message") == 2
+
+    def test_a_message_for_nobody_is_dropped(self) -> None:
+        youtube._publish_progress(("nobody", 1, None))
+
+
+class TestYtPlaylistProgress:
+    async def test_the_worker_key_and_the_subscription_key_are_the_same(
+        self, mock_author: MagicMock
+    ) -> None:
+        """The whole phase-3 chain in one assertion. The key the opts hand the
+        worker through match_filter and the key the card subscribes under are
+        minted separately, so a mismatch is silent: extraction succeeds, the
+        playlist queues, and the bar never moves."""
+        seen: list[tuple[int, Optional[int]]] = []
+
+        async def _extract(request: Any) -> dict[str, Any]:
+            # What the worker would carry: _count_entry is armed with the key.
+            request_id = request.opts["match_filter"].args[0]
+            youtube._publish_progress((request_id, 7, 100))
+            return {"entries": []}
+
+        with patch.object(youtube, "_run_extract", new=_extract):
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PLkeymatch",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PLkeymatch",
+                on_progress=lambda done, total: seen.append((done, total)),
+            )
+
+        assert seen == [(7, 100)]
+
+    def test_count_entry_through_a_real_youtubedl(self) -> None:
+        """The two load-bearing facts live only in comments citing yt-dlp line
+        numbers, and both are silent when wrong: a non-None return drops entries,
+        and the per-entry site fires only for an entry check_filter() calls
+        is_single_video. Driven through the real YoutubeDL, offline."""
+        from yt_dlp import YoutubeDL
+
+        published: list[tuple[str, int, Optional[int]]] = []
+
+        class _Q:
+            def put_nowait(self, message: Any) -> None:
+                published.append(message)
+
+        entries = [
+            {
+                "_type": "url",
+                # ie_key selects the extractor check_filter asks, and the URL is
+                # what it parses. An eleven-char id, or _VALID_URL rejects it.
+                "ie_key": "Youtube",
+                "id": "abcdefghijk",
+                "url": "https://www.youtube.com/watch?v=abcdefghijk",
+                "title": f"T{n}",
+            }
+            for n in range(60)
+        ]
+        playlist: Any = {
+            "_type": "playlist",
+            "id": "PLreal",
+            "title": "Real",
+            "entries": entries,
+            "playlist_count": 60,
+            "extractor": "youtube:tab",
+            "extractor_key": "YoutubeTab",
+            "webpage_url": "https://www.youtube.com/playlist?list=PLreal",
+        }
+
+        with patch.object(
+            ytdlp_pool_module, "worker_progress_queue", return_value=_Q()
+        ):
+            # Any at the yt-dlp boundary, like every other call into it here.
+            opts: Any = {
+                **youtube._playlist_opts("rid"),
+                "quiet": True,
+                "extract_flat": True,
+            }
+            with YoutubeDL(opts) as ydl:
+                result: Any = ydl.process_ie_result(playlist, download=False)
+
+        # Nothing was dropped: a non-None return would silently eat entries, and
+        # a non-None at the PLAYLIST-level call eats the whole playlist.
+        assert len(result["entries"]) == 60
+        # The header count arrives first, indexless, before any entry.
+        assert published[0] == ("rid", 0, 60)
+        # Then every _PROGRESS_EVERY-th index, in walk order.
+        assert [d for _, d, _ in published[1:]] == [25, 50]
+
+    def test_the_per_entry_hook_needs_a_video_shaped_id(self) -> None:
+        """is_single_video parses the id against _VALID_URL, so an entry shape
+        yt-dlp stops recognising zeroes the bar with extraction still green. This
+        is the failure mode; the test above is the working one."""
+        from yt_dlp import YoutubeDL
+
+        published: list[Any] = []
+
+        class _Q:
+            def put_nowait(self, message: Any) -> None:
+                published.append(message)
+
+        entries = [
+            {
+                "_type": "url",
+                "ie_key": "Youtube",
+                "id": "short",
+                "url": "https://x/y",
+                "title": f"T{n}",
+            }
+            for n in range(60)
+        ]
+        playlist: Any = {
+            "_type": "playlist",
+            "id": "PLshort",
+            "entries": entries,
+            "extractor": "youtube:tab",
+            "extractor_key": "YoutubeTab",
+            "webpage_url": "https://www.youtube.com/playlist?list=PLshort",
+        }
+        with patch.object(
+            ytdlp_pool_module, "worker_progress_queue", return_value=_Q()
+        ):
+            # Any at the yt-dlp boundary, like every other call into it here.
+            opts: Any = {
+                **youtube._playlist_opts("rid"),
+                "quiet": True,
+                "extract_flat": True,
+            }
+            with YoutubeDL(opts) as ydl:
+                result: Any = ydl.process_ie_result(playlist, download=False)
+
+        assert len(result["entries"]) == 60  # still all queued
+        assert [d for _, d, _ in published[1:]] == []  # and no per-entry report
+
+    async def test_a_subscriber_leaving_mid_publish_does_not_break_the_rest(
+        self,
+    ) -> None:
+        """_publish_progress runs on the drain thread and the subscriber list is
+        mutated from the event loop, so it iterates a copy."""
+        seen: list[int] = []
+        first_report: list[Any] = []
+
+        def _leaver(done: int, _total: Optional[int]) -> None:
+            youtube._PROGRESS_SUBSCRIBERS["k"].remove(first_report[0])
+
+        def _stayer(done: int, _total: Optional[int]) -> None:
+            seen.append(done)
+
+        first_report.append(_leaver)
+        with youtube._progress_subscription("k", _leaver):
+            with youtube._progress_subscription("k", _stayer):
+                youtube._publish_progress(("k", 3, 9))
+        assert seen == [3]
+
+    def test_a_malformed_request_id_is_refused(self) -> None:
+        """The guard has to cover the LOOKUP, not just the unpack: an unhashable
+        id raises TypeError out of dict.get, on the drain thread, where it kills
+        progress for the life of the executor."""
+        youtube._publish_progress(([], 1, 2))
+        youtube._publish_progress(("only-two", 1))
+
+    def test_the_module_pool_is_built_with_a_progress_sink(self) -> None:
+        """Asserted against the source, because the autouse seam swaps the pool
+        for a thread-backed one before any test sees it. Without the sink the
+        worker's queue is drained into nothing and every bar is indeterminate."""
+        import ast
+
+        tree = ast.parse(pathlib.Path(youtube.__file__).read_text())
+        calls = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "ytdlp_pool" for t in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+        ]
+        assert calls, "module-level ytdlp_pool assignment not found"
+        assert any(kw.arg == "progress_sink" for kw in calls[0].keywords)
+
+    async def test_no_card_means_the_extraction_is_unchanged(
+        self, mock_author: MagicMock
+    ) -> None:
+        with patch.object(
+            youtube, "_extract_once", new=AsyncMock(return_value={"entries": []})
+        ) as extract:
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PL1",
+            )
+
+        opts = extract.call_args.args[1].opts
+        assert opts is youtube._YTDL_PLAYLIST_OPTS
+
+    async def test_a_card_arms_the_hook_and_subscribes_to_it(
+        self, mock_author: MagicMock
+    ) -> None:
+        seen: list[Any] = []
+
+        async def _extract(key: str, request: Any, **_: Any) -> dict[str, Any]:
+            # The worker's messages, replayed from where the drain thread would.
+            youtube._publish_progress((key, 0, 1671))
+            youtube._publish_progress((key, 25, None))
+            return {"entries": []}
+
+        with patch.object(youtube, "_extract_once", new=_extract):
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PL1",
+                on_progress=lambda d, t: seen.append((d, t)),
+            )
+
+        assert seen == [(0, 1671), (25, None)]
+        assert youtube._PROGRESS_SUBSCRIBERS == {}
