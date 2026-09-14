@@ -636,10 +636,13 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   Postgres forever.
 - Callers with a prefetch task must settle it BEFORE clear/shuffle/remove so the
   prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
-  `-clear`/`-remove` use `_cancel_prefetch()`; **`-shuffle` uses
+  `-clear` uses `_cancel_prefetch()`; **`-shuffle` and `-remove` use
   `_neutralize_prefetch()`**, because `cancel_task()` no-ops on a COMPLETED prefetch
-  and its surviving claim would pin that song to the front of the reorder and leave
-  the too-few guard counting one short of what `-queue` shows.
+  and its surviving claim would pin that song to the front of the reorder, or leave
+  the next song unremovable for the whole current song. `-remove` settles only when
+  the claimed head matches (`_claimed_head_matches`, which also tries the head's
+  requeued form), and both refill the slot in a `finally` unless the player is
+  `retired`: an orphan prefetch on a torn-down player can LPOP the saved queue.
 - `clear()` invalidates in-flight work through the generation counter and the cursor
   reset ALONE — a prefetched song the loop is holding is discarded because
   `commit_dequeue` refuses (nothing is claimed once the cursor is 0). There was once

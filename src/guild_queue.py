@@ -18,8 +18,8 @@ work through the generation counter and the cursor reset alone.
 
 qsize() is PENDING (len - cursor); display_size() is pending PLUS in-flight (len).
 
-Not known here: stream prefetch (MusicPlayer cancels its prefetch task before
-clear()/shuffle()/remove()), embeds and ETA math (built over display_items()/
+Not known here: stream prefetch (MusicPlayer settles its prefetch task before
+clear()/shuffle(), and before remove() when the head it claimed matches), embeds and ETA math (built over display_items()/
 peek_next()), and the state hash (crash recovery hands this class ready-made
 entries via SongQueueEntry.from_crashed_state).
 """
@@ -375,9 +375,10 @@ class GuildQueue:
             return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
-    # Callers with a prefetch task (MusicPlayer) must cancel it before any of
-    # these: its CancelledError handler's requeue_front() must land before the
-    # drain, or the item is stranded. A COMPLETED prefetch is an in-flight head.
+    # Callers with a prefetch task (MusicPlayer) settle it before any of these that
+    # must reach the head it claimed: its CancelledError handler's requeue_front()
+    # must land before the drain, or the item is stranded. A COMPLETED prefetch is
+    # an in-flight head.
 
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything on it — claimed prefix included,
@@ -507,6 +508,10 @@ class GuildQueue:
     def display_items(self) -> list[QueueItem]:
         """Snapshot of the queued items in display order."""
         return list(self._items)
+
+    def claimed_head(self) -> Optional[QueueItem]:
+        """The item a consumer holds at the head, or None when nothing is claimed."""
+        return self._items[0] if self._cursor else None
 
     def peek_next(self) -> Optional[QueueItem]:
         return self._items[0] if self._items else None
