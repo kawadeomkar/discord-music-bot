@@ -47,6 +47,7 @@ from src.util import (
     fmt_duration,
     notice_embed,
     pluralize,
+    progress_line,
     record_span_error,
     trace_footer,
     traceparent_context,
@@ -131,13 +132,6 @@ def _requester_mention(
 ) -> str:
     return requester.mention if requester else "Unknown"
 
-
-# Square emoji blocks: the played portion renders in a different colour from the
-# remainder. Width is low because each block glyph is much wider than a dash.
-_BAR_WIDTH = 10
-_BAR_FILL_DONE = "🟦"
-_BAR_FILL_REMAINING = "⬜"
-_BAR_HEAD = "🔘"
 
 # Collapses rapid -pause/-resume toggling into one trailing embed edit + Activity
 # refresh.
@@ -238,22 +232,9 @@ def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
     return total_secs, partial
 
 
-def _build_progress_bar(
-    elapsed_secs: float, duration_secs: int, width: int = _BAR_WIDTH
-) -> str:
-    if duration_secs <= 0:
-        return ""
-    # Clamp before formatting: imprecise metadata plus an FFmpeg -ss offset can
-    # push the raw position past the reported duration.
-    elapsed_secs = max(0.0, min(elapsed_secs, float(duration_secs)))
-    ratio = elapsed_secs / duration_secs
-    head_pos = min(width - 1, int(ratio * width))
-    bar = (
-        _BAR_FILL_DONE * head_pos
-        + _BAR_HEAD
-        + _BAR_FILL_REMAINING * (width - head_pos - 1)
-    )
-    return f"`{fmt_duration(int(elapsed_secs))}` {bar} `{fmt_duration(duration_secs)}`"
+def _clock(secs: float) -> str:
+    """A progress_line label for a playing song's position and duration."""
+    return fmt_duration(int(secs))
 
 
 def _fmt_finish_time(duration_secs: int, tz: ZoneInfo) -> str:
@@ -1204,7 +1185,9 @@ class MusicPlayer:
                 if position_override is not None
                 else song.position_secs
             )
-            bar = _build_progress_bar(position, song.duration_secs)
+            # Clamped inside progress_line: imprecise metadata plus an FFmpeg -ss
+            # offset can push the position past the reported duration.
+            bar = progress_line(position, song.duration_secs, label=_clock)
             if bar:
                 lines.append(bar)
                 lines.append("")

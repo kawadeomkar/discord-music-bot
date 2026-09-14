@@ -12,6 +12,7 @@ import pytest
 from opentelemetry import trace as trace_api
 
 from src.util import (
+    BAR_WIDTH,
     FOOTER_LIMIT,
     current_traceparent,
     traceparent_context,
@@ -24,6 +25,8 @@ from src.util import (
     get_logger,
     join_footer,
     pluralize,
+    progress_bar,
+    progress_line,
     queue_message,
 )
 
@@ -534,3 +537,93 @@ class TestTypingKeepaliveCancellation:
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
         assert keepalive.cancelled()
+
+
+class TestProgressBar:
+    @pytest.mark.parametrize(
+        "ratio,expected",
+        [
+            (0.0, "🔘" + "⬜" * 9),
+            (0.5, "🟦" * 5 + "🔘" + "⬜" * 4),
+            (11 / 12, "🟦" * 9 + "🔘"),
+            (1.0, "🟦" * 9 + "🔘"),
+        ],
+    )
+    def test_head_reserves_the_last_cell(self, ratio: float, expected: str) -> None:
+        assert progress_bar(ratio) == expected
+
+    @pytest.mark.parametrize("width,expected", [(0, ""), (1, "🔘"), (3, "🟦🟦🔘")])
+    def test_narrow_widths(self, width: int, expected: str) -> None:
+        """width=0 renders rather than raising, and a width of one is the head."""
+        assert progress_bar(1.0, width=width) == expected
+
+    @pytest.mark.parametrize("ratio", [-0.5, 1.5, 12.0])
+    def test_a_ratio_outside_zero_to_one_is_clamped(self, ratio: float) -> None:
+        """A replayed progress stream reports past its own total, and the
+        renderer must not run off the end of the bar."""
+        bar = progress_bar(ratio)
+        assert len(bar) == BAR_WIDTH
+        assert bar in ("🔘" + "⬜" * 9, "🟦" * 9 + "🔘")
+
+    def test_the_default_width_is_the_shared_constant(self) -> None:
+        assert len(progress_bar(0.5)) == BAR_WIDTH
+
+
+def _clock(secs: float) -> str:
+    return fmt_duration(int(secs))
+
+
+def _cells(line: str) -> str:
+    """The glyph run between the two backticked labels."""
+    return line.split("`")[2].strip()
+
+
+class TestProgressLine:
+    """The Now Playing bar's shape, shared by the NP card (clock labels) and the
+    queue-progress card (song counts)."""
+
+    def test_empty_string_without_a_positive_total(self) -> None:
+        assert progress_line(0.0, 0, label=_clock) == ""
+        assert progress_line(10.0, -1, label=_clock) == ""
+
+    def test_labels_both_ends_around_the_bar(self) -> None:
+        assert progress_line(65.0, 200, label=_clock) == (
+            "`1:05` " + progress_bar(65 / 200) + " `3:20`"
+        )
+
+    def test_head_at_start_when_the_position_is_zero(self) -> None:
+        line = progress_line(0.0, 200, label=_clock)
+        assert line.startswith("`0:00`")
+        assert _cells(line) == "🔘" + "⬜" * 9
+
+    def test_head_at_end_when_the_position_equals_the_total(self) -> None:
+        assert _cells(progress_line(200.0, 200, label=_clock)) == "🟦" * 9 + "🔘"
+
+    def test_head_roughly_midpoint_at_half(self) -> None:
+        assert _cells(progress_line(100.0, 200, label=_clock)) == (
+            "🟦" * 5 + "🔘" + "⬜" * 4
+        )
+
+    def test_a_position_past_the_total_is_clamped_bar_and_label(self) -> None:
+        """Imprecise duration metadata plus a -ss start offset can push the raw
+        position past the reported duration; the left label must never read past
+        the right one (e.g. `4:05 … 4:02`)."""
+        line = progress_line(250.0, 200, label=_clock)
+        assert line.startswith("`3:20`")
+        assert "`4:10`" not in line
+        assert _cells(line) == "🟦" * 9 + "🔘"
+
+    def test_a_negative_position_is_clamped_bar_and_label(self) -> None:
+        line = progress_line(-5.0, 200, label=_clock)
+        assert line.startswith("`0:00`")
+        assert _cells(line).startswith("🔘")
+
+    def test_width_is_customizable_and_defaults_to_the_shared_constant(self) -> None:
+        assert len(_cells(progress_line(0.0, 200, label=_clock, width=5))) == 5
+        assert len(_cells(progress_line(0.0, 200, label=_clock))) == BAR_WIDTH
+
+    def test_a_count_label_formats_both_ends(self) -> None:
+        """The queue-progress card's label: nothing clock-shaped leaks in."""
+        assert progress_line(335, 1671, label=lambda n: str(int(n))) == (
+            "`335` " + progress_bar(335 / 1671) + " `1671`"
+        )

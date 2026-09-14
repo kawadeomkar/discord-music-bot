@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import re
 from typing import Any, Final, Optional
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 
 import discord
 import structlog
@@ -225,6 +225,47 @@ def fmt_duration(secs: int) -> str:
     m, s = divmod(max(0, secs), 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# Square emoji blocks: the done portion renders in a different colour from the
+# remainder. Width is low because each block glyph is much wider than a dash.
+# Public, because the queue-progress card quantizes its count against it.
+BAR_WIDTH = 10
+_BAR_FILL_DONE = "🟦"
+_BAR_FILL_REMAINING = "⬜"
+_BAR_HEAD = "🔘"
+
+
+def progress_bar(ratio: float, *, width: int = BAR_WIDTH) -> str:
+    """The glyph run for a ratio, clamped to 0..1: filled cells, then a head marking
+    the position reached, then what remains. A width of 0 renders nothing."""
+    if width <= 0:
+        return ""
+    ratio = max(0.0, min(1.0, ratio))
+    # One short of the end, so the head has a cell at 100% and never renders with
+    # filled cells behind it.
+    filled = min(width - 1, int(ratio * width))
+    return (
+        _BAR_FILL_DONE * filled + _BAR_HEAD + _BAR_FILL_REMAINING * (width - filled - 1)
+    )
+
+
+def progress_line(
+    position: float,
+    total: float,
+    *,
+    label: Callable[[float], str],
+    width: int = BAR_WIDTH,
+) -> str:
+    """`label(position)` <bar> `label(total)` — the Now Playing bar, for anything
+    with a position and a known end. The position is clamped to 0..total before it
+    is labelled, so the left label never reads past the right one. "" without a
+    positive total."""
+    if total <= 0:
+        return ""
+    position = max(0.0, min(position, total))
+    bar = progress_bar(position / total, width=width)
+    return f"`{label(position)}` {bar} `{label(total)}`"
 
 
 def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
