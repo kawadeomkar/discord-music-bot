@@ -187,10 +187,12 @@ class TestRegistryInvariants:
                     )
 
     def test_5_every_bot_env_has_a_debug_row(self) -> None:
-        rows = {var.name for var in _CONFIG_ALLOWLIST}
+        rows = {var.name: var for var in _CONFIG_ALLOWLIST}
         for spec in SETTINGS:
             if spec.scope is SettingScope.BOT:
                 assert spec.env in rows, spec.key
+                if spec.attr is not None:
+                    assert rows[spec.env].knob == spec.attr, spec.key
 
     def test_6_values_round_trip_at_their_bounds_and_default(self) -> None:
         # A write-time minimum follows the bot's value. At its lowest, the env

@@ -301,6 +301,48 @@ class TestConfigAllowlist:
         assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
         assert "leaked" not in "\n".join(config_lines())
 
+    def test_every_settable_knob_is_a_knob_row(self) -> None:
+        knobs = {v.knob for v in _CONFIG_ALLOWLIST if v.knob is not None}
+        assert knobs == config.FLOAT_KNOBS | config.INT_KNOBS
+        assert all(v.knob == v.name for v in _CONFIG_ALLOWLIST if v.knob is not None)
+
+    @pytest.mark.parametrize(
+        ("override", "env", "rendered"),
+        [
+            (None, None, "3s (default)"),
+            (None, "4", "4s (env)"),
+            (5.0, "4", "5s (bot owner; env 4s)"),
+            (5.0, None, "5s (bot owner; default 3s)"),
+        ],
+    )
+    def test_a_knob_row_renders_the_value_in_force_and_its_source(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        override: float | None,
+        env: str | None,
+        rendered: str,
+    ) -> None:
+        """The `-settings bot` card's labels. "env" shows the parsed baseline, not
+        the raw string, and an override names the value it shadows."""
+        if env is None:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS", raising=False)
+            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 3.0)
+        else:
+            monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
+            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", float(env))
+        if override is not None:
+            config.set_override("HEARTBEAT_INTERVAL_SECS", override)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "HEARTBEAT_INTERVAL_SECS")
+        assert render_config_value(var) == rendered
+
+    def test_a_count_knob_renders_as_a_whole_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PLAY_INFLIGHT_MAX", raising=False)
+        config.set_override("PLAY_INFLIGHT_MAX", 8)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "PLAY_INFLIGHT_MAX")
+        assert render_config_value(var) == "8 (bot owner; default 16)"
+
     def test_no_duplicate_rows(self) -> None:
         names = [v.name for v in _CONFIG_ALLOWLIST]
         assert len(names) == len(set(names))
@@ -3312,6 +3354,10 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
 
         checked = 0
         for var in _CONFIG_ALLOWLIST:
+            if var.knob is not None:
+                # Rendered from the value in force, never from a stored copy.
+                assert var.fallback is None and var.fallback_factory is None, var.name
+                continue
             if var.kind is not _ConfigKind.VALUE:
                 continue
             default = getattr(config, var.name, None)
@@ -3344,6 +3390,9 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
             kwargs = {k.arg: k.value for k in node.keywords}
             name_node, fallback = kwargs.get("name"), kwargs.get("fallback")
             if not isinstance(name_node, ast.Constant) or fallback is None:
+                continue
+            if "knob" in kwargs:
+                literal_rows.append(f"{name_node.value} (knob= with fallback=)")
                 continue
             default = getattr(config, str(name_node.value), None)
             if not isinstance(default, (int, float)) or isinstance(default, bool):

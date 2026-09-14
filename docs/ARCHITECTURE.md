@@ -2413,6 +2413,12 @@ through `_float_env`/`_int_env`, which record the floor each enforced
   `-debug`, `-analytics`, each `-play`'s admission and resolve wait, each stream probe) at
   the next one, and a value built into a long-lived object at its rebuild — a guild's
   resolve semaphore, once its in-flight requests have all retired.
+- **`-debug` shows what is in force.** Each knob's Config-block row sets `knob=` and
+  carries no fallback. `render_config_value` renders it at render time through the
+  registry's `format_value`, with the `-settings bot` card's labels: `3s (default)`,
+  `3s (env)` (the parsed baseline, not the raw string), `5s (bot owner; env 3s)` or
+  `5s (bot owner; default 3s)`. Every other row is env-only and renders its raw string,
+  since its value cannot change after import.
 - **Two maps, `Literal` keys.** Each accessor's return type is its map's value type, with
   no `cast`. The keys are `Literal` strings rather than an `Enum` because
   `importlib.reload(config)` would mint new enum classes, and a registry built before

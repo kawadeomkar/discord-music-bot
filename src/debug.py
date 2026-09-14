@@ -32,6 +32,8 @@ from src.config import debug_mode_default
 from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth
+from src.settings import SETTINGS, format_value
+from src.settings_card import bot_shown
 from src.util import (
     FOOTER_SUFFIX_SEP,
     cancel_task,
@@ -280,6 +282,9 @@ class _ConfigVar:
     fallback: Optional[str] = None
     # For a default main() can still replace after this tuple is built.
     fallback_factory: Optional[Callable[[], str]] = None
+    # A knob -settings bot can override: rendered from the value in force and its
+    # source at render time, so the row carries no fallback.
+    knob: Optional[config.FloatKnob | config.IntKnob] = None
 
 
 _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
@@ -310,44 +315,42 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback=str(config.YTDLP_POOL_WORKERS),
     ),
     _ConfigVar(
-        name="PLAY_INFLIGHT_MAX",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_INFLIGHT_MAX),
+        name="PLAY_INFLIGHT_MAX", kind=_ConfigKind.VALUE, knob="PLAY_INFLIGHT_MAX"
     ),
     _ConfigVar(
         name="PLAY_RESOLVE_CONCURRENCY",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_RESOLVE_CONCURRENCY),
+        knob="PLAY_RESOLVE_CONCURRENCY",
     ),
     _ConfigVar(
         name="PLAY_RESOLVE_WAIT_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_RESOLVE_WAIT_SECS),
+        knob="PLAY_RESOLVE_WAIT_SECS",
     ),
     _ConfigVar(
         name="PLAY_SLOW_NOTICE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_SLOW_NOTICE_SECS),
+        knob="PLAY_SLOW_NOTICE_SECS",
     ),
     _ConfigVar(
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
+        knob="NOW_PLAYING_UPDATE_INTERVAL_SECS",
     ),
     _ConfigVar(
         name="HEARTBEAT_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.HEARTBEAT_INTERVAL_SECS),
+        knob="HEARTBEAT_INTERVAL_SECS",
     ),
     _ConfigVar(
         name="STREAM_PROBE_TIMEOUT_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.STREAM_PROBE_TIMEOUT_SECS),
+        knob="STREAM_PROBE_TIMEOUT_SECS",
     ),
     _ConfigVar(
         name="ANALYTICS_RENDER_DEADLINE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.ANALYTICS_RENDER_DEADLINE_SECS),
+        knob="ANALYTICS_RENDER_DEADLINE_SECS",
     ),
     _ConfigVar(name="LIVENESS_FILE", kind=_ConfigKind.VALUE),
     _ConfigVar(
@@ -355,25 +358,13 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         kind=_ConfigKind.VALUE,
         fallback=str(config.LIVENESS_INTERVAL_SECS),
     ),
+    _ConfigVar(name="PING_TICK_SECS", kind=_ConfigKind.VALUE, knob="PING_TICK_SECS"),
     _ConfigVar(
-        name="PING_TICK_SECS",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.PING_TICK_SECS),
+        name="PING_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="PING_DEADLINE_SECS"
     ),
+    _ConfigVar(name="DEBUG_TICK_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_TICK_SECS"),
     _ConfigVar(
-        name="PING_DEADLINE_SECS",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.PING_DEADLINE_SECS),
-    ),
-    _ConfigVar(
-        name="DEBUG_TICK_SECS",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.DEBUG_TICK_SECS),
-    ),
-    _ConfigVar(
-        name="DEBUG_DEADLINE_SECS",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.DEBUG_DEADLINE_SECS),
+        name="DEBUG_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_DEADLINE_SECS"
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_DELAY_SECS",
@@ -473,8 +464,18 @@ def redact_url(raw: str, *, hide_host: bool = False) -> str:
         return "unparseable"
 
 
+def _render_knob(knob: config.FloatKnob | config.IntKnob) -> str:
+    """`5s (bot owner; env 3s)`: the -settings bot card's rendering, so the
+    operator's two views of a knob agree."""
+    spec = next(spec for spec in SETTINGS if spec.attr == knob)
+    shown = bot_shown(spec, host_debug_default=False, debug_default_override=None)
+    return f"{format_value(spec, shown.value)} ({shown.source})"
+
+
 def render_config_value(var: _ConfigVar) -> str:
     """One allowlist row's value, redacted per its kind."""
+    if var.knob is not None:
+        return _render_knob(var.knob)
     raw = os.environ.get(var.name)
     if var.kind is _ConfigKind.SECRET:
         # Presence only: this block has to stay safe to screenshot into an issue.
