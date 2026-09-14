@@ -867,9 +867,10 @@ cannot suppress its own retry, and `_release_np_host` clears it because retireme
 strip-edit the message by a path that never reaches `_push_np_edit`.
 
 A guild with **debug mode** enabled changes the payload even then: the footer carries the
-runtime snapshot, which `RuntimeSampler` resamples at
-`max(1.0, min(5.0, NOW_PLAYING_UPDATE_INTERVAL_SECS))`. That is the footer reporting live
-values; debug mode is opt-in per guild and off by default.
+runtime snapshot, which `RuntimeSampler` resamples every `sample_interval_secs()`: the
+bot's `now_playing_update_interval_secs()` floored at 1 s and capped at 5 s, re-read each
+tick. That is the footer reporting live values; debug mode is opt-in per guild and off by
+default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
 
@@ -2095,9 +2096,10 @@ Rules each seam encodes:
   A line absent leaves no break behind: a card with no snapshot and no span is one
   line, and the dashboards' string form is one line plus its counts.
 
-`RuntimeSampler` feeds the runtime segments on the NP tick's cadence
-(`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is
-effectively debug-enabled.
+`RuntimeSampler` feeds the runtime segments on the bot's NP tick cadence
+(`sample_interval_secs()`, floored at 1 s and capped at 5 s, re-read each tick, so a
+`-settings bot np-refresh` change reaches it within one interval), running only while some
+guild is effectively debug-enabled.
 
 ### Analytics rendering
 
