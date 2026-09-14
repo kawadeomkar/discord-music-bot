@@ -592,6 +592,8 @@ something at the head:
 | `FAILED` | the resolve returned no song and retired the copy | plays on |
 | `DROPPED` | a `-clear` or `-remove` took the copy out of the queue | plays on |
 
+**A `--now` during the replay's resolve inserts no resume tail.** It neutralizes the resolve, which hands the copy back to the head, and `interject()` finds a `-replay` copy of the live song next (`_is_replay_of`): the copy already plays the song again after the interjection, so a tail at the interrupt position ahead of it would play the song a third time. The interrupted fragment records its own history row, as with `-skip`, and `--now`'s reply says the song plays again from `0:00` after it. A marker held for the length of `replay_current` could not stand in for this check: the replay's verdict runs as soon as the neutralize cancels its resolve, before `--now` has inserted anything.
+
 Expiring the bound stops nothing: a resolve past it can still fail, and a stop into
 it would cut the song off for a copy that never plays.
 

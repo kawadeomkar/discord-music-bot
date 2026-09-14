@@ -190,14 +190,17 @@ class InterjectOutcome:
     confirmation wording."""
 
     interrupted_title: str
-    # None → no resume entry (the interrupted song was nearly finished, or had no
-    # webpage_url to rebuild from).
+    # None → no resume entry (the interrupted song was nearly finished, had no
+    # webpage_url to rebuild from, or a -replay copy of it is next).
     resume_position: Optional[int]
     was_paused: bool  # the OBSERVED state when it was interrupted
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
     # `--now` restores what it interrupted while plain -play brings it back
     # playing. Wording keys off this.
     returns_paused: bool = False
+    # A -replay copy of the interrupted song was next: it plays after this from
+    # 0:00, and resume_position is None.
+    replay_pending: bool = False
 
     @property
     def resume_position_str(self) -> str:
@@ -1734,7 +1737,10 @@ class MusicPlayer:
         was_paused = vc.is_paused()
         position = int(current.position_secs)
         resume: Optional[QueueObject] = None
-        if current.webpage_url:
+        # A -replay copy of this song is next, so it already plays again after the
+        # interjection; a resume tail ahead of it would play the song a third time.
+        replay_pending = _is_replay_of(self.queue.peek_next(), current.webpage_url)
+        if current.webpage_url and not replay_pending:
             # On the RAW position: the EOF cap below would mask "almost over".
             near_end = (
                 current.duration_secs > 0
@@ -1814,6 +1820,7 @@ class MusicPlayer:
             resume_position=position if resume is not None else None,
             was_paused=was_paused,
             returns_paused=resume is not None and resume.start_paused,
+            replay_pending=replay_pending,
         )
 
     async def settle_prefetch(self) -> None:

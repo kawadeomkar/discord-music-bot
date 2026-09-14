@@ -9326,6 +9326,41 @@ def interject_obj(mock_author: MagicMock) -> QueueObject:
 
 
 class TestInterject:
+    async def test_a_replay_copy_of_the_song_next_gets_no_resume_tail(
+        self,
+        music_player: MusicPlayer,
+        interject_obj: QueueObject,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """The copy plays the song again after the interjection already; only a
+        copy of THIS song counts, since another song's replay is not a resume."""
+        live_song.elapsed_secs = 83.0
+        music_player.current_song = live_song
+        other = QueueObject(
+            "https://yt.com/v=other", "Other", mock_author, is_replay=True
+        )
+        copy = QueueObject(
+            live_song.webpage_url, live_song.title, mock_author, is_replay=True
+        )
+
+        await music_player.queue.put([other])
+        with_other = await music_player.interject(interject_obj, mock_vc)
+        assert with_other is not None and not with_other.replay_pending
+        assert with_other.resume_position is not None
+
+        await music_player.queue_clear()
+        music_player._stopped_deliberately = False
+        music_player._skip_history_for = None
+        music_player._pending_resume_tail = None
+        await music_player.queue.put([copy])
+        with_copy = await music_player.interject(interject_obj, mock_vc)
+
+        assert with_copy is not None and with_copy.replay_pending
+        assert with_copy.resume_position is None
+        assert music_player.queue.display_items() == [interject_obj, copy]
+
     async def test_the_resume_tail_reads_a_real_ytdl(
         self,
         music_player: MusicPlayer,
@@ -12063,6 +12098,57 @@ class TestReplayCurrent:
         assert outcome is not None
         assert outcome.result is ReplayResult.TORN_DOWN
         mock_vc.stop.assert_not_called()
+
+    async def test_a_now_during_the_resolve_plays_the_song_twice_not_three_times(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        mock_author: MagicMock,
+        replayer: MagicMock,
+        _stub_replay_resolve: AsyncMock,
+    ) -> None:
+        """--now neutralizes the replay's resolve, which hands the copy back to the
+        head, then front-inserts. A resume tail there would sit ahead of the copy:
+        the song, the interjection, the rest of the song, then all of it again."""
+        live_song.elapsed_secs = 83.0
+        music_player.current_song = live_song
+        claimed = asyncio.Event()
+
+        async def resolve_forever() -> None:
+            # Gives its claim back on cancel, as _prefetch_next_song does.
+            item = music_player.queue.get_nowait()
+            claimed.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                music_player.queue.requeue_front(item)
+                raise
+
+        _stub_replay_resolve.side_effect = resolve_forever
+        replaying = asyncio.create_task(
+            music_player.replay_current(
+                mock_vc, requester=replayer, analytics=REPLAY_ASK
+            )
+        )
+        async with asyncio.timeout(5):
+            await claimed.wait()
+        interjection = QueueObject("https://yt.com/v=x", "Song X", mock_author)
+
+        outcome = await music_player.interject(interjection, mock_vc)
+        async with asyncio.timeout(5):
+            replayed = await replaying
+
+        assert outcome is not None and outcome.replay_pending
+        assert outcome.resume_position is None
+        queued = [queue_object(item) for item in music_player.queue.display_items()]
+        assert [q.title for q in queued] == ["Song X", live_song.title]
+        assert queued[1].is_replay and not queued[1].is_resume
+        # No tail, so the interrupted fragment records its own row, as with -skip.
+        assert music_player._skip_history_for is None
+        assert replayed is not None
+        assert replayed.result is ReplayResult.INTERRUPTED
+        mock_vc.stop.assert_called_once()  # --now's stop, not a second one
 
     async def test_declines_once_the_player_has_been_torn_down(
         self,

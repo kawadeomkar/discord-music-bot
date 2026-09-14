@@ -1527,6 +1527,37 @@ class TestNowFlag:
         assert "nearly finished" in embed.description
         assert "will not resume" in embed.description
 
+    async def test_a_pending_replay_is_what_the_reply_promises(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """No resume position here either, but "will not resume" would be false:
+        the song's replay plays after the interjection."""
+        from src.musicplayer import InterjectOutcome
+
+        live_mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Again",
+                resume_position=None,
+                was_paused=False,
+                replay_pending=True,
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        )
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "plays again from `0:00` after this" in embed.description
+        assert "will not resume" not in embed.description
+
     async def test_interjecting_over_an_interjection_promises_a_return(
         self,
         music_bot: MusicBot,
