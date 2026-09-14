@@ -2424,6 +2424,28 @@ def _current(url: str = "url", title: str = "title", **kwargs: Any) -> SongQueue
 
 
 class TestPopQueueAndStartSong:
+    async def test_re_arms_the_queue_keys_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A guild playing one long queue writes nothing else to the queue key. Left
+        to its enqueue-time TTL, the list expires while the heartbeat keeps the state
+        key alive, and a crash then recovers the playing song and nothing behind it."""
+        await fake_redis.rpush(store.queue_key(), b"first", b"second")
+        await fake_redis.expire(store.queue_key(), 600)
+
+        await store.pop_queue_and_start_song(_current(), 1000.0)
+
+        assert await fake_redis.ttl(store.queue_key()) == GUILD_TTL
+
+    async def test_a_start_that_empties_the_list_leaves_no_key(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), b"only")
+
+        await store.pop_queue_and_start_song(_current(), 1000.0)
+
+        assert await fake_redis.exists(store.queue_key()) == 0
+
     async def test_lpop_removes_first_item_only(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -2665,6 +2687,16 @@ class TestSetCurrentSongState:
         await store.set_current_song_state(_current(), 1000.0)
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"untouched"]
+
+    async def test_re_arms_the_queue_keys_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), b"behind the recovered song")
+        await fake_redis.expire(store.queue_key(), 600)
+
+        await store.set_current_song_state(_current(), 1000.0)
+
+        assert await fake_redis.ttl(store.queue_key()) == GUILD_TTL
 
     async def test_clears_pause_epoch(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

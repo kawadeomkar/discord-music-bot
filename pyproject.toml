@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.38.6"
+version = "2.38.7"
 requires-poetry = '>=2.0'
 
 packages = [
