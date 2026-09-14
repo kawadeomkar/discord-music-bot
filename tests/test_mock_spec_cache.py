@@ -704,17 +704,21 @@ class TestDriftDetection:
             assert drift_for(Probe) == []
             assert "handler" in MagicMock(spec=Probe).__dict__["_spec_asyncs"]
 
-    def test_a_reverted_mutation_is_invisible_here(self, isolated_cache: None) -> None:
+    def test_a_reverted_mutation_is_invisible_here(
+        self, monkeypatch: pytest.MonkeyPatch, isolated_cache: None
+    ) -> None:
         """The bound on this check, asserted so it stays a known one.
 
         It compares against the class as it stands now, so a `patch.object` that
         has already exited leaves nothing to differ — even though every mock
         built inside the block came from the pre-mutation snapshot. Strict mode
-        below is what covers this ordering."""
+        below is what covers this ordering, so it is pinned off here: a run under
+        MOCK_SPEC_CACHE_STRICT=1 would otherwise raise at the served mock."""
 
         class Probe:
             async def handler(self) -> None: ...
 
+        monkeypatch.setattr(mock_spec_cache, "_STRICT", False)
         MagicMock(spec=Probe)  # fills the entry from the clean class
         with patch.object(Probe, "handler", MagicMock()):
             served = MagicMock(spec=Probe)

@@ -341,7 +341,7 @@ def check_for_drift() -> list[str]:
     after its first spec'd mock therefore poisons every later mock of it —
     an attribute the class gained raises `AttributeError`, one it lost still
     resolves, and a method swapped between sync and async flips `_spec_asyncs`
-    the wrong way. All of it is silent, and under `-n 8` it is worker-dependent.
+    the wrong way. All of it is silent, and under `-n auto` it is worker-dependent.
 
     Recomputing the whole cache costs one `dir()` walk per entry, so the session
     can check at the end that it was never lied to. It compares against the class
