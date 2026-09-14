@@ -306,11 +306,27 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
 
     BOT_SETTINGS_OVERRIDES is scrubbed so a shell exporting `ignore` cannot turn
     every BotSettings test into a refusal.
+
+    OWNER_IDS is scrubbed so a shell exporting one cannot make MusicBotApp skip
+    the owner lookup its tests expect.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.delenv("OWNER_IDS", raising=False)
     monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+
+
+@pytest.fixture(autouse=True)
+def reset_owner_lookup_backoff() -> Iterator[None]:
+    """Forget a failed owner lookup between tests. The deadline is module-global,
+    so one test's raising is_owner would otherwise deny every operator check for
+    the next 60s of the suite."""
+    import src.util as util
+
+    util._owner_lookup_retry_at = 0.0
+    yield
+    util._owner_lookup_retry_at = 0.0
 
 
 @pytest.fixture(autouse=True, scope="session")

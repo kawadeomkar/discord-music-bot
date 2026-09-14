@@ -44,6 +44,7 @@ from src.spotify import Spotify
 from src.util import (
     FOOTER_LIMIT,
     get_logger,
+    is_operator,
     join_footer,
     send_embed,
     trace_footer,
@@ -487,19 +488,12 @@ async def run_health_dashboard(
         versions = await collect_versions()
         # Owner only: -ping has no permission gate, and this advisory confirms to
         # every member which hosts run on the default credential. The cheap local
-        # check runs first — is_owner() is a REST GET (application_info, retried
-        # up to ~25s on a 5xx) and would otherwise precede the skeleton send. It
-        # RAISES on a 5xx, and _prepare runs before the send with exceptions
-        # propagating, so an unguarded call would cost the whole board.
+        # check runs first: the owner check can be a REST GET (application_info,
+        # retried up to ~25s on a 5xx) and would otherwise precede the skeleton
+        # send. is_operator never raises, which _prepare's propagation needs.
         warning = default_password_embed(debug_suffix=debug_suffix)
-        if warning is not None:
-            try:
-                is_owner = await ctx.bot.is_owner(ctx.author)
-            except Exception as e:  # noqa: BLE001 — an unknown owner is not an owner
-                log.warning(f"ping owner check failed: {type(e).__name__}: {e}")
-                is_owner = False
-            if not is_owner:
-                warning = None
+        if warning is not None and not await is_operator(ctx):
+            warning = None
 
     def _render() -> list[discord.Embed]:
         embed = render_ping_embed(

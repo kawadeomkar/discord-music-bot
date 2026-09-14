@@ -1444,3 +1444,50 @@ class TestBotSettingsOverridesIgnored:
         monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", raw)
         with pytest.raises(ValueError, match="BOT_SETTINGS_OVERRIDES"):
             config.bot_settings_overrides_ignored()
+
+
+class TestOwnerIds:
+    @pytest.mark.parametrize(
+        ("raw", "ids"),
+        [
+            (None, set()),
+            ("", set()),
+            ("  ", set()),
+            ("123456789012345678", {123456789012345678}),
+            (
+                "123456789012345678,23456789012345678901",
+                {123456789012345678, 23456789012345678901},
+            ),
+            (
+                " 123456789012345678, 234567890123456789 345678901234567890 ",
+                {123456789012345678, 234567890123456789, 345678901234567890},
+            ),
+        ],
+    )
+    def test_the_accepted_values(
+        self, monkeypatch: pytest.MonkeyPatch, raw: Optional[str], ids: set[int]
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("OWNER_IDS", raising=False)
+        else:
+            monkeypatch.setenv("OWNER_IDS", raw)
+        assert config.owner_ids() == ids
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "abc",
+            "-1",
+            "1234567890123456",
+            "123456789012345678901",
+            "\u0663" * 18,
+            "123456789012345678;234567890123456789",
+            "123456789012345678,abc",
+        ],
+    )
+    def test_anything_else_raises_naming_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("OWNER_IDS", raw)
+        with pytest.raises(ValueError, match="OWNER_IDS"):
+            config.owner_ids()

@@ -260,7 +260,7 @@ graph TD
 | `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver `-ping` and `-debug` share. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row, a block of rendered lines) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. Both callers reply through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
 | `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
 | `debug.py` | `-debug`: the snapshot's collectors and rendering, plus `--enable`/`--disable` argument parsing. **Observation-only by rule** — nothing here changes playback, caching, queueing or persistence, which is what keeps "test with debug on, ship with debug off" a valid methodology. Every collector degrades to a labeled `unknown`/`n/a` rather than raising (`_safe_block`): a debug tool that crashes is worse than no debug tool. The host blocks are gated on bot ownership at **collection**, not at render, so a non-owner's `-debug` launches no probe at all — the public surface is versions plus this server's own player/voice state. The `Config` block renders a deny-by-default allowlist: `SECRET` variables show `set`/`unset` and never a value, `URL` variables lose userinfo, credential-bearing query params and the host itself. `musicbot.py` owns the command registration. `DebugSettings` holds each guild's debug-mode choice as a projection of `debug_mode` that `GuildSettings` writes (`apply_choices`, `drop`) — it has no writer of its own — and the operator's session `debug-default` (`set_default_override`). |
-| `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `fmt_duration`/`fmt_seconds` (the clock, and the shortest seconds text that parses back to the same float), `DASHES` (every dash a keyboard substitutes for `-`), `codeblock_fields` (lines split across 1024-char code-block fields), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`. |
+| `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `fmt_duration`/`fmt_seconds` (the clock, and the shortest seconds text that parses back to the same float), `DASHES` (every dash a keyboard substitutes for `-`), `codeblock_fields` (lines split across 1024-char code-block fields), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`, `is_operator` (the owner check `-debug` and `-ping` share: fails closed, never raises, and a lookup that raised answers False for 60s without asking again; `owner_lookup_backing_off` says when). |
 
 **Key types:**
 
@@ -319,6 +319,8 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 3. For non-`play` commands: the bot is in the same voice channel as the author
 
 `-help` (and the `--help` flag on any command) is exempt from the voice-channel gate: the help command carries no `before_invoke(validate_commands)`, and `--help` short-circuits in `invoke()` ahead of it — so help is always reachable, even from outside a voice channel. `-play --now` and `-play --next` are gated MORE strictly than a plain `-play`: the same-channel exemption is lifted for both, since one stops what another channel is hearing and the other decides what it hears next. Appending is what the exemption was for, and neither appends.
+
+**Who counts as the bot's operator** is discord.py's `Bot.is_owner`, asked through `util.is_operator`. With `OWNER_IDS` set, `MusicBotApp` passes it as `owner_ids` and that list is the answer, with no REST call. Unset, discord.py calls `application_info()` once: the application's owner, or, for a team-owned application, every member whose role is Admin or Developer. A successful lookup is cached until restart, so a developer removed from the team keeps the operator's reach until then. A lookup that raises caches nothing, and discord.py retries its 5xx for up to ~25 s, so `is_operator` remembers the failure for 60 s (`OWNER_LOOKUP_RETRY_SECS`) and answers False without asking. It fails closed and never raises: an unreachable owner is not an owner.
 
 **Supported `-play` inputs:**
 
@@ -1719,9 +1721,10 @@ and answers to `-status`, `-health` and `-l`, so an ungated advisory would confi
 every member of every guild — permanently, in Discord's retained history — that this
 host runs the public default. The value is a public constant in a GPL repo; the leak
 is the confirmation, not the string. The `is_owner()` await must also be reached only
-when the advisory exists: `MusicBotApp` sets neither `owner_id` nor `owner_ids`, so
-discord.py falls through to `application_info()`, a REST GET that retries ~25 s on a
-5xx and then raises — ahead of the skeleton send the command promises is immediate.
+when the advisory exists: unless `OWNER_IDS` is set, discord.py falls through to
+`application_info()`, a REST GET that retries ~25 s on a 5xx and then raises — ahead
+of the skeleton send the command promises is immediate. `util.is_operator` turns the
+raise into a denial and skips the call for 60 s after one fails.
 
 The default lives in six places with nothing linking them: `src/config.py`,
 `build_common.sh`'s preflight, three `docker-compose.yml` service interpolations, and

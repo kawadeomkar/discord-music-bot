@@ -352,7 +352,8 @@ src/
 └── util.py           # logger factory, embed helpers (safe_label, verbatim_code),
                       # fmt_duration/fmt_seconds, progress_bar/progress_line (the NP bar and
                       # the card's), task helpers (spawn_background, cancel_task, join_task,
-                      # set_within), channel_claim, ProgressFn, PoolSlotUnavailable
+                      # set_within), channel_claim, ProgressFn, PoolSlotUnavailable,
+                      # is_operator (the owner check -debug and -ping share)
 
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
@@ -1298,6 +1299,7 @@ duplicated.
 | Variable | Default | Notes |
 |---|---|---|
 | `DISCORD_TOKEN` | — | required; startup fails without it |
+| `OWNER_IDS` | — | the bot's operator, as Discord user ids (comma- or space-separated, each 17–20 ASCII digits; anything else refuses startup). Passed as discord.py's `owner_ids`, so set it IS the list and `is_owner` makes no REST call. Unset, discord.py looks it up with `application_info()`: the application's owner, or every team member whose role is Admin or Developer, cached until restart — a developer removed from the team keeps the operator's reach until then. `util.is_operator` fails closed and remembers a failed lookup for 60s |
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | both or neither; validated live at startup |
 | `REDIS_URL` | `redis://localhost:6379` | bot runs degraded (no persistence/recovery) without Redis |
 | `HISTORY_ARCHIVE_ENABLED` | `false` | **the consent gate for long-term storage** — `true` enables the Postgres archive tier (outbox writes, drainer, `POSTGRES_URL` requirement). Strict parse (`true/1/yes` / `false/0/no`, case-insensitive; unset/empty → false; garbage aborts startup, and `setup_hook` reads it FIRST so the ValueError cannot be swallowed by `@_guild_op`). Set together with `COMPOSE_PROFILES=archive` — the pair is documented in `.env.example` |

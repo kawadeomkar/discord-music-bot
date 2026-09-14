@@ -305,6 +305,22 @@ class TestConfigAllowlist:
         names = [v.name for v in _CONFIG_ALLOWLIST]
         assert len(names) == len(set(names))
 
+    @pytest.mark.parametrize(
+        ("name", "unset", "value"),
+        [
+            ("OWNER_IDS", "application owner (default)", "123456789012345678"),
+            ("BOT_SETTINGS_OVERRIDES", "apply (default)", "ignore"),
+        ],
+    )
+    def test_the_operator_variables_render_what_is_in_force(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, unset: str, value: str
+    ) -> None:
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == name)
+        monkeypatch.delenv(name, raising=False)
+        assert render_config_value(var) == unset
+        monkeypatch.setenv(name, value)
+        assert render_config_value(var) == value
+
 
 class TestDiscordBlock:
     def test_falls_back_to_single_shard_shape(self, mock_bot: MagicMock) -> None:

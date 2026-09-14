@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import re
+import time
 from typing import Any, Final, Optional
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
 
@@ -472,3 +473,34 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
 
 
 log = get_logger(__name__)
+
+
+# How long a failed owner lookup is remembered. Each lookup is an
+# application_info() REST call, which discord.py retries for up to ~25s on a 5xx.
+OWNER_LOOKUP_RETRY_SECS: Final[float] = 60.0
+_owner_lookup_retry_at = 0.0
+
+
+def owner_lookup_backing_off() -> bool:
+    """True while a failed owner lookup is remembered, when is_operator answers
+    False without asking: a reply can say the operator could not be confirmed."""
+    return time.monotonic() < _owner_lookup_retry_at
+
+
+async def is_operator(ctx: commands.Context) -> bool:
+    """Is the caller the bot's operator (discord.py's is_owner)? Fails CLOSED and
+    never raises. is_owner() looks the owner up with application_info() unless
+    OWNER_IDS is set or a lookup already succeeded, and RAISES when that fails;
+    a failure answers False for OWNER_LOOKUP_RETRY_SECS without asking again."""
+    global _owner_lookup_retry_at
+    if owner_lookup_backing_off():
+        return False
+    try:
+        return await ctx.bot.is_owner(ctx.author)
+    except Exception as e:  # noqa: BLE001 — an unreachable owner is not an owner
+        _owner_lookup_retry_at = time.monotonic() + OWNER_LOOKUP_RETRY_SECS
+        log.warning(
+            f"owner check failed, denying for {OWNER_LOOKUP_RETRY_SECS:.0f}s: "
+            f"{type(e).__name__}: {e}"
+        )
+        return False

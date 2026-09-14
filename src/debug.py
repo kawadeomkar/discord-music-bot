@@ -293,6 +293,8 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback_factory=lambda: config.ENVIRONMENT,
     ),
     _ConfigVar(name="DEBUG_MODE", kind=_ConfigKind.VALUE, fallback="false"),
+    _ConfigVar(name="OWNER_IDS", kind=_ConfigKind.VALUE, fallback="application owner"),
+    _ConfigVar(name="BOT_SETTINGS_OVERRIDES", kind=_ConfigKind.VALUE, fallback="apply"),
     _ConfigVar(
         name="HISTORY_ARCHIVE_ENABLED", kind=_ConfigKind.VALUE, fallback="false"
     ),

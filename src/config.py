@@ -415,6 +415,23 @@ def debug_mode_default() -> bool:
     return _parse_bool_env("DEBUG_MODE")
 
 
+def owner_ids() -> frozenset[int]:
+    """OWNER_IDS: the Discord user ids of the bot's operator, comma- or
+    space-separated. Set, it IS the operator list; empty, discord.py looks the
+    application's owner up instead. Each must be 17-20 ASCII digits, else this
+    raises naming the variable. Read once, in MusicBotApp.__init__."""
+    raw = os.environ.get("OWNER_IDS") or ""
+    ids: set[int] = set()
+    for token in raw.replace(",", " ").split():
+        if not (token.isascii() and token.isdecimal() and 17 <= len(token) <= 20):
+            raise ValueError(
+                "OWNER_IDS must be Discord user ids (17-20 digits), comma- or "
+                f"space-separated; got {token!r}"
+            )
+        ids.add(int(token))
+    return frozenset(ids)
+
+
 def bot_settings_overrides_ignored() -> bool:
     """BOT_SETTINGS_OVERRIDES: `ignore` runs the process on environment and code
     values, never reading bot:{application_id}:config; unset, empty and `apply`
