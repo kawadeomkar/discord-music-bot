@@ -60,6 +60,9 @@ from src.musicplayer import MusicPlayer
 from src.spotify import (
     Spotify,
     SpotifyAuthError,
+    SpotifyBusyError,
+    SpotifyPlaylistForbiddenError,
+    SpotifyPlaylistTooSlowError,
     SpotifyRateLimitError,
     SpotifyRequestError,
 )
@@ -460,6 +463,9 @@ class MusicBot(commands.Cog):
                 (
                     ExtractionError,
                     PlaylistInputError,
+                    SpotifyBusyError,
+                    SpotifyPlaylistForbiddenError,
+                    SpotifyPlaylistTooSlowError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
                 ),

@@ -117,6 +117,20 @@ def reset_probe_streak() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def reset_spotify_walks() -> Iterator[None]:
+    """The Spotify walk registry holds futures bound to the loop that created them,
+    as _INFLIGHT_EXTRACTS does, and a left subscriber would feed a later test's
+    card from an earlier test's walk."""
+    import src.spotify as spotify
+
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
+    yield
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
+
+
+@pytest.fixture(autouse=True)
 async def close_shared_http_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[None]:

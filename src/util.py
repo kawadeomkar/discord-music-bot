@@ -13,6 +13,15 @@ from opentelemetry.trace.propagation.tracecontext import (
 )
 
 
+# (done_so_far, total_if_known) — what a long resolve reports as it walks. `done`
+# is ABSOLUTE, never a delta, so a dropped report self-corrects on the next one.
+# MAY BE CALLED OFF THE EVENT LOOP: Spotify calls it on the loop, the yt-dlp
+# transport from YtdlpPool's drain thread, so an implementation must be
+# synchronous and non-blocking. Declared here because spotify.py and youtube.py
+# know nothing about guilds and must not import what renders it.
+ProgressFn = Callable[[int, Optional[int]], None]
+
+
 # Discord's embed field-value cap; it rejects the WHOLE send past it.
 _FIELD_VALUE_MAX = 1024
 _TRUNCATION_MARK = "..."

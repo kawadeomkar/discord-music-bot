@@ -40,6 +40,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
 15. [Subsystem Invariants](#subsystem-invariants)
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
+    - [Spotify playlist paging](#spotify-playlist-paging)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
@@ -984,7 +985,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist:v2:{id}` | String | JSON array of track titles | 1 h (user-editable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1306,7 +1307,7 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
+| `playlist(id)` | `spotify:playlist:v2:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -1769,6 +1770,22 @@ sharded deployment. And `fetch_pot=auto` consults the sidecar only when a select
 format requires a token, so it costs nothing while `visionos` is healthy; YouTube's
 PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
 provisioned ahead of enforcement rather than after it.
+
+### Spotify playlist paging
+
+`playlist()` follows the API's `next` cursor to the end. That turns one request per playlist into up to a hundred, so three things bound what it can cost.
+
+**The walk is bounded twice.** `_PLAYLIST_PAGE_TIMEOUT_SECS` (20 s) covers one request, which is the thing that can hang — `_HTTP_TIMEOUT` does not reach a page spending three 429 retries at up to `_MAX_RETRY_AFTER_SECS` each. Neither bound is allowed to cut a 429 sleep short: the walk hands `http_call` the earlier of the two as a `deadline`, and a retry that would sleep past it raises `SpotifyRateLimitError` at once. Expired, either bound would raise `SpotifyPlaylistTooSlowError`, whose advice for a stalled page is to try again — the one thing a rate limit must never be answered with, since the retry re-sends every request that earned the 429. `_PLAYLIST_WALK_TIMEOUT_SECS` (120 s) covers the whole walk and is sized against the WORK: `_MAX_PLAYLIST_PAGES` is derived from Spotify's own 10,000-item ceiling, so the budget allows ~1.2 s a page where a healthy call is ~0.2 s. A single bound could not tell a stalled request from a large playlist, and only one of those is worth retrying — `SpotifyPlaylistTooSlowError.whole_walk` is which deadline expired.
+
+**The pages are issued sequentially, and that is a choice.** `total` is known after page 1, so pages 2..N could go out together. They do not: a walk already meets Spotify's per-application rate limiter a hundred times more often than a track lookup did, and the 120 s budget absorbs about one fully-retried page. Concurrency would spend exactly the thing that is scarce. If this ever needs to be faster, raise the budget before adding parallelism.
+
+**Two process-wide bounds, not per guild**, because the limiter is per application. `_playlist_slot()` (2, rebuilt per event loop) caps concurrent walks, and the wait for it is bounded by `PLAY_RESOLVE_WAIT_SECS` — the walk budget starts only once the slot is held, so without that bound a small playlist behind two 10,000-track walks waits minutes having sent nothing, and it answers `SpotifyBusyError` instead. `_INFLIGHT_PLAYLISTS` single-flights on the cache key, so N users pasting one link is one walk rather than N identical hundred-request ones. `PLAY_RESOLVE_CONCURRENCY` covers neither — it guards yt-dlp workers, and a Spotify walk holds none. The slot is taken INSIDE the single flight, around the requests alone, for the reason `_extract_once` takes its pool slot there: a joiner issues no request and must not queue for a slot it will not use.
+
+**The walk belongs to no caller.** Every caller awaiting it — the one that started it and every joiner — subscribes to `_PLAYLIST_SUBSCRIBERS` under the cache key for as long as it waits, and each page's report goes to all of them, so a second guild's card moves with the walk it joined. The cache write is the job's own, after the walk: a caller cancelled mid-walk (a `-stop`) neither takes the walk from the others, which await it through `asyncio.shield`, nor throws away a hundred requests nobody is left to cache.
+
+**A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
+
+**A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
 
 ### yt-dlp process boundary
 

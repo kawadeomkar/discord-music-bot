@@ -320,7 +320,8 @@ src/
 ├── youtube.py        # yt-dlp integration: caches, stream probe/heal, YTDL audio source, worker fn
 ├── ytdlp_pool.py     # ProcessPoolExecutor lifecycle: lazy spawn, break-healing, worker log plumbing
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source
-├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached)
+├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached); the playlist
+│                     # pager, its walk slot and single flight
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
 ├── dashboard.py      # optimistic-send + live-edit driver shared by -ping and -debug
 ├── ping.py           # -ping health dashboard: probes + render (sequencing is dashboard.py)
@@ -674,7 +675,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `ytdl:playlist:{list id}` | string | 15m | a YouTube playlist's kept entries, in order, as the five identity fields a queue entry needs. Keyed on the `list=` id, so the playlist page, a watch link carrying `&index=`, and a `&t=` copy share one entry. Entries yt-dlp could not describe are dropped BEFORE the write, so a hit cannot resurrect them; an empty result is not written at all. TTL'd, so eviction-safe |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
-| `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
+| `spotify:{track,artist,album}:{id}`, `spotify:playlist:v2:{id}` | string | 24h/24h/24h, 1h | cached lookups. The playlist key is versioned: following `next` changed the cached VALUE, so an unversioned key would have kept answering 100 tracks for an hour after deploy |
 | `lock:guild:{id}:recovery` | string | 60s | SET NX EX recovery lock, one restore per guild at a time. The value is a per-acquisition random token, and release is a WATCH/MULTI compare-and-delete — an unconditional DEL would let a holder whose lock expired mid-recovery delete its successor's |
 
 Postgres holds two tables — `play_history`, and `play_history_rejected` (rows the server
@@ -1016,6 +1017,8 @@ Per-guild synchronization primitives and what they protect:
 | `_GuildPlays.resolves` (semaphore, src/play_placement.py) | how many of a guild's admitted `-play`s may hold one of the shared, process-wide yt-dlp pool's workers to RESOLVE (`PLAY_RESOLVE_CONCURRENCY`, default 2 against 4 workers). Admission is a memory bound; this is the pool bound on the resolve, and without it one guild's paste burst delays every other guild's extractions — including the playback loop's own in-band ones. Taken **inside `_extract_once`**, around the job it starts: a source- or playlist-cache hit and a Spotify playlist hold no worker, and a caller joining an in-flight job holds none either. Threaded down as `pool_slot` because `src/youtube.py` knows nothing about guilds; a resolve reached outside a command passes None. `docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken` |
 | `youtube.prefetch_warm_slot()` (semaphore, process-wide) | how many enqueue-time stream warms may hold a worker. A search resolves flat and leaves the stream to `prefetch_stream`, which `queue_put` spawns per song and nobody awaits — so those never pass through `resolves` and would otherwise be bounded only by `PLAY_INFLIGHT_MAX`. Half the pool, and NOT per guild: the harm is a warm queued ahead of another guild's in-band resolve. The loop's own one-ahead prefetch takes `_stream_source` instead and never waits here |
 | `_GuildPlays.lock` (`PlayRegistry`, src/play_placement.py) | the insert alone — one Redis round trip, bounded by `PLACE_TIMEOUT_SECS` (7s, deliberately outliving the start write's own 5s hold on the queue mutex). `-play` resolves with no lock and enters `PlayRegistry.place()` for the put, where four checks replace the re-read a serialized body relied on: the player is not `retired` (`-stop`/kick/watchdog since dispatch), `queue.generation` did not move (`-clear`), no command stamped it (`dropped_by` — a `-stop` landing before the join has no player to retire and no queue to bump, so the stamp has to invalidate on its own), the author is still in voice. Under the hold: the put, and the `queue_position` on it. The playlist embeds and the front-insert notices are built BEFORE the lock; the tail confirmation is built AFTER the put and off the lock, so the slot it names is the slot the song took. `_GuildPlays.join` is the cold-start singleflight: one `-join` per guild, awaited through `asyncio.shield` by every request that found no voice client. `docs/ARCHITECTURE.md#play-placement` |
+| `_playlist_slot()` (semaphore, src/spotify.py, process-wide) | how many Spotify playlist walks run at once (2) — Spotify's rate limiter is per application, and a walk is up to 100 requests. The wait is bounded by `PLAY_RESOLVE_WAIT_SECS` (`SpotifyBusyError`), and the semaphore is rebuilt when the running loop changes |
+| `_INFLIGHT_PLAYLISTS` / `_PLAYLIST_SUBSCRIBERS` (src/spotify.py, process-wide) | one walk per playlist, awaited through `asyncio.shield` by every caller, each of whose cards receives the walk's page reports; the job writes the cache itself, so a cancelled caller costs nothing |
 | `_TYPING_HOLDS` / `_TYPING_TASKS` (src/util.py, process-wide) | one typing keepalive per CHANNEL, refcounted across the concurrent commands sharing it — per channel, not per guild, because that is what Discord's indicator is scoped to |
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
@@ -1266,7 +1269,6 @@ duplicated.
 | Where | Marker | Summary |
 |---|---|---|
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
-| spotify.py `playlist` | FIXME | playlists >100 tracks silently truncated (first page only, `next` cursor never followed) |
 | sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
 | youtube.py `yt_source` / `_first_video_entry` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results (the marker moved to `_first_video_entry` with the loop it describes) |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |

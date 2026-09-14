@@ -118,7 +118,7 @@ replies that the link isn't from a site it can play.
 **To run the bot** — Docker, plus credentials:
 
 - A [Discord bot token](https://discord.com/developers/applications)
-- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work. When credentials are provided, the bot validates them against the Spotify API on startup — invalid credentials are logged as an error and Spotify links are declined (everything else keeps working). Run `-ping` to see the current Spotify status.
+- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work. When credentials are provided, the bot validates them against the Spotify API on startup — invalid credentials are logged as an error and Spotify links are declined (everything else keeps working). Run `-ping` to see the current Spotify status. Spotify limits what a Development Mode app may read, and it can refuse such an app another user's playlist tracks even while its credentials work; the bot then answers "Spotify won't share that playlist's tracks" and logs which playlist.
 
 The Docker Compose stack contains its own Redis to enable persistence, caching, and crash recovery.
 Credentials *must* be set in a `.env` file at the project root before starting anything:
@@ -527,6 +527,31 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.37.0
+
+**A Spotify playlist over 100 tracks now queues in full.** Only the first page was ever
+read — the `next` cursor was never followed — so a 300-track playlist queued 100 and
+reported success, with nothing to say the other 200 had been dropped. If you have been
+working around that by splitting playlists up, stop: `-play <playlist link>` takes the
+whole thing, up to Spotify's own 10,000-item ceiling.
+
+Two consequences worth knowing before you paste a big one. The lookup takes longer,
+because it is one HTTPS round trip per 100 tracks: a 1,000-track playlist is ten
+sequential requests, typically a second or two, against the ~150 ms a truncated one used
+to take. And it is bounded twice — 20 seconds for any single request, 120 seconds for the
+whole walk — past which the command fails and queues **nothing**, rather than queueing a
+part of a playlist you would have to work out the shape of yourself. The two are reported
+differently, because only one is worth retrying: a stalled request says so and invites a
+retry, while a playlist that used the whole budget tells you to queue it in parts. Items a playlist
+can hold with no title of their own — removed or region-dropped tracks, and podcast
+episodes that carry none — are skipped, so "Queued N songs" can be lower than the
+playlist's own item count. A local file is kept: its name is exactly what a YouTube
+search wants.
+
+Already-cached playlists are not stale for an hour after the upgrade: the cache key moved,
+so the first `-play` after deploy re-reads from Spotify. Nothing to configure, no data
+touched, and rolling back is only a redeploy.
 
 ## Upgrading to 2.35.1
 

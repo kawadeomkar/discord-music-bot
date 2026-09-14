@@ -2,18 +2,25 @@
 
 import redis.asyncio as aioredis
 import time
-from typing import Any
+import asyncio
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
+
+from tests.helpers import settle
 from redis.asyncio import Redis
 
+from src import spotify as spotify_module
 from src.spotify import (
     _HTTP_TIMEOUT,
     _MAX_RETRY_AFTER_SECS,
     Spotify,
     SpotifyAuthError,
+    SpotifyBusyError,
+    SpotifyPlaylistForbiddenError,
+    SpotifyPlaylistTooSlowError,
     SpotifyRateLimitError,
     SpotifyRequestError,
 )
@@ -117,13 +124,50 @@ class TestSpotifyRefreshToken:
     async def test_refresh_token_sets_expiry_from_real_ttl(
         self, spotify: Spotify, fake_redis: aioredis.Redis
     ) -> None:
-        """token_expiry should reflect the key's actual remaining TTL, not a flat guess."""
+        """token_expiry reflects the key's actual remaining TTL less the margin."""
         await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
 
         before = time.time()
         await spotify._refresh_token()
 
-        assert 115 <= spotify.token_expiry - before <= 121
+        margin = spotify_module._TOKEN_EXPIRY_MARGIN_SECS
+        assert 115 - margin <= spotify.token_expiry - before <= 121 - margin
+
+    async def test_a_fresh_token_expires_early_by_the_margin(
+        self,
+        spotify: Spotify,
+        mock_auth_response: dict[str, Any],
+    ) -> None:
+        """Checked once before a retry loop that can sleep 30s on 429s: with no
+        margin a request can carry a token that expired while it slept, and a 401
+        reads as "rejected the credentials"."""
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_resp)
+
+        before = time.time()
+        await spotify._refresh_token(use_cache=False)
+
+        assert spotify.token_expiry - before <= 3600 - 60 + 1
+
+    async def test_a_cached_token_inside_the_margin_is_not_reused(
+        self,
+        spotify: Spotify,
+        fake_redis: aioredis.Redis,
+        mock_auth_response: dict[str, Any],
+    ) -> None:
+        """Reused, it would be marked expired on arrival and re-read from Redis on
+        every call until the key lapsed."""
+        await fake_redis.set("spotify:auth:token", b"nearly_gone", ex=30)
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_resp)
+
+        await spotify._refresh_token()
+
+        assert spotify.auth_token == mock_auth_response["access_token"]
 
     async def test_refresh_token_falls_through_on_expired_key(
         self,
@@ -600,6 +644,57 @@ class TestSpotifyHttpCall:
         assert slept == [1.0, 2.0, 4.0]  # exponential, header ignored
         assert all(s <= _MAX_RETRY_AFTER_SECS for s in slept)
 
+    async def test_a_retry_that_would_outlive_the_deadline_is_a_rate_limit(
+        self, spotify: Spotify
+    ) -> None:
+        """Slept anyway, the caller's own bound would expire mid-sleep and report
+        a hang. Nothing is slept and the second request is never sent."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "10"}
+        session = _make_mock_session(limited)
+        spotify._session_factory = lambda **kw: session
+        deadline = asyncio.get_running_loop().time() + 5.0
+
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock()) as slept,
+            pytest.raises(SpotifyRateLimitError) as excinfo,
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/x", deadline=deadline)
+
+        slept.assert_not_awaited()
+        assert session.request.call_count == 1
+        assert excinfo.value.retry_after == 10.0
+
+    async def test_a_retry_inside_the_deadline_still_sleeps(
+        self, spotify: Spotify
+    ) -> None:
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "10"}
+        ok = AsyncMock()
+        ok.status = 200
+        ok.json = AsyncMock(return_value={"data": "ok"})
+        responses = [limited, ok]
+        session = _make_mock_session(ok)
+        session.request = MagicMock(
+            side_effect=lambda *a, **kw: _request_cm(responses.pop(0))
+        )
+        spotify._session_factory = lambda **kw: session
+        deadline = asyncio.get_running_loop().time() + 20.0
+
+        with patch("src.spotify.asyncio.sleep", new=AsyncMock()) as slept:
+            result = await spotify.http_call(
+                "https://api.spotify.com/v1/x", deadline=deadline
+            )
+
+        assert result == {"data": "ok"}
+        slept.assert_awaited_once_with(10.0)
+
     async def test_http_call_refreshes_expired_token(self, spotify: Spotify) -> None:
         spotify.token_expiry = time.time() - 1  # force expiry
 
@@ -655,7 +750,7 @@ class TestSpotifyRedisCache:
             spotify, "http_call", new=AsyncMock(return_value={"items": []})
         ):
             await spotify.playlist("ttl_test_playlist")
-        ttl = await fake_redis.ttl("spotify:playlist:ttl_test_playlist")
+        ttl = await fake_redis.ttl("spotify:playlist:v2:ttl_test_playlist")
         assert 3590 <= ttl <= 3600
 
     async def test_cache_graceful_when_no_redis(self, fake_redis: Redis) -> None:
@@ -843,3 +938,570 @@ class TestSharedSession:
 
         with pytest.raises(RuntimeError, match="closed"):
             spotify._session_or_create()
+
+
+def _playlist_page(
+    titles: list[str], *, total: int, next_url: Optional[str]
+) -> dict[str, Any]:
+    """One page of `v1/playlists/{id}/tracks` under the fields mask."""
+    return {
+        "items": [{"track": {"name": t, "artists": [{"name": "A"}]}} for t in titles],
+        "total": total,
+        "next": next_url,
+    }
+
+
+def _pages(count: int, page_size: int = 100) -> list[dict[str, Any]]:
+    """`count` tracks split into pages, each pointing at the next."""
+    names = [f"T{i}" for i in range(count)]
+    chunks = [names[i : i + page_size] for i in range(0, count, page_size)] or [[]]
+    return [
+        _playlist_page(
+            chunk,
+            total=count,
+            next_url=None
+            if i == len(chunks) - 1
+            else f"https://api.spotify.com/v1/next/{i + 1}",
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+class TestSpotifyPlaylistPaging:
+    """The `next` cursor. The four tests in TestSpotifyPlaylist above patch
+    http_call with a single AsyncMock(return_value=...), which answers every page
+    identically — they keep passing against a pager and prove nothing about it, so
+    these build a real multi-page side effect."""
+
+    async def test_a_250_track_playlist_returns_all_250(self, spotify: Spotify) -> None:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=_pages(250))
+        ) as call:
+            result = await spotify.playlist("pid_250")
+
+        assert len(result) == 250
+        assert result[0] == "T0 A"
+        assert result[-1] == "T249 A"
+        assert call.await_count == 3
+
+    async def test_the_mask_asks_for_next_and_total(self, spotify: Spotify) -> None:
+        """Under `fields` Spotify returns only what is named: without `next` the
+        walk cannot terminate, without `total` the card has no denominator."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=_pages(10))
+        ) as call:
+            await spotify.playlist("pid_mask")
+
+        fields = call.await_args_list[0].kwargs["params"]["fields"]
+        assert "next" in fields
+        assert "total" in fields
+
+    async def test_the_cursor_is_followed_as_a_whole_url(
+        self, spotify: Spotify
+    ) -> None:
+        """`next` carries its own offset in its query, so params must not ride
+        beside it."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=_pages(250))
+        ) as call:
+            await spotify.playlist("pid_cursor")
+
+        second = call.await_args_list[1]
+        assert second.args[0] == "https://api.spotify.com/v1/next/1"
+        assert second.kwargs["params"] is None
+
+    async def test_progress_reports_the_total_from_the_first_page(
+        self, spotify: Spotify
+    ) -> None:
+        seen: list[tuple[int, Optional[int]]] = []
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=_pages(250))):
+            await spotify.playlist(
+                "pid_prog", on_progress=lambda d, t: seen.append((d, t))
+            )
+
+        assert seen == [(100, 250), (200, 250), (250, 250)]
+
+    async def test_progress_counts_items_walked_not_titles_kept(
+        self, spotify: Spotify
+    ) -> None:
+        """The numerator measures how far the walk has got, so a playlist holding
+        a removed track still fills its bar. What was QUEUED is the return value."""
+        page = _playlist_page(["Real"], total=2, next_url=None)
+        page["items"].append({"track": None})
+        seen: list[tuple[int, Optional[int]]] = []
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            result = await spotify.playlist(
+                "pid_gap", on_progress=lambda d, t: seen.append((d, t))
+            )
+
+        assert result == ["Real A"]
+        assert seen == [(2, 2)]
+
+    async def test_an_episode_without_artists_is_still_queued(
+        self, spotify: Spotify
+    ) -> None:
+        page = {"items": [{"track": {"name": "Some Episode"}}], "total": 1}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            assert await spotify.playlist("pid_ep") == ["Some Episode"]
+
+    async def test_a_single_page_playlist_makes_one_call(
+        self, spotify: Spotify
+    ) -> None:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=_pages(10))
+        ) as call:
+            assert len(await spotify.playlist("pid_one")) == 10
+        call.assert_awaited_once()
+
+    async def test_no_progress_callback_is_the_default(self, spotify: Spotify) -> None:
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=_pages(250))):
+            assert len(await spotify.playlist("pid_default")) == 250
+
+    async def test_a_cache_hit_reports_no_progress(self, spotify: Spotify) -> None:
+        """_cached_call returns before fetch(), so a cached playlist has nothing to
+        report — and it resolves far under the threshold that shows a card."""
+        seen: list[tuple[int, Optional[int]]] = []
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=_pages(250))):
+            await spotify.playlist("pid_cached")
+            seen.clear()
+            await spotify.playlist(
+                "pid_cached", on_progress=lambda d, t: seen.append((d, t))
+            )
+
+        assert seen == []
+
+    async def test_a_failure_midway_raises_and_caches_nothing(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """A part-walked playlist must never be cached: an hour of answering with
+        three fifths of a playlist is the truncation bug with extra steps."""
+        pages = _pages(500)
+        side_effect: list[Any] = [*pages[:2], SpotifyRequestError(502, "tracks")]
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=side_effect)):
+            with pytest.raises(SpotifyRequestError):
+                await spotify.playlist("pid_broken")
+
+        assert await fake_redis.get("spotify:playlist:v2:pid_broken") is None
+
+    async def test_a_throttled_page_is_reported_as_a_rate_limit(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Through the real http_call, at 1/40 scale: Retry-After 10s against the
+        20s page bound. The second sleep would outlive the bound. Expired, that
+        bound answers SpotifyPlaylistTooSlowError — "try again" — which re-sends up
+        to 100 requests into a per-application limiter."""
+        monkeypatch.setattr(spotify_module, "_PLAYLIST_PAGE_TIMEOUT_SECS", 0.5)
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "0.25"}
+        session = _make_mock_session(limited)
+        spotify._session_factory = lambda **kw: session
+
+        with pytest.raises(SpotifyRateLimitError):
+            await spotify.playlist("pid_throttled")
+
+        # Slept at t=0 (0.25 < 0.5) and gave up at t=0.25 instead of sleeping into
+        # the bound. Real sleeps: the loop clock is what the deadline reads.
+        assert session.request.call_count == 2
+
+    async def test_the_whole_walk_is_bounded(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_HTTP_TIMEOUT is per request, and 100 pages of 429 retries have no
+        aggregate bound — which on a cold start holds the playback gate open."""
+        monkeypatch.setattr(spotify_module, "_PLAYLIST_WALK_TIMEOUT_SECS", 0.05)
+
+        async def _slow(*_: Any, **__: Any) -> dict[str, Any]:
+            await asyncio.sleep(0.2)
+            return _playlist_page([], total=0, next_url=None)
+
+        with patch.object(spotify, "http_call", new=_slow):
+            with pytest.raises(SpotifyPlaylistTooSlowError):
+                await spotify.playlist("pid_slow")
+
+    async def test_one_playlist_pasted_twice_is_walked_once(
+        self, spotify: Spotify
+    ) -> None:
+        """A full walk is 100 requests where a track lookup was one, so N users
+        pasting one link is N identical hundred-request walks racing to write one
+        cache entry. The first starts it; the rest await its outcome."""
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(*_: Any, **__: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _playlist_page(["T"], total=1, next_url=None)
+
+        with patch.object(spotify, "http_call", new=_slow):
+            walks = [
+                asyncio.create_task(spotify.playlist("pid_shared")) for _ in range(8)
+            ]
+            await settle()
+            gate.set()
+            results = await asyncio.gather(*walks)
+
+        assert calls == 1
+        assert all(r == ["T A"] for r in results)
+
+    async def test_a_failed_walk_leaves_the_key_free(self, spotify: Spotify) -> None:
+        """Registered before the shield, so a retry after a failure starts a
+        fresh walk rather than joining a future that already raised."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            with pytest.raises(RuntimeError):
+                await spotify.playlist("pid_fail")
+        assert spotify_module._INFLIGHT_PLAYLISTS == {}
+
+    async def test_every_caller_on_a_shared_walk_hears_its_pages(
+        self, spotify: Spotify
+    ) -> None:
+        """A second guild pasting the same playlist joins the walk; its card is fed
+        by the walk, not by whichever caller happened to start it."""
+        gate = asyncio.Event()
+        pages = _pages(250)
+
+        async def _paged(*_: Any, **__: Any) -> dict[str, Any]:
+            await gate.wait()
+            return pages.pop(0)
+
+        leader: list[tuple[int, Optional[int]]] = []
+        joiner: list[tuple[int, Optional[int]]] = []
+        with patch.object(spotify, "http_call", new=_paged):
+            first = asyncio.create_task(
+                spotify.playlist(
+                    "pid_fed", on_progress=lambda d, t: leader.append((d, t))
+                )
+            )
+            await settle()
+            second = asyncio.create_task(
+                spotify.playlist(
+                    "pid_fed", on_progress=lambda d, t: joiner.append((d, t))
+                )
+            )
+            await settle()
+            gate.set()
+            await asyncio.gather(first, second)
+
+        assert leader == joiner == [(100, 250), (200, 250), (250, 250)]
+        assert spotify_module._PLAYLIST_SUBSCRIBERS == {}
+
+    async def test_one_cancelled_caller_leaves_the_walk_to_the_others(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """Shielded: a -stop on one guild's -play must not cancel a walk another
+        guild is waiting on. Cached by the walk itself, so even a walk every caller
+        abandoned is not 100 requests thrown away."""
+        gate = asyncio.Event()
+
+        async def _slow(*_: Any, **__: Any) -> dict[str, Any]:
+            await gate.wait()
+            return _playlist_page(["T"], total=1, next_url=None)
+
+        with patch.object(spotify, "http_call", new=_slow):
+            first = asyncio.create_task(spotify.playlist("pid_kept"))
+            await settle()
+            second = asyncio.create_task(spotify.playlist("pid_kept"))
+            await settle()
+            first.cancel()
+            await settle()
+            gate.set()
+            assert await second == ["T A"]
+            assert first.cancelled()
+
+            gate.clear()
+            alone = asyncio.create_task(spotify.playlist("pid_abandoned"))
+            await settle()
+            alone.cancel()
+            await settle()
+            gate.set()
+            await settle()
+
+        assert await fake_redis.get("spotify:playlist:v2:pid_abandoned") is not None
+
+    async def test_a_walk_that_cannot_get_a_slot_says_spotify_is_busy(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The 120s walk budget starts after the slot is taken, so a small playlist
+        behind two 10,000-track walks otherwise waits minutes with nothing sent."""
+        monkeypatch.setattr(spotify_module, "PLAY_RESOLVE_WAIT_SECS", 0.05)
+        slot = spotify_module._playlist_slot()
+        for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
+            await slot.acquire()
+        http_call = AsyncMock()
+        try:
+            with patch.object(spotify, "http_call", new=http_call):
+                with pytest.raises(SpotifyBusyError) as excinfo:
+                    async with asyncio.timeout(5):
+                        await spotify.playlist("pid_queued")
+        finally:
+            for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
+                slot.release()
+        http_call.assert_not_awaited()
+        assert "busy" in excinfo.value.user_message
+
+    def test_the_walk_slot_follows_the_running_loop(self) -> None:
+        """A Semaphore binds to the first loop that waits on it; pytest-asyncio
+        builds a loop per test, so a module-level one breaks the next test that
+        contends on it."""
+
+        async def _contend() -> asyncio.Semaphore:
+            slot = spotify_module._playlist_slot()
+            held = [slot.acquire() for _ in range(3)]
+            waiter = asyncio.ensure_future(asyncio.gather(*held))
+            await asyncio.sleep(0)
+            slot.release()
+            await waiter
+            return slot
+
+        assert asyncio.run(_contend()) is not asyncio.run(_contend())
+
+    async def test_concurrent_walks_are_bounded(self, spotify: Spotify) -> None:
+        """Process-wide, because the harm is Spotify's rate limiter, which is per
+        application. Nothing else bounds these: PLAY_RESOLVE_CONCURRENCY guards
+        yt-dlp workers and a Spotify walk holds none."""
+        live = 0
+        peak = 0
+        gate = asyncio.Event()
+
+        async def _slow(*_: Any, **__: Any) -> dict[str, Any]:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await gate.wait()
+            live -= 1
+            return _playlist_page(["T"], total=1, next_url=None)
+
+        with patch.object(spotify, "http_call", new=_slow):
+            walks = [
+                asyncio.create_task(spotify.playlist(f"pid_b{n}")) for n in range(8)
+            ]
+            await settle()
+            gate.set()
+            await asyncio.gather(*walks)
+
+        assert peak == spotify_module._PLAYLIST_WALK_CONCURRENCY
+
+    async def test_the_first_page_asks_for_the_fields_the_walk_needs(
+        self, spotify: Spotify
+    ) -> None:
+        """Under `fields` Spotify answers with only the keys named, so `next` and
+        `total` have to be asked for: without the first the walk cannot terminate,
+        without the second progress has no denominator and a short walk cannot be
+        detected. The page size is asked for too — the page cap is derived from
+        it, so they must agree."""
+        page = _playlist_page(["T"], total=1, next_url=None)
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)) as c:
+            await spotify.playlist("pid_fields")
+        assert (awaited := c.await_args) is not None
+        params = awaited.kwargs["params"]
+        assert params["limit"] == spotify_module._PLAYLIST_PAGE_SIZE
+        for field in ("next", "total", "items(track(name,artists(name)))"):
+            assert field in params["fields"]
+
+    async def test_the_cursor_is_followed_without_the_first_pages_params(
+        self, spotify: Spotify
+    ) -> None:
+        """The cursor is a full URL carrying its own offset; passing the first
+        page's params beside it would fight the offset it encodes."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=_pages(250))
+        ) as c:
+            await spotify.playlist("pid_cursor")
+        assert c.await_args_list[0].kwargs["params"] is not None
+        assert all(call.kwargs["params"] is None for call in c.await_args_list[1:])
+
+    async def test_an_off_origin_cursor_is_refused(
+        self, spotify: Spotify, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The walk sends the bearer token to whatever the cursor names. Spotify
+        is trusted, but this repo has already shipped one host built from an
+        unvalidated response field, so the origin is checked rather than assumed."""
+        pages = [
+            _playlist_page(["T1"], total=2, next_url="https://evil.example/steal"),
+            _playlist_page(["T2"], total=2, next_url=None),
+        ]
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=pages)) as c:
+            assert await spotify.playlist("pid_evil") == ["T1 A"]
+        # Stopped at page 1: the second page was never requested.
+        assert c.await_count == 1
+        assert "off-origin cursor" in caplog.text
+
+    async def test_a_short_walk_is_reported(
+        self,
+        spotify: Spotify,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Silent truncation is the bug this pager removes. Every ending but an
+        exhausted `next` is short, and `total` is the only thing that can say so."""
+        monkeypatch.setattr(spotify_module, "_MAX_PLAYLIST_PAGES", 2)
+        page = _playlist_page(
+            ["T"], total=500, next_url="https://api.spotify.com/v1/next"
+        )
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            await spotify.playlist("pid_short")
+        assert "walked 2 of 500 items" in caplog.text
+
+    async def test_a_short_walk_is_not_cached(
+        self, spotify: Spotify, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every later paste would be answered from the cache with the partial
+        list, and a hit logs nothing — the truncation this pager reports, hidden."""
+        monkeypatch.setattr(spotify_module, "_MAX_PLAYLIST_PAGES", 2)
+        page = _playlist_page(
+            ["T"], total=500, next_url="https://api.spotify.com/v1/next"
+        )
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            await spotify.playlist("pid_short")
+        assert await fake_redis.get("spotify:playlist:v2:pid_short") is None
+
+    async def test_a_track_with_no_name_is_walked_not_queued(
+        self, spotify: Spotify, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A removed track (null) and one Spotify sends without a name are counted
+        as walked, so a healthy playlist holding them is complete, and cached."""
+        page = _playlist_page(["Kept"], total=3, next_url=None)
+        page["items"] += [{"track": None}, {"track": {"artists": []}}]
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            titles = await spotify.playlist("pid_gaps")
+        assert titles == ["Kept A"]
+        assert "walked" not in caplog.text
+        assert await fake_redis.get("spotify:playlist:v2:pid_gaps") is not None
+
+    async def test_a_403_on_the_tracks_is_the_apps_access_not_the_credentials(
+        self, spotify: Spotify, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """SpotifyAuthError reads "rejected the credentials", which sends an
+        operator to rotate credentials that work."""
+        with patch.object(
+            spotify,
+            "http_call",
+            new=AsyncMock(side_effect=SpotifyAuthError(403, "endpoint: tracks")),
+        ):
+            with pytest.raises(SpotifyPlaylistForbiddenError) as excinfo:
+                await spotify.playlist("pid_refused")
+        assert "won't share" in excinfo.value.user_message
+        assert "pid_refused" in caplog.text
+
+    async def test_a_page_without_items_is_the_same_refusal(
+        self, spotify: Spotify
+    ) -> None:
+        """An empty playlist still carries `items: []`; a page with no key at all
+        would otherwise queue nothing and say the playlist was empty."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value={"total": 5, "next": None})
+        ):
+            with pytest.raises(SpotifyPlaylistForbiddenError):
+                await spotify.playlist("pid_itemless")
+
+    async def test_a_401_is_still_the_credentials(self, spotify: Spotify) -> None:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=SpotifyAuthError(401))
+        ):
+            with pytest.raises(SpotifyAuthError):
+                await spotify.playlist("pid_401")
+
+    async def test_a_complete_walk_is_not_reported(
+        self, spotify: Spotify, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=_pages(250))):
+            await spotify.playlist("pid_whole")
+        assert "walked" not in caplog.text
+
+    def test_the_page_cap_covers_spotifys_own_item_ceiling(self) -> None:
+        """Derived, not assumed: `limit=100` is what the API accepts although its
+        reference documents 50, so halving the page size must double the guard
+        rather than truncate at half a playlist."""
+        assert (
+            spotify_module._MAX_PLAYLIST_PAGES * spotify_module._PLAYLIST_PAGE_SIZE
+            > spotify_module._PLAYLIST_MAX_ITEMS
+        )
+
+    async def test_one_stalled_page_is_not_reported_as_an_oversized_playlist(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The two failures need different advice: a stall is worth retrying and
+        an oversized playlist is not. They are told apart by which deadline
+        expired, because every aiohttp timeout subclasses builtin TimeoutError
+        and `except TimeoutError` alone once called a connect failure too large."""
+        monkeypatch.setattr(spotify_module, "_PLAYLIST_PAGE_TIMEOUT_SECS", 0.05)
+
+        async def _stalled(*_: Any, **__: Any) -> dict[str, Any]:
+            await asyncio.sleep(5)
+            return _playlist_page([], total=0, next_url=None)
+
+        with patch.object(spotify, "http_call", new=_stalled):
+            with pytest.raises(SpotifyPlaylistTooSlowError) as caught:
+                await spotify.playlist("pid_stalled")
+
+        assert not caught.value.whole_walk
+        assert "try again" in caught.value.user_message
+        assert "smaller parts" not in caught.value.user_message
+
+    async def test_an_oversized_playlist_does_not_advise_a_retry(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A walk that used its whole budget will use it again on every attempt,
+        so "try again" is advice that cannot work. It says what to do instead."""
+        monkeypatch.setattr(spotify_module, "_PLAYLIST_WALK_TIMEOUT_SECS", 0.08)
+
+        async def _steady(*_: Any, **__: Any) -> dict[str, Any]:
+            await asyncio.sleep(0.02)
+            return _playlist_page(
+                ["T"], total=1000, next_url="https://api.spotify.com/v1/next"
+            )
+
+        with patch.object(spotify, "http_call", new=_steady):
+            with pytest.raises(SpotifyPlaylistTooSlowError) as caught:
+                await spotify.playlist("pid_big")
+
+        assert caught.value.whole_walk
+        assert "smaller parts" in caught.value.user_message
+        assert "try again" not in caught.value.user_message
+
+    async def test_the_walk_budget_covers_the_ten_thousand_item_ceiling(self) -> None:
+        """_MAX_PLAYLIST_PAGES is Spotify's own ceiling expressed in pages, so the
+        walk must afford every one of them. At least a second each — five times a
+        healthy call — or the largest playlists are permanently unqueueable, which
+        is what 0.6s a page did. Asserted as the ratio because that is the
+        decision: the two constants move together and neither is meaningful
+        alone."""
+        per_page = (
+            spotify_module._PLAYLIST_WALK_TIMEOUT_SECS
+            / spotify_module._MAX_PLAYLIST_PAGES
+        )
+        assert per_page >= 1.0, f"{per_page}s a page at the cap"
+        # And one page can never eat the whole walk.
+        assert (
+            spotify_module._PLAYLIST_PAGE_TIMEOUT_SECS
+            < spotify_module._PLAYLIST_WALK_TIMEOUT_SECS
+        )
+
+    async def test_a_cursor_that_never_ends_stops_at_the_page_cap(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(spotify_module, "_MAX_PLAYLIST_PAGES", 3)
+        forever = _playlist_page(
+            ["T"], total=999, next_url="https://api.spotify.com/v1/next"
+        )
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=forever)
+        ) as call:
+            assert await spotify.playlist("pid_loop") == ["T A"] * 3
+        assert call.await_count == 3
+
+    async def test_the_cache_key_is_versioned(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """Following `next` changes the cached VALUE, so an entry written by the
+        truncating build must not be read back for an hour after deploy."""
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=_pages(10))):
+            await spotify.playlist("pid_v2")
+
+        assert await fake_redis.get("spotify:playlist:v2:pid_v2") is not None
+        assert await fake_redis.get("spotify:playlist:pid_v2") is None
