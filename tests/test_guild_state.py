@@ -4,7 +4,7 @@ import dataclasses
 import logging
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import discord
 import orjson
@@ -13,13 +13,14 @@ from zoneinfo import ZoneInfo
 import pytest
 from unittest.mock import MagicMock
 
-from src import guild_state
+from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     Analytics,
+    BotConfig,
     BotConfigField,
     BotConfigFieldName,
     CONFIG_DOMAIN,
@@ -123,6 +124,15 @@ class TestGuildStateDataFromRedis:
         # None means "nothing persisted" — callers skip the assignment instead
         # of clobbering live state with a fabricated 1.0 default.
         assert GuildStateData.from_redis({}).volume is None
+
+    def test_a_legacy_volume_outside_the_config_domain_reads_as_unset(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """StateField.VOLUME and ConfigField.VOLUME are one wire name, so one
+        domain: restore falls back to this copy and must never play above 100%."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert GuildStateData.from_redis({b"volume": b"1.5"}).volume is None
+        assert "volume=1.5" in caplog.text
 
     @pytest.mark.parametrize("raw", [b"nan", b"inf", b"-inf"])
     def test_non_finite_float_treated_as_malformed(
@@ -1835,6 +1845,153 @@ class TestGuildConfig:
         assert GuildConfig.from_redis(raw).debug_mode is None
 
 
+def _guild_state_warnings(caplog: pytest.LogCaptureFixture) -> int:
+    return sum(
+        r.name == "src.guild_state" and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+
+
+_JUST_OUTSIDE = [
+    pytest.param(field, value, id=f"{field}={value}")
+    for field, domain in CONFIG_DOMAIN.items()
+    for value in (domain.lo - 0.01, domain.hi + 0.01)
+]
+
+
+class TestGuildConfigNumericFields:
+    """Every numeric field is held to CONFIG_DOMAIN wherever a GuildConfig is
+    built. This key outlives builds and can be hand-edited, and a value outside
+    the domain is one no -settings write could have stored."""
+
+    def test_every_attribute_is_its_wire_name(self) -> None:
+        """__post_init__ reads each CONFIG_DOMAIN field by its wire name."""
+        names = {f.name for f in dataclasses.fields(GuildConfig)}
+        assert names == _members(ConfigField)
+
+    def test_nothing_stored_is_all_unset(self) -> None:
+        assert GuildConfig.from_redis({}) == GuildConfig()
+
+    @pytest.mark.parametrize("field", sorted(CONFIG_DOMAIN))
+    @pytest.mark.parametrize("bound", ["lo", "hi"])
+    def test_a_value_on_either_bound_round_trips(
+        self, field: ConfigFieldName, bound: str
+    ) -> None:
+        value: float = getattr(CONFIG_DOMAIN[field], bound)
+        config = dataclasses.replace(GuildConfig(), **{field: value})
+        assert config.to_redis() == {field: str(value)}
+        raw = {k.encode(): v.encode() for k, v in config.to_redis().items()}
+        assert GuildConfig.from_redis(raw) == config
+
+    @pytest.mark.parametrize(("field", "value"), _JUST_OUTSIDE)
+    def test_just_outside_the_domain_reads_as_unset_with_one_warning(
+        self, field: ConfigFieldName, value: float, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            config = GuildConfig.from_redis({field.encode(): repr(value).encode()})
+        assert getattr(config, field) is None
+        assert _guild_state_warnings(caplog) == 1
+        assert field in caplog.text
+
+    @pytest.mark.parametrize("field", sorted(CONFIG_DOMAIN))
+    @pytest.mark.parametrize("raw", [b"nan", b"inf", b"-inf"])
+    def test_a_non_finite_value_reads_as_unset_with_one_warning(
+        self, field: ConfigFieldName, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            config = GuildConfig.from_redis({field.encode(): raw})
+        assert getattr(config, field) is None
+        assert _guild_state_warnings(caplog) == 1
+
+    def test_a_constructed_non_finite_value_is_refused_too(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A chained comparison is False for NaN; `not (v < lo or v > hi)` is not."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert GuildConfig(np_refresh_secs=float("nan")).np_refresh_secs is None
+        assert _guild_state_warnings(caplog) == 1
+
+    @pytest.mark.parametrize("garbage", [b"soon", b"5m", b"\xff"])
+    def test_garbage_reads_as_unset(self, garbage: bytes) -> None:
+        raw = {ConfigField.IDLE_TIMEOUT.encode(): garbage}
+        assert GuildConfig.from_redis(raw).idle_timeout_secs is None
+
+    def test_off_survives_as_a_set_value(self) -> None:
+        """OFF_SECS is falsy: a truthiness test anywhere on this path would turn a
+        guild's explicit "off" back into "follow the bot"."""
+        config = GuildConfig.from_redis({ConfigField.SLOW_NOTICE.encode(): b"0"})
+        assert config.slow_notice_secs is not None
+        assert config.slow_notice_secs == OFF_SECS
+        assert config.to_redis() == {ConfigField.SLOW_NOTICE: str(OFF_SECS)}
+
+    def test_off_is_refused_where_the_domain_has_no_off(self) -> None:
+        raw = {ConfigField.IDLE_TIMEOUT.encode(): b"0"}
+        assert GuildConfig.from_redis(raw).idle_timeout_secs is None
+
+    def test_a_constructed_out_of_domain_volume_is_unset(self) -> None:
+        assert GuildConfig(volume=1.5).volume is None
+
+    def test_a_refused_field_leaves_the_others(self) -> None:
+        """One bad field costs the guild that field, not its whole config."""
+        raw = {
+            ConfigField.VOLUME.encode(): b"1.5",
+            ConfigField.IDLE_TIMEOUT.encode(): b"600",
+            ConfigField.DEBUG_MODE.encode(): b"1",
+        }
+        config = GuildConfig.from_redis(raw)
+        assert config.volume is None
+        assert config.idle_timeout_secs == 600.0
+        assert config.debug_mode is True
+
+
+_BOT_COUNT_FIELDS = frozenset(knob.lower() for knob in config.INT_KNOBS)
+
+
+class TestBotConfig:
+    """bot:{application_id}:config's value object. Parsing only: the bounds are
+    the registry's."""
+
+    def test_every_attribute_is_its_wire_name(self) -> None:
+        names = {f.name for f in dataclasses.fields(BotConfig)}
+        assert names == _members(BotConfigField)
+
+    def test_the_count_fields_are_the_int_knobs(self) -> None:
+        ints = {f.name for f in dataclasses.fields(BotConfig) if f.type == (int | None)}
+        assert ints == _BOT_COUNT_FIELDS
+
+    def test_nothing_stored_is_all_unset(self) -> None:
+        assert BotConfig.from_redis({}) == BotConfig()
+        assert BotConfig().to_redis() == {}
+
+    @pytest.mark.parametrize("field", sorted(get_args(BotConfigFieldName.__value__)))
+    def test_each_field_round_trips(self, field: str) -> None:
+        value: float = 2 if field in _BOT_COUNT_FIELDS else 2.5
+        bot_config = dataclasses.replace(BotConfig(), **{field: value})
+        assert bot_config.to_redis() == {field: str(value)}
+        raw = {field.encode(): str(value).encode()}
+        assert BotConfig.from_redis(raw) == bot_config
+
+    @pytest.mark.parametrize("raw", [b"2.5", b"2.0", b"nan", b"two"])
+    def test_a_count_is_read_exactly(
+        self, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Not _b_opt_int: its float fallback reads 2.5 as 2."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            parsed = BotConfig.from_redis({b"play_inflight_max": raw})
+        assert parsed.play_inflight_max is None
+        assert _guild_state_warnings(caplog) == 1
+
+    @pytest.mark.parametrize("raw", [b"nan", b"inf", b"soon"])
+    def test_an_unusable_float_reads_as_unset(self, raw: bytes) -> None:
+        assert BotConfig.from_redis({b"heartbeat_interval_secs": raw}) == BotConfig()
+
+    def test_a_parseable_value_is_kept_whatever_its_bounds(self) -> None:
+        raw = {b"ping_tick_secs": b"0", b"play_resolve_concurrency": b"-3"}
+        parsed = BotConfig.from_redis(raw)
+        assert parsed.ping_tick_secs == 0.0
+        assert parsed.play_resolve_concurrency == -3
+
+
 class TestStoredVolumeMigration:
     """Volume moved from guild:{id}:state to guild:{id}:config. The fallback is a
     one-release migration path, not a permanent dual-read: dropping the legacy field
@@ -1864,6 +2021,26 @@ class TestStoredVolumeMigration:
             state=GuildStateData(), config=GuildConfig(volume=0.0)
         )
         assert snapshot.stored_volume == 0.0
+
+    def test_an_out_of_domain_volume_in_both_hashes_is_no_stored_volume(
+        self,
+    ) -> None:
+        """set_volume writes both copies with one string, so a hand-edit that
+        reached both leaves restore nothing to assign: the player stays at 100%."""
+        raw = {b"volume": b"1.5"}
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData.from_redis(raw), config=GuildConfig.from_redis(raw)
+        )
+        assert snapshot.stored_volume is None
+
+    def test_an_out_of_domain_config_volume_falls_back_to_the_legacy_copy(
+        self,
+    ) -> None:
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData.from_redis({b"volume": b"0.3"}),
+            config=GuildConfig.from_redis({b"volume": b"1.5"}),
+        )
+        assert snapshot.stored_volume == 0.3
 
 
 class TestGuildConfigTimezone:

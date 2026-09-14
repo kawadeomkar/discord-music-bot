@@ -167,6 +167,19 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
         return None
 
 
+def _b_count(raw: dict[bytes, bytes], key: str) -> int | None:
+    """An exact int() and nothing else: _b_opt_int's float fallback exists for
+    float-rounded snowflakes, and it reads a stored count of 2.5 as 2."""
+    v = raw.get(key.encode())
+    if v is None or v == b"":
+        return None
+    try:
+        return int(v)
+    except ValueError, TypeError:
+        log.warning(f"guild_state: malformed count for {key!r}: {v!r}")
+        return None
+
+
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
 
 
@@ -211,6 +224,11 @@ _CONFIG_FIELD_NAMES: Final[frozenset[str]] = frozenset(
 
 def is_config_field(name: str) -> TypeIs[ConfigFieldName]:
     return name in _CONFIG_FIELD_NAMES
+
+
+# Not a setting: the application id of the bot that last wrote a setting to the
+# hash, stamped by the store's writers when given one. GuildConfig never reads it.
+CONFIG_WRITER_FIELD: Final = "writer_app_id"
 
 
 type BotConfigFieldName = Literal[
@@ -286,6 +304,19 @@ CONFIG_DOMAIN: Final[Mapping[ConfigFieldName, ConfigDomain]] = MappingProxyType(
     }
 )
 
+
+def _admitted(field: ConfigFieldName, value: float | None) -> float | None:
+    """value, or None with a WARNING when CONFIG_DOMAIN refuses it."""
+    domain = CONFIG_DOMAIN[field]
+    if value is None or domain.admits(value):
+        return value
+    log.warning(
+        f"guild_state: {field}={value!r} is outside {domain.lo}..{domain.hi}; "
+        "reading it as unset"
+    )
+    return None
+
+
 # Zone names already proven unusable on this host. ZoneInfo caches successful
 # lookups only; a failed one is a filesystem miss plus a log line on every
 # render. Capped because this key outlives builds and can be hand-edited.
@@ -325,6 +356,22 @@ class GuildConfig:
     # An IANA name, not a ZoneInfo: the wire stays human-readable. Resolved by
     # tzinfo(), which is also where an unusable name degrades.
     timezone: str | None = None
+    idle_timeout_secs: float | None = None
+    alone_timeout_secs: float | None = None
+    np_refresh_secs: float | None = None
+    # OFF_SECS is a set value meaning off: compare with ==, never truthiness.
+    slow_notice_secs: float | None = None
+
+    def __post_init__(self) -> None:
+        """A numeric field CONFIG_DOMAIN does not admit becomes unset, so no
+        producer — a hand-edited hash, a caller's GuildConfig(...) — holds a value
+        outside it. Total, because it runs on the read path; no type coercion, as
+        in HistoryEntry.__post_init__. Attribute names are the wire names (a test
+        asserts it)."""
+        for field in CONFIG_DOMAIN:
+            value: float | None = getattr(self, field)
+            if value is not None and not CONFIG_DOMAIN[field].admits(value):
+                object.__setattr__(self, field, _admitted(field, value))
 
     def to_redis(self) -> dict[str, str]:
         """Only fields with a value: an unset field is ABSENT from the hash, so
@@ -336,6 +383,14 @@ class GuildConfig:
             mapping[ConfigField.VOLUME] = str(self.volume)
         if self.timezone is not None:
             mapping[ConfigField.TIMEZONE] = self.timezone
+        if self.idle_timeout_secs is not None:
+            mapping[ConfigField.IDLE_TIMEOUT] = str(self.idle_timeout_secs)
+        if self.alone_timeout_secs is not None:
+            mapping[ConfigField.ALONE_TIMEOUT] = str(self.alone_timeout_secs)
+        if self.np_refresh_secs is not None:
+            mapping[ConfigField.NP_REFRESH] = str(self.np_refresh_secs)
+        if self.slow_notice_secs is not None:
+            mapping[ConfigField.SLOW_NOTICE] = str(self.slow_notice_secs)
         return mapping
 
     def tzinfo(self) -> ZoneInfo:
@@ -365,6 +420,83 @@ class GuildConfig:
             debug_mode={"1": True, "0": False}.get(_b_str(raw, ConfigField.DEBUG_MODE)),
             volume=_b_float(raw, ConfigField.VOLUME),
             timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
+            idle_timeout_secs=_b_float(raw, ConfigField.IDLE_TIMEOUT),
+            alone_timeout_secs=_b_float(raw, ConfigField.ALONE_TIMEOUT),
+            np_refresh_secs=_b_float(raw, ConfigField.NP_REFRESH),
+            slow_notice_secs=_b_float(raw, ConfigField.SLOW_NOTICE),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BotConfig:
+    """The operator's stored overrides in bot:{application_id}:config, one
+    Optional field per -settings bot knob; absent means "run on the environment
+    value". Only parsing happens here. The bounds are the -settings registry's
+    (settings.in_bounds), and some depend on other knobs, so they are checked
+    where a value is applied, not where it is read."""
+
+    now_playing_update_interval_secs: float | None = None
+    heartbeat_interval_secs: float | None = None
+    play_slow_notice_secs: float | None = None
+    play_inflight_max: int | None = None
+    play_resolve_concurrency: int | None = None
+    play_resolve_wait_secs: float | None = None
+    stream_probe_timeout_secs: float | None = None
+    ping_tick_secs: float | None = None
+    ping_deadline_secs: float | None = None
+    debug_tick_secs: float | None = None
+    debug_deadline_secs: float | None = None
+    analytics_render_deadline_secs: float | None = None
+
+    def to_redis(self) -> dict[str, str]:
+        """Only fields with a value, as GuildConfig.to_redis."""
+        wire: tuple[tuple[BotConfigFieldName, float | None], ...] = (
+            (
+                BotConfigField.NOW_PLAYING_UPDATE_INTERVAL,
+                self.now_playing_update_interval_secs,
+            ),
+            (BotConfigField.HEARTBEAT_INTERVAL, self.heartbeat_interval_secs),
+            (BotConfigField.PLAY_SLOW_NOTICE, self.play_slow_notice_secs),
+            (BotConfigField.PLAY_INFLIGHT_MAX, self.play_inflight_max),
+            (BotConfigField.PLAY_RESOLVE_CONCURRENCY, self.play_resolve_concurrency),
+            (BotConfigField.PLAY_RESOLVE_WAIT, self.play_resolve_wait_secs),
+            (BotConfigField.STREAM_PROBE_TIMEOUT, self.stream_probe_timeout_secs),
+            (BotConfigField.PING_TICK, self.ping_tick_secs),
+            (BotConfigField.PING_DEADLINE, self.ping_deadline_secs),
+            (BotConfigField.DEBUG_TICK, self.debug_tick_secs),
+            (BotConfigField.DEBUG_DEADLINE, self.debug_deadline_secs),
+            (
+                BotConfigField.ANALYTICS_RENDER_DEADLINE,
+                self.analytics_render_deadline_secs,
+            ),
+        )
+        return {name: str(value) for name, value in wire if value is not None}
+
+    @classmethod
+    def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
+        """Deserialize raw HGETALL output; an empty dict yields all-unset, and an
+        unparseable or non-finite field reads as unset."""
+        return cls(
+            now_playing_update_interval_secs=_b_float(
+                raw, BotConfigField.NOW_PLAYING_UPDATE_INTERVAL
+            ),
+            heartbeat_interval_secs=_b_float(raw, BotConfigField.HEARTBEAT_INTERVAL),
+            play_slow_notice_secs=_b_float(raw, BotConfigField.PLAY_SLOW_NOTICE),
+            play_inflight_max=_b_count(raw, BotConfigField.PLAY_INFLIGHT_MAX),
+            play_resolve_concurrency=_b_count(
+                raw, BotConfigField.PLAY_RESOLVE_CONCURRENCY
+            ),
+            play_resolve_wait_secs=_b_float(raw, BotConfigField.PLAY_RESOLVE_WAIT),
+            stream_probe_timeout_secs=_b_float(
+                raw, BotConfigField.STREAM_PROBE_TIMEOUT
+            ),
+            ping_tick_secs=_b_float(raw, BotConfigField.PING_TICK),
+            ping_deadline_secs=_b_float(raw, BotConfigField.PING_DEADLINE),
+            debug_tick_secs=_b_float(raw, BotConfigField.DEBUG_TICK),
+            debug_deadline_secs=_b_float(raw, BotConfigField.DEBUG_DEADLINE),
+            analytics_render_deadline_secs=_b_float(
+                raw, BotConfigField.ANALYTICS_RENDER_DEADLINE
+            ),
         )
 
 
@@ -456,7 +588,8 @@ class GuildStateData:
         # 0.0 would be elevated to the default.
         total_pause = _b_float(raw, StateField.TOTAL_PAUSE_SECONDS)
         return cls(
-            volume=_b_float(raw, StateField.VOLUME),
+            # One wire name with ConfigField.VOLUME, so one domain.
+            volume=_admitted(ConfigField.VOLUME, _b_float(raw, StateField.VOLUME)),
             voice_channel_id=_b_opt_int(raw, StateField.VOICE_CHANNEL_ID),
             text_channel_id=_b_opt_int(raw, StateField.TEXT_CHANNEL_ID),
             current_song_url=_b_str(raw, StateField.CURRENT_SONG_URL),

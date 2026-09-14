@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Concatenate, Final, Optional, ParamSpec, TypeVar, cast
+from typing import (
+    Any,
+    Concatenate,
+    Final,
+    Optional,
+    ParamSpec,
+    TypeVar,
+    cast,
+    get_args,
+)
 
 import orjson
 import redis.asyncio as aioredis
@@ -21,6 +32,10 @@ from redis.typing import EncodableT, FieldT
 
 from src import config
 from src.guild_state import (
+    CONFIG_DOMAIN,
+    CONFIG_WRITER_FIELD,
+    BotConfig,
+    BotConfigFieldName,
     ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
@@ -29,6 +44,7 @@ from src.guild_state import (
     HistoryEntry,
     NowPlayingData,
     QueueEntry,
+    ResettableConfigField,
     SongQueueEntry,
     StateField,
     parse_history_entry,
@@ -48,6 +64,10 @@ GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 # setting that expires after a day idle reverts for reasons the user cannot
 # see. See GuildConfig and _pipe_expire_all.
 GUILD_CONFIG_KEY = "guild:{guild_id}:config"
+# An operator's overrides of the bot-wide knobs (BotConfig). Keyed by application
+# id, so a dev bot and a prod bot sharing one Redis cannot retune each other.
+# No TTL, like GUILD_CONFIG_KEY.
+BOT_CONFIG_KEY = "bot:{application_id}:config"
 # Global write-ahead buffer for the Postgres history archive: every guild's
 # entries interleave (each carries its guild_id), XADDed beside the display
 # list and drained oldest-first by HistoryOutboxDrainer. NO TTL — it holds
@@ -523,6 +543,42 @@ async def reclaim_outbox_stale(
 # Commands per pipeline, so one enormous bot cannot buffer every guild's reply
 # into a single response.
 _CONFIG_READ_BATCH: Final[int] = 250
+# SCAN's COUNT hint when listing config keys.
+_CONFIG_SCAN_COUNT: Final[int] = 1000
+# A listed key names a guild only in the exact form GUILD_CONFIG_KEY formats:
+# `guild:007:config` is not guild 7's key, and `*` also matches `guild:1:2:config`.
+_GUILD_CONFIG_KEY_RE: Final[re.Pattern[bytes]] = re.compile(
+    rb"guild:([1-9][0-9]*):config"
+)
+
+
+async def _read_config_batches(
+    redis: aioredis.Redis,
+    guild_ids: Sequence[int],
+    queue: Callable[[Pipeline, str], object],
+    *,
+    batch_timeout: Optional[float],
+) -> list[tuple[int, Any]]:
+    """(guild id, reply) for each guild whose batch was read; a batch that fails
+    or outlives `batch_timeout` is left out, with one WARNING. Pipelined rather
+    than one awaited command each: the pool RAISES rather than queueing past its
+    cap, so a plain fan-out fails every guild past it."""
+    read: list[tuple[int, Any]] = []
+    ids = list(guild_ids)
+    for start in range(0, len(ids), _CONFIG_READ_BATCH):
+        batch = ids[start : start + _CONFIG_READ_BATCH]
+        try:
+            # transaction=False: independent reads with nothing to make atomic.
+            pipe = redis.pipeline(transaction=False)
+            for guild_id in batch:
+                queue(pipe, GUILD_CONFIG_KEY.format(guild_id=guild_id))
+            async with asyncio.timeout(batch_timeout):
+                replies = await pipe.execute()
+        except Exception as e:  # noqa: BLE001 — reported by omission
+            log.warning(f"config read failed for {len(batch)} guilds: {e!r}")
+            continue
+        read.extend(zip(batch, replies))
+    return read
 
 
 async def read_guild_configs(
@@ -532,25 +588,64 @@ async def read_guild_configs(
     entry ONLY for a guild whose read happened: a missing guild means "could
     not read", not the all-unset GuildConfig an absent hash yields, and a
     caller that caches this must not treat the two alike or a Redis blink reads
-    as every guild un-choosing everything. Pipelined rather than one awaited
-    HGETALL each: the pool RAISES rather than queueing past its cap, so a plain
-    fan-out fails every guild past it."""
-    configs: dict[int, GuildConfig] = {}
-    ids = list(guild_ids)
-    for start in range(0, len(ids), _CONFIG_READ_BATCH):
-        batch = ids[start : start + _CONFIG_READ_BATCH]
+    as every guild un-choosing everything."""
+    replies = await _read_config_batches(
+        redis, guild_ids, lambda pipe, key: pipe.hgetall(key), batch_timeout=None
+    )
+    return {
+        guild_id: GuildConfig.from_redis(cast(dict[bytes, bytes], raw))
+        for guild_id, raw in replies
+    }
+
+
+async def read_config_writers(
+    redis: aioredis.Redis, guild_ids: Sequence[int], *, batch_timeout: float
+) -> dict[int, int]:
+    """Each guild's CONFIG_WRITER_FIELD stamp, on read_guild_configs' contract: a
+    guild whose batch failed or timed out is absent. So is a guild whose key
+    carries no integer stamp."""
+    replies = await _read_config_batches(
+        redis,
+        guild_ids,
+        lambda pipe, key: pipe.hget(key, CONFIG_WRITER_FIELD),
+        batch_timeout=batch_timeout,
+    )
+    writers: dict[int, int] = {}
+    for guild_id, raw in replies:
         try:
-            # transaction=False: independent reads with nothing to make atomic.
-            pipe = redis.pipeline(transaction=False)
-            for guild_id in batch:
-                pipe.hgetall(GUILD_CONFIG_KEY.format(guild_id=guild_id))
-            replies = await pipe.execute()
-        except Exception as e:  # noqa: BLE001 — reported by omission, see above
-            log.warning(f"config read failed for {len(batch)} guilds: {e}")
+            writers[guild_id] = int(raw)
+        except TypeError, ValueError:
             continue
-        for guild_id, raw in zip(batch, replies):
-            configs[guild_id] = GuildConfig.from_redis(cast(dict[bytes, bytes], raw))
-    return configs
+    return writers
+
+
+async def scan_guild_config_ids(
+    redis: aioredis.Redis, *, timeout: float
+) -> Optional[list[int]]:
+    """Every guild id with a guild:{id}:config key, or None when any SCAN call
+    fails or outlives `timeout`. Never raises. The calls run one after another, so
+    it holds one connection at a time."""
+    ids: dict[int, None] = {}
+    cursor = 0
+    try:
+        while True:
+            async with asyncio.timeout(timeout):
+                cursor, keys = cast(
+                    tuple[int, list[bytes]],
+                    await redis.scan(
+                        cursor,
+                        match=GUILD_CONFIG_KEY.format(guild_id="*"),
+                        count=_CONFIG_SCAN_COUNT,
+                    ),
+                )
+            for key in keys:
+                if (match := _GUILD_CONFIG_KEY_RE.fullmatch(key)) is not None:
+                    ids[int(match[1])] = None
+            if cursor == 0:
+                return list(ids)
+    except Exception as e:  # noqa: BLE001 — reported as None
+        log.warning(f"config key scan failed: {e!r}")
+        return None
 
 
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
@@ -590,6 +685,49 @@ def _guild_op(
         return wrapper
 
     return decorator
+
+
+def _bot_op(
+    default: Any = None,
+    default_factory: Optional[Callable[[], Any]] = None,
+) -> Callable[
+    [Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]]],
+    Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]],
+]:
+    """_guild_op's contract for BotConfigStore: on any exception, log
+    `[bot:{application_id}] {method} failed: {e}` and return `default` (or
+    `default_factory()`). Typed to its class, so either decorator on the other
+    store is a pyright error."""
+
+    def decorator(
+        func: Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]],
+    ) -> Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]]:
+        @wraps(func)
+        async def wrapper(
+            self: BotConfigStore, *args: _P.args, **kwargs: _P.kwargs
+        ) -> _R:
+            try:
+                return await func(self, *args, **kwargs)
+            except Exception as e:
+                log.warning(f"[bot:{self.application_id}] {func.__name__} failed: {e}")
+                return default_factory() if default_factory is not None else default
+
+        return wrapper
+
+    return decorator
+
+
+# Config fields with a writer of their own: set_volume keeps the legacy :state
+# copy fresh, set_timezone validates, set_debug_mode is a switch.
+_DEDICATED_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
+    {ConfigField.VOLUME, ConfigField.TIMEZONE, ConfigField.DEBUG_MODE}
+)
+_RESETTABLE_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
+    get_args(ResettableConfigField.__value__)
+)
+_BOT_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
+    get_args(BotConfigFieldName.__value__)
+)
 
 
 class GuildRedisStore:
@@ -636,6 +774,13 @@ class GuildRedisStore:
         queued writes: on a not-yet-created key it is a no-op."""
         pipe.expire(self.state_key(), GUILD_TTL)
         await pipe.execute()
+
+    def _pipe_config_tail(self, pipe: Pipeline, writer: Optional[int]) -> None:
+        """Queue what every config SET ends with: the CONFIG_WRITER_FIELD stamp when
+        a writer is given, and the PERSIST that keeps the key out of eviction."""
+        if writer is not None:
+            pipe.hset(self.config_key(), CONFIG_WRITER_FIELD, str(writer))
+        pipe.persist(self.config_key())
 
     # Queue operations
 
@@ -1075,19 +1220,29 @@ class GuildRedisStore:
             config=GuildConfig.from_redis(raw_config),
         )
 
+    def _volume_admitted(self, volume: float) -> bool:
+        """The volume setters take a raw float, so they check CONFIG_DOMAIN
+        themselves: a value the next read would turn back into unset is never sent."""
+        if CONFIG_DOMAIN[ConfigField.VOLUME].admits(volume):
+            return True
+        log.warning(f"[guild:{self.guild_id}] refusing out-of-domain volume {volume!r}")
+        return False
+
     @_guild_op(default=False)
-    async def set_volume(self, volume: float) -> bool:
+    async def set_volume(self, volume: float, *, writer: Optional[int] = None) -> bool:
         """Persist the guild volume. True when it landed. guild:{id}:config is
         the source of truth; the legacy state field is written TOO, and not
         deleted, for one release: `just up <older-sha>` reads only
         StateField.VOLUME and would otherwise reset every migrated guild to
         100%. Drop that leg with StateField.VOLUME and GuildStateData.volume."""
+        if not self._volume_admitted(volume):
+            return False
         # Encoded by GuildConfig.to_redis, never by hand, so the wire format
         # for volume has one definition.
         mapping = GuildConfig(volume=volume).to_redis()
         pipe = self.redis.pipeline()
         pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
-        pipe.persist(self.config_key())
+        self._pipe_config_tail(pipe, writer)
         pipe.hset(self.state_key(), StateField.VOLUME, mapping[ConfigField.VOLUME])
         # The legacy write can CREATE the state hash on a guild whose TTL has
         # lapsed, and a key created without an EXPIRE never expires.
@@ -1095,15 +1250,30 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def migrate_volume(self, volume: float) -> bool:
+    async def migrate_volume(
+        self, volume: float, *, writer: Optional[int] = None
+    ) -> bool:
         """Seed :config's volume from the legacy state field. HSETNX, never an
         overwrite: restore writes this back after an arbitrary number of awaits,
         and a `-volume` landing in that window would otherwise be clobbered by
         the older value, durably."""
+        if not self._volume_admitted(volume):
+            return False
         mapping = GuildConfig(volume=volume).to_redis()
         pipe = self.redis.pipeline()
         pipe.hsetnx(self.config_key(), ConfigField.VOLUME, mapping[ConfigField.VOLUME])
-        pipe.persist(self.config_key())
+        self._pipe_config_tail(pipe, writer)
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def reset_volume(self) -> bool:
+        """Delete the stored volume from :config AND the legacy :state copy in one
+        MULTI: restore reads config, then legacy, so a reset that left the legacy
+        copy would come back at the next restart. True when it landed."""
+        pipe = self.redis.pipeline()
+        pipe.hdel(self.config_key(), ConfigField.VOLUME)
+        pipe.hdel(self.state_key(), StateField.VOLUME)
         await pipe.execute()
         return True
 
@@ -1113,12 +1283,58 @@ class GuildRedisStore:
     async def get_config(self) -> GuildConfig:
         """This guild's stored preferences; all-unset when nothing is stored OR
         Redis is unreachable — the same answer, since unset means "follow the
-        host default" and an outage should degrade to the host's configuration."""
+        host default" and an outage should degrade to the host's configuration.
+        A caller that must tell the two apart uses read_config."""
+        raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.config_key()))
+        return GuildConfig.from_redis(raw)
+
+    @_guild_op(default=None)
+    async def read_config(self) -> Optional[GuildConfig]:
+        """This guild's stored preferences, or None when the read failed, so
+        "could not read" stays distinguishable from "never chose"."""
         raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.config_key()))
         return GuildConfig.from_redis(raw)
 
     @_guild_op(default=False)
-    async def set_debug_mode(self, enabled: bool) -> bool:
+    async def update_config(
+        self, config: GuildConfig, *, writer: Optional[int] = None
+    ) -> bool:
+        """Persist the fields `config` sets. True when it landed. Refused, with
+        nothing sent, when it sets no field or sets volume, timezone or
+        debug_mode, which have writers of their own. An out-of-domain value
+        arrives already unset by GuildConfig.__post_init__, so it is refused as
+        an empty config."""
+        mapping = config.to_redis()
+        dedicated = sorted(mapping.keys() & _DEDICATED_CONFIG_FIELDS)
+        if not mapping or dedicated:
+            log.warning(
+                f"[guild:{self.guild_id}] update_config refused: "
+                f"{dedicated or 'no field set'}"
+            )
+            return False
+        pipe = self.redis.pipeline()
+        pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
+        self._pipe_config_tail(pipe, writer)
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def reset_config_fields(self, *fields: ResettableConfigField) -> bool:
+        """Delete stored choices, so each field reads as "never chose". True when
+        it landed. Refused, with nothing sent, when it names no field or one that
+        is not resettable here: volume needs reset_volume."""
+        if not fields or not _RESETTABLE_CONFIG_FIELDS.issuperset(fields):
+            log.warning(
+                f"[guild:{self.guild_id}] reset_config_fields refused: {fields!r}"
+            )
+            return False
+        await self.redis.hdel(self.config_key(), *fields)
+        return True
+
+    @_guild_op(default=False)
+    async def set_debug_mode(
+        self, enabled: bool, *, writer: Optional[int] = None
+    ) -> bool:
         """Persist this guild's debug-mode choice. True when it landed; the
         command uses False to tell the user the setting applies to this process
         only. PERSIST because this key must never be an eviction candidate: an
@@ -1128,12 +1344,12 @@ class GuildRedisStore:
             self.config_key(),
             mapping=_hset_mapping(GuildConfig(debug_mode=enabled).to_redis()),
         )
-        pipe.persist(self.config_key())
+        self._pipe_config_tail(pipe, writer)
         await pipe.execute()
         return True
 
     @_guild_op(default=False)
-    async def set_timezone(self, name: str) -> bool:
+    async def set_timezone(self, name: str, *, writer: Optional[int] = None) -> bool:
         """Persist the IANA zone this guild renders ETAs in. True when it
         landed. Stores the name as given (GuildConfig.tzinfo resolves at read
         time). No caller yet: the write half of the planned `-options` command.
@@ -1149,7 +1365,7 @@ class GuildRedisStore:
             self.config_key(),
             mapping=_hset_mapping(GuildConfig(timezone=name).to_redis()),
         )
-        pipe.persist(self.config_key())
+        self._pipe_config_tail(pipe, writer)
         await pipe.execute()
         return True
 
@@ -1272,3 +1488,55 @@ class GuildRedisStore:
             except WatchError:
                 # Changed hands between the read and EXEC — same conclusion.
                 pass
+
+
+# ── Bot-wide Redis store ──────────────────────────────────────────────────────
+
+
+class BotConfigStore:
+    """Redis IO for bot:{application_id}:config, with GuildRedisStore's contract:
+    every method logs and never raises (@_bot_op). Its method names are the
+    guild store's config methods, and read_config is the None-on-failure reader."""
+
+    def __init__(self, redis: aioredis.Redis, application_id: int) -> None:
+        self.redis = redis
+        self.application_id = application_id
+
+    def config_key(self) -> str:
+        return BOT_CONFIG_KEY.format(application_id=self.application_id)
+
+    @_bot_op(default=None)
+    async def read_config(self) -> Optional[BotConfig]:
+        """The stored overrides, or None when the read failed."""
+        raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.config_key()))
+        return BotConfig.from_redis(raw)
+
+    @_bot_op(default=False)
+    async def update_config(self, config: BotConfig) -> bool:
+        """Persist the fields `config` sets. True when it landed; a config that
+        sets none is refused with nothing sent. PERSIST, because this key must
+        never be an eviction candidate."""
+        mapping = config.to_redis()
+        if not mapping:
+            log.warning(
+                f"[bot:{self.application_id}] update_config refused: no field set"
+            )
+            return False
+        pipe = self.redis.pipeline()
+        pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
+
+    @_bot_op(default=False)
+    async def reset_config_fields(self, *fields: BotConfigFieldName) -> bool:
+        """Delete stored overrides, so each knob runs on its environment value.
+        True when it landed; refused, with nothing sent, when it names no field or
+        one this hash does not hold."""
+        if not fields or not _BOT_CONFIG_FIELDS.issuperset(fields):
+            log.warning(
+                f"[bot:{self.application_id}] reset_config_fields refused: {fields!r}"
+            )
+            return False
+        await self.redis.hdel(self.config_key(), *fields)
+        return True

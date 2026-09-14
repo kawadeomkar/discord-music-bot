@@ -51,13 +51,16 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import HistoryEntry, SongQueueEntry
+from src.guild_state import BotConfig, GuildConfig, HistoryEntry, SongQueueEntry
 from src.redis_client import (
+    GUILD_CONFIG_KEY,
+    GUILD_STATE_KEY,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
     HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
+    BotConfigStore,
     GuildRedisStore,
     ack_outbox,
     ensure_outbox_group,
@@ -69,6 +72,7 @@ from src.redis_client import (
     read_outbox_pending,
     reclaim_outbox_stale,
     retire_outbox,
+    scan_guild_config_ids,
     trim_outbox_below,
 )
 
@@ -630,6 +634,76 @@ class TestOutboxKeyIsNonEvictable:
         # with no error and no log line.
         await _push(redis, 1)
         assert await redis.ttl(HISTORY_OUTBOX_KEY) == -1
+
+
+_GUILD_CONFIG_WRITES: list[Any] = [
+    pytest.param(lambda s: s.set_volume(0.5, writer=1234), id="set_volume"),
+    pytest.param(lambda s: s.migrate_volume(0.5, writer=1234), id="migrate_volume"),
+    pytest.param(lambda s: s.set_debug_mode(True, writer=1234), id="set_debug_mode"),
+    pytest.param(
+        lambda s: s.set_timezone("Europe/London", writer=1234), id="set_timezone"
+    ),
+    pytest.param(
+        lambda s: s.update_config(GuildConfig(idle_timeout_secs=600.0), writer=1234),
+        id="update_config",
+    ),
+]
+
+
+class TestConfigKeysAreNonEvictable:
+    """Golden rule 12 against a real server: every config write PERSISTs its key.
+    Each key is seeded with a TTL first, because `ttl == -1` on a key nothing ever
+    expired passes whether or not the PERSIST ran."""
+
+    @pytest.mark.parametrize("write", _GUILD_CONFIG_WRITES)
+    async def test_every_guild_config_write_persists(
+        self, redis: aioredis.Redis, write: Any
+    ) -> None:
+        store = GuildRedisStore(redis, 42)
+        await redis.hset(store.config_key(), "debug_mode", "1")
+        await redis.expire(store.config_key(), 600)
+
+        assert await write(store) is True
+
+        assert await redis.ttl(store.config_key()) == -1
+
+    async def test_the_bot_config_write_persists(self, redis: aioredis.Redis) -> None:
+        bot_store = BotConfigStore(redis, application_id=1234)
+        await redis.hset(bot_store.config_key(), "ping_tick_secs", "2.0")
+        await redis.expire(bot_store.config_key(), 600)
+
+        assert await bot_store.update_config(BotConfig(play_inflight_max=4)) is True
+
+        assert await redis.ttl(bot_store.config_key()) == -1
+
+
+class TestConfigKeyScanWalksTheCursor:
+    """fakeredis answers SCAN in one page, so only a real server exercises the
+    loop that follows the cursor."""
+
+    async def test_every_config_id_comes_back_across_pages(
+        self, redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ids = list(range(1, 2501))
+        pipe = redis.pipeline(transaction=False)
+        for guild_id in ids:
+            pipe.hset(GUILD_CONFIG_KEY.format(guild_id=guild_id), "debug_mode", "1")
+            pipe.hset(GUILD_STATE_KEY.format(guild_id=guild_id), "volume", "0.5")
+        await pipe.execute()
+        calls = 0
+        real_scan = redis.scan
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return await real_scan(*args, **kwargs)
+
+        monkeypatch.setattr(redis, "scan", counting)
+
+        found = await scan_guild_config_ids(redis, timeout=5.0)
+
+        assert calls > 1
+        assert sorted(found or []) == ids
 
 
 class TestConfigReadsSurviveTheConnectionCap:

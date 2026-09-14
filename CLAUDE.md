@@ -77,11 +77,12 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
 4. **Every user-visible reply is an embed.** `MusicContext.send` prepends the Now Playing
    block to responses; a bare `content` string would render as loose text above the
    block. Use `notice_embed()` / `send_embed()` from `src/util.py`.
-5. **Redis IO never raises out of `GuildRedisStore`.** Its methods are wrapped by the
-   `@_guild_op` decorator (log warning, return default). Everything must degrade
-   gracefully when Redis is down or `store is None` — the in-memory bot keeps working.
-   Keep new store methods on this pattern; never pass a **mutable** `default=` to
-   `_guild_op` (use `default_factory`; a test enforces this).
+5. **Redis IO never raises out of `GuildRedisStore` or `BotConfigStore`.** Their methods are
+   wrapped by `@_guild_op` and `@_bot_op` (log a warning prefixed `[guild:{id}]` or
+   `[bot:{application_id}]`, return the default). Everything must degrade gracefully
+   when Redis is down or `store is None` — the in-memory bot keeps working. Keep new
+   store methods on this pattern; never pass a **mutable** `default=` to either
+   decorator (use `default_factory`; `TestStoreOpDefaults` enforces this for both).
    **The scope is the class, not the module.** The outbox-stream helpers in the same
    file (`ensure_outbox_group`, `read_outbox_pending`, `read_outbox_new`,
    `retire_outbox`, `ack_outbox`, `outbox_depth`, `outbox_pending_count`,
@@ -692,7 +693,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
-| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
+| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. A numeric value outside `CONFIG_DOMAIN` reads as unset. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `ytdl:source:{query}` | string | 24h | search → {webpage_url, title, duration, uploader, thumbnail, cached_at}. The query is case-folded, EXCEPT for a URL — YouTube video ids are case-sensitive and two would share an entry. Past `_YT_SOURCE_FRESH_SECS` (1h) a hit is served as-is and a SEARCH is refreshed behind the reply (`_revalidate_source`, one flat POST); a link is not, since what ages is the ranking a search resolved through. An entry with no `cached_at` is from the build before the stamp and reads as fresh — it carries that build's 1h TTL |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata, plus a `traceparent` naming the extraction that minted the URL — the only record of where a serving URL came from, and what the playback span links back to — and `probed_at` when the verdict was PLAYABLE: inside `_PROBE_REUSE_SECS` (10s) the playback loop reuses that verdict instead of re-probing a URL the resolve just confirmed. An UNCONFIRMED entry is never stamped |
 | `ytdl:playlist:v2:{list id}` | string | 15m | a YouTube playlist's kept entries, in order, as the five identity fields a queue entry needs. Keyed on the `list=` id, so the playlist page, a watch link carrying `&index=`, and a `&t=` copy share one entry. Entries yt-dlp could not describe are dropped BEFORE the write, so a hit cannot resurrect them; an empty result is not written at all. TTL'd, so eviction-safe |
@@ -1366,7 +1367,11 @@ must keep meaning "follow the host default", or "never chose" collapses into "ch
 the default") → `to_redis` writes it only when set → `from_redis` reads an
 unrecognised value as unset → a numeric field also gets a `CONFIG_DOMAIN` entry in
 `guild_state.py`, which the `-settings` registry's static bounds must equal (a test
-compares them) → write method on `GuildRedisStore` that PERSISTs and
+compares them) and outside which `GuildConfig.__post_init__` reads a value as unset →
+write it with `GuildRedisStore.update_config`, which PERSISTs and takes `writer=`; a
+field that needs a write-boundary check or a second copy (as `timezone` and `volume`
+do) gets a dedicated writer instead, added to the set `update_config` refuses, that
+PERSISTs, takes `writer=` and
 **encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
 single-field config serializes to exactly that field, so the wire format has one
 definition and a setter cannot drift from what `from_redis` expects) → **validate at
