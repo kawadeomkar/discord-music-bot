@@ -2413,6 +2413,19 @@ through `_float_env`/`_int_env`, which record the floor each enforced
   `-debug`, `-analytics`, each `-play`'s admission and resolve wait, each stream probe) at
   the next one, and a value built into a long-lived object at its rebuild — a guild's
   resolve semaphore, once its in-flight requests have all retired.
+- **`TestBotKnobsAreReadAtCallTime`** holds that rule over every `src/` module in one AST
+  pass, matching identifiers by name, so an aliased import is caught without tracking it.
+  **G1**: no read of a knob's baseline (a `Name` or `Attribute` load, or an import of it from
+  `src.config`) outside `config.py`; an attribute of `BotConfigField`, whose wire names two
+  count knobs share, is not one. **G2**: no accessor called when a module is imported or a
+  `def`/`class` statement runs — module and class bodies, decorators and parameter defaults;
+  function bodies, lazy annotations and an accessor passed uncalled are fine. **G3**:
+  `set_override`/`clear_override` called only in `src/settings.py`. **G4**: no knob read in a
+  pool worker's entry function or any same-module function it calls by bare name, since a
+  worker re-imports modules with environment values only; the test asserts each entry still
+  exists. The same walker runs over a synthetic source holding every shape, and must report
+  exactly those lines. String-keyed access (`getattr(config, "PING_TICK_SECS")`) is invisible
+  to all four, and none exists in `src/`.
 - **`-debug` shows what is in force.** Each knob's Config-block row sets `knob=` and
   carries no fallback. `render_config_value` renders it at render time through the
   registry's `format_value`, with the `-settings bot` card's labels: `3s (default)`,

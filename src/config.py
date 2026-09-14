@@ -278,7 +278,8 @@ def env_floor(knob: FloatKnob | IntKnob) -> float:
 
 # Settable knobs: each accessor returns a stored -settings bot override, else the
 # UPPER_CASE env baseline. set_override's one caller in src/ is src/settings.py.
-# See docs/ARCHITECTURE.md#settings-resolution.
+# Consumers call the accessor when the value applies, never the baseline
+# (TestBotKnobsAreReadAtCallTime). See docs/ARCHITECTURE.md#settings-resolution.
 _FLOAT_OVERRIDES: Final[dict[FloatKnob, float]] = {}
 _INT_OVERRIDES: Final[dict[IntKnob, int]] = {}
 

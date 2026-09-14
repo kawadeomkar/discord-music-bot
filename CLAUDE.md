@@ -1092,6 +1092,7 @@ Per-guild synchronization primitives and what they protect:
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
 | `GuildSettings` per-guild write lock (src/settings.py) | `guild:{id}:config`: it is the ONLY writer (`-settings`, `-volume`, `-debug --enable/--disable`, restore's volume migration, guild removal), each write a bounded store call then a synchronous commit that stamps (guild, field) from one sequence counter. A read (restore's `seed`, the startup `hydrate`, `load`) never locks: it skips any field stamped after it began, so a read straddling a write never undoes it. The locks are refcounted and dropped when idle, and `reading()` registrations bound how long stamps and forget marks live. `DebugSettings` is its projection of `debug_mode`. `docs/ARCHITECTURE.md#settings-resolution` |
+| `config`'s override maps (`_FLOAT_OVERRIDES`, `_INT_OVERRIDES`) | each bot knob's `-settings bot` override. One writer, `BotSettings` in src/settings.py (guard G3); read synchronously through the knob's accessor, `config.<knob in lower case>()`, when the value applies — never the UPPER_CASE baseline, never at import (G1, G2), and never in a pool worker (G4). A reload of `config` drops them. `docs/ARCHITECTURE.md#settings-resolution` |
 | `Spotify._auth_lock` | token refresh double-fire |
 | `PostgresHistoryArchive._analytics_slot` | one -analytics aggregate in flight per process. Deliberately NOT `_read_slots`: that budget is two against a max_size=4 pool, sized when leaderboard was its only taker, and this is the heaviest of the three readers |
 | `chart_pool` (1 worker) | matplotlib off the event loop AND off the GIL. A thread is no better than no thread — figure construction is pure Python and contends with discord.py's audio player thread; measured loop lag spikes to 108ms threaded, against 4.23ms frame lateness in a process. Warmed at `setup_hook` **only when the archive is enabled**, after the yt-dlp prewarm that brings the forkserver up — the cold first render is 688ms warmed against 2,976ms not |
@@ -1211,6 +1212,11 @@ can spend the whole placement budget before the insert begins.
   existing assertions encode it. Disabled-mode behavior is covered by explicit tests
   that monkeypatch the flag per case — which wins over the fixture (same MonkeyPatch
   instance, later call). Don't "fix" the fixture to match the ship default.
+- **Bot knobs in tests** are set with `config.set_override(<knob>, value)` in the test body.
+  Don't patch a consumer module's copy (there is none), and don't use `monkeypatch.setitem` on
+  the private maps (pyright does not check that value). The autouse `clear_bot_knob_overrides`
+  clears every override after each test. `monkeypatch.setattr(config, "<KNOB>", v)` patches the
+  env **baseline**, which an override shadows. Use it only for tests about the baseline.
 - Redis in tests is `fakeredis`; Discord objects are `MagicMock(spec=...)` doubles,
   built through the spec cache `tests/conftest.py` installs at import — so **a spec
   class must not be mutated once it has been used as a spec** (`functools.wraps` on
@@ -1420,6 +1426,20 @@ for a time value (registry invariants 2 and 10) → tests in test_guild_state.py
 test_redis_client.py and test_settings.py. It goes in `guild:{id}:config`, NOT
 `guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
 any guild idle for a day.
+
+**Add a bot setting** (an owner-tunable, process-wide knob): parse its env baseline in
+`config.py` with `_float_env`/`_int_env` and a named floor → add the name to `FloatKnob` or
+`IntKnob` → add the accessor, `def <name in lowercase>() -> float` returning
+`_FLOAT_OVERRIDES.get("<NAME>", <NAME>)` (the accessor sweep in `test_config.py` fails a
+missing or miswired one) → every consumer calls `config.<name>()` when the value applies. Never
+call it at import, class-body or default-argument time, and never read `<NAME>` itself
+(`TestBotKnobsAreReadAtCallTime` G1/G2) → a registry `SettingSpec` with `attr` and `env` both
+`"<NAME>"`, a `field` whose `BotConfigField` value is `"<name in lowercase>"` (invariant 10), and a
+chat range whose minimum is strictly above `config.env_floor("<NAME>")` for a time-valued knob, at
+least equal for a count (invariant 3) → a `-debug` allowlist row with
+`knob="<NAME>"` and no `fallback` → tests set it with `config.set_override`. A value built into
+a long-lived object (a semaphore, a session) applies only when that object is rebuilt, and the
+spec's `applies` string says so. No pool worker may read it (G4).
 
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
