@@ -271,6 +271,8 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     # `--next` inserts through its own wrapper, which neutralizes the loop's
     # prefetch first — a plain front insert lands behind that claim.
     mp.queue_put_next = AsyncMock()
+    # A str, not auto-vivified: the queued-playlist card joins it into its text.
+    mp.playlist_facts = MagicMock(return_value="")
     mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in

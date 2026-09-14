@@ -825,7 +825,7 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 3).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 4: a playlist card sent with its unavailable-songs notice).
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 

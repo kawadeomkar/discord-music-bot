@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.37.1, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.37.3, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -910,7 +910,7 @@ per-tick-varying footer would edit the board until its deadline (which is why th
 suffix omits elapsed-ms).
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
-10-embed cap; worst case here is 3), then `_adopt_np_host_if_current` makes that message
+10-embed cap; worst case here is 4, a playlist card under its unavailable-songs notice), then `_adopt_np_host_if_current` makes that message
 the new host and retires the previous one (dedicated NP message → deleted; command
 response → strip-edited back to its own embeds). Attaching at send time makes response +
 block one atomic message, so the bar is never momentarily buried. Song end: host is

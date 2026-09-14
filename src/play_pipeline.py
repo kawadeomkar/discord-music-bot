@@ -20,7 +20,7 @@ from discord.ext import commands
 
 from src.guild_queue import QueueItem
 from src.guild_state import Analytics
-from src.musicplayer import InterjectOutcome, MusicPlayer
+from src.musicplayer import InterjectOutcome, MusicPlayer, queue_runtime
 from src.play_placement import (
     Placement,
     PlayRequest,
@@ -124,9 +124,14 @@ class EmptyPlaylistError(PlaylistInputError):
 @dataclass
 class ResolvedSpotifyPlaylist:
     """A Spotify playlist resolved to track titles, still needing per-title
-    YouTube search resolution."""
+    YouTube search resolution. The rest is what the enqueue embed reports:
+    lengths are Spotify's, not the YouTube matches'."""
 
     titles: list[str]
+    name: Optional[str] = None
+    duration_secs: int = 0
+    duration_partial: bool = False
+    unavailable: int = 0
 
 
 @dataclass
@@ -137,6 +142,8 @@ class ResolvedYoutubePlaylist:
 
     tracks: list[QueueObject]
     skipped: int = 0
+    title: Optional[str] = None
+    unavailable: int = 0
 
 
 def _apply_playlist_index(
@@ -271,21 +278,46 @@ def _head_depth(mp: MusicPlayer, placement: Placement) -> int:
     return mp.enqueue_depth()
 
 
+def _songs_ahead(mp: MusicPlayer, placement: Placement) -> int:
+    """Queued songs a playlist's first song plays after, read under the place lock.
+    Both front placements go ahead of the whole queue."""
+    return mp.queue.display_size() if placement is Placement.TAIL else 0
+
+
+def _playlist_heading(name: Optional[str], link: Optional[str]) -> str:
+    """The playlist's name linked to it, as the queue cards link a song; the bare
+    link when the resolve found no name. Stripped: Discord renders `**name **`
+    literally, and Spotify returns names with trailing spaces."""
+    name = (name or "").strip()
+    if not name:
+        return link or ""
+    label = f"**{safe_label(name, ECHO_ROW_MAX)}**"
+    return f"[{label}]({link})" if link else label
+
+
 async def _nothing_to_release() -> None:
     """Default `release_hold` for the enqueue helpers. A warm placement holds no
     playback gate, so there is nothing to release when its put lands."""
 
 
 async def _reply(
-    ctx: commands.Context, embeds: Sequence[discord.Embed], reaction: str = "👍"
+    ctx: commands.Context,
+    embeds: Sequence[discord.Embed],
+    reaction: str = "👍",
+    *,
+    together: bool = False,
 ) -> None:
     """Confirm a placement that already happened. return_exceptions: the song is IN
     the queue, and a missing Add Reactions permission or a deleted invoking message
-    must not render "Failed to queue song" over a song that plays."""
+    must not render "Failed to queue song" over a song that plays. `together` sends
+    several embeds as one message, in order; separate sends race."""
+    sends = (
+        [ctx.send(embeds=list(embeds))]
+        if together and len(embeds) > 1
+        else [ctx.send(embed=embed) for embed in embeds]
+    )
     results = await asyncio.gather(
-        ctx.message.add_reaction(reaction),
-        *(ctx.send(embed=embed) for embed in embeds),
-        return_exceptions=True,
+        ctx.message.add_reaction(reaction), *sends, return_exceptions=True
     )
     for failed in (r for r in results if isinstance(r, BaseException)):
         log.warning(f"Confirmation leg failed after the song was queued: {failed!r}")
@@ -372,7 +404,13 @@ async def queue_source(
             # Otherwise the enqueue below confirms "Queued playlist" with 👍
             # over nothing queued, which reads exactly like success.
             raise EmptyPlaylistError()
-        return ResolvedSpotifyPlaylist(titles)
+        return ResolvedSpotifyPlaylist(
+            titles,
+            name=playlist.name,
+            duration_secs=playlist.duration_secs,
+            duration_partial=playlist.duration_partial,
+            unavailable=playlist.unavailable,
+        )
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
             raise ValueError("YTSource with type=PLAYLIST must have list_id set")
@@ -388,7 +426,12 @@ async def queue_source(
         )
         tracks, skipped = _apply_playlist_index(playlist.tracks, source.index)
         _apply_playlist_timestamp(tracks, source)
-        return ResolvedYoutubePlaylist(tracks, skipped=skipped)
+        return ResolvedYoutubePlaylist(
+            tracks,
+            skipped=skipped,
+            title=playlist.title,
+            unavailable=playlist.unavailable,
+        )
     ts: Optional[int] = None
     search: str
     if isinstance(source, SpotifySource):
@@ -448,10 +491,10 @@ async def enqueue_playlist(
         # below take the place lock, and queue_put_next neutralizes inside it.
         await mp.settle_prefetch()
     warning = timestamp_warning(source)
-    warning_line = f"\n\n{warning}" if warning else ""
     # "Queued playlist" on its own reads as "at the back".
     next_suffix = " — plays next" if placement is Placement.NEXT else ""
     tracks: Sequence[QueueItem]
+    ahead = 0
     if isinstance(qobj, ResolvedSpotifyPlaylist):
         titles = qobj.titles
         count = len(titles)
@@ -462,11 +505,13 @@ async def enqueue_playlist(
         shown_titles = queue_message(
             [safe_label(t, ECHO_ROW_MAX) for t in islice(titles, _ECHO_PLUS_ONE)]
         )
-        embed = build_embed(
-            f"Queued playlist — {count} {pluralize(count, 'song')}{next_suffix}",
-            f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}{warning_line}",
-            discord.Color.blue(),
+        link = (
+            f"https://open.spotify.com/playlist/{source.id}"
+            if isinstance(source, SpotifySource)
+            else None
         )
+        heading = [_playlist_heading(qobj.name, link)]
+        runtime = (qobj.duration_secs, qobj.duration_partial)
         # Built outside the lock: one YTSource per title, and the depth it
         # is minted against is almost always still the depth at the insert.
         provisional = _head_depth(mp, placement)
@@ -478,6 +523,7 @@ async def enqueue_playlist(
         log.info(f"spotify playlist track count: {len(tracks)}")
         async with cog._plays.place(req) as verdict:
             if verdict.placed:
+                ahead = _songs_ahead(mp, placement)
                 tracks = _rebase_positions(
                     tracks, provisional, _head_depth(mp, placement)
                 )
@@ -489,32 +535,27 @@ async def enqueue_playlist(
         # attribute reads unguarded. Fix: have the Resolved*Playlist dataclasses
         # carry their own source.
         assert isinstance(source, YTSource)
-        playlist_url = source.playlist_url
         tracks = qobj.tracks
         count = len(tracks)
         log.info(f"yt playlist track count: {count}")
+        heading = [_playlist_heading(qobj.title, source.playlist_url)]
         # Stated: only the `index=` in the user's own URL explains fewer songs.
-        skipped_line = (
-            f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
-            f"earlier {pluralize(qobj.skipped, 'song')}\n"
-            if qobj.skipped
-            else ""
-        )
+        if qobj.skipped:
+            heading.append(
+                f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
+                f"earlier {pluralize(qobj.skipped, 'song')}"
+            )
         shown_titles = queue_message(
             [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, _ECHO_PLUS_ONE)]
         )
-        embed = build_embed(
-            f"Queued playlist — {count} {pluralize(count, 'song')}{next_suffix}",
-            f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
-            f"{skipped_line}\n{shown_titles}{warning_line}",
-            discord.Color.blue(),
-        )
+        runtime = queue_runtime(tracks)
         # Minted before the lock: at 5,000 tracks the pass is milliseconds of
         # event-loop time every sibling -play would wait out (_rebase_positions).
         provisional = _head_depth(mp, placement)
         tracks = _rebase_positions(tracks, 0, provisional)
         async with cog._plays.place(req) as verdict:
             if verdict.placed:
+                ahead = _songs_ahead(mp, placement)
                 tracks = _rebase_positions(
                     tracks, provisional, _head_depth(mp, placement)
                 )
@@ -525,8 +566,32 @@ async def enqueue_playlist(
     # The songs are in the queue, which is all the cold-start gate hold was
     # waiting for. What follows is a Discord send and a stream warm.
     await release_hold()
+    # After the put, like the single-song card, so the facts describe the slot taken.
+    header = [f"Requested by: [{ctx.author.mention}]", *heading]
+    header.append(mp.playlist_facts(ahead=ahead, runtime=runtime))
+    body = [line for line in header if line]
+    description = "\n".join(body) + f"\n\n{shown_titles}"
+    if warning:
+        description += f"\n\n{warning}"
+    embeds = [
+        build_embed(
+            f"Queued playlist — {count} {pluralize(count, 'song')}{next_suffix}",
+            description,
+            discord.Color.blue(),
+        )
+    ]
+    if qobj.unavailable:
+        n = qobj.unavailable
+        embeds.insert(
+            0,
+            notice_embed(
+                f"Skipped **{n}** unavailable {pluralize(n, 'song')} from this playlist.",
+                discord.Color.red(),
+            ),
+        )
     await asyncio.gather(
-        _reply(ctx, [embed]), _warm_front_track(tracks, placement, cog=cog)
+        _reply(ctx, embeds, together=True),
+        _warm_front_track(tracks, placement, cog=cog),
     )
 
 
