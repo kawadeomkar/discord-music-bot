@@ -350,12 +350,29 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback=str(config.PING_DEADLINE_SECS),
     ),
     _ConfigVar(
-        name="DEBUG_TICK_SECS", kind=_ConfigKind.VALUE, fallback=str(DEBUG_TICK_SECS)
+        name="DEBUG_TICK_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.DEBUG_TICK_SECS),
     ),
     _ConfigVar(
         name="DEBUG_DEADLINE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(DEBUG_DEADLINE_SECS),
+        fallback=str(config.DEBUG_DEADLINE_SECS),
+    ),
+    _ConfigVar(
+        name="QUEUE_PROGRESS_DELAY_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.QUEUE_PROGRESS_DELAY_SECS),
+    ),
+    _ConfigVar(
+        name="QUEUE_PROGRESS_TICK_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.QUEUE_PROGRESS_TICK_SECS),
+    ),
+    _ConfigVar(
+        name="QUEUE_PROGRESS_MAX_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.QUEUE_PROGRESS_MAX_SECS),
     ),
     _ConfigVar(
         name="POT_PROVIDER_URL", kind=_ConfigKind.URL, fallback="http://127.0.0.1:4416"

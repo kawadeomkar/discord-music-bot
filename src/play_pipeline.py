@@ -21,7 +21,12 @@ from discord.ext import commands
 from src.guild_queue import QueueItem
 from src.guild_state import Analytics
 from src.musicplayer import InterjectOutcome, MusicPlayer
-from src.play_placement import Placement, PlayRequest, ResolveMode
+from src.play_placement import (
+    Placement,
+    PlayRequest,
+    ResolveMode,
+    slow_resolve_notice,
+)
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -34,8 +39,10 @@ from src.sources import (
     timestamp_warning,
 )
 from src.telemetry import get_tracer
+from src.queue_progress import enqueue_progress, is_collection
 from src.util import (
     ECHO_MAX,
+    ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
     get_logger,
@@ -327,6 +334,7 @@ async def queue_source(
     analytics: Analytics,
     origin: str,
     mode: ResolveMode,
+    on_progress: Optional[ProgressFn] = None,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
@@ -339,6 +347,12 @@ async def queue_source(
     same helper, so "a search may go flat" cannot be decided from the input
     shape — only the caller knows whether the song must be playable on arrival.
 
+    `on_progress` is how a collection reports its walk to the live card, handed
+    down as a bare callback for the same reason `pool_slot` is: youtube.py and
+    spotify.py know nothing about guilds, and less about embeds. Absent for
+    everything that is not a collection, and for a cache hit, which finishes far
+    under the threshold that would show a card.
+
     `pool_slot` is the guild's resolve bound, handed down rather than held around
     this call: it is taken at the extraction itself, so a cache hit and the pure
     HTTP of a Spotify playlist do not queue behind two in-flight lookups. See
@@ -346,7 +360,9 @@ async def queue_source(
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
-        titles = await cog._require_spotify().playlist(source.id)
+        titles = await cog._require_spotify().playlist(
+            source.id, on_progress=on_progress
+        )
         if not titles:
             # Otherwise the enqueue below confirms "Queued playlist" with 👍
             # over nothing queued, which reads exactly like success.
@@ -362,6 +378,7 @@ async def queue_source(
             analytics=analytics,
             user_input=origin,
             redis=cog.redis,
+            on_progress=on_progress,
             pool_slot=pool_slot,
         )
         tracks, skipped = _apply_playlist_index(tracks, source.index)
@@ -627,6 +644,7 @@ async def _resolve_interjection_source(
     source: Union[SpotifySource, YTSource, SoundcloudSource],
     *,
     origin: str,
+    on_progress: Optional[ProgressFn] = None,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     cog: MusicBot,
 ) -> tuple[QueueObject, list[QueueItem]]:
@@ -641,7 +659,9 @@ async def _resolve_interjection_source(
         queued_at=ctx.message.created_at.timestamp(), queue_position=0
     )
     if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-        titles = await cog._require_spotify().playlist(source.id)
+        titles = await cog._require_spotify().playlist(
+            source.id, on_progress=on_progress
+        )
         if not titles:
             raise EmptyPlaylistError()
         yts = await _searches_for(titles, analytics=analytics, origin=origin)
@@ -665,6 +685,7 @@ async def _resolve_interjection_source(
             analytics=analytics,
             user_input=origin,
             redis=cog.redis,
+            on_progress=on_progress,
             pool_slot=pool_slot,
         )
         # Indexed here too: `--now` on a link copied mid-playlist starts at the
@@ -716,133 +737,158 @@ async def interject_flow(
     during the 1–4s extraction removes the reason and the track is appended.
     """
     source = parse_input(url)
-    qobj, follow_on = await _resolve_interjection_source(
-        ctx,
-        source,
-        origin=url,
-        pool_slot=cog._plays.resolve_slot(req),
-        cog=cog,
-    )
-    # The head only: `interjected` is attribution, which song cut the line.
-    qobj.interjected = True
-
-    # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
-    # the interrupt and the new song, and the current song plays through the wait.
-    # A gate, not a hint — this flow stops what is playing, so a head that could
-    # not be extracted must not get that far. Also back-fills the embed fields.
-    if not await YTDL.prefetch_stream(qobj, redis=cog.redis):
-        raise RuntimeError(
-            "Could not get a playable stream for that song, so the current "
-            "song was left alone."
-        )
-
-    # Before the lock: the neutralize can wait on a prefetch pinned in the
-    # yt-dlp executor, which under _place would hold the guild's lock.
-    await mp.settle_prefetch()
-
-    outcome: Optional[InterjectOutcome] = None
-    resumed = False
-    async with cog._plays.place(req) as verdict:
-        if not verdict.placed:
-            pass
-        elif require_paused and not vc.is_paused():
-            # Resumed during the resolve, so the reason to interject is gone:
-            # append instead. The append takes the lock again on its own.
-            resumed = True
-        else:
-            outcome = await mp.interject(
-                qobj, vc, resume_paused=resume_paused, follow_on=follow_on
-            )
-            if outcome is None:
-                # The song ended during the resolve, so this interrupted nothing:
-                # the marker comes off and the song front-inserts instead.
-                qobj.interjected = False
-                # interject() also returns None when the loop moved on to a
-                # DIFFERENT song, which this insert waits behind: depth 1.
-                qobj.analytics = replace(
-                    qobj.analytics, queue_position=front_insert_depth(mp)
+    # The second entry point for both, covering `-playnow <playlist>` and plain
+    # `-play` over a paused song. A plain `async with`: no gate hold here, so the
+    # LIFO constraint on the other entry point does not apply. It spans the whole
+    # flow, so the retraction lands after vc.stop() — the delete is a Discord
+    # round trip and this command stops what is playing.
+    async with contextlib.AsyncExitStack() as stack:
+        progress = None
+        if is_collection(source):
+            progress = await stack.enter_async_context(
+                enqueue_progress(
+                    ctx,
+                    source,
+                    placement_note="Interrupts the current song once it's queued.",
+                    debug_suffix=cog.debug_suffix(ctx),
+                    dropped=req.dropped,
                 )
-                # queue_put_next, for the claim the loop's prefetch holds.
-                # prefetch=False — the stream URL was warmed above.
-                await mp.queue_put_next([qobj, *follow_on], prefetch=False)
-    if not verdict.placed:
-        await cog._report_dropped(req, verdict)
-        return
-
-    if resumed:
-        # Clear the marker: a queued song must not trigger replace semantics
-        # later. The interjection's 0 is replaced at the insert.
-        qobj.interjected = False
-        note = (
-            collection_note(url, len(follow_on) + 1, head_playing=False)
-            if follow_on
-            else ""
-        )
-        await enqueue_single(
+            )
+        else:
+            await stack.enter_async_context(
+                slow_resolve_notice(
+                    ctx,
+                    query=req.query,
+                    debug_suffix=cog.debug_suffix(ctx),
+                    dropped=req.dropped,
+                )
+            )
+        qobj, follow_on = await _resolve_interjection_source(
             ctx,
-            qobj,
-            mp,
-            req,
-            note=note,
-            warning=timestamp_warning(source),
-            follow_on=follow_on,
+            source,
+            origin=url,
+            on_progress=progress.update if progress else None,
+            pool_slot=cog._plays.resolve_slot(req),
             cog=cog,
         )
-        return
+        # The head only: `interjected` is attribution, which song cut the line.
+        qobj.interjected = True
 
-    if outcome is None:
-        note = "The song being interrupted already ended — queued to play next instead."
+        # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
+        # the interrupt and the new song, and the current song plays through the wait.
+        # A gate, not a hint — this flow stops what is playing, so a head that could
+        # not be extracted must not get that far. Also back-fills the embed fields.
+        if not await YTDL.prefetch_stream(qobj, redis=cog.redis):
+            raise RuntimeError(
+                "Could not get a playable stream for that song, so the current "
+                "song was left alone."
+            )
+
+        # Before the lock: the neutralize can wait on a prefetch pinned in the
+        # yt-dlp executor, which under _place would hold the guild's lock.
+        await mp.settle_prefetch()
+
+        outcome: Optional[InterjectOutcome] = None
+        resumed = False
+        async with cog._plays.place(req) as verdict:
+            if not verdict.placed:
+                pass
+            elif require_paused and not vc.is_paused():
+                # Resumed during the resolve, so the reason to interject is gone:
+                # append instead. The append takes the lock again on its own.
+                resumed = True
+            else:
+                outcome = await mp.interject(
+                    qobj, vc, resume_paused=resume_paused, follow_on=follow_on
+                )
+                if outcome is None:
+                    # The song ended during the resolve, so this interrupted nothing:
+                    # the marker comes off and the song front-inserts instead.
+                    qobj.interjected = False
+                    # interject() also returns None when the loop moved on to a
+                    # DIFFERENT song, which this insert waits behind: depth 1.
+                    qobj.analytics = replace(
+                        qobj.analytics, queue_position=front_insert_depth(mp)
+                    )
+                    # queue_put_next, for the claim the loop's prefetch holds.
+                    # prefetch=False — the stream URL was warmed above.
+                    await mp.queue_put_next([qobj, *follow_on], prefetch=False)
+        if not verdict.placed:
+            await cog._report_dropped(req, verdict)
+            return
+
+        if resumed:
+            # Clear the marker: a queued song must not trigger replace semantics
+            # later. The interjection's 0 is replaced at the insert.
+            qobj.interjected = False
+            note = (
+                collection_note(url, len(follow_on) + 1, head_playing=False)
+                if follow_on
+                else ""
+            )
+            await enqueue_single(
+                ctx,
+                qobj,
+                mp,
+                req,
+                note=note,
+                warning=timestamp_warning(source),
+                follow_on=follow_on,
+                cog=cog,
+            )
+            return
+
+        if outcome is None:
+            note = "The song being interrupted already ended — queued to play next instead."
+            if follow_on:
+                # Nothing was interrupted, so the head is QUEUED rather than
+                # playing: it counts, and -remove reaches it.
+                note += collection_note(url, len(follow_on) + 1, head_playing=False)
+            await asyncio.gather(
+                ctx.send(embed=playing_next_embed(ctx, qobj, note=note)),
+                ctx.message.add_reaction("⏯️"),
+            )
+            return
+
+        if outcome.resume_position is None:
+            desc = f"**{outcome.interrupted_title}** was nearly finished and will not resume."
+        elif outcome.returns_paused:
+            # returns_paused, not was_paused: with resume_paused=False a paused
+            # song comes back playing.
+            desc = (
+                f"**{outcome.interrupted_title}** will return paused at "
+                f"`{outcome.resume_position_str}`."
+            )
+        elif outcome.was_paused:
+            desc = (
+                f"**{outcome.interrupted_title}** was paused at "
+                f"`{outcome.resume_position_str}` and will resume from there."
+            )
+        else:
+            desc = (
+                f"**{outcome.interrupted_title}** will resume at "
+                f"`{outcome.resume_position_str}`."
+            )
         if follow_on:
-            # Nothing was interrupted, so the head is QUEUED rather than
-            # playing: it counts, and -remove reaches it.
-            note += collection_note(url, len(follow_on) + 1, head_playing=False)
+            # The interrupted song waits behind the whole playlist, so the reply says
+            # so and names the undo (`-remove <the link>` matches user_input).
+            desc += collection_note(
+                url,
+                len(follow_on),
+                returns=(
+                    f" **{outcome.interrupted_title}** returns after the last of them."
+                    if outcome.resume_position is not None
+                    else ""
+                ),
+                head_playing=True,
+            )
         await asyncio.gather(
-            ctx.send(embed=playing_next_embed(ctx, qobj, note=note)),
+            send_embed(
+                ctx,
+                truncate_embed_title(f"▶️ Playing now: {qobj.title}"),
+                f"Requested by: [{ctx.author.mention}]\n{desc}",
+                discord.Color.blue(),
+                thumbnail=qobj.thumbnail,
+            ),
             ctx.message.add_reaction("⏯️"),
         )
-        return
-
-    if outcome.resume_position is None:
-        desc = (
-            f"**{outcome.interrupted_title}** was nearly finished and will not resume."
-        )
-    elif outcome.returns_paused:
-        # returns_paused, not was_paused: with resume_paused=False a paused
-        # song comes back playing.
-        desc = (
-            f"**{outcome.interrupted_title}** will return paused at "
-            f"`{outcome.resume_position_str}`."
-        )
-    elif outcome.was_paused:
-        desc = (
-            f"**{outcome.interrupted_title}** was paused at "
-            f"`{outcome.resume_position_str}` and will resume from there."
-        )
-    else:
-        desc = (
-            f"**{outcome.interrupted_title}** will resume at "
-            f"`{outcome.resume_position_str}`."
-        )
-    if follow_on:
-        # The interrupted song waits behind the whole playlist, so the reply says
-        # so and names the undo (`-remove <the link>` matches user_input).
-        desc += collection_note(
-            url,
-            len(follow_on),
-            returns=(
-                f" **{outcome.interrupted_title}** returns after the last of them."
-                if outcome.resume_position is not None
-                else ""
-            ),
-            head_playing=True,
-        )
-    await asyncio.gather(
-        send_embed(
-            ctx,
-            truncate_embed_title(f"▶️ Playing now: {qobj.title}"),
-            f"Requested by: [{ctx.author.mention}]\n{desc}",
-            discord.Color.blue(),
-            thumbnail=qobj.thumbnail,
-        ),
-        ctx.message.add_reaction("⏯️"),
-    )

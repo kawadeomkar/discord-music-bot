@@ -22,6 +22,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
    - [Now Playing Host Model](#now-playing-host-model)
+   - [Queue progress card](#queue-progress-card)
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
    - [Crash Recovery](#crash-recovery)
@@ -647,11 +648,13 @@ On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases n
 
 #### Saying so while it waits
 
-`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands. It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
+`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands or the request is dropped (see [Queue progress card](#queue-progress-card)). It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
 
 No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
 
 It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. Bypassing it also skips debug-mode decoration, so the footer arrives pre-rendered as `debug_suffix`, like the dashboards'. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits a Discord call, and an await between the teardown decision and the hold release is exactly what that path may not have.
+
+**Single tracks only, and one per channel.** A collection shows the [queue progress card](#queue-progress-card) instead — two messages for one `-play` is worse than either — and both entry points take the same `if`, the interjection route included. Because `PLAY_INFLIGHT_MAX` is 16 and `PLAY_RESOLVE_CONCURRENCY` guarantees the tail of a pasted burst crosses the delay, `util.channel_claim` gives a channel to one notice at a time. The claim is exclusive and keyed by KIND (a channel showing a card can still show a notice for a different request), and it is taken at the SEND, so a request that settles inside its own delay never denies the slot to a slow sibling. A request that loses the claim asks again every `_NOTICE_RETRY_SECS` until it settles, so its notice posts once the other is taken back; each notice names its query and its requester, so the one on screen is never mistaken for someone else's. The span records `play.slow_notice` (`shown`, `claimed_elsewhere`, `send_failed`).
 
 **The task that posts it is the task that retracts it**, in its own `finally`. A caller cancelled while the send is in flight never learns the message handle, so a delete anywhere else would leave the notice standing with nothing that knows its id. The caller only signals and joins, through `util.join_task`, which re-raises a cancellation aimed at the caller and shields the joined task: `await task` makes the joined task the canceller's `_fut_waiter`, so an unshielded join would cancel the very task it is waiting out, mid-cleanup.
 
@@ -843,6 +846,44 @@ snapshot, which `RuntimeSampler` resamples at
 is opt-in per guild and off by default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
+
+---
+
+### Queue progress card
+
+A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card in the channel saying how far it has got (`src/queue_progress.py`). It is deleted the moment the enqueue lands, or the moment `-stop`, `-clear`, `-remove` or a teardown drops the request.
+
+**A drop is heard mid-resolve.** Those commands stamp `PlayRequest.dropped_by`, and `place()` reads the stamp only once the resolve returns — about 90 s after the stamp for a 5,547-track playlist. So the stamp also sets `PlayRequest.dropped`, an `asyncio.Event` handed to the card and to the slow-resolve notice, and `retire_player` sets it for every unplaced request on the player it retires (a kick or the alone-watchdog calls no command). The message comes down at once; the resolve itself runs to completion and its result is discarded at `place()`, which is where the "dropped" reply is sent.
+
+**The wait is in the resolve, not in the enqueue.** Measured on a YouTube Mix whose walk yielded 1,671 entries — 492 distinct videos, see [The playlist cache](#the-playlist-cache): 28.98 s of a 29.60 s command is `queue_source`, and the insert is 0.01 s. A bar counting songs added to the queue would sit at 0 for 29 seconds and then jump to 100 % in one frame, which is worse than no bar. So the card reports the resolve, and its numbers come from the source walking its own pages.
+
+**Two phases, because the others are unreachable.** `FETCHING`, and `STALLED` once the card passes `QUEUE_PROGRESS_MAX_SECS`. A "queued" or "done" render would exist for less than a frame — the insert is 0.01 s and the card is deleted immediately after — and every failure path deletes the card before anything could render one.
+
+**Where the numbers come from.** A Spotify collection is easy: the pager reads `total` from page 1 and reports after every page, so its bar is determinate from the first tick. A YouTube collection has no such channel — `YTDL.yt_playlist` awaits one `extract_info` that returns after the whole continuation walk, so the track count and the tracks would arrive in the same tick, milliseconds before the card is deleted. It gets one built for it (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). A collection with no header count at all — a Mix (`RD…`, other than a curated `RDCLAK5uy_` list), a channel tab — still renders indeterminate: an elapsed line rounded to 5 s and no bar. That is a steady state, not a transient one.
+
+**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null and ID-less entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
+
+**The card is a SECOND message and never becomes the confirmation.** `play_pipeline._reply` sends the confirmation through `MusicContext.send`, which prepends the Now Playing block and adopts that message as the NP host. A card sent with `ctx.channel.send` — which it must be, or the progress updater rewrites it every 3 s — can never do that, so merging the two would stop every playlist enqueue from re-hosting the NP card at the channel bottom. The cost of not merging is that the existing host sits *above* the card, edited invisibly, for the card's whole life: one of the documented exceptions to the host model, listed under [Now Playing host invariants](#now-playing-host-invariants), bounded by the delete, and NOT by the ceiling below — that stops the card EDITING, it does not take it down, so a resolve that outlives it leaves the host buried until the enqueue finally settles.
+
+**Two entry points.** `commands/play.py::_resolve_and_place` covers `-play`, `-playnext` and the cold start; `play_pipeline.interject_flow` covers `-playnow <playlist>` and plain `-play <playlist>` over a paused song, which return one level above `_resolve_and_place` and would otherwise get nothing. Only the first has a playback gate hold, so only the first is subject to the ordering rule below.
+
+**Ordering, at the first entry point.** The card is entered on the outer `AsyncExitStack` **before** the gate hold, so LIFO unwinds it after: taking the card back awaits a Discord call, and on a cold start no await may sit between `abandon_cold_start`'s hold-count read and the hold's release, or two participants each read the other's hold and neither tears the player down.
+
+**The driver is stopped by a signal and awaited, never cancelled.** The send is deferred past the delay, so it is owned by a task — the command body is blocked inside `queue_source` and cannot wait it out. That task both sends and then edits, so there is a recurring window in which the message exists on Discord and the local handle does not; cancelling inside it orphans the card permanently, because the teardown reads `None` and deletes nothing while the POST lands anyway. So the task that sent the card deletes it in its own `finally`, and the teardown sets the settled signal and joins the task, bounded by `QUEUE_PROGRESS_JOIN_SECS`. The delete suppresses `HTTPException` — it runs while an `ExtractionError` may be propagating, and a 404 about a card the user deleted must not replace the real error.
+
+**Nothing edits under the place lock.** `PlayRegistry.place()`'s body is the put alone, bounded by `PLACE_TIMEOUT_SECS`; the card's state object takes a plain attribute store and the driver renders on its own cadence.
+
+**The edit budget is per channel.** Discord allows 5 edits / 5 s per channel and every `PATCH /channels/{cid}/messages/{mid}` there shares one bucket, which the NP progress bar already spends a third of at its 3 s cadence. A 429 never reaches `safe_edit` — `HTTPClient.request` logs it and sleeps the bucket internally — so the symptom is the NP bar silently freezing, invisible in our logs. Three things keep the card inside the budget:
+
+- `QUEUE_PROGRESS_TICK_SECS` defaults to **5.0 s** with its own floor of 2.0 s, not the dashboards' 0.05 s: `-ping` and `-debug` can share that floor because their deadlines cap the damage at ~8 edits, and this card has no such cap.
+- **One card per channel.** `PLAY_INFLIGHT_MAX` is 16 and requests resolve concurrently, so a pasted burst would otherwise arm sixteen edit loops on one bucket. `PLAY_RESOLVE_CONCURRENCY` cannot throttle them — it is taken inside `_extract_once`, below where the card is entered, so requests 3..16 park there and are *guaranteed* to cross the display threshold. The claim is taken when a card is about to be sent rather than at entry, so a cache hit that finished inside the delay never denies the slot to a slow sibling. A request that loses it asks again every tick, so its card appears once the other is taken back rather than never. The span records `play.progress_card` (`shown`, `claimed_elsewhere`, `stalled`, `send_failed`), and a stall also logs a WARNING with the counts it reached.
+- **The count is quantized to the bar's cells.** The bar is the Now Playing bar (`util.progress_line`), labelled `` `done` … `total` songs `` where the NP card puts clock times. A Spotify page landing every ~300 ms moves the raw count six times per tick, so `embeds_changed` would suppress nothing. The number rendered is the smallest count that fills the cells the bar draws, so the two never disagree and a whole enqueue costs at most `BAR_WIDTH` edits. This is also why a determinate card shows no elapsed line: the elapsed step moves every tick by construction, which would undo the quantization and put the card back to one edit per tick.
+
+**What the card does NOT fix is the composite.** Card + NP bar is 0.2/s + 0.333/s, comfortably inside the 1.0/s the bucket allows. Add a `-debug` at its 1 s tick and the channel is at **1.533/s — 7.67 edits per 5 s against 5**, for the dashboard's whole 8 s deadline. That overlap is already 33 % over budget on `main` without the card, so the card worsens an existing problem rather than creating one; the honest statement is that the per-feature budgets hold and the composite does not, and the thing that gives way is the NP bar, silently. Anyone adding a fifth edit loop to a channel should fix the composite rather than size against the remainder.
+
+**The card owns its own deadline.** Nothing else bounds the work it watches: `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a resolve slot and deliberately not the extraction inside it, `PLACE_TIMEOUT_SECS` bounds 0.01 s of a 29 s command, and yt-dlp's own `socket_timeout` × `retries` lets a single page hold 300 s with no aggregate bound across 56 of them. Past `QUEUE_PROGRESS_MAX_SECS` the card renders its terminal state once and stops editing; the exit stack still deletes it when the enqueue finally settles.
+
+**The typing indicator keeps running under it.** `background_typing` is refcounted per channel, so suppressing it for a collection would drop it for every other `-play` in flight there.
 
 ---
 

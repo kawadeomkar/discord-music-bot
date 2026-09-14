@@ -46,6 +46,9 @@ def _float_env(name: str, default: float, *, minimum: float) -> float:
     the driver's timed wait into a hot spin."""
     raw = (os.environ.get(name) or "").strip()
     if not raw:
+        # Checked too: a floor derived from other knobs can rise past a default.
+        if default < minimum:
+            raise ValueError(f"{name} must be >= {minimum}; its default is {default}")
         return default
     try:
         value = float(raw)
@@ -84,6 +87,41 @@ DEBUG_DEADLINE_SECS: float = _float_env(
 ANALYTICS_RENDER_DEADLINE_SECS: float = _float_env(
     "ANALYTICS_RENDER_DEADLINE_SECS", 20.0, minimum=_MIN_DASHBOARD_SECS
 )
+
+# The live card a slow collection enqueue shows (src/queue_progress.py). The delay
+# marks the unusual rather than narrating every -play: a cache-hit playlist
+# resolves in one Redis GET and lands before it fires. Above 2.0s because a
+# measured ten-track enqueue ran 2.03s end to end and does not need a card; the
+# real trigger is a cliff at ~101 tracks, where a second continuation page makes
+# the resolve ~3.1s, so any value between 2.03 and 3.1 behaves identically.
+QUEUE_PROGRESS_DELAY_SECS: float = _float_env(
+    "QUEUE_PROGRESS_DELAY_SECS", 2.5, minimum=_MIN_DASHBOARD_SECS
+)
+
+# The card's own floor, not the dashboards' 0.05: -ping and -debug can share that
+# because their deadlines cap the damage at ~8 edits, and this card has none.
+# Discord allows 5 edits / 5s per CHANNEL — one bucket, shared with the Now
+# Playing bar's 3s cadence, which already spends a third of it.
+_MIN_QUEUE_TICK_SECS: Final[float] = 2.0
+
+QUEUE_PROGRESS_TICK_SECS: float = _float_env(
+    "QUEUE_PROGRESS_TICK_SECS", 5.0, minimum=_MIN_QUEUE_TICK_SECS
+)
+
+# The card's own ceiling. Nothing else bounds the work it watches:
+# PLAY_RESOLVE_WAIT_SECS bounds the wait for a slot and deliberately not the
+# extraction inside it, and PLACE_TIMEOUT_SECS bounds 0.01s of a 29s command.
+# Past it the card says so once and stops editing; it is still deleted when the
+# enqueue settles.
+# Floored at delay + tick, the two knobs above it: under the delay the card is born
+# stalled, and under delay + tick it never renders a second frame. Below the floor
+# startup is refused, default included.
+QUEUE_PROGRESS_MAX_SECS: float = _float_env(
+    "QUEUE_PROGRESS_MAX_SECS",
+    300.0,
+    minimum=QUEUE_PROGRESS_DELAY_SECS + QUEUE_PROGRESS_TICK_SECS,
+)
+
 
 # Higher floor than the dashboards: each tick is a Redis write per PLAYING guild,
 # AOF-appended.

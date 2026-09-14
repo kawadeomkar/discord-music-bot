@@ -169,10 +169,11 @@ class PoolSlotUnavailable(Exception):
     See docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
 
 
-# One transient message per channel per KIND, exclusive. PLAY_INFLIGHT_MAX is 16
-# and requests resolve concurrently, and discord.py sleeps a throttled channel
-# bucket internally — so sixteen slow-resolve notices would cost the
-# confirmations. See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait.
+# One transient message per channel per KIND, exclusive: a card and a
+# slow-resolve notice are different kinds and coexist, but sixteen cards do not.
+# PLAY_INFLIGHT_MAX is 16 and requests resolve concurrently, and discord.py
+# sleeps a throttled channel bucket internally — so the cost lands on the
+# confirmations, not here. See docs/ARCHITECTURE.md#queue-progress-card.
 _CLAIMED_CHANNELS: dict[str, set[int]] = {}
 
 

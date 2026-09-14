@@ -43,6 +43,7 @@ from src.sources import (
     YTSource,
     YTType,
 )
+from src.queue_progress import EnqueueProgress
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     admit,
@@ -1699,7 +1700,8 @@ class TestNowFlag:
                 music_bot, mock_ctx, url=f"--now {url}"
             )
 
-        music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
+        music_bot.spotify.playlist.assert_awaited_once()
+        assert music_bot.spotify.playlist.call_args.args == ("37i9dQZF1DXcBWIGoYBM5M",)
         ys.assert_awaited_once()
         assert ys.call_args.args[1] == "ytsearch:First Song"
         live_mp.interject.assert_awaited_once()
@@ -4522,3 +4524,675 @@ class TestResolveWaitExpiredReply:
         )
         assert "too many songs being looked up" in said
         assert "ResolveWaitExpired" not in said
+
+
+@contextlib.asynccontextmanager
+async def _recording_hold(order: list[str], label: str) -> AsyncIterator[None]:
+    """A defer_playback stand-in that records when its hold is released."""
+    try:
+        yield
+    finally:
+        order.append(label)
+
+
+class _CardSpy:
+    """A stand-in for enqueue_progress that counts entries and exits and yields a
+    real handle, so a caller's `progress.update` is exercised rather than stubbed.
+
+    Records kwargs as well as args. Everything the card is TOLD arrives by
+    keyword — the placement note, the debug footer — so a spy that kept only
+    positional arguments observed the two it could never be passed, and every
+    one of them could be mutated to "" with the whole suite green."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.kwargs: list[dict[str, Any]] = []
+        self.handle = EnqueueProgress()
+        self.entered = 0
+        self.exited = 0
+
+    @property
+    def last_kwargs(self) -> dict[str, Any]:
+        return self.kwargs[-1]
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append(args)
+        self.kwargs.append(kwargs)
+        return self._card()
+
+    @contextlib.asynccontextmanager
+    async def _card(self) -> AsyncIterator[EnqueueProgress]:
+        self.entered += 1
+        try:
+            yield self.handle
+        finally:
+            self.exited += 1
+
+
+class TestQueueProgressCard:
+    """The card is armed for collections only, on both entry points, and taken
+    back on every exit. What it renders is tests/test_queue_progress.py's."""
+
+    _PLAYLIST = "https://www.youtube.com/playlist?list=PLcardtest"
+
+    @pytest.fixture
+    def live_mp(self) -> MagicMock:
+        from src.musicplayer import InterjectOutcome
+
+        mp = mock_mp()
+        mp.current_song = MagicMock()
+        mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Original Song",
+                resume_position=151,
+                was_paused=False,
+            )
+        )
+        return mp
+
+    @pytest.fixture
+    def live_vc(self, mock_ctx: MagicMock) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        return in_authors_channel(vc, mock_ctx)
+
+    def _warm(self, music_bot: MusicBot, mock_ctx: MagicMock) -> MagicMock:
+        mock_ctx.voice_client = playing_vc(mock_ctx)
+        mp = mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        return mp
+
+    async def _play(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, url: str, card: _CardSpy
+    ) -> MagicMock:
+        """Run -play with the card and the notice both spied. Returns the notice
+        spy: which of the two armed is the assertion in half these tests."""
+        notice = MagicMock(return_value=contextlib.nullcontext())
+        mock_ctx.message.content = f"-play {url}"
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.commands.play.slow_resolve_notice", new=notice),
+            patch("src.commands.play.enqueue_progress", new=card),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+        return notice
+
+    async def test_the_card_is_taken_back_after_the_gate_hold_releases(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The behaviour the source check below stands for. LIFO: the card is
+        entered before the hold, so it unwinds after — taking it back awaits a
+        Discord call, and on a cold start no await may sit between
+        _abandon_cold_start's hold-count read and the hold's release."""
+        order: list[str] = []
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+
+        mp = mock_mp()
+        mp.defer_playback = MagicMock(
+            return_value=_recording_hold(order, "hold released")
+        )
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.voice_client = None
+
+        class _OrderedCard(_CardSpy):
+            @contextlib.asynccontextmanager
+            async def _card(self) -> AsyncIterator[EnqueueProgress]:
+                self.entered += 1
+                order.append("card entered")
+                try:
+                    yield self.handle
+                finally:
+                    self.exited += 1
+                    order.append("card retracted")
+
+        card = _OrderedCard()
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert order.index("card entered") < order.index("hold released")
+        assert order.index("hold released") < order.index("card retracted")
+
+    def test_the_card_is_entered_before_the_gate_hold(self) -> None:
+        """LIFO: taking the card back awaits a Discord call, and on a cold start
+        that await may not sit between the teardown decision and the hold release.
+        The existing source-inspection test cannot see this — the await lands
+        inside AsyncExitStack.__aexit__, not on a line of _resolve_and_place."""
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(play_cmd._resolve_and_place).strip())
+        entries = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "enter_async_context"
+        ]
+        cards = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "enqueue_progress"
+        ]
+        holds = [
+            node.value.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Await)
+            and any(isinstance(t, ast.Name) and t.id == "hold" for t in node.targets)
+        ]
+        assert cards and holds and entries
+        assert max(cards) < min(holds), (cards, holds)
+
+    async def test_the_card_is_told_where_the_playlist_will_land(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The note is the card's only statement of placement. Passed by keyword,
+        so a spy that kept only positional arguments could never see it — and it
+        could be mutated to "" with the whole suite green."""
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        notes: dict[str, str] = {}
+        for flag in ("", "--next"):
+            card = _CardSpy()
+            with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+                await self._play(
+                    music_bot, mock_ctx, f"{flag} {self._PLAYLIST}".strip(), card
+                )
+            notes[flag] = card.last_kwargs["placement_note"]
+
+        # Nothing to say for a tail insert: the confirmation already says it.
+        assert notes[""] == ""
+        assert "next" in notes["--next"]
+
+    async def test_an_interjecting_card_says_it_will_interrupt(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The other note, and the only branch that can produce it: over a live
+        song a playlist stops what is playing, which is not what the queue-tail
+        wording says."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(return_value=[first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+
+        assert "nterrupt" in card.last_kwargs["placement_note"]
+
+    @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
+    async def test_the_cards_handle_reaches_the_extraction(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, cold: bool
+    ) -> None:
+        """The seam phase 3 hangs off. on_progress=None anywhere between the card
+        and yt_playlist leaves every YouTube bar indeterminate forever, with the
+        playlist still queueing and nothing failing. The cold start passes it at
+        its own call site, and the first -play <playlist> of a session is cold."""
+        if cold:
+            music_bot.get_mp = MagicMock(return_value=mock_mp())
+            mock_ctx.voice_client = None
+
+            async def _join(*_: Any) -> None:
+                mock_ctx.voice_client = connected_vc(mock_ctx)
+
+            mock_ctx.invoke = AsyncMock(side_effect=_join)
+        else:
+            self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+        playlist = AsyncMock(return_value=tracks)
+
+        with patch.object(YTDL, "yt_playlist", new=playlist):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert (awaited := playlist.await_args) is not None
+        reporter = awaited.kwargs["on_progress"]
+        assert reporter is not None
+        # The handle the card yielded, not some other callable: reporting into a
+        # different EnqueueProgress moves a bar nobody is looking at.
+        reporter(4, 9)
+        assert (card.handle.done, card.handle.total) == (4, 9)
+
+    async def test_a_single_track_interjection_gets_the_notice(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The other half of the same `if`. A single track over a live song took
+        the same 1-4s resolve and said nothing at all, because this entry point
+        only ever armed the card."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        notice = MagicMock(return_value=contextlib.nullcontext())
+        card = _CardSpy()
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+
+        with (
+            patch("src.play_pipeline.slow_resolve_notice", new=notice),
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch("src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=qobj)),
+            patch(
+                "src.play_pipeline.YTDL.prefetch_stream",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="--now https://yt.com/v=1"
+            )
+
+        notice.assert_called_once()
+        assert card.entered == 0
+
+    async def test_the_interjection_card_outlives_the_interrupt(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The retraction is a Discord round trip, and this is the one command
+        whose point is stopping what is playing promptly — so it lands after
+        interject(), not between the resolve and the interrupt."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        order: list[str] = []
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+
+        class _OrderedCard(_CardSpy):
+            @contextlib.asynccontextmanager
+            async def _card(self) -> AsyncIterator[EnqueueProgress]:
+                self.entered += 1
+                try:
+                    yield self.handle
+                finally:
+                    self.exited += 1
+                    order.append("card retracted")
+
+        async def _interject(*_a: Any, **_k: Any) -> Any:
+            from src.musicplayer import InterjectOutcome
+
+            order.append("interrupted")
+            return InterjectOutcome(
+                interrupted_title="Original", resume_position=1, was_paused=False
+            )
+
+        live_mp.interject = AsyncMock(side_effect=_interject)
+        card = _OrderedCard()
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(return_value=[first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+
+        assert order == ["interrupted", "card retracted"]
+
+    async def test_the_interjection_leg_reports_progress_too(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """A second yt_playlist call site, and the one a _resolve_and_place-shaped
+        test cannot reach."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        playlist = AsyncMock(return_value=[first])
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch("src.play_pipeline.YTDL.yt_playlist", new=playlist),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+
+        assert (awaited := playlist.await_args) is not None
+        reporter = awaited.kwargs["on_progress"]
+        assert reporter is not None
+        reporter(2, 5)
+        assert (card.handle.done, card.handle.total) == (2, 5)
+
+    async def test_the_card_carries_the_debug_footer(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The card sends through ctx.channel.send, which bypasses the decoration
+        MusicContext.send applies — so the footer has to be threaded in, and it is
+        pre-rendered once because a per-tick-varying one would edit every tick."""
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+        with (
+            patch.object(MusicBot, "debug_suffix", return_value="trace=abc123"),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+        assert card.last_kwargs["debug_suffix"] == "trace=abc123"
+
+    async def test_the_card_is_told_which_source_it_is_about(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The source is what the card reads the playlist link off, and what
+        decides a determinate bar from an elapsed line."""
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+        assert card.calls[-1][1].playlist_url == self._PLAYLIST
+
+    async def test_a_collection_gets_the_card_and_not_the_notice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Two messages for one -play is worse than either alone."""
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+            notice = await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert (card.entered, card.exited) == (1, 1)
+        notice.assert_not_called()
+
+    async def test_a_single_track_gets_the_notice_and_not_the_card(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._warm(music_bot, mock_ctx)
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        card = _CardSpy()
+
+        notice = await self._play(music_bot, mock_ctx, "just a search", card)
+
+        assert card.entered == 0
+        notice.assert_called_once()
+
+    async def test_the_card_is_taken_back_when_the_resolve_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._warm(music_bot, mock_ctx)
+        card = _CardSpy()
+
+        with patch.object(
+            YTDL, "yt_playlist", new=AsyncMock(side_effect=Exception("yt-dlp failed"))
+        ):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert (card.entered, card.exited) == (1, 1)
+
+    async def test_the_card_is_taken_back_when_the_request_is_dropped(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-clear during the resolve: place() refuses, _report_dropped replies,
+        and the card still goes."""
+        mp = self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+
+        async def _dropped(*_: Any, **__: Any) -> list[QueueObject]:
+            mp.queue.generation += 1
+            return tracks
+
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(side_effect=_dropped)):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        mp.queue_put.assert_not_awaited()
+        assert (card.entered, card.exited) == (1, 1)
+
+    async def test_a_drop_stamped_mid_resolve_reaches_the_card(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """place() reads the stamp only once the resolve returns, so the card is
+        handed the request's own signal to take itself back sooner."""
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+
+        async def _stopped(*_: Any, **__: Any) -> list[QueueObject]:
+            music_bot._plays.inflight(mock_ctx.guild.id, "stop")
+            return tracks
+
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(side_effect=_stopped)):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert card.last_kwargs["dropped"].is_set()
+
+    async def test_a_drop_stamped_mid_resolve_reaches_the_notice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._warm(music_bot, mock_ctx)
+
+        async def _stopped(*_: Any, **__: Any) -> QueueObject:
+            music_bot._plays.inflight(mock_ctx.guild.id, "stop")
+            return song(1, mock_ctx)
+
+        play_pipeline.queue_source = AsyncMock(side_effect=_stopped)
+        notice = await self._play(music_bot, mock_ctx, "just a search", _CardSpy())
+
+        assert notice.call_args.kwargs["dropped"].is_set()
+
+    async def test_the_interjection_card_and_notice_hear_a_drop_too(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        notice = MagicMock(return_value=contextlib.nullcontext())
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+
+        async def _stopped_playlist(*_: Any, **__: Any) -> list[QueueObject]:
+            music_bot._plays.inflight(mock_ctx.guild.id, "stop")
+            return [first]
+
+        async def _stopped_track(*_: Any, **__: Any) -> QueueObject:
+            music_bot._plays.inflight(mock_ctx.guild.id, "stop")
+            return first
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch("src.play_pipeline.slow_resolve_notice", new=notice),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(side_effect=_stopped_playlist),
+            ),
+            patch(
+                "src.play_pipeline.YTDL.yt_source",
+                new=AsyncMock(side_effect=_stopped_track),
+            ),
+            patch(
+                "src.play_pipeline.YTDL.prefetch_stream",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="--now https://yt.com/v=1"
+            )
+
+        assert card.last_kwargs["dropped"].is_set()
+        assert notice.call_args.kwargs["dropped"].is_set()
+
+    async def test_the_card_is_taken_back_when_the_command_is_cancelled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._warm(music_bot, mock_ctx)
+        gate = asyncio.Event()
+        card = _CardSpy()
+
+        async def _hang(*_: Any, **__: Any) -> list[QueueObject]:
+            await gate.wait()
+            return []
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+            patch("src.commands.play.enqueue_progress", new=card),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(side_effect=_hang)),
+        ):
+            mock_ctx.message.content = f"-play {self._PLAYLIST}"
+            task = asyncio.create_task(
+                command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._PLAYLIST)
+            )
+            await settle()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert (card.entered, card.exited) == (1, 1)
+
+    async def test_the_interjection_branch_gets_one_too(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """`-play --now <playlist>` never reaches _resolve_and_place, so a
+        _resolve_and_place-shaped test cannot see this branch: it returns at
+        commands/play.py's live_vc check, one level above. CLAUDE.md has --now
+        take a playlist in full, which is the long-collection case."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(return_value=[first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+
+        live_mp.interject.assert_awaited_once()
+        assert (card.entered, card.exited) == (1, 1)
+
+    async def test_a_single_track_interjection_gets_no_card(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.queue_source",
+                new=AsyncMock(return_value=song(1, mock_ctx)),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="--now a search"
+            )
+
+        assert card.entered == 0
+
+    async def test_the_collection_walk_reports_into_the_handle(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The seam that makes the bar move: queue_source hands the callback to
+        Spotify's pager, and nothing between here and there may drop it."""
+        self._warm(music_bot, mock_ctx)
+        assert music_bot.spotify is not None
+        seen: list[Any] = []
+
+        async def _playlist(_pid: str, *, on_progress: Any = None) -> list[str]:
+            seen.append(on_progress)
+            if on_progress is not None:
+                on_progress(100, 250)
+            return ["One"]
+
+        music_bot.spotify.playlist = AsyncMock(side_effect=_playlist)
+        card = _CardSpy()
+
+        with patch.object(
+            YTDL, "yt_source", new=AsyncMock(return_value=song(1, mock_ctx))
+        ):
+            await self._play(
+                music_bot,
+                mock_ctx,
+                "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                card,
+            )
+
+        assert seen and seen[0] is not None
+        assert (card.handle.done, card.handle.total) == (100, 250)
+
+    async def test_the_spotify_interjection_leg_reports_progress_too(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The Spotify branch of _resolve_interjection_source passes the callback at
+        its own call site, which no _resolve_and_place-shaped test reaches."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        assert music_bot.spotify is not None
+
+        async def _playlist(_pid: str, *, on_progress: Any = None) -> list[str]:
+            if on_progress is not None:
+                on_progress(100, 250)
+            return ["One", "Two"]
+
+        music_bot.spotify.playlist = AsyncMock(side_effect=_playlist)
+        card = _CardSpy()
+
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_source",
+                new=AsyncMock(return_value=song(1, mock_ctx)),
+            ),
+            patch(
+                "src.play_pipeline.YTDL.prefetch_stream",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot,
+                mock_ctx,
+                url="--now https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+            )
+
+        assert card.entered == 1
+        assert (card.handle.done, card.handle.total) == (100, 250)
