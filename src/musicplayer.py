@@ -26,6 +26,7 @@ from src import config
 from src.guild_history import GuildHistory
 from src.guild_queue import (
     GuildQueue,
+    RemoveMatcher,
     RemoveOutcome,
     ShuffleOutcome,
     is_persisted,
@@ -1111,11 +1112,12 @@ class MusicPlayer:
         return await self.queue.get()
 
     async def _cancel_prefetch(self) -> None:
-        """Cancel any in-flight prefetch task and wait for it. Must run before any
-        bulk queue mutation, so the item it dequeued is back at the front
-        (requeue_front, in its CancelledError handler) before the drain. A prefetch
-        blocked inside run_in_executor cannot be interrupted, so this await can sit
-        until the worker exits."""
+        """Cancel any in-flight prefetch task and wait for it, ahead of -clear's
+        drain, so the item it dequeued is back at the front (requeue_front, in its
+        CancelledError handler) before the drain. A no-op on a COMPLETED prefetch,
+        whose claim clear() retires by resetting the cursor. A prefetch blocked
+        inside run_in_executor cannot be interrupted, so this await can sit until
+        the worker exits."""
         await cancel_task(self._prefetch_task)
 
     async def _flush_played(self, items: Sequence[QueueItem]) -> None:
@@ -1183,25 +1185,63 @@ class MusicPlayer:
         return [item_label(item) for item in cleared_items]
 
     async def queue_shuffle(self) -> str:
+        too_few = "There must be at least 4 songs to shuffle the queue"
+        # Before the neutralize, which a refused shuffle has no use for.
+        if self.queue.display_size() < 4:
+            return too_few
         # Neutralize rather than cancel: cancel_task() no-ops on a COMPLETED
         # prefetch, whose claim would pin its song to the front of the reorder.
         await self._neutralize_prefetch()
-        outcome = await self.queue.shuffle()
+        try:
+            outcome = await self.queue.shuffle()
+        finally:
+            # The neutralized prefetch took the resolve of the next song with it.
+            self._restart_prefetch()
         if outcome is ShuffleOutcome.TOO_FEW_SONGS:
-            return "There must be at least 4 songs to shuffle the queue"
-        # The neutralized prefetch took the resolve of the next song with it.
-        if self.current_song is not None:
-            self.ensure_prefetch()
+            return too_few
         return "Shuffled!"
 
     async def queue_remove(self, needle: str) -> RemoveOutcome:
         """Remove every queued item matching `needle` — the resolved yt-dlp URL, or
-        what the user originally typed (see remove_matcher)."""
-        await self._cancel_prefetch()
-        outcome = await self.queue.remove(remove_matcher(needle))
-        await self._flush_played(outcome.removed)
-        await self._dispose_orphaned_cards(outcome.removed)
+        what the user originally typed (see remove_matcher). The prefetch is
+        settled only when the head it claimed matches: remove() never touches a
+        claimed item, and an unrelated removal keeps the prefetched song."""
+        matcher = remove_matcher(needle)
+        settled = self._claimed_head_matches(matcher)
+        if settled:
+            # Neutralize, not cancel: a completed prefetch keeps its claim on the head.
+            await self._neutralize_prefetch()
+        try:
+            outcome = await self.queue.remove(matcher)
+            await self._flush_played(outcome.removed)
+            await self._dispose_orphaned_cards(outcome.removed)
+        finally:
+            if settled:
+                self._restart_prefetch()
         return outcome
+
+    def _claimed_head_matches(self, matcher: RemoveMatcher) -> bool:
+        """Whether a removal would take the song the prefetch holds: the claimed
+        item as queued, or, for a completed prefetch, the QueueObject its
+        neutralize requeues. A lazy search matches the link it resolved to only
+        in that second form."""
+        task = self._prefetch_task
+        claimed = self.queue.claimed_head()
+        if task is None or claimed is None:
+            return False
+        if matcher(claimed) is not None:
+            return True
+        if not task.done() or task.cancelled() or task.exception() is not None:
+            return False
+        song = task.result()
+        return song is not None and matcher(self._requeued_form(song)) is not None
+
+    def _restart_prefetch(self) -> None:
+        """Refill the prefetch slot a bulk mutation emptied, while a song plays.
+        Never on a retired player: an orphan prefetch whose resolve failed would
+        LPOP the queue the teardown saved."""
+        if not self.retired and self.current_song is not None:
+            self.ensure_prefetch()
 
     # ── Embed building ────────────────────────────────────────────────────────
 
@@ -1856,9 +1896,17 @@ class MusicPlayer:
             song = None
         if song is None:
             return
+        self.queue.requeue_front(self._requeued_form(song))
+        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
+        # communicate(), and this runs under the caller's place lock. loop() keeps
+        # its twin call off its own mutex for the same reason.
+        self._spawn_background(asyncio.to_thread(song.cleanup))
+
+    def _requeued_form(self, song: YTDL) -> QueueObject:
+        """The QueueObject a completed prefetch goes back on the queue as."""
         # Dropping a field here restarts a neutralized resume entry from 0:00,
         # loses a ?t= offset, or zeroes the ask this play was queued against.
-        rebuilt = QueueObject(
+        return QueueObject(
             song.webpage_url or "",
             song.title or "",
             song.requester or self._require_requester(),
@@ -1880,11 +1928,6 @@ class MusicPlayer:
             np_host_ref=song.np_host_ref,
             is_replay=song.is_replay,
         )
-        self.queue.requeue_front(rebuilt)
-        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
-        # communicate(), and this runs under the caller's place lock. loop() keeps
-        # its twin call off its own mutex for the same reason.
-        self._spawn_background(asyncio.to_thread(song.cleanup))
 
     async def _announce_start_offset(self, song: YTDL) -> None:
         """One-line notice for a song starting partway in (a `?t=` link). Sent from
@@ -2330,8 +2373,9 @@ class MusicPlayer:
             source = await self._resolve_source(source)
             if source is not claimed:
                 self._prefetched_head = (claimed, source)
-            # No re-extraction here: _cancel_prefetch() awaits this task, and an
-            # executor job cannot be interrupted. The play-time resolve decides.
+            # No re-extraction here: -clear, -shuffle and -remove await this task's
+            # cancel, and an executor job cannot be interrupted. The play-time
+            # resolve decides.
             song = await self._stream_source(source, allow_reextract=False)
         except asyncio.CancelledError:
             self.queue.requeue_front(source)

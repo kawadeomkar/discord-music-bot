@@ -1057,6 +1057,44 @@ class TestQueueShuffle:
         assert await music_player.queue_shuffle() == "Shuffled!"
         assert music_player._prefetch_task is None
 
+    async def test_a_refused_shuffle_leaves_the_prefetch_alone(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+    ) -> None:
+        for i in range(3):
+            await music_player.queue_put(
+                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            )
+        song = ytdl_instance({"webpage_url": "https://yt.com/watch?v=0"})
+        song.cleanup = MagicMock()
+        finished = _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+
+        result = await music_player.queue_shuffle()
+
+        assert result == "There must be at least 4 songs to shuffle the queue"
+        assert music_player._prefetch_task is finished
+        song.cleanup.assert_not_called()
+
+    async def test_a_shuffle_on_a_retired_player_starts_no_prefetch(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        for i in range(4):
+            await music_player.queue_put(
+                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            )
+        music_player.current_song = live_song
+        music_player.mark_retired()
+
+        assert await music_player.queue_shuffle() == "Shuffled!"
+        assert music_player._prefetch_task is None
+
     async def test_a_shuffle_during_a_song_start_is_the_only_prefetch(
         self,
         music_player: MusicPlayer,
@@ -1454,6 +1492,247 @@ class TestQueueRemove:
 
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
+
+
+def _completed_prefetch(music_player: MusicPlayer, song: Any) -> asyncio.Future[Any]:
+    """A prefetch that finished: its claim on the head is open and its task done,
+    which is the state it holds for nearly the whole current song."""
+    music_player.queue.get_nowait()
+    finished: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    finished.set_result(song)
+    music_player._prefetch_task = cast(Any, finished)
+    return finished
+
+
+def _spy_mirror_calls(store: GuildRedisStore) -> list[str]:
+    calls: list[str] = []
+    for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+        original = getattr(store, name)
+
+        def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+            calls.append(_n)
+            return _o(*a, **k)
+
+        setattr(store, name, spy)
+    return calls
+
+
+class TestQueueRemoveWithAPrefetch:
+    """A completed prefetch claims the queue head until the next song starts, and
+    remove() never touches a claimed item. -remove settles the prefetch when the
+    head it holds matches, and only then."""
+
+    @pytest.fixture
+    def spawned(self) -> Generator[list[str]]:
+        """Stands in for the prefetch coroutine, so a re-spawn is observable
+        without resolving anything."""
+        spawned: list[str] = []
+
+        async def _prefetch(_self: Any) -> None:
+            spawned.append("prefetch")
+
+        with patch.object(MusicPlayer, "_prefetch_next_song", new=_prefetch):
+            yield spawned
+
+    async def _queue(self, music_player: MusicPlayer, author: MagicMock) -> None:
+        await music_player.queue.put(
+            [
+                QueueObject(f"https://yt.com/v={n}", f"Song {n}", author)
+                for n in range(8)
+            ]
+        )
+
+    async def test_the_head_a_completed_prefetch_holds_is_removable(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+        fake_redis: aioredis.Redis,
+        spawned: list[str],
+    ) -> None:
+        await self._queue(music_player, mock_author)
+        song = ytdl_instance({"webpage_url": "https://yt.com/v=0", "title": "Song 0"})
+        song.cleanup = MagicMock()
+        _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+
+        outcome = await music_player.queue_remove("https://yt.com/v=0")
+
+        assert outcome.positions == [1]
+        assert [i.webpage_url for i in music_player.queue.display_items()] == [  # pyright: ignore[reportAttributeAccessIssue]
+            f"https://yt.com/v={n}" for n in range(1, 8)
+        ]
+        await asyncio.gather(*list(music_player._background_tasks))
+        song.cleanup.assert_called_once()
+        # One prefetch re-spawned into the emptied slot, over a consistent cursor.
+        assert music_player._prefetch_task is not None
+        await music_player._prefetch_task
+        assert spawned == ["prefetch"]
+        assert music_player.queue._cursor == 0
+        assert music_player.store is not None
+        stored = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        assert stored == [e.to_redis() for e in music_player.queue.mirror_entries()]
+
+    async def test_an_unrelated_removal_leaves_the_prefetch_alone(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+        spawned: list[str],
+    ) -> None:
+        """No FFmpeg process killed, no probe, no repeated extraction: the song the
+        prefetch holds is still next."""
+        await self._queue(music_player, mock_author)
+        song = ytdl_instance({"webpage_url": "https://yt.com/v=0", "title": "Song 0"})
+        song.cleanup = MagicMock()
+        finished = _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+
+        outcome = await music_player.queue_remove("https://yt.com/v=5")
+
+        assert outcome.positions == [6]
+        assert music_player._prefetch_task is finished
+        assert music_player.queue._cursor == 1
+        song.cleanup.assert_not_called()
+        assert spawned == []
+
+    @pytest.mark.parametrize("kind", ["lazy", "flat"])
+    async def test_a_resolved_head_is_removed_by_the_link_it_plays_as(
+        self,
+        kind: str,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+        spawned: list[str],
+    ) -> None:
+        """A lazy search has no link until the prefetch resolves it, so only the
+        requeued form matches the link the Now Playing card shows. Either head
+        swaps back in serialized differently from its list entry, and the removal
+        still takes one LREM."""
+        head: Any = (
+            YTSource(ytsearch="ytsearch:artist song", user_input="https://sp/p")
+            if kind == "lazy"
+            else QueueObject("https://yt.com/v=head", "Head", mock_author)
+        )
+        await music_player.queue.put(
+            [
+                head,
+                *(
+                    QueueObject(f"https://yt.com/v={n}", f"S{n}", mock_author)
+                    for n in range(7)
+                ),
+            ]
+        )
+        song = ytdl_instance(
+            {"webpage_url": "https://yt.com/v=head", "title": "Head (Official)"}
+        )
+        song.cleanup = MagicMock()
+        _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+        assert music_player.store is not None
+        calls = _spy_mirror_calls(music_player.store)
+
+        outcome = await music_player.queue_remove("https://yt.com/v=head")
+
+        assert outcome.positions == [1]
+        assert calls == ["remove_queue_entries"]
+
+    async def test_a_restored_head_is_removed_with_the_list_matching_memory(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+        fake_redis: aioredis.Redis,
+        spawned: list[str],
+    ) -> None:
+        """After a restart the queue is rebuilt from the Redis list in memory only,
+        and its lazy Spotify head resolves through the prefetch like any other.
+        Removing that head by the link it plays as leaves the list exactly what
+        memory holds."""
+        store = music_player.store
+        assert store is not None
+        await music_player.queue.put(
+            [
+                YTSource(
+                    ytsearch="ytsearch:artist song",
+                    process=True,
+                    user_input="https://sp/p",
+                ),
+                *(
+                    QueueObject(f"https://yt.com/v={n}", f"S{n}", mock_author)
+                    for n in range(7)
+                ),
+            ],
+            batch=True,
+        )
+        snapshot = await store.get_playback_snapshot()
+        assert snapshot is not None
+        # The restart resolves each requester through the guild.
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player.queue = GuildQueue(music_player._guild, store)
+        assert await music_player.queue.restore_entries(snapshot.queue) == 8
+        song = ytdl_instance({"webpage_url": "https://yt.com/v=head", "title": "Head"})
+        song.cleanup = MagicMock()
+        _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+
+        outcome = await music_player.queue_remove("https://yt.com/v=head")
+
+        assert outcome.positions == [1]
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [e.to_redis() for e in music_player.queue.mirror_entries()]
+        assert len(stored) == 7
+
+    async def test_a_retired_player_starts_no_prefetch(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+        spawned: list[str],
+    ) -> None:
+        """A -remove suspended across -stop, a kick or the alone-watchdog finishes
+        on a torn-down player. A prefetch started there, whose resolve then failed,
+        would LPOP the queue the teardown saved for -resume."""
+        await self._queue(music_player, mock_author)
+        song = ytdl_instance({"webpage_url": "https://yt.com/v=0"})
+        song.cleanup = MagicMock()
+        _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+        music_player.mark_retired()
+
+        await music_player.queue_remove("https://yt.com/v=0")
+
+        assert music_player._prefetch_task is None
+        assert spawned == []
+
+    async def test_the_slot_is_refilled_when_the_removal_raises(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        live_song: MagicMock,
+        ytdl_instance: Callable[..., Any],
+        spawned: list[str],
+    ) -> None:
+        await self._queue(music_player, mock_author)
+        song = ytdl_instance({"webpage_url": "https://yt.com/v=0"})
+        song.cleanup = MagicMock()
+        _completed_prefetch(music_player, song)
+        music_player.current_song = live_song
+
+        with (
+            patch.object(
+                MusicPlayer, "_flush_played", new=AsyncMock(side_effect=RuntimeError)
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            await music_player.queue_remove("https://yt.com/v=0")
+
+        assert music_player._prefetch_task is not None
 
 
 # ── GetQueue embed ────────────────────────────────────────────────────────────
