@@ -4849,6 +4849,123 @@ class TestQueueProgressCard:
 
         assert order == ["interrupted", "card retracted"]
 
+    async def test_a_reply_slower_than_the_delay_brings_no_card_up(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The real card, not the spy. A playlist queued inside the delay whose
+        reply then outlasted it — on a cold start Discord held the reaction for
+        2.0s — put its card up under the confirmation it should never share a
+        channel with."""
+        self._warm(music_bot, mock_ctx)
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        mock_ctx.channel.send = AsyncMock(return_value=message)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+
+        async def _slow_reply(*_: Any, **__: Any) -> None:
+            await asyncio.sleep(0.2)
+
+        mock_ctx.message.content = f"-play {self._PLAYLIST}"
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+            patch("src.queue_progress.QUEUE_PROGRESS_DELAY_SECS", 0.05),
+            patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_slow_reply)),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=self._PLAYLIST
+            )
+
+        mock_ctx.channel.send.assert_not_awaited()
+
+    async def test_the_card_settles_before_the_confirmation_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+        seen: list[bool] = []
+
+        async def _reply(*_: Any, **__: Any) -> None:
+            seen.append(card.last_kwargs["request_settled"].is_set())
+
+        with (
+            patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_reply)),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert seen == [True]
+
+    async def test_the_notice_settles_before_the_confirmation_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The same `if`, the other message: a song found just inside the notice's
+        delay has the same reply after it."""
+        self._warm(music_bot, mock_ctx)
+        notice = MagicMock(return_value=contextlib.nullcontext())
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        seen: list[bool] = []
+
+        async def _reply(*_: Any, **__: Any) -> None:
+            seen.append(notice.call_args.kwargs["request_settled"].is_set())
+
+        mock_ctx.message.content = "-play https://yt.com/v=1"
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.commands.play.slow_resolve_notice", new=notice),
+            patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_reply)),
+            patch.object(YTDL, "yt_source", new=AsyncMock(return_value=qobj)),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://yt.com/v=1"
+            )
+
+        assert seen == [True]
+
+    async def test_the_interjection_card_settles_between_the_interrupt_and_the_reply(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The second entry point. Still after interject(), which is the point of
+        this command, and no longer after the reply."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        seen: dict[str, bool] = {}
+
+        async def _interject(*_a: Any, **_k: Any) -> Any:
+            from src.musicplayer import InterjectOutcome
+
+            seen["interrupt"] = card.last_kwargs["request_settled"].is_set()
+            return InterjectOutcome(
+                interrupted_title="Original", resume_position=1, was_paused=False
+            )
+
+        async def _send(*_a: Any, **_k: Any) -> None:
+            seen["reply"] = card.last_kwargs["request_settled"].is_set()
+
+        live_mp.interject = AsyncMock(side_effect=_interject)
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch("src.play_pipeline.send_embed", new=AsyncMock(side_effect=_send)),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(return_value=[first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+
+        assert seen == {"interrupt": False, "reply": True}
+
     async def test_the_interjection_leg_reports_progress_too(
         self,
         music_bot: MusicBot,
@@ -4980,7 +5097,7 @@ class TestQueueProgressCard:
         with patch.object(YTDL, "yt_playlist", new=AsyncMock(side_effect=_stopped)):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
 
-        assert card.last_kwargs["dropped"].is_set()
+        assert card.last_kwargs["request_settled"].is_set()
 
     async def test_a_drop_stamped_mid_resolve_reaches_the_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4994,7 +5111,7 @@ class TestQueueProgressCard:
         play_pipeline.queue_source = AsyncMock(side_effect=_stopped)
         notice = await self._play(music_bot, mock_ctx, "just a search", _CardSpy())
 
-        assert notice.call_args.kwargs["dropped"].is_set()
+        assert notice.call_args.kwargs["request_settled"].is_set()
 
     async def test_the_interjection_card_and_notice_hear_a_drop_too(
         self,
@@ -5040,8 +5157,8 @@ class TestQueueProgressCard:
                 music_bot, mock_ctx, url="--now https://yt.com/v=1"
             )
 
-        assert card.last_kwargs["dropped"].is_set()
-        assert notice.call_args.kwargs["dropped"].is_set()
+        assert card.last_kwargs["request_settled"].is_set()
+        assert notice.call_args.kwargs["request_settled"].is_set()
 
     async def test_the_card_is_taken_back_when_the_command_is_cancelled(
         self, music_bot: MusicBot, mock_ctx: MagicMock
