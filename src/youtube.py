@@ -1043,6 +1043,10 @@ class QueueObject:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
+    # A -replay copy. Runtime-only, so absent from SongQueueEntry: a crash restores
+    # an ordinary queued song. YTDL carries it so _neutralize_prefetch's rebuild
+    # keeps it; an interjection's resume tail never sets it.
+    is_replay: bool = field(default=False, repr=False)
     # Ask-time analytics. yt_source/yt_playlist REQUIRE it; the default exists
     # for rehydration and the carry sites, which always pass a real value.
     analytics: Analytics = ANALYTICS_ZERO
@@ -1413,6 +1417,7 @@ class YTDL(discord.FFmpegOpusAudio):
         np_channel_id: int = 0,
         np_dedicated: bool = False,
         np_host_ref: Optional[NpHostRef] = None,
+        is_replay: bool = False,
     ) -> None:
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -1437,6 +1442,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self.np_channel_id: int = np_channel_id
         self.np_dedicated: bool = np_dedicated
         self.np_host_ref: Optional[NpHostRef] = np_host_ref
+        self.is_replay: bool = is_replay
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -1713,6 +1719,7 @@ class YTDL(discord.FFmpegOpusAudio):
             np_channel_id=qo.np_channel_id,
             np_dedicated=qo.np_dedicated,
             np_host_ref=qo.np_host_ref,
+            is_replay=qo.is_replay,
         )
 
     @classmethod

@@ -1278,7 +1278,9 @@ class MusicPlayer:
         channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
         duration = fmt_duration(item.duration) if item.duration is not None else "?:??"
         detail = [f"Channel: {channel}", f"Duration: `{duration}`"]
-        if item.is_resume and item.ts:
+        if isinstance(item, QueueObject) and item.is_replay:
+            detail.append("🔁 Replays from `0:00`")
+        elif item.is_resume and item.ts:
             detail.append(f"⏮ Resumes at `{fmt_duration(item.ts)}`")
         elif item.ts:
             detail.append(f"Starts at `{item.ts}s`")
@@ -1808,6 +1810,7 @@ class MusicPlayer:
             np_channel_id=song.np_channel_id,
             np_dedicated=song.np_dedicated,
             np_host_ref=song.np_host_ref,
+            is_replay=song.is_replay,
         )
         self.queue.requeue_front(rebuilt)
         # Handed off, not awaited: cleanup() kills the subprocess and blocks on

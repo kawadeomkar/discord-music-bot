@@ -10401,6 +10401,7 @@ class TestNeutralizePrefetch:
             np_message_id=77,
             np_channel_id=88,
             np_dedicated=True,
+            is_replay=True,
         )
         song.cleanup = MagicMock()
 
@@ -10428,6 +10429,7 @@ class TestNeutralizePrefetch:
             rebuilt.np_message_id,
             rebuilt.np_channel_id,
             rebuilt.np_dedicated,
+            rebuilt.is_replay,
         ) == (
             "https://open.spotify.com/playlist/abc",
             False,
@@ -10438,6 +10440,7 @@ class TestNeutralizePrefetch:
             1234.5,
             77,
             88,
+            True,
             True,
         )
 
@@ -11662,6 +11665,43 @@ class TestInterjectOverASongThatIsOver:
         assert music_player.queue.display_items() == []
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
+
+
+class TestReplayQueueCard:
+    async def test_a_replay_card_says_it_replays_from_the_start(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """peek_next() is _items[0], so the replay is what the NP block's "Up next"
+        renders while the interrupted song is still current — the same song, in two
+        cards, one above the other. Unmarked it reads as a duplicate queue entry
+        rather than as the replay the user just asked for."""
+        replay = QueueObject(
+            live_song.webpage_url,
+            live_song.title,
+            mock_author,
+            duration=210,
+            is_replay=True,
+        )
+        await music_player.queue.put([replay])
+        music_player.current_song = live_song
+
+        block = music_player.np_embed_block()
+
+        assert len(block) == 2
+        next_up = described(block[1])
+        assert "🔁 Replays from `0:00`" in next_up
+        assert "Resumes at" not in next_up
+
+    async def test_an_ordinary_entry_is_not_marked_as_a_replay(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        queued = QueueObject(
+            "https://yt.com/v=b", "Queued B", mock_author, duration=210
+        )
+        await music_player.queue.put([queued])
+        music_player.current_song = live_song
+
+        assert "Replays from" not in described(music_player.np_embed_block()[1])
 
 
 class TestInterjectLoopStart:
