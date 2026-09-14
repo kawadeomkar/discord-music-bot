@@ -674,15 +674,17 @@ async def enqueue_single(
                 await mp.queue_put_front(qobj)
             elif placement is Placement.NEXT:
                 await mp.queue_put_next(qobj)
+            elif follow_on:
+                # One put, so a -remove waiting on the queue mutex takes the head
+                # and its tail together or neither. The tail is re-minted from the
+                # head's depth: play_history keeps whatever number is on it. Only
+                # interject_flow passes follow_on, and it already warmed the head.
+                await mp.queue_put(
+                    [qobj, *_rebase_positions(follow_on, provisional, depth + 1)],
+                    prefetch=False,
+                )
             else:
                 await mp.queue_put(qobj)
-                if follow_on:
-                    # Behind the head, in its order, re-minted from the head's
-                    # depth: play_history keeps whatever number is on them.
-                    await mp.queue_put(
-                        _rebase_positions(follow_on, provisional, depth + 1),
-                        prefetch=False,
-                    )
             log.info(f"play ({placement.value}) qsize: {mp.queue.qsize()}")
     if not verdict.placed:
         await cog._report_dropped(req, verdict)
@@ -866,8 +868,10 @@ async def interject_flow(
                 pass
             elif require_paused and not vc.is_paused():
                 # Resumed during the resolve, so the reason to interject is gone:
-                # append instead. The append takes the lock again on its own.
+                # append instead. The append takes the lock again on its own, and
+                # until it places, -remove or -clear may still drop the request.
                 resumed = True
+                req.placed = False
             else:
                 outcome = await mp.interject(
                     qobj, vc, resume_paused=resume_paused, follow_on=follow_on

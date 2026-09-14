@@ -23,7 +23,7 @@ from src.play_placement import (
     ResolveMode,
     resolve_mode_for,
 )
-from src.guild_queue import RemoveMode, remove_matcher
+from src.guild_queue import GuildQueue, RemoveMode, remove_matcher
 from src.play_pipeline import (
     EmptyPlaylistError,
     PlaylistIndexError,
@@ -32,6 +32,7 @@ from src.play_pipeline import (
     _rebase_positions,
     collection_note,
 )
+from src.redis_client import GuildRedisStore
 from src.util import ECHO_MAX
 from src.sources import (
     SoundcloudSource,
@@ -738,8 +739,148 @@ class TestEnqueuePlaylist:
             await play_pipeline._warm_front_track([head], Placement.NEXT, cog=music_bot)
         warm.assert_not_awaited()
 
+    @pytest.mark.parametrize("placement", list(Placement))
+    async def test_a_remove_during_a_playlist_put_takes_every_track_or_none(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        fake_redis: Any,
+        placement: Placement,
+    ) -> None:
+        """placement_split_probe.py, once per placement. A `-remove <playlist link>`
+        that reaches the queue mutex while the playlist's insert waits on it runs
+        after the whole insert, never between its tracks."""
+        link = "https://www.youtube.com/playlist?list=PLsplit"
+        queue = GuildQueue(
+            mock_ctx.guild, GuildRedisStore(fake_redis, guild_id=mock_ctx.guild.id)
+        )
+        mp = mock_mp()
+        mp.queue = queue
+
+        async def _put(obj: Any, *, prefetch: bool = True) -> None:
+            await queue.put(list(obj), batch=not prefetch)
+
+        async def _put_front(obj: Any, *, prefetch: bool = True) -> None:
+            await queue.put_front(list(obj))
+
+        mp.queue_put = AsyncMock(side_effect=_put)
+        mp.queue_put_front = AsyncMock(side_effect=_put_front)
+        mp.queue_put_next = AsyncMock(side_effect=_put_front)
+        tracks = [
+            QueueObject(
+                f"https://yt.com/v={n}", f"T{n}", mock_ctx.author, user_input=link
+            )
+            for n in range(4)
+        ]
+        source = YTSource(
+            url=link, process=False, type=YTType.PLAYLIST, list_id="PLsplit"
+        )
+
+        await queue._mutex.acquire()  # the loop's commit hold
+        placing = asyncio.create_task(
+            play_pipeline.enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedYoutubePlaylist(tracks),
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                analytics=_ANALYTICS,
+                origin=link,
+                placement=placement,
+                cog=music_bot,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if queue._mutex._waiters:
+                break
+        assert queue._mutex._waiters, "the insert never reached the queue mutex"
+        removing = asyncio.create_task(queue.remove(remove_matcher(link)))
+        await asyncio.sleep(0)
+        queue._mutex.release()
+        await placing
+        outcome = await removing
+
+        assert len(outcome.removed) == 4
+        assert queue.display_items() == []
+
 
 class TestEnqueueSingle:
+    async def test_a_remove_during_the_put_takes_the_head_and_tail_together(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        """A `-remove <playlist link>` that reaches the queue mutex while this
+        placement waits on it must find the whole playlist or none of it: one
+        between a head put and a tail put took the head and let the tail land."""
+        link = "https://www.youtube.com/playlist?list=PLsplit"
+        queue = GuildQueue(
+            mock_ctx.guild, GuildRedisStore(fake_redis, guild_id=mock_ctx.guild.id)
+        )
+        mp = mock_mp()
+        mp.queue = queue
+
+        async def _put(obj: Any, *, prefetch: bool = True) -> None:
+            await queue.put(obj if isinstance(obj, list) else [obj], batch=not prefetch)
+
+        mp.queue_put = AsyncMock(side_effect=_put)
+        head, *tail = [
+            QueueObject(
+                f"https://yt.com/v={n}", f"T{n}", mock_ctx.author, user_input=link
+            )
+            for n in range(4)
+        ]
+
+        await queue._mutex.acquire()  # the loop's commit hold
+        placing = asyncio.create_task(
+            play_pipeline.enqueue_single(
+                mock_ctx,
+                head,
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                follow_on=tail,
+                cog=music_bot,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if queue._mutex._waiters:
+                break
+        removing = asyncio.create_task(queue.remove(remove_matcher(link)))
+        await asyncio.sleep(0)
+        queue._mutex.release()
+        await placing
+        outcome = await removing
+
+        assert len(outcome.removed) == 4
+        assert queue.display_items() == []
+
+    async def test_a_head_and_its_tail_go_in_one_put(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        head = QueueObject("https://yt.com/v=0", "Head", mock_ctx.author)
+        tail = [
+            QueueObject(f"https://yt.com/v={n}", f"T{n}", mock_ctx.author)
+            for n in (1, 2)
+        ]
+
+        await play_pipeline.enqueue_single(
+            mock_ctx,
+            head,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            follow_on=tail,
+            cog=music_bot,
+        )
+
+        (call,) = mp.queue_put.await_args_list
+        assert [item.webpage_url for item in call.args[0]] == [
+            "https://yt.com/v=0",
+            "https://yt.com/v=1",
+            "https://yt.com/v=2",
+        ]
+        assert call.kwargs == {"prefetch": False}
+
     @staticmethod
     def _playing_mp(head: Any = None) -> MagicMock:
         """A player with a song live and `head` at the queue front. The default

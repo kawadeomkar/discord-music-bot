@@ -396,8 +396,9 @@ class PlayRequest:
     # down now rather than when the command does: a drop is read only after the
     # resolve, and the reply after the put can outlast the delay either one waits.
     settled: asyncio.Event = field(default_factory=asyncio.Event)
-    # Set under the place lock. A placed request is past the point any command can
-    # drop it, but it stays in the registry until its reply is sent.
+    # Set under the place lock once its checks pass, before the put, and cleared if
+    # the put raises. A placed request is past the point any command can drop it,
+    # but it stays in the registry until its reply is sent.
     placed: bool = False
 
 
@@ -611,10 +612,16 @@ class PlayRegistry:
                     yield PlaceResult(PlaceVerdict.VOICE, refusal)
                     return
                 span.set_attribute("play.verdict", PlaceVerdict.PLACE.value)
-                yield PlaceResult(PlaceVerdict.PLACE)
-                # After the body: a put that raised or was cut short queued nothing,
-                # and a placed request is one no command will stamp or report.
+                # Before the put: a command arriving while it runs waits on the queue
+                # mutex behind it and acts on what it inserted, so it must neither
+                # stamp this request nor report it stopped. A put that raised or was
+                # cut short gives the request back.
                 req.placed = True
+                try:
+                    yield PlaceResult(PlaceVerdict.PLACE)
+                except BaseException:
+                    req.placed = False
+                    raise
         except TimeoutError as e:
             if not bound.expired():
                 # Someone else's deadline (an inner wait_for). Reporting it as a
