@@ -1148,8 +1148,8 @@ class MusicPlayer:
         if outcome is ShuffleOutcome.TOO_FEW_SONGS:
             return "There must be at least 4 songs to shuffle the queue"
         # The neutralized prefetch took the resolve of the next song with it.
-        if self.current_song is not None and self._prefetch_task is None:
-            self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
+        if self.current_song is not None:
+            self._ensure_prefetch()
         return "Shuffled!"
 
     async def queue_remove(self, needle: str) -> RemoveOutcome:
@@ -2189,6 +2189,14 @@ class MusicPlayer:
         await cancel_task(self._pause_debounce_task)
         self._pause_debounce_task = None
 
+    def _ensure_prefetch(self) -> asyncio.Task[Optional[YTDL]]:
+        """The one-ahead prefetch, started only into an EMPTY slot. Every slot write
+        goes through here: a task started over a live one strands that one's claim
+        and drifts _cursor for good, since loop() settles only the task it reads."""
+        if self._prefetch_task is None:
+            self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
+        return self._prefetch_task
+
     @_tracer.start_as_current_span("player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
         """Pre-resolve and stream the next queued song while the current one plays.
@@ -2518,9 +2526,8 @@ class MusicPlayer:
                     if song.is_resume and self._np_host_message is not None:
                         self._spawn_background(self._dispose_previous_np_card(song))
 
-                    self._prefetch_task = asyncio.create_task(
-                        self._prefetch_next_song()
-                    )
+                    # A -shuffle may already have filled the slot.
+                    self._ensure_prefetch()
 
                     await self.play_next.wait()
 
