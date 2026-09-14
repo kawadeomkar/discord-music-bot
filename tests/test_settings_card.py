@@ -44,6 +44,7 @@ class TestServerValues:
             card.Shown(DEFAULT_TIMEZONE, "default"),
             card.Shown(300.0, "default"),
             card.Shown(10.0, "default"),
+            card.Shown(3.0, "default"),
             card.Shown(False, "default"),
         ]
 
@@ -53,6 +54,7 @@ class TestServerValues:
             timezone="Asia/Tokyo",
             idle_timeout_secs=600.0,
             alone_timeout_secs=120.0,
+            np_refresh_secs=10.0,
             debug_mode=False,
         )
         assert [shown for _, shown in _server_rows(stored)] == [
@@ -60,12 +62,25 @@ class TestServerValues:
             card.Shown("Asia/Tokyo", "set here"),
             card.Shown(600.0, "set here"),
             card.Shown(120.0, "set here"),
+            card.Shown(10.0, "set here"),
             card.Shown(False, "set here"),
         ]
 
     def test_debug_follows_the_bots_current_default_while_unset(self) -> None:
         rows = dict(_server_rows(None, debug_default=True))
         assert rows[_spec("debug")] == card.Shown(True, "default")
+
+    def test_np_refresh_follows_the_bots_current_value_while_unset(self) -> None:
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        rows = dict(_server_rows(None))
+        assert rows[_spec("np-refresh")] == card.Shown(5.0, "default")
+
+    def test_a_value_under_the_bots_runs_as_the_bots_and_names_both(self) -> None:
+        rows = dict(_server_rows(GuildConfig(np_refresh_secs=4.0)))
+        assert rows[_spec("np-refresh")] == card.Shown(4.0, "set here")
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        rows = dict(_server_rows(GuildConfig(np_refresh_secs=4.0)))
+        assert rows[_spec("np-refresh")] == card.Shown(5.0, "bot minimum; set here 4s")
 
     def test_not_saved_replaces_the_source(self) -> None:
         rows = dict(
@@ -133,6 +148,7 @@ class TestServerCard:
                 timezone="America/Argentina/ComodRivadavia",
                 idle_timeout_secs=1800.0,
                 alone_timeout_secs=120.0,
+                np_refresh_secs=30.0,
                 debug_mode=True,
             ),
             unsaved=frozenset(
@@ -141,6 +157,7 @@ class TestServerCard:
                     "timezone",
                     "idle_timeout_secs",
                     "alone_timeout_secs",
+                    "np_refresh_secs",
                     "debug_mode",
                 }
             ),
@@ -172,6 +189,7 @@ class TestServerCard:
                 "**Leave when idle** · 5:00 · default\n"
                 "**Leave when alone** · 0:10 · default",
             ),
+            ("Messages", "**Progress bar refresh** · 3s · default"),
             ("Diagnostics", "**Debug footer** · off · default"),
         ]
         assert embed.footer.text == (
@@ -230,6 +248,17 @@ class TestDetail:
             "the queue runs empty."
         )
 
+    def test_a_setting_that_follows_the_bots_value_quotes_it_live(self) -> None:
+        spec = _spec("np-refresh")
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        embed = card.detail(spec, card.Shown(5.0, "default"), default=5.0)
+        assert embed.description == (
+            "**Progress bar refresh** (`np-refresh`; also `progress-bar`, "
+            "`progress-bar-refresh`) — How often the Now Playing bar moves. Current "
+            "**5s** (default) · Default 5s (the bot's default) · Allowed 5s–30s · "
+            "Applies from the next tick."
+        )
+
     def test_a_bot_setting_names_its_baseline_in_the_source(self) -> None:
         spec = _spec("heartbeat", SettingScope.BOT)
         embed = card.detail(spec, card.Shown(5.0, "bot owner; env 3s"), default=None)
@@ -257,6 +286,7 @@ class TestReplies:
             ("timezone", "Asia/Tokyo"),
             ("idle-timeout", 630.0),
             ("alone-timeout", 95.0),
+            ("np-refresh", 12.5),
             ("debug", True),
         ):
             spec = _spec(key)

@@ -348,6 +348,26 @@ class TestReplies:
         )
         assert cog.guild_settings.alone_timeout_secs(GUILD) == 90.0
 
+    async def test_np_refresh(self, cog: MusicBot, settings_ctx: MagicMock) -> None:
+        ctx = _with_manage_server(settings_ctx)
+        await _invoke(cog, ctx, "progress-bar 10")
+        assert _text(ctx) == (
+            "**Progress bar refresh** is now **10s** for this server (was **3s**, the "
+            "default). It applies from the next tick. It is saved for this server. "
+            f"Changed by {MENTION}."
+        )
+        assert cog.guild_settings.np_refresh_secs(GUILD) == 10.0
+        await _invoke(cog, ctx, "np-refresh 2")
+        assert _text(ctx) == (
+            "**Progress bar refresh** has to be between **3s** and **30s** here: the "
+            "bot refreshes no faster than **3s**."
+        )
+        await _invoke(cog, ctx, "np-refresh reset")
+        assert _text(ctx) == (
+            "**Progress bar refresh** here is back to the bot's default, which is "
+            f"**3s** right now. It is saved for this server. Changed by {MENTION}."
+        )
+
     async def test_debug_on_names_what_it_publishes(
         self, cog: MusicBot, settings_ctx: MagicMock
     ) -> None:
@@ -458,6 +478,7 @@ class TestCard:
         assert values == [
             "**Volume** · 100% · default\n**Timezone** · America/Los_Angeles · default",
             "**Leave when idle** · 5:00 · default\n**Leave when alone** · 0:10 · default",
+            "**Progress bar refresh** · 3s · default",
             "**Debug footer** · off · default",
         ]
 

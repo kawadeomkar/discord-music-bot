@@ -38,7 +38,7 @@ from src.guild_state import (
     parse_queue_entry,
 )
 from src.redis_client import GuildRedisStore
-from src import musicplayer
+from src import config, musicplayer
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -6115,6 +6115,34 @@ class TestProgressUpdater:
                 await music_player._progress_updater(mock_song)
 
         assert music_player._np_host_message is new_host
+
+    async def test_the_cadence_is_read_every_tick_and_never_faster_than_the_bot(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """A change lands after the sleep in progress, which keeps its length."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        self._host(music_player)
+        guild_settings = music_player._cog.guild_settings
+        guild_id = music_player._guild.id
+        slept: list[float] = []
+
+        async def _sleep(secs: float) -> None:
+            slept.append(secs)
+            if len(slept) == 1:
+                await guild_settings.write(guild_id, GuildConfig(np_refresh_secs=10.0))
+            elif len(slept) == 2:
+                config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 12.0)
+            else:
+                raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._progress_updater(mock_song)
+
+        assert slept == [3.0, 10.0, 12.0]
 
     async def test_logs_and_continues_on_http_exception(
         self, music_player: MusicPlayer, mock_song: MagicMock

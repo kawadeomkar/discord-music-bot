@@ -2191,8 +2191,9 @@ class MusicPlayer:
         )
 
     async def _progress_updater(self, song: YTDL) -> None:
-        interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
         while True:
+            # Read per tick: a change lands after the tick in progress.
+            interval = self._cog.guild_settings.np_refresh_secs(self._guild.id)
             await asyncio.sleep(interval)
             vc = self._guild.voice_client
             if not isinstance(vc, discord.VoiceClient) or vc.source is not song:

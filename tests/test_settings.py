@@ -165,6 +165,10 @@ class TestRegistryInvariants:
         for spec in SETTINGS:
             assert 0 < len(spec.summary) <= 200, spec.key
             assert spec.applies, spec.key
+            if spec.why_write_minimum is not None:
+                assert spec.write_minimum is not None, spec.key
+                assert "{bound}" in spec.why_write_minimum, spec.key
+                assert len(spec.why_write_minimum) <= 200, spec.key
             for why, side in (
                 (spec.why_minimum, spec.minimum),
                 (spec.why_maximum, spec.maximum),
@@ -182,6 +186,12 @@ class TestRegistryInvariants:
                 assert spec.env in rows, spec.key
 
     def test_6_values_round_trip_at_their_bounds_and_default(self) -> None:
+        # A write-time minimum follows the bot's value. At its lowest, the env
+        # floor, a server setting's whole static range is writable.
+        for spec in SETTINGS:
+            knob = settings.followed_knob(spec)
+            if spec.write_minimum is not None and knob and not config.is_int_knob(knob):
+                config.set_override(knob, config.env_floor(knob))
         checked = 0
         for spec in SETTINGS:
             points: list[float | str | bool] = []
@@ -193,10 +203,10 @@ class TestRegistryInvariants:
                 ]
             if spec.default is not None:
                 points.append(spec.default)
-            elif spec.attr is not None:
+            elif (knob := spec.attr or settings.followed_knob(spec)) is not None:
                 # An exported variable may deliberately sit outside the chat range.
-                if not (os.environ.get(spec.attr) or "").strip():
-                    points.append(config.baseline(spec.attr))
+                if not (os.environ.get(knob) or "").strip():
+                    points.append(config.baseline(knob))
             elif spec.kind is SettingKind.SWITCH:
                 points.append(config.debug_mode_default())
             if spec.kind is SettingKind.SECONDS_OR_OFF:
@@ -298,6 +308,19 @@ class TestRegistryInvariants:
     ) -> None:
         monkeypatch.setattr(config, "YTDLP_POOL_WORKERS", workers)
         assert bound(_spec("play-resolve-concurrency").maximum) == ceiling
+
+    def test_a_server_setting_without_a_default_follows_its_bot_setting(
+        self,
+    ) -> None:
+        for spec in SETTINGS:
+            knob = settings.followed_knob(spec)
+            if spec.scope is SettingScope.BOT or spec.default is not None:
+                assert knob is None, spec.key
+            elif spec.key != "debug":  # follows DEBUG_MODE, which is not a knob
+                assert knob is not None, spec.key
+                assert [s.attr for s in SETTINGS if s.key == spec.key and s.attr] == [
+                    knob
+                ]
 
     def test_12_every_label_is_typeable(self) -> None:
         for spec in SETTINGS:
@@ -475,6 +498,32 @@ class TestOutOfRange:
         assert high.text == (
             "**Leave when alone** has to be between **0:10** and **2:00**. Music keeps "
             "playing while the bot waits alone, and every song counts toward history."
+        )
+
+    @pytest.mark.parametrize("value", ["2s", "0.5"])
+    def test_np_refresh_below_the_bots_value_names_it(self, value: str) -> None:
+        """Below the static floor too: the bot's value is the binding minimum."""
+        result = parse_value(_spec("np-refresh"), value)
+        assert isinstance(result, Refusal)
+        assert result.side == "minimum"
+        assert result.text == (
+            "**Progress bar refresh** has to be between **3s** and **30s** here: the "
+            "bot refreshes no faster than **3s**."
+        )
+
+    def test_np_refresh_follows_the_bots_value_at_the_write(self) -> None:
+        spec = _spec("np-refresh")
+        assert parse_value(spec, "4s") == Parsed(4.0)
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        result = parse_value(spec, "4s")
+        assert isinstance(result, Refusal)
+        assert "between **5s** and **30s** here" in result.text
+        assert parse_value(spec, "5s") == Parsed(5.0)
+        high = parse_value(spec, "31s")
+        assert isinstance(high, Refusal)
+        assert (
+            high.text
+            == "**Progress bar refresh** has to be between **5s** and **30s**."
         )
 
     def test_a_count_refuses_a_fraction(self) -> None:
@@ -735,6 +784,7 @@ class TestParseSettingsArgs:
             ("idle=15 minutes", _set("idle-timeout", 900.0)),
             ("alone-timeout:1:30", _set("alone-timeout", 90.0)),
             ("leave-when-alone 2m", _set("alone-timeout", 120.0)),
+            ("Progress-Bar 5s", _set("np-refresh", 5.0)),
         ],
     )
     def test_near_misses_normalize(self, arg: str, expected: SettingsRequest) -> None:
@@ -880,12 +930,20 @@ class TestHelpSections:
         ((name, entries),) = help_sections()
         assert name == "SETTINGS"
         text = "\n".join(line for entry in entries for line in entry)
+        server = {s.key for s in SETTINGS if s.scope is SettingScope.SERVER}
+        words = {word.rstrip(",") for word in text.split()}
         for spec in SETTINGS:
             names = (spec.key, *spec.aliases)
             if spec.scope is SettingScope.SERVER:
                 assert all(n in text for n in names), spec.key
-            else:
-                assert spec.key not in text.split(), spec.key
+            elif spec.key not in server:
+                assert spec.key not in words, spec.key
+
+    def test_a_range_that_follows_the_bot_names_it(self) -> None:
+        """Built once, when the command is defined: a number there would go stale."""
+        ((_, entries),) = help_sections()
+        text = " ".join(" ".join(entry) for entry in entries)
+        assert "the bot's value–30s" in text
 
     def test_lines_fit_the_help_code_block(self) -> None:
         ((_, entries),) = help_sections()
@@ -1367,6 +1425,20 @@ class TestGuildSettingsAccessors:
         assert guild_settings.alone_timeout_secs(_GUILD) == 120.0
         await guild_settings.reset(_GUILD, ConfigField.ALONE_TIMEOUT)
         assert guild_settings.alone_timeout_secs(_GUILD) == 10.0
+
+    async def test_np_refresh_is_never_faster_than_the_bot(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        assert guild_settings.np_refresh_secs(_GUILD) == 3.0
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        assert guild_settings.np_refresh_secs(_GUILD) == 5.0  # read at the call
+        await guild_settings.write(_GUILD, GuildConfig(np_refresh_secs=10.0))
+        assert guild_settings.np_refresh_secs(_GUILD) == 10.0
+        await guild_settings.write(_GUILD, GuildConfig(np_refresh_secs=4.0))
+        assert guild_settings.np_refresh_secs(_GUILD) == 5.0
+        config.clear_override("NOW_PLAYING_UPDATE_INTERVAL_SECS")
+        assert guild_settings.np_refresh_secs(_GUILD) == 4.0
 
 
 class TestGuildSettingsWritePath:
@@ -2043,6 +2115,7 @@ class TestHotPathsNeverAwaitSettings:
             "seed",
             "idle_timeout_secs",
             "alone_timeout_secs",
+            "np_refresh_secs",
         ],
     )
     def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:

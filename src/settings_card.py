@@ -19,6 +19,7 @@ from src.settings import (
     SettingSpec,
     SettingValue,
     allowed_text,
+    followed_knob,
     format_value,
     from_stored,
 )
@@ -36,6 +37,7 @@ DEGRADED_COLOR: Final = discord.Color.orange()
 SET_HERE: Final = "set here"
 DEFAULT: Final = "default"
 NOT_SAVED: Final = "not saved"
+BOT_MINIMUM: Final = "bot minimum"
 
 _SERVER_SPECS: Final = tuple(s for s in SETTINGS if s.scope is SettingScope.SERVER)
 _BOT_SPECS: Final = tuple(s for s in SETTINGS if s.scope is SettingScope.BOT)
@@ -70,11 +72,14 @@ class Shown:
 
 
 def server_default(spec: SettingSpec, *, debug_default: bool) -> SettingValue:
-    """What a server setting runs on while this server has not set it."""
+    """What a server setting runs on while this server has not set it: its own
+    default, or the bot's current value for one that follows the bot."""
     if spec.default is not None:
         return spec.default
     if spec.field == ConfigField.DEBUG_MODE:
         return debug_default
+    if (knob := followed_knob(spec)) is not None:
+        return config.effective(knob)
     raise ValueError(f"{spec.key} has no server default")
 
 
@@ -85,7 +90,9 @@ def server_shown(
     debug_default: bool,
     persisted: bool,
 ) -> Shown:
-    """The value a server setting renders with, from the cached config."""
+    """The value a server setting renders with, from the cached config. A stored
+    value under its write-time minimum renders that minimum, which is what runs,
+    and names the stored value: `5s`, `bot minimum; set here 3s`."""
     raw = getattr(stored, spec.field) if stored is not None and spec.field else None
     if raw is None:
         value = server_default(spec, debug_default=debug_default)
@@ -93,9 +100,16 @@ def server_shown(
         value = raw
     else:
         value = from_stored(spec, raw)
-    if not persisted:
-        return Shown(value, NOT_SAVED)
-    return Shown(value, DEFAULT if raw is None else SET_HERE)
+    source = DEFAULT if raw is None else SET_HERE
+    if (
+        raw is not None
+        and spec.write_minimum is not None
+        and isinstance(value, float)
+        and value < (floor := spec.write_minimum())
+    ):
+        source = f"{BOT_MINIMUM}; set here {format_value(spec, value)}"
+        value = floor
+    return Shown(value, source if persisted else NOT_SAVED)
 
 
 def _env_set(spec: SettingSpec) -> bool:
@@ -204,7 +218,7 @@ def _names(spec: SettingSpec) -> str:
 
 
 def _accepts(spec: SettingSpec) -> str:
-    text = allowed_text(spec)
+    text = allowed_text(spec, now=True)
     if spec.kind in (SettingKind.SWITCH, SettingKind.TIMEZONE):
         return f"Takes {text}"
     return f"Allowed {text}"

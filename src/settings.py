@@ -124,6 +124,9 @@ class SettingSpec:
     # One sentence each; an out-of-range refusal appends the side the value missed.
     why_minimum: str | None = None
     why_maximum: str | None = None
+    # Completes "has to be between A and B here: ..." when write_minimum refuses;
+    # {bound} is that minimum, rendered.
+    why_write_minimum: str | None = None
     # Server scope's code default; None where the value follows a bot setting or
     # DEBUG_MODE, and for every bot spec, whose default is its env baseline.
     default: float | str | None = None
@@ -223,6 +226,22 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
             "toward history."
         ),
         default=DEFAULT_ALONE_TIMEOUT_SECS,
+    ),
+    SettingSpec(
+        key="np-refresh",
+        aliases=("progress-bar", "progress-bar-refresh"),
+        scope=SettingScope.SERVER,
+        kind=SettingKind.SECONDS,
+        group=SettingGroup.MESSAGES,
+        label="Progress bar refresh",
+        summary="How often the Now Playing bar moves.",
+        applies="from the next tick",
+        field=ConfigField.NP_REFRESH,
+        minimum=_server_bound(ConfigField.NP_REFRESH, "lo"),
+        maximum=_server_bound(ConfigField.NP_REFRESH, "hi"),
+        # Never faster than the bot: its value is the channel's edit budget.
+        write_minimum=config.now_playing_update_interval_secs,
+        why_write_minimum="the bot refreshes no faster than {bound}",
     ),
     SettingSpec(
         key="debug",
@@ -485,6 +504,15 @@ _BY_NAME: Final[Mapping[SettingScope, Mapping[str, SettingSpec]]] = MappingProxy
 )
 
 
+def followed_knob(spec: SettingSpec) -> config.FloatKnob | config.IntKnob | None:
+    """The bot knob a server setting runs on while unset: the one the bot setting
+    of the same key overrides. None for a bot setting, or a server one without."""
+    if spec.scope is not SettingScope.SERVER:
+        return None
+    bot = _BY_NAME[SettingScope.BOT].get(_fold(spec.key))
+    return bot.attr if bot is not None else None
+
+
 # ── Values: bounds, rendering and conversion to what is stored ──────────────
 
 
@@ -596,34 +624,44 @@ def _out_of_range(
     side: Literal["minimum", "maximum"],
     lo: float | None,
     hi: float | None,
+    *,
+    floor: float | None = None,
 ) -> Refusal:
-    why = spec.why_minimum if side == "minimum" else spec.why_maximum
-    text = f"**{spec.label}** has to be {_range_text(spec, lo, hi)}."
-    return Refusal(
-        reason=RefusalReason.OUT_OF_RANGE,
-        text=f"{text} {why}" if why else text,
-        spec=spec,
-        side=side,
-    )
+    """`floor`: the write-only minimum the value missed, when it is the binding one."""
+    text = f"**{spec.label}** has to be {_range_text(spec, lo, hi)}"
+    if floor is not None and spec.why_write_minimum is not None:
+        bold = f"**{format_value(spec, floor)}**"
+        text += f" here: {spec.why_write_minimum.format(bound=bold)}."
+    else:
+        why = spec.why_minimum if side == "minimum" else spec.why_maximum
+        text += f". {why}" if why else "."
+    return Refusal(reason=RefusalReason.OUT_OF_RANGE, text=text, spec=spec, side=side)
 
 
 def check_write(spec: SettingSpec, value: SettingValue) -> Refusal | None:
-    """in_bounds, then the write-only bounds that follow another setting."""
+    """in_bounds, then the write-only bounds that follow another setting. A
+    refusal names the range a write may take, write-only bounds included."""
     lo, hi = bound(spec.minimum), bound(spec.maximum)
-    if not in_bounds(spec, value):
-        below = isinstance(value, (int, float)) and lo is not None and value < lo
-        return _out_of_range(spec, "minimum" if below else "maximum", lo, hi)
-    if isinstance(value, (bool, str)):
+    floor = spec.write_minimum() if spec.write_minimum is not None else None
+    ceiling = spec.write_maximum() if spec.write_maximum is not None else None
+    write_lo = floor if lo is None else lo if floor is None else max(floor, lo)
+    write_hi = ceiling if hi is None else hi if ceiling is None else min(ceiling, hi)
+    if isinstance(value, (bool, str)) or (
+        spec.kind is SettingKind.SECONDS_OR_OFF and value == OFF_SECS
+    ):
+        if in_bounds(spec, value):
+            return None
+        return _out_of_range(spec, "maximum", write_lo, write_hi)
+    if in_bounds(spec, value):
+        if floor is not None and value < floor:
+            return _out_of_range(spec, "minimum", write_lo, write_hi, floor=floor)
+        if ceiling is not None and value > ceiling:
+            return _out_of_range(spec, "maximum", write_lo, write_hi)
         return None
-    if spec.write_minimum is not None and value < (floor := spec.write_minimum()):
-        return _out_of_range(
-            spec, "minimum", floor if lo is None else max(floor, lo), hi
-        )
-    if spec.write_maximum is not None and value > (ceiling := spec.write_maximum()):
-        return _out_of_range(
-            spec, "maximum", lo, ceiling if hi is None else min(ceiling, hi)
-        )
-    return None
+    if lo is not None and value < lo:
+        dynamic = floor if floor is not None and floor > lo else None
+        return _out_of_range(spec, "minimum", write_lo, write_hi, floor=dynamic)
+    return _out_of_range(spec, "maximum", write_lo, write_hi)
 
 
 # ── The duration grammar ──────────────────────────────────────────────────────
@@ -1230,14 +1268,22 @@ _HELP_WIDTH: Final = 48
 _HELP_INDENT: Final = "    "
 
 
-def allowed_text(spec: SettingSpec) -> str:
-    """What a spec accepts, as the help and the detail view print it."""
+def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
+    """What a spec accepts, as the help and the detail view print it. A write-time
+    minimum follows the bot, so only `now` (a render at the call) quotes its value;
+    the help is built once, at import, and names it instead."""
     match spec.kind:
         case SettingKind.SWITCH:
             return "on or off"
         case SettingKind.TIMEZONE:
             return "a city like Europe/London, or UTC"
-    lo = format_value(spec, bound(spec.minimum) or 0)
+    static_lo = bound(spec.minimum) or 0
+    if spec.write_minimum is None:
+        lo = format_value(spec, static_lo)
+    elif now:
+        lo = format_value(spec, max(static_lo, spec.write_minimum()))
+    else:
+        lo = "the bot's value"
     hi = format_value(spec, bound(spec.maximum) or 0)
     return f"{lo}–{hi}" + (" or off" if spec.kind is SettingKind.SECONDS_OR_OFF else "")
 
@@ -1555,6 +1601,14 @@ class GuildSettings:
         stored = self.peek(guild_id)
         value = stored.alone_timeout_secs if stored is not None else None
         return DEFAULT_ALONE_TIMEOUT_SECS if value is None else value
+
+    def np_refresh_secs(self, guild_id: int) -> float:
+        """How often the Now Playing bar moves: the bot's value while unset, and
+        never faster than it. The bot's value is read at the call."""
+        bot = config.now_playing_update_interval_secs()
+        stored = self.peek(guild_id)
+        value = stored.np_refresh_secs if stored is not None else None
+        return bot if value is None else max(value, bot)
 
     # ── Stamps and registrations ──────────────────────────────────────────────
 

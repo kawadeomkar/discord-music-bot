@@ -361,7 +361,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `REDIS_URL` | No | Redis connection URL (defaults to `redis://localhost:6379`) |
 | `POSTGRES_URL` | No | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). Unset → the entire Postgres tier is off (no outbox writes, no drainer, pre-Postgres read behavior) |
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
-| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`, floor `1.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
+| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`, floor `1.0`; sized against Discord's ~5 edits/5 s per-channel bucket). A server's `np-refresh` can only slow it |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC endpoint (default `http://localhost:4317`) |
@@ -850,25 +850,26 @@ Mechanics:
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
 - Discord's 10-embed cap is checked defensively at attach time (worst case here is 3).
 
-**Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
+**Progress bar**: `_progress_updater` edits the host's NP embed every `GuildSettings.np_refresh_secs()`: the larger of the server's `np-refresh` and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s), read before each sleep, so a change lands after the tick in progress. A server can slow its bar but never speed it past the bot's value, because the channel's edit bucket is shared with everything else the bot sends and edits there; the write is refused below the bot's value, and a stored value the bot has since overtaken runs at the bot's value and shows as `bot minimum` on the card. Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
 **Identical re-renders are not pushed.** `_push_np_edit` compares the rendered payload
 (`[e.to_dict() for e in embeds]`) and the host id against the last pair it sent
-successfully, and returns without a PATCH when both match. The bar has ten segments, so a
-four-minute song's display changes ~10 times while the 3 s tick fires ~80: roughly seven
-in eight edits carried nothing new, one request each from a bucket shared across every
-concurrently-playing guild. Keying on the payload rather than on playback position covers
-pause state, next-up, volume and a swapped-in own embed without enumerating them — the
-same approach `dashboard.py` uses for `-ping` and `-debug`. The pair is recorded only
-after a successful edit, so a failure cannot suppress its own retry, and
-`_release_np_host` clears it because retirement can strip-edit the message by a path that
-never reaches `_push_np_edit`.
+successfully, and returns without a PATCH when both match. While a song with a known
+duration plays, the two never match: the bar prints the elapsed clock
+(`fmt_duration(int(elapsed_secs))`), which changes every second, so at any cadence of 1 s
+or more every tick is a real PATCH on the channel's bucket. That is why the cadence has a
+1 s floor and why a server's `np-refresh` can only slow it. What the guard skips is a card
+with nothing moving on it, such as a song with no duration, whose bar is empty. Keying on
+the payload rather than on playback position covers pause state, next-up, volume and a
+swapped-in own embed without enumerating them — the same approach `dashboard.py` uses for
+`-ping` and `-debug`. The pair is recorded only after a successful edit, so a failure
+cannot suppress its own retry, and `_release_np_host` clears it because retirement can
+strip-edit the message by a path that never reaches `_push_np_edit`.
 
-A guild with **debug mode** enabled saves nothing here: the footer carries the runtime
-snapshot, which `RuntimeSampler` resamples at
-`max(1.0, min(5.0, NOW_PLAYING_UPDATE_INTERVAL_SECS))` — the same 3 s cadence as the tick
-— so the payload differs every time. That is the footer reporting live values; debug mode
-is opt-in per guild and off by default.
+A guild with **debug mode** enabled changes the payload even then: the footer carries the
+runtime snapshot, which `RuntimeSampler` resamples at
+`max(1.0, min(5.0, NOW_PLAYING_UPDATE_INTERVAL_SECS))`. That is the footer reporting live
+values; debug mode is opt-in per guild and off by default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
 
@@ -1048,7 +1049,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
-| `guild:{id}:config` | Hash | 5 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
+| `guild:{id}:config` | Hash | 6 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
