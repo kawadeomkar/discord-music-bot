@@ -937,7 +937,7 @@ Two independent triggers, both handled in `musicbot.py`:
 2. **Alone in channel** (`on_voice_state_update`):
    - Bot ejected (`before.channel` set, `after.channel` None) → full `cleanup()`.
    - Bot *moved* between channels → cancel any stale alone-timer from the old channel.
-   - Last human leaves the bot's channel → start a **10-second countdown** (`_alone_countdown`, tracked in `_alone_timers`): sends a notice via `send_with_np`, sleeps 10 s, re-checks channel membership, and cleans up if still alone. A human rejoining (or an explicit stop) cancels the timer. Mute/deafen events (channel unchanged) are ignored.
+   - Last human leaves the bot's channel → start a **10-second countdown** (`_alone_countdown`, tracked in `_alone_timers`): sends a notice via `send_with_np`, sleeps 10 s, re-checks channel membership, and cleans up if still alone. A human rejoining (or an explicit stop) cancels the timer. Any other channel change that leaves the bot alone, another bot joining or leaving included, restarts it: the replacement is stored before the old countdown unwinds, and a countdown removes only its own entry, so a later rejoin still cancels the replacement. Mute/deafen events (channel unchanged) are ignored.
 
 `cleanup()` also cancels any pending alone-timer first, so the timer can't fire after cleanup and attempt a second teardown.
 
