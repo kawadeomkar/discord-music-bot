@@ -496,7 +496,8 @@ All configuration is via environment variables (a `.env` file is loaded by Docke
 Compose; for local runs, export them or use your shell's dotenv tooling). The bot's
 operator can also change some of them at runtime with `-settings bot`, within a narrower
 range; a value set that way is stored in Redis and wins over the variable until it is
-reset. Server settings (`-settings`) live in Redis too.
+reset. A variable you set outside that range still applies, and `-settings bot` marks it
+`outside chat range`. Server settings (`-settings`) live in Redis too.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|

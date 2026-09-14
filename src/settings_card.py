@@ -22,6 +22,7 @@ from src.settings import (
     followed_knob,
     format_value,
     from_stored,
+    in_bounds,
 )
 from src.util import (
     codeblock_fields,
@@ -38,6 +39,7 @@ SET_HERE: Final = "set here"
 DEFAULT: Final = "default"
 NOT_SAVED: Final = "not saved"
 BOT_MINIMUM: Final = "bot minimum"
+OUTSIDE_CHAT_RANGE: Final = "outside chat range"
 
 _SERVER_SPECS: Final = tuple(s for s in SETTINGS if s.scope is SettingScope.SERVER)
 _BOT_SPECS: Final = tuple(s for s in SETTINGS if s.scope is SettingScope.BOT)
@@ -126,7 +128,8 @@ def bot_shown(
 ) -> Shown:
     """A bot setting as the operator's views render it: the value in force, and
     where it comes from — `bot owner; env 3s` for an override, `not saved` for one
-    whose write did not reach Redis."""
+    whose write did not reach Redis, `env, outside chat range` for an environment
+    value chat could not set."""
     origin = "env" if _env_set(spec) else "default"
     if spec.attr is None:
         base = format_value(spec, host_debug_default)
@@ -140,6 +143,9 @@ def bot_shown(
     if not persisted:
         return Shown(baseline if override is None else override, NOT_SAVED)
     if override is None:
+        # Honoured as set; a chat write can only move it back inside.
+        if not in_bounds(spec, baseline):
+            return Shown(baseline, f"{origin}, {OUTSIDE_CHAT_RANGE}")
         return Shown(baseline, origin)
     return Shown(override, f"bot owner; {origin} {format_value(spec, baseline)}")
 

@@ -128,6 +128,26 @@ class TestBotValues:
         )
         assert shown == expected
 
+    def test_an_environment_value_outside_chat_range_is_marked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single-server install runs the resolve concurrency at the full pool,
+        one above what chat accepts. It is honoured, and the card says chat could
+        not have set it."""
+        spec = _spec("play-resolve-concurrency", SettingScope.BOT)
+        monkeypatch.setenv("PLAY_RESOLVE_CONCURRENCY", "4")
+        monkeypatch.setattr(config, "PLAY_RESOLVE_CONCURRENCY", 4)
+        monkeypatch.setattr(config, "YTDLP_POOL_WORKERS", 4)
+        shown = card.bot_shown(
+            spec, host_debug_default=False, debug_default_override=None
+        )
+        assert shown == card.Shown(4, "env, outside chat range")
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
+        shown = card.bot_shown(
+            spec, host_debug_default=False, debug_default_override=None
+        )
+        assert shown == card.Shown(2, "bot owner; env 4")
+
     def test_an_unsaved_knob_says_so(self) -> None:
         config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
         shown = card.bot_shown(

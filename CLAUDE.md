@@ -1329,7 +1329,9 @@ The operator can override fifteen of these at runtime with `-settings bot <setti
 `QUEUE_PROGRESS_DELAY_SECS`/`QUEUE_PROGRESS_TICK_SECS`/`QUEUE_PROGRESS_MAX_SECS`), within a chat
 range narrower than the environment's floor. A stored override wins over the variable
 until it is reset, startup logs a WARNING for each one that shadows a set variable, and
-`-debug` and `-settings bot` label every value `default`, `env` or `bot owner; env 3s`.
+`-debug` and `-settings bot` label every value `default`, `env` or `bot owner; env 3s`. A
+variable set outside the chat range is honoured and labelled `env, outside chat range`; chat
+can only move it back inside.
 
 | Variable | Default | Notes |
 |---|---|---|

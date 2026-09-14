@@ -2434,8 +2434,11 @@ through `_float_env`/`_int_env`, which record the floor each enforced
   carries no fallback. `render_config_value` renders it at render time through the
   registry's `format_value`, with the `-settings bot` card's labels: `3s (default)`,
   `3s (env)` (the parsed baseline, not the raw string), `5s (bot owner; env 3s)` or
-  `5s (bot owner; default 3s)`. Every other row is env-only and renders its raw string,
-  since its value cannot change after import.
+  `5s (bot owner; default 3s)`. An environment value outside the chat range is honoured
+  and renders `0.5s (env, outside chat range)`: a chat write can only move it back inside,
+  which is how a single-server install keeps `PLAY_RESOLVE_CONCURRENCY` at the full pool.
+  Every other row is env-only and renders its raw string, since its value cannot change
+  after import.
 - **`-debug`'s "This server" block lists the server settings changed here**, which everyone
   can see, so it names server keys only: `timezone Europe/London, idle-timeout 10:00
   (2 changed)`, with the card's `not saved` and `bot minimum` labels. A key still following

@@ -313,6 +313,7 @@ class TestConfigAllowlist:
         [
             (None, None, "3s (default)"),
             (None, "4", "4s (env)"),
+            (None, "0.5", "0.5s (env, outside chat range)"),
             (5.0, "4", "5s (bot owner; env 4s)"),
             (5.0, None, "5s (bot owner; default 3s)"),
         ],
