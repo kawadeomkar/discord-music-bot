@@ -15,7 +15,7 @@ import discord
 import fakeredis
 import pytest
 
-from src import play_pipeline
+from src import play_pipeline, util
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -25,6 +25,7 @@ import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.musicbot import MusicBot
+from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
@@ -88,6 +89,34 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def no_leaked_progress_subscribers() -> Iterator[None]:
+    """Assert every progress subscription was released, then clear.
+
+    Same shape as the channel claim below: module state whose leak is silent. A
+    stranded subscriber keeps receiving a later extraction's counts and moves a
+    card nobody is looking at. One test asserted the dict empty; every other one
+    could leave it dirty."""
+    yield
+    leaked = {k: len(v) for k, v in youtube_mod._PROGRESS_SUBSCRIBERS.items() if v}
+    youtube_mod._PROGRESS_SUBSCRIBERS.clear()
+    assert not leaked, f"progress subscribers not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_channel_claims() -> Iterator[None]:
+    """Assert every per-channel claim was released, then clear.
+
+    Process-wide state, like _TYPING_HOLDS: a leaked channel id silently
+    suppresses that kind of message in that channel for the life of the process,
+    and only an assertion can tell a released claim from a cleared one. Cleared
+    before the assert so one leak cannot cascade into every later test."""
+    yield
+    leaked = {k: set(v) for k, v in util._CLAIMED_CHANNELS.items() if v}
+    util._CLAIMED_CHANNELS.clear()
+    assert not leaked, f"channel claims not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
 def reset_probe_streak() -> Iterator[None]:
     """Zero the process-wide unconfirmed-probe streak between tests.
 
@@ -98,8 +127,28 @@ def reset_probe_streak() -> Iterator[None]:
     import src.youtube as youtube
 
     youtube._unconfirmed_streak = 0
+    # Same reason, one dict over: _INFLIGHT_EXTRACTS holds futures bound to the loop
+    # that created them, and pytest-asyncio builds a new loop per test. A test that
+    # abandons a leader would otherwise leave a key later tests await on — a hang in
+    # an unrelated test, not a failure in the one that caused it.
+    youtube._INFLIGHT_EXTRACTS.clear()
     yield
+    youtube._INFLIGHT_EXTRACTS.clear()
     youtube._unconfirmed_streak = 0
+
+
+@pytest.fixture(autouse=True)
+def reset_spotify_walks() -> Iterator[None]:
+    """The Spotify walk registry holds futures bound to the loop that created them,
+    as _INFLIGHT_EXTRACTS does, and a left subscriber would feed a later test's
+    card from an earlier test's walk."""
+    import src.spotify as spotify
+
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
+    yield
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -290,6 +339,28 @@ def reset_structlog_contextvars() -> Iterator[None]:
     structlog.contextvars.clear_contextvars()
 
 
+@pytest.fixture(autouse=True)
+def settle_youtube_background_jobs() -> Iterator[None]:
+    """Drain the two fire-and-forget registries src.youtube keeps between tests.
+
+    Both outlive the call that started them by design — the stream-cache warm the
+    reply does not wait for, and the source-cache revalidation served behind a stale
+    hit. Each test gets its own event loop, so one left pending is a task destroyed
+    on a closed loop, and its patches are long gone by the time it would run.
+    """
+    import src.youtube as youtube
+
+    yield
+    pending = [
+        *youtube._INFLIGHT_STREAM_WARMS.values(),
+        *youtube._SOURCE_REVALIDATIONS,
+    ]
+    for job in pending:
+        job.cancel()
+    youtube._INFLIGHT_STREAM_WARMS.clear()
+    youtube._SOURCE_REVALIDATIONS.clear()
+
+
 @pytest.fixture
 def mock_guild() -> MagicMock:
     guild = MagicMock(spec=discord.Guild)
@@ -334,6 +405,9 @@ def mock_message(mock_author: MagicMock, mock_channel: MagicMock) -> MagicMock:
     message = MagicMock(spec=discord.Message)
     message.author = mock_author
     message.channel = mock_channel
+    # Present because Message carries one, not because the command path reads it:
+    # parse_input takes its search from the bound argument alone. A test that wants
+    # a specific input passes it as `url=`.
     message.content = "-play test song"
     message.add_reaction = AsyncMock()
     # A real tz-aware datetime, as discord.py derives from the message snowflake:
@@ -377,6 +451,9 @@ def mock_ctx(
     # `extras["observation_only"]` to decide whether to skip get_mp(), and an
     # auto-mock there silently exempts the whole suite.
     ctx.command.extras = {}
+    # A real name, not a MagicMock: check_voice_permissions keys its same-channel
+    # exemption on it, and -play's insert re-runs that check against this author.
+    ctx.command.name = "play"
     return ctx
 
 
@@ -530,6 +607,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._plays = PlayRegistry()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -578,6 +656,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._plays = PlayRegistry()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -604,7 +683,17 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     return cog
 
 
-_PLAY_STAGES = ("queue_source", "enqueue_single", "enqueue_playlist")
+_PLAY_STAGES = (
+    "queue_source",
+    "enqueue_single",
+    "enqueue_playlist",
+    "interject_flow",
+    "_resolve_interjection_source",
+)
+
+# The cold-start teardown -play reaches through, stubbed by the routing tests the
+# same way and restored for the same reason.
+_PLAY_CMD_SEAMS = ("abandon_cold_start",)
 
 
 @pytest.fixture(autouse=True)
@@ -615,7 +704,12 @@ def _restore_play_stages() -> Iterator[None]:
     next one runs against the previous one's mock. Here rather than in one test file
     because -play, -playnow and the pipeline's own tests all stub them.
     """
+    from src.commands import play as play_cmd
+
     saved = {name: getattr(play_pipeline, name) for name in _PLAY_STAGES}
+    saved_cmd = {name: getattr(play_cmd, name) for name in _PLAY_CMD_SEAMS}
     yield
     for name, fn in saved.items():
         setattr(play_pipeline, name, fn)
+    for name, fn in saved_cmd.items():
+        setattr(play_cmd, name, fn)

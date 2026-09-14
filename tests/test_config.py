@@ -400,6 +400,18 @@ class TestFloatEnv:
         with pytest.raises(ValueError, match="KNOB must be >= 0.05"):
             _float_env("KNOB", 1.0, minimum=0.05)
 
+    def test_a_default_under_a_derived_floor_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QUEUE_PROGRESS_MAX_SECS's floor is DELAY + TICK, so raising the tick
+        alone could sink the untouched 300s default beneath it and start a card
+        that is born stalled."""
+        monkeypatch.delenv("KNOB", raising=False)
+        with pytest.raises(
+            ValueError, match="KNOB must be >= 400.0; its default is 300.0"
+        ):
+            _float_env("KNOB", 300.0, minimum=400.0)
+
     @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
     def test_non_finite_is_refused(
         self, raw: str, monkeypatch: pytest.MonkeyPatch
@@ -418,6 +430,38 @@ class TestFloatEnv:
         monkeypatch.setenv("KNOB", raw)
         with pytest.raises(ValueError, match="KNOB must be a number"):
             _float_env("KNOB", 1.0, minimum=0.05)
+
+
+class TestPlayBounds:
+    """The two -play knobs, and the floor that keeps them meaningful."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload: fixture teardown runs ahead of monkeypatch's
+        own, so a reload here would re-read the very value under test and raise
+        out of teardown."""
+        import importlib
+
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    def test_defaults(self) -> None:
+        assert config.PLAY_INFLIGHT_MAX == 16
+        assert config.PLAY_RESOLVE_CONCURRENCY == 2
+
+    @pytest.mark.parametrize("name", ["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"])
+    def test_zero_is_refused_at_import(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """Floored at 1, and loudly. Zero admits nothing: every -play in every
+        guild declined, or every resolve waiting on a semaphore that never opens,
+        with no error to say why."""
+        import importlib
+
+        monkeypatch.setenv(name, "0")
+        with pytest.raises(ValueError, match=name):
+            importlib.reload(config)
 
 
 class TestArchiveTunables:

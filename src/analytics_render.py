@@ -1,18 +1,16 @@
 """The `-analytics` chart: a six-panel PNG, rendered in a worker process.
 
-matplotlib is imported inside `build_figure`, never at module scope: the parent imports
-this module only to name the callable it hands the pool, so the worker pays the import
-in the process that uses it. Nothing is constructed at module scope either (golden rule
-10) — the pool instance lives in src.chart_pool.
+matplotlib is imported inside `build_figure`, never at module scope: the parent
+imports this module only to name the callable it hands the pool. Nothing is
+constructed at module scope either (golden rule 10); the pool lives in
+src.chart_pool.
 
-Only machine-minted labels reach the image. matplotlib's bundled font covers no CJK,
-Thai or emoji, and a missing glyph renders as tofu silently, since warning filters do
-not cross a process boundary. `_ascii_safe()` raises rather than asserts; every
-human-authored string renders in the embed instead.
-
-`query_source` is the one archive-derived string that reaches the figure. Its character
-domain is what makes it safe: sources.py stores a hostname matching `[a-z0-9.-]{1,64}`.
-The dimension is open, so it is capped at the top few plus a minted "other".
+Only machine-minted labels reach the image: matplotlib's bundled font covers no
+CJK, Thai or emoji, and a missing glyph renders as tofu silently in a worker.
+`_ascii_safe()` guards every drawn string; human-authored text renders in the
+embed. `query_source` is the one archive-derived string here, safe because
+sources.py stores a hostname matching `[a-z0-9.-]{1,64}`; the dimension is open,
+so it is capped at the top few plus a minted "other".
 
 See docs/ARCHITECTURE.md#analytics-rendering.
 """
@@ -41,18 +39,16 @@ PIXELS: Final[tuple[int, int]] = (
     int(FIGSIZE[1] * DPI),
 )
 
-# Explicitly dark, and committed to: a PNG cannot follow the viewer's theme the way
-# an embed does, so one of the two modes has to be chosen. Dark matches the Discord
-# embed surface these are pasted onto.
+# Dark, committed to: a PNG cannot follow the viewer's theme, and dark matches the
+# Discord embed surface these are pasted onto.
 _BG: Final[str] = "#2b2d31"
 _PANEL: Final[str] = "#232428"
 _INK: Final[str] = "#e6e8eb"
 _MUTED: Final[str] = "#9aa1ab"
 _GRID: Final[str] = "#3a3d43"
 
-# The reference palette's dark steps, in validated slot order. The order carries the
-# adjacent-pair CVD separation — re-run the validator if it changes.
-# See docs/ARCHITECTURE.md#analytics-rendering.
+# The reference palette's dark steps in validated slot order; the order carries
+# the adjacent-pair CVD separation. See docs/ARCHITECTURE.md#analytics-rendering.
 _SOURCE_COLORS: Final[tuple[str, ...]] = (
     "#3987e5",  # blue
     "#d95926",  # orange
@@ -63,8 +59,7 @@ _SOURCE_COLORS: Final[tuple[str, ...]] = (
 _OTHER_COLOR: Final[str] = "#9085e9"  # violet — the minted residual bucket
 _ACCENT: Final[str] = "#3987e5"
 
-# Magnitude takes a sequential ramp: one hue, stepped 700 -> 100. Darkest first, so
-# the near-zero end recedes into the dark surface.
+# Sequential ramp for magnitude, darkest first so the near-zero end recedes.
 _SEQUENTIAL_BLUE: Final[tuple[str, ...]] = (
     "#0d366b",
     "#104281",
@@ -81,19 +76,17 @@ _SEQUENTIAL_BLUE: Final[tuple[str, ...]] = (
     "#cde2fb",
 )
 
-# The residual bucket, minted here rather than found in the data: `query_source` is an
-# OPEN set, so without a cap every distinct host a guild has ever played becomes a
-# legend entry and a stack segment, with no bound. Five plus this is six.
+# The residual bucket for every source past the cap — `query_source` is an open
+# set. Five plus this is six.
 OTHER_SOURCE: Final[str] = "other"
 # Shown for the empty query_source every pre-archive backfill row carries.
 UNKNOWN_SOURCE: Final[str] = "unknown"
 MAX_SOURCES: Final[int] = len(_SOURCE_COLORS)
 
-# The domain sources.py guarantees (normalize_query_host), plus our own bucket. Not a
-# membership list — see the module docstring.
+# The domain sources.py guarantees (normalize_query_host), plus our own bucket.
 _SLUG_RE: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9.-]{1,64}$")
 
-# Room at the top for the suptitle, and hspace for the per-panel titles plus panel
+# Room at the top for the suptitle; hspace for the per-panel titles plus panel
 # 1's legend band.
 _LAYOUT: Final[dict[str, float]] = {
     "left": 0.055,
@@ -104,8 +97,8 @@ _LAYOUT: Final[dict[str, float]] = {
     "hspace": 0.58,
 }
 
-# Fingerprints what the image looks like, so a palette or layout change invalidates
-# the PNG cache — whose key otherwise digests the aggregate alone.
+# Fingerprints what the image looks like, so a palette or layout change
+# invalidates the PNG cache, whose key otherwise digests the aggregate alone.
 RENDER_VERSION: Final[str] = hashlib.blake2b(
     repr(
         (DPI, FIGSIZE, _LAYOUT, _SOURCE_COLORS, _SEQUENTIAL_BLUE, _OTHER_COLOR)
@@ -114,30 +107,23 @@ RENDER_VERSION: Final[str] = hashlib.blake2b(
 ).hexdigest()
 
 _WEEKDAYS: Final[tuple[str, ...]] = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-# Minted from the same tuple the SQL asks for, so the labels cannot name a
-# percentile the query does not return.
+# Minted from the tuple the SQL asks for, so a label cannot name a percentile the
+# query does not return.
 _PCT_LABELS: Final[tuple[str, ...]] = tuple(
     f"p{int(pct * 100)}" for pct in WAIT_PERCENTILES
 )
 
 
 class UnsafeGlyphError(ValueError):
-    """A string bound for the image that the bundled font cannot render.
-
-    Raised, never asserted: `python -O` strips asserts, and this is the ONLY guard —
-    matplotlib's own missing-glyph warning is swallowed in the worker. The command
-    routes this to the embed-only card, so the numbers survive.
-    """
+    """A string bound for the image that the bundled font cannot render. Raised,
+    since `python -O` strips asserts and this is the only guard; the command
+    routes it to the embed-only card."""
 
 
 def _ascii_safe(text: str) -> str:
-    """Every string about to be drawn passes through here.
-
-    ASCII is the exact subset of DejaVu Sans this module is willing to promise, and
-    the check is on the CHARACTER DOMAIN rather than on where the string came from —
-    which is what makes it catch a future panel smuggling an uploader name in, even
-    when that panel's test data happens to be ASCII.
-    """
+    """Every drawn string passes through here. ASCII is the subset of DejaVu Sans
+    this module promises, checked on the character domain rather than on
+    provenance, so a panel smuggling an uploader name in is caught."""
     if not text.isascii():
         raise UnsafeGlyphError(
             f"non-ASCII string bound for the chart image: {text!r} — "
@@ -147,34 +133,30 @@ def _ascii_safe(text: str) -> str:
 
 
 def fold_sources(metrics: AnalyticsMetrics) -> tuple[str, ...]:
-    """The source dimension the panels draw, most plays first, capped.
-
-    Everything past the cap folds into one minted bucket rather than being dropped:
-    a guild whose long tail vanished would read the stacked bars as a play count
-    lower than its own topline.
-    """
+    """The source dimension the panels draw, most plays first, capped. The tail
+    folds into one minted bucket rather than being dropped, or the stacked bars
+    would read as a play count lower than the topline."""
     totals: dict[str, int] = {}
     for row in metrics.daily_by_source:
         totals[row.source] = totals.get(row.source, 0) + row.plays
-    # completion and source_completion index this result too, so their sources are
-    # seeded here and every panel's lookup resolves inside `kept`.
+    # completion and source_completion index this result too, so their sources
+    # are seeded here and every panel's lookup resolves inside `kept`.
     for bucket in metrics.completion:
         totals.setdefault(bucket.source, 0)
     for entry in metrics.source_completion:
         totals.setdefault(entry.source, 0)
     ranked = sorted(totals, key=lambda s: (-totals[s], s))
     kept = tuple(ranked[:MAX_SOURCES])
+    # OTHER_SOURCE can also be a real query_source (normalize_query_host accepts a
+    # dotless label); appending it blindly would draw that segment twice.
     if len(ranked) > MAX_SOURCES and OTHER_SOURCE not in kept:
         return kept + (OTHER_SOURCE,)
-    # OTHER_SOURCE is minted here, but nothing stops it being a real query_source:
-    # normalize_query_host accepts a dotless label. Appending it blindly would list
-    # it twice in `kept` and draw that segment twice, over-counting the stack.
     return kept
 
 
 def _source_label(source: str, kept: tuple[str, ...]) -> str:
-    """Which legend entry a raw source belongs to. A value outside the domain is
-    folded into "other" rather than raising: a mis-stamped row must cost a legend
+    """Which legend entry a raw source belongs to. A value outside the domain
+    folds into "other" rather than raising: a mis-stamped row must cost a legend
     entry, not the whole chart."""
     if source in kept:
         return source
@@ -184,10 +166,8 @@ def _source_label(source: str, kept: tuple[str, ...]) -> str:
 
 
 def _legend_label(source: str) -> str:
-    """What the legend shows for a source. `''` is a real archived value — every
-    `just db-backfill` row carries it — and matplotlib reads an empty label as NO
-    label, so the legend renders empty and warns once per render into a worker's raw
-    stderr. Minted, so it stays inside the drawn-string domain."""
+    """`''` is a real archived value (every backfill row), and matplotlib reads an
+    empty label as NO label, so the legend would render empty and warn."""
     return source or UNKNOWN_SOURCE
 
 
@@ -213,15 +193,13 @@ def _style(ax: Any, title: str, *, ylabel: str = "", title_pad: float = 7) -> No
 
 
 def dense_buckets(m: AnalyticsMetrics) -> tuple[list[str], list[int], list[float]]:
-    """Every bucket in the window, zero-filled — labels, plays, hours.
-
-    The SQL returns only buckets that have plays, so zero-filling is what keeps the
-    time axis even. Falls back to the aggregate's own buckets if the window is
-    unstamped, costing the spacing rather than the panel."""
+    """Every bucket in the window, zero-filled — labels, plays, hours. The SQL
+    returns only buckets with plays, so this keeps the time axis even. Falls back
+    to the aggregate's own buckets when the window is unstamped."""
     step = 7 * 86400 if m.bucket_unit == "week" else 86400
     span = m.window_end_epoch - m.window_start_epoch
-    # Bounded by the window's own length: a weekly window snaps its start back to a
-    # Monday, so it runs up to six days longer than `days`.
+    # A weekly window snaps its start back to a Monday, so it runs up to six days
+    # longer than `days`.
     if m.window_start_epoch <= 0 or not 0 < span <= (m.days + 7) * 86400:
         return (
             [p.day for p in m.daily],
@@ -244,8 +222,7 @@ def dense_buckets(m: AnalyticsMetrics) -> tuple[list[str], list[int], list[float
 
 
 def _tick_stride(count: int, target: int = 10) -> int:
-    """Show about `target` x labels however long the series is. 90 daily bars with
-    every date printed is an unreadable smear."""
+    """About `target` x labels however long the series is."""
     return max(1, -(-count // target))
 
 
@@ -259,8 +236,8 @@ def _panel_daily_by_source(
             stacks[_source_label(row.source, kept)][index[row.day]] += row.plays
     from matplotlib.collections import PolyCollection
 
-    # One collection per source. Collections do not autoscale, hence the limits below.
-    # See docs/ARCHITECTURE.md#analytics-rendering.
+    # One collection per source. Collections do not autoscale, hence the limits
+    # below. See docs/ARCHITECTURE.md#analytics-rendering.
     half = 0.82 / 2
     bottom = [0.0] * len(days)
     for source in kept:
@@ -272,8 +249,7 @@ def _panel_daily_by_source(
                     for x, (b, h) in enumerate(zip(bottom, heights))
                 ],
                 facecolors=_color_for(source, kept),
-                # A surface-coloured hairline between segments, so two adjacent hues
-                # never share an edge.
+                # A surface-coloured hairline so two adjacent hues never share an edge.
                 edgecolors=_PANEL,
                 linewidths=0.4,
                 label=_ascii_safe(_legend_label(source)),
@@ -282,12 +258,11 @@ def _panel_daily_by_source(
         bottom = [b + v for b, v in zip(bottom, heights)]
     if days:
         # add_collection feeds the data limits without applying them, and a
-        # collection has no sticky edge at y=0, so the floor is pinned here.
+        # collection has no sticky edge at y=0.
         ax.autoscale_view()
         ax.set_ylim(bottom=0)
     unit = "week" if m.bucket_unit == "week" else "day"
-    # Extra title pad on this panel alone: it is the only one with a legend, and the
-    # legend sits between the title and the axes.
+    # Extra title pad: the legend sits between the title and the axes.
     _style(
         ax,
         f"Plays per {unit}, by source",
@@ -301,8 +276,6 @@ def _panel_daily_by_source(
         rotation=0,
     )
     if kept:
-        # Its own band between the title and the axes, one row across the panel
-        # width. The title pad above reserves the space.
         legend = ax.legend(
             fontsize=6.5,
             ncol=max(len(kept), 1),
@@ -325,13 +298,11 @@ def _panel_heatmap(ax: Any, m: AnalyticsMetrics, fig: Figure) -> None:
     from matplotlib.colors import LinearSegmentedColormap
     from matplotlib.ticker import MaxNLocator
 
-    # Built here, not at module scope: this module stays import-safe before
-    # matplotlib exists (golden rule 10).
     cmap = LinearSegmentedColormap.from_list(
         "analytics_seq", _SEQUENTIAL_BLUE
     ).with_extremes(under=_PANEL)
-    # An empty hour is absence: vmin sits above zero and with_extremes catches what
-    # falls below. Both bounds explicit, so the scale cannot degenerate.
+    # An empty hour is absence: vmin sits above zero and with_extremes catches
+    # what falls below. Both bounds explicit, so the scale cannot degenerate.
     peak = max((max(row) for row in grid), default=0)
     image = ax.imshow(
         grid,
@@ -348,8 +319,8 @@ def _panel_heatmap(ax: Any, m: AnalyticsMetrics, fig: Figure) -> None:
     ax.set_yticks(range(7))
     ax.set_yticklabels([_ascii_safe(d) for d in _WEEKDAYS])
     bar = fig.colorbar(image, ax=ax, pad=0.02, fraction=0.045)
-    # Integer ticks: the scale counts plays, and the sub-1 vmin above would
-    # otherwise put fractional labels on a count.
+    # Integer ticks: the scale counts plays, and the sub-1 vmin would otherwise
+    # put fractional labels on a count.
     bar.locator = MaxNLocator(integer=True)
     bar.update_ticks()
     bar.ax.tick_params(colors=_MUTED, labelsize=6, length=0)
@@ -370,11 +341,9 @@ def _panel_listening_time(
 
 
 def _panel_completion(ax: Any, m: AnalyticsMetrics, kept: tuple[str, ...]) -> None:
-    """Grouped by source because the per-play distributions differ in SHAPE even
-    where their means converge — aggregated into one histogram those shapes are lost.
-
-    This is the per-play view, deliberately: the duration-weighted ratio answers a
-    different question and lives on the panel where song length is the axis."""
+    """Per-play completion, grouped by source because the distributions differ in
+    shape even where their means converge. The duration-weighted ratio answers a
+    different question and lives on the song-length panel."""
     series: dict[str, list[float]] = {s: [0.0] * 10 for s in kept}
     for row in m.completion:
         if 1 <= row.bucket <= 10:
@@ -398,13 +367,9 @@ def _panel_completion(ax: Any, m: AnalyticsMetrics, kept: tuple[str, ...]) -> No
 
 
 def _panel_durations(ax: Any, m: AnalyticsMetrics, kept: tuple[str, ...]) -> None:
-    """Song length, annotated with the DURATION-WEIGHTED completion per source.
-
-    The two completion numbers disagree by design and the difference is the finding:
-    on the live archive, pasted YouTube links play 21% of their seconds but 14 of 16
-    individual plays run to the end. A handful of abandoned hour-long mixes dominates
-    the weighted number, which is exactly why it belongs on the length axis.
-    """
+    """Song length, annotated with the duration-weighted completion per source —
+    a handful of abandoned hour-long mixes dominates that number, which is why it
+    belongs on the length axis."""
     counts = [0] * 21
     for row in m.durations:
         if 0 <= row.minutes <= 20:
@@ -422,8 +387,8 @@ def _panel_durations(ax: Any, m: AnalyticsMetrics, kept: tuple[str, ...]) -> Non
     if weighted:
         # Headroom, so the note never lands on a bar.
         ax.set_ylim(top=max(max(counts), 1) * 1.28)
-        # Summed by label before ranking, so a folded group reports once. Clamped at
-        # 100: nothing constrains played_secs <= duration_secs.
+        # Summed by label before ranking, so a folded group reports once. Clamped
+        # at 100: nothing constrains played_secs <= duration_secs.
         merged: dict[str, tuple[float, float]] = {}
         for entry in m.source_completion:
             if entry.duration_secs > 0:
@@ -451,9 +416,7 @@ def _panel_durations(ax: Any, m: AnalyticsMetrics, kept: tuple[str, ...]) -> Non
 
 
 def _fmt_secs(value: float) -> str:
-    """A wait, in the largest unit that keeps it short. Machine-minted, so it is
-    ASCII by construction — but it still goes through _ascii_safe at the draw site,
-    because that guard is on the DOMAIN of what is drawn, not on its provenance."""
+    """A wait, in the largest unit that keeps it short."""
     if value < 60:
         return f"{value:.0f}s"
     if value < 3600:
@@ -462,16 +425,10 @@ def _fmt_secs(value: float) -> str:
 
 
 def _panel_wait(ax: Any, m: AnalyticsMetrics) -> None:
-    """A box/percentile strip: box p25-p75, median at p50, whiskers to p10 and p90.
-
-    Percentiles, never a mean: the live archive has p50 = 35 s against a mean of
-    1,142 s, skewed by one song queued and left overnight. A bar per percentile —
-    which this used to draw — is the wrong form for the same reason a bar chart of
-    quartiles is: it invites reading five independent quantities where there is one
-    distribution, and it puts a baseline at zero that means nothing here.
-    """
-    # No ylabel: this strip has one row, and the units belong on the value axis,
-    # which is x here.
+    """A percentile strip: box p25-p75, median at p50, whiskers to p10 and p90.
+    Percentiles, never a mean: one song queued overnight skews a mean by orders
+    of magnitude."""
+    # No ylabel: one row, and the units belong on the value axis, which is x.
     _style(ax, "Queue wait")
     if len(m.wait_pcts) != len(WAIT_PERCENTILES) or m.wait_p50_secs <= WAIT_UNAVAILABLE:
         ax.text(
@@ -489,9 +446,8 @@ def _panel_wait(ax: Any, m: AnalyticsMetrics) -> None:
         ax.grid(False)
         return
     p10, p25, p50, p75, p90 = m.wait_pcts
-    # bxp, not boxplot: the percentiles are already computed server-side, and
-    # boxplot() would want every raw wait shipped from Postgres to re-derive them.
-    # Horizontal because one distribution in a wide panel reads along its axis.
+    # bxp, not boxplot: the percentiles are computed server-side, and boxplot()
+    # would want every raw wait shipped from Postgres.
     ax.bxp(
         [
             {
@@ -518,9 +474,8 @@ def _panel_wait(ax: Any, m: AnalyticsMetrics) -> None:
     ax.grid(False, axis="y")
     ax.set_xlabel(_ascii_safe("seconds"), color=_MUTED, fontsize=8)
     ax.set_xlim(left=0)
-    # The corner note names the percentiles the box and whiskers span. Only the
-    # median is labelled — the x-axis carries the rest, and on a skewed distribution
-    # end labels overlap.
+    # Only the median is labelled — the x-axis carries the rest, and on a skewed
+    # distribution end labels overlap.
     ax.annotate(
         _ascii_safe(f"{_PCT_LABELS[WAIT_MEDIAN_INDEX]} {_fmt_secs(p50)}"),
         xy=(p50, 1.0),
@@ -531,8 +486,7 @@ def _panel_wait(ax: Any, m: AnalyticsMetrics) -> None:
         fontsize=7.5,
         color=_INK,
     )
-    # What the box and whiskers MEAN, because bxp's defaults are 1.5*IQR whiskers and
-    # these are not: a reader who assumes the default reads the tails wrong.
+    # bxp's default whiskers are 1.5*IQR and these are not; say so.
     ax.text(
         0.99,
         0.93,
@@ -547,13 +501,10 @@ def _panel_wait(ax: Any, m: AnalyticsMetrics) -> None:
 
 
 def build_figure(metrics: AnalyticsMetrics) -> Figure:
-    """The six panels, as a Figure — split from the rasterization so a test can make
-    a dozen structural assertions against one construction and only one pays savefig.
-
-    `matplotlib.figure.Figure` directly, never pyplot: pyplot keeps every figure in a
-    global registry until it is explicitly closed, which in a long-lived worker is a
-    leak. Measured over 300 renders, 0 live Figure objects remain.
-    """
+    """The six panels as a Figure, split from rasterization so tests can inspect
+    one construction. `matplotlib.figure.Figure` directly, never pyplot: pyplot
+    keeps every figure in a global registry until closed, a leak in a long-lived
+    worker."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -562,13 +513,12 @@ def build_figure(metrics: AnalyticsMetrics) -> Figure:
     kept = fold_sources(metrics)
     fig = Figure(figsize=FIGSIZE, dpi=DPI, facecolor=_BG)
     axes = fig.subplots(3, 2)
-    # A fixed layout, applied before the panels are drawn: the grid is always 3x2 at
-    # one figsize with one font, so the solve has a single answer and these numbers
-    # are it. Applied first because fig.colorbar(ax=...) takes its space from the
-    # parent axes at creation. See docs/ARCHITECTURE.md#analytics-rendering.
+    # A fixed layout, applied BEFORE the panels: fig.colorbar(ax=...) takes its
+    # space from the parent axes at creation. The grid is always 3x2 at one
+    # figsize with one font, so the solve has one answer and these numbers are it.
+    # See docs/ARCHITECTURE.md#analytics-rendering.
     fig.subplots_adjust(**_LAYOUT)
-    # Solved once and handed to both panels: it walks the window minting a
-    # strftime per bucket, and the two callers must agree on the axis anyway.
+    # Solved once for both panels, which must agree on the axis anyway.
     days, _, hours = dense_buckets(metrics)
     _panel_daily_by_source(axes[0][0], metrics, kept, days)
     _panel_heatmap(axes[0][1], metrics, fig)
@@ -588,13 +538,9 @@ def build_figure(metrics: AnalyticsMetrics) -> Figure:
 
 
 def render_dashboard(metrics: AnalyticsMetrics) -> bytes:
-    """Rasterize the dashboard to PNG bytes. THE worker entry point.
-
-    PNG, not JPEG: measured on this figure, JPEG is 65% LARGER (93.3 KiB against
-    56.6 KiB) *and* lower quality — flat-colour panels with thin lines and text are
-    the DCT pathological case. WebP is smaller still and buys nothing against an
-    8 MB ceiling.
-    """
+    """Rasterize the dashboard to PNG bytes — the worker entry point. PNG, not
+    JPEG: flat-colour panels with thin lines and text are the DCT pathological
+    case (measured 65% larger and lower quality)."""
     import io
 
     figure = build_figure(metrics)

@@ -11,13 +11,10 @@ from src.config import (
     using_default_postgres_password,
 )
 from src.redis_client import GuildRedisStore
-from src.util import (
-    notice_embed,
-)
+from src.util import notice_embed
 
 if TYPE_CHECKING:
-    # A runtime import would close the cycle (musicbot imports this module); the cog
-    # is only named in annotations. Same guard recovery.py and musicplayer.py use.
+    # A runtime import would close the cycle: musicbot imports this module.
     from src.musicbot import MusicBot
 from src.debug import (
     ArchiveStatsReader,
@@ -33,11 +30,8 @@ log = get_logger(__name__)
 
 
 async def run(ctx: commands.Context, arg: str, *, cog: MusicBot) -> None:
-    """`-debug` — the snapshot card, or the per-guild toggle.
-
-    Takes the cog: the snapshot reads the player registry, the Redis handle and the
-    archive off it, and the toggle writes the guild's stored choice through it.
-    """
+    """`-debug` — the snapshot card, or the per-guild toggle. Takes the cog:
+    the snapshot reads the player registry off it, the toggle writes through it."""
     action = parse_debug_arg(arg)
     if action is None:
         await ctx.send(
@@ -48,10 +42,7 @@ async def run(ctx: commands.Context, arg: str, *, cog: MusicBot) -> None:
         await toggle(ctx, action, cog=cog)
         return
     inputs = await build_inputs(ctx, cog=cog)
-    # No typing indicator and no ctx.send: the dashboard sends its own
-    # skeleton immediately and edits it as blocks land, so the reply IS the
-    # acknowledgement. It uses channel.send to stay off the Now Playing host,
-    # which an edit loop must not own (src/dashboard.py).
+    # No typing indicator: the dashboard's own skeleton is the acknowledgement.
     await run_debug_dashboard(ctx, inputs)
 
 
@@ -68,9 +59,7 @@ async def toggle(ctx: commands.Context, action: DebugAction, *, cog: MusicBot) -
             )
         )
         return
-    # A moderator action: the toggle is guild-wide and every member sees the
-    # result on every reply, so it is not the invoking user's to make alone.
-    # Reading `-debug` stays open to everyone; only writing is gated.
+    # Guild-wide and visible on every reply, so only writing is gated.
     author = ctx.author
     may_toggle = (
         isinstance(author, discord.Member) and author.guild_permissions.manage_guild
@@ -87,18 +76,14 @@ async def toggle(ctx: commands.Context, action: DebugAction, *, cog: MusicBot) -
         return
     enabled = action is DebugAction.ENABLE
     persisted = await cog.debug_settings.toggle(cog.redis, ctx.guild.id, enabled)
-    # Say which kind of change this was. A guild told "on" that quietly reverts
-    # on the next restart reads as the bot ignoring them, so a degraded write is
-    # named rather than rounded up to success.
+    # A degraded write is named, not rounded up to success.
     durability = (
         "The setting is saved for this server."
         if persisted
         else "⚠️ It could not be saved (Redis is unavailable), so it applies "
         "until the bot restarts."
     )
-    # Names what enabling publishes, at the moment the choice is made: the
-    # footer reports the whole process's load, and the Now Playing card carries
-    # it passively to everyone who can read the channel while music plays.
+    # Names what enabling publishes, at the moment the choice is made.
     scope = (
         " While it is on, every embed here — including the live Now Playing "
         "card — shows the bot process's load to anyone who can read the channel."
@@ -120,14 +105,9 @@ async def toggle(ctx: commands.Context, action: DebugAction, *, cog: MusicBot) -
 
 
 async def is_operator(ctx: commands.Context) -> bool:
-    """Is the caller the bot owner? Fails CLOSED.
-
-    `is_owner()` falls through to an `application_info()` REST call when neither
-    owner_id nor owner_ids is configured (MusicBotApp sets neither), and it RAISES
-    rather than returning False — a diagnostic must not disclose the host just
-    because Discord blinked. discord.py caches the answer onto the bot afterwards,
-    so this is one round trip per process, not per command.
-    """
+    """Is the caller the bot owner? Fails CLOSED: is_owner() falls through to
+    an application_info() REST call (no owner_id is configured) and RAISES on
+    failure. discord.py caches the answer, so one round trip per process."""
     try:
         return await ctx.bot.is_owner(ctx.author)
     except Exception as e:  # noqa: BLE001 — an unreachable owner is not an owner
@@ -141,10 +121,7 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
     guild_id = ctx.guild.id if ctx.guild else None
     archive_enabled = history_archive_enabled()
     operator = await is_operator(ctx)
-    # Asked symmetrically — not only when the password IS the default — because a
-    # row that renders for False and vanishes for True makes its own absence the
-    # answer. Moot while the whole Checks block is owner-only, and it stays right
-    # if that ever loosens.
+    # Asked symmetrically: a row that vanishes for True makes its absence the answer.
     default_password = (
         (using_default_postgres_password() and archive_enabled) if operator else None
     )
@@ -158,14 +135,12 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
         store=GuildRedisStore(cog.redis, guild_id)
         if cog.redis is not None and guild_id is not None
         else None,
-        # Structural: PostgresHistoryArchive satisfies ArchiveStatsReader, and
-        # a cog built without an archive (tests, disabled tier) passes None.
+        # Structural: PostgresHistoryArchive satisfies ArchiveStatsReader.
         archive=cast(Optional[ArchiveStatsReader], cog.history_archive),
         archive_enabled=archive_enabled,
         prometheus_url=debug_prometheus_url(),
         operator=operator,
         default_password=default_password,
-        # Gated on `operator`: the card withholds its Runtime block from a
-        # non-owner and says so, so the footer must not print those figures.
+        # The card withholds its Runtime block from a non-owner; so must the footer.
         debug_suffix=cog.debug_suffix(ctx, host_metrics=operator),
     )

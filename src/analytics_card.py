@@ -1,17 +1,14 @@
 """`-analytics` — everything the command needs except the figure and the pool.
 
-Two halves, and the file is ordered that way. The first is PURE: an
-`AnalyticsMetrics` in, keys, dicts or an embed out. The second does IO — it drives
-the chart pool, reads and writes the PNG cache, and sends the card. Only the command
-itself stays on the MusicBot cog, where discord.py needs it.
+Two halves, in file order. The first is pure: an `AnalyticsMetrics` in, keys,
+dicts or an embed out. The second does IO: the chart pool, the PNG cache, the send.
 
-Every human-authored string the command shows renders HERE, never in the chart image:
-the runtime image ships no system fonts and matplotlib's bundled face covers no CJK,
-Thai or emoji. The embed gets Discord's full-Unicode stack, masked links and live
-mentions. See docs/ARCHITECTURE.md#analytics-rendering.
+Every human-authored string renders HERE, never in the chart image: the runtime
+image ships no system fonts and matplotlib's bundled face covers no CJK, Thai or
+emoji. See docs/ARCHITECTURE.md#analytics-rendering.
 
-Named `analytics_card` because `guild_state.Analytics` already exists — a per-song
-enqueue stamp — and the two would sit one capital apart.
+Named `analytics_card` because `guild_state.Analytics` (a per-song enqueue stamp)
+already exists.
 """
 
 import asyncio
@@ -60,51 +57,43 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 _tracer = trace.get_tracer(__name__)
 
-# The four windows -analytics answers, and the whole of its key space. A closed key
-# space is what makes the day-long TTL a rate bound: one recompute per guild per
-# window per day, worst case. See docs/ARCHITECTURE.md#analytics-rendering.
+# The four windows -analytics answers — the whole key space, which is what makes
+# the day-long TTL a rate bound. See docs/ARCHITECTURE.md#analytics-rendering.
 ALLOWED_DAYS: Final[tuple[int, ...]] = (7, 30, 90, 365)
 DEFAULT_DAYS: Final[int] = 30
 
-# Three lists plus a topline share Discord's 4096-character description limit with
-# the Now Playing block. Five keeps the worst case near 3,450; the arithmetic picks
-# this constant, so redo it before raising it.
+# Three lists plus a topline share the 4096-char description with the Now Playing
+# block; five keeps the worst case near 3,450. Redo that arithmetic before raising.
 TOP_N: Final[int] = 5
 
-# Bumped on any change to the cached shape. The codec defaults missing fields rather
-# than rejecting them, so without this a rolling deploy would decode an old entry into
-# a valid-looking card with wrong values.
+# Bumped on any change to the cached shape: the codec defaults missing fields, so
+# a rolling deploy would otherwise decode an old entry into a wrong-valued card.
 _CACHE_VERSION: Final[int] = 1
-# Bumped on any change to the FIGURE, independently of the aggregate: a layout change
-# must not be served from an entry the previous layout produced.
+# Bumped on any change to the FIGURE, independently of the aggregate.
 _PNG_CACHE_VERSION: Final[int] = 1
 
 _TITLE_MAX: Final[int] = 50
 _NAME_MAX: Final[int] = 40
 _URL_MAX: Final[int] = 150
-# A paren, whitespace or control character inside a masked-link URL ends the markdown
-# early. Sibling of leaderboard.py's `linkable`, which is private to that module; keep
-# the two in step.
+# A control character inside a masked-link URL ends the markdown early. Sibling of
+# leaderboard.py's `linkable`; keep the two in step.
 _LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
 
 _DAY_SECS: Final[int] = 86400
 
-# The chart image's attachment name. One constant because it is written in three
-# places that must agree — the File, the embed's set_image, and the test that pins
-# the pair — and Discord resolves attachment:// by exact filename.
+# The chart's attachment name: the File and the embed's set_image must agree,
+# since Discord resolves attachment:// by exact filename.
 IMAGE_FILENAME: Final[str] = "analytics.png"
 
 
 def cache_key(guild_id: int, days: int) -> str:
-    """Keyed by window, and by nothing else. There is deliberately no `{tz}`
-    component: the query takes no zone parameter, so a second key dimension would
-    be meaningless. Worst case per guild is four windows."""
+    """Keyed by window alone — the query takes no zone parameter."""
     return f"analytics:agg:v{_CACHE_VERSION}:{guild_id}:{days}"
 
 
 def png_cache_key(guild_id: int, days: int, digest: str) -> str:
-    """Keyed to a digest of the aggregate the PNG was rendered from, and to the
-    renderer's own version, so a stale PNG misses rather than pairing an old chart
+    """Keyed to a digest of the aggregate the PNG was rendered from and to the
+    renderer's version, so a stale PNG misses rather than pairing an old chart
     with fresh numbers."""
     return (
         f"analytics:png:v{_PNG_CACHE_VERSION}.{analytics_render.RENDER_VERSION}"
@@ -113,19 +102,17 @@ def png_cache_key(guild_id: int, days: int, digest: str) -> str:
 
 
 def cache_ttl_secs(metrics: AnalyticsMetrics, now: Optional[float] = None) -> int:
-    """Seconds until the next UTC midnight, when the answer changes.
-
-    The window is N complete days, so the artifact is immutable for its whole life.
-    Derived from the query's own clock read, so a non-positive result means the day
-    turned while it ran and the caller skips the write."""
+    """Seconds until the next UTC midnight, when the answer changes. Derived from
+    the query's own clock read; non-positive means the day turned while it ran
+    and the caller skips the write."""
     now = time.time() if now is None else now
     if metrics.today_start_epoch <= 0:
         return 0
     return int(metrics.today_start_epoch + _DAY_SECS - now)
 
 
-# The cache wire format, spelled out once: field -> record type and the names that
-# reach Redis, so an attribute rename breaks the decode into a miss.
+# The cache wire format: field -> record type and the names that reach Redis, so
+# an attribute rename breaks the decode into a miss.
 _WIRE: Final[dict[str, tuple[type, tuple[str, ...]]]] = {
     "daily": (DailyPoint, ("day", "plays", "listen_secs")),
     "daily_by_source": (SourceDay, ("day", "source", "plays")),
@@ -147,8 +134,8 @@ _WIRE: Final[dict[str, tuple[type, tuple[str, ...]]]] = {
     ),
 }
 
-# The scalar half, same rule, each with the callable that coerces it on the way back
-# in — so a version skew is a cache miss rather than a later TypeError.
+# The scalar half, each with the callable that coerces it on the way back in, so
+# a version skew is a cache miss rather than a later TypeError.
 _SCALARS: Final[dict[str, Any]] = {
     "days": int,
     "window_start_epoch": float,
@@ -179,8 +166,7 @@ def to_cache(metrics: AnalyticsMetrics) -> dict:
 
 def from_cache(raw: object) -> Optional[AnalyticsMetrics]:
     """Rebuild a cached AnalyticsMetrics. None means MALFORMED, never "empty": an
-    empty window is a valid cached value, and caching it is what stops an idle guild
-    re-querying Postgres on every invocation. Do not test truthiness."""
+    empty window is a valid cached value. Do not test truthiness."""
     if not isinstance(raw, dict):
         return None
     try:
@@ -197,22 +183,16 @@ def from_cache(raw: object) -> Optional[AnalyticsMetrics]:
 
 
 def aggregate_digest(metrics: AnalyticsMetrics) -> str:
-    """A short, stable fingerprint of the aggregate, for the PNG key.
-
-    Sorted keys so the digest depends on the VALUES rather than on dict insertion
-    order — a cache hit rebuilds the metrics through from_cache, and the two paths
-    must agree or every hit would re-render. blake2b at 8 bytes: this is a cache
-    discriminator, not a security boundary, and 16 hex characters keep the key short.
-    """
+    """A short fingerprint of the aggregate for the PNG key. Sorted keys, so a
+    cache hit rebuilt through from_cache digests the same; blake2b at 8 bytes is a
+    cache discriminator, not a security boundary."""
     blob = orjson.dumps(to_cache(metrics), option=orjson.OPT_SORT_KEYS)
     return hashlib.blake2b(blob, digest_size=8).hexdigest()
 
 
 def resolve_days(requested: int) -> Optional[int]:
-    """The requested window, or None when it is not one of the four.
-
-    A rejection must never reach Postgres and must never take a read slot, so this
-    runs before anything else in the command body."""
+    """The requested window, or None when it is not one of the four. Runs before
+    anything else in the command, so a rejection never takes a read slot."""
     return requested if requested in ALLOWED_DAYS else None
 
 
@@ -226,9 +206,8 @@ def _linkable(url: str) -> bool:
 
 
 def _fmt_wait(secs: float) -> str:
-    """A queue wait, or the reason there isn't one. WAIT_UNAVAILABLE is not 0s: every
-    queued_at in the window was the epoch-0 backfill sentinel, and a confident "0s"
-    would read as "songs play instantly here"."""
+    """A queue wait, or n/a: WAIT_UNAVAILABLE means every queued_at in the window
+    was the backfill sentinel, and a confident "0s" would read as instant play."""
     if secs <= WAIT_UNAVAILABLE:
         return "n/a"
     return f"{secs:.0f}s" if secs < 60 else fmt_duration(int(secs))
@@ -255,8 +234,8 @@ def _line_artist(rank: int, t: TopArtist) -> str:
 
 
 def _line_song(rank: int, t: TopSong) -> str:
-    # A blank title is a real archived value (the zero-value convention), and an
-    # empty masked-link label renders as an invisible link.
+    # A blank title is a real archived value, and an empty masked-link label
+    # renders as an invisible link.
     title = safe_label(t.title, _TITLE_MAX) or "Unknown"
     label = f"[{title}]({t.webpage_url})" if _linkable(t.webpage_url) else title
     return (
@@ -266,16 +245,12 @@ def _line_song(rank: int, t: TopSong) -> str:
 
 
 def window_label(metrics: AnalyticsMetrics) -> str:
-    """What the title says the card covers: the requested window, and the days with
-    plays beside it when they differ.
-
-    FlagConverter silently defaults an input it does not recognise, so the period is
-    named where the answer is read."""
+    """The requested window, with the days that have plays beside it when they
+    differ. FlagConverter silently defaults an unrecognised input, so the period
+    is named where the answer is read."""
     period = metrics.period_label
     if 0 < metrics.archived_days < metrics.days:
-        # "with plays", not "archived": first_play is min() over the window SLICE, so
-        # a guild archiving for a year that went quiet through July reports 5 here.
-        # Coverage would need a probe outside the window; this is what the number is.
+        # "with plays", not "archived": first_play is min() over the window SLICE.
         return (
             f"{period} ({metrics.archived_days} "
             f"{pluralize(metrics.archived_days, 'day')} with plays)"
@@ -286,8 +261,7 @@ def window_label(metrics: AnalyticsMetrics) -> str:
 def _topline(m: AnalyticsMetrics) -> str:
     per = "week" if m.bucket_unit == "week" else "day"
     buckets = max(len(m.daily), 1)
-    # Rounded, not floored: 59 plays over 30 active days is 2 a day, and // renders
-    # it as "1 plays" -- understating by a third and disagreeing with its own noun.
+    # Rounded, not floored: 59 plays over 30 days is 2 a day, and // says "1 plays".
     avg = round(m.plays / buckets)
     return (
         f"**{m.plays}** {pluralize(m.plays, 'play')} · "
@@ -307,14 +281,10 @@ def build_embed(
     image_filename: Optional[str] = None,
     chart_note: Optional[str] = None,
 ) -> discord.Embed:
-    """The card. `image_filename` attaches the chart; without it this is the
-    embed-only build — which is both what P2 ships and the permanent fallback for
-    every way the render can fail, so the numbers survive a chart that does not.
-
-    Sections go in the DESCRIPTION, not in fields: a field value caps at 1024
-    characters and five masked-link lines do not reliably fit, while the 4096-char
-    description does. leaderboard.py records the same finding.
-    """
+    """The card. Without `image_filename` this is the embed-only build, the
+    fallback for every way the render can fail. Sections go in the description:
+    a field value caps at 1024 characters and five masked-link lines do not
+    reliably fit."""
     sections = [_topline(metrics)]
     if metrics.top_listeners:
         sections.append(
@@ -350,10 +320,8 @@ def build_embed(
 
 
 def footer_text(metrics: AnalyticsMetrics, note: Optional[str] = None) -> str:
-    """Times are UTC and the window ends yesterday — both stated, because both are
-    surprising. A UTC day boundary is 17:00 in US/Pacific, so an evening's listening
-    can fall across two daily bars, and a guild whose only plays are from this
-    morning is empty to this command."""
+    """Times are UTC and the window ends yesterday — both stated, because a UTC
+    day boundary is 17:00 in US/Pacific and this morning's plays are absent."""
     ends = "the last complete week" if metrics.bucket_unit == "week" else "yesterday"
     text = (
         f"Long-term archive · times in UTC · window ends {ends}, "
@@ -384,9 +352,8 @@ def invalid_days_notice() -> str:
 
 
 # ── The IO half ───────────────────────────────────────────────────────────────
-# Everything above is pure. Below drives the chart pool, the PNG cache and Discord.
-# `redis` and `tasks` arrive as parameters rather than through a cog, so the split
-# survives: nothing here reaches back into MusicBot.
+# `redis` and `tasks` arrive as parameters rather than through a cog, so nothing
+# here reaches back into MusicBot.
 
 
 async def render_chart(
@@ -396,16 +363,13 @@ async def render_chart(
     redis: Optional[aioredis.Redis],
     tasks: set[asyncio.Task],
 ) -> Optional[bytes]:
-    """The chart, or None to send the card without one.
-
-    Every failure here degrades to the embed-only card rather than to an error:
-    the numbers are already in hand, and a chart that could not be drawn must not
-    take them with it. The catch below is deliberately broad for that reason.
-    """
+    """The chart, or None to send the card without one. Every failure degrades to
+    the embed-only card: the numbers are in hand and a chart that could not be
+    drawn must not take them with it — hence the broad catch."""
     guild = ctx.guild
     if guild is None or not chart_pool_mod.chart_available():
-        # The slim runtime image, which ships without matplotlib. One line, and no
-        # worker is spawned to discover it.
+        # The slim runtime image ships without matplotlib; no worker is spawned
+        # to discover it.
         if guild is not None:
             log.warning(
                 "matplotlib is not installed — sending -analytics without its chart"
@@ -414,18 +378,11 @@ async def render_chart(
     me = guild.me
     perms = ctx.channel.permissions_for(me) if me is not None else None
     if perms is not None and not perms.attach_files:
-        # This is the bot's FIRST file upload, and many existing installs' grants
-        # predate it. Preflighted rather than discovered at send time, so the
-        # render is not paid for a message Discord will refuse.
+        # Preflighted so the render is not paid for a message Discord will refuse.
         log.info("missing Attach Files — sending -analytics without its chart")
         return None
-    # Keyed to a digest of the aggregate it was rendered from, so a stale PNG
-    # MISSES rather than pairing a chart from one hour with numbers recomputed
-    # in another — with nothing on the card to say the two disagree.
     key = png_cache_key(guild.id, metrics.days, aggregate_digest(metrics))
     cached = await analytics_png_get(redis, key)
-    # Its own span: this is the command's most expensive step, and png.cached
-    # separates a cache hit from a render at a glance.
     with _tracer.start_as_current_span("analytics.render") as span:
         span.set_attribute("png.cached", cached is not None)
         if cached is not None:
@@ -440,7 +397,7 @@ async def render_chart(
             )
             if not done:
                 # A ProcessPoolExecutor cannot cancel a running call, so the
-                # worker finishes regardless — it finishes into the cache.
+                # worker finishes into the cache.
                 # See docs/ARCHITECTURE.md#analytics-rendering.
                 span.set_attribute("png.timed_out", True)
                 spawn_background(
@@ -452,11 +409,9 @@ async def render_chart(
             await analytics_png_set(redis, key, png, cache_ttl_secs(metrics))
             return png
         except Exception as e:
-            # Exception, because the docstring's promise is every failure:
-            # _picklable_call re-raises whatever pickles, so worker exceptions
-            # arrive as themselves. CancelledError is a BaseException and still
-            # propagates. The message is fixed — matplotlib's name filesystem
-            # paths.
+            # Worker exceptions arrive as themselves (_picklable_call re-raises
+            # whatever pickles); CancelledError is a BaseException and still
+            # propagates.
             span.record_exception(e)
             log.warning(f"analytics chart render failed: {type(e).__name__}: {e}")
             return None
@@ -469,11 +424,9 @@ async def cache_late_render(
     *,
     redis: Optional[aioredis.Redis],
 ) -> None:
-    """Store a chart whose caller already gave up on it.
-
-    The TTL is recomputed here rather than captured: a render that overran the
-    deadline may have crossed midnight, and cache_ttl_secs returns non-positive
-    for exactly that, which skips the write."""
+    """Store a chart whose caller already gave up on it. The TTL is recomputed
+    here: a render that overran the deadline may have crossed midnight, which
+    cache_ttl_secs reports as non-positive."""
     try:
         png = await render
     except Exception as e:
@@ -490,16 +443,10 @@ async def send_card(
     png: Optional[bytes],
     guild: Optional[discord.Guild],
 ) -> None:
-    """One message through ctx.send, so the Now Playing block rides along and the
-    card may adopt the NP host — this command sends once and never edits, unlike
-    -ping and -debug.
-
-    A Discord refusal of the upload retries without it: a permission can change
-    between the preflight and the send.
-
-    A missing chart says so on the card only when the reason is actionable. The
-    permission is re-read here — permissions_for is local — which keeps
-    render_chart's contract at "bytes or no bytes"."""
+    """One message through ctx.send, so the Now Playing block rides along. A
+    Discord refusal of the upload retries without it. A missing chart is noted on
+    the card only when the reason is actionable; the permission is re-read here
+    (permissions_for is local) so render_chart stays "bytes or no bytes"."""
     note = None
     if png is None and guild is not None:
         me = guild.me
