@@ -58,7 +58,14 @@ from src.util import (
     trace_id_of,
 )
 from src.youtube import NpHostRef, QueueObject, YTDL
-from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
+from tests.helpers import (
+    described,
+    mocked,
+    noop_ffmpeg_init,
+    queue_object,
+    seed_queue,
+    stub_create_task,
+)
 
 
 @functools.wraps(MusicPlayer.loop)
@@ -128,6 +135,9 @@ def mock_song() -> MagicMock:
     # reads `traceparent` off it to link this song's trace to the extraction that
     # minted its URL, and a MagicMock there would be a str where a str is parsed.
     song.data = {}
+    # The level a real YTDL's filter carries, at the player's default: a bare
+    # MagicMock compares unequal to every float, and loop() would rebuild it.
+    song.volume = 1.0
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
@@ -7140,6 +7150,9 @@ class TestLoop:
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
         song.played_at = 0.0
+        # The level a real YTDL's filter carries, at the player's default: a bare
+        # MagicMock compares unequal to every float, and loop() would rebuild it.
+        song.volume = 1.0
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -8242,7 +8255,9 @@ class TestLoop:
                 MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
             ),
             patch.object(
-                MusicPlayer, "_stream_source", new=AsyncMock(return_value=MagicMock())
+                MusicPlayer,
+                "_stream_source",
+                new=AsyncMock(return_value=MagicMock(volume=1.0)),
             ),
         ):
             await music_player.loop()
@@ -8417,7 +8432,9 @@ class TestLoop:
                 MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
             ),
             patch.object(
-                MusicPlayer, "_stream_source", new=AsyncMock(return_value=MagicMock())
+                MusicPlayer,
+                "_stream_source",
+                new=AsyncMock(return_value=MagicMock(volume=1.0)),
             ),
         ):
             await music_player.loop()
@@ -8455,7 +8472,9 @@ class TestLoop:
                 MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
             ),
             patch.object(
-                MusicPlayer, "_stream_source", new=AsyncMock(return_value=MagicMock())
+                MusicPlayer,
+                "_stream_source",
+                new=AsyncMock(return_value=MagicMock(volume=1.0)),
             ),
         ):
             await music_player.loop()
@@ -8752,6 +8771,9 @@ class TestLoopAdditional:
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
         song.played_at = 0.0
+        # The level a real YTDL's filter carries, at the player's default: a bare
+        # MagicMock compares unequal to every float, and loop() would rebuild it.
+        song.volume = 1.0
         song.persisted = True
         # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the
         # loop reads `traceparent` off it to link this song's trace to the
@@ -8825,6 +8847,7 @@ class TestLoopAdditional:
 
         prefetched = MagicMock()
         prefetched.cleanup = MagicMock()
+        prefetched.volume = music_player.volume
 
         gets: list[int] = []
 
@@ -9983,6 +10006,310 @@ async def _raising_commit() -> AsyncGenerator[bool]:
     claim_outstanding standing for the loop's outer handler."""
     raise RuntimeError("boom inside the claim window")
     yield False  # pragma: no cover - unreachable, satisfies the generator shape
+
+
+def _queue_key(mp: MusicPlayer) -> str:
+    assert mp.store is not None
+    return mp.store.queue_key()
+
+
+class TestVolumeReachesTheBuiltSource:
+    """A source's level is baked into FFmpeg's `-filter:a` when it is built, and
+    loop() builds the next song one song early. Where both branches meet, loop()
+    rebuilds a source whose level no longer matches the player's, so a volume
+    change applies from the next song as its reply says. Real YTDLs throughout,
+    with FFmpeg's spawn recorded rather than run."""
+
+    @staticmethod
+    def _stream(qo: QueueObject, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "url": f"https://r.googlevideo.com/{qo.title}",
+            "webpage_url": qo.webpage_url,
+            "title": qo.title,
+            "duration": 180,
+        }
+
+    @pytest.fixture
+    def spawns(self) -> Generator[list[tuple[YTDL, str]]]:
+        """Every source built, with the options its FFmpeg was handed."""
+        recorded: list[tuple[YTDL, str]] = []
+
+        def _init(
+            source: Any,
+            url: str,
+            *,
+            executable: str,
+            before_options: str | None,
+            options: str | None,
+        ) -> None:
+            noop_ffmpeg_init(source)
+            recorded.append((source, options or ""))
+
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=_init):
+            yield recorded
+
+    @pytest.fixture
+    def cleaned(self) -> Generator[MagicMock]:
+        with patch.object(YTDL, "cleanup", autospec=True) as cleanup:
+            yield cleanup
+
+    async def _play_two(
+        self,
+        mp: MusicPlayer,
+        first: QueueObject,
+        *,
+        while_the_first_plays: Callable[[], Awaitable[None]] = AsyncMock(),
+        resolve: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+    ) -> list[YTDL]:
+        """Two songs through loop(): the first resolved in band, the second by the
+        prefetch the first spawns. Returns what vc.play received, in order."""
+        mp.bot.wait_until_ready = AsyncMock()
+        mocked(mp.bot.is_closed).side_effect = [False, False, True]
+        mp.bot.loop = asyncio.get_running_loop()
+        second = QueueObject("https://yt.com/watch?v=second", "second", first.requester)
+        await mp.queue.put([first, second])
+
+        played: list[YTDL] = []
+
+        def _play(song: YTDL, after: object) -> None:
+            played.append(song)
+            song._frames_read = 1000
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=_play)
+        vc.pause = MagicMock()
+        mocked(mp._guild).voice_client = vc
+        songs_ended = 0
+
+        async def _song_ends() -> None:
+            nonlocal songs_ended
+            songs_ended += 1
+            if songs_ended == 1:
+                await while_the_first_plays()
+
+        mp.play_next.wait = _song_ends  # pyright: ignore[reportAttributeAccessIssue]
+        stream = resolve or AsyncMock(side_effect=self._stream)
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(side_effect=lambda s: s)
+            ),
+            patch.object(YTDL, "_resolve_playable_stream", new=stream),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await mp.loop()
+        await asyncio.gather(*mp._background_tasks)
+        return played
+
+    async def test_a_completed_prefetch_plays_at_the_new_level(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        spawns: list[tuple[YTDL, str]],
+        cleaned: MagicMock,
+    ) -> None:
+        stream = AsyncMock(side_effect=self._stream)
+
+        async def _write() -> None:
+            task = music_player._prefetch_task
+            assert task is not None
+            await asyncio.wait([task])
+            music_player.volume = 0.5
+
+        played = await self._play_two(
+            music_player, queue_obj, while_the_first_plays=_write, resolve=stream
+        )
+
+        first, second = played
+        assert (first.volume, second.volume) == (1.0, 0.5)
+        options = dict((id(source), opts) for source, opts in spawns)
+        assert "-filter:a volume=0.5" in options[id(second)]
+        stale = spawns[1][0]
+        assert stale is not second and stale.volume == 1.0
+        assert any(call.args[0] is stale for call in cleaned.call_args_list)
+        # Rebuilt over the stream the prefetch resolved: no second resolve.
+        assert stream.await_count == 2
+
+    async def test_a_prefetch_still_resolving_plays_at_the_new_level(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        spawns: list[Any],
+        cleaned: MagicMock,
+    ) -> None:
+        """It read the level when it entered _stream_source, before the write."""
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _stream(qo: QueueObject, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            if qo.title == "second":
+                parked.set()
+                await release.wait()
+            return self._stream(qo)
+
+        async def _write() -> None:
+            await parked.wait()
+            music_player.volume = 0.5
+            release.set()
+
+        played = await self._play_two(
+            music_player,
+            queue_obj,
+            while_the_first_plays=_write,
+            resolve=AsyncMock(side_effect=_stream),
+        )
+        assert [song.volume for song in played] == [1.0, 0.5]
+
+    async def test_an_in_band_resolve_plays_at_the_new_level(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        spawns: list[Any],
+        cleaned: MagicMock,
+    ) -> None:
+        parked = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _stream(qo: QueueObject, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            if qo.title == queue_obj.title:
+                parked.set()
+                await release.wait()
+            return self._stream(qo)
+
+        async def _write_during_the_resolve() -> None:
+            await parked.wait()
+            music_player.volume = 0.3
+            release.set()
+
+        writer = asyncio.create_task(_write_during_the_resolve())
+        played = await self._play_two(
+            music_player, queue_obj, resolve=AsyncMock(side_effect=_stream)
+        )
+        await writer
+        assert [song.volume for song in played] == [0.3, 0.3]
+
+    async def test_an_unchanged_level_is_never_rebuilt(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        spawns: list[tuple[YTDL, str]],
+        cleaned: MagicMock,
+    ) -> None:
+        """At 0.5 with no write, each built source is the one played. A builder
+        that dropped the level would leave every source reading 1.0, and every
+        song would be rebuilt."""
+        music_player.volume = 0.5
+        played = await self._play_two(music_player, queue_obj)
+        assert [source for source, _ in spawns] == played
+        assert all("-filter:a volume=0.5" in opts for _, opts in spawns)
+
+    async def test_the_queue_ends_as_it_does_without_a_rebuild(
+        self,
+        music_player: MusicPlayer,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+        queue_obj: QueueObject,
+        spawns: list[Any],
+        cleaned: MagicMock,
+    ) -> None:
+        async def _write() -> None:
+            task = music_player._prefetch_task
+            assert task is not None
+            await asyncio.wait([task])
+            music_player.volume = 0.5
+
+        await self._play_two(music_player, queue_obj, while_the_first_plays=_write)
+        rebuilt_queue = (
+            list(music_player.queue._items),
+            music_player.queue._cursor,
+            await fake_redis.lrange(_queue_key(music_player), 0, -1),
+        )
+
+        other = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        other._restore_complete.set()
+        other._playback_gate.set()
+        await self._play_two(other, queue_obj)
+        assert rebuilt_queue == (
+            list(other.queue._items),
+            other.queue._cursor,
+            await fake_redis.lrange(_queue_key(other), 0, -1),
+        )
+        assert rebuilt_queue == ([], 0, [])
+
+    def test_a_failed_spawn_plays_the_old_source(
+        self,
+        music_player: MusicPlayer,
+        ytdl_instance: Callable[..., YTDL],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        song = ytdl_instance()
+        music_player.volume = 0.5
+
+        def _spawn_fails(source: Any, *args: Any, **kwargs: Any) -> None:
+            noop_ffmpeg_init(source)
+            raise discord.ClientException("ffmpeg was not found.")
+
+        with (
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=_spawn_fails),
+            caplog.at_level(logging.WARNING, logger="src.musicplayer"),
+        ):
+            assert music_player._at_current_volume(song) is song
+        assert caplog.text.count("could not rebuild") == 1
+        assert not music_player._background_tasks
+
+    async def test_every_carried_field_survives_the_rebuild(
+        self,
+        music_player: MusicPlayer,
+        ytdl_instance: Callable[..., YTDL],
+        spawns: list[tuple[YTDL, str]],
+    ) -> None:
+        """Driven by YTDL.__init__'s signature, so a keyword added later without
+        being carried by _queue_object_of fails here."""
+        import inspect
+
+        not_compared = {"volume", "data", "before_options", "options", "requester"}
+        carried: dict[str, Any] = {
+            "start_offset": 42,
+            "interjected": True,
+            "is_resume": True,
+            "start_paused": True,
+            "analytics": Analytics(queued_at=1.5, queue_position=3),
+            "query_source": "search",
+            "user_input": "typed",
+            "persisted": False,
+            "played_at": 1234.5,
+            "np_message_id": 11,
+            "np_channel_id": 22,
+            "np_dedicated": True,
+            "np_host_ref": NpHostRef(
+                message=MagicMock(spec=discord.Message), own_embeds=[], dedicated=True
+            ),
+        }
+        keywords = {
+            name
+            for name, param in inspect.signature(YTDL.__init__).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        assert set(carried) == keywords - not_compared
+        song = ytdl_instance(**carried)
+        music_player.volume = 0.5
+
+        with patch.object(YTDL, "cleanup", autospec=True) as cleanup:
+            rebuilt = music_player._at_current_volume(song)
+            await asyncio.gather(*music_player._background_tasks)
+        cleanup.assert_called_once_with(song)
+
+        assert rebuilt is not song
+        for name in (*carried, "requester"):
+            assert getattr(rebuilt, name) == getattr(song, name), name
+        options = spawns[-1][1]
+        assert "-ss 42" in options and "-filter:a volume=0.5" in options
+        assert rebuilt.volume == 0.5
 
 
 class TestPrefetchedHeadRespectsPersistence:

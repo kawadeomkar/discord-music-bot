@@ -1527,9 +1527,36 @@ class TestYTStream:
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
         ):
-            await YTDL.yt_stream(qobj, channel, volume=0.5)
+            source = await YTDL.yt_stream(qobj, channel, volume=0.5)
 
         assert "volume=0.5" in captured_options["options"]
+        # The level the source was built at: loop() rebuilds a source whose level
+        # no longer matches the player's.
+        assert source.volume == 0.5
+
+    async def test_from_stream_data_builds_at_the_level_it_is_given(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The one construction site: yt_stream returns through it, and
+        MusicPlayer._at_current_volume rebuilds a prefetched song with it."""
+        channel = AsyncMock(spec=discord.TextChannel)
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=7
+        )
+        options: list[str] = []
+
+        def capture_init(self: Any, url: str, **kwargs: Any) -> None:
+            noop_ffmpeg_init(self)
+            options.append(kwargs["options"])
+
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init):
+            unity = YTDL.from_stream_data(qobj, channel, _fake_ytdl_data(), volume=1.0)
+            quieter = YTDL.from_stream_data(
+                qobj, channel, _fake_ytdl_data(), volume=0.25
+            )
+
+        assert (unity.volume, quieter.volume) == (1.0, 0.25)
+        assert options == ["-vn -ss 7", "-vn -ss 7 -filter:a volume=0.25"]
 
     async def test_yt_stream_appends_seek_when_ts_set(
         self, mock_ctx: MagicMock

@@ -1800,9 +1800,18 @@ class MusicPlayer:
             song = None
         if song is None:
             return
+        rebuilt = self._queue_object_of(song)
+        self.queue.requeue_front(rebuilt)
+        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
+        # communicate(), and this runs under the caller's place lock. loop() keeps
+        # its twin call off its own mutex for the same reason.
+        self._spawn_background(asyncio.to_thread(song.cleanup))
+
+    def _queue_object_of(self, song: YTDL) -> QueueObject:
+        """The QueueObject a built source came from, with every field it carries."""
         # Dropping a field here restarts a neutralized resume entry from 0:00,
         # loses a ?t= offset, or zeroes the ask this play was queued against.
-        rebuilt = QueueObject(
+        return QueueObject(
             song.webpage_url or "",
             song.title or "",
             song.requester or self._require_requester(),
@@ -1823,11 +1832,27 @@ class MusicPlayer:
             np_dedicated=song.np_dedicated,
             np_host_ref=song.np_host_ref,
         )
-        self.queue.requeue_front(rebuilt)
-        # Handed off, not awaited: cleanup() kills the subprocess and blocks on
-        # communicate(), and this runs under the caller's place lock. loop() keeps
-        # its twin call off its own mutex for the same reason.
+
+    def _at_current_volume(self, song: YTDL) -> YTDL:
+        """`song` rebuilt over the same stream at self.volume, its old FFmpeg reaped
+        off the loop. No probe and no extraction: one FFmpeg spawn, the call
+        yt_stream makes on the loop too. A spawn that fails returns `song`, which
+        plays at its old level rather than being skipped."""
+        try:
+            rebuilt = YTDL.from_stream_data(
+                self._queue_object_of(song),
+                self._channel,
+                song.data,
+                volume=self.volume,
+            )
+        except (discord.ClientException, OSError) as e:
+            log.warning(
+                f"[guild:{self._guild.id}] could not rebuild {song.title!r} at volume "
+                f"{self.volume}; it plays at {song.volume}: {e!r}"
+            )
+            return song
         self._spawn_background(asyncio.to_thread(song.cleanup))
+        return rebuilt
 
     async def _announce_start_offset(self, song: YTDL) -> None:
         """One-line notice for a song starting partway in (a `?t=` link). Sent from
@@ -2384,6 +2409,15 @@ class MusicPlayer:
                             )
                         continue
 
+                    if self.current_song.volume != self.volume:
+                        # A volume write landed after this source was built. Both
+                        # branches meet here with nothing awaited since their
+                        # assignment, and no claim is touched.
+                        built = self.current_song
+                        self.current_song = self._at_current_volume(built)
+                        span.set_attribute(
+                            "song.volume_rebuilt", self.current_song is not built
+                        )
                     span.set_attribute("song.title", self.current_song.title or "")
                     _link_stream_provenance(span, self.current_song)
                     # Advances with the song, not the iteration: a failed resolve

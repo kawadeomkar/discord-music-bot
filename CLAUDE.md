@@ -538,7 +538,8 @@ PHASE 2 — PREFETCH (background):
   ▼
 PHASE 3 — STREAM (playback loop, usually zero extraction):
   loop(): gate open → dequeue → resolve (if YTSource) → yt_stream (cache hit →
-  no yt-dlp call) → vc.play(YTDL) → atomic Redis start transaction →
+  no yt-dlp call) → rebuild if the volume changed → vc.play(YTDL) → atomic Redis
+  start transaction →
   NP embed + 3s progress updater → spawn prefetch for next → play_next.wait()
   → history add, clear transient state, next iteration
 ```
@@ -1023,7 +1024,10 @@ See `docs/ARCHITECTURE.md#yt-dlp-client-strategy` for the measurements behind bo
 **FFmpeg**: `YTDL(discord.FFmpegOpusAudio)` with
 `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` and `-vn`; `?t=`/interject
 seeks via `-ss`; volume via `-filter:a volume=` (which is why `-volume` applies from the
-next song). `read()` counts frames → `elapsed_secs`/`position_secs` is the single source
+next song). A source is built one song early by the prefetch, so `loop()` compares the
+level baked into the source it is about to play (`YTDL.volume`) with the player's and
+rebuilds it over the same stream when they differ (`_at_current_volume`: one FFmpeg
+spawn, no probe, no extraction). `read()` counts frames → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, pause confirmation, history,
 interject resume point) and freezes during any pause automatically.
 
@@ -1417,11 +1421,14 @@ any guild idle for a day.
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
 parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
-instance assignment, and the `cls(...)` call at the end of `YTDL.yt_stream` in
-`src/youtube.py`** — miss these three and the field is silently dropped the moment the
-queue object becomes a playing song, which is where every read of it happens → then
-**BOTH places a playing song is turned back into a QueueObject**: `_neutralize_prefetch`'s
-rebuild and `MusicPlayer.interject()`'s resume tail. **Not gated on "playback-relevant"** —
+instance assignment, and the `cls(...)` call in `YTDL.from_stream_data` (which
+`yt_stream` returns through) in `src/youtube.py`** — miss these three and the field is
+silently dropped the moment the queue object becomes a playing song, which is where every
+read of it happens → then **BOTH places a playing song is turned back into a
+QueueObject**: `MusicPlayer._queue_object_of` (the rebuild `_neutralize_prefetch` and
+the volume rebuild in `loop()` share) and `MusicPlayer.interject()`'s resume tail.
+`YTDL.volume` is the one keyword that is never carried: it is the level baked into that
+source, and a requeued song is rebuilt at the level current then. **Not gated on "playback-relevant"** —
 `user_input` and `persisted` are neither, and both were lost through exactly that gap.
 They fail differently: a `YTDL` missing the attribute outright *raises* there and strands
 the prefetch's claim (which is what `persisted` did to every `--now`/`--next` over a

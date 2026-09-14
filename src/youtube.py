@@ -1397,6 +1397,7 @@ class YTDL(discord.FFmpegOpusAudio):
         start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
+        volume: float = 1.0,
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
@@ -1418,9 +1419,12 @@ class YTDL(discord.FFmpegOpusAudio):
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
         self.start_offset: int = start_offset
+        # The level in this source's -filter:a. Never carried onto a QueueObject:
+        # a requeued song goes back through yt_stream at the level current then.
+        self.volume: float = volume
         # Interjection flags carried from the QueueObject (see its field
-        # comments). A resume tail and _neutralize_prefetch rebuild a QueueObject
-        # from these, so every field the queue entry has must survive here.
+        # comments). A resume tail and MusicPlayer._queue_object_of rebuild a
+        # QueueObject from these, so every field the queue entry has must survive.
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
@@ -1680,7 +1684,19 @@ class YTDL(discord.FFmpegOpusAudio):
         data = await cls._resolve_playable_stream(
             qo, redis, allow_reextract=allow_reextract
         )
+        return cls.from_stream_data(qo, channel, data, volume=volume)
 
+    @classmethod
+    def from_stream_data(
+        cls,
+        qo: QueueObject,
+        channel: discord.TextChannel,
+        data: YTDLVideoInfo,
+        *,
+        volume: float,
+    ) -> YTDL:
+        """A source for `qo` over an already-resolved stream, at `volume`. The
+        one place a YTDL is built; spawns FFmpeg, so it raises what its spawn does."""
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             # No user notice here: prefetch constructs this while the previous
@@ -1697,6 +1713,7 @@ class YTDL(discord.FFmpegOpusAudio):
             start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
+            volume=volume,
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
