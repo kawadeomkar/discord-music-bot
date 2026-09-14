@@ -1226,6 +1226,7 @@ class MusicBot(commands.Cog):
             "skips_player_setup": True,
             "examples": [
                 "-settings",
+                "-settings leave-when-idle 10:00",
                 "-settings timezone Europe/London",
                 "-settings volume 80",
                 "-settings debug-footer reset",

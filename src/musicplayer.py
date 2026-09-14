@@ -35,6 +35,7 @@ from src.guild_queue import (
 from src.guild_state import (
     DEFAULT_TIMEZONE,
     DEFAULT_VOLUME,
+    DEFAULT_IDLE_TIMEOUT_SECS,
     ConfigField,
     GuildConfig,
     HistoryEntry,
@@ -153,9 +154,13 @@ _RESUME_EOF_MARGIN_SECS = 10
 _SONG_COMPLETE_MARGIN_SECS = 5
 
 # ── Playback gate ────────────────────────────────
-# How long loop() waits for a voice connection before tearing the player down.
-# Matches the idle queue_get() timeout.
-_PLAYBACK_GATE_TIMEOUT = 300
+# How long loop() waits for a voice connection before tearing the player down:
+# the idle-timeout default.
+_PLAYBACK_GATE_TIMEOUT = DEFAULT_IDLE_TIMEOUT_SECS
+
+# Bound on resolving an entry the loop has dequeued, whatever the server's idle
+# timeout: that setting bounds only the wait for the entry.
+_IN_BAND_RESOLVE_TIMEOUT_SECS = 300.0
 
 # Ceiling on the start transaction, the one Redis write under the queue's bulk
 # mutex; the pool sets no socket_timeout. Past it the song plays unpersisted and
@@ -2356,8 +2361,11 @@ class MusicPlayer:
                         source = None
                     else:
                         source = None
+                        idle_secs = self._cog.guild_settings.idle_timeout_secs(
+                            self._guild.id
+                        )
                         try:
-                            async with async_timeout.timeout(300):
+                            async with async_timeout.timeout(idle_secs) as idle:
                                 source = await self.queue_get()
                                 claim_outstanding = True
                                 # Safe before the resolve: a YTSource is persisted
@@ -2367,6 +2375,10 @@ class MusicPlayer:
                                 # Re-read: a clear() during the blocking get
                                 # belongs to the queue this item came from.
                                 commit_generation = self.queue.generation
+                                idle.reschedule(
+                                    asyncio.get_running_loop().time()
+                                    + _IN_BAND_RESOLVE_TIMEOUT_SECS
+                                )
                                 source = await self._resolve_source(source)
                         except asyncio.TimeoutError:
                             log.warning("Queue timed out, disconnecting")

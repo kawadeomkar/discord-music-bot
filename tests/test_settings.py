@@ -450,6 +450,21 @@ class TestOutOfRange:
         assert result.side == "minimum"
         assert "between **5s** and **30s**" in result.text
 
+    def test_each_side_of_idle_timeout_says_why(self) -> None:
+        spec = _spec("idle-timeout")
+        low, high = parse_value(spec, "4m"), parse_value(spec, "45m")
+        assert isinstance(low, Refusal) and isinstance(high, Refusal)
+        assert low.text == (
+            "**Leave when idle** has to be between **5:00** and **30:00**. A shorter "
+            "wait can end the session while a song is still being looked up. `-stop` "
+            "in the bot's voice channel makes it leave right away."
+        )
+        assert high.text == (
+            "**Leave when idle** has to be between **5:00** and **30:00**. While the "
+            "bot waits it stays in its channel, and a `-play` from another channel "
+            "plays there."
+        )
+
     def test_a_count_refuses_a_fraction(self) -> None:
         spec = _spec("play-inflight-max")
         assert isinstance(parse_value(spec, "2.5"), Refusal)
@@ -704,6 +719,8 @@ class TestParseSettingsArgs:
             ("—volume 50", _set("volume", 50)),
             ("--bot heartbeat 5s", _set("heartbeat", 5.0, SettingScope.BOT)),
             ("Debug-Footer on", _set("debug", True)),
+            ("leave-when-idle 10m", _set("idle-timeout", 600.0)),
+            ("idle=15 minutes", _set("idle-timeout", 900.0)),
         ],
     )
     def test_near_misses_normalize(self, arg: str, expected: SettingsRequest) -> None:
@@ -1307,6 +1324,23 @@ class TestGuildSettingsReads:
             with pytest.raises(asyncio.CancelledError):
                 await caller
         assert guild_settings._loads == {}
+
+
+class TestGuildSettingsAccessors:
+    """Synchronous and total: what a hot path runs on, from the cache alone."""
+
+    async def test_idle_timeout_is_the_stored_value_or_the_default(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        assert guild_settings.idle_timeout_secs(_GUILD) == 300.0
+        # A partial entry: this field is still unknown, so it is the default.
+        await guild_settings.write(_GUILD, GuildConfig(timezone="Asia/Tokyo"))
+        assert guild_settings.idle_timeout_secs(_GUILD) == 300.0
+        await guild_settings.write(_GUILD, GuildConfig(idle_timeout_secs=1800.0))
+        assert guild_settings.idle_timeout_secs(_GUILD) == 1800.0
+        await guild_settings.reset(_GUILD, ConfigField.IDLE_TIMEOUT)
+        assert guild_settings.idle_timeout_secs(_GUILD) == 300.0
 
 
 class TestGuildSettingsWritePath:
@@ -1974,7 +2008,8 @@ class TestHotPathsNeverAwaitSettings:
     would hang for as long as Redis stalls. Hot paths read synchronously."""
 
     @pytest.mark.parametrize(
-        "name", ["peek", "is_complete", "is_persisted", "reading", "seed"]
+        "name",
+        ["peek", "is_complete", "is_persisted", "reading", "seed", "idle_timeout_secs"],
     )
     def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:
         import inspect

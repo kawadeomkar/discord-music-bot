@@ -42,14 +42,21 @@ class TestServerValues:
         assert [shown for _, shown in _server_rows(None)] == [
             card.Shown(100.0, "default"),
             card.Shown(DEFAULT_TIMEZONE, "default"),
+            card.Shown(300.0, "default"),
             card.Shown(False, "default"),
         ]
 
     def test_set_values_render_in_their_unit(self) -> None:
-        stored = GuildConfig(volume=0.29, timezone="Asia/Tokyo", debug_mode=False)
+        stored = GuildConfig(
+            volume=0.29,
+            timezone="Asia/Tokyo",
+            idle_timeout_secs=600.0,
+            debug_mode=False,
+        )
         assert [shown for _, shown in _server_rows(stored)] == [
             card.Shown(29, "set here"),
             card.Shown("Asia/Tokyo", "set here"),
+            card.Shown(600.0, "set here"),
             card.Shown(False, "set here"),
         ]
 
@@ -121,9 +128,12 @@ class TestServerCard:
             GuildConfig(
                 volume=1.0,
                 timezone="America/Argentina/ComodRivadavia",
+                idle_timeout_secs=1800.0,
                 debug_mode=True,
             ),
-            unsaved=frozenset({"volume", "timezone", "debug_mode"}),
+            unsaved=frozenset(
+                {"volume", "timezone", "idle_timeout_secs", "debug_mode"}
+            ),
         )
         embed = card.server_card(
             guild_name="*`[" * 34, rows=rows, read_failed=True, operator=True
@@ -147,11 +157,12 @@ class TestServerCard:
                 "**Volume** · 80% · set here\n"
                 "**Timezone** · America/Los_Angeles · default",
             ),
+            ("Leaving voice", "**Leave when idle** · 5:00 · default"),
             ("Diagnostics", "**Debug footer** · off · default"),
         ]
         assert embed.footer.text == (
-            "Names work with dashes: -settings debug-footer to see one · "
-            "-settings debug-footer <value> · -settings debug-footer reset"
+            "Names work with dashes: -settings leave-when-idle to see one · "
+            "-settings leave-when-idle <value> · -settings leave-when-idle reset"
         )
 
     def test_every_name_on_the_card_is_typeable(self) -> None:
@@ -195,6 +206,16 @@ class TestDetail:
             "default) · Takes on or off · Applies immediately."
         )
 
+    def test_a_duration_setting(self) -> None:
+        spec = _spec("idle-timeout")
+        embed = card.detail(spec, card.Shown(600.0, "set here"), default=300.0)
+        assert embed.description == (
+            "**Leave when idle** (`idle-timeout`; also `idle`, `leave-when-idle`) — "
+            "How long the bot stays in voice with nothing queued. Current **10:00** "
+            "(set here) · Default 5:00 · Allowed 5:00–30:00 · Applies the next time "
+            "the queue runs empty."
+        )
+
     def test_a_bot_setting_names_its_baseline_in_the_source(self) -> None:
         spec = _spec("heartbeat", SettingScope.BOT)
         embed = card.detail(spec, card.Shown(5.0, "bot owner; env 3s"), default=None)
@@ -217,7 +238,12 @@ class TestDetail:
 class TestReplies:
     def test_a_value_copied_off_a_reply_parses_back(self) -> None:
         """Every value renders through format_value, which round-trips."""
-        for key, value in (("volume", 37), ("timezone", "Asia/Tokyo"), ("debug", True)):
+        for key, value in (
+            ("volume", 37),
+            ("timezone", "Asia/Tokyo"),
+            ("idle-timeout", 630.0),
+            ("debug", True),
+        ):
             spec = _spec(key)
             text = (
                 card.set_reply(

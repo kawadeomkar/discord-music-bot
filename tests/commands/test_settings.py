@@ -152,11 +152,12 @@ class TestVolumeTakesTheVoiceGateToo:
         assert await _stored(fake_redis_bot) == GuildConfig()
         settings_ctx.bot.is_owner.assert_not_awaited()
 
+    @pytest.mark.parametrize("arg", ["timezone Europe/London", "idle-timeout 10m"])
     async def test_that_listener_may_not_change_anything_else(
-        self, cog: MusicBot, settings_ctx: MagicMock, fake_redis_bot: Redis
+        self, cog: MusicBot, settings_ctx: MagicMock, fake_redis_bot: Redis, arg: str
     ) -> None:
         _in_voice(settings_ctx, bot_channel=True)
-        await _invoke(cog, settings_ctx, "timezone Europe/London")
+        await _invoke(cog, settings_ctx, arg)
         assert _text(settings_ctx) == card.NO_PERMISSION
         _denied_by_the_operator_check(settings_ctx)
         assert await _stored(fake_redis_bot) == GuildConfig()
@@ -321,6 +322,22 @@ class TestReplies:
             f"saved for this server. Changed by {MENTION}."
         )
 
+    async def test_idle_timeout(self, cog: MusicBot, settings_ctx: MagicMock) -> None:
+        ctx = _with_manage_server(settings_ctx)
+        await _invoke(cog, ctx, "leave-when-idle 10m")
+        assert _text(ctx) == (
+            "**Leave when idle** is now **10:00** for this server (was **5:00**, the "
+            "default). It applies the next time the queue runs empty. It is saved "
+            f"for this server. Changed by {MENTION}."
+        )
+        assert cog.guild_settings.idle_timeout_secs(GUILD) == 600.0
+        await _invoke(cog, ctx, "idle reset")
+        assert _text(ctx) == (
+            "**Leave when idle** is back to the default, **5:00**. It is saved for "
+            f"this server. Changed by {MENTION}."
+        )
+        assert cog.guild_settings.idle_timeout_secs(GUILD) == 300.0
+
     async def test_debug_on_names_what_it_publishes(
         self, cog: MusicBot, settings_ctx: MagicMock
     ) -> None:
@@ -430,6 +447,7 @@ class TestCard:
         values = [field.value for field in _embed(settings_ctx).fields]
         assert values == [
             "**Volume** · 100% · default\n**Timezone** · America/Los_Angeles · default",
+            "**Leave when idle** · 5:00 · default",
             "**Debug footer** · off · default",
         ]
 

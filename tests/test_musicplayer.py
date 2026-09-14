@@ -7113,6 +7113,144 @@ class TestRestoreStateTtlRefresh:
 # ── Loop ──────────────────────────────────────────────────────────────────────
 
 
+class TestIdleTimeout:
+    """The wait for the next song is the server's idle-timeout, read from the cache
+    once per wait; resolving the entry that wait hands over keeps its own bound."""
+
+    @staticmethod
+    def _seed(mp: MusicPlayer, secs: float | None) -> None:
+        guild_settings = mp._cog.guild_settings
+        with guild_settings.reading() as started:
+            guild_settings.seed(
+                mp._guild.id, GuildConfig(idle_timeout_secs=secs), started=started
+            )
+
+    @staticmethod
+    def _stopped(stopped: asyncio.Event) -> Callable[[Any], Awaitable[None]]:
+        async def _stop(_self: Any) -> None:
+            stopped.set()
+
+        return _stop
+
+    @pytest.mark.parametrize(
+        ("stored", "wait"), [(None, 300.0), (600.0, 600.0), (1800.0, 1800.0)]
+    )
+    async def test_the_wait_is_the_servers_idle_timeout(
+        self, music_player: MusicPlayer, stored: float | None, wait: float
+    ) -> None:
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        self._seed(music_player, stored)
+        delays: list[float] = []
+        real_timeout = musicplayer.async_timeout.timeout
+
+        def _spy(delay: float) -> Any:
+            delays.append(delay)
+            return real_timeout(delay)
+
+        stopped = asyncio.Event()
+        with (
+            patch.object(musicplayer.async_timeout, "timeout", _spy),
+            patch.object(
+                MusicPlayer,
+                "queue_get",
+                new=AsyncMock(side_effect=asyncio.TimeoutError()),
+            ),
+            patch.object(MusicPlayer, "stop", new=self._stopped(stopped)),
+        ):
+            await music_player.loop()
+        await asyncio.sleep(0)
+        assert delays == [musicplayer._PLAYBACK_GATE_TIMEOUT, wait]
+        assert stopped.is_set()
+
+    async def test_a_change_applies_from_the_next_wait(
+        self, music_player: MusicPlayer
+    ) -> None:
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        delays: list[float] = []
+        real_timeout = musicplayer.async_timeout.timeout
+
+        def _spy(delay: float) -> Any:
+            delays.append(delay)
+            return real_timeout(delay)
+
+        gets = 0
+
+        async def _get(self_inner: MusicPlayer) -> Never:
+            nonlocal gets
+            gets += 1
+            if gets == 1:
+                # Written during the first wait; the loop's error path starts the next.
+                await self_inner._cog.guild_settings.write(
+                    self_inner._guild.id, GuildConfig(idle_timeout_secs=600.0)
+                )
+                raise RuntimeError("boom")
+            raise asyncio.TimeoutError()
+
+        with (
+            patch.object(musicplayer.async_timeout, "timeout", _spy),
+            patch.object(MusicPlayer, "queue_get", new=_get),
+            patch.object(MusicPlayer, "stop", new=self._stopped(asyncio.Event())),
+        ):
+            await music_player.loop()
+        assert delays == [musicplayer._PLAYBACK_GATE_TIMEOUT, 300.0, 600.0]
+
+    async def test_a_stalled_store_does_not_hold_the_loop_from_its_wait(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The pool has no socket_timeout. The setting comes from the cache, so a
+        Redis that accepts and never answers cannot keep the loop from its wait."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        never = asyncio.Event()
+
+        async def _stall(*_args: Any, **_kwargs: Any) -> None:
+            await never.wait()
+
+        reached = asyncio.Event()
+
+        async def _get(_self: Any) -> Never:
+            reached.set()
+            raise asyncio.TimeoutError()
+
+        with (
+            patch.object(GuildRedisStore, "read_config", new=_stall),
+            patch("src.settings.read_guild_configs", new=_stall),
+            patch.object(MusicPlayer, "queue_get", new=_get),
+            patch.object(MusicPlayer, "stop", new=self._stopped(asyncio.Event())),
+        ):
+            async with asyncio.timeout(1):
+                await music_player.loop()
+        assert reached.is_set()
+
+    async def test_a_wedged_resolve_keeps_its_own_bound_at_the_longest_wait(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Bounded by the setting, a resolve that never returns would hold a guild
+        with songs queued silent for up to 30 minutes."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        self._seed(music_player, 1800.0)
+        seed_queue(music_player.queue, queue_obj)
+        never = asyncio.Event()
+
+        async def _wedged(_self: Any, _source: Any) -> Never:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        stopped = asyncio.Event()
+        with (
+            patch("src.musicplayer._IN_BAND_RESOLVE_TIMEOUT_SECS", 0.05),
+            patch.object(MusicPlayer, "_resolve_source", new=_wedged),
+            patch.object(MusicPlayer, "stop", new=self._stopped(stopped)),
+        ):
+            async with asyncio.timeout(2):
+                await music_player.loop()
+        await asyncio.sleep(0)
+        assert stopped.is_set()
+
+
 class TestLoop:
     @pytest.fixture
     def mock_song(self) -> MagicMock:

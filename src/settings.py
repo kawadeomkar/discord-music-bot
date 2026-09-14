@@ -39,6 +39,7 @@ from discord.ext import commands
 from src import config, guild_state
 from src.guild_state import (
     CONFIG_DOMAIN,
+    DEFAULT_IDLE_TIMEOUT_SECS,
     DEFAULT_TIMEZONE,
     DEFAULT_VOLUME,
     OFF_SECS,
@@ -178,6 +179,28 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         minimum=None,
         maximum=None,
         default=DEFAULT_TIMEZONE,
+    ),
+    SettingSpec(
+        key="idle-timeout",
+        aliases=("idle", "leave-when-idle"),
+        scope=SettingScope.SERVER,
+        kind=SettingKind.DURATION,
+        group=SettingGroup.LEAVING_VOICE,
+        label="Leave when idle",
+        summary="How long the bot stays in voice with nothing queued.",
+        applies="the next time the queue runs empty",
+        field=ConfigField.IDLE_TIMEOUT,
+        minimum=_server_bound(ConfigField.IDLE_TIMEOUT, "lo"),
+        maximum=_server_bound(ConfigField.IDLE_TIMEOUT, "hi"),
+        why_minimum=(
+            "A shorter wait can end the session while a song is still being looked "
+            "up. `-stop` in the bot's voice channel makes it leave right away."
+        ),
+        why_maximum=(
+            "While the bot waits it stays in its channel, and a `-play` from another "
+            "channel plays there."
+        ),
+        default=DEFAULT_IDLE_TIMEOUT_SECS,
     ),
     SettingSpec(
         key="debug",
@@ -1495,6 +1518,15 @@ class GuildSettings:
     def is_persisted(self, guild_id: int, field: str) -> bool:
         """False while the field's last write had not reached Redis."""
         return (guild_id, field) not in self._unpersisted
+
+    # The accessors: synchronous and total. An unread or unset field is the
+    # default; a stored value already passed CONFIG_DOMAIN when it was parsed.
+
+    def idle_timeout_secs(self, guild_id: int) -> float:
+        """How long the playback loop waits for the next song before leaving."""
+        stored = self.peek(guild_id)
+        value = stored.idle_timeout_secs if stored is not None else None
+        return DEFAULT_IDLE_TIMEOUT_SECS if value is None else value
 
     # ── Stamps and registrations ──────────────────────────────────────────────
 

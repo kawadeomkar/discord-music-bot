@@ -622,7 +622,7 @@ Returns a `QueueObject`.
 
 `ResolveMode` (`src/play_placement.py`) is how a caller says whether a resolve may stop at search metadata. `resolve_mode_for(placement)` maps `TAIL` and `NEXT` to `FLAT_OK` and `COLD_FRONT` to `FULL`; `_resolve_interjection_source` passes `FULL` explicitly, and `MusicPlayer._resolve_source` takes `yt_source`'s `flat=False` default. The function enumerates `Placement` rather than defaulting, so a member added later cannot inherit `FLAT_OK` in silence — a test asserts the mapping member by member.
 
-**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the 300 s idle timeout.
+**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the server's idle timeout (5:00 by default).
 
 **Flat for cold starts was weighed and declined, on the failure boundary rather than the clock.** The clock argues for it: a cold search would acknowledge from the flat POST at ~0.65 s instead of ~2.46 s, and time-to-audio is measured materially unchanged (0.65 s + 1.86 s against 2.46 s — see [yt-dlp three-phase pipeline](#yt-dlp-three-phase-pipeline)), so the trade on latency alone is nearly two seconds of acknowledgement for about fifty milliseconds of audio. What it costs is where a failure lands. Two cases separate: a search that resolves to *nothing* raises either way and `_abandon_cold_start` runs unchanged, but a head whose **stream** extraction fails later is the new exposure — under FULL the bot never joins and the user is told the song was not queued, under flat the bot has already joined, already sent the card, and answers with `_handle_dead_stream`'s notice before idling out of a channel it entered for one song. Re-creating the boundary means holding the playback gate across the spawned stream extraction and tearing down on failure, which puts a new await inside the cold-start teardown path — the most delicate sequencing in the repo — to buy back a boundary the current code gets for free. Reopen it with that cost in view, not with the latency number alone.
 
@@ -743,9 +743,9 @@ flowchart TD
     Start(["iteration start\nplay_next.clear()"])
     HavePF{"prefetched_song\navailable?"}
     UsePF["current_song = prefetched_song\n(its claim becomes ours)"]
-    GetQueue["queue_get() — 300s timeout"]
+    GetQueue["queue_get() — the server's idle timeout"]
     Timeout["TimeoutError → stop()"]
-    Resolve["_resolve_source()\nYTSource → QueueObject"]
+    Resolve["_resolve_source()\nYTSource → QueueObject\n(its own 300s bound)"]
     Stream["_stream_source() → YTDL"]
     Failed{"YTDL is None?"}
     FailPop["queue.finish_failed_dequeue()\nsend 'Failed…' via send_with_np"]
@@ -931,13 +931,13 @@ resume(vc): vc.resume() → store.on_resume(now)       → mark_resumed()
 
 ### Auto-Disconnect
 
-Two independent triggers, both handled in `musicbot.py`:
+Two independent triggers, the playback loop's (`musicplayer.py`) and `VoiceWatchdog`'s (`recovery.py`):
 
-1. **Queue idle timeout**: `loop()`'s `queue_get()` times out after 300 s with nothing queued → `stop()` → cleanup + disconnect.
+1. **Queue idle timeout**: `loop()`'s `queue_get()` times out after the server's `idle-timeout` with nothing queued → `stop()` → cleanup + disconnect. The setting is 5:00 by default and at most 30:00, and is read from `GuildSettings`' cache once per wait. Its minimum is the fixed wait it replaced, because the timer does not consult `PlayRegistry`: a shorter one could end the session while a `-play` is still resolving. Once `queue_get()` hands over an entry, the timer is rescheduled to `_IN_BAND_RESOLVE_TIMEOUT_SECS` (300 s) for that entry's resolve, so a wedged resolve cannot hold a guild with songs queued silent for the length of a long wait.
 2. **Alone in channel** (`on_voice_state_update`):
    - Bot ejected (`before.channel` set, `after.channel` None) → full `cleanup()`.
    - Bot *moved* between channels → cancel any stale alone-timer from the old channel.
-   - Last human leaves the bot's channel → start a **10-second countdown** (`_alone_countdown`, tracked in `_alone_timers`): sends a notice via `send_with_np`, sleeps 10 s, re-checks channel membership, and cleans up if still alone. A human rejoining (or an explicit stop) cancels the timer. Any other channel change that leaves the bot alone, another bot joining or leaving included, restarts it: the replacement is stored before the old countdown unwinds, and a countdown removes only its own entry, so a later rejoin still cancels the replacement. Mute/deafen events (channel unchanged) are ignored.
+   - Last human leaves the bot's channel → start a **10-second countdown** (`VoiceWatchdog._countdown`, tracked in `_timers`): sends a notice via `send_with_np`, sleeps 10 s, re-checks channel membership, and cleans up if still alone. A human rejoining (or an explicit stop) cancels the timer. Any other channel change that leaves the bot alone, another bot joining or leaving included, restarts it: the replacement is stored before the old countdown unwinds, and a countdown removes only its own entry, so a later rejoin still cancels the replacement. Mute/deafen events (channel unchanged) are ignored.
 
 `cleanup()` also cancels any pending alone-timer first, so the timer can't fire after cleanup and attempt a second teardown.
 
@@ -1048,7 +1048,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
-| `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
+| `guild:{id}:config` | Hash | 4 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
@@ -1461,7 +1461,7 @@ stateDiagram-v2
 
     Playing --> WaitingForSong : stream error (None YTDL)\nskip to next
 
-    WaitingForSong --> [*] : 300s queue timeout\nor cleanup()
+    WaitingForSong --> [*] : idle timeout\nor cleanup()
     Playing --> [*] : cleanup() / alone timer / eject
 ```
 
