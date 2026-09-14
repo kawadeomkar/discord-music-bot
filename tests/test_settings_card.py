@@ -310,15 +310,38 @@ class TestBotCard:
             "Stored bot settings are ignored (`BOT_SETTINGS_OVERRIDES=ignore`)."
         )
 
-    def test_rows_are_code_in_debugs_config_form(self) -> None:
+    def test_each_setting_shows_its_value_summary_and_command(self) -> None:
+        """The server card's shape, not code blocks: a range column would push a
+        code-block row past a phone's width."""
         config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
         embed = card.bot_card(
             rows=card.bot_rows(host_debug_default=False, debug_default_override=None),
             ignored=False,
         )
         playback = next(f.value or "" for f in embed.fields if f.name == "Playback")
-        assert playback.startswith("```\n")
-        assert "heartbeat                 5s (bot owner; default 3s)" in playback
+        assert playback.startswith(
+            "**Heartbeat** · 5s · bot owner; default 3s\n"
+            "How often a playing server saves its position.\n"
+            "`-settings bot heartbeat <value>` · 2s–30s"
+        )
+        assert "```" not in str(embed.to_dict())
+        assert embed.footer.text == (
+            "-settings bot <setting> reset returns one to the environment · "
+            "-settings bot <setting> shows one in full"
+        )
+
+    def test_every_command_on_the_card_sets_its_own_setting(self) -> None:
+        rows = card.bot_rows(host_debug_default=False, debug_default_override=None)
+        embed = card.bot_card(rows=rows, ignored=False)
+        text = "\n".join(f.value or "" for f in embed.fields)
+        keys = re.findall(r"`-settings bot (\S+) <value>`", text)
+        # Grouped on the card, so compared without order.
+        assert sorted(keys) == sorted(spec.key for spec, _ in rows)
+        for spec, _ in rows:
+            arg = f"bot {spec.key} <{_lowest(spec)}>"
+            request = parse_settings_args(arg, tail=f"settings {arg}")
+            assert isinstance(request, SettingsRequest), (arg, request)
+            assert (request.spec, request.action) == (spec, SettingsAction.SET), arg
 
 
 class TestDetail:

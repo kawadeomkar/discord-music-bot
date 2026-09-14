@@ -377,7 +377,7 @@ class TestScopes:
         playback = next(
             f.value or "" for f in _embed(ctx).fields if f.name == "Playback"
         )
-        assert "heartbeat                 5s (not saved)" in playback
+        assert "**Heartbeat** · 5s · not saved" in playback
 
     async def test_while_stored_settings_are_ignored_a_write_is_refused_unsent(
         self, cog: MusicBot, settings_ctx: MagicMock, bot_settings: BotSettings

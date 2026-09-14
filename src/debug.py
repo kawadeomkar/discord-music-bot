@@ -465,8 +465,8 @@ def redact_url(raw: str, *, hide_host: bool = False) -> str:
 
 
 def _render_knob(knob: config.FloatKnob | config.IntKnob) -> str:
-    """`5s (bot owner; env 3s)`: the -settings bot card's rendering, so the
-    operator's two views of a knob agree."""
+    """`5s (bot owner; env 3s)`: the value and source label the -settings bot
+    card shows, so the operator's two views of a knob agree."""
     spec = next(spec for spec in SETTINGS if spec.attr == knob)
     shown = bot_shown(spec, host_debug_default=False, debug_default_override=None)
     return f"{format_value(spec, shown.value)} ({shown.source})"

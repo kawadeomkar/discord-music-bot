@@ -27,7 +27,6 @@ from src.settings import (
 )
 from src.util import (
     EMBED_FIELD_LIMIT,
-    codeblock_fields,
     notice_embed,
     safe_label,
     truncate_embed_title,
@@ -219,13 +218,17 @@ def server_card(
     return embed
 
 
+def _bot_command(spec: SettingSpec) -> str:
+    # The key: the environment variable's name in lower case, the operator's word.
+    return f"-settings bot {spec.key}"
+
+
 def bot_card(*, rows: list[tuple[SettingSpec, Shown]], ignored: bool) -> discord.Embed:
-    """The bot-wide settings, for the operator only, as code-block rows in
-    -debug's Config form."""
+    """The bot-wide settings, for the operator only, in the server card's shape."""
     description = (
-        "Bot-wide: each applies in every server. `-settings bot <setting> <value>` "
-        "changes one, and `-settings bot <setting> reset` returns it to the "
-        "environment."
+        "Bot-wide: each applies in every server, and only the bot's operator can "
+        "change them. To change one, run the command under it with a value from its "
+        "range."
     )
     if ignored:
         description = (
@@ -235,16 +238,13 @@ def bot_card(*, rows: list[tuple[SettingSpec, Shown]], ignored: bool) -> discord
     embed = discord.Embed(
         title="Bot settings", description=description, color=CHANGE_COLOR
     )
-    width = max(len(spec.key) for spec, _ in rows)
-    for group in dict.fromkeys(spec.group for spec, _ in rows):
-        lines = [
-            f"{spec.key:<{width}}  {format_value(spec, shown.value)} ({shown.source})"
-            for spec, shown in rows
-            if spec.group is group
-        ]
-        for name, value in codeblock_fields(group.value, lines):
-            embed.add_field(name=name, value=value, inline=False)
-    embed.set_footer(text="-settings bot <setting> shows one setting in full")
+    _add_rows(embed, rows, _bot_command)
+    embed.set_footer(
+        text=(
+            "-settings bot <setting> reset returns one to the environment · "
+            "-settings bot <setting> shows one in full"
+        )
+    )
     return embed
 
 
