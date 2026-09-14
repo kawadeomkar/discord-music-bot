@@ -633,13 +633,12 @@ class TestYTSource:
         failure) is re-raised untouched as the classified ExtractionError — only a
         genuine UnsupportedError is remapped to the friendly message. _command_error
         renders the ExtractionError via its user_message."""
-        from src.youtube import ExtractionError
 
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.side_effect = DownloadError(
                 "ERROR: unable to download webpage"
             )
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 await YTDL.yt_source(
                     mock_ctx.author,
                     "ytsearch:test",
@@ -1100,9 +1099,9 @@ class TestExtractSingleflight:
             joiner = asyncio.create_task(_extract_once("k", MagicMock()))
             await asyncio.sleep(0)
             gate.set()
-            with pytest.raises(ExtractionError):
+            with pytest.raises(youtube.ExtractionError):
                 await joiner
-            with pytest.raises(ExtractionError):
+            with pytest.raises(youtube.ExtractionError):
                 await leader
 
     async def test_identical_concurrent_queries_extract_once(self) -> None:
@@ -1147,7 +1146,7 @@ class TestExtractSingleflight:
 
         with patch("src.youtube._run_extract", new=_boom):
             for _ in range(2):
-                with pytest.raises(ExtractionError):
+                with pytest.raises(youtube.ExtractionError):
                     await _extract_once("k", MagicMock())
 
         assert calls == 2
@@ -1309,6 +1308,63 @@ class TestYTSourceUnifiedExtraction:
         cached = orjson.loads(stream_entry)
         assert cached["url"] == fake_data["url"]
         assert cached["title"] == "Test Song"
+
+    @pytest.mark.parametrize("flat", [False, True], ids=["full", "flat"])
+    async def test_a_search_with_no_video_is_refused_and_not_cached(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, flat: bool
+    ) -> None:
+        """A search whose extraction holds no video hands back its wrapper, whose
+        webpage_url is the `ytsearch:` string. Cached as a song, every play of it
+        fails for 24h and blames YouTube's stream (seen live)."""
+        wrapper = {
+            "_type": "playlist",
+            "webpage_url": "ytsearch:Fantasy Snow Strippers",
+            "title": "Fantasy Snow Strippers",
+            "entries": [],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=wrapper):
+            with pytest.raises(youtube.ExtractionError) as excinfo:
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "ytsearch:Fantasy Snow Strippers",
+                    redis=fake_redis,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                    flat=flat,
+                )
+
+        assert "playable" in excinfo.value.user_message
+        assert await fake_redis.keys("ytdl:source:*") == []
+        await _settle_stream_warms()
+        assert await fake_redis.keys("ytdl:stream:*") == []
+
+    def test_a_wrapper_with_no_video_has_no_first_entry(self) -> None:
+        """Every caller reads None as "nothing usable"; the wrapper itself would be
+        a song whose page URL is the search string."""
+        wrapper: Any = {
+            "webpage_url": "ytsearch:x",
+            "entries": [None, {"_type": "playlist"}],
+        }
+        assert youtube._first_video_entry(wrapper) is None
+        video: Any = {"webpage_url": "https://www.youtube.com/watch?v=a"}
+        assert youtube._first_video_entry(video) is video
+
+    async def test_an_entry_without_a_page_url_is_refused(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        fake_data = _fake_ytdl_data(webpage_url="ytsearch:odd")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            with pytest.raises(youtube.ExtractionError):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "odd",
+                    redis=fake_redis,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+        assert await fake_redis.keys("ytdl:source:*") == []
 
     async def test_stream_cache_hit_for_prefetch_after_yt_source(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3910,14 +3966,14 @@ class TestExtractionErrorClassification:
             )
 
     def test_downloaderror_is_reclassified_with_its_fields_mined(self) -> None:
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         real_error = self._real_downloaderror()
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = real_error
 
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
 
         err = caught.value
@@ -3974,7 +4030,7 @@ class TestExtractionErrorClassification:
         inner error so the flag survives the (otherwise unpicklable) boundary."""
         import sys
 
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         try:
             raise UnsupportedError("https://example.com/not-media")
@@ -3984,19 +4040,19 @@ class TestExtractionErrorClassification:
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = wrapped
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is True
 
     def test_non_unsupported_error_is_not_flagged_unsupported(self) -> None:
         """A garden-variety DownloadError (network failure, video unavailable) must
         classify with unsupported=False — only genuine UnsupportedError sets it."""
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = self._real_downloaderror()
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is False
 

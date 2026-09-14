@@ -394,6 +394,16 @@ def safe_label(text: str, limit: int) -> str:
     return discord.utils.escape_markdown(neutralized, ignore_links=False)
 
 
+def verbatim_code(text: str, limit: int) -> Optional[str]:
+    """`text` as an inline code span a user can copy back exactly, or None when no
+    span can hold it: past `limit`, or carrying a backtick or a control character.
+    Unescaped because Discord shows a code span's content literally, so
+    safe_label's backslashes would be copied along with the text."""
+    if len(text) > limit or "`" in text or _LABEL_UNSAFE.search(text):
+        return None
+    return f"`{text}`"
+
+
 def truncate(text: str, limit: int) -> str:
     """Clip to `limit` characters, ellipsizing if clipped."""
     if len(text) <= limit:

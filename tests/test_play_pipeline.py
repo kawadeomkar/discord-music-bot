@@ -1,9 +1,12 @@
 """Tests for the -play pipeline (src/play_pipeline.py)."""
 
+import ast
 import asyncio
+import pathlib
 import contextlib
+import inspect
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -20,13 +23,16 @@ from src.play_placement import (
     ResolveMode,
     resolve_mode_for,
 )
+from src.guild_queue import RemoveMode, remove_matcher
 from src.play_pipeline import (
     EmptyPlaylistError,
     PlaylistIndexError,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
     _rebase_positions,
+    collection_note,
 )
+from src.util import ECHO_MAX
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -1739,6 +1745,116 @@ class TestTheResumeNoticeDescribesARestoredQueue:
         )
 
         mp.build_resume_notice_embed.assert_called_once()
+
+
+class TestSpanDecoratorsNameTheirOwnFunction:
+    """`bot.queue_source` once decorated `plays_after_note`, a microsecond string
+    helper inserted directly beneath it, while the 29s resolve it was written for
+    emitted no span at all. A decorator naming one function and sitting on another
+    is invisible to every behavioural test, so it is asserted from the source."""
+
+    # Every module that decorates a function with a span name. The bug is not
+    # specific to play_pipeline — it is what a same-signature insert above a
+    # decorated function does anywhere — so the guard covers all of them.
+    _MODULES = (
+        "src/play_pipeline.py",
+        "src/play_placement.py",
+        "src/musicplayer.py",
+        "src/queue_progress.py",
+        "src/youtube.py",
+        "src/spotify.py",
+    )
+
+    @staticmethod
+    def _decorations(source: Optional[str] = None) -> list[tuple[str, str]]:
+        """(span name, decorated function) for every tracer decorator in a module."""
+        tree = ast.parse(
+            source if source is not None else inspect.getsource(play_pipeline)
+        )
+        found: list[tuple[str, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not isinstance(decorator, ast.Call):
+                    continue
+                called = decorator.func
+                if (
+                    not isinstance(called, ast.Attribute)
+                    or called.attr != "start_as_current_span"
+                ):
+                    continue
+                (name,) = decorator.args
+                assert isinstance(name, ast.Constant)
+                span_name = name.value
+                assert isinstance(span_name, str)
+                found.append((span_name, node.name))
+        return found
+
+    def test_the_resolve_is_the_one_bot_queue_source_wraps(self) -> None:
+        assert ("bot.queue_source", "queue_source") in self._decorations()
+
+    def test_every_span_name_matches_the_function_under_it(self) -> None:
+        decorations = self._decorations()
+        assert len(decorations) >= 5
+        for span_name, func_name in decorations:
+            assert span_name == f"bot.{func_name.lstrip('_')}"
+
+    def test_no_module_decorates_a_function_it_does_not_name(self) -> None:
+        """Same rule, every module. The prefix differs per module — `bot.`,
+        `player.`, `spotify.` — and a tail may abbreviate (`player.prefetch` over
+        `_prefetch_next_song`), so what is asserted is that one NAMES the other:
+        either is a substring of the other. `bot.queue_source` sitting on
+        `plays_after_note`, the bug this encodes, shares nothing either way."""
+        checked = 0
+        for path in self._MODULES:
+            for span_name, func_name in self._decorations(
+                pathlib.Path(path).read_text()
+            ):
+                checked += 1
+                tail = span_name.split(".")[-1]
+                func = func_name.lstrip("_")
+                assert tail in func or func in tail, (path, span_name, func_name)
+        assert checked >= 10
+
+
+class TestCollectionNote:
+    """The undo a --now playlist offers has to work when copied: -remove compares
+    links literally, and every Mix link carries an underscore in `start_radio`."""
+
+    @staticmethod
+    def _copied(note: str) -> str:
+        return note.split("`-remove ", 1)[1].split("`", 1)[0]
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ&start_radio=1",
+            "https://open.spotify.com/playlist/37i9dQZF1DX*0XUsuxWHRQ",
+            "https://www.youtube.com/playlist?list=PL_a_b~c|d",
+        ],
+    )
+    def test_the_copied_command_removes_the_playlist(
+        self, mock_ctx: MagicMock, url: str
+    ) -> None:
+        note = collection_note(url, 483, head_playing=False)
+        track = QueueObject(
+            "https://www.youtube.com/watch?v=x", "X", mock_ctx.author, user_input=url
+        )
+        assert remove_matcher(self._copied(note))(track) is RemoveMode.ORIGIN
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/" + "a" * ECHO_MAX,
+            "https://example.com/`-skip`",
+            "https://example.com/a\nb",
+        ],
+    )
+    def test_a_link_no_code_span_can_hold_is_named_instead(self, url: str) -> None:
+        note = collection_note(url, 2, head_playing=False)
+        assert "`-remove` followed by the link you pasted" in note
+        assert url not in note
 
 
 class TestSearchesForAPlaylist:

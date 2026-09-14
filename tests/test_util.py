@@ -14,6 +14,7 @@ from opentelemetry import trace as trace_api
 from src import util
 from tests.helpers import settle
 from src.util import (
+    verbatim_code,
     BAR_WIDTH,
     FOOTER_LIMIT,
     current_traceparent,
@@ -716,3 +717,13 @@ class TestProgressLine:
         assert progress_line(335, 1671, label=lambda n: str(int(n))) == (
             "`335` " + progress_bar(335 / 1671) + " `1671`"
         )
+
+
+class TestVerbatimCode:
+    def test_the_text_is_not_escaped(self) -> None:
+        """Discord shows a code span literally, so an escape is copied with it."""
+        assert verbatim_code("a_b*c", 20) == "`a_b*c`"
+
+    @pytest.mark.parametrize("text", ["a`b", "a\nb", "a\x00b", "x" * 21])
+    def test_what_a_span_cannot_hold_is_refused(self, text: str) -> None:
+        assert verbatim_code(text, 20) is None

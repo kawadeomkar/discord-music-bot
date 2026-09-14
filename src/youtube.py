@@ -1259,9 +1259,10 @@ async def _extract_for_source(
         raise
 
 
-def _first_video_entry(data: YTDLExtractResult) -> YTDLEntry:
+def _first_video_entry(data: YTDLExtractResult) -> Optional[YTDLEntry]:
     """A wrapper carries the video in `entries`; a lone-video result already is the
-    entry. A result with no usable entry falls back to the wrapper."""
+    entry. None for a wrapper holding no video: its own webpage_url is the search
+    string, and cached as a song it would fail every play for the entry's TTL."""
     if "entries" not in data:
         return data
     # TODO: Validate search results have a usable audio format before accepting.
@@ -1272,7 +1273,7 @@ def _first_video_entry(data: YTDLExtractResult) -> YTDLEntry:
     for entry in data["entries"]:
         if entry and entry.get("_type", None) != "playlist":
             return entry
-    return data
+    return None
 
 
 def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
@@ -1762,16 +1763,19 @@ class YTDL(discord.FFmpegOpusAudio):
                 search,
                 pool_slot=pool_slot,
             )
+            flat_entry = (
+                _first_video_entry(flat_data) if flat_data is not None else None
+            )
             flat_qobj = (
                 _queue_object_from_flat_entry(
-                    _first_video_entry(flat_data),
+                    flat_entry,
                     requester,
                     query_source=query_source,
                     analytics=analytics,
                     user_input=origin,
                     ts=ts,
                 )
-                if flat_data is not None
+                if flat_entry is not None
                 else None
             )
             if flat_qobj is not None:
@@ -1818,7 +1822,16 @@ class YTDL(discord.FFmpegOpusAudio):
 
         # Separate from `data` because a leaf (YTDLEntry) is not assignable back to the
         # result type, and "raw result" vs "chosen entry" are two things.
-        selected: YTDLEntry = _first_video_entry(data)
+        selected = _first_video_entry(data)
+        if selected is None or not str(selected.get("webpage_url", "")).startswith(
+            ("https://", "http://")
+        ):
+            # Refused before the cache write below: an identity that is not a page
+            # URL cannot be streamed, and cached it fails every play for 24h.
+            log.warning(f"no playable result for {search!r}")
+            raise ExtractionError(
+                "Couldn't find anything playable for that.", expected=True
+            )
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
             # It is accepted but does nothing — the file is never named or

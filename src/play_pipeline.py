@@ -52,6 +52,7 @@ from src.util import (
     safe_label,
     send_embed,
     truncate_embed_title,
+    verbatim_code,
 )
 from src.youtube import YTDL, QueueObject
 
@@ -176,7 +177,6 @@ def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> No
         tracks[0].ts = source.ts
 
 
-@_tracer.start_as_current_span("bot.queue_source")
 def plays_after_note(
     mp: MusicPlayer, voice_client: Optional[discord.VoiceProtocol]
 ) -> str:
@@ -218,10 +218,13 @@ def collection_note(
         if head_playing
         else "the whole playlist back out."
     )
+    # -remove compares links literally, so the command has to be copyable as-is.
+    command = verbatim_code(f"-remove {url}", ECHO_MAX)
+    if command is None:
+        command = "`-remove` followed by the link you pasted"
     return (
         f"\n\nQueued **{queued}** {pluralize(queued, 'song')} from the playlist."
-        f"{returns}\nNot what you wanted? `-remove {safe_label(url, ECHO_MAX)}` "
-        f"takes {undo}"
+        f"{returns}\nNot what you wanted? {command} takes {undo}"
     )
 
 
@@ -327,6 +330,7 @@ def playing_next_embed(
     )
 
 
+@_tracer.start_as_current_span("bot.queue_source")
 async def queue_source(
     ctx: commands.Context,
     source: Union[SpotifySource, YTSource, SoundcloudSource],

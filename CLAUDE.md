@@ -335,7 +335,10 @@ src/
 │                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
 ├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus, tunables
-└── util.py           # logger factory, embed helpers, fmt_duration, task helpers
+└── util.py           # logger factory, embed helpers (safe_label, verbatim_code), fmt_duration,
+                      # progress_bar/progress_line (the NP bar and the card's), task helpers
+                      # (spawn_background, cancel_task, join_task, set_within), channel_claim,
+                      # ProgressFn, PoolSlotUnavailable
 
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
