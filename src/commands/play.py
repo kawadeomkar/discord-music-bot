@@ -12,7 +12,7 @@ import discord
 from discord.ext import commands
 
 from src.guild_state import Analytics
-from src.musicplayer import RESTORE_WAIT_SECS
+from src.musicplayer import DEPTH_RESTORE_WAIT_SECS, RESTORE_WAIT_SECS
 from src.recovery import abandon_cold_start, join_succeeded
 from src.sources import (
     parse_input,
@@ -94,19 +94,11 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
             if front:
                 position = 0
             else:
-                # Wait out any in-flight restore: restore_entries() appends,
-                # so a put() landing first leaves the deque holding this
-                # song ahead of entries Redis lists behind it, and every
-                # later commit-time LPOP then retires the wrong one.
-                if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                    await ctx.send(
-                        embed=notice_embed(
-                            "Still loading this server's saved queue — try "
-                            "again in a moment.",
-                            discord.Color.orange(),
-                        )
-                    )
-                    return
+                # Wait out any in-flight restore: the queue stays empty
+                # until restore_entries() replays it, so a -play in the
+                # crash-recovery window would read 0 behind a queue about
+                # to reappear. Already set in the common case.
+                await mp.wait_for_restore(timeout=DEPTH_RESTORE_WAIT_SECS)
                 position = mp.enqueue_depth()
             analytics = Analytics(
                 queued_at=ctx.message.created_at.timestamp(),

@@ -186,6 +186,11 @@ _START_WRITE_TIMEOUT = 5.0
 # so a server that accepts the connection then stalls would hang the command outright.
 RESTORE_WAIT_SECS = 5.0
 
+# How long a warm -play waits for its restore before reading the ask-time queue
+# depth. Short because a timeout here only costs an approximate analytics field:
+# the depth is recorded from whatever has landed and the command proceeds.
+DEPTH_RESTORE_WAIT_SECS = 1.0
+
 
 @dataclass(frozen=True)
 class InterjectOutcome:
