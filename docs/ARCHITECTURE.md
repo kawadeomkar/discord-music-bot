@@ -670,7 +670,7 @@ On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases n
 
 #### Saying so while it waits
 
-`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands or the request is dropped (see [Queue progress card](#queue-progress-card)). It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
+`slow_resolve_notice` posts once a request outlives its server's `slow-notice` — `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) unless the server set its own, 4–60s or `off` — and deletes the message when the song lands or the request is dropped (see [Queue progress card](#queue-progress-card)). Both `-play` entry points read that value synchronously from `GuildSettings` as they enter the notice and pass it as the required `delay=`; `off` is `None`, which arms no poster task. It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
 
 No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
 
@@ -1049,7 +1049,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
-| `guild:{id}:config` | Hash | 6 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
+| `guild:{id}:config` | Hash | 7 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
@@ -1672,9 +1672,11 @@ logs, so persistence degrades silently rather than crashing.
 Only the **outbox** can reach that state by growing. The history lists are bounded
 at `HISTORY_CACHE_LIMIT` per guild, so their total scales with guild count
 (~24 KB each, ~24 MB across a thousand), not with runtime. The config hashes are
-bounded by the number of settings that exist — three fields, ~160 bytes measured,
-per guild that has chosen one — so they scale with guild count even more weakly
-(~1.5 MB across ten thousand) and cannot grow on their own at all. The outbox is near-empty
+bounded by the number of settings that exist — seven fields and the `writer_app_id`
+stamp, 272–304 bytes with every field set (`MEMORY USAGE` on `redis:7-alpine` 7.4.11,
+listpack-encoded), per guild that has chosen one — so they scale with guild count even
+more weakly (~3 MB across ten thousand guilds that set everything) and cannot grow on
+their own at all. The outbox is near-empty
 whenever the drainer keeps up and grows for the whole duration of a Postgres
 outage, at ~625 bytes per play — so the bundled 256 MB budget holds roughly 429k
 un-archived plays. `HISTORY_OUTBOX_MAX` is the opt-in bound on it; it defaults to

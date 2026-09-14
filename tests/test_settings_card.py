@@ -5,7 +5,7 @@ import pytest
 
 from src import config
 from src import settings_card as card
-from src.guild_state import DEFAULT_TIMEZONE, GuildConfig
+from src.guild_state import DEFAULT_TIMEZONE, OFF_SECS, GuildConfig
 from src.settings import (
     SETTINGS,
     Parsed,
@@ -45,6 +45,7 @@ class TestServerValues:
             card.Shown(300.0, "default"),
             card.Shown(10.0, "default"),
             card.Shown(3.0, "default"),
+            card.Shown(6.0, "default"),
             card.Shown(False, "default"),
         ]
 
@@ -55,6 +56,7 @@ class TestServerValues:
             idle_timeout_secs=600.0,
             alone_timeout_secs=120.0,
             np_refresh_secs=10.0,
+            slow_notice_secs=OFF_SECS,
             debug_mode=False,
         )
         assert [shown for _, shown in _server_rows(stored)] == [
@@ -63,6 +65,7 @@ class TestServerValues:
             card.Shown(600.0, "set here"),
             card.Shown(120.0, "set here"),
             card.Shown(10.0, "set here"),
+            card.Shown(OFF_SECS, "set here"),
             card.Shown(False, "set here"),
         ]
 
@@ -149,6 +152,7 @@ class TestServerCard:
                 idle_timeout_secs=1800.0,
                 alone_timeout_secs=120.0,
                 np_refresh_secs=30.0,
+                slow_notice_secs=60.0,
                 debug_mode=True,
             ),
             unsaved=frozenset(
@@ -158,6 +162,7 @@ class TestServerCard:
                     "idle_timeout_secs",
                     "alone_timeout_secs",
                     "np_refresh_secs",
+                    "slow_notice_secs",
                     "debug_mode",
                 }
             ),
@@ -189,7 +194,11 @@ class TestServerCard:
                 "**Leave when idle** · 5:00 · default\n"
                 "**Leave when alone** · 0:10 · default",
             ),
-            ("Messages", "**Progress bar refresh** · 3s · default"),
+            (
+                "Messages",
+                "**Progress bar refresh** · 3s · default\n"
+                "**Lookup notice** · 6s · default",
+            ),
             ("Diagnostics", "**Debug footer** · off · default"),
         ]
         assert embed.footer.text == (
@@ -259,6 +268,16 @@ class TestDetail:
             "Applies from the next tick."
         )
 
+    def test_an_off_setting(self) -> None:
+        spec = _spec("slow-notice")
+        embed = card.detail(spec, card.Shown(OFF_SECS, "set here"), default=6.0)
+        assert embed.description == (
+            "**Lookup notice** (`slow-notice`; also `lookup-notice`) — How long a "
+            'lookup for one song runs before "still looking it up" appears. Current '
+            "**off** (set here) · Default 6s (the bot's default) · Allowed 4s–60s or "
+            "off · Applies from the next -play."
+        )
+
     def test_a_bot_setting_names_its_baseline_in_the_source(self) -> None:
         spec = _spec("heartbeat", SettingScope.BOT)
         embed = card.detail(spec, card.Shown(5.0, "bot owner; env 3s"), default=None)
@@ -287,6 +306,8 @@ class TestReplies:
             ("idle-timeout", 630.0),
             ("alone-timeout", 95.0),
             ("np-refresh", 12.5),
+            ("slow-notice", OFF_SECS),
+            ("slow-notice", 7.5),
             ("debug", True),
         ):
             spec = _spec(key)

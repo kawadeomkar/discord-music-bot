@@ -368,6 +368,20 @@ class TestReplies:
             f"**3s** right now. It is saved for this server. Changed by {MENTION}."
         )
 
+    async def test_slow_notice_off(
+        self, cog: MusicBot, settings_ctx: MagicMock
+    ) -> None:
+        ctx = _with_manage_server(settings_ctx)
+        await _invoke(cog, ctx, "lookup-notice off")
+        assert _text(ctx) == (
+            "**Lookup notice** is now **off** for this server (was **6s**, the "
+            "default). It applies from the next -play. It is saved for this server. "
+            f"Changed by {MENTION}."
+        )
+        assert cog.guild_settings.slow_notice_secs(GUILD) is None
+        await _invoke(cog, ctx, "slow-notice 10")
+        assert "(was **off**, set here)" in _text(ctx)
+
     async def test_debug_on_names_what_it_publishes(
         self, cog: MusicBot, settings_ctx: MagicMock
     ) -> None:
@@ -478,7 +492,7 @@ class TestCard:
         assert values == [
             "**Volume** · 100% · default\n**Timezone** · America/Los_Angeles · default",
             "**Leave when idle** · 5:00 · default\n**Leave when alone** · 0:10 · default",
-            "**Progress bar refresh** · 3s · default",
+            "**Progress bar refresh** · 3s · default\n**Lookup notice** · 6s · default",
             "**Debug footer** · off · default",
         ]
 

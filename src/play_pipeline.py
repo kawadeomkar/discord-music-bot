@@ -759,10 +759,12 @@ async def interject_flow(
                 )
             )
         else:
+            delay = cog.guild_settings.slow_notice_secs(req.guild_id)
             await stack.enter_async_context(
                 slow_resolve_notice(
                     ctx,
                     query=req.query,
+                    delay=delay,
                     debug_suffix=cog.debug_suffix(ctx),
                     dropped=req.dropped,
                 )

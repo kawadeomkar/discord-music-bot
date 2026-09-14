@@ -244,6 +244,23 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         why_write_minimum="the bot refreshes no faster than {bound}",
     ),
     SettingSpec(
+        key="slow-notice",
+        aliases=("lookup-notice",),
+        scope=SettingScope.SERVER,
+        kind=SettingKind.SECONDS_OR_OFF,
+        group=SettingGroup.MESSAGES,
+        label="Lookup notice",
+        summary='How long a lookup for one song runs before "still looking it up" appears.',
+        applies="from the next -play",
+        field=ConfigField.SLOW_NOTICE,
+        minimum=_server_bound(ConfigField.SLOW_NOTICE, "lo"),
+        maximum=_server_bound(ConfigField.SLOW_NOTICE, "hi"),
+        why_minimum=(
+            "Most lookups finish within 4s, so a shorter delay would post the notice "
+            "for ordinary ones."
+        ),
+    ),
+    SettingSpec(
         key="debug",
         aliases=("debug-footer",),
         scope=SettingScope.SERVER,
@@ -1609,6 +1626,16 @@ class GuildSettings:
         stored = self.peek(guild_id)
         value = stored.np_refresh_secs if stored is not None else None
         return bot if value is None else max(value, bot)
+
+    def slow_notice_secs(self, guild_id: int) -> Optional[float]:
+        """How long a -play's lookup runs before the notice posts; None when this
+        server turned it off. The bot's value, read at the call, while unset."""
+        stored = self.peek(guild_id)
+        value = stored.slow_notice_secs if stored is not None else None
+        if value is None:
+            return config.play_slow_notice_secs()
+        # OFF_SECS is falsy and set: compare, never test truthiness.
+        return None if value == OFF_SECS else value
 
     # ── Stamps and registrations ──────────────────────────────────────────────
 

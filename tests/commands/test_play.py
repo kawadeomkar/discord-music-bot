@@ -11,13 +11,14 @@ import orjson
 import pytest
 import redis.asyncio as aioredis
 
-from src import play_pipeline
-from src.guild_state import Analytics
+from src import config, play_pipeline
+from src.guild_state import OFF_SECS, Analytics, GuildConfig
 from src.help import CATEGORY_COMMANDS
 from src.musicbot import MusicBot
 from src.play_placement import ResolveWaitExpired
 from src.commands import play as play_cmd
 from src.recovery import abandon_cold_start
+from src.redis_client import GuildRedisStore
 from src.guild_queue import RemoveMode, RemoveOutcome
 from src.play_placement import (
     PLACE_TIMEOUT_SECS,
@@ -3197,6 +3198,71 @@ class TestPlayShowsTyping:
         assert entered == ["typing"]
 
 
+class TestTheSlowNoticeIsTheServers:
+    """-play reads its server's slow-notice as it enters the notice: synchronously,
+    from GuildSettings' cache."""
+
+    @pytest.mark.parametrize(
+        ("stored", "delay"), [(None, 6.0), (20.0, 20.0), (OFF_SECS, None)]
+    )
+    async def test_the_notice_is_handed_the_servers_delay(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        stored: Optional[float],
+        delay: Optional[float],
+    ) -> None:
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        if stored is not None:
+            await music_bot.guild_settings.write(
+                mock_ctx.guild.id, GuildConfig(slow_notice_secs=stored)
+            )
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice") as notice,
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
+        notice.assert_called_once()
+        assert notice.call_args.kwargs["delay"] == delay
+
+    async def test_the_notice_still_posts_when_the_store_stalls(
+        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The pool has no socket_timeout. The delay comes from the cache, so a
+        Redis that accepts and never answers holds neither the request nor its
+        notice."""
+        cog = music_bot_with_redis
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        cog.get_mp = MagicMock(return_value=mock_mp())
+        config.set_override("PLAY_SLOW_NOTICE_SECS", 0.02)
+        resolved = song(1, mock_ctx)
+
+        async def _slow_resolve(*_args: Any, **_kwargs: Any) -> Any:
+            await asyncio.sleep(0.1)
+            return resolved
+
+        never = asyncio.Event()
+
+        async def _stall(*_args: Any, **_kwargs: Any) -> None:
+            await never.wait()
+
+        play_pipeline.queue_source = _slow_resolve
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch.object(GuildRedisStore, "read_config", new=_stall),
+            patch("src.settings.read_guild_configs", new=_stall),
+        ):
+            async with asyncio.timeout(1):
+                await command_callback(MusicBot.play)(cog, mock_ctx, url="a")
+        posted = [
+            call.kwargs["embed"].description
+            for call in mock_ctx.channel.send.await_args_list
+        ]
+        assert any("Still looking up" in (text or "") for text in posted)
+
+
 class TestSpanDecoratorsNameTheirFunction:
     """A helper inserted between a decorator and the function it was written for
     silently inherits its span: bot.enqueue_playlist once measured a --next-only
@@ -4777,9 +4843,12 @@ class TestQueueProgressCard:
     ) -> None:
         """The other half of the same `if`. A single track over a live song took
         the same 1-4s resolve and said nothing at all, because this entry point
-        only ever armed the card."""
+        only ever armed the card. It waits the server's slow-notice, like -play's."""
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
+        await music_bot.guild_settings.write(
+            mock_ctx.guild.id, GuildConfig(slow_notice_secs=20.0)
+        )
         notice = MagicMock(return_value=contextlib.nullcontext())
         card = _CardSpy()
         qobj = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
@@ -4798,6 +4867,7 @@ class TestQueueProgressCard:
             )
 
         notice.assert_called_once()
+        assert notice.call_args.kwargs["delay"] == 20.0
         assert card.entered == 0
 
     async def test_the_interjection_card_outlives_the_interrupt(

@@ -132,6 +132,13 @@ class TestRegistryInvariants:
             )
             assert spec.field in members, spec.key
 
+    def test_2_every_server_field_has_exactly_one_spec(self) -> None:
+        """So no stored field lacks a way to show and reset it."""
+        server_fields = [
+            spec.field for spec in SETTINGS if spec.scope is SettingScope.SERVER
+        ]
+        assert sorted(f for f in server_fields if f) == sorted(_members(ConfigField))
+
     def test_2_every_bot_field_has_exactly_one_spec(self) -> None:
         bot_fields = [
             spec.field
@@ -526,6 +533,16 @@ class TestOutOfRange:
             == "**Progress bar refresh** has to be between **5s** and **30s**."
         )
 
+    @pytest.mark.parametrize("value", ["0", "0s", "0:00"])
+    def test_a_server_slow_notice_of_zero_names_off(self, value: str) -> None:
+        result = parse_value(_spec("slow-notice"), value)
+        assert isinstance(result, Refusal)
+        assert result.text == (
+            "**Lookup notice** has to be between **4s** and **60s**, or `off`. Most "
+            "lookups finish within 4s, so a shorter delay would post the notice for "
+            "ordinary ones."
+        )
+
     def test_a_count_refuses_a_fraction(self) -> None:
         spec = _spec("play-inflight-max")
         assert isinstance(parse_value(spec, "2.5"), Refusal)
@@ -785,6 +802,8 @@ class TestParseSettingsArgs:
             ("alone-timeout:1:30", _set("alone-timeout", 90.0)),
             ("leave-when-alone 2m", _set("alone-timeout", 120.0)),
             ("Progress-Bar 5s", _set("np-refresh", 5.0)),
+            ("lookup-notice off", _set("slow-notice", OFF_SECS)),
+            ("slow-notice=10.5s", _set("slow-notice", 10.5)),
         ],
     )
     def test_near_misses_normalize(self, arg: str, expected: SettingsRequest) -> None:
@@ -1439,6 +1458,42 @@ class TestGuildSettingsAccessors:
         assert guild_settings.np_refresh_secs(_GUILD) == 5.0
         config.clear_override("NOW_PLAYING_UPDATE_INTERVAL_SECS")
         assert guild_settings.np_refresh_secs(_GUILD) == 4.0
+
+    async def test_slow_notice_is_the_bots_while_unset_and_none_when_off(
+        self, guild_cog: Any
+    ) -> None:
+        guild_settings = GuildSettings(guild_cog)
+        assert guild_settings.slow_notice_secs(_GUILD) == 6.0
+        config.set_override("PLAY_SLOW_NOTICE_SECS", 8.0)
+        assert guild_settings.slow_notice_secs(_GUILD) == 8.0  # read at the call
+        await guild_settings.write(_GUILD, GuildConfig(slow_notice_secs=20.0))
+        assert guild_settings.slow_notice_secs(_GUILD) == 20.0
+        await guild_settings.write(_GUILD, GuildConfig(slow_notice_secs=OFF_SECS))
+        assert guild_settings.slow_notice_secs(_GUILD) is None
+        await guild_settings.reset(_GUILD, ConfigField.SLOW_NOTICE)
+        assert guild_settings.slow_notice_secs(_GUILD) == 8.0
+
+    async def test_off_survives_every_read_back(
+        self, guild_cog: Any, fake_redis: aioredis.Redis
+    ) -> None:
+        """OFF_SECS is 0.0, which is falsy: a truthiness test anywhere between the
+        write and the accessor would read a server's `off` as unset and post the
+        notice at the bot's delay."""
+        await GuildSettings(guild_cog).write(
+            _GUILD, GuildConfig(slow_notice_secs=OFF_SECS)
+        )
+        stored = await _guild_store(fake_redis).read_config()
+        assert stored is not None and stored.slow_notice_secs == OFF_SECS
+
+        hydrated = GuildSettings(guild_cog)
+        assert await hydrated.hydrate([_GUILD]) == set()
+        restored = GuildSettings(guild_cog)
+        with restored.reading() as started:
+            restored.seed(_GUILD, stored, started=started)
+        for read_back in (hydrated, restored):
+            peeked = read_back.peek(_GUILD)
+            assert peeked is not None and peeked.slow_notice_secs == OFF_SECS
+            assert read_back.slow_notice_secs(_GUILD) is None
 
 
 class TestGuildSettingsWritePath:
@@ -2116,6 +2171,7 @@ class TestHotPathsNeverAwaitSettings:
             "idle_timeout_secs",
             "alone_timeout_secs",
             "np_refresh_secs",
+            "slow_notice_secs",
         ],
     )
     def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:

@@ -221,9 +221,11 @@ async def _resolve_and_place(
                 )
             )
         else:
+            delay = cog.guild_settings.slow_notice_secs(req.guild_id)
             await stack.enter_async_context(
                 slow_resolve_notice(
                     ctx,
+                    delay=delay,
                     query=req.query,
                     debug_suffix=cog.debug_suffix(ctx),
                     dropped=req.dropped,
