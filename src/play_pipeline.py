@@ -822,7 +822,7 @@ async def interject_flow(
                     source,
                     placement_note="Interrupts the current song once it's queued.",
                     debug_suffix=cog.debug_suffix(ctx),
-                    dropped=req.dropped,
+                    request_settled=req.settled,
                 )
             )
         else:
@@ -831,7 +831,7 @@ async def interject_flow(
                     ctx,
                     query=req.query,
                     debug_suffix=cog.debug_suffix(ctx),
-                    dropped=req.dropped,
+                    request_settled=req.settled,
                 )
             )
         qobj, follow_on = await _resolve_interjection_source(

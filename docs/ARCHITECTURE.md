@@ -741,7 +741,7 @@ On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases n
 
 #### Saying so while it waits
 
-`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the song lands or the request is dropped (see [Queue progress card](#queue-progress-card)). It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
+`slow_resolve_notice` posts once a request outlives `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) and deletes the message when the request settles — `place()` returns, or the request is dropped (see [Queue progress card](#queue-progress-card)). It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
 
 No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
 
@@ -946,9 +946,11 @@ is opt-in per guild and off by default.
 
 ### Queue progress card
 
-A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card in the channel saying how far it has got (`src/queue_progress.py`). It is deleted the moment the enqueue lands, or the moment `-stop`, `-clear`, `-remove` or a teardown drops the request.
+A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card in the channel saying how far it has got (`src/queue_progress.py`). It is deleted the moment the request settles: when `place()` returns, before the confirmation is sent, or when `-stop`, `-clear`, `-remove` or a teardown drops the request.
 
-**A drop is heard mid-resolve.** Those commands stamp `PlayRequest.dropped_by`, and `place()` reads the stamp only once the resolve returns — about 90 s after the stamp for a 5,547-track playlist. So the stamp also sets `PlayRequest.dropped`, an `asyncio.Event` handed to the card and to the slow-resolve notice, and `retire_player` sets it for every unplaced request on the player it retires (a kick or the alone-watchdog calls no command). The message comes down at once; the resolve itself runs to completion and its result is discarded at `place()`, which is where the "dropped" reply is sent.
+**A drop is heard mid-resolve.** Those commands stamp `PlayRequest.dropped_by`, and `place()` reads the stamp only once the resolve returns — about 90 s after the stamp for a 5,547-track playlist. So the stamp also sets `PlayRequest.settled`, an `asyncio.Event` handed to the card and to the slow-resolve notice, and `retire_player` sets it for every unplaced request on the player it retires (a kick or the alone-watchdog calls no command). The message comes down at once; the resolve itself runs to completion and its result is discarded at `place()`, which is where the "dropped" reply is sent.
+
+**So is the end of the placement.** `place()` sets the same event on its way out, placed, refused or stalled, so neither message waits for the command to return. Everything after the put is the reply, and its sends and reactions are Discord round trips that can outlast the delay: on a cold start a playlist queued in 1.7 s and Discord held the confirmation's 👍 reaction for 2.0 s, which is long enough for a card waiting on the return to come up at 2.5 s, under a confirmation already posted. The interjection route still retracts after the interrupt, because `interject()` runs inside `place()`'s body.
 
 **The wait is in the resolve, not in the enqueue.** Measured on a YouTube Mix whose walk yielded 1,671 entries — 492 distinct videos, see [The playlist cache](#the-playlist-cache): 28.98 s of a 29.60 s command is `queue_source`, and the insert is 0.01 s. A bar counting songs added to the queue would sit at 0 for 29 seconds and then jump to 100 % in one frame, which is worse than no bar. So the card reports the resolve, and its numbers come from the source walking its own pages.
 
