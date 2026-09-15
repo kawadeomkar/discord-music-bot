@@ -627,7 +627,9 @@ class TestReplies:
         await _invoke(cog, ctx, "debug reset")
         assert _text(ctx) == (
             "**Debug footer** here is back to the bot's default, which is **on** "
-            f"right now. It is saved for this server. Changed by {MENTION}."
+            "right now. While it is on, every embed here — including the live Now "
+            "Playing card — shows the bot process's load to anyone who can read the "
+            f"channel. It is saved for this server. Changed by {MENTION}."
         )
         assert cog.debug_settings.enabled(GUILD) is True
 

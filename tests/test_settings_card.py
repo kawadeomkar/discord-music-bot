@@ -438,6 +438,15 @@ class TestReplies:
             "by @a."
         )
 
+    @pytest.mark.parametrize("default", [True, False])
+    def test_a_debug_reset_discloses_only_when_it_turns_the_footer_on(
+        self, default: bool
+    ) -> None:
+        text = card.reset_reply(
+            _spec("debug"), default, persisted=True, mention="@a"
+        ).description
+        assert ("anyone who can read the channel" in (text or "")) is default
+
     def test_a_refusal_carries_the_reason_for_the_side_missed(self) -> None:
         spec = _spec("heartbeat", SettingScope.BOT)
         result = parse_value(spec, "1s")

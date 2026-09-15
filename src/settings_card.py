@@ -337,6 +337,9 @@ def reset_reply(
         )
     else:
         text = f"**{spec.label}** is back to the default, **{shown}**."
+    if spec.field == ConfigField.DEBUG_MODE and default is True:
+        # A reset can turn the footer on, so it says what that publishes too.
+        text += f" {_DEBUG_DISCLOSURE}"
     text += f" {_SAVED if persisted else _NOT_SAVED} {_changed_by(mention)}"
     return notice_embed(text, CHANGE_COLOR)
 
