@@ -728,7 +728,7 @@ class GuildRedisStore:
         start_offset: float,
     ) -> Pipeline:
         """The state and snapshot legs every song start writes, in one MULTI;
-        the caller adds its queue leg and executes. `now_playing` rides the same
+        the caller adds its queue leg, then that key's EXPIRE, and executes. `now_playing` rides the same
         transaction, so a crash can never leave state pointing at song B while
         the snapshot shows song A."""
         mapping = self._now_playing_state_mapping(
@@ -764,6 +764,9 @@ class GuildRedisStore:
             current, play_start_epoch, now_playing, start_offset
         )
         pipe.lpop(self.queue_key())
+        # A guild playing a long queue writes nothing else to this key, and the
+        # state key it recovers alongside is re-armed every heartbeat.
+        pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
         return True
 
@@ -802,6 +805,7 @@ class GuildRedisStore:
         pipe = self._start_song_pipeline(
             current, play_start_epoch, now_playing, start_offset
         )
+        pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
         return True
 
