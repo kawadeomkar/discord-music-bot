@@ -13,7 +13,6 @@ from src import settings_card as card
 from src.guild_state import ConfigField, ConfigFieldName, GuildConfig, is_config_field
 from src.play_placement import check_voice_permissions
 from src.settings import (
-    SETTINGS,
     BotSettings,
     Refusal,
     RefusalReason,
@@ -150,13 +149,7 @@ def _bot_settings(cog: MusicBot) -> Optional[BotSettings]:
 
 def _bot_card(cog: MusicBot) -> discord.Embed:
     bot_settings = _bot_settings(cog)
-    unsaved = frozenset(
-        spec.key
-        for spec in SETTINGS
-        if bot_settings is not None
-        and spec.scope is SettingScope.BOT
-        and not bot_settings.is_persisted(spec)
-    )
+    unsaved = bot_settings.unsaved() if bot_settings is not None else frozenset()
     return card.bot_card(
         rows=card.bot_rows(
             host_debug_default=cog.debug_settings.host_default,

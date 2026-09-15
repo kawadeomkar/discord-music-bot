@@ -13,6 +13,7 @@ from src.config import (
 from src import settings_card
 from src.guild_state import GuildConfig
 from src.redis_client import GuildRedisStore
+from src.settings import BotSettings
 from src.util import is_operator, notice_embed
 
 if TYPE_CHECKING:
@@ -124,6 +125,8 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
         (using_default_postgres_password() and archive_enabled) if operator else None
     )
     settings = cog.guild_settings
+    # MusicBotApp's, built in setup_hook; absent on a bot that never ran it.
+    bot_settings = getattr(cog.bot, "bot_settings", None)
     rows = (
         settings_card.server_rows(
             settings.peek(guild_id),
@@ -154,4 +157,7 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
         debug_suffix=cog.debug_suffix(ctx, host_metrics=operator),
         settings=tuple(rows),
         settings_read=guild_id is None or settings.is_complete(guild_id),
+        bot_unsaved=bot_settings.unsaved()
+        if isinstance(bot_settings, BotSettings)
+        else frozenset(),
     )

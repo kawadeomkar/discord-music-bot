@@ -464,18 +464,28 @@ def redact_url(raw: str, *, hide_host: bool = False) -> str:
         return "unparseable"
 
 
-def _render_knob(knob: config.FloatKnob | config.IntKnob) -> str:
+def _render_knob(
+    knob: config.FloatKnob | config.IntKnob, *, unsaved: frozenset[str]
+) -> str:
     """`5s (bot owner; env 3s)`: the value and source label the -settings bot
     card shows, so the operator's two views of a knob agree."""
     spec = next(spec for spec in SETTINGS if spec.attr == knob)
-    shown = bot_shown(spec, host_debug_default=False, debug_default_override=None)
+    shown = bot_shown(
+        spec,
+        host_debug_default=False,
+        debug_default_override=None,
+        persisted=spec.key not in unsaved,
+    )
     return f"{format_value(spec, shown.value)} ({shown.source})"
 
 
-def render_config_value(var: _ConfigVar) -> str:
-    """One allowlist row's value, redacted per its kind."""
+def render_config_value(
+    var: _ConfigVar, *, unsaved: frozenset[str] = frozenset()
+) -> str:
+    """One allowlist row's value, redacted per its kind. `unsaved` holds the bot
+    setting keys whose last write or reset did not reach Redis."""
     if var.knob is not None:
-        return _render_knob(var.knob)
+        return _render_knob(var.knob, unsaved=unsaved)
     raw = os.environ.get(var.name)
     if var.kind is _ConfigKind.SECRET:
         # Presence only: this block has to stay safe to screenshot into an issue.
@@ -488,10 +498,11 @@ def render_config_value(var: _ConfigVar) -> str:
     return raw.strip()
 
 
-def config_lines() -> list[str]:
+def config_lines(*, unsaved: frozenset[str] = frozenset()) -> list[str]:
     width = max(len(var.name) for var in _CONFIG_ALLOWLIST) + 2
     return [
-        f"{var.name:<{width}}{render_config_value(var)}" for var in _CONFIG_ALLOWLIST
+        f"{var.name:<{width}}{render_config_value(var, unsaved=unsaved)}"
+        for var in _CONFIG_ALLOWLIST
     ]
 
 
@@ -534,6 +545,9 @@ class DebugInputs:
     # value may be missing from it.
     settings: tuple[tuple[SettingSpec, Shown], ...] = ()
     settings_read: bool = True
+    # The bot settings whose last write or reset did not reach Redis, by key, so
+    # the Config block marks them as -settings bot does.
+    bot_unsaved: frozenset[str] = frozenset()
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
@@ -1609,7 +1623,9 @@ def instant_blocks(
     blocks: dict[str, list[str]] = {}
     guild = ctx.guild
     if inputs.operator:
-        blocks["Config"] = _safe_block("config", config_lines)
+        blocks["Config"] = _safe_block(
+            "config", lambda: config_lines(unsaved=inputs.bot_unsaved)
+        )
         blocks["Discord"] = _safe_block(
             "discord", lambda: discord_lines(ctx.bot, players=inputs.players)
         )

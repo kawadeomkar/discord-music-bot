@@ -25,7 +25,7 @@ from src.commands import debug as debug_cmd
 from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
-from src.settings import SETTINGS, SettingScope
+from src.settings import SETTINGS, BotSettings, SettingScope
 from src.musicbot import MusicBot as MusicBotCog
 from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, cancel_task, spawn_background
 from src.guild_queue import QueueObject
@@ -667,6 +667,27 @@ class TestTheSettingsLine:
         embed = cast(discord.Embed, call.kwargs["embeds"][0])
         server = next(f for f in embed.fields if f.name == "This server")
         assert "settings     volume 50% (1 changed)" in (server.value or "")
+
+    async def test_an_unsaved_bot_setting_is_marked_in_the_config_block(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The label -settings bot shows: a write that did not reach Redis is gone
+        at the next start, and the Config block must not show it as the owner's."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.voice_client = None
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        bot_settings = BotSettings(cog.bot, redis=None, ignore_stored=False)
+        cast(Any, cog.bot).bot_settings = bot_settings
+        heartbeat = next(
+            s for s in SETTINGS if s.key == "heartbeat" and s.scope is SettingScope.BOT
+        )
+        await bot_settings.write(heartbeat, 5.0)
+
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        blocks = debug.instant_blocks(mock_ctx, inputs, source="x")
+
+        row = next(line for line in blocks["Config"] if "HEARTBEAT_INTERVAL" in line)
+        assert row.endswith("5s (not saved)")
 
     async def test_a_non_operator_sees_this_servers_settings_and_none_of_the_bots(
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock

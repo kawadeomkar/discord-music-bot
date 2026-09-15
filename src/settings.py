@@ -1547,6 +1547,12 @@ class BotSettings:
         """False while the setting's last write or reset had not reached Redis."""
         return spec.attr not in self._unpersisted
 
+    def unsaved(self) -> frozenset[str]:
+        """The keys of the settings whose last write or reset had not reached Redis."""
+        return frozenset(
+            spec.key for spec in _STORED_BOT_SPECS if spec.attr in self._unpersisted
+        )
+
     async def _store_io(
         self, call: Callable[[BotConfigStore], Awaitable[bool]]
     ) -> bool:
