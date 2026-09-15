@@ -33,6 +33,7 @@ from src.commands import ping as ping_cmd
 from src.commands import play as play_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
+from src.commands import replay as replay_cmd
 from src.commands import resume as resume_cmd
 from src.commands import settings as settings_cmd
 from src.commands import shuffle as shuffle_cmd
@@ -83,6 +84,7 @@ from src.util import (
     cancel_task,
     notice_embed,
     record_span_error,
+    refund_cooldown,
     send_embed,
     spawn_background,
     trace_footer,
@@ -433,9 +435,10 @@ class MusicBot(commands.Cog):
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
             )
         elif isinstance(error, commands.CommandOnCooldown):
+            cmd = ctx.command.name if ctx.command else "command"
             await ctx.send(
                 embed=notice_embed(
-                    f"That was just run here — try again in {error.retry_after:.0f}s.",
+                    f"`{cmd}` is on cooldown — try again in {error.retry_after:.0f}s.",
                     discord.Color.orange(),
                 )
             )
@@ -463,6 +466,8 @@ class MusicBot(commands.Cog):
             queue_control=play_takes_the_queue(ctx, voice_client),
         )
         if msg:
+            # prepare() charges a cooldown before this hook runs; a refusal is not a use.
+            refund_cooldown(ctx)
             await ctx.send(embed=notice_embed(msg, discord.Color.red()))
             raise commands.CommandError(msg)
 
@@ -781,6 +786,42 @@ class MusicBot(commands.Cog):
             await resume_cmd.run(ctx, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
+
+    @commands.command(
+        name="replay",
+        aliases=["rp", "restart"],
+        brief="play the current song again from the beginning",
+        help=(
+            "Starts the song that is playing over from 0:00.\n\n"
+            "Nothing is dropped from the queue: the song plays again first, then "
+            "everything behind it follows in the same order, each one a song-length "
+            "further out. A **paused** song comes back playing, the way `-play` "
+            "does."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": ["-replay", "-rp"],
+            "note": (
+                "The interrupted play is recorded in `-history` at the point it "
+                "reached, the way a skipped song is; the replay is recorded "
+                "again when it ends. A song still at its beginning is left alone, "
+                "and a song queued with a `?t=` timestamp replays from `0:00` "
+                "rather than from its timestamp."
+            ),
+        },
+    )
+    @commands.before_invoke(validate_commands)
+    # One -replay per guild at a time, so two callers cannot both front-insert a
+    # copy. The cooldown bounds history churn — every replay writes an entry to a
+    # list LTRIMmed to HISTORY_CACHE_LIMIT.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @commands.cooldown(1, 5.0, commands.BucketType.guild)
+    @_tracer.start_as_current_span("bot.replay")
+    async def replay(self, ctx: commands.Context) -> None:
+        try:
+            await replay_cmd.run(ctx, mp=self.get_mp(ctx))
+        except Exception as e:
+            await self._command_error(ctx, e, title="Failed to replay song")
 
     @commands.command(
         name="shuffle",

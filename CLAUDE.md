@@ -296,7 +296,9 @@ src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
 ├── musicbot.py       # MusicBot cog — command REGISTRATION and one try/except each;
 │                     # per-guild player registry (mps), the discord.py hooks, crash-recovery entry
-├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP host, ETA, interject
+├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch (ensure_prefetch), gate,
+│                     # NP host, ETA, interject, the hooks -replay drives (hand_over_to_replay),
+│                     # and still_live, the one liveness test both interrupts use
 ├── play_placement.py # -play's flag grammar, its voice gate, the two bounds on the resolve
 │                     # (ResolveSlot's deadline on the WAIT for a slot, and slow_resolve_notice
 │                     # saying so past it), and PlayRegistry: the per-guild
@@ -718,10 +720,10 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `bot:{application_id}:config` | hash | **none, ever (PERSISTed)** | the operator's bot-wide overrides (`BotConfig`): one field per `-settings bot` knob, named as its env var in lower case, absent meaning "run on the environment value". Written only by `BotSettings.write`/`write_reset` (`-settings bot <setting> <value>`/`reset`), applied at startup by `BotSettings.hydrate`, never read while `BOT_SETTINGS_OVERRIDES=ignore`. Keyed by application so a dev and a prod bot sharing one Redis cannot retune each other. `debug-default` is never stored. `just bot-settings` lists and deletes it without chat |
 | `ytdl:source:{query}` | string | 24h | search → {webpage_url, title, duration, uploader, thumbnail, cached_at}. The query is case-folded, EXCEPT for a URL — YouTube video ids are case-sensitive and two would share an entry. Past `_YT_SOURCE_FRESH_SECS` (1h) a hit is served as-is and a SEARCH is refreshed behind the reply (`_revalidate_source`, one flat POST); a link is not, since what ages is the ranking a search resolved through. An entry with no `cached_at` is from the build before the stamp and reads as fresh — it carries that build's 1h TTL |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata, plus a `traceparent` naming the extraction that minted the URL — the only record of where a serving URL came from, and what the playback span links back to — and `probed_at` when the verdict was PLAYABLE: inside `_PROBE_REUSE_SECS` (10s) the playback loop reuses that verdict instead of re-probing a URL the resolve just confirmed. An UNCONFIRMED entry is never stamped |
-| `ytdl:playlist:v2:{list id}` | string | 15m | a YouTube playlist's kept entries, in order, as the five identity fields a queue entry needs. Keyed on the `list=` id, so the playlist page, a watch link carrying `&index=`, and a `&t=` copy share one entry. Entries yt-dlp could not describe are dropped BEFORE the write, so a hit cannot resurrect them; an empty result is not written at all. TTL'd, so eviction-safe |
+| `ytdl:playlist:v3:{list id}` | string | 15m | a YouTube playlist's kept entries, in order, as the five identity fields a queue entry needs, beside the playlist's `title` and its `unavailable` count. Keyed on the `list=` id, so the playlist page, a watch link carrying `&index=`, and a `&t=` copy share one entry. Entries yt-dlp could not describe — null, id-less, or id-only (a private or deleted video: no title and no duration) — are dropped and counted BEFORE the write, so a hit cannot resurrect them; an empty result is not written at all. TTL'd, so eviction-safe |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
-| `spotify:{track,artist,album}:{id}`, `spotify:playlist:v2:{id}` | string | 24h/24h/24h, 1h | cached lookups. The playlist key is versioned: following `next` changed the cached VALUE, so an unversioned key would have kept answering 100 tracks for an hour after deploy |
+| `spotify:{track,artist,album}:{id}`, `spotify:playlist:v3:{id}` | string | 24h/24h/24h, 1h | cached lookups. A playlist entry is a dict of the kept titles plus the playlist's name, total length and unavailable-item count, and only a complete walk writes one. The key is versioned by that VALUE's shape: under the 1h TTL an unversioned key would answer a deploy that changes it with the previous build's entries |
 | `lock:guild:{id}:recovery` | string | 60s | SET NX EX recovery lock, one restore per guild at a time. The value is a per-acquisition random token, and release is a WATCH/MULTI compare-and-delete — an unconditional DEL would let a holder whose lock expired mid-recovery delete its successor's |
 
 Postgres holds two tables — `play_history`, and `play_history_rejected` (rows the server
@@ -946,7 +948,7 @@ per-tick-varying footer would edit the board until its deadline (which is why th
 suffix omits elapsed-ms).
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
-10-embed cap; worst case here is 3), then `_adopt_np_host_if_current` makes that message
+10-embed cap; worst case here is 4, a playlist card under its unavailable-songs notice), then `_adopt_np_host_if_current` makes that message
 the new host and retires the previous one (dedicated NP message → deleted; command
 response → strip-edited back to its own embeds). Attaching at send time makes response +
 block one atomic message, so the bar is never momentarily buried. Song end: host is
@@ -1105,7 +1107,7 @@ Per-guild synchronization primitives and what they protect:
 | `history:outbox` consumer group (Redis) | replaced the `history:drainer` lease. Not mutual exclusion — `XREADGROUP >` gives two drainers **disjoint** entries and `XACK` settles by ID, so a second drainer duplicates work instead of destroying plays it never inserted |
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
-| claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject). Every write of a new task goes through `_ensure_prefetch()`, which never starts one over a task already in the slot: loop() settles only the task it reads, so a second one's claim drifts `_cursor` for good |
+| claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject vs `-replay`). Every write of a new task goes through `ensure_prefetch()`, which never starts one over a task already in the slot: loop() settles only the task it reads, so a second one's claim drifts `_cursor` for good |
 
 The dequeue commit and the start transaction's server-side LPOP share ONE mutex hold,
 via `GuildQueue.commit_dequeue()` — the async context manager the playback loop wraps

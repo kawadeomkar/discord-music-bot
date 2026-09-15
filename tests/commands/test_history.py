@@ -169,6 +169,7 @@ class TestHistoryCommand:
             "analytics",
             "debug",
             "resume",
+            "replay",
             "shuffle",
             "clear",
             "remove",
@@ -186,8 +187,10 @@ class TestHistoryCommand:
         two racing on a disconnected bot both read `voice_client is None`, so
         validate_commands' "already being used in channel X" check cannot fire for
         either — both join, and the second MOVES the bot to its own author's channel.
+        `-replay` for a fifth: two racing callers would each front-insert a replay,
+        so the song plays three times.
 
-        `-shuffle`/`-clear`/`-remove` for a fifth: all three park on the queue's
+        `-shuffle`/`-clear`/`-remove` for a sixth: all three park on the queue's
         bulk mutex, which the playback loop holds across the start transaction. A
         Redis that stalls there wedges them, and every repeat while wedged parks
         another coroutine holding an OTel span `cog_after_invoke` never closes —
