@@ -29,6 +29,7 @@ from src.guild_queue import (
     RemoveOutcome,
     ShuffleOutcome,
     is_persisted,
+    is_replay_of,
     item_label,
     remove_matcher,
 )
@@ -175,14 +176,17 @@ class InterjectOutcome:
     confirmation wording."""
 
     interrupted_title: str
-    # None → no resume entry (the interrupted song was nearly finished, or had no
-    # webpage_url to rebuild from).
+    # None → no resume entry (the interrupted song was nearly finished, had no
+    # webpage_url to rebuild from, or a -replay copy of it is next).
     resume_position: Optional[int]
     was_paused: bool  # the OBSERVED state when it was interrupted
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
     # `--now` restores what it interrupted while plain -play brings it back
     # playing. Wording keys off this.
     returns_paused: bool = False
+    # A -replay copy of the interrupted song was next: it plays after this from
+    # 0:00, and resume_position is None.
+    replay_pending: bool = False
 
     @property
     def resume_position_str(self) -> str:
@@ -343,6 +347,8 @@ class MusicPlayer:
         "_pause_debounce_task",
         "_skip_history_for",
         "_pending_resume_tail",
+        "_retire_np_for",
+        "_replay_of",
         "_ended_song",
         "_last_stream_error",
     )
@@ -388,6 +394,8 @@ class MusicPlayer:
     _pause_debounce_task: Optional[asyncio.Task]
     _skip_history_for: Optional[YTDL]
     _pending_resume_tail: Optional[QueueObject]
+    _retire_np_for: Optional[YTDL]
+    _replay_of: Optional[trace.SpanContext]
     _ended_song: Optional[YTDL]
     _last_stream_error: Optional[StreamFailure]
 
@@ -459,7 +467,7 @@ class MusicPlayer:
         # Set by whoever calls vc.stop() on the live song, cleared at each vc.play().
         # Zero frames alone cannot tell a stream that never opened from one we stopped
         # before its first frame; this is the half that says which. Also a liveness
-        # term: see _still_live().
+        # term: see still_live().
         self._stopped_deliberately = False
         # The gate stays shut until a command establishes a voice connection, so a
         # player built by a command that never connects cannot walk the queue and
@@ -487,6 +495,12 @@ class MusicPlayer:
         # iteration end; set and cleared wherever _skip_history_for is.
         self._skip_history_for: Optional[YTDL] = None
         self._pending_resume_tail: Optional[QueueObject] = None
+        # The song whose NP card the loop retires instead of finalizing. An identity,
+        # like _skip_history_for, so a stale marker cannot retire another song's card.
+        self._retire_np_for: Optional[YTDL] = None
+        # The trace of the play a -replay stopped, linked from the replay's own
+        # trace when that starts: one song is one trace, and a replay is two.
+        self._replay_of: Optional[trace.SpanContext] = None
         # The song whose playback ended but whose history row is not written yet;
         # keeps the play claimable across the prefetch await — see
         # claim_current_song_for_history.
@@ -554,6 +568,10 @@ class MusicPlayer:
         the player outlived its voice client (an eject on_voice_state_update never
         saw), so its legs and gate are untrustworthy: rebuild, don't reuse."""
         return self.current_song is None and not self._playback_gate.is_set()
+
+    @property
+    def guild_id(self) -> int:
+        return self._guild.id
 
     @property
     def retired(self) -> bool:
@@ -825,7 +843,8 @@ class MusicPlayer:
         if not song.produced_audio:
             # ffmpeg exited without a frame: nobody heard it.
             return None
-        # Captured before cleanup()'s retire_np_host_on_stop() disposes of it.
+        # Captured before cleanup()'s retire_np_host_on_stop() disposes of it: the
+        # history row names this message.
         host = self._np_host_message
         entry = HistoryEntry.from_song(
             song,
@@ -1150,7 +1169,7 @@ class MusicPlayer:
             return "There must be at least 4 songs to shuffle the queue"
         # The neutralized prefetch took the resolve of the next song with it.
         if self.current_song is not None:
-            self._ensure_prefetch()
+            self.ensure_prefetch()
         return "Shuffled!"
 
     async def queue_remove(self, needle: str) -> RemoveOutcome:
@@ -1278,7 +1297,9 @@ class MusicPlayer:
         channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
         duration = fmt_duration(item.duration) if item.duration is not None else "?:??"
         detail = [f"Channel: {channel}", f"Duration: `{duration}`"]
-        if item.is_resume and item.ts:
+        if isinstance(item, QueueObject) and item.is_replay:
+            detail.append("🔁 Replays from `0:00`")
+        elif item.is_resume and item.ts:
             detail.append(f"⏮ Resumes at `{fmt_duration(item.ts)}`")
         elif item.ts:
             detail.append(f"Starts at `{item.ts}s`")
@@ -1652,7 +1673,7 @@ class MusicPlayer:
         current = self.current_song
         # Before the neutralize as well as after it: the neutralize destroys the
         # next song's resolved source, and a song already gone needs neither.
-        if current is None or not self._still_live(current):
+        if current is None or not self.still_live(current):
             return None
         span = trace.get_current_span()
         span.set_attribute("discord.guild_id", str(self._guild.id))
@@ -1664,13 +1685,16 @@ class MusicPlayer:
 
         # Re-check after those awaits (a cancel can block up to yt-dlp's socket
         # timeout): a song no longer live gets no resume tail.
-        if not self._still_live(current):
+        if not self.still_live(current):
             return None
 
         was_paused = vc.is_paused()
         position = int(current.position_secs)
         resume: Optional[QueueObject] = None
-        if current.webpage_url:
+        # A -replay copy of this song is next, so it already plays again after the
+        # interjection; a resume tail ahead of it would play the song a third time.
+        replay_pending = is_replay_of(self.queue.peek_next(), current.webpage_url)
+        if current.webpage_url and not replay_pending:
             # On the RAW position: the EOF cap below would mask "almost over".
             near_end = (
                 current.duration_secs > 0
@@ -1736,7 +1760,7 @@ class MusicPlayer:
                     self._pending_resume_tail = None
             raise
 
-        self._stop_if_live(current, vc)
+        self.stop_if_live(current, vc)
 
         # After the insert, so the tail just built is counted.
         span.set_attribute("interject.depth", self.queue.resume_tail_depth())
@@ -1750,12 +1774,13 @@ class MusicPlayer:
             resume_position=position if resume is not None else None,
             was_paused=was_paused,
             returns_paused=resume is not None and resume.start_paused,
+            replay_pending=replay_pending,
         )
 
     async def settle_prefetch(self) -> None:
-        """Take any in-flight prefetch off the board ahead of an interjection, so
-        the cancel of a prefetch pinned in the yt-dlp executor runs outside the
-        caller's place lock; interject()'s own call then finds an empty slot."""
+        """Take any in-flight prefetch off the board ahead of a front insert that
+        must play next (`--now`, `-replay`). Called before a place lock, the cancel of
+        a prefetch pinned in the yt-dlp executor runs outside it."""
         await self._neutralize_prefetch()
 
     async def _neutralize_prefetch(self) -> None:
@@ -1808,6 +1833,7 @@ class MusicPlayer:
             np_channel_id=song.np_channel_id,
             np_dedicated=song.np_dedicated,
             np_host_ref=song.np_host_ref,
+            is_replay=song.is_replay,
         )
         self.queue.requeue_front(rebuilt)
         # Handed off, not awaited: cleanup() kills the subprocess and blocks on
@@ -1902,11 +1928,11 @@ class MusicPlayer:
             )
             return None
 
-    def _still_live(self, song: YTDL) -> bool:
+    def still_live(self, song: YTDL) -> bool:
         """Is `song` still the song the loop is playing? Each term is a window a
         command can wake up in: play_next is set before current_song is cleared,
-        a -skip or --now may already have stopped it, and a finished loop task
-        is a torn-down player."""
+        a -skip, --now or -replay may already have stopped it, and a finished loop
+        task is a torn-down player. See docs/ARCHITECTURE.md#-replay."""
         return (
             self.current_song is song
             and not self.play_next.is_set()
@@ -1914,21 +1940,45 @@ class MusicPlayer:
             and not (self._player is not None and self._player.done())
         )
 
-    def _stop_if_live(self, song: YTDL, vc: discord.VoiceClient) -> bool:
+    def stop_if_live(self, song: YTDL, vc: discord.VoiceClient) -> bool:
         """Stop `song` only while it is still live: the front-inserted entries play
         next either way, and stopping a song the loop moved past kills the NEXT one.
         Records the stop, which the loop clears at its next vc.play()."""
-        if not self._still_live(song):
+        if not self.still_live(song):
             return False
         self.note_deliberate_stop()
         vc.stop()
         return True
 
+    def holds_prefetch(self, task: asyncio.Task[Optional[YTDL]]) -> bool:
+        """Whether `task` is the one in the prefetch slot, the task loop() settles."""
+        return self._prefetch_task is task
+
+    @property
+    def torn_down(self) -> bool:
+        """Retired, or the playback loop has exited."""
+        return self._retired or (self._player is not None and self._player.done())
+
+    @property
+    def stopped_deliberately(self) -> bool:
+        """Whether a command stopped the live song, as opposed to it ending."""
+        return self._stopped_deliberately
+
+    def hand_over_to_replay(self, song: YTDL) -> Optional[trace.SpanContext]:
+        """After -replay stops `song`: retire its NP card, and have the replay's trace
+        link back to this play's. Returns that play's span context, or None when it had
+        no trace."""
+        self._retire_np_for = song
+        if self._playback_span is None:
+            return None
+        self._replay_of = self._playback_span.get_span_context()
+        return self._replay_of
+
     def note_deliberate_stop(self) -> None:
         """Record that the live song is about to be stopped by us, not by ffmpeg.
         Call BEFORE vc.stop(); the loop clears it at each vc.play(). A stop we
         initiate reaches `after` as error=None — indistinguishable, on frame count
-        alone, from a dead stream — and _still_live() refuses a song stopped here."""
+        alone, from a dead stream — and still_live() refuses a song stopped here."""
         self._stopped_deliberately = True
 
     async def _drop_unplayable_stream_cache(self, song: YTDL) -> None:
@@ -2209,7 +2259,7 @@ class MusicPlayer:
         await cancel_task(self._pause_debounce_task)
         self._pause_debounce_task = None
 
-    def _ensure_prefetch(self) -> asyncio.Task[Optional[YTDL]]:
+    def ensure_prefetch(self) -> asyncio.Task[Optional[YTDL]]:
         """The one-ahead prefetch, started only into an EMPTY slot. Every slot write
         goes through here: a task started over a live one strands that one's claim
         and drifts _cursor for good, since loop() settles only the task it reads."""
@@ -2372,6 +2422,11 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
                     _link_stream_provenance(span, self.current_song)
+                    if self.current_song.is_replay:
+                        span.set_attribute("song.is_replay", True)
+                        if self._replay_of is not None:
+                            span.add_link(self._replay_of, {"link.kind": "replay_of"})
+                            self._replay_of = None
                     # Advances with the song, not the iteration: a failed resolve
                     # renders no card, so the previous song's tail keeps naming its
                     # own trace.
@@ -2546,8 +2601,8 @@ class MusicPlayer:
                     if song.is_resume and self._np_host_message is not None:
                         self._spawn_background(self._dispose_previous_np_card(song))
 
-                    # A -shuffle may already have filled the slot.
-                    self._ensure_prefetch()
+                    # A -replay or -shuffle may already have filled the slot.
+                    self.ensure_prefetch()
 
                     await self.play_next.wait()
 
@@ -2570,7 +2625,12 @@ class MusicPlayer:
 
                     # Capture the host, release it (the finished bar stays behind as
                     # a record), then fire one last edit so the bar shows its true
-                    # final state.
+                    # final state. A -replay plays this song again, so its bar is
+                    # retired instead; identity, cleared either way.
+                    retire_np = self._retire_np_for is song
+                    self._retire_np_for = None
+                    if retire_np:
+                        span.set_attribute("song.ended_by", "replay")
                     finished_host = self._np_host_message
                     finished_own = self._np_host_own_embeds
                     finished_dedicated = self._np_host_dedicated
@@ -2582,10 +2642,10 @@ class MusicPlayer:
                         str(finished_host.id) if finished_host is not None else "",
                     )
                     if finished_host is not None:
-                        if stream_failed:
-                            # This song delivered nothing, so dispose of the block
-                            # rather than finalize it to 100% above the failure
-                            # notice.
+                        if stream_failed or retire_np:
+                            # No 100% bar above a failure notice, and an
+                            # interrupted song's bar belongs to its replay's card:
+                            # dispose of the block rather than finalize it.
                             self._spawn_background(
                                 self._retire_np_host(
                                     finished_host, finished_own, finished_dedicated
@@ -2671,10 +2731,9 @@ class MusicPlayer:
                             HistoryEntry.from_song(
                                 song,
                                 guild_id=self._guild.id,
-                                # The host captured at song end, not
-                                # _np_host_message, which was nulled above. Both
-                                # ids come off that one message — never the home
-                                # channel, which commands reassign. 0 = nothing
+                                # The host captured at song end: _np_host_message was
+                                # nulled above, and a retired dedicated host is already
+                                # deleted. Both ids come off that message; 0 = nothing
                                 # hosted it.
                                 message_id=(
                                     finished_host.id if finished_host is not None else 0
@@ -2749,6 +2808,7 @@ class MusicPlayer:
                     # A tail left holding this slot would receive a LATER fragment's
                     # card ids and delete the wrong message.
                     self._pending_resume_tail = None
+                    self._retire_np_for = None
                     self._ended_song = None
                     self.current_song = None
                     self.play_message = None

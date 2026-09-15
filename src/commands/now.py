@@ -3,6 +3,7 @@
 import discord
 from discord.ext import commands
 
+from src.commands._common import NOTHING_PLAYING
 from src.musicplayer import MusicPlayer
 from src.util import notice_embed
 
@@ -29,8 +30,4 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
         # Crash-recovery window: a snapshot survived the restart, no bar yet.
         await ctx.send(embed=mp.play_message)
     else:
-        await ctx.send(
-            embed=notice_embed(
-                "No songs are currently playing.", discord.Color.orange()
-            )
-        )
+        await ctx.send(embed=notice_embed(NOTHING_PLAYING, discord.Color.orange()))

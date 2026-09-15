@@ -854,7 +854,12 @@ async def interject_flow(
             )
             return
 
-        if outcome.resume_position is None:
+        if outcome.replay_pending:
+            desc = (
+                f"**{outcome.interrupted_title}** was about to replay, so it plays "
+                "again from `0:00` after this."
+            )
+        elif outcome.resume_position is None:
             desc = f"**{outcome.interrupted_title}** was nearly finished and will not resume."
         elif outcome.returns_paused:
             # returns_paused, not was_paused: with resume_paused=False a paused
