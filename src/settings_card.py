@@ -47,8 +47,9 @@ _BOT_SPECS: Final = tuple(s for s in SETTINGS if s.scope is SettingScope.BOT)
 
 _CARD_INTRO: Final = (
     "Anyone can view these. Changing one needs Manage Server; volume can also be "
-    "changed by anyone in the bot's voice channel. The bot's operator can change "
-    "them too. To change one, run the command under it with a value from its range."
+    "changed by anyone in the bot's voice channel, or in any voice channel while "
+    "the bot isn't in one. The bot's operator can change them too. To change one, "
+    "run the command under it with a value from its range."
 )
 _SERVER_FOOTER: Final = (
     "-settings <setting> reset puts one back to its default · -settings <setting> "
@@ -277,7 +278,8 @@ def detail(
     parts += [_accepts(spec), f"Applies {spec.applies}"]
     if spec.field == ConfigField.VOLUME:
         parts.append(
-            "Can be changed with Manage Server, or by anyone in the bot's voice channel"
+            "Can be changed with Manage Server, by the bot's operator, or by anyone "
+            "in the bot's voice channel (any voice channel while it isn't in one)"
         )
     about = f"{spec.summary} {spec.more}" if spec.more else spec.summary
     text = f"**{spec.label}** ({_names(spec)}) — {about} " + " · ".join(parts)
@@ -456,7 +458,7 @@ NO_PERMISSION: Final = (
 NO_PERMISSION_VOLUME: Final = (
     "Changing the volume needs the **Manage Server** permission, or being in the "
     "bot's voice channel (any voice channel while it isn't in one). Join it and try "
-    "again, or use `-volume`."
+    "again."
 )
 OPERATOR_ONLY: Final = (
     "Bot-wide settings can only be changed by the bot's operator. Run `-settings` "

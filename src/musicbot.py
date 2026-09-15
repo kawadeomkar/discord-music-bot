@@ -1272,8 +1272,9 @@ class MusicBot(commands.Cog):
                 "-settings volume reset",
             ],
             "note": (
-                "Changing a setting needs Manage Server, or being in the bot's voice "
-                "channel for volume."
+                "Changing a setting needs Manage Server. Volume can also be changed "
+                "from the bot's voice channel, or from any voice channel while the "
+                "bot isn't in one. The bot's operator can change any of them."
             ),
         },
     )

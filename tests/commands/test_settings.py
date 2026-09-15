@@ -185,6 +185,8 @@ class TestVolumeTakesTheVoiceGateToo:
         _in_voice(settings_ctx, bot_channel=False)
         await _invoke(cog, settings_ctx, "volume 50")
         assert _text(settings_ctx) == card.NO_PERMISSION_VOLUME
+        # -volume runs the same voice gate, so pointing at it cannot help.
+        assert "-volume" not in _text(settings_ctx)
         _denied_by_the_operator_check(settings_ctx)
         assert await _stored(fake_redis_bot) == GuildConfig()
 
@@ -777,8 +779,8 @@ class TestCard:
         assert _text(settings_ctx) == (
             "**Volume** (`volume`; also `vol`) — Playback level. Current **100%** "
             "(default) · Default 100% · Allowed 0%–100% · Applies from the next song "
-            "· Can be changed with Manage Server, or by anyone in the bot's voice "
-            "channel."
+            "· Can be changed with Manage Server, by the bot's operator, or by anyone "
+            "in the bot's voice channel (any voice channel while it isn't in one)."
         )
 
 
