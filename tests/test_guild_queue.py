@@ -1610,6 +1610,12 @@ class TestRemoveMatcher:
             is RemoveMode.ORIGIN
         )
 
+    def test_a_spotify_uri_keeps_its_case(self) -> None:
+        """`-play spotify:track:<id>` queues that track, so its origin is a link
+        and the id in it is case-sensitive base62 like any other."""
+        item = self._song("https://yt.com/v=1", "spotify:track:4uLU6hMCjMI75M1A2tKUQC")
+        assert remove_matcher("spotify:track:4ulu6hmcjmi75m1a2tkuqc")(item) is None
+
     def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
         only thing it can be matched by, and the only place that link is."""

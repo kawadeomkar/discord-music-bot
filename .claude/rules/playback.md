@@ -42,8 +42,11 @@ play():
   │      • --now                     → interrupt, park a resume tail (resume_paused=True)
   │      • plain -play + PAUSED song → same flow, resume_paused=False ("-play means play")
   │      • --next                    → NOT here: it never interrupts, paused or not
-  ├─ parse_input (sources.py): single word → parse_url (youtube/spotify/soundcloud/
-  │        any dotted domain → URLSource.OTHER, handed raw to yt-dlp); else ytsearch
+  ├─ parse_input (sources.py): one token once Discord's wrappers are off → parse_url, a
+  │        linear, anchored link test (youtube/spotify/soundcloud; any other http(s)
+  │        host → URLSource.OTHER for yt-dlp; a Spotify link that names nothing
+  │        playable raises UnsupportedSpotifyLinkError before any join); else ytsearch.
+  │        is_link is the one link-or-text verdict. docs/ARCHITECTURE.md#source-resolution
   ├─ placement (Placement enum — the insert position, decided separately from
   │        cold_start, which also drives the analytics shortcut and the join dance):
   │      • disconnected              → COLD_FRONT

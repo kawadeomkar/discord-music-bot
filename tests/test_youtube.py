@@ -3340,6 +3340,19 @@ class TestSourceCacheKey:
         key = _source_cache_key("  https://yt.com/v=Ab  ")
         assert key == "ytdl:source:https://yt.com/v=Ab"
 
+    def test_a_scheme_less_link_keeps_its_case(self) -> None:
+        """What users paste. parse_url reads it as a link, so its key must too, or
+        two ids differing only in case share an entry."""
+        upper = _source_cache_key("youtu.be/aBcDeFgHiJk")
+        assert upper == "ytdl:source:youtu.be/aBcDeFgHiJk"
+        assert upper != _source_cache_key("youtu.be/AbCdEfGhIjK")
+
+    def test_a_search_holding_a_link_is_still_a_search(self) -> None:
+        """Words around a link are a search, which parse_input folds like any
+        other."""
+        key = _source_cache_key("ytsearch:https://youtu.be/aBcDeFgHiJk Live")
+        assert key == "ytdl:source:ytsearch:https://youtu.be/abcdefghijk live"
+
 
 class TestSourceCacheRevalidation:
     """A hit older than _YT_SOURCE_FRESH_SECS is served as-is and refreshed behind
@@ -3429,12 +3442,14 @@ class TestSourceCacheRevalidation:
         assert not youtube._SOURCE_REVALIDATIONS
         mock_extract.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "link", ["https://www.youtube.com/watch?v=oldOne", "youtu.be/oldOne12345"]
+    )
     async def test_a_stale_link_refreshes_nothing(
-        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, link: str
     ) -> None:
         """What ages is the ranking a SEARCH resolved through. A link's mapping is
         the link, and refreshing one would cost a full extraction to learn that."""
-        link = "https://www.youtube.com/watch?v=oldOne"
         await fake_redis.set(
             f"ytdl:source:{link}",
             orjson.dumps(
