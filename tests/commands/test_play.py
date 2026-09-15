@@ -44,7 +44,8 @@ from src.sources import (
     YTType,
 )
 from src.queue_progress import EnqueueProgress
-from src.youtube import YTDL, QueueObject
+from src.spotify import SpotifyPlaylist
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 from tests.helpers import (
     admit,
     command_callback,
@@ -59,6 +60,7 @@ from tests.helpers import (
     paused_vc,
     playing_vc,
     queue_object,
+    stub_yt_playlist,
 )
 
 # Captured before any test replaces the module attribute: the tests that want the
@@ -586,7 +588,7 @@ class TestPlayWhilePaused:
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
@@ -1527,6 +1529,37 @@ class TestNowFlag:
         assert "nearly finished" in embed.description
         assert "will not resume" in embed.description
 
+    async def test_a_pending_replay_is_what_the_reply_promises(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """No resume position here either, but "will not resume" would be false:
+        the song's replay plays after the interjection."""
+        from src.musicplayer import InterjectOutcome
+
+        live_mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Again",
+                resume_position=None,
+                was_paused=False,
+                replay_pending=True,
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        )
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "plays again from `0:00` after this" in embed.description
+        assert "will not resume" not in embed.description
+
     async def test_interjecting_over_an_interjection_promises_a_return(
         self,
         music_bot: MusicBot,
@@ -1631,7 +1664,7 @@ class TestNowFlag:
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(
                 music_bot,
@@ -1666,7 +1699,7 @@ class TestNowFlag:
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(
                 music_bot, mock_ctx, url=f"--now {url}"
@@ -1690,7 +1723,15 @@ class TestNowFlag:
         mock_ctx.voice_client = live_vc
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=SpotifyPlaylist(
+                name=None,
+                titles=["First Song", "Second"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
+        )
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
 
         with patch(
@@ -1735,7 +1776,7 @@ class TestNowFlag:
 
         with patch(
             "src.play_pipeline.YTDL.yt_playlist",
-            new=AsyncMock(return_value=[first, second]),
+            new=stub_yt_playlist([first, second]),
         ):
             await command_callback(MusicBot.play)(
                 music_bot, mock_ctx, url=f"--now {url}"
@@ -1997,7 +2038,7 @@ class TestPlacementInsertsAndConfirmations:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
             patch.object(
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
             ),
@@ -2046,7 +2087,7 @@ class TestPlacementInsertsAndConfirmations:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
             patch.object(
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
             ),
@@ -2089,7 +2130,7 @@ class TestPlacementInsertsAndConfirmations:
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
@@ -4647,7 +4688,7 @@ class TestQueueProgressCard:
                     order.append("card retracted")
 
         card = _OrderedCard()
-        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+        with patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
 
         assert order.index("card entered") < order.index("hold released")
@@ -4697,7 +4738,7 @@ class TestQueueProgressCard:
         notes: dict[str, str] = {}
         for flag in ("", "--next"):
             card = _CardSpy()
-            with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+            with patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)):
                 await self._play(
                     music_bot, mock_ctx, f"{flag} {self._PLAYLIST}".strip(), card
                 )
@@ -4726,7 +4767,7 @@ class TestQueueProgressCard:
             patch("src.play_pipeline.enqueue_progress", new=card),
             patch(
                 "src.play_pipeline.YTDL.yt_playlist",
-                new=AsyncMock(return_value=[first]),
+                new=stub_yt_playlist([first]),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -4755,7 +4796,7 @@ class TestQueueProgressCard:
             self._warm(music_bot, mock_ctx)
         tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
         card = _CardSpy()
-        playlist = AsyncMock(return_value=tracks)
+        playlist = stub_yt_playlist(tracks)
 
         with patch.object(YTDL, "yt_playlist", new=playlist):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
@@ -4840,7 +4881,7 @@ class TestQueueProgressCard:
             patch("src.play_pipeline.enqueue_progress", new=card),
             patch(
                 "src.play_pipeline.YTDL.yt_playlist",
-                new=AsyncMock(return_value=[first]),
+                new=stub_yt_playlist([first]),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -4848,6 +4889,123 @@ class TestQueueProgressCard:
             )
 
         assert order == ["interrupted", "card retracted"]
+
+    async def test_a_reply_slower_than_the_delay_brings_no_card_up(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The real card, not the spy. A playlist queued inside the delay whose
+        reply then outlasted it — on a cold start Discord held the reaction for
+        2.0s — put its card up under the confirmation it should never share a
+        channel with."""
+        self._warm(music_bot, mock_ctx)
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+        message.delete = AsyncMock()
+        mock_ctx.channel.send = AsyncMock(return_value=message)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+
+        async def _slow_reply(*_: Any, **__: Any) -> None:
+            await asyncio.sleep(0.2)
+
+        mock_ctx.message.content = f"-play {self._PLAYLIST}"
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+            patch("src.queue_progress.QUEUE_PROGRESS_DELAY_SECS", 0.05),
+            patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_slow_reply)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=self._PLAYLIST
+            )
+
+        mock_ctx.channel.send.assert_not_awaited()
+
+    async def test_the_card_settles_before_the_confirmation_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._warm(music_bot, mock_ctx)
+        tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
+        card = _CardSpy()
+        seen: list[bool] = []
+
+        async def _reply(*_: Any, **__: Any) -> None:
+            seen.append(card.last_kwargs["request_settled"].is_set())
+
+        with (
+            patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_reply)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
+        ):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+
+        assert seen == [True]
+
+    async def test_the_notice_settles_before_the_confirmation_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The same `if`, the other message: a song found just inside the notice's
+        delay has the same reply after it."""
+        self._warm(music_bot, mock_ctx)
+        notice = MagicMock(return_value=contextlib.nullcontext())
+        qobj = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        seen: list[bool] = []
+
+        async def _reply(*_: Any, **__: Any) -> None:
+            seen.append(notice.call_args.kwargs["request_settled"].is_set())
+
+        mock_ctx.message.content = "-play https://yt.com/v=1"
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch("src.commands.play.slow_resolve_notice", new=notice),
+            patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_reply)),
+            patch.object(YTDL, "yt_source", new=AsyncMock(return_value=qobj)),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://yt.com/v=1"
+            )
+
+        assert seen == [True]
+
+    async def test_the_interjection_card_settles_between_the_interrupt_and_the_reply(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The second entry point. Still after interject(), which is the point of
+        this command, and no longer after the reply."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        seen: dict[str, bool] = {}
+
+        async def _interject(*_a: Any, **_k: Any) -> Any:
+            from src.musicplayer import InterjectOutcome
+
+            seen["interrupt"] = card.last_kwargs["request_settled"].is_set()
+            return InterjectOutcome(
+                interrupted_title="Original", resume_position=1, was_paused=False
+            )
+
+        async def _send(*_a: Any, **_k: Any) -> None:
+            seen["reply"] = card.last_kwargs["request_settled"].is_set()
+
+        live_mp.interject = AsyncMock(side_effect=_interject)
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch("src.play_pipeline.send_embed", new=AsyncMock(side_effect=_send)),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=stub_yt_playlist([first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+
+        assert seen == {"interrupt": False, "reply": True}
 
     async def test_the_interjection_leg_reports_progress_too(
         self,
@@ -4862,7 +5020,7 @@ class TestQueueProgressCard:
         mock_ctx.voice_client = live_vc
         card = _CardSpy()
         first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
-        playlist = AsyncMock(return_value=[first])
+        playlist = stub_yt_playlist([first])
 
         with (
             patch("src.play_pipeline.enqueue_progress", new=card),
@@ -4889,7 +5047,7 @@ class TestQueueProgressCard:
         card = _CardSpy()
         with (
             patch.object(MusicBot, "debug_suffix", return_value="trace=abc123"),
-            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
         assert card.last_kwargs["debug_suffix"] == "trace=abc123"
@@ -4902,7 +5060,7 @@ class TestQueueProgressCard:
         self._warm(music_bot, mock_ctx)
         tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
         card = _CardSpy()
-        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+        with patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
         assert card.calls[-1][1].playlist_url == self._PLAYLIST
 
@@ -4914,7 +5072,7 @@ class TestQueueProgressCard:
         tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
         card = _CardSpy()
 
-        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)):
+        with patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)):
             notice = await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
 
         assert (card.entered, card.exited) == (1, 1)
@@ -4954,9 +5112,9 @@ class TestQueueProgressCard:
         tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
         card = _CardSpy()
 
-        async def _dropped(*_: Any, **__: Any) -> list[QueueObject]:
+        async def _dropped(*_: Any, **__: Any) -> YoutubePlaylist:
             mp.queue.generation += 1
-            return tracks
+            return YoutubePlaylist(title=None, tracks=tracks, unavailable=0)
 
         with patch.object(YTDL, "yt_playlist", new=AsyncMock(side_effect=_dropped)):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
@@ -4973,14 +5131,14 @@ class TestQueueProgressCard:
         tracks = [QueueObject("https://yt.com/v=1", "One", mock_ctx.author)]
         card = _CardSpy()
 
-        async def _stopped(*_: Any, **__: Any) -> list[QueueObject]:
+        async def _stopped(*_: Any, **__: Any) -> YoutubePlaylist:
             music_bot._plays.inflight(mock_ctx.guild.id, "stop")
-            return tracks
+            return YoutubePlaylist(title=None, tracks=tracks, unavailable=0)
 
         with patch.object(YTDL, "yt_playlist", new=AsyncMock(side_effect=_stopped)):
             await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
 
-        assert card.last_kwargs["dropped"].is_set()
+        assert card.last_kwargs["request_settled"].is_set()
 
     async def test_a_drop_stamped_mid_resolve_reaches_the_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4994,7 +5152,7 @@ class TestQueueProgressCard:
         play_pipeline.queue_source = AsyncMock(side_effect=_stopped)
         notice = await self._play(music_bot, mock_ctx, "just a search", _CardSpy())
 
-        assert notice.call_args.kwargs["dropped"].is_set()
+        assert notice.call_args.kwargs["request_settled"].is_set()
 
     async def test_the_interjection_card_and_notice_hear_a_drop_too(
         self,
@@ -5009,9 +5167,9 @@ class TestQueueProgressCard:
         notice = MagicMock(return_value=contextlib.nullcontext())
         first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
 
-        async def _stopped_playlist(*_: Any, **__: Any) -> list[QueueObject]:
+        async def _stopped_playlist(*_: Any, **__: Any) -> YoutubePlaylist:
             music_bot._plays.inflight(mock_ctx.guild.id, "stop")
-            return [first]
+            return YoutubePlaylist(title=None, tracks=[first], unavailable=0)
 
         async def _stopped_track(*_: Any, **__: Any) -> QueueObject:
             music_bot._plays.inflight(mock_ctx.guild.id, "stop")
@@ -5040,8 +5198,8 @@ class TestQueueProgressCard:
                 music_bot, mock_ctx, url="--now https://yt.com/v=1"
             )
 
-        assert card.last_kwargs["dropped"].is_set()
-        assert notice.call_args.kwargs["dropped"].is_set()
+        assert card.last_kwargs["request_settled"].is_set()
+        assert notice.call_args.kwargs["request_settled"].is_set()
 
     async def test_the_card_is_taken_back_when_the_command_is_cancelled(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -5050,9 +5208,9 @@ class TestQueueProgressCard:
         gate = asyncio.Event()
         card = _CardSpy()
 
-        async def _hang(*_: Any, **__: Any) -> list[QueueObject]:
+        async def _hang(*_: Any, **__: Any) -> YoutubePlaylist:
             await gate.wait()
-            return []
+            return YoutubePlaylist(title=None, tracks=[], unavailable=0)
 
         with (
             no_typing("src.commands.play.background_typing"),
@@ -5091,7 +5249,7 @@ class TestQueueProgressCard:
             patch("src.play_pipeline.enqueue_progress", new=card),
             patch(
                 "src.play_pipeline.YTDL.yt_playlist",
-                new=AsyncMock(return_value=[first]),
+                new=stub_yt_playlist([first]),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -5134,11 +5292,17 @@ class TestQueueProgressCard:
         assert music_bot.spotify is not None
         seen: list[Any] = []
 
-        async def _playlist(_pid: str, *, on_progress: Any = None) -> list[str]:
+        async def _playlist(_pid: str, *, on_progress: Any = None) -> SpotifyPlaylist:
             seen.append(on_progress)
             if on_progress is not None:
                 on_progress(100, 250)
-            return ["One"]
+            return SpotifyPlaylist(
+                name=None,
+                titles=["One"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
 
         music_bot.spotify.playlist = AsyncMock(side_effect=_playlist)
         card = _CardSpy()
@@ -5169,10 +5333,16 @@ class TestQueueProgressCard:
         mock_ctx.voice_client = live_vc
         assert music_bot.spotify is not None
 
-        async def _playlist(_pid: str, *, on_progress: Any = None) -> list[str]:
+        async def _playlist(_pid: str, *, on_progress: Any = None) -> SpotifyPlaylist:
             if on_progress is not None:
                 on_progress(100, 250)
-            return ["One", "Two"]
+            return SpotifyPlaylist(
+                name=None,
+                titles=["One", "Two"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
 
         music_bot.spotify.playlist = AsyncMock(side_effect=_playlist)
         card = _CardSpy()

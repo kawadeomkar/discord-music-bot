@@ -161,6 +161,16 @@ def is_persisted(item: Optional[QueueItem]) -> bool:
     return item.persisted if isinstance(item, QueueObject) else True
 
 
+def is_replay_of(item: Optional[QueueItem], webpage_url: str) -> bool:
+    """Whether `item` is a -replay copy of the song at `webpage_url`."""
+    return (
+        isinstance(item, QueueObject)
+        and item.is_replay
+        and bool(webpage_url)
+        and item.webpage_url == webpage_url
+    )
+
+
 class GuildQueue:
     """Every queue operation the bot can perform. Mirror-touching methods degrade
     gracefully when the store is None or a store call fails (GuildRedisStore logs

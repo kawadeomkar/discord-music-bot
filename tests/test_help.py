@@ -284,6 +284,14 @@ class TestCommandHelp:
             note = (command.extras or {}).get("note")
             assert note is None or len(note) <= FIELD_LIMIT
 
+    def test_replay_ranks_below_skip_in_playback(self) -> None:
+        """CATEGORY_COMMANDS is ordered by how often a command is reached for, not
+        alphabetically — and a name reads plausibly at any index, so a reorder is
+        invisible. -replay plays one song again on request; -skip is reached for many
+        times per session."""
+        playback = CATEGORY_COMMANDS["Playback"]
+        assert playback.index("replay") > playback.index("skip")
+
 
 class TestErrors:
     async def test_unknown_command_sends_red_embed(
