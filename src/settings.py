@@ -1252,10 +1252,17 @@ _TOO_MUCH: Final = Refusal(
         "`-settings <setting> <value>`, e.g. `-settings volume 80`."
     ),
 )
-_RESET_WITHOUT_KEY: Final = Refusal(
-    reason=RefusalReason.RESET_WITHOUT_KEY,
-    text="Say which setting to reset, like `-settings volume reset`.",
-)
+# The example names a setting of the scope asked about.
+_RESET_WITHOUT_KEY: Final[dict[SettingScope, Refusal]] = {
+    SettingScope.SERVER: Refusal(
+        reason=RefusalReason.RESET_WITHOUT_KEY,
+        text="Say which setting to reset, like `-settings volume reset`.",
+    ),
+    SettingScope.BOT: Refusal(
+        reason=RefusalReason.RESET_WITHOUT_KEY,
+        text="Say which bot setting to reset, like `-settings bot heartbeat reset`.",
+    ),
+}
 
 
 def _undash(token: str) -> str:
@@ -1346,7 +1353,7 @@ def _parse_scoped(tokens: list[str], scope: SettingScope) -> SettingsRequest | R
     # `reset <setting>`: the one other word order accepted.
     if _is_reset_word(tokens[0]):
         if len(tokens) == 1:
-            return _RESET_WITHOUT_KEY
+            return _RESET_WITHOUT_KEY[scope]
         if len(tokens) > 2:
             return _TOO_MUCH
         spec = _lookup(_undash(tokens[1]), scope)

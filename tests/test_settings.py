@@ -8,6 +8,7 @@ import datetime
 import importlib.resources
 import logging
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -910,6 +911,20 @@ class TestParseSettingsArgs:
         result = _request(arg)
         assert isinstance(result, Refusal)
         assert result.reason is reason
+
+    @pytest.mark.parametrize("scope", list(SettingScope))
+    def test_a_reset_without_a_key_suggests_a_reset_of_its_own_scope(
+        self, scope: SettingScope
+    ) -> None:
+        """Copied as written, the example resets a setting of the scope the
+        operator or member asked about, never one of the other."""
+        result = _request("bot reset" if scope is SettingScope.BOT else "reset")
+        assert isinstance(result, Refusal)
+        example = re.search(r"`-settings (.+?)`", result.text)
+        assert example is not None
+        request = _request(example.group(1))
+        assert isinstance(request, SettingsRequest)
+        assert (request.action, request.scope) == (SettingsAction.RESET, scope)
 
     @pytest.mark.parametrize(
         ("arg", "key"), [("heartbeat 5", "heartbeat"), ("bot volume 50", "volume")]
