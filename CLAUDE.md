@@ -668,6 +668,12 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   200-entry LREMs that cost 1.6× the rebuild while holding one MULTI/EXEC, which stalls
   every guild, not just the one removing. A test pins the value (`≤ 18`) because the
   other tests size their input from the constant and move with it.
+- **A swapped-in item keeps the entry the list holds.** `requeue_front` may hand back a
+  claimed item's resolved or rebuilt form, which serializes differently from its entry.
+  `_listed` records the replaced entry, and `_mirror_entry()` serializes the item as it
+  for every byte-exact write: the rebuild, the LREM and `_claimed_blobs()`. Without it a
+  claimed swap hides from `_claimed_blobs()`, an LREM takes its entry instead of a
+  byte-identical twin's, and the song start's LPOP retires the next song's.
 - `remove()` takes a **predicate**, and `remove_matcher()` beside the class owns the
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
   casefolds — folding a link would let one Spotify playlist's base62 id match another's.

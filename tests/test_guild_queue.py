@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.guild_queue import (
+    QueueItem,
     _to_entry,
     _LREM_MAX_ENTRIES,
     _LREM_MAX_SHARE,
@@ -2357,6 +2358,142 @@ class TestRequeueFront:
         gq_no_redis.requeue_front(resolved)
         assert gq_no_redis.qsize() == 1
         assert gq_no_redis.get_nowait() is resolved
+
+
+def _restyled(item: QueueItem) -> QueueObject:
+    """What _neutralize_prefetch requeues for a flat playlist entry: the same ask,
+    with the metadata the stream extraction filled in."""
+    assert isinstance(item, QueueObject)
+    return replace(item, duration=201, uploader="Channel", thumbnail="https://i/hq.jpg")
+
+
+def _resolved(source: YTSource, requester: Any) -> QueueObject:
+    """What the prefetch requeues for a lazy search it had already resolved."""
+    return QueueObject(
+        "https://yt.com/v=resolved", "Resolved", requester, user_input=source.user_input
+    )
+
+
+class TestRequeueFrontSwap:
+    """requeue_front() can swap in an object that serializes differently from the
+    entry the list holds. The list keeps that entry, so every write that has to
+    match it byte for byte serializes the swapped-in item as the entry it replaced."""
+
+    @pytest.mark.parametrize("kind", ["lazy", "flat"])
+    async def test_removing_a_swapped_head_takes_the_lrem_path(
+        self,
+        kind: str,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        head: Any = (
+            YTSource(ytsearch="ytsearch:artist song", user_input="https://sp/p")
+            if kind == "lazy"
+            else _qobj(1, mock_author)
+        )
+        keeps = [_qobj(n, mock_author) for n in range(10, 17)]
+        await gq.put([head, *keeps])
+        claimed = gq.get_nowait()
+        swapped = _resolved(head, mock_author) if kind == "lazy" else _restyled(claimed)
+        assert _to_entry(swapped).to_redis() != _to_entry(claimed).to_redis()
+        gq.requeue_front(swapped)
+        calls = _spy_mirror_calls(store)
+
+        outcome = await gq.remove(remove_matcher(swapped.webpage_url))
+
+        assert outcome.removed == [swapped]
+        assert calls == ["remove_queue_entries"], "the LREM missed and rebuilt"
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_swapped_claim_still_guards_its_twin(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """One video listed twice gives two byte-identical entries. Once the first
+        copy is swapped and claimed again, the claimed-entry guard must still see
+        its listed bytes: an LREM of the pending twin takes the head-most match,
+        the claimed copy's entry, and the song start's LPOP then retires the next
+        song's."""
+        first, second = _qobj(1, mock_author), _qobj(1, mock_author)
+        other = _qobj(2, mock_author)
+        pads = [_qobj(n, mock_author) for n in range(10, 16)]
+        await gq.put([first, other, second, *pads])
+        gq.requeue_front(_restyled(gq.get_nowait()))
+        gq.get_nowait()
+        calls = _spy_mirror_calls(store)
+
+        outcome = await gq.remove(remove_matcher(second.webpage_url))
+        async with gq.commit_dequeue(gq.generation) as committed:
+            assert committed
+            await gq.redis_pop_for(None)
+
+        assert outcome.removed == [second]
+        assert calls == ["rebuild_queue"]
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert [parse_queue_entry(b).webpage_url for b in stored] == [  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+            item.webpage_url for item in [other, *pads]
+        ]
+
+    async def test_a_rebuild_writes_the_listed_entry_back(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """A rebuild restates the swapped-in item as the entry it replaced, so the
+        record stays true and a later removal of that item still takes LREM."""
+        head = _qobj(1, mock_author)
+        keeps = [_qobj(n, mock_author) for n in range(10, 17)]
+        await gq.put([head, *keeps])
+        swapped = _restyled(gq.get_nowait())
+        gq.requeue_front(swapped)
+        assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
+
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert _to_entry(head).to_redis() in stored
+        assert _to_entry(swapped).to_redis() not in stored
+        calls = _spy_mirror_calls(store)
+        await gq.remove(remove_matcher(swapped.webpage_url))
+        assert calls == ["remove_queue_entries"]
+
+    async def test_a_second_swap_keeps_the_first_listed_entry(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        head = _qobj(1, mock_author)
+        await gq.put([head])
+        gq.requeue_front(_restyled(gq.get_nowait()))
+        again = replace(_restyled(gq.get_nowait()), title="Retitled")
+        gq.requeue_front(again)
+
+        assert gq.mirror_entries() == [_to_entry(head)]
+        assert len(gq._listed) == 1
+
+    @pytest.mark.parametrize("leaves_by", ["commit", "remove", "clear"])
+    async def test_the_record_goes_when_its_item_leaves(
+        self, leaves_by: str, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        head = _qobj(1, mock_author)
+        await gq.put([head, _qobj(2, mock_author)])
+        swapped = _restyled(gq.get_nowait())
+        gq.requeue_front(swapped)
+        assert id(swapped) in gq._listed
+
+        if leaves_by == "commit":
+            assert gq.get_nowait() is swapped
+            async with gq.commit_dequeue(gq.generation) as committed:
+                assert committed
+        elif leaves_by == "remove":
+            await gq.remove(remove_matcher(swapped.webpage_url))
+        else:
+            await gq.clear()
+
+        assert gq._listed == {}
 
 
 # ── bulk mutations vs in-flight dequeue ───────────────────────────────────────

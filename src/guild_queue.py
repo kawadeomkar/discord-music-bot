@@ -185,6 +185,7 @@ class GuildQueue:
         "_mutex",
         "_generation",
         "_mirror_dirty",
+        "_listed",
     )
 
     def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
@@ -200,6 +201,10 @@ class GuildQueue:
         # did not land, or a mirror write cut short. Cleared by the next write that
         # replaces the list: a rebuild, a DELETE, or the next song start.
         self._mirror_dirty = False
+        # The entry the list holds for an item requeue_front() swapped in, which
+        # serializes as its resolved or rebuilt form. Keyed by id() and holding the
+        # item, so the id cannot be reused while the record lives.
+        self._listed: dict[int, tuple[QueueItem, QueueEntry]] = {}
 
     @contextlib.contextmanager
     def _mirror_write(self) -> Iterator[None]:
@@ -249,12 +254,18 @@ class GuildQueue:
     def requeue_front(self, item: QueueItem) -> None:
         """Give a claim back: the cursor steps back and the item is pending again;
         the mirror never moved. `item` may be the RESOLVED form of what was
-        claimed and replaces it. Index 0 is the only claimed slot there is: the
-        prefetch's requeue always lands before loop() can take a second claim."""
+        claimed and replaces it, keeping the claimed item's entry as its own mirror
+        entry (_mirror_entry). Index 0 is the only claimed slot there is: the
+        prefetch's requeue always lands before loop() can take a second claim.
+        Synchronous: the prefetch's CancelledError handler calls it."""
         # Guarded: unguarded, _cursor == 0 goes negative and the write clobbers
         # the TAIL.
         if self._cursor > 0:
             self._cursor -= 1
+            claimed = self._items[0]
+            if item is not claimed:
+                self._listed[id(item)] = (item, self._mirror_entry(claimed))
+                self._listed.pop(id(claimed), None)
             self._items[0] = item
         self._sync_wake()
 
@@ -381,6 +392,7 @@ class GuildQueue:
             self._generation += 1
             cleared_items = list(self._items)
             self._items.clear()
+            self._listed.clear()
             self._cursor = 0
             self._sync_wake()
             # An emptied deque means DELETE in _write_mirror, which also records
@@ -441,7 +453,12 @@ class GuildQueue:
 
             self._items = deque(kept)
             self._sync_wake()  # cursor unchanged — nothing before it can move
-            await self._write_mirror(self._items, removed=removed_items)
+            try:
+                await self._write_mirror(self._items, removed=removed_items)
+            finally:
+                # After the write, which LREMs by these records.
+                for item in removed_items:
+                    self._listed.pop(id(item), None)
 
         return RemoveOutcome(
             removed=removed_items,
@@ -533,7 +550,7 @@ class GuildQueue:
         (I1)."""
         if self._cursor == 0:
             return False
-        self._items.popleft()
+        self._listed.pop(id(self._items.popleft()), None)
         self._cursor -= 1
         self._sync_wake()
         return True
@@ -596,7 +613,7 @@ class GuildQueue:
     def mirror_entries(self) -> list[QueueEntry]:
         """The persisted subset of the deque, claimed prefix included, in order —
         what a rebuild writes."""
-        return [_to_entry(s) for s in self._items if is_persisted(s)]
+        return [self._mirror_entry(s) for s in self._items if is_persisted(s)]
 
     async def redis_pop_for(
         self, item: Optional[QueueItem], *, persisted: Optional[bool] = None
@@ -628,7 +645,8 @@ class GuildQueue:
         (_LREM_MAX_ENTRIES) and guarded twice more because LREM matches exact
         bytes: skipped when a removed blob equals a claimed item's (LREM takes the
         head-most copy — the entry awaiting its commit-time LPOP), and falling
-        through to the rebuild on a short count."""
+        through to the rebuild on a short count. Every item is serialized as the
+        list holds it (_mirror_entry)."""
         if self._store is None:
             return
         survivors = sum(1 for s in items if is_persisted(s))
@@ -646,7 +664,7 @@ class GuildQueue:
             and dropped_count <= _LREM_MAX_ENTRIES
             and dropped_count * _LREM_MAX_SHARE <= survivors
         ):
-            dropped = [_to_entry(s) for s in removed if is_persisted(s)]
+            dropped = [self._mirror_entry(s) for s in removed if is_persisted(s)]
             dropped_blobs = [entry.to_redis() for entry in dropped]
             if not self._claimed_blobs(dropped_blobs):
                 with self._mirror_write():
@@ -659,7 +677,7 @@ class GuildQueue:
                 )
         with self._mirror_write():
             landed = await self._store.rebuild_queue(
-                [_to_entry(s) for s in items if is_persisted(s)]
+                [self._mirror_entry(s) for s in items if is_persisted(s)]
             )
         # Only a rebuild that landed answers for the whole list; one that did not
         # leaves it as unknown as before, and the next enqueue tries again.
@@ -671,13 +689,23 @@ class GuildQueue:
         inserted, and two entries for one song compare equal."""
         return any(held is item for held in self._items)
 
+    def _mirror_entry(self, item: QueueItem) -> QueueEntry:
+        """The entry the list holds for `item`: its own serialization, or, for an
+        item requeue_front() swapped in, the entry of what it replaced. Every
+        write that must match the list byte for byte (a rebuild, an LREM, the
+        claimed-entry guard) serializes through here."""
+        listed = self._listed.get(id(item))
+        if listed is not None and listed[0] is item:
+            return listed[1]
+        return _to_entry(item)
+
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a
         CLAIMED item's — the entry awaiting its commit-time LPOP."""
         if not self._cursor:
             return False
         claimed = {
-            _to_entry(s).to_redis()
+            self._mirror_entry(s).to_redis()
             for s in islice(self._items, 0, self._cursor)
             if is_persisted(s)
         }
