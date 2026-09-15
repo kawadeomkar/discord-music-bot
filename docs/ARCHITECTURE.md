@@ -233,7 +233,7 @@ graph TD
 |---|---|
 | `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when **`HISTORY_ARCHIVE_ENABLED` is true** (`PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`) — the flag is the consent gate, never URL presence: enabled without `POSTGRES_URL` **raises**, and disabled ignores a set one with an INFO, leaving bit-identical pre-Postgres behavior, and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
 | `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-play --now`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, the per-guild alone-disconnect timers, and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect) and crash recovery via `on_ready`. |
-| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, and `--now` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
+| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, `--now` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`), and the public hooks `-replay` drives from `commands/replay.py` (`still_live()`, `stop_if_live()`, `ensure_prefetch()`, `hand_over_to_replay()`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
 | `guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns **one deque plus a cursor into it** (`_items[:_cursor]` claimed, `_items[_cursor:]` pending) and the Redis mirror, along with the bulk-mutation mutex, the generation counter, and the `_wake` Event whose sole writer is `_sync_wake()`. Every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. This replaced an `asyncio.Queue` plus a parallel display `deque` whose agreement had to be maintained by hand — see [Queue invariant](#queue-invariant). |
 | `guild_history.py` | `GuildHistory` — played-song history domain class. Two legs, both bounded at `HISTORY_CACHE_LIMIT` (50): the PERSISTed `guild:{id}:history` Redis list and an in-memory deque of the same window. `recent()` merges those two and **never reads Postgres** — see [History read path](#history-read-path). Writes additionally XADD the outbox while the archive is enabled. |
 | `guild_state.py` | Schema module: **every byte persisted to Redis is defined here**. Field-name constants (`StateField`, `NowPlayingField`, `QueueEntryField`, `ConfigField`) + frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`, `HistoryEntry`, `GuildConfig`) with `from_redis`/`to_redis` converters. `GuildConfig` is the durable-settings object behind `guild:{id}:config`, and every one of its fields is `Optional` on purpose: absent means "follow the host default", which an explicit `False`/`0.0` does not (`tzinfo()` resolves the stored IANA name at read time, falling back to `DEFAULT_TIMEZONE` rather than raising on a render path). Pure data — no domain logic, no project runtime imports. Wire formats are pinned by golden-fixture tests. |
@@ -290,6 +290,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
 | `-resume` | `r` | — | Resume paused playback; re-hosts the Now Playing block so the pause confirmation becomes plain history. |
+| `-replay` | `rp`, `restart` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`commands/replay.py`'s `replay_current()` → `ReplayOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `MIN_REPLAY_POSITION_SECS`. See [-replay](#-replay). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
@@ -460,7 +461,7 @@ sequenceDiagram
     Sources-->>Bot: YTSource | SpotifySource | SoundcloudSource
 
     alt Spotify playlist
-        Bot->>SP: spotify.playlist(id) → List[str] titles
+        Bot->>SP: spotify.playlist(id) → SpotifyPlaylist, its titles
         Bot->>Sources: spotify_playlist_to_ytsearch(titles) → List[YTSource]
         Bot->>MP: queue_put(items, prefetch=False)
     else YouTube playlist
@@ -523,6 +524,98 @@ Key properties:
 
 ---
 
+### -replay
+
+`-replay` (`rp`, `restart`) plays the live song again from `0:00`. The body is
+`src/commands/replay.py`, as every command body is; the cog keeps the declaration,
+the decorators and the `except` that renders the failure embed. The replay flow lives
+there too — `replay_current()`, its verdict and `ReplayResult` — and drives the player
+only through its public methods. The player keeps what its loop reads: the retire
+marker and the trace link, both set by `hand_over_to_replay()`. It reuses
+`--now`'s skeleton — neutralize the prefetch, front-insert, stop the live song,
+let the loop's ordinary dequeue do the rest — and differs in four decided ways.
+
+- **The interrupted play keeps its own history entry.** `--now` suppresses the
+  parked fragment's entry via `_skip_history_for` because its resume tail spans the
+  whole play. A replay starts at `0:00` and spans none of what was already heard, so
+  suppressing here would lose that listening with no row, no log line and no reject.
+  Two plays, two rows; `played_at` is stamped fresh on the replay, so the
+  `(guild_id, played_at, webpage_url)` dedup index does not collide.
+- **The replay is the caller's ask.** `requester` and the ask-time `analytics` both
+  name whoever ran `-replay`, not the original requester, or `-leaderboard` credits
+  a play to someone who did not ask for it. `query_source` and `user_input` stay with
+  the song: they classify how the song was *found*, which a replay does not change.
+- **A paused song comes back playing**, on `-play`'s precedent ("`-play` means
+  play") and `-skip`'s: the ask is for the song to sound.
+  Nothing sets `start_paused`, so the flag keeps its single `--now` producer.
+- **The interrupted song's NP card is retired, not finalized.** A replay is the same
+  song, so a bar frozen at the interrupt position would stand directly above the
+  replay's own card naming it again. `_retire_np_for` carries the song's identity to
+  the loop's iteration end, the way `_skip_history_for` does.
+
+**Liveness.** `MusicPlayer.still_live()` is the single test both `replay_current()`
+and `interject()` use before acting on a song, and every term is a window a command
+can wake up in:
+
+| Term | Window it closes |
+|---|---|
+| `current_song is song` | the obvious one |
+| `not play_next.is_set()` | the audio thread sets `play_next` two task cancels before the loop clears `current_song`; acting there replays a finished song and stops the next one |
+| `not _stopped_deliberately` | `note_deliberate_stop()` precedes every stop we make (`-skip`, `--now`, `-replay`), and until the loop's next `vc.play()` `current_song` names a song already over — the stopped one, or the next one before it starts. Acting there front-inserts against it: a `--now` landing after a `-replay`'s stop would park a resume tail ahead of the replay, and a `-replay` after a `-skip` replays what was skipped. The loop clears the flag at that `vc.play()` |
+| loop task not done | a torn-down player (`-stop`, the alone watchdog, a voice kick): the voice client is gone, so the stop would land on a disconnected one |
+
+It is checked twice per command — at dispatch and again after the prefetch is neutralized
+— because the neutralize destroys the next song's resolved source and a song already
+gone needs neither.
+
+**Bounding the resolve.** The replay is resolved through the loop's own
+`_prefetch_next_song()`, so the extraction, probe and FFmpeg spawn are paid while the
+interrupted song is still playing rather than in the silence after the stop. The wait
+is `asyncio.wait({task}, timeout=...)`: it does not cancel the task when the bound
+expires, and does not re-raise when a teardown cancels it — `cleanup()` cancels
+exactly this task, and a direct `await` would put that `CancelledError` into a command
+body whose `except Exception` cannot catch it.
+
+**The stop is a gate, as it is for `--now`.** A copy that cannot play must not stop
+what is playing, so the song is stopped only when the copy is certain to be next:
+the task in the slot is still the replay's, it has finished, and the claimed head is
+the very `QueueObject` the replay inserted (`_replay_result`). Identity, not a URL
+match, is what separates the cases that must not stop, because each of them leaves
+something at the head:
+
+| `ReplayResult` | What happened | The song |
+|---|---|---|
+| `REPLAYING` | the copy resolved and is held at the head | stopped; the copy plays now |
+| `ENDED_FIRST` | the song ended before the verdict | already over; the copy plays next |
+| `STILL_LOADING` | the resolve outlived `_REPLAY_RESOLVE_TIMEOUT`, still holding the copy | plays on; the copy follows it |
+| `STOPPED_ELSEWHERE` | a `-skip` or `--now` stopped the song first (`_stopped_deliberately`) | stopped by that command; the copy is still queued |
+| `TORN_DOWN` | the player was torn down (`-stop`, a kick, the alone watchdog) | gone; the copy waits in the saved queue for `-resume` |
+| `INTERRUPTED` | another command cancelled the resolve. The verdict runs as the cancel lands, before that command has changed the queue, so it cannot say where the copy ends up | plays on, or is stopped by that command |
+| `QUEUED_LATER` | a `-shuffle` or `--next` landed after the resolve finished and put something ahead of the copy, which is still queued — by identity, or as a rebuilt copy carrying `is_replay` | plays on; the copy plays when the queue reaches it |
+| `FAILED` | the resolve returned no song and retired the copy | plays on |
+| `DROPPED` | a `-clear` or `-remove` took the copy out of the queue | plays on |
+
+**A replay is two traces, and they say so.** One song is one trace, so the interrupted play and its replay are separate traces with the same attribute keys. The interrupted iteration records `song.ended_by=replay`; `player.replay` links to it (`link.kind=replayed_song`); the replayed iteration records `song.is_replay` and links back to it (`link.kind=replay_of`), carried on `MusicPlayer._replay_of` from the stop to the replay's start. `bot.replay` records `replay.outcome` on every exit, the refusals that never reach the player included.
+
+**A `--now` during the replay's resolve inserts no resume tail.** It neutralizes the resolve, which hands the copy back to the head, and `interject()` finds a `-replay` copy of the live song next (`guild_queue.is_replay_of`): the copy already plays the song again after the interjection, so a tail at the interrupt position ahead of it would play the song a third time. The interrupted fragment records its own history row, as with `-skip`, and `--now`'s reply says the song plays again from `0:00` after it. A marker held for the length of `replay_current` could not stand in for this check: the replay's verdict runs as soon as the neutralize cancels its resolve, before `--now` has inserted anything.
+
+Expiring the bound stops nothing: a resolve past it can still fail, and a stop into
+it would cut the song off for a copy that never plays.
+
+**Writing the slot.** The front insert awaits an LPUSH, and the song can end inside
+it: the loop reads and nulls the slot, claims the copy, and at the copy's start
+spawns its own prefetch. So liveness is checked once more after the insert, with no
+await between that check and the slot write, and the write goes through
+`ensure_prefetch()` — as the loop's and `-shuffle`'s do — which never starts a task
+over one already in the slot. Two tasks in the slot is two claims the loop settles
+one of: the next song is skipped, or the replay lost, and `_cursor` drifts for good.
+
+**Residual race.** A teardown completing *inside* that resolve leaves the replay on
+the queue, so a later `-resume` plays it. The stop is guarded, so nothing is sent to a
+disconnected client.
+
+---
+
 ### Source Resolution
 
 `parse_input` / `parse_url` in `sources.py` classify the raw input string:
@@ -550,7 +643,7 @@ flowchart TD
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
-- **Playlist**: `Spotify.playlist(id)` → `List[str]` titles → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
 
 ---
 
@@ -664,17 +757,17 @@ It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` tak
 
 `yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
 
-It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v2:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
+It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v3:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes). `yt_playlist` returns a `YoutubePlaylist`: the tracks, the playlist's `title` (from the extraction's top-level info-dict, which carries it with and without `lazy_playlist`; `None` when absent) and `unavailable`, the count of entries dropped as unplayable.
 
 **Fifteen minutes, not the source cache's day.** A playlist is editable, and its entry count and order are what the callers' `&index=` handling and every "Queued playlist — N songs" line are built from. What the window has to cover is the two cases that actually hurt: the same collection pasted twice in a burst, and a re-paste soon after.
 
 **The key is the `list=` id.** One collection reaches the bot as `/playlist?list=X`, as a watch link carrying `&index=4`, and with a `&t=` on the end. Keyed on the pasted URL those are three entries and three extractions. A URL with no `list=` falls back to itself.
 
-**Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. Entries yt-dlp could not describe (a null entry for a deleted video, one with no `id`) are dropped in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps.
+**Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. The value is `{"title", "unavailable", "entries": [...]}`, so a hit returns the title and count the miss wrote. Entries yt-dlp could not describe (a null entry, one with no `id`, and one with an `id` but neither a title nor a duration — how a private or deleted video arrives in a flat extraction) are dropped and counted in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps. A live entry has a title and no duration and is kept; an entry with a duration and no title is kept under its video id. The count rides the span as `ytdl.playlist_unavailable`.
 
 **An empty result is not cached.** A private or unavailable playlist extracts to no entries too, and a quarter of an hour is a long time to answer a retry with the same nothing.
 
-**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key carries a `v2` because this changed what an entry holds: an unversioned key would serve a pre-dedupe Mix for its remaining TTL.
+**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`; a dropped repeat is not counted as unavailable, so a private video a Mix walks past twice counts once. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key is versioned with the value's shape (`v3`: a deduplicated entry list beside the title and unavailable count), so no build reads a value written for another.
 
 ---
 
@@ -755,7 +848,7 @@ Key details:
 
 - **Atomic start transaction**: for a real queue item, `pop_queue_and_start_song` LPOPs the Redis queue and writes all current-song state fields plus the `now_playing` display snapshot in one `MULTI/EXEC` — there is no window where the song is neither on the queue list nor in the state hash. A crash-recovered song (`persisted=False`) was never on the Redis list, so only the state fields are written (an LPOP would drop an unrelated queued song).
 - **Backdated epoch**: `play_start_epoch` is stored as `play_start − song.start_offset`. The same offset is passed again as `start_offset`, seeding `last_position_secs` so a crash inside the first heartbeat interval still resumes a `?t=` song at its offset. The backdated epoch now feeds only the legacy fallback.
-- **`_prefetch_next_song`** dequeues via `queue.get_nowait()`, resolves + streams the next item while the current song plays. If cancelled (clear/shuffle/remove), it returns the item to the front via `queue.requeue_front()` — the claim goes back with it. If resolve/stream fails, it settles the claim and mirrors it via `queue.finish_failed_dequeue()`.
+- **`_prefetch_next_song`** dequeues via `queue.get_nowait()`, resolves + streams the next item while the current song plays. If cancelled (clear/shuffle/remove), it returns the item to the front via `queue.requeue_front()` — the claim goes back with it. If resolve/stream fails, it settles the claim and mirrors it via `queue.finish_failed_dequeue()`. The queue keeps the claimed entry, which for a lazy Spotify track is still a search, so the prefetch also records what it resolved to in `_prefetched_head`; while that entry is still the head, Up next, `-queue` and the ETA walks show the resolved song (`_displayed()`). Display only — the queue, its claim and its Redis mirror are untouched.
 - **Every claim is settled exactly once** — by `commit_dequeue()` (the song starts), `finish_failed_dequeue()` (failure), or `requeue_front()` (cancellation, which returns the claim with the item). The loop's exception handler releases a claim no other path settled, tracked by `claim_outstanding`; a claim left standing would keep its item counted as in flight forever and the next release would settle a different song.
 - **Resume entries**: an `is_resume` `SongQueueEntry` (from an interjection) replays through the same FFmpeg `-ss ts` seek path as a `?t=` song and honours `start_paused`. The parked song's history add is deferred via `_skip_history_for` so it is recorded once, at its resume tail — see [-play --now Interjection](#-play---now-interjection).
 
@@ -825,7 +918,7 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 3).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 4: a playlist card sent with its unavailable-songs notice).
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
@@ -865,7 +958,7 @@ A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card 
 
 **Where the numbers come from.** A Spotify collection is easy: the pager reads `total` from page 1 and reports after every page, so its bar is determinate from the first tick. A YouTube collection has no such channel — `YTDL.yt_playlist` awaits one `extract_info` that returns after the whole continuation walk, so the track count and the tracks would arrive in the same tick, milliseconds before the card is deleted. It gets one built for it (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). A collection with no header count at all — a Mix (`RD…`, other than a curated `RDCLAK5uy_` list), a channel tab — still renders indeterminate: an elapsed line rounded to 5 s and no bar. That is a steady state, not a transient one.
 
-**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null and ID-less entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
+**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null, ID-less and id-only (private or deleted) entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
 
 **The card is a SECOND message and never becomes the confirmation.** `play_pipeline._reply` sends the confirmation through `MusicContext.send`, which prepends the Now Playing block and adopts that message as the NP host. A card sent with `ctx.channel.send` — which it must be, or the progress updater rewrites it every 3 s — can never do that, so merging the two would stop every playlist enqueue from re-hosting the NP card at the channel bottom. The cost of not merging is that the existing host sits *above* the card, edited invisibly, for the card's whole life: one of the documented exceptions to the host model, listed under [Now Playing host invariants](#now-playing-host-invariants), bounded by the delete, and NOT by the ceiling below — that stops the card EDITING, it does not take it down, so a resolve that outlives it leaves the host buried until the enqueue finally settles.
 
@@ -1006,6 +1099,7 @@ sequenceDiagram
 | `store` | `Optional[GuildRedisStore]` | `None` if no Redis configured |
 | `_player` | `Optional[asyncio.Task]` | Long-lived `loop()` task |
 | `_prefetch_task` | `Optional[asyncio.Task]` | Active `_prefetch_next_song()` task |
+| `_prefetched_head` | `Optional[tuple[QueueItem, QueueObject]]` | The entry the prefetch claimed and what it resolved to, for the cards (matched by identity) |
 | `_restore_task` / `_restore_complete` | `Optional[asyncio.Task]` / `asyncio.Event` | One-shot `_restore_state()`; the event gates `loop()`'s first dequeue |
 | `_progress_task` | `Optional[asyncio.Task]` | Per-song progress-bar updater |
 | `_heartbeat_task` | `Optional[asyncio.Task]` | Per-song position recorder for crash recovery; started only when a store exists |
@@ -1036,7 +1130,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:v2:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1044,7 +1138,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
-- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`), `queued_at timestamptz` (read at **ask** time — when the user's command message was sent) and `queue_position` (read at the **insert** — how many songs were ahead of it when it took its slot, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. Rows written before the insert-time mint carry the dispatch-time depth, which differs only when two requests resolved together. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption.), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
+- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`. They identify the host and do not promise it still exists: a dedicated card the bot retires is deleted after its id is recorded — at a `-replay`, a teardown, a stream that never opened, and a parked tail flushed by `-clear`/`-remove`. A reader that fetches the message must expect a 404), `queued_at timestamptz` (read at **ask** time — when the user's command message was sent) and `queue_position` (read at the **insert** — how many songs were ahead of it when it took its slot, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. Rows written before the insert-time mint carry the dispatch-time depth, which differs only when two requests resolved together. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption.), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
 - **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
@@ -1358,7 +1452,7 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:v2:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
+| `playlist(id)` | `spotify:playlist:v3:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -1837,6 +1931,8 @@ provisioned ahead of enforcement rather than after it.
 **A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
 
 **A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
+
+**The name is a request of its own.** `v1/playlists/{id}/tracks` does not carry the playlist's name, so after the walk, still inside its slot, `_playlist_name` sends one `GET v1/playlists/{id}?fields=name`, bounded by `_PLAYLIST_PAGE_TIMEOUT_SECS`. Folding the name into page 1 — fetching `v1/playlists/{id}` with a nested `tracks(...)` mask — does not work: the `tracks.next` cursor Spotify returns then carries that request's `fields=name,tracks(...)`, and page 2 fetched from it comes back as `{}`, which this walk reads as a refused playlist. The name only decorates the confirmation, so any failure there returns `None` and never fails the walk. The walk's own mask adds `duration_ms`, which costs no extra request: the result sums the kept tracks' milliseconds and divides once, and marks the total `duration_partial` when a kept track carried none. `unavailable` counts items walked and not kept.
 
 ### Progress out of a yt-dlp worker
 

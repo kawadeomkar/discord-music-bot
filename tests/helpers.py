@@ -16,8 +16,9 @@ from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.play_placement import PlayMode, PlayRequest
-from src.youtube import QueueObject
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 
 if TYPE_CHECKING:
     from src.musicbot import MusicBot
@@ -124,6 +125,18 @@ def stub_create_task(return_value: Optional[Any] = None) -> MagicMock:
         return return_value if return_value is not None else MagicMock()
 
     return MagicMock(side_effect=_impl)
+
+
+def stub_yt_playlist(
+    tracks: list[QueueObject], *, title: Optional[str] = None, unavailable: int = 0
+) -> AsyncMock:
+    """A stand-in for YTDL.yt_playlist resolving to `tracks`, untitled and with
+    nothing unavailable unless the test says otherwise."""
+    return AsyncMock(
+        return_value=YoutubePlaylist(
+            title=title, tracks=tracks, unavailable=unavailable
+        )
+    )
 
 
 def make_mock_task() -> MagicMock:
@@ -259,6 +272,8 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     # `--next` inserts through its own wrapper, which neutralizes the loop's
     # prefetch first — a plain front insert lands behind that claim.
     mp.queue_put_next = AsyncMock()
+    # A str, not auto-vivified: the queued-playlist card joins it into its text.
+    mp.playlist_facts = MagicMock(return_value="")
     mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in
@@ -275,3 +290,52 @@ def mock_mp(qsize: int = 0) -> MagicMock:
         return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
     )
     return mp
+
+
+# What -replay mints at dispatch: the command message's snowflake time, and
+# depth 0 — the replay plays immediately.
+REPLAY_ASK = Analytics(queued_at=1752530500.5, queue_position=0)
+
+
+def loop_song(url: str, title: str, *, position: float) -> MagicMock:
+    """A spec'd YTDL stand-in — a bare MagicMock reads truthy for
+    start_paused/is_resume and would trip the loop's start path."""
+    song = MagicMock(spec=YTDL)
+    song.title = title
+    song.webpage_url = url
+    song.duration_secs = 210
+    song.duration = "0:03:30"
+    song.uploader = "Loop Channel"
+    song.thumbnail = ""
+    song.views = None
+    song.likes = None
+    song.abr = None
+    song.asr = None
+    song.acodec = ""
+    song.requester = None
+    song.start_offset = 0
+    song.position_secs = position
+    song.produced_audio = True
+    song.interjected = False
+    song.is_resume = False
+    song.is_replay = False
+    song.start_paused = False
+    song.analytics = ANALYTICS_ZERO
+    song.user_input = None
+    song.query_source = ""
+    song.played_at = 0.0
+    song.persisted = True
+    song.data = {}
+    return song
+
+
+def replayed_song(source: QueueObject) -> MagicMock:
+    song = loop_song(source.webpage_url, source.title, position=42.0)
+    # Read by _neutralize_prefetch's rebuild, which the -replay runs.
+    song.np_message_id, song.np_channel_id = 0, 0
+    song.np_dedicated, song.np_host_ref = False, None
+    song.is_replay = source.is_replay
+    song.analytics = source.analytics
+    song.persisted = source.persisted
+    song.requester = source.requester
+    return song

@@ -70,6 +70,7 @@ from src.youtube import (
     warm_worker,
     YTDLVideoInfo,
     YTDLVideoMetadata,
+    YoutubePlaylist,
 )
 from tests.helpers import noop_ffmpeg_init, settle
 
@@ -299,8 +300,6 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             "thumbnail",
             # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
             "ts",
-            # Runtime-only NP handle; a live Message cannot be carried on a source.
-            "np_host_ref",
         }
         carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
         params = set(inspect.signature(YTDL.__init__).parameters)
@@ -326,6 +325,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             start_paused=True,
             persisted=False,
             played_at=12.5,
+            is_replay=True,
         )
 
         song = await self._played(qobj)
@@ -338,7 +338,8 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             song.start_paused,
             song.persisted,
             song.played_at,
-        ) == ("typed", "search", True, True, True, False, 12.5)
+            song.is_replay,
+        ) == ("typed", "search", True, True, True, False, 12.5, True)
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a
@@ -872,13 +873,14 @@ class TestYTPlaylistAnalytics:
         with patch(
             "src.youtube._ytdlp_extract", return_value=self._entries("a", "b", "c")
         ):
-            tracks = await YTDL.yt_playlist(
+            playlist = await YTDL.yt_playlist(
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=Analytics(queued_at=1752529000.5, queue_position=2),
                 user_input="https://yt.com/playlist?list=PL1",
             )
+        tracks = playlist.tracks
         assert [t.analytics.queue_position for t in tracks] == [2, 3, 4]
         assert all(t.analytics.queued_at == 1752529000.5 for t in tracks)
         assert all(t.query_source == "youtube.com" for t in tracks)
@@ -894,14 +896,16 @@ class TestYTPlaylistAnalytics:
             # A deleted video, and one missing its ID — both skipped.
             return_value=self._entries("a", None, "b", "", "c"),
         ):
-            tracks = await YTDL.yt_playlist(
+            playlist = await YTDL.yt_playlist(
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
                 user_input="https://yt.com/playlist?list=PL1",
             )
+        tracks = playlist.tracks
         assert [t.title for t in tracks] == ["Ta", "Tb", "Tc"]
+        assert playlist.unavailable == 2
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
 
 
@@ -3492,13 +3496,14 @@ class TestYtPlaylistEntries:
             return _slim_info({"_type": "playlist", "entries": entries})
 
         with patch("src.youtube._run_extract", new=_extract):
-            return await YTDL.yt_playlist(
+            playlist = await YTDL.yt_playlist(
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
                 user_input="https://www.youtube.com/playlist?list=PL1",
             )
+        return playlist.tracks
 
     async def test_a_short_gets_the_same_url_a_pasted_link_would(
         self, mock_ctx: MagicMock
@@ -3608,7 +3613,7 @@ class TestMixRepeats:
         url = f"https://www.youtube.com/watch?v={ids[0]}&list={list_id}"
         data = {"_type": "playlist", "id": list_id, "entries": self._entries(*ids)}
         with patch("src.youtube._ytdlp_extract", return_value=data):
-            return await YTDL.yt_playlist(
+            playlist = await YTDL.yt_playlist(
                 url,
                 ctx.author,
                 query_source="youtube.com",
@@ -3616,6 +3621,7 @@ class TestMixRepeats:
                 user_input=url,
                 redis=redis,
             )
+        return playlist.tracks
 
     @pytest.mark.parametrize("list_id", ["RDa", "RDAMVMa"])
     async def test_a_mix_keeps_each_video_once_in_first_seen_order(
@@ -3653,7 +3659,7 @@ class TestMixRepeats:
                 redis=fake_redis,
             )
         extract.assert_not_called()
-        assert self._urls(again) == ["a", "b"]
+        assert self._urls(again.tracks) == ["a", "b"]
 
     def test_the_repeat_count_rides_the_span(self) -> None:
         """The walk's own size and what was queued disagree for a repeating Mix,
@@ -3670,23 +3676,109 @@ class TestMixRepeats:
                 cast(Any, {"id": "RDa", "entries": self._entries("a", "b")}), url
             )
         with tracer.start_as_current_span("repeats"):
-            tracks = _playlist_tracks(
+            tracks, unavailable = _playlist_tracks(
                 cast(Any, {"id": "RDa", "entries": self._entries("a", "a", "b", "a")}),
                 url,
             )
         with tracer.start_as_current_span("kept"):
-            kept = _playlist_tracks(
+            kept, kept_unavailable = _playlist_tracks(
                 cast(Any, {"id": "PLx", "entries": self._entries("a", "a")}), url
             )
         unique, repeats, owned = exporter.get_finished_spans()
         assert len(tracks) == 2
+        # A dropped repeat is not an unavailable video.
+        assert unavailable == 0
         assert "ytdl.playlist_repeats" not in (unique.attributes or {})
         assert (repeats.attributes or {})["ytdl.playlist_repeats"] == 2
         assert (repeats.attributes or {})["ytdl.playlist_repeats_dropped"] is True
         # A playlist's repeats are counted and kept.
         assert len(kept) == 2
+        assert kept_unavailable == 0
         assert (owned.attributes or {})["ytdl.playlist_repeats"] == 1
         assert (owned.attributes or {})["ytdl.playlist_repeats_dropped"] is False
+
+
+class TestUnavailableEntries:
+    """A private or deleted video in a flat playlist arrives as its id alone — no
+    title, no duration — and would otherwise queue under its id and fail at its
+    turn. It is dropped and counted, so the confirmation can say how many went."""
+
+    _URL = "https://www.youtube.com/playlist?list=PLx"
+
+    @staticmethod
+    def _entry(video_id: str, **overrides: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "id": video_id,
+            "title": f"Song {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": 100,
+        }
+        entry.update(overrides)
+        return entry
+
+    def _tracks(self, *entries: Any, list_id: str = "PLx") -> tuple[list[str], int]:
+        tracks, unavailable = _playlist_tracks(
+            cast(Any, {"id": list_id, "entries": list(entries)}), self._URL
+        )
+        return [t.webpage_url.rsplit("=", 1)[1] for t in tracks], unavailable
+
+    def test_an_id_only_entry_is_dropped_and_counted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            ids, unavailable = self._tracks(
+                self._entry("a"),
+                {"id": "jYC5BcL7YtQ", "title": None, "duration": None},
+                self._entry("b"),
+            )
+        assert ids == ["a", "b"]
+        assert unavailable == 1
+        assert "jYC5BcL7YtQ" in caplog.text
+
+    def test_a_null_and_an_id_less_entry_are_counted(self) -> None:
+        ids, unavailable = self._tracks(
+            None, self._entry("a"), {"title": "no id", "duration": 100}
+        )
+        assert ids == ["a"]
+        assert unavailable == 2
+
+    def test_a_live_entry_is_kept(self) -> None:
+        """A title and no duration: live, not unavailable."""
+        ids, unavailable = self._tracks(
+            self._entry("live", duration=None, live_status="is_live")
+        )
+        assert ids == ["live"]
+        assert unavailable == 0
+
+    def test_an_entry_with_a_duration_and_no_title_is_named_by_its_id(self) -> None:
+        tracks, unavailable = _playlist_tracks(
+            cast(Any, {"id": "PLx", "entries": [self._entry("untitled", title=None)]}),
+            self._URL,
+        )
+        assert [(t.title, t.duration) for t in tracks] == [("untitled", 100)]
+        assert unavailable == 0
+
+    def test_a_mix_counts_an_unavailable_video_it_repeats_once(self) -> None:
+        """The repeat is the walk's, not a second unavailable video."""
+        gone = {"id": "gone"}
+        ids, unavailable = self._tracks(
+            self._entry("a"), gone, self._entry("a"), gone, list_id="RDa"
+        )
+        assert ids == ["a"]
+        assert unavailable == 1
+
+    def test_the_unavailable_count_rides_the_span(self) -> None:
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        with tracer.start_as_current_span("clean"):
+            self._tracks(self._entry("a"))
+        with tracer.start_as_current_span("dropped"):
+            self._tracks(None, {"id": "gone"}, self._entry("a"))
+        clean, dropped = exporter.get_finished_spans()
+        assert "ytdl.playlist_unavailable" not in (clean.attributes or {})
+        assert (dropped.attributes or {})["ytdl.playlist_unavailable"] == 2
 
 
 class TestPlaylistCache:
@@ -3706,14 +3798,14 @@ class TestPlaylistCache:
             for video_id in ids
         ]
 
-    async def _fetch(
+    async def _resolve(
         self,
         ctx: MagicMock,
         redis: aioredis.Redis,
         url: str,
         *,
         analytics: Analytics = _ANALYTICS,
-    ) -> list[QueueObject]:
+    ) -> YoutubePlaylist:
         return await YTDL.yt_playlist(
             url,
             ctx.author,
@@ -3722,6 +3814,16 @@ class TestPlaylistCache:
             user_input=url,
             redis=redis,
         )
+
+    async def _fetch(
+        self,
+        ctx: MagicMock,
+        redis: aioredis.Redis,
+        url: str,
+        *,
+        analytics: Analytics = _ANALYTICS,
+    ) -> list[QueueObject]:
+        return (await self._resolve(ctx, redis, url, analytics=analytics)).tracks
 
     async def test_a_second_paste_inside_the_window_is_one_redis_get(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3735,7 +3837,7 @@ class TestPlaylistCache:
         assert mock_extract.call_count == 1
         assert [q.webpage_url for q in first] == [q.webpage_url for q in second]
         assert [q.title for q in second] == ["Song a1", "Song a2"]
-        assert await fake_redis.ttl("ytdl:playlist:v2:PLcache") == _YT_PLAYLIST_TTL
+        assert await fake_redis.ttl("ytdl:playlist:v3:PLcache") == _YT_PLAYLIST_TTL
 
     async def test_every_entry_point_to_one_collection_shares_the_entry(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3757,11 +3859,11 @@ class TestPlaylistCache:
             )
 
         assert mock_extract.call_count == 1
-        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:v2:PLsame"]
+        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:v3:PLsame"]
 
     def test_a_url_with_no_list_id_keys_on_itself(self) -> None:
         assert youtube._playlist_cache_key("https://sc.com/set/x") == (
-            "ytdl:playlist:v2:https://sc.com/set/x"
+            "ytdl:playlist:v3:https://sc.com/set/x"
         )
 
     async def test_two_users_pasting_one_collection_run_one_extraction(
@@ -3793,24 +3895,86 @@ class TestPlaylistCache:
     async def test_the_cache_cannot_resurrect_a_skipped_entry(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
     ) -> None:
-        """A deleted video arrives as a null entry and an id-less one as a title with
-        no id. Both are dropped before the write, so the hit sees what the miss did."""
+        """A null entry, an id-less one, and a private video's id-only one are all
+        dropped before the write, so the hit sees what the miss did — and reports
+        the same count of them."""
         url = "https://www.youtube.com/playlist?list=PLskip"
         entries: list[Any] = [
             None,
             *self._entries("d1"),
             {"title": "no id here"},
+            {"id": "private"},
             *self._entries("d2"),
         ]
         data = {"_type": "playlist", "entries": entries}
-        with patch("src.youtube._ytdlp_extract", return_value=data):
-            miss = await self._fetch(mock_ctx, fake_redis, url)
-            hit = await self._fetch(mock_ctx, fake_redis, url)
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            miss = await self._resolve(mock_ctx, fake_redis, url)
+            hit = await self._resolve(mock_ctx, fake_redis, url)
 
-        assert [q.webpage_url for q in miss] == [q.webpage_url for q in hit]
-        assert len(hit) == 2
+        assert mock_extract.call_count == 1
+        assert [q.webpage_url for q in miss.tracks] == [
+            q.webpage_url for q in hit.tracks
+        ]
+        assert len(hit.tracks) == 2
+        assert miss.unavailable == hit.unavailable == 3
         # Positions count kept tracks, so the drops leave no gaps.
-        assert [q.analytics.queue_position for q in hit] == [0, 1]
+        assert [q.analytics.queue_position for q in hit.tracks] == [0, 1]
+
+    async def test_a_hit_returns_the_title_the_miss_extracted(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Read from the top-level info-dict through _slim_info, which slims the
+        worker's result and must leave the playlist's title on it."""
+        url = "https://www.youtube.com/playlist?list=PLEFC01F5D8255CE9B"
+        title = "David Bowie: From The Beginning"
+        data = _slim_info(
+            {"_type": "playlist", "title": title, "entries": self._entries("f1")}
+        )
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            miss = await self._resolve(mock_ctx, fake_redis, url)
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        assert mock_extract.call_count == 1
+        assert miss.title == hit.title == title
+        assert (miss.unavailable, hit.unavailable) == (0, 0)
+        stored = orjson.loads(
+            cast(bytes, await fake_redis.get("ytdl:playlist:v3:PLEFC01F5D8255CE9B"))
+        )
+        assert stored["title"] == title
+        assert stored["unavailable"] == 0
+        assert [e["webpage_url"] for e in stored["entries"]] == [
+            "https://www.youtube.com/watch?v=f1"
+        ]
+
+    @pytest.mark.parametrize("extracted", [{}, {"title": ""}], ids=["absent", "empty"])
+    async def test_an_untitled_playlist_has_no_title(
+        self,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+        extracted: dict[str, Any],
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLnotitle"
+        data = {"_type": "playlist", **extracted, "entries": self._entries("g1")}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            miss = await self._resolve(mock_ctx, fake_redis, url)
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        assert miss.title is hit.title is None
+
+    async def test_a_hit_missing_the_playlist_fields_still_parses(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLbare"
+        entry = {"webpage_url": "https://www.youtube.com/watch?v=h1", "title": "H1"}
+        await fake_redis.set(
+            "ytdl:playlist:v3:PLbare", orjson.dumps({"entries": [entry]})
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        mock_extract.assert_not_called()
+        assert (hit.title, hit.unavailable) == (None, 0)
+        assert [q.title for q in hit.tracks] == ["H1"]
 
     async def test_an_empty_playlist_is_not_cached(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -3844,9 +4008,9 @@ class TestPlaylistCache:
                 redis=fake_redis,
             )
 
-        assert [q.requester for q in second] == [mock_author, mock_author]
-        assert [q.analytics.queue_position for q in second] == [7, 8]
-        assert {q.user_input for q in second} == {"the second paste"}
+        assert [q.requester for q in second.tracks] == [mock_author, mock_author]
+        assert [q.analytics.queue_position for q in second.tracks] == [7, 8]
+        assert {q.user_input for q in second.tracks} == {"the second paste"}
 
 
 class TestSlimInfoReturnContract:
