@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import time
 from typing import Any, Never, cast
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import orjson
@@ -37,6 +37,7 @@ from src.guild_state import (
 )
 from src.redis_client import GuildRedisStore
 from src import musicplayer
+from src.commands import replay as replay_cmd
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -56,7 +57,16 @@ from src.util import (
     trace_id_of,
 )
 from src.youtube import NpHostRef, QueueObject, YTDL
-from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
+from tests.helpers import (
+    REPLAY_ASK,
+    described,
+    loop_song,
+    mocked,
+    queue_object,
+    replayed_song,
+    seed_queue,
+    stub_create_task,
+)
 
 
 @functools.wraps(MusicPlayer.loop)
@@ -81,57 +91,6 @@ def _stub_prefetch(monkeypatch: pytest.MonkeyPatch) -> None:
     from src import youtube
 
     monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
-
-@pytest.fixture
-def mock_song() -> MagicMock:
-    """A mock YTDL-like song object with all metadata attributes."""
-    song = MagicMock()
-    song.title = "Test Song Title"
-    song.requester = MagicMock()
-    song.requester.mention = "<@123456>"
-    song.requester.id = 123456
-    song.requester.display_name = "TestUser"
-    song.webpage_url = "https://www.youtube.com/watch?v=testid"
-    song.duration = "0:03:30"
-    song.uploader = "Test Channel"
-    song.views = 1_000_000
-    song.likes = 50_000
-    song.dislikes = 500
-    song.thumbnail = "https://img.youtube.com/vi/testid/0.jpg"
-    song.duration_secs = 210
-    song.elapsed_secs = 0.0
-    song.start_offset = 0
-    song.abr = 128
-    song.asr = 44100
-    song.acodec = "opus"
-    # Interjection flags a real YTDL always carries — as bare MagicMock attributes
-    # they'd read truthy and trip the loop's start_paused/is_resume gates.
-    song.interjected = False
-    song.is_resume = False
-    song.start_paused = False
-    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-    # clamps its fields into the play_history column domain. query_source likewise
-    # a real string — the slug clamp regex-matches it and a MagicMock raises
-    # TypeError there, exactly as a MagicMock title would.
-    song.analytics = ANALYTICS_ZERO
-    song.query_source = ""
-    # Same reason: the resume tail an interjection builds carries it, and it is
-    # serialized straight to the queue mirror.
-    song.user_input = None
-    # Unstamped, like a song the loop has not started yet: the loop's or-stamp
-    # writes the real clock here, and the epoch clamp raises on a MagicMock.
-    song.played_at = 0.0
-    # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
-    # reads `traceparent` off it to link this song's trace to the extraction that
-    # minted its URL, and a MagicMock there would be a str where a str is parsed.
-    song.data = {}
-    # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
-    # so tests that set either attribute get the derived position automatically.
-    type(song).position_secs = PropertyMock(
-        side_effect=lambda: song.start_offset + song.elapsed_secs
-    )
-    return song
 
 
 @pytest.fixture
@@ -6823,10 +6782,10 @@ class TestQueueEntryCard:
 
 class TestPrefetchNextSong:
     def test_the_prefetch_span_wraps_the_prefetch_itself(self) -> None:
-        """On _ensure_prefetch the span would cover only creating the task: it ends
+        """On ensure_prefetch the span would cover only creating the task: it ends
         before the resolve starts, and the resolve's spans report under an ended one."""
         assert hasattr(MusicPlayer._prefetch_next_song, "__wrapped__")
-        assert not hasattr(MusicPlayer._ensure_prefetch, "__wrapped__")
+        assert not hasattr(MusicPlayer.ensure_prefetch, "__wrapped__")
 
     async def test_returns_none_when_queue_empty(
         self, music_player: MusicPlayer
@@ -7186,6 +7145,7 @@ class TestLoop:
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
         song.is_resume = False
+        song.is_replay = False
         song.start_paused = False
         # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
         # clamps its fields into the play_history column domain — query_source
@@ -8798,6 +8758,7 @@ class TestLoopAdditional:
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
         song.is_resume = False
+        song.is_replay = False
         song.start_paused = False
         # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
         # clamps its fields into the play_history column domain — query_source
@@ -9358,30 +9319,6 @@ class TestLoopAdditional:
 
 
 @pytest.fixture
-def mock_vc() -> MagicMock:
-    vc = MagicMock(spec=discord.VoiceClient)
-    vc.is_playing.return_value = True
-    vc.is_paused.return_value = False
-    return vc
-
-
-@pytest.fixture
-def live_song(mock_song: MagicMock) -> MagicMock:
-    """mock_song with the interjection flags a real YTDL carries — bare MagicMock
-    attributes would read truthy and trip the loop's is_resume/start_paused
-    gates."""
-    mock_song.interjected = False
-    mock_song.is_resume = False
-    mock_song.start_paused = False
-    # Both have been silently dropped by the rebuild before now — persisted as an
-    # outright AttributeError (YTDL had no such attribute at all), user_input as a
-    # quiet default. A bare MagicMock reads truthy for either and hides both.
-    mock_song.user_input = "https://open.spotify.com/playlist/live"
-    mock_song.persisted = True
-    return mock_song
-
-
-@pytest.fixture
 def interject_obj(mock_author: MagicMock) -> QueueObject:
     return QueueObject(
         webpage_url="https://www.youtube.com/watch?v=urgent",
@@ -9393,6 +9330,41 @@ def interject_obj(mock_author: MagicMock) -> QueueObject:
 
 
 class TestInterject:
+    async def test_a_replay_copy_of_the_song_next_gets_no_resume_tail(
+        self,
+        music_player: MusicPlayer,
+        interject_obj: QueueObject,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """The copy plays the song again after the interjection already; only a
+        copy of this song counts, since another song's replay is not a resume."""
+        live_song.elapsed_secs = 83.0
+        music_player.current_song = live_song
+        other = QueueObject(
+            "https://yt.com/v=other", "Other", mock_author, is_replay=True
+        )
+        copy = QueueObject(
+            live_song.webpage_url, live_song.title, mock_author, is_replay=True
+        )
+
+        await music_player.queue.put([other])
+        with_other = await music_player.interject(interject_obj, mock_vc)
+        assert with_other is not None and not with_other.replay_pending
+        assert with_other.resume_position is not None
+
+        await music_player.queue_clear()
+        music_player._stopped_deliberately = False
+        music_player._skip_history_for = None
+        music_player._pending_resume_tail = None
+        await music_player.queue.put([copy])
+        with_copy = await music_player.interject(interject_obj, mock_vc)
+
+        assert with_copy is not None and with_copy.replay_pending
+        assert with_copy.resume_position is None
+        assert music_player.queue.display_items() == [interject_obj, copy]
+
     async def test_the_resume_tail_reads_a_real_ytdl(
         self,
         music_player: MusicPlayer,
@@ -9686,6 +9658,9 @@ class TestInterject:
         # It returns, so its history entry waits for the tail rather than being
         # written now — the marker is what defers it.
         assert music_player._skip_history_for is live_song
+        # And the stop is recorded, so a -replay landing before the loop wakes is
+        # declined rather than front-inserting a second copy of the same song.
+        assert music_player._stopped_deliberately
         mock_vc.stop.assert_called_once()
         assert outcome is not None
         assert outcome.resume_position == 30
@@ -10469,6 +10444,7 @@ class TestNeutralizePrefetch:
             np_message_id=77,
             np_channel_id=88,
             np_dedicated=True,
+            is_replay=True,
         )
         song.cleanup = MagicMock()
 
@@ -10496,6 +10472,7 @@ class TestNeutralizePrefetch:
             rebuilt.np_message_id,
             rebuilt.np_channel_id,
             rebuilt.np_dedicated,
+            rebuilt.is_replay,
         ) == (
             "https://open.spotify.com/playlist/abc",
             False,
@@ -10506,6 +10483,7 @@ class TestNeutralizePrefetch:
             1234.5,
             77,
             88,
+            True,
             True,
         )
 
@@ -11515,6 +11493,27 @@ class TestInterjectPostNeutralizeRecheck:
         finally:
             prefetch.cancel()
 
+    async def test_a_song_a_replay_already_stopped_is_not_interjected_over(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The mirror image of -replay declining a --now'd song: -replay's
+        max_concurrency bucket is its own and --now admits through PlayRegistry, so
+        neither declines the other, and current_song still names the song the other
+        one stopped. Interjecting over it builds a resume tail for a play that is
+        already ending."""
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        music_player.note_deliberate_stop()
+
+        assert await music_player.interject(interject_obj, mock_vc) is None
+        assert music_player.queue.display_items() == []
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
+
     async def test_bailing_leaves_an_existing_stack_untouched(
         self,
         music_player: MusicPlayer,
@@ -11730,6 +11729,330 @@ class TestInterjectOverASongThatIsOver:
         assert music_player.queue.display_items() == []
         mock_vc.stop.assert_not_called()
         assert music_player._skip_history_for is None
+
+
+class TestReplayQueueCard:
+    async def test_a_replay_card_says_it_replays_from_the_start(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """peek_next() is _items[0], so the replay is what the NP block's "Up next"
+        renders while the interrupted song is still current — the same song, in two
+        cards, one above the other. Unmarked it reads as a duplicate queue entry
+        rather than as the replay the user just asked for."""
+        replay = QueueObject(
+            live_song.webpage_url,
+            live_song.title,
+            mock_author,
+            duration=210,
+            is_replay=True,
+        )
+        await music_player.queue.put([replay])
+        music_player.current_song = live_song
+
+        block = music_player.np_embed_block()
+
+        assert len(block) == 2
+        next_up = described(block[1])
+        assert "🔁 Replays from `0:00`" in next_up
+        assert "Resumes at" not in next_up
+
+    async def test_an_ordinary_entry_is_not_marked_as_a_replay(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        queued = QueueObject(
+            "https://yt.com/v=b", "Queued B", mock_author, duration=210
+        )
+        await music_player.queue.put([queued])
+        music_player.current_song = live_song
+
+        assert "Replays from" not in described(music_player.np_embed_block()[1])
+
+
+class TestReplayLoopStart:
+    """Loop-level behavior for a -replay, the counterpart to TestInterjectLoopStart:
+    the replay plays from 0:00 unannounced, its two traces link to each other, the
+    interrupted play is recorded under its own played_at, and the card it leaves
+    behind is retired rather than finalized."""
+
+    async def _run_replay(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+    ) -> dict[str, Any]:
+        """Drive two loop iterations: song A plays, a -replay lands while the loop
+        waits on it, and the replay plays in the second iteration."""
+        first = loop_song("https://yt.com/v=a", "Song A", position=42.0)
+        replay_song = loop_song("https://yt.com/v=a", "Song A", position=0.0)
+        replay_song.is_replay = True  # carried from the copy by yt_stream
+
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        vc.pause = MagicMock()
+        vc.stop = MagicMock()
+        vc.is_paused = MagicMock(return_value=False)
+        vc.is_playing = MagicMock(return_value=True)
+        mocked(music_player._guild).voice_client = vc
+
+        recorded: list[HistoryEntry] = []
+        replayed = False
+
+        async def wait_then_replay() -> None:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                await replay_cmd.replay_current(
+                    music_player,
+                    vc,
+                    requester=mocked(queue_obj.requester),
+                    analytics=REPLAY_ASK,
+                )
+
+        music_player.play_next.wait = AsyncMock(side_effect=wait_then_replay)
+
+        async def fake_prefetch(_self: MusicPlayer) -> MagicMock | None:
+            """Stands in for the real prefetch, claim included: the loop's
+            prefetched branch settles a claim it did not take itself, so a mock that
+            only returns a song desynchronises the cursor and the iteration dies in
+            commit_dequeue."""
+            if music_player.queue.empty():
+                return None
+            music_player.queue.get_nowait()
+            return replay_song
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=first)
+            ),
+            patch.object(MusicPlayer, "_prefetch_next_song", new=fake_prefetch),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(MusicPlayer, "pause", new=AsyncMock()) as pause_mock,
+            patch.object(
+                MusicPlayer, "_announce_resume", new=AsyncMock()
+            ) as resume_mock,
+            patch.object(
+                MusicPlayer, "_announce_start_offset", new=AsyncMock()
+            ) as offset_mock,
+            patch.object(
+                GuildHistory, "add", new=AsyncMock(side_effect=recorded.append)
+            ),
+            _recording_tracer() as exporter,
+        ):
+            # Bounded: a regression that parks the loop fails here in seconds
+            # rather than at pytest-timeout's 120.
+            async with asyncio.timeout(5):
+                await music_player.loop()
+
+        return {
+            "exporter": exporter,
+            "first": first,
+            "replay": replay_song,
+            "recorded": recorded,
+            "pause": pause_mock,
+            "resume": resume_mock,
+            "offset": offset_mock,
+            "vc": vc,
+        }
+
+    async def test_the_two_traces_of_a_replay_say_so_and_are_linked(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """One song is one trace, so a replay is two, with identical attribute keys
+        otherwise: "why did this song restart" meant matching them by wall clock."""
+        out = await self._run_replay(music_player, queue_obj)
+
+        interrupted, replayed = _iterations(out["exporter"])
+        assert (interrupted.attributes or {})["song.ended_by"] == "replay"
+        assert "song.is_replay" not in (interrupted.attributes or {})
+        assert (replayed.attributes or {})["song.is_replay"] is True
+        assert [link.context.span_id for link in replayed.links] == [
+            interrupted.context.span_id
+        ]
+        assert music_player._replay_of is None
+
+    async def test_the_replay_plays_from_the_beginning_and_announces_nothing(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """ts is unset, so no -ss and no "Starting song at N seconds"; is_resume is
+        false, so no "Resuming". The card opening at 0:00 is the whole message."""
+        out = await self._run_replay(music_player, queue_obj)
+
+        assert out["replay"].start_offset == 0
+        assert out["replay"].start_paused is False
+        # Cleared at the replay's vc.play(): left set, every later -replay and
+        # --now would read the replay as a song already stopped.
+        assert music_player._stopped_deliberately is False
+        out["resume"].assert_not_awaited()
+        out["offset"].assert_not_awaited()
+        out["pause"].assert_not_awaited()
+
+    async def test_the_interrupted_play_is_recorded_under_its_own_start(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Both fragments are recorded — the replay spans none of what the first one
+        played — and they must carry different played_at values: play_history dedups
+        on (guild_id, played_at, webpage_url), so a shared stamp silently drops the
+        second row."""
+        out = await self._run_replay(music_player, queue_obj)
+
+        recorded = cast(list[HistoryEntry], out["recorded"])
+        assert len(recorded) == 2
+        assert recorded[0].played_secs == 42
+        assert recorded[0].webpage_url == recorded[1].webpage_url
+        assert recorded[0].played_at != recorded[1].played_at
+
+    async def test_the_interrupted_songs_card_is_retired_not_finalized(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """A bar frozen at 0:42 directly above the replay's own card names the same
+        song twice."""
+        host = MagicMock(spec=discord.Message)
+        host.id = 999
+        host.channel = MagicMock()
+        host.channel.id = 888
+
+        with (
+            patch.object(MusicPlayer, "_retire_np_host", new=AsyncMock()) as retire,
+            patch.object(MusicPlayer, "_fire_finalize_now_playing") as finalize,
+        ):
+            music_player._np_host_message = host
+            await self._run_replay(music_player, queue_obj)
+
+        assert retire.await_count >= 1
+        finalize.assert_not_called()
+        assert music_player._retire_np_for is None
+
+
+class TestReplayAgainstTheRealLoop:
+    """-replay awaits its front insert and then writes the prefetch slot, which the
+    loop reads and nulls at every song end. A song that ends inside that await must
+    not leave two tasks claiming items: loop() settles only the one it reads, so
+    the other's claim drifts _cursor for good."""
+
+    @pytest.mark.parametrize("latency", ["two ticks", "until the loop claims the copy"])
+    async def test_a_song_ending_inside_the_insert_plays_everything_once(
+        self, music_player: MusicPlayer, mock_author: MagicMock, latency: str
+    ) -> None:
+        a, b, c = (
+            QueueObject(f"https://yt.com/v={v}", f"Song {v}", mock_author)
+            for v in "abc"
+        )
+        await music_player.queue.put([a, b, c])
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        played: list[str] = []
+        afters: list[Callable[[Any], None]] = []
+
+        def _play(song: MagicMock, after: Callable[[Any], None]) -> None:
+            played.append(song.webpage_url)
+            afters.append(after)
+            if len(played) > 1:
+                # Everything after the first song ends on its own, shortly.
+                asyncio.get_running_loop().call_later(0.01, after, None)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=_play)
+        vc.stop = MagicMock(side_effect=lambda: afters[-1](None))
+        vc.pause = MagicMock()
+        vc.is_paused = MagicMock(return_value=False)
+        vc.is_playing = MagicMock(return_value=True)
+        mocked(music_player._guild).voice_client = vc
+        mocked(music_player.bot.is_closed).side_effect = lambda: len(played) >= 4
+
+        real_push = GuildRedisStore.push_queue_front
+
+        async def _push_while_the_song_ends(
+            store: GuildRedisStore, entries: Any
+        ) -> bool:
+            landed = await real_push(store, entries)
+            afters[0](None)  # song A reaches its end inside the LPUSH
+            if latency == "two ticks":
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            else:
+                # put_front holds the queue mutex through this await, so the loop
+                # can claim the copy here but not start it.
+                async with asyncio.timeout(5):
+                    while not music_player.queue.claim_outstanding():
+                        await asyncio.sleep(0)
+            return landed
+
+        async def _stream(source: QueueObject, **_: Any) -> MagicMock:
+            return replayed_song(source)
+
+        with (
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(side_effect=_stream)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(GuildHistory, "add", new=AsyncMock()),
+        ):
+            loop = asyncio.create_task(music_player.loop())
+            music_player._player = loop
+            async with asyncio.timeout(5):
+                while not (
+                    played
+                    and music_player._prefetch_task is not None
+                    and music_player._prefetch_task.done()
+                ):
+                    await asyncio.sleep(0)
+            with patch.object(
+                GuildRedisStore, "push_queue_front", new=_push_while_the_song_ends
+            ):
+                outcome = await replay_cmd.replay_current(
+                    music_player, vc, requester=mock_author, analytics=REPLAY_ASK
+                )
+            async with asyncio.timeout(5):
+                await loop
+
+        assert outcome is not None and outcome.stopped is False
+        assert played == [a.webpage_url, a.webpage_url, b.webpage_url, c.webpage_url]
+        assert not music_player.queue.claim_outstanding()
+        assert music_player.queue.display_items() == []
+        assert music_player.store is not None
+        assert (
+            await music_player.store.redis.llen(f"guild:{music_player._guild.id}:queue")
+            == 0
+        )
+
+    async def test_a_slot_filled_during_the_insert_is_not_overwritten(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        replayer: MagicMock,
+    ) -> None:
+        music_player.current_song = live_song
+        other = asyncio.create_task(asyncio.sleep(3600))
+        real_put_front = GuildQueue.put_front
+
+        async def _put_front_then_fill(queue: GuildQueue, items: Any) -> Any:
+            result = await real_put_front(queue, items)
+            music_player._prefetch_task = other  # the loop's or -shuffle's own
+            return result
+
+        try:
+            with (
+                patch.object(GuildQueue, "put_front", new=_put_front_then_fill),
+                patch("src.commands.replay._REPLAY_RESOLVE_TIMEOUT", 0.01),
+            ):
+                await replay_cmd.replay_current(
+                    music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                )
+            assert music_player._prefetch_task is other
+        finally:
+            other.cancel()
 
 
 class TestInterjectLoopStart:

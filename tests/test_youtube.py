@@ -300,8 +300,6 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             "thumbnail",
             # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
             "ts",
-            # Runtime-only NP handle; a live Message cannot be carried on a source.
-            "np_host_ref",
         }
         carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
         params = set(inspect.signature(YTDL.__init__).parameters)
@@ -327,6 +325,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             start_paused=True,
             persisted=False,
             played_at=12.5,
+            is_replay=True,
         )
 
         song = await self._played(qobj)
@@ -339,7 +338,8 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             song.start_paused,
             song.persisted,
             song.played_at,
-        ) == ("typed", "search", True, True, True, False, 12.5)
+            song.is_replay,
+        ) == ("typed", "search", True, True, True, False, 12.5, True)
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a

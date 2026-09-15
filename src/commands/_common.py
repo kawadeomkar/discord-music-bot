@@ -17,6 +17,10 @@ from src.util import (
 )
 
 
+# -now and -replay answer the same idle state, so they answer it identically.
+NOTHING_PLAYING = "No songs are currently playing."
+
+
 def echo(text: str, limit: int = ECHO_MAX) -> str:
     """A needle safe to put in an embed — see util.safe_label."""
     return safe_label(text, limit)
