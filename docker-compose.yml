@@ -43,9 +43,10 @@ services:
       # metrics stack lives on another host.
       - DEBUG_PROMETHEUS_URL=${DEBUG_PROMETHEUS_URL:-http://localhost:${PROMETHEUS_HOST_PORT:-9090}}
       # Off by default; `true` starts every server with debug mode on. This is the
-      # default for servers that have NEVER run `-debug --enable`/`--disable` —
-      # that choice is per server, persisted to guild:{id}:config, and wins over
-      # this value across restarts.
+      # default for servers that have NEVER chosen with `-debug --enable`/`--disable`
+      # or `-settings debug` — that choice is per server, persisted to
+      # guild:{id}:config, and wins over this value across restarts. The operator's
+      # `-settings bot debug-default` replaces this value until the bot restarts.
       - DEBUG_MODE
       #
       # Built from the same POSTGRES_* vars as the postgres service below, so

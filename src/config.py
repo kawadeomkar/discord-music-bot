@@ -425,9 +425,10 @@ def history_archive_enabled() -> bool:
 
 def debug_mode_default() -> bool:
     """Process-wide default for debug mode (observation-only embed footers) for
-    guilds that never ran `-debug --enable/--disable`; a persisted per-guild
-    choice wins over it. Read once by MusicBot.__init__ so garbage aborts
-    startup."""
+    guilds that never chose with `-debug --enable/--disable` or `-settings debug`;
+    a persisted per-guild choice wins over it, and the operator's `-settings bot
+    debug-default` replaces it until restart. Read once by MusicBot.__init__ so
+    garbage aborts startup."""
     return _parse_bool_env("DEBUG_MODE")
 
 

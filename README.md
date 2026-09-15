@@ -548,8 +548,8 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 ## Upgrading to 2.39.0
 
 **Four settings now refuse startup when they are out of range**, the way the other
-tunables already did. Each used to be read with no check at all, so a typo reached the
-loop that uses it:
+tunables already did. Each used to be read with no range check, so an out-of-range value
+reached the loop that uses it:
 
 | Variable | Accepted | What an out-of-range value used to do |
 |---|---|---|
@@ -558,10 +558,10 @@ loop that uses it:
 | `LIVENESS_INTERVAL_SECS` | 1 to 60 | above 90, a healthy container reported unhealthy between touches |
 | `YTDLP_POOL_WORKERS` | 1 or more | `0` failed every lookup, each time the pool tried to start |
 
-A value outside its range, `nan`, `inf`, or something that is not a number now stops the
-bot at startup with an error naming the variable, instead of starting. If yours start as
-before, nothing changes: every default is inside its range. Rolling back is only a
-redeploy.
+A value outside its range, `nan` or `inf` now stops the bot at startup instead of
+starting. Something that is not a number already stopped it; the error now names the
+variable. If yours start as before, nothing changes: every default is inside its range.
+Rolling back is only a redeploy.
 
 ## Upgrading to 2.37.0
 
