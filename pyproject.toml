@@ -114,7 +114,7 @@ optional = true
 # Dependabot bump inside a caret range turns an untouched PR red at the `types` step
 # while everyone who has not re-run `just install` still passes locally. The range
 # had already drifted once: the floor read ^1.1.409 while the lock resolved 1.1.411.
-pyright = { version = "1.1.411", extras = ["nodejs"] }
+pyright = { version = "1.1.414", extras = ["nodejs"] }
 # Exact-pinned, like yt-dlp and discord-py, because a second file has to agree
 # with it: .pre-commit-config.yaml pins the ruff hook by `rev`, and the hook runs
 # ruff from its own isolated environment. Under a caret range any `poetry update`
