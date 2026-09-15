@@ -549,9 +549,8 @@ def live_song(mock_song: MagicMock) -> MagicMock:
     mock_song.interjected = False
     mock_song.is_resume = False
     mock_song.start_paused = False
-    # Both have been silently dropped by the rebuild before now — persisted as an
-    # outright AttributeError (YTDL had no such attribute at all), user_input as a
-    # quiet default. A bare MagicMock reads truthy for either and hides both.
+    # Real values: a bare MagicMock reads truthy for both, and would hide a rebuild
+    # that drops either.
     mock_song.user_input = "https://open.spotify.com/playlist/live"
     mock_song.persisted = True
     return mock_song

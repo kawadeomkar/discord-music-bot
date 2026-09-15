@@ -495,8 +495,8 @@ class MusicPlayer:
         # iteration end; set and cleared wherever _skip_history_for is.
         self._skip_history_for: Optional[YTDL] = None
         self._pending_resume_tail: Optional[QueueObject] = None
-        # The song whose NP card the loop retires instead of finalizing. Identity,
-        # not a flag, like _skip_history_for.
+        # The song whose NP card the loop retires instead of finalizing. An identity,
+        # like _skip_history_for, so a stale marker cannot retire another song's card.
         self._retire_np_for: Optional[YTDL] = None
         # The trace of the play a -replay stopped, linked from the replay's own
         # trace when that starts: one song is one trace, and a replay is two.
@@ -844,7 +844,7 @@ class MusicPlayer:
             # ffmpeg exited without a frame: nobody heard it.
             return None
         # Captured before cleanup()'s retire_np_host_on_stop() disposes of it: the
-        # row names the host, which a dedicated card no longer outlives.
+        # history row names this message.
         host = self._np_host_message
         entry = HistoryEntry.from_song(
             song,
@@ -1965,9 +1965,9 @@ class MusicPlayer:
         return self._stopped_deliberately
 
     def hand_over_to_replay(self, song: YTDL) -> Optional[trace.SpanContext]:
-        """After -replay stops `song`: retire its NP card instead of freezing it above
-        the replay's, and have the replay's trace link back to this play's. Returns
-        that play's span context, or None when it had no trace."""
+        """After -replay stops `song`: retire its NP card, and have the replay's trace
+        link back to this play's. Returns that play's span context, or None when it had
+        no trace."""
         self._retire_np_for = song
         if self._playback_span is None:
             return None
@@ -2731,10 +2731,9 @@ class MusicPlayer:
                             HistoryEntry.from_song(
                                 song,
                                 guild_id=self._guild.id,
-                                # The host captured at song end, not
-                                # _np_host_message, which was nulled above; a
-                                # dedicated one retired above no longer exists.
-                                # Both ids come off that one message. 0 = nothing
+                                # The host captured at song end: _np_host_message was
+                                # nulled above, and a retired dedicated host is already
+                                # deleted. Both ids come off that message; 0 = nothing
                                 # hosted it.
                                 message_id=(
                                     finished_host.id if finished_host is not None else 0

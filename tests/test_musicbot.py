@@ -858,7 +858,7 @@ class TestValidateCommands:
     async def test_a_refusal_hands_back_the_cooldown_prepare_charged(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """discord.py's prepare() charges cooldowns BEFORE before-invoke hooks, so a
+        """discord.py's prepare() charges cooldowns before before-invoke hooks, so a
         -rp from outside voice spent -replay's one guild token and locked the whole
         guild out for five seconds. Against the real command's real bucket."""
         mock_ctx.voice_client = None
@@ -903,10 +903,8 @@ class TestMaxConcurrencyNotice:
     ) -> None:
         """This arm is the only place a user learns why they were refused. Deleting
         it falls through to the generic handler, and zeroing retry_after reads as
-        "try again now". It names the command because -analytics and -replay both
-        carry a cooldown now, so an unnamed refusal does not say which one it
-        answers — and the copy was unpinned until two branches wrote two different
-        strings for it."""
+        "try again now". It names the command: -analytics and -replay both carry a
+        cooldown, and an unnamed refusal does not say which one it answers."""
         mock_ctx.command = MagicMock()
         mock_ctx.command.name = "analytics"
         await music_bot.cog_command_error(

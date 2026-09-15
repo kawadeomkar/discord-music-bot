@@ -9281,7 +9281,7 @@ class TestInterject:
         mock_author: MagicMock,
     ) -> None:
         """The copy plays the song again after the interjection already; only a
-        copy of THIS song counts, since another song's replay is not a resume."""
+        copy of this song counts, since another song's replay is not a resume."""
         live_song.elapsed_secs = 83.0
         music_player.current_song = live_song
         other = QueueObject(
@@ -11711,10 +11711,10 @@ class TestReplayQueueCard:
 
 
 class TestReplayLoopStart:
-    """Loop-level behavior for a -replay, the counterpart to
-    TestInterjectLoopStart: the replay plays from 0:00, a paused one parks and SAYS
-    so, the interrupted play is recorded under its own played_at, and the card it
-    leaves behind is retired rather than frozen."""
+    """Loop-level behavior for a -replay, the counterpart to TestInterjectLoopStart:
+    the replay plays from 0:00 unannounced, its two traces link to each other, the
+    interrupted play is recorded under its own played_at, and the card it leaves
+    behind is retired rather than finalized."""
 
     async def _run_replay(
         self,
@@ -11841,7 +11841,7 @@ class TestReplayLoopStart:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """Both fragments are recorded — the replay spans none of what the first one
-        played — and they must carry DIFFERENT played_at values: play_history dedups
+        played — and they must carry different played_at values: play_history dedups
         on (guild_id, played_at, webpage_url), so a shared stamp silently drops the
         second row."""
         out = await self._run_replay(music_player, queue_obj)

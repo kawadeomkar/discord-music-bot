@@ -168,7 +168,7 @@ class TestReplayCommand:
         live_vc: MagicMock,
     ) -> None:
         """replay_current returns None when the song ends inside its stream warm.
-        Something WAS playing at dispatch, so the generic idle notice would read as
+        Something was playing at dispatch, so the generic idle notice would read as
         the bot having ignored the command."""
         replay.return_value = None
         music_bot.get_mp = MagicMock(return_value=live_mp)
@@ -545,7 +545,7 @@ class TestReplayDecorators:
     the decorators bypassed. Nothing else reads them."""
 
     def test_replay_is_rate_limited_as_well_as_serialized(self) -> None:
-        """max_concurrency bounds how many run at once; it does not bound how OFTEN.
+        """max_concurrency bounds how many run at once; it does not bound how often.
         -replay is the one command that consumes nothing and can be repeated on the
         same song forever, and every repeat writes a history entry — which LTRIMs a
         real play out of the 50-entry window that, with the archive off, is the only
@@ -683,10 +683,8 @@ class TestReplayCurrent:
         mock_vc: MagicMock,
         replayer: MagicMock,
     ) -> None:
-        """The live song ALWAYS carries a played_at — the loop stamps it at
-        vc.play(). Carrying it onto the replay would be invisible here if the
-        fixture were left unstamped, and in production it deletes an archive row:
-        the loop's stamp is `played_at or now`, so an inherited value survives, both
+        """The live song always carries a played_at, stamped at vc.play(), so the
+        fixture stamps one. Inherited, it survives the loop's `played_at or now`: both
         rows share the (guild_id, played_at, webpage_url) dedup key, and ON CONFLICT
         DO NOTHING drops the second with no error and no log line."""
         live_song.played_at = 1752530000.0
@@ -779,7 +777,7 @@ class TestReplayCurrent:
         mock_vc: MagicMock,
         replayer: MagicMock,
     ) -> None:
-        """-play's precedent: the caller named THIS song, so the ask is for it to
+        """-play's precedent: the caller named this song, so the ask is for it to
         sound. Parked instead, the replay is a bot making no noise under a card that
         says Now Playing — which reads as the command having been ignored."""
         mock_vc.is_playing.return_value = False
@@ -1043,7 +1041,7 @@ class TestReplayCurrent:
         replayer: MagicMock,
     ) -> None:
         """The opposite of a --now interjection, deliberately: a resume tail
-        SPANS what was already heard, so the fragment declines its entry — a replay
+        spans what was already heard, so the fragment declines its entry — a replay
         starts at 0:00 and spans nothing, so suppressing the interrupted play would
         lose that listening outright."""
         live_song.elapsed_secs = 42.0
@@ -1257,9 +1255,9 @@ class TestReplayCurrent:
         mock_author: MagicMock,
         command: str,
     ) -> None:
-        """The same commands against a COMPLETED resolve, in the tick between it
+        """The same commands against a completed resolve, in the tick between it
         finishing and the verdict: -clear's cancel is a no-op on a done task and
-        empties the deque around the claim, and a neutralize requeues a REBUILT
+        empties the deque around the claim, and a neutralize requeues a rebuilt
         copy, so identity with the copy is what tells them apart."""
         music_player.current_song = live_song
         replay = QueueObject(
@@ -1323,7 +1321,7 @@ class TestReplayCurrent:
         mock_vc: MagicMock,
         replayer: MagicMock,
     ) -> None:
-        """A completed prefetch bypasses the queue, so it would play INSTEAD of the
+        """A completed prefetch bypasses the queue, so it would play instead of the
         front-inserted replay."""
         music_player.current_song = live_song
         blocker = asyncio.create_task(asyncio.sleep(30))
@@ -1347,7 +1345,7 @@ class TestReplayCurrent:
     ) -> None:
         """The neutralize is destructive and the liveness answer does not depend on
         it, so checking only afterwards spends the next song's fully-resolved source
-        to reach a refusal — the user is told nothing was replayed AND the next
+        to reach a refusal — the user is told nothing was replayed and the next
         transition pays a cold extraction it had already paid for."""
         music_player.current_song = live_song
         music_player.note_deliberate_stop()  # already stopped by --now
@@ -1425,12 +1423,10 @@ class TestReplayCurrent:
         mock_vc: MagicMock,
         replayer: MagicMock,
     ) -> None:
-        """current_song is NOT cleared when a song ends — the loop clears it two
-        task cancels later. In that window an identity check alone passes for a song
-        already finished, and the replay then plays a second full time ahead of the
-        queue and earns a second full-length history row. play_next is set by the
-        audio thread and cleared at the top of the next iteration, so it marks
-        exactly that window."""
+        """current_song is not cleared when a song ends; the loop clears it two task
+        cancels later. There, an identity check alone passes for a finished song, which
+        would play again in full with a second history row. play_next, set by the
+        audio thread and cleared at the next iteration, marks exactly that window."""
         music_player.current_song = live_song
         music_player.play_next.set()
 

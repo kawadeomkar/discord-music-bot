@@ -87,20 +87,11 @@ async def replay_current(
     requester: Union[discord.User, discord.Member],
     analytics: Analytics,
 ) -> Optional[ReplayOutcome]:
-    """Play `mp`'s live song again from its beginning.
-
-    A rebuilt copy goes to the front of the queue with no `ts` (so no -ss, and a
-    `?t=` offset is dropped), is resolved the way any next song is prefetched,
-    and the live song is stopped; the loop's dequeue -> play cycle does the rest.
-    The copy is persisted, so a crash mid-replay recovers like any front insert.
-    A paused song comes back playing.
-
-    `requester` and `analytics` are the caller's: the replay is a new ask.
-
-    None when there is no live song, no URL to rebuild from, or the song stopped
-    being live while the replay resolved.
-    See docs/ARCHITECTURE.md#-replay.
-    """
+    """Play `mp`'s live song again from `0:00`: front-insert a copy with no `ts`,
+    persisted like any front insert, resolve it through the loop's prefetch, then stop
+    the song. `requester` and `analytics` are the caller's. None when nothing is live,
+    there is no URL to rebuild from, or the song stopped being live while the copy
+    resolved. See docs/ARCHITECTURE.md#-replay."""
     current = mp.current_song
     if current is None or not current.webpage_url:
         return None
@@ -119,7 +110,7 @@ async def replay_current(
         uploader=current.uploader,
         thumbnail=current.thumbnail,
         analytics=analytics,
-        # Classifies how the SONG was found, which a replay does not change,
+        # Classifies how the song was found, which a replay does not change,
         # and webpage_url cannot rebuild it — a Spotify link, a search and a
         # pasted link all archive as youtube.com.
         query_source=current.query_source,
@@ -128,7 +119,7 @@ async def replay_current(
         # dequeues it.
         is_replay=True,
     )
-    # A completed prefetch bypasses the queue and would play INSTEAD of the
+    # A completed prefetch bypasses the queue and would play instead of the
     # front-inserted replay — take it off the board first.
     await mp.settle_prefetch()
     # Re-check after that await.
