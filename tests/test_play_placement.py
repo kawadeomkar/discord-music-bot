@@ -478,7 +478,25 @@ class TestRetirePlayerFence:
 
 class TestPlacedMeansLanded:
     """`placed` is what -stop/-clear/-remove read to decide whether a request is
-    past dropping. Set before the body, a put that raised claims to have landed."""
+    past dropping. It is set once the checks pass, so a command arriving during the
+    put leaves the request alone, and a put that raised gives the request back."""
+
+    async def test_a_request_is_placed_while_its_put_runs(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        req = admit(music_bot, mock_ctx, mp)
+
+        async with music_bot._plays.place(req) as verdict:
+            assert verdict.placed
+            assert req.placed
+            stopped = music_bot._plays.inflight(play_key(mock_ctx), "remove")
+            # place() sets it on return too, so a drop is only visible in here.
+            assert not req.settled.is_set()
+
+        assert stopped == []
+        assert req.dropped_by == ""
 
     async def test_a_body_that_raises_leaves_the_request_droppable(
         self, music_bot: MusicBot, mock_ctx: MagicMock
