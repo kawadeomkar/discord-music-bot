@@ -1081,6 +1081,7 @@ tests/                  # one test_*.py per src/ module, plus:
 ├── commands/           # mirrors src/commands/ — a command's tests live with its body
 ├── conftest.py         # shared fixtures and seams
 ├── helpers.py          # test-only builders
+├── mock_spec_cache.py  # memoizes unittest.mock spec introspection
 └── test_context.py     # Discord context doubles
 
 migrations/             # NNNN_*.sql, applied in numeric order — the only source of schema
