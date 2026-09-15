@@ -707,9 +707,10 @@ def _playlist_cache_key(url: str) -> str:
     arrives as /playlist?list=X, as a watch link carrying `&index=`, and with a `&t=`
     on it, and those must share an entry rather than fragmenting the cache per entry
     point. A URL carrying no `list=` falls back to itself. Versioned with the value:
-    v2 entries hold a Mix without its repeats."""
+    v3 holds the title and the unavailable count beside the entries, and a Mix
+    without its repeats."""
     list_id = parse_qs(urlparse(url).query).get("list", [""])[0]
-    return f"ytdl:playlist:v2:{list_id or url}"
+    return f"ytdl:playlist:v3:{list_id or url}"
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -1306,13 +1307,26 @@ def _first_video_entry(data: YTDLExtractResult) -> Optional[YTDLEntry]:
     return None
 
 
-def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
-    """The playable entries of a flat playlist extraction, in order. Entries yt-dlp
-    could not describe are dropped HERE, before the cache, so a hit cannot resurrect
-    a deleted video the miss already refused."""
-    # Optional in the element type, not re-annotated on the loop target: yt-dlp emits
-    # a null entry for a deleted/private video, which is what the guard below skips —
-    # declaring it non-optional excluded that case.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class YoutubePlaylist:
+    """What yt_playlist resolves: the tracks to queue, plus the playlist's own title
+    (None when the extraction carries none) and how many of its entries were dropped
+    as unavailable. A Mix's dropped repeats are not counted as unavailable."""
+
+    title: Optional[str]
+    tracks: list[QueueObject]
+    unavailable: int
+
+
+def _playlist_tracks(
+    data: YTDLExtractResult, url: str
+) -> tuple[list[SourceIdentity], int]:
+    """The playable entries of a flat playlist extraction, in order, and how many
+    entries were unavailable. Those are dropped HERE, before the cache, so a hit
+    cannot resurrect a deleted video the miss already refused."""
+    # Optional in the element type, not re-annotated on the loop target: yt-dlp can
+    # emit a null entry, which is what the guard below skips — declaring it
+    # non-optional excluded that case.
     entries: list[Optional[YTDLEntry]] = data.get("entries") or []
     tracks: list[SourceIdentity] = []
     # A Mix keeps each video's first occurrence: yt-dlp's window walk can repeat a
@@ -1321,12 +1335,15 @@ def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
     mix = is_mix(data.get("id", ""))
     seen: set[str] = set()
     repeats = 0
+    unavailable = 0
     for i, entry in enumerate(entries):
         if not entry:
+            unavailable += 1
             log.warning("Skipping null entry at playlist index %d for %s", i, url)
             continue
         video_id = entry.get("id")
         if not video_id:
+            unavailable += 1
             log.warning(
                 "Skipping entry at playlist index %d (title=%r) — missing video ID for %s",
                 i,
@@ -1339,6 +1356,18 @@ def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
             if mix:
                 continue
         seen.add(video_id)
+        # A private or deleted video arrives as its id alone, with no title and no
+        # duration; a live entry has a title and is kept. Checked after the repeat,
+        # so a Mix that walks past one unavailable video twice counts it once.
+        if not entry.get("title") and entry.get("duration") is None:
+            unavailable += 1
+            log.warning(
+                "Skipping unavailable video %s at playlist index %d for %s",
+                video_id,
+                i,
+                url,
+            )
+            continue
         # A flat entry already carries what the card shows. duration is None on a
         # live entry; uploader falls back to channel on lockupViewModel entries.
         raw_duration = entry.get("duration")
@@ -1354,13 +1383,15 @@ def _playlist_tracks(data: YTDLExtractResult, url: str) -> list[SourceIdentity]:
                 thumbnail=entry.get("thumbnail"),
             )
         )
+    if unavailable:
+        trace.get_current_span().set_attribute("ytdl.playlist_unavailable", unavailable)
     if repeats:
         span = trace.get_current_span()
         span.set_attribute("ytdl.playlist_repeats", repeats)
         span.set_attribute("ytdl.playlist_repeats_dropped", mix)
         if mix:
             log.info("Dropped %d repeated entries from the mix at %s", repeats, url)
-    return tracks
+    return tracks, unavailable
 
 
 async def _revalidate_source(
@@ -1922,8 +1953,9 @@ class YTDL(discord.FFmpegOpusAudio):
         redis: Optional[aioredis.Redis] = None,
         on_progress: Optional[ProgressFn] = None,
         pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
-    ) -> list[QueueObject]:
-        """Fetch flat entry metadata for every video in a YouTube playlist.
+    ) -> YoutubePlaylist:
+        """Fetch flat entry metadata for every video in a YouTube playlist, with the
+        playlist's title and the count of entries dropped as unavailable.
 
         query_source, analytics and user_input are REQUIRED (see yt_source).
         `analytics` is the head's — track positions are derived per kept track
@@ -1937,7 +1969,8 @@ class YTDL(discord.FFmpegOpusAudio):
         `on_progress` arms the streaming hook and subscribes to it. Without one the
         opts are the shared constant — no match_filter, no lazy_playlist. With one,
         the ENTRY LIST comes back identical and the info-dict does not: lazy
-        extraction drops the top-level playlist_count, which nothing here reads.
+        extraction drops the top-level playlist_count, which nothing here reads, and
+        keeps the top-level title, which is read.
         A caller that JOINS an
         extraction started without one gets no reports: it issues no request of its
         own, so there is nothing to arm."""
@@ -1947,7 +1980,9 @@ class YTDL(discord.FFmpegOpusAudio):
         cached = await cache_get(redis, cache_key)
         span.set_attribute("ytdl.playlist_cache_hit", cached is not None)
         if cached is not None:
-            tracks = [_identity_from_wire(entry) for entry in cached]
+            title = cached.get("title")
+            unavailable = cached.get("unavailable", 0)
+            tracks = [_identity_from_wire(entry) for entry in cached.get("entries", [])]
         else:
             # The extraction is the publisher and the key names it, so two cards
             # on one playlist both move (see _progress_subscription).
@@ -1965,7 +2000,8 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
             if data is None:
                 raise Exception(f"Could not fetch YouTube playlist: {url}")
-            tracks = _playlist_tracks(data, url)
+            title = data.get("title") or None
+            tracks, unavailable = _playlist_tracks(data, url)
             if tracks:
                 # An empty result is not cached: a private or unavailable playlist
                 # extracts to no entries too, and a quarter hour is a long time to
@@ -1973,21 +2009,29 @@ class YTDL(discord.FFmpegOpusAudio):
                 await cache_set(
                     redis,
                     cache_key,
-                    [_identity_to_wire(track) for track in tracks],
+                    {
+                        "title": title,
+                        "unavailable": unavailable,
+                        "entries": [_identity_to_wire(track) for track in tracks],
+                    },
                     _YT_PLAYLIST_TTL,
                 )
         span.set_attribute("ytdl.playlist_size", len(tracks))
         # Positions derive from the KEPT tracks, so the entries _playlist_tracks
         # dropped leave no gaps. replace() so a field added to Analytics is carried.
-        return [
-            _queue_object_from_identity(
-                track,
-                requester,
-                query_source=query_source,
-                analytics=replace(
-                    analytics, queue_position=analytics.queue_position + offset
-                ),
-                user_input=user_input,
-            )
-            for offset, track in enumerate(tracks)
-        ]
+        return YoutubePlaylist(
+            title=title,
+            tracks=[
+                _queue_object_from_identity(
+                    track,
+                    requester,
+                    query_source=query_source,
+                    analytics=replace(
+                        analytics, queue_position=analytics.queue_position + offset
+                    ),
+                    user_input=user_input,
+                )
+                for offset, track in enumerate(tracks)
+            ],
+            unavailable=unavailable,
+        )

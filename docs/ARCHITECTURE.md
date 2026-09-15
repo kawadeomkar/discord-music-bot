@@ -461,7 +461,7 @@ sequenceDiagram
     Sources-->>Bot: YTSource | SpotifySource | SoundcloudSource
 
     alt Spotify playlist
-        Bot->>SP: spotify.playlist(id) → List[str] titles
+        Bot->>SP: spotify.playlist(id) → SpotifyPlaylist, its titles
         Bot->>Sources: spotify_playlist_to_ytsearch(titles) → List[YTSource]
         Bot->>MP: queue_put(items, prefetch=False)
     else YouTube playlist
@@ -643,7 +643,7 @@ flowchart TD
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
-- **Playlist**: `Spotify.playlist(id)` → `List[str]` titles → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
 
 ---
 
@@ -757,17 +757,17 @@ It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` tak
 
 `yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
 
-It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v2:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes).
+It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v3:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes). `yt_playlist` returns a `YoutubePlaylist`: the tracks, the playlist's `title` (from the extraction's top-level info-dict, which carries it with and without `lazy_playlist`; `None` when absent) and `unavailable`, the count of entries dropped as unplayable.
 
 **Fifteen minutes, not the source cache's day.** A playlist is editable, and its entry count and order are what the callers' `&index=` handling and every "Queued playlist — N songs" line are built from. What the window has to cover is the two cases that actually hurt: the same collection pasted twice in a burst, and a re-paste soon after.
 
 **The key is the `list=` id.** One collection reaches the bot as `/playlist?list=X`, as a watch link carrying `&index=4`, and with a `&t=` on the end. Keyed on the pasted URL those are three entries and three extractions. A URL with no `list=` falls back to itself.
 
-**Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. Entries yt-dlp could not describe (a null entry for a deleted video, one with no `id`) are dropped in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps.
+**Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. The value is `{"title", "unavailable", "entries": [...]}`, so a hit returns the title and count the miss wrote. Entries yt-dlp could not describe (a null entry, one with no `id`, and one with an `id` but neither a title nor a duration — how a private or deleted video arrives in a flat extraction) are dropped and counted in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps. A live entry has a title and no duration and is kept; an entry with a duration and no title is kept under its video id. The count rides the span as `ytdl.playlist_unavailable`.
 
 **An empty result is not cached.** A private or unavailable playlist extracts to no entries too, and a quarter of an hour is a long time to answer a retry with the same nothing.
 
-**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key carries a `v2` because this changed what an entry holds: an unversioned key would serve a pre-dedupe Mix for its remaining TTL.
+**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`; a dropped repeat is not counted as unavailable, so a private video a Mix walks past twice counts once. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key is versioned with the value's shape (`v3`: a deduplicated entry list beside the title and unavailable count), so no build reads a value written for another.
 
 ---
 
@@ -918,7 +918,7 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 3).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 4: a playlist card sent with its unavailable-songs notice).
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
@@ -956,7 +956,7 @@ A collection enqueue that outlives `QUEUE_PROGRESS_DELAY_SECS` gets a live card 
 
 **Where the numbers come from.** A Spotify collection is easy: the pager reads `total` from page 1 and reports after every page, so its bar is determinate from the first tick. A YouTube collection has no such channel — `YTDL.yt_playlist` awaits one `extract_info` that returns after the whole continuation walk, so the track count and the tracks would arrive in the same tick, milliseconds before the card is deleted. It gets one built for it (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). A collection with no header count at all — a Mix (`RD…`, other than a curated `RDCLAK5uy_` list), a channel tab — still renders indeterminate: an elapsed line rounded to 5 s and no bar. That is a steady state, not a transient one.
 
-**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null and ID-less entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
+**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null, ID-less and id-only (private or deleted) entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
 
 **The card is a SECOND message and never becomes the confirmation.** `play_pipeline._reply` sends the confirmation through `MusicContext.send`, which prepends the Now Playing block and adopts that message as the NP host. A card sent with `ctx.channel.send` — which it must be, or the progress updater rewrites it every 3 s — can never do that, so merging the two would stop every playlist enqueue from re-hosting the NP card at the channel bottom. The cost of not merging is that the existing host sits *above* the card, edited invisibly, for the card's whole life: one of the documented exceptions to the host model, listed under [Now Playing host invariants](#now-playing-host-invariants), bounded by the delete, and NOT by the ceiling below — that stops the card EDITING, it does not take it down, so a resolve that outlives it leaves the host buried until the enqueue finally settles.
 
@@ -1127,7 +1127,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:v2:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1449,7 +1449,7 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:v2:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
+| `playlist(id)` | `spotify:playlist:v3:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -1928,6 +1928,8 @@ provisioned ahead of enforcement rather than after it.
 **A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
 
 **A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
+
+**The name is a request of its own.** `v1/playlists/{id}/tracks` does not carry the playlist's name, so after the walk, still inside its slot, `_playlist_name` sends one `GET v1/playlists/{id}?fields=name`, bounded by `_PLAYLIST_PAGE_TIMEOUT_SECS`. Folding the name into page 1 — fetching `v1/playlists/{id}` with a nested `tracks(...)` mask — does not work: the `tracks.next` cursor Spotify returns then carries that request's `fields=name,tracks(...)`, and page 2 fetched from it comes back as `{}`, which this walk reads as a refused playlist. The name only decorates the confirmation, so any failure there returns `None` and never fails the walk. The walk's own mask adds `duration_ms`, which costs no extra request: the result sums the kept tracks' milliseconds and divides once, and marks the total `duration_partial` when a kept track carried none. `unavailable` counts items walked and not kept.
 
 ### Progress out of a yt-dlp worker
 

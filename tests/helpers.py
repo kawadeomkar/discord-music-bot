@@ -18,7 +18,7 @@ from discord.utils import MISSING as _DISCORD_MISSING
 from src.guild_queue import GuildQueue, QueueItem
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.play_placement import PlayMode, PlayRequest
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 
 if TYPE_CHECKING:
     from src.musicbot import MusicBot
@@ -125,6 +125,18 @@ def stub_create_task(return_value: Optional[Any] = None) -> MagicMock:
         return return_value if return_value is not None else MagicMock()
 
     return MagicMock(side_effect=_impl)
+
+
+def stub_yt_playlist(
+    tracks: list[QueueObject], *, title: Optional[str] = None, unavailable: int = 0
+) -> AsyncMock:
+    """A stand-in for YTDL.yt_playlist resolving to `tracks`, untitled and with
+    nothing unavailable unless the test says otherwise."""
+    return AsyncMock(
+        return_value=YoutubePlaylist(
+            title=title, tracks=tracks, unavailable=unavailable
+        )
+    )
 
 
 def make_mock_task() -> MagicMock:
@@ -260,6 +272,8 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     # `--next` inserts through its own wrapper, which neutralizes the loop's
     # prefetch first — a plain front insert lands behind that claim.
     mp.queue_put_next = AsyncMock()
+    # A str, not auto-vivified: the queued-playlist card joins it into its text.
+    mp.playlist_facts = MagicMock(return_value="")
     mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in

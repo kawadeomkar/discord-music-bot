@@ -221,10 +221,11 @@ def _remaining_secs(item: QueueObject) -> Optional[int]:
     return item.duration
 
 
-def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
+def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
     """Total remaining playtime of queued items, and whether any duration was
     unknown (the total is then a lower bound, flagged with "~"). Shared by
-    queue_embed() and the resume notices so they can't disagree."""
+    queue_embed(), the resume notices and the queued-playlist card so they can't
+    disagree."""
     total_secs = 0
     partial = False
     for item in items:
@@ -694,7 +695,7 @@ class MusicPlayer:
         items = self.queue.display_items()
         total = len(items)
 
-        total_secs, duration_partial = _queue_runtime(items)
+        total_secs, duration_partial = queue_runtime(items)
 
         now_pst, walk = self._queue_eta_seed()
 
@@ -814,7 +815,7 @@ class MusicPlayer:
         count = len(items)
         songs = pluralize(count, "song")
         embed.add_field(name="Queued", value=f"**{count}** {songs}", inline=True)
-        total_secs, partial = _queue_runtime(items)
+        total_secs, partial = queue_runtime(items)
         if total_secs > 0:
             prefix = "~" if partial else ""
             embed.add_field(
@@ -1350,6 +1351,27 @@ class MusicPlayer:
             note=note,
             warning=warning,
         )
+
+    def playlist_facts(self, *, ahead: int, runtime: tuple[int, bool]) -> str:
+        """The queued-playlist card's facts, read after the insert like the single-song
+        card's: total runtime (queue_runtime's shape), the queued songs that play
+        before it, and when its first song starts. A playlist that starts at once
+        has no start time to give."""
+        runtime_secs, partial = runtime
+        facts = []
+        if runtime_secs > 0:
+            prefix = "~" if partial else ""
+            facts.append(
+                f"Total Duration: **{prefix}{_fmt_total_duration(runtime_secs)}**"
+            )
+        if ahead:
+            facts.append(f"Songs ahead: **{ahead}**")
+        lines = ["  ·  ".join(facts)] if facts else []
+        now_pst, walk = self._eta_walk_to(ahead + 1)
+        if walk.cumulative_secs or walk.uncertain:
+            eta = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+            lines.append(f"Est. playing at {_fmt_eta(eta, walk.uncertain)}")
+        return "\n".join(lines)
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
         item = self.queue.peek_next()

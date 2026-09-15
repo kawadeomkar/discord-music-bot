@@ -2375,6 +2375,64 @@ class TestEtaWalkTo:
 # ── BuildNowPlayingEmbed ──────────────────────────────────────────────────────
 
 
+class TestPlaylistFacts:
+    """The queued-playlist card's facts line: total runtime, the queued songs ahead,
+    and the start time — the same walk and formats the queue cards use."""
+
+    def test_a_playlist_that_starts_at_once_gives_its_length_alone(
+        self, music_player: MusicPlayer
+    ) -> None:
+        facts = music_player.playlist_facts(ahead=0, runtime=(3723, False))
+        assert facts == "Total Duration: **1h 2m 3s**"
+
+    def test_an_unknown_length_marks_the_total_as_a_lower_bound(
+        self, music_player: MusicPlayer
+    ) -> None:
+        facts = music_player.playlist_facts(ahead=0, runtime=(60, True))
+        assert "Total Duration: **~1m**" in facts
+
+    def test_no_known_length_says_nothing_about_it(
+        self, music_player: MusicPlayer
+    ) -> None:
+        assert music_player.playlist_facts(ahead=0, runtime=(0, True)) == ""
+
+    def test_behind_a_queue_it_counts_the_songs_ahead_and_when_it_starts(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
+            QueueObject("https://yt.com/v=2", "B", mock_author, duration=90),
+        )
+        first, second = music_player.playlist_facts(
+            ahead=2, runtime=(600, False)
+        ).split("\n")
+        assert first == "Total Duration: **10m**  ·  Songs ahead: **2**"
+        now_pst, walk = music_player._eta_walk_to(3)
+        eta = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        assert second == f"Est. playing at {_fmt_eta(eta, walk.uncertain)}"
+        assert not second.startswith("Est. playing at ~")
+
+    def test_a_lazy_track_ahead_makes_the_start_time_approximate(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        seed_queue(music_player.queue, YTSource(ytsearch="ytsearch:lazy song"))
+        facts = music_player.playlist_facts(ahead=1, runtime=(600, False))
+        assert "Est. playing at ~**" in facts
+
+    def test_it_plays_next_after_the_live_song(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Front placements have nothing queued ahead, but the live song still plays
+        out first."""
+        music_player.current_song = mock_song
+        facts = music_player.playlist_facts(ahead=0, runtime=(600, False))
+        assert "Songs ahead" not in facts
+        assert "Est. playing at" in facts
+
+
 class TestBuildNowPlayingEmbed:
     def test_returns_discord_embed(
         self, music_player: MusicPlayer, mock_song: MagicMock
