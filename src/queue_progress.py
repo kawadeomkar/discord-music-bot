@@ -203,11 +203,12 @@ async def enqueue_progress(
     delay: float,
     placement_note: str = "",
     debug_suffix: Optional[str] = None,
-    dropped: Optional[asyncio.Event] = None,
+    request_settled: Optional[asyncio.Event] = None,
 ) -> AsyncGenerator[EnqueueProgress]:
     """Show a live card once a collection has resolved for `delay`, and take it
-    back when the enqueue lands or when `dropped` is set. `delay` is required, so
-    every call site reads the server's queue-progress-delay when it enters.
+    back when `request_settled` is set or the block exits, whichever comes first.
+    `delay` is required, so every call site reads the server's
+    queue-progress-delay when it enters.
 
     The card is a SECOND message, deleted on every exit path; it never becomes
     the confirmation. `_reply` sends that through MusicContext.send, which adopts
@@ -304,7 +305,11 @@ async def enqueue_progress(
                     await message.delete()
 
     driver = asyncio.create_task(_run_card())
-    relay = asyncio.create_task(set_when_set(dropped, settled)) if dropped else None
+    relay = (
+        asyncio.create_task(set_when_set(request_settled, settled))
+        if request_settled
+        else None
+    )
     try:
         yield progress
     finally:

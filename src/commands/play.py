@@ -219,7 +219,7 @@ async def _resolve_and_place(
                     delay=delay,
                     placement_note=_placement_note(args.mode),
                     debug_suffix=cog.debug_suffix(ctx),
-                    dropped=req.dropped,
+                    request_settled=req.settled,
                 )
             )
         else:
@@ -230,7 +230,7 @@ async def _resolve_and_place(
                     delay=delay,
                     query=req.query,
                     debug_suffix=cog.debug_suffix(ctx),
-                    dropped=req.dropped,
+                    request_settled=req.settled,
                 )
             )
         # The cold-start gate hold lives on its own stack, so the path that PLACES

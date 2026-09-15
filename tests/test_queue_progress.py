@@ -894,7 +894,7 @@ class TestADroppedRequest:
         dropped = asyncio.Event()
 
         async with enqueue_progress(
-            card_ctx, _yt_playlist(), delay=_FAST_DELAY, dropped=dropped
+            card_ctx, _yt_playlist(), delay=_FAST_DELAY, request_settled=dropped
         ):
             await asyncio.sleep(0.05)
             card_ctx.channel.send.assert_awaited_once()
@@ -910,7 +910,7 @@ class TestADroppedRequest:
         _fast()
         dropped = asyncio.Event()
         async with enqueue_progress(
-            card_ctx, _yt_playlist(), delay=0.05, dropped=dropped
+            card_ctx, _yt_playlist(), delay=0.05, request_settled=dropped
         ):
             dropped.set()
             await asyncio.sleep(0.1)

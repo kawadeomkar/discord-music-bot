@@ -298,12 +298,12 @@ async def slow_resolve_notice(
     query: str,
     delay: Optional[float],
     debug_suffix: Optional[str] = None,
-    dropped: Optional[asyncio.Event] = None,
+    request_settled: Optional[asyncio.Event] = None,
 ) -> AsyncGenerator[None]:
     """Say that `query` is still being looked up once it outlives `delay`, and
-    take the message back when it lands or when `dropped` is set. `delay` is
-    required, so every call site reads the server's slow-notice when it enters;
-    None is off and arms nothing.
+    take the message back when `request_settled` is set or the block exits,
+    whichever comes first. `delay` is required, so every call site reads the
+    server's slow-notice when it enters; None is off and arms nothing.
 
     ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the Now
     Playing host, so deleting it would drag the live progress bar onto it.
@@ -358,7 +358,11 @@ async def slow_resolve_notice(
                     await posted.delete()
 
     notice = asyncio.create_task(_post())
-    relay = asyncio.create_task(set_when_set(dropped, settled)) if dropped else None
+    relay = (
+        asyncio.create_task(set_when_set(request_settled, settled))
+        if request_settled
+        else None
+    )
     try:
         yield
     finally:
@@ -388,9 +392,11 @@ class PlayRequest:
     # after the resolve, where a -pause landing in between would change the answer.
     queue_control: bool = False
     dropped_by: str = ""
-    # Set with `dropped_by` and by retire_player. place() reads the drop only once
-    # the resolve returns; this takes the request's card or notice back now.
-    dropped: asyncio.Event = field(default_factory=asyncio.Event)
+    # Set by a drop (with `dropped_by`, or by retire_player) and as place() returns.
+    # Either way the request's card or notice has nothing left to say, so it comes
+    # down now rather than when the command does: a drop is read only after the
+    # resolve, and the reply after the put can outlast the delay either one waits.
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
     # Set under the place lock. A placed request is past the point any command can
     # drop it, but it stays in the registry until its reply is sent.
     placed: bool = False
@@ -512,7 +518,7 @@ class PlayRegistry:
         # place() refuses every unplaced request on a retired player.
         for req in plays.inflight:
             if req.mp is mp and not req.placed:
-                req.dropped.set()
+                req.settled.set()
 
     def inflight(
         self,
@@ -531,7 +537,7 @@ class PlayRegistry:
         dropped = [r for r in plays.inflight if not r.placed and matches(r)]
         for req in dropped:
             req.dropped_by = by
-            req.dropped.set()
+            req.settled.set()
         return dropped
 
     def cold_join(
@@ -625,3 +631,6 @@ class PlayRegistry:
             record_span_error(span, e)
             log.warning(f"Place stalled after {PLACE_TIMEOUT_SECS}s: {req.query}")
             raise PlaceStalled(before_the_put=not acquired) from e
+        finally:
+            # Placed, refused or stalled, everything after this is the reply.
+            req.settled.set()

@@ -22,6 +22,7 @@ from src import util
 from src.util import channel_claim
 from src import config
 from src.play_placement import (
+    PlaceStalled,
     PlayArgs,
     _GuildPlays,
     _NOTICE_CLAIM,
@@ -223,9 +224,9 @@ class TestPlayRegistry:
             play_key(mock_ctx), "remove", lambda r: r.query == "wanted"
         )
 
-        assert wanted.dropped.is_set()
-        assert not kept.dropped.is_set()
-        assert not placed.dropped.is_set()
+        assert wanted.settled.is_set()
+        assert not kept.settled.is_set()
+        assert not placed.settled.is_set()
 
     def test_the_registry_is_dropped_once_idle(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -487,9 +488,9 @@ class TestRetirePlayerFence:
 
         await music_bot._plays.retire_player(play_key(mock_ctx), cast(Any, mp))
 
-        assert resolving.dropped.is_set()
-        assert not placed.dropped.is_set()
-        assert not elsewhere.dropped.is_set()
+        assert resolving.settled.is_set()
+        assert not placed.settled.is_set()
+        assert not elsewhere.settled.is_set()
 
 
 class TestPlacedMeansLanded:
@@ -521,6 +522,58 @@ class TestPlacedMeansLanded:
             assert verdict.placed
 
         assert req.placed
+
+
+class TestPlaceSettlesTheRequest:
+    """`settled` is what takes a request's card or notice down. place() sets it on
+    the way out, so the message is gone before the reply — whose sends and
+    reactions can outlast the delay it waited out — rather than after it."""
+
+    async def test_a_placed_request_settles_once_the_put_returns(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        req = admit(music_bot, mock_ctx, mp)
+
+        async with music_bot._plays.place(req) as verdict:
+            assert verdict.placed
+            # The put is still running: the card is still true.
+            assert not req.settled.is_set()
+
+        assert req.settled.is_set()
+
+    async def test_a_refused_request_settles_too(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Its reply is the "dropped" report, which is no faster than a
+        confirmation."""
+        mp = mock_mp()
+        req = admit(music_bot, mock_ctx, mp)
+        req.dropped_by = "stop"
+
+        async with music_bot._plays.place(req) as verdict:
+            assert not verdict.placed
+
+        assert req.settled.is_set()
+        assert not req.placed
+
+    async def test_a_stalled_place_settles_the_request(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        await plays.lock.acquire()
+        try:
+            with (
+                patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
+                pytest.raises(PlaceStalled),
+            ):
+                async with music_bot._plays.place(req):
+                    pass  # pragma: no cover - the lock is never acquired
+        finally:
+            plays.lock.release()
+
+        assert req.settled.is_set()
 
 
 class TestResolveSlot:
@@ -854,7 +907,7 @@ class TestSlowResolveNotice:
         dropped = asyncio.Event()
         message = mock_ctx.channel.send.return_value
         async with slow_resolve_notice(
-            mock_ctx, query="a song", delay=0.02, dropped=dropped
+            mock_ctx, query="a song", delay=0.02, request_settled=dropped
         ):
             await asyncio.sleep(0.05)
             mock_ctx.channel.send.assert_awaited_once()
@@ -869,7 +922,7 @@ class TestSlowResolveNotice:
     ) -> None:
         dropped = asyncio.Event()
         async with slow_resolve_notice(
-            mock_ctx, query="a song", delay=0.05, dropped=dropped
+            mock_ctx, query="a song", delay=0.05, request_settled=dropped
         ):
             dropped.set()
             await asyncio.sleep(0.1)
