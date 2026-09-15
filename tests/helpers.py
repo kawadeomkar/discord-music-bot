@@ -16,8 +16,9 @@ from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.play_placement import PlayMode, PlayRequest
-from src.youtube import QueueObject
+from src.youtube import YTDL, QueueObject
 
 if TYPE_CHECKING:
     from src.musicbot import MusicBot
@@ -275,3 +276,52 @@ def mock_mp(qsize: int = 0) -> MagicMock:
         return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
     )
     return mp
+
+
+# What -replay mints at dispatch: the command message's snowflake time, and
+# depth 0 — the replay plays immediately.
+REPLAY_ASK = Analytics(queued_at=1752530500.5, queue_position=0)
+
+
+def loop_song(url: str, title: str, *, position: float) -> MagicMock:
+    """A spec'd YTDL stand-in — a bare MagicMock reads truthy for
+    start_paused/is_resume and would trip the loop's start path."""
+    song = MagicMock(spec=YTDL)
+    song.title = title
+    song.webpage_url = url
+    song.duration_secs = 210
+    song.duration = "0:03:30"
+    song.uploader = "Loop Channel"
+    song.thumbnail = ""
+    song.views = None
+    song.likes = None
+    song.abr = None
+    song.asr = None
+    song.acodec = ""
+    song.requester = None
+    song.start_offset = 0
+    song.position_secs = position
+    song.produced_audio = True
+    song.interjected = False
+    song.is_resume = False
+    song.is_replay = False
+    song.start_paused = False
+    song.analytics = ANALYTICS_ZERO
+    song.user_input = None
+    song.query_source = ""
+    song.played_at = 0.0
+    song.persisted = True
+    song.data = {}
+    return song
+
+
+def replayed_song(source: QueueObject) -> MagicMock:
+    song = loop_song(source.webpage_url, source.title, position=42.0)
+    # Read by _neutralize_prefetch's rebuild, which the -replay runs.
+    song.np_message_id, song.np_channel_id = 0, 0
+    song.np_dedicated, song.np_host_ref = False, None
+    song.is_replay = source.is_replay
+    song.analytics = source.analytics
+    song.persisted = source.persisted
+    song.requester = source.requester
+    return song

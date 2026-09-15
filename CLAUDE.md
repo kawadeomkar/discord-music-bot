@@ -284,9 +284,9 @@ src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
 ├── musicbot.py       # MusicBot cog — command REGISTRATION and one try/except each;
 │                     # per-guild player registry (mps), the discord.py hooks, crash-recovery entry
-├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch (_ensure_prefetch), gate,
-│                     # NP host, ETA, interject, -replay (replay_current, ReplayResult), and
-│                     # _still_live, the one liveness test both interrupts use
+├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch (ensure_prefetch), gate,
+│                     # NP host, ETA, interject, the hooks -replay drives (hand_over_to_replay),
+│                     # and still_live, the one liveness test both interrupts use
 ├── play_placement.py # -play's flag grammar, its voice gate, the two bounds on the resolve
 │                     # (ResolveSlot's deadline on the WAIT for a slot, and slow_resolve_notice
 │                     # saying so past it), and PlayRegistry: the per-guild
@@ -1066,7 +1066,7 @@ Per-guild synchronization primitives and what they protect:
 | `history:outbox` consumer group (Redis) | replaced the `history:drainer` lease. Not mutual exclusion — `XREADGROUP >` gives two drainers **disjoint** entries and `XACK` settles by ID, so a second drainer duplicates work instead of destroying plays it never inserted |
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
-| claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject vs `-replay`). Every write of a new task goes through `_ensure_prefetch()`, which never starts one over a task already in the slot: loop() settles only the task it reads, so a second one's claim drifts `_cursor` for good |
+| claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject vs `-replay`). Every write of a new task goes through `ensure_prefetch()`, which never starts one over a task already in the slot: loop() settles only the task it reads, so a second one's claim drifts `_cursor` for good |
 
 The dequeue commit and the start transaction's server-side LPOP share ONE mutex hold,
 via `GuildQueue.commit_dequeue()` — the async context manager the playback loop wraps

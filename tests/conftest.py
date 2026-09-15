@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import aiohttp
 import discord
@@ -24,6 +24,7 @@ import src.spotify as spotify_mod
 import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
+from src.guild_state import ANALYTICS_ZERO
 from src.musicbot import MusicBot
 from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
@@ -479,6 +480,92 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # turns into a failure on whichever test the collection lands in.
     bot.loop.create_task = stub_create_task()
     return bot
+
+
+@pytest.fixture
+def mock_song() -> MagicMock:
+    """A mock YTDL-like song object with all metadata attributes."""
+    song = MagicMock()
+    song.title = "Test Song Title"
+    song.requester = MagicMock()
+    song.requester.mention = "<@123456>"
+    song.requester.id = 123456
+    song.requester.display_name = "TestUser"
+    song.webpage_url = "https://www.youtube.com/watch?v=testid"
+    song.duration = "0:03:30"
+    song.uploader = "Test Channel"
+    song.views = 1_000_000
+    song.likes = 50_000
+    song.dislikes = 500
+    song.thumbnail = "https://img.youtube.com/vi/testid/0.jpg"
+    song.duration_secs = 210
+    song.elapsed_secs = 0.0
+    song.start_offset = 0
+    song.abr = 128
+    song.asr = 44100
+    song.acodec = "opus"
+    # Interjection flags a real YTDL always carries — as bare MagicMock attributes
+    # they'd read truthy and trip the loop's start_paused/is_resume gates.
+    song.interjected = False
+    song.is_resume = False
+    song.start_paused = False
+    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+    # clamps its fields into the play_history column domain. query_source likewise
+    # a real string — the slug clamp regex-matches it and a MagicMock raises
+    # TypeError there, exactly as a MagicMock title would.
+    song.analytics = ANALYTICS_ZERO
+    song.query_source = ""
+    # Same reason: the resume tail an interjection builds carries it, and it is
+    # serialized straight to the queue mirror.
+    song.user_input = None
+    # Unstamped, like a song the loop has not started yet: the loop's or-stamp
+    # writes the real clock here, and the epoch clamp raises on a MagicMock.
+    song.played_at = 0.0
+    # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
+    # reads `traceparent` off it to link this song's trace to the extraction that
+    # minted its URL, and a MagicMock there would be a str where a str is parsed.
+    song.data = {}
+    # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
+    # so tests that set either attribute get the derived position automatically.
+    type(song).position_secs = PropertyMock(
+        side_effect=lambda: song.start_offset + song.elapsed_secs
+    )
+    return song
+
+
+@pytest.fixture
+def mock_vc() -> MagicMock:
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    return vc
+
+
+@pytest.fixture
+def live_song(mock_song: MagicMock) -> MagicMock:
+    """mock_song with the interjection flags a real YTDL carries — bare MagicMock
+    attributes would read truthy and trip the loop's is_resume/start_paused
+    gates."""
+    mock_song.interjected = False
+    mock_song.is_resume = False
+    mock_song.start_paused = False
+    # Both have been silently dropped by the rebuild before now — persisted as an
+    # outright AttributeError (YTDL had no such attribute at all), user_input as a
+    # quiet default. A bare MagicMock reads truthy for either and hides both.
+    mock_song.user_input = "https://open.spotify.com/playlist/live"
+    mock_song.persisted = True
+    return mock_song
+
+
+@pytest.fixture
+def replayer(mock_author: MagicMock) -> MagicMock:
+    """The caller of -replay, distinct from whoever queued the live song: the
+    replay is their ask and both the requester and the analytics must say so."""
+    member = MagicMock(spec=discord.Member)
+    member.id = 424242
+    member.display_name = "Replayer"
+    member.mention = "<@424242>"
+    return member
 
 
 def _patch_xadd_monotonic_ids() -> None:
