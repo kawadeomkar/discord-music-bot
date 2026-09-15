@@ -632,6 +632,20 @@ class MusicPlayer:
             )
         return self._last_author
 
+    def _resolve_requester(
+        self, requester_id: Optional[int]
+    ) -> Union[discord.User, discord.Member]:
+        """Who queued a lazy search: the guild member, else the cached user (a
+        member who left keeps their plays), else the fallback requester, which is
+        what an entry queued before searches carried an ID has always resolved to."""
+        if requester_id is not None:
+            who = self._guild.get_member(requester_id) or self.bot.get_user(
+                requester_id
+            )
+            if who is not None:
+                return who
+        return self._require_requester()
+
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs: (now_pst, walk).
         cumulative_secs starts at the current song's total duration as a proxy for
@@ -1980,7 +1994,7 @@ class MusicPlayer:
         # play, so the stream URL this extraction yields is wanted immediately.
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
-                self._require_requester(),
+                self._resolve_requester(source.requester_id),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
                 query_source=source.query_source,

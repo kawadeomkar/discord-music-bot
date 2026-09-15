@@ -738,6 +738,7 @@ class GuildQueue:
                 ),
                 user_input=entry.user_input,
                 query_source=entry.query_source,
+                requester_id=entry.requester_id,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
