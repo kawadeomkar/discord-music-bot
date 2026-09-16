@@ -13,9 +13,11 @@ import logging
 import math
 import re
 from zoneinfo import ZoneInfo, available_timezones
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Final, Self, Union
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, Self, TypeIs, Union, get_args
 
 import orjson
 
@@ -167,18 +169,111 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
 
 
+type ConfigFieldName = Literal[
+    "debug_mode",
+    "volume",
+    "timezone",
+    "idle_timeout_secs",
+    "alone_timeout_secs",
+    "np_refresh_secs",
+    "slow_notice_secs",
+    "queue_progress_delay_secs",
+]
+# volume has its own reset, which also clears the legacy :state copy.
+type ResettableConfigField = Literal[
+    "debug_mode",
+    "timezone",
+    "idle_timeout_secs",
+    "alone_timeout_secs",
+    "np_refresh_secs",
+    "slow_notice_secs",
+    "queue_progress_delay_secs",
+]
+
+
 class ConfigField:
     """Wire field names for guild:{id}:config, spelled out so renaming a Python
-    attribute can never silently rename a Redis field."""
+    attribute can never silently rename a Redis field. Bare Final, so each member
+    is typed as its own Literal."""
 
-    DEBUG_MODE: Final[str] = "debug_mode"
-    VOLUME: Final[str] = "volume"
-    TIMEZONE: Final[str] = "timezone"
+    DEBUG_MODE: Final = "debug_mode"
+    VOLUME: Final = "volume"
+    TIMEZONE: Final = "timezone"
+    IDLE_TIMEOUT: Final = "idle_timeout_secs"
+    ALONE_TIMEOUT: Final = "alone_timeout_secs"
+    NP_REFRESH: Final = "np_refresh_secs"
+    SLOW_NOTICE: Final = "slow_notice_secs"  # OFF_SECS is off
+    QUEUE_PROGRESS_DELAY: Final = "queue_progress_delay_secs"
+
+
+ALL_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
+    get_args(ConfigFieldName.__value__)
+)
+
+
+def is_config_field(name: str) -> TypeIs[ConfigFieldName]:
+    return name in ALL_CONFIG_FIELDS
+
+
+# Not a setting: the application id of the bot that last wrote a setting to the
+# hash, stamped by the store's writers when given one. GuildConfig never reads it.
+CONFIG_WRITER_FIELD: Final = "writer_app_id"
 
 
 # The zone every guild renders ETAs in until it picks one; the schema layer
 # validates against the same default it hands back.
 DEFAULT_TIMEZONE: Final[str] = "America/Los_Angeles"
+# A player's volume until its guild's stored one is restored, and after a reset.
+DEFAULT_VOLUME: Final = 1.0
+
+# Beside DEFAULT_TIMEZONE because the -settings registry, the playback loop and the
+# voice watchdog all read them, and this module imports nothing from src at runtime.
+DEFAULT_IDLE_TIMEOUT_SECS: Final = 300.0
+DEFAULT_ALONE_TIMEOUT_SECS: Final = 10.0
+# slow_notice_secs' stored "off". Falsy, and still a set value: never test it for
+# truthiness.
+OFF_SECS: Final = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigDomain:
+    """The values a numeric guild:{id}:config field may hold."""
+
+    lo: float
+    hi: float
+    off: bool = False  # OFF_SECS is admitted too, outside [lo, hi]
+
+    def admits(self, value: float) -> bool:
+        # Chained comparison: False for NaN, where `not (v < lo or v > hi)` is True.
+        return (self.off and value == OFF_SECS) or self.lo <= value <= self.hi
+
+
+# guild:{id}:config's numeric domain. The -settings registry's server specs take
+# their static bounds from here. np_refresh_secs' lo is the bot knob's env floor:
+# the lowest bot value an operator can run.
+CONFIG_DOMAIN: Final[Mapping[ConfigFieldName, ConfigDomain]] = MappingProxyType(
+    {
+        ConfigField.VOLUME: ConfigDomain(0.0, 1.0),
+        ConfigField.IDLE_TIMEOUT: ConfigDomain(DEFAULT_IDLE_TIMEOUT_SECS, 1800.0),
+        ConfigField.ALONE_TIMEOUT: ConfigDomain(DEFAULT_ALONE_TIMEOUT_SECS, 120.0),
+        ConfigField.NP_REFRESH: ConfigDomain(1.0, 30.0),
+        ConfigField.SLOW_NOTICE: ConfigDomain(4.0, 60.0, off=True),
+        ConfigField.QUEUE_PROGRESS_DELAY: ConfigDomain(2.0, 60.0),
+    }
+)
+
+
+def _admitted(field: ConfigFieldName, value: float | None) -> float | None:
+    """value, or None with a WARNING when CONFIG_DOMAIN refuses it."""
+    domain = CONFIG_DOMAIN[field]
+    if value is None or domain.admits(value):
+        return value
+    log.warning(
+        f"guild_state: {field}={value!r} is outside {domain.lo}..{domain.hi}; "
+        "reading it as unset"
+    )
+    return None
+
 
 # Zone names already proven unusable on this host. ZoneInfo caches successful
 # lookups only; a failed one is a filesystem miss plus a log line on every
@@ -219,6 +314,23 @@ class GuildConfig:
     # An IANA name, not a ZoneInfo: the wire stays human-readable. Resolved by
     # tzinfo(), which is also where an unusable name degrades.
     timezone: str | None = None
+    idle_timeout_secs: float | None = None
+    alone_timeout_secs: float | None = None
+    np_refresh_secs: float | None = None
+    # OFF_SECS is a set value meaning off: compare with ==, never truthiness.
+    slow_notice_secs: float | None = None
+    queue_progress_delay_secs: float | None = None
+
+    def __post_init__(self) -> None:
+        """A numeric field CONFIG_DOMAIN does not admit becomes unset, so no
+        producer — a hand-edited hash, a caller's GuildConfig(...) — holds a value
+        outside it. Total, because it runs on the read path; no type coercion, as
+        in HistoryEntry.__post_init__. Attribute names are the wire names (a test
+        asserts it)."""
+        for field in CONFIG_DOMAIN:
+            value: float | None = getattr(self, field)
+            if value is not None and not CONFIG_DOMAIN[field].admits(value):
+                object.__setattr__(self, field, _admitted(field, value))
 
     def to_redis(self) -> dict[str, str]:
         """Only fields with a value: an unset field is ABSENT from the hash, so
@@ -226,10 +338,19 @@ class GuildConfig:
         mapping: dict[str, str] = {}
         if self.debug_mode is not None:
             mapping[ConfigField.DEBUG_MODE] = "1" if self.debug_mode else "0"
-        if self.volume is not None:
-            mapping[ConfigField.VOLUME] = str(self.volume)
         if self.timezone is not None:
             mapping[ConfigField.TIMEZONE] = self.timezone
+        numbers: tuple[tuple[ConfigFieldName, float | None], ...] = (
+            (ConfigField.VOLUME, self.volume),
+            (ConfigField.IDLE_TIMEOUT, self.idle_timeout_secs),
+            (ConfigField.ALONE_TIMEOUT, self.alone_timeout_secs),
+            (ConfigField.NP_REFRESH, self.np_refresh_secs),
+            (ConfigField.SLOW_NOTICE, self.slow_notice_secs),
+            (ConfigField.QUEUE_PROGRESS_DELAY, self.queue_progress_delay_secs),
+        )
+        mapping.update(
+            {field: str(value) for field, value in numbers if value is not None}
+        )
         return mapping
 
     def tzinfo(self) -> ZoneInfo:
@@ -259,6 +380,11 @@ class GuildConfig:
             debug_mode={"1": True, "0": False}.get(_b_str(raw, ConfigField.DEBUG_MODE)),
             volume=_b_float(raw, ConfigField.VOLUME),
             timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
+            idle_timeout_secs=_b_float(raw, ConfigField.IDLE_TIMEOUT),
+            alone_timeout_secs=_b_float(raw, ConfigField.ALONE_TIMEOUT),
+            np_refresh_secs=_b_float(raw, ConfigField.NP_REFRESH),
+            slow_notice_secs=_b_float(raw, ConfigField.SLOW_NOTICE),
+            queue_progress_delay_secs=_b_float(raw, ConfigField.QUEUE_PROGRESS_DELAY),
         )
 
 
@@ -350,7 +476,8 @@ class GuildStateData:
         # 0.0 would be elevated to the default.
         total_pause = _b_float(raw, StateField.TOTAL_PAUSE_SECONDS)
         return cls(
-            volume=_b_float(raw, StateField.VOLUME),
+            # One wire name with ConfigField.VOLUME, so one domain.
+            volume=_admitted(ConfigField.VOLUME, _b_float(raw, StateField.VOLUME)),
             voice_channel_id=_b_opt_int(raw, StateField.VOICE_CHANNEL_ID),
             text_channel_id=_b_opt_int(raw, StateField.TEXT_CHANNEL_ID),
             current_song_url=_b_str(raw, StateField.CURRENT_SONG_URL),

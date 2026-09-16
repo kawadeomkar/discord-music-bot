@@ -8,7 +8,7 @@ import asyncio
 import contextlib
 from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any, Optional, cast
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -16,7 +16,8 @@ from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
-from src.guild_state import ANALYTICS_ZERO, Analytics
+from src.guild_state import ANALYTICS_ZERO, Analytics, GuildConfig
+from src.redis_client import GuildRedisStore, iter_guild_configs
 from src.play_placement import PlayMode, PlayRequest
 from src.youtube import YTDL, QueueObject, YoutubePlaylist
 
@@ -339,3 +340,46 @@ def replayed_song(source: QueueObject) -> MagicMock:
     song.persisted = source.persisted
     song.requester = source.requester
     return song
+
+
+async def stored_config(store: GuildRedisStore) -> GuildConfig:
+    """The store's config as read_config returns it, for a read that must land."""
+    config = await store.read_config()
+    assert config is not None
+    return config
+
+
+async def read_all_configs(
+    redis: Any, guild_ids: list[int], **kwargs: Any
+) -> dict[int, GuildConfig]:
+    """Every batch iter_guild_configs yields for `guild_ids`, merged."""
+    return {
+        guild_id: config
+        async for batch in iter_guild_configs(redis, guild_ids, **kwargs)
+        for guild_id, config in batch.items()
+    }
+
+
+@contextlib.contextmanager
+def stalled_config_reads() -> Iterator[None]:
+    """A Redis that accepts a guild config read and never answers it: the single
+    read and the batched one both park for good."""
+    never = asyncio.Event()
+
+    async def _stall(*_args: Any, **_kwargs: Any) -> None:
+        await never.wait()
+
+    async def _stall_batches(*_args: Any, **_kwargs: Any) -> AsyncGenerator[Any]:
+        await never.wait()
+        yield {}
+
+    with (
+        patch.object(GuildRedisStore, "read_config", new=_stall),
+        patch("src.settings.iter_guild_configs", new=_stall_batches),
+    ):
+        yield
+
+
+def members(cls: type) -> set[str]:
+    """The values of a constants class's UPPER_CASE attributes."""
+    return {v for k, v in vars(cls).items() if k.isupper()}
