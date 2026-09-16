@@ -18,6 +18,7 @@ from discord.utils import MISSING as _DISCORD_MISSING
 from src.guild_queue import GuildQueue, QueueItem
 from src.guild_state import ANALYTICS_ZERO, Analytics, GuildConfig
 from src.redis_client import GuildRedisStore, iter_guild_configs
+from src.settings import GuildSettings
 from src.play_placement import PlayMode, PlayRequest
 from src.youtube import YTDL, QueueObject, YoutubePlaylist
 
@@ -378,6 +379,13 @@ def stalled_config_reads() -> Iterator[None]:
         patch("src.settings.iter_guild_configs", new=_stall_batches),
     ):
         yield
+
+
+def add_settings_state(cog: Any) -> None:
+    """The settings state MusicBot.__init__ builds, for a cog built without it."""
+    cog.guild_settings = GuildSettings(cog)
+    cog._hydrate_retries = set()
+    cog._orphan_sweep_claimed = False
 
 
 def members(cls: type) -> set[str]:

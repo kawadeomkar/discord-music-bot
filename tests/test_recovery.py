@@ -7,7 +7,7 @@ owns both the extracted module and the cog surface that reaches it.
 """
 
 import asyncio
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from collections.abc import Coroutine
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -93,33 +93,143 @@ class TestOnReady:
         music_bot.redis = None
         await music_bot.on_ready()  # must not raise, no tasks created
 
-    async def test_creates_restore_task_per_guild(
+    async def test_spawns_one_recovery_task_and_only_the_first_sweeps(
+        self, music_bot_with_redis: MusicBot
+    ) -> None:
+        stub = stub_create_task()
+        with (
+            patch("asyncio.create_task", stub),
+            patch.object(music_bot_with_redis, "_recover_after_ready") as recover,
+        ):
+            await music_bot_with_redis.on_ready()
+            await music_bot_with_redis.on_ready()
+        assert stub.call_count == 2
+        assert [c.kwargs for c in recover.call_args_list] == [
+            {"sweep": True},
+            {"sweep": False},
+        ]
+
+    async def test_recovery_hydrates_before_the_first_restore(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
+        """The hydrate's batches hold one pool connection at a time; the restore
+        fan-out is what reaches the pool's cap, so it starts only after the pass."""
         guilds = list(music_bot_with_redis.bot.guilds)
-        stub = stub_create_task()
+        order: list[str] = []
         passed_guilds = []
+
+        async def _hydrate(ids: Any = None) -> None:
+            # Suspends, as the real read does: spawned restores would run here.
+            await asyncio.sleep(0)
+            order.append("hydrate")
 
         async def _noop() -> None:
             pass
 
-        # Patched where on_ready LOOKS IT UP — musicbot's module globals — not where
-        # it is defined, or the cog keeps calling the real one. Capture happens
-        # synchronously in the spy (before stub_create_task closes the coroutine,
-        # which would prevent the body running).
-        def _spy(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+        def _restore(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+            # Recorded when the task is spawned, not when it runs.
+            order.append("restore")
             passed_guilds.append(guild)
             return _noop()
 
+        # Patched where the cog LOOKS IT UP — musicbot's module globals — not
+        # where it is defined, or the cog keeps calling the real one.
         with (
-            patch("asyncio.create_task", stub),
-            patch("src.musicbot.restore_guild", _spy),
+            patch.object(music_bot_with_redis, "_hydrate_configs", _hydrate),
+            patch("src.musicbot.restore_guild", _restore),
         ):
-            await music_bot_with_redis.on_ready()
+            await music_bot_with_redis._recover_after_ready()
+            await asyncio.gather(*music_bot_with_redis._restore_tasks)
 
-        # One per guild, plus the one-off config hydration.
-        assert stub.call_count == len(guilds) + 1
+        assert order == ["hydrate", *["restore"] * len(guilds)]
         assert passed_guilds == guilds
+
+
+class TestOrphanSweepRunsAfterRecovery:
+    """The sweep needs a complete guild cache and must not add a connection to the
+    restore fan-out, so it runs once, after every restore it spawned returned."""
+
+    @staticmethod
+    def _gate(
+        cog: MusicBot, *, shard_ids: Any = None, application_id: Any = 42
+    ) -> None:
+        bot = cast(Any, cog.bot)
+        bot.shard_ids = shard_ids
+        bot.application_id = application_id
+
+    async def test_it_runs_only_after_every_restore_returned(
+        self, music_bot_with_redis: MusicBot
+    ) -> None:
+        self._gate(music_bot_with_redis)
+        order: list[str] = []
+        release = asyncio.Event()
+
+        async def _restore(cog: MusicBot, guild: MagicMock) -> None:
+            await release.wait()
+            order.append("restore")
+
+        async def _sweep(**kwargs: Any) -> None:
+            order.append("sweep")
+
+        with (
+            patch.object(music_bot_with_redis, "_hydrate_configs", AsyncMock()),
+            patch("src.musicbot.restore_guild", _restore),
+            patch.object(music_bot_with_redis.guild_settings, "sweep_orphans", _sweep),
+        ):
+            recovery = asyncio.create_task(
+                music_bot_with_redis._recover_after_ready(sweep=True)
+            )
+            await asyncio.sleep(0.01)
+            assert order == []
+            release.set()
+            await recovery
+
+        assert order == ["restore"] * len(music_bot_with_redis.bot.guilds) + ["sweep"]
+
+    @pytest.mark.parametrize(
+        ("sweep", "shard_ids", "application_id"),
+        [(False, None, 42), (True, [0], 42), (True, None, None)],
+        ids=["not-the-first-ready", "a-shard-subset", "no-application-id"],
+    )
+    async def test_it_does_not_run(
+        self,
+        music_bot_with_redis: MusicBot,
+        sweep: bool,
+        shard_ids: Any,
+        application_id: Any,
+    ) -> None:
+        self._gate(
+            music_bot_with_redis, shard_ids=shard_ids, application_id=application_id
+        )
+        sweeper = AsyncMock()
+        with (
+            patch.object(music_bot_with_redis, "_hydrate_configs", AsyncMock()),
+            patch("src.musicbot.restore_guild", AsyncMock()),
+            patch.object(music_bot_with_redis.guild_settings, "sweep_orphans", sweeper),
+        ):
+            await music_bot_with_redis._recover_after_ready(sweep=sweep)
+        sweeper.assert_not_awaited()
+
+    async def test_membership_is_the_bots_guild_cache(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        self._gate(music_bot_with_redis)
+        bot = cast(Any, music_bot_with_redis.bot)
+        bot.get_guild = lambda guild_id: (
+            mock_guild if guild_id == mock_guild.id else None
+        )
+        sweeper = AsyncMock()
+        with (
+            patch.object(music_bot_with_redis, "_hydrate_configs", AsyncMock()),
+            patch("src.musicbot.restore_guild", AsyncMock()),
+            patch.object(music_bot_with_redis.guild_settings, "sweep_orphans", sweeper),
+        ):
+            await music_bot_with_redis._recover_after_ready(sweep=True)
+        call = sweeper.await_args
+        assert call is not None
+        assert call.kwargs["is_member"](mock_guild.id) is True
+        assert call.kwargs["is_member"](1) is False
+        assert call.kwargs["application_id"] == 42
 
 
 class TestRestoreGuildLock:

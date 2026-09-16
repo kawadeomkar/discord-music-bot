@@ -28,10 +28,16 @@ from src.guild_state import ANALYTICS_ZERO
 from src.musicbot import MusicBot
 from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
+from src.settings import GuildSettings
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
-from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
+from tests.helpers import (
+    add_settings_state,
+    noop_ffmpeg_init,
+    stub_create_task,
+    tier_enabled,
+)
 from tests.mock_spec_cache import check_for_drift, install as install_mock_spec_cache
 
 # Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
@@ -303,9 +309,13 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     the one hundreds of embed assertions encode: with it on, every embed the bot
     sends grows a debug footer — command responses, the Now Playing block at every
     render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
+
+    BOT_SETTINGS_OVERRIDES is scrubbed so a shell exporting `ignore` cannot turn
+    every BotSettings test into a refusal.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
@@ -461,6 +471,16 @@ def mock_ctx(
     # runtime.
     ctx.cog.debug_settings.enabled = MagicMock(return_value=False)
     ctx.cog.debug_settings.snapshot = None
+    # GuildSettings reads these off the cog at call time, and auto-vivified they
+    # are a truthy redis it would write through and a MagicMock application id
+    # HSET cannot encode. A real GuildSettings, not a spec'd mock: its accessors
+    # then return registry defaults, and a test that needs a stored value seeds
+    # it, so GuildConfig's domain check runs. This mock is the cog of every
+    # player the suite builds, including the ones the real get_mp builds.
+    ctx.cog.redis = None
+    ctx.cog.mps = {}
+    ctx.cog.bot.application_id = None
+    ctx.cog.guild_settings = GuildSettings(ctx.cog)
     ctx.send = AsyncMock()
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
@@ -473,7 +493,7 @@ def mock_ctx(
     # Explicit, for the same reason mock_author pins guild_permissions: a bare
     # MagicMock answers `.extras.get("anything")` with a truthy mock, so every
     # command would look like it carried every flag. cog_before_invoke reads
-    # `extras["observation_only"]` to decide whether to skip get_mp(), and an
+    # `extras["skips_player_setup"]` to decide whether to skip get_mp(), and an
     # auto-mock there silently exempts the whole suite.
     ctx.command.extras = {}
     # A real name, not a MagicMock: check_voice_permissions keys its same-channel
@@ -497,6 +517,11 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
     bot.history_drainer = MagicMock()
+    # None, for the same reason: cog_load hands an existing BotSettings this
+    # session's debug-default, and a MagicMock there would turn debug mode on for
+    # every guild. A bot that never logged in has no application id.
+    bot.bot_settings = None
+    bot.application_id = None
     # start() IS reached now: a command wrapper resolves its player as an argument,
     # so get_mp() runs on every path including the early returns a body used to take
     # before it. Without this the loop() coroutine is created, never scheduled by the
@@ -643,6 +668,9 @@ def music_player(
     here would ever set them (start() and the -join/-play call sites never run),
     so both are set. Tests exercising either race must clear them again first.
     """
+    # The player's store and GuildSettings share cog.redis in production, so the
+    # restore's SEED write lands on the server its tests read.
+    mock_ctx.cog.redis = fake_redis
     mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
     mp._restore_complete.set()
     mp._playback_gate.set()
@@ -743,6 +771,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    add_settings_state(cog)
     return cog
 
 
@@ -790,6 +819,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    add_settings_state(cog)
     return cog
 
 

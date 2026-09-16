@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol, cast
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
@@ -31,7 +31,7 @@ from src import config
 from src.config import debug_mode_default
 from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
-from src.redis_client import GuildRedisStore, outbox_depth, read_guild_configs
+from src.redis_client import GuildRedisStore, outbox_depth
 from src.util import (
     FOOTER_SUFFIX_SEP,
     cancel_task,
@@ -1706,35 +1706,30 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
 
 
 class DebugSettings:
-    """Per-guild debug-mode state: the durable choice, its read cache, and the
-    sampler feeding the footer. DEBUG_MODE is the default every guild starts
-    from; the durable copy lives in guild:{id}:config and this holds the read
-    cache. One instance per cog, built in MusicBot.__init__."""
+    """Per-guild debug-mode state: each guild's choice, and the sampler feeding
+    the footer. DEBUG_MODE is the default every guild starts from. The durable
+    copy lives in guild:{id}:config, which GuildSettings reads and writes; this is
+    its projection of debug_mode, kept here because every send reads it. One
+    instance per cog, built in MusicBot.__init__."""
 
     __slots__ = (
         "_default",
+        "_default_override",
         "_overrides",
-        "_toggle_seq",
-        "_toggled_at",
-        "_unpersisted",
         "_sampler",
     )
 
     def __init__(self) -> None:
         # Read ONCE, here, so a garbage value aborts startup inside load_extension.
         self._default: bool = debug_mode_default()
+        # The operator's `-settings bot debug-default`, for this process only: never
+        # stored, so a restart returns every guild that never chose to _default.
+        self._default_override: Optional[bool] = None
         # A guild that never chose is ABSENT and follows _default, including when
         # the env var later changes — absence is not False.
         self._overrides: dict[int, bool] = {}
-        # A monotonic stamp bumped by every toggle, and its value at each guild's
-        # last toggle: hydrate() applies a Redis read across an await and uses
-        # these to leave a guild toggled in that window alone. _unpersisted holds
-        # the guilds whose cached value did NOT reach Redis.
-        self._toggle_seq: int = 0
-        self._toggled_at: dict[int, int] = {}
-        self._unpersisted: set[int] = set()
         self._sampler = RuntimeSampler()
-        if self._default and config.ENVIRONMENT == "production":
+        if self.default and config.ENVIRONMENT == "production":
             # Observation-only, so an advisory rather than a refusal.
             log.warning(
                 "DEBUG_MODE is on in production: every command response will "
@@ -1749,13 +1744,26 @@ class DebugSettings:
         (and every DM) follows the host default. Synchronous and in-memory:
         MusicContext.send calls this on every reply."""
         if guild_id is None:
-            return self._default
-        return self._overrides.get(guild_id, self._default)
+            return self.default
+        return self._overrides.get(guild_id, self.default)
 
     @property
     def default(self) -> bool:
-        """The host's DEBUG_MODE, which a guild with no stored choice follows."""
+        """What a guild with no stored choice follows: the operator's session
+        override when one is set, else the host's DEBUG_MODE."""
+        if self._default_override is not None:
+            return self._default_override
         return self._default
+
+    @property
+    def host_default(self) -> bool:
+        """DEBUG_MODE, as read at startup."""
+        return self._default
+
+    @property
+    def default_override(self) -> Optional[bool]:
+        """The operator's session default, or None while DEBUG_MODE applies."""
+        return self._default_override
 
     @property
     def snapshot(self) -> Optional[RuntimeSnapshot]:
@@ -1766,10 +1774,6 @@ class DebugSettings:
     def has_override(self, guild_id: Optional[int]) -> bool:
         """Has this guild made an explicit choice, rather than following the host?"""
         return guild_id is not None and guild_id in self._overrides
-
-    def is_persisted(self, guild_id: Optional[int]) -> bool:
-        """Did this guild's choice reach Redis? True for a guild that never chose."""
-        return guild_id not in self._unpersisted
 
     def footer(
         self, guild: Optional[discord.Guild], *, host_metrics: bool = True
@@ -1817,81 +1821,44 @@ class DebugSettings:
         )
 
     # ── Mutations ─────────────────────────────────────────────────────────────
+    # The stored choices are written by GuildSettings, the one writer of
+    # guild:{id}:config; these project what it read or committed.
 
-    async def hydrate(
-        self, redis: Optional[aioredis.Redis], guilds: Sequence[discord.Guild]
-    ) -> None:
-        """Hydrate the in-memory cache from each guild's stored config. Runs at
-        cog_load and again on every on_ready, so it must be safe to replay. Two
-        skip rules: a guild whose config could not be READ is skipped
-        (read_guild_configs omits it, so "Redis blinked" cannot revert a stored
-        choice to the host default), and a guild toggled while this pass was
-        reading is skipped (the read and the apply straddle an await)."""
-        if redis is None:
-            return
-        guilds = list(guilds)
-        if not guilds:
-            return
-        started = self._toggle_seq
-        configs = await read_guild_configs(redis, [g.id for g in guilds])
-        for guild in guilds:
-            config = configs.get(guild.id)
-            if config is None or self._toggled_at.get(guild.id, 0) > started:
-                continue
-            if config.debug_mode is None:
-                # No stored choice: follow the host default, uncached, or a later
-                # env change would not reach this guild.
-                self._overrides.pop(guild.id, None)
+    def apply_choices(self, choices: Mapping[int, Optional[bool]]) -> None:
+        """Cache each guild's choice; None means none is stored, so the guild
+        follows the default, uncached, and a later default change still reaches
+        it. One sampler re-check for the whole batch. Whether a choice reached
+        Redis is GuildSettings.is_persisted's to answer."""
+        for guild_id, choice in choices.items():
+            if choice is None:
+                self._overrides.pop(guild_id, None)
             else:
-                self._overrides[guild.id] = config.debug_mode
-                self._unpersisted.discard(guild.id)
+                self._overrides[guild_id] = choice
         self.sync_sampler()
 
-    async def toggle(
-        self, redis: Optional[aioredis.Redis], guild_id: int, enabled: bool
-    ) -> bool:
-        """Apply an explicit choice for one guild. Returns whether it reached
-        Redis; the caller reports that."""
-        # Redis FIRST, cache second: a failed write must not leave the cache
-        # claiming a setting the next on_ready would silently undo.
-        persisted = False
-        if redis is not None:
-            persisted = await GuildRedisStore(redis, guild_id).set_debug_mode(enabled)
-        self._overrides[guild_id] = enabled
-        # Stamp this guild so a hydration pass that read BEFORE this write cannot
-        # apply its older value on top of it.
-        self._toggle_seq += 1
-        self._toggled_at[guild_id] = self._toggle_seq
-        if persisted:
-            self._unpersisted.discard(guild_id)
-        else:
-            self._unpersisted.add(guild_id)
-        # The sampler runs only while some guild wants it.
-        self.sync_sampler()
-        log.info(
-            f"debug mode {'enabled' if enabled else 'disabled'} by command",
-            persisted=persisted,
-        )
-        return persisted
-
-    async def forget(self, redis: Optional[aioredis.Redis], guild_id: int) -> None:
-        """Drop a departed guild's override, cache and durable copy alike, or a
-        guild that removes and re-adds the bot silently resumes a setting nobody
-        there chose — and the config key carries no TTL, so it would sit in
-        Redis forever."""
-        self._toggled_at.pop(guild_id, None)
-        self._unpersisted.discard(guild_id)
+    def drop(self, guild_id: int) -> None:
+        """Forget a departed guild's choice."""
         if self._overrides.pop(guild_id, None) is not None:
             self.sync_sampler()
-        if redis is not None:
-            await GuildRedisStore(redis, guild_id).clear_config()
+
+    def set_default_override(self, value: Optional[bool]) -> None:
+        """Replace the default for this process; None returns it to DEBUG_MODE.
+        Called by BotSettings, which holds the value across a cog reload."""
+        self._default_override = value
+        if value and config.ENVIRONMENT == "production":
+            log.warning(
+                "debug mode's default is on in production for this process: every "
+                "server that has not chosen for itself shows the debug footer until "
+                "the bot restarts or the default is reset."
+            )
+        self.sync_sampler()
 
     # ── Sampler lifecycle ─────────────────────────────────────────────────────
 
     def sync_sampler(self) -> None:
         """Run the sampler exactly while some guild is effectively debug-enabled.
         Public because cog_load calls it before any toggle has happened."""
-        self._sampler.apply(wanted=self._default or any(self._overrides.values()))
+        self._sampler.apply(wanted=self.default or any(self._overrides.values()))
 
     async def aclose(self) -> None:
         """Stop the sampler, unconditionally."""

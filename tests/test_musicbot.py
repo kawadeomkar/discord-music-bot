@@ -1003,6 +1003,23 @@ class TestCogLoadSpotifyValidation:
         music_bot.spotify.validate.assert_awaited_once()
         assert music_bot.spotify_status is SpotifyStatus.ENABLED
 
+    async def test_cog_load_warms_the_timezone_index_off_the_loop(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The first -settings timezone would otherwise build the index, a walk
+        of the tz database, on the event loop."""
+        music_bot.spotify = None
+        music_bot._restore_tasks = set()
+        warm = MagicMock()
+        with (
+            patch("src.musicbot.settings_registry.warm_timezones", warm),
+            patch("src.musicbot.asyncio.to_thread", wraps=asyncio.to_thread) as hop,
+        ):
+            await music_bot.cog_load()
+            await asyncio.gather(*music_bot._restore_tasks)
+        hop.assert_called_once_with(warm)
+        warm.assert_called_once_with()
+
     async def test_valid_credentials_stay_enabled(self, music_bot: MusicBot) -> None:
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(return_value=None)
