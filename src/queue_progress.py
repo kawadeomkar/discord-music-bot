@@ -168,6 +168,14 @@ def render_progress_card(
     return [embed]
 
 
+def card_ceiling(delay: float, tick: float, max_secs: float) -> float:
+    """How long a card edits before it stalls. The card sends after its delay and
+    checks the ceiling after each tick, so under delay + 2 ticks it stalls at its
+    first check without one ordinary edit. The three are set separately, so no
+    one of them can hold this."""
+    return max(max_secs, delay + 2 * tick)
+
+
 def is_collection(source: Source) -> bool:
     """Whether this input resolves to many tracks. The card owns these and
     slow_resolve_notice owns the rest: two messages for one -play is worse than

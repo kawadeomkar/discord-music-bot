@@ -363,6 +363,12 @@ def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
     return plural if plural is not None else singular + "s"
 
 
+def fmt_seconds(secs: float) -> str:
+    """Seconds as the shortest text that reads back as the same float: 3.0 → "3s",
+    0.25 → "0.25s". repr() is that shortest form; only its trailing ".0" goes."""
+    return repr(float(secs)).removesuffix(".0") + "s"
+
+
 # Discord's hard limits: an over-length title, footer or field value 400s the
 # whole send(). The field cap matters most for lists a user can grow (removed
 # songs), where the 400 lands after the command has already mutated state.
