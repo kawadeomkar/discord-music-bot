@@ -33,8 +33,11 @@ from redis.typing import EncodableT, FieldT
 
 from src import config
 from src.guild_state import (
+    ALL_BOT_CONFIG_FIELDS,
     CONFIG_DOMAIN,
     CONFIG_WRITER_FIELD,
+    BotConfig,
+    BotConfigFieldName,
     ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
@@ -63,6 +66,10 @@ GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 # setting that expires after a day idle reverts for reasons the user cannot
 # see. See GuildConfig and _pipe_expire_all.
 GUILD_CONFIG_KEY = "guild:{guild_id}:config"
+# An operator's overrides of the bot-wide knobs (BotConfig). Keyed by application
+# id, so a dev bot and a prod bot sharing one Redis cannot retune each other.
+# No TTL, like GUILD_CONFIG_KEY.
+BOT_CONFIG_KEY = "bot:{application_id}:config"
 # Global write-ahead buffer for the Postgres history archive: every guild's
 # entries interleave (each carries its guild_id), XADDed beside the display
 # list and drained oldest-first by HistoryOutboxDrainer. NO TTL — it holds
@@ -769,6 +776,36 @@ def _guild_op(
                 return await func(self, *args, **kwargs)
             except Exception as e:
                 log.warning(f"[guild:{self.guild_id}] {func.__name__} failed: {e}")
+                return default_factory() if default_factory is not None else default
+
+        return wrapper
+
+    return decorator
+
+
+def _bot_op(
+    default: Any = None,
+    default_factory: Optional[Callable[[], Any]] = None,
+) -> Callable[
+    [Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]]],
+    Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]],
+]:
+    """_guild_op's contract for BotConfigStore: on any exception, log
+    `[bot:{application_id}] {method} failed: {e}` and return `default` (or
+    `default_factory()`). Typed to its class, so either decorator on the other
+    store is a pyright error."""
+
+    def decorator(
+        func: Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]],
+    ) -> Callable[Concatenate[BotConfigStore, _P], Awaitable[_R]]:
+        @wraps(func)
+        async def wrapper(
+            self: BotConfigStore, *args: _P.args, **kwargs: _P.kwargs
+        ) -> _R:
+            try:
+                return await func(self, *args, **kwargs)
+            except Exception as e:
+                log.warning(f"[bot:{self.application_id}] {func.__name__} failed: {e}")
                 return default_factory() if default_factory is not None else default
 
         return wrapper
@@ -1562,3 +1599,58 @@ class GuildRedisStore:
             except WatchError:
                 # Changed hands between the read and EXEC — same conclusion.
                 pass
+
+
+# ── Bot-wide Redis store ──────────────────────────────────────────────────────
+
+
+class BotConfigStore:
+    """Redis IO for bot:{application_id}:config, with GuildRedisStore's contract:
+    every method logs and never raises (@_bot_op). Its method names are the
+    guild store's config methods, and read_config is the None-on-failure reader."""
+
+    def __init__(self, redis: aioredis.Redis, application_id: int) -> None:
+        self.redis = redis
+        self.application_id = application_id
+
+    def config_key(self) -> str:
+        return BOT_CONFIG_KEY.format(application_id=self.application_id)
+
+    @_bot_op(default=None)
+    async def read_config(self) -> Optional[BotConfig]:
+        """The stored overrides, or None when the read failed. A key that is not a
+        hash reads as unset (_config_hash)."""
+        raw = await _read_config_hash(
+            self.redis, self.config_key(), f"[bot:{self.application_id}]"
+        )
+        return BotConfig.from_redis(raw)
+
+    @_bot_op(default=False)
+    async def update_config(self, config: BotConfig) -> bool:
+        """Persist the fields `config` sets. True when it landed; a config that
+        sets none is refused with nothing sent. PERSIST, because this key must
+        never be an eviction candidate."""
+        mapping = config.to_redis()
+        if not mapping:
+            log.warning(
+                f"[bot:{self.application_id}] update_config refused: no field set"
+            )
+            return False
+        pipe = self.redis.pipeline()
+        pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
+
+    @_bot_op(default=False)
+    async def reset_config_fields(self, *fields: BotConfigFieldName) -> bool:
+        """Delete stored overrides, so each knob runs on its environment value.
+        True when it landed; refused, with nothing sent, when it names no field or
+        one this hash does not hold."""
+        if not fields or not ALL_BOT_CONFIG_FIELDS.issuperset(fields):
+            log.warning(
+                f"[bot:{self.application_id}] reset_config_fields refused: {fields!r}"
+            )
+            return False
+        await self.redis.hdel(self.config_key(), *fields)
+        return True

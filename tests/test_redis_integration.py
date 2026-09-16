@@ -51,7 +51,7 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import GuildConfig, HistoryEntry, SongQueueEntry
+from src.guild_state import BotConfig, GuildConfig, HistoryEntry, SongQueueEntry
 from src.redis_client import (
     GUILD_CONFIG_KEY,
     GUILD_STATE_KEY,
@@ -60,6 +60,7 @@ from src.redis_client import (
     HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
+    BotConfigStore,
     GuildRedisStore,
     ack_outbox,
     ensure_outbox_group,
@@ -665,6 +666,15 @@ class TestConfigKeysAreNonEvictable:
 
         assert await redis.ttl(store.config_key()) == -1
 
+    async def test_the_bot_config_write_persists(self, redis: aioredis.Redis) -> None:
+        bot_store = BotConfigStore(redis, application_id=1234)
+        await redis.hset(bot_store.config_key(), "ping_tick_secs", "2.0")
+        await redis.expire(bot_store.config_key(), 600)
+
+        assert await bot_store.update_config(BotConfig(play_inflight_max=4)) is True
+
+        assert await redis.ttl(bot_store.config_key()) == -1
+
 
 class TestConfigKeyScanWalksTheCursor:
     """fakeredis answers SCAN in one page, so only a real server exercises the
@@ -788,11 +798,14 @@ class TestConfigReadsSurviveTheConnectionCap:
             store = GuildRedisStore(client, 1)
             await client.set(store.config_key(), b"not a hash")
             await client.rpush(store.queue_key(), b"entry")
+            bot_store = BotConfigStore(client, 99)
+            await client.set(bot_store.config_key(), b"not a hash")
 
             snapshot = await store.get_playback_snapshot()
 
             assert await store.read_config() == GuildConfig()
             assert snapshot is not None and snapshot.config == GuildConfig()
+            assert await bot_store.read_config() == BotConfig()
             await client.set(store.queue_key(), b"not a list")
             assert await store.get_playback_snapshot() is None
         finally:

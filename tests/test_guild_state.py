@@ -20,6 +20,9 @@ from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     Analytics,
+    BotConfig,
+    BotConfigField,
+    BotConfigFieldName,
     CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
     OFF_SECS,
@@ -1964,6 +1967,102 @@ class TestGuildConfigNumericFields:
 _BOT_COUNT_FIELDS = frozenset(knob.lower() for knob in config.INT_KNOBS)
 
 
+class TestBotConfig:
+    """bot:{application_id}:config's value object. Parsing only: the bounds are
+    the registry's."""
+
+    def test_every_attribute_is_its_wire_name(self) -> None:
+        names = {f.name for f in dataclasses.fields(BotConfig)}
+        assert names == members(BotConfigField)
+
+    def test_the_count_fields_are_the_int_knobs(self) -> None:
+        ints = {f.name for f in dataclasses.fields(BotConfig) if f.type == (int | None)}
+        assert ints == _BOT_COUNT_FIELDS
+
+    def test_nothing_stored_is_all_unset(self) -> None:
+        assert BotConfig.from_redis({}) == BotConfig()
+        assert BotConfig().to_redis() == {}
+
+    @pytest.mark.parametrize("field", sorted(get_args(BotConfigFieldName.__value__)))
+    def test_each_field_round_trips(self, field: str) -> None:
+        value: float = 2 if field in _BOT_COUNT_FIELDS else 2.5
+        bot_config = dataclasses.replace(BotConfig(), **{field: value})
+        assert bot_config.to_redis() == {field: str(value)}
+        raw = {field.encode(): str(value).encode()}
+        assert BotConfig.from_redis(raw) == bot_config
+
+    @pytest.mark.parametrize("raw", [b"2.5", b"2.0", b"nan", b"two"])
+    def test_a_count_is_read_exactly(
+        self, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Not _b_opt_int: its float fallback reads 2.5 as 2."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            parsed = BotConfig.from_redis({b"play_inflight_max": raw})
+        assert parsed.play_inflight_max is None
+        assert _guild_state_warnings(caplog) == 1
+
+    @pytest.mark.parametrize("raw", [b"nan", b"inf", b"soon"])
+    def test_an_unusable_float_reads_as_unset(self, raw: bytes) -> None:
+        assert BotConfig.from_redis({b"heartbeat_interval_secs": raw}) == BotConfig()
+
+    def test_a_parseable_value_is_kept_whatever_its_bounds(self) -> None:
+        raw = {b"ping_tick_secs": b"0", b"play_resolve_concurrency": b"-3"}
+        parsed = BotConfig.from_redis(raw)
+        assert parsed.ping_tick_secs == 0.0
+        assert parsed.play_resolve_concurrency == -3
+
+
+class TestStoredVolumeMigration:
+    """Volume moved from guild:{id}:state to guild:{id}:config. The fallback is a
+    one-release migration path, not a permanent dual-read: dropping the legacy field
+    outright would have silently reset every deployed guild to 100%."""
+
+    def test_config_wins_when_both_are_present(self) -> None:
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData(volume=0.10),
+            config=GuildConfig(volume=0.75),
+        )
+        assert snapshot.stored_volume == 0.75
+
+    def test_a_legacy_value_is_still_honoured(self) -> None:
+        """The guild set 30% before the deploy; it must come back at 30%."""
+        snapshot = GuildPlaybackSnapshot(state=GuildStateData(volume=0.30))
+        assert snapshot.stored_volume == 0.30
+
+    def test_nothing_stored_stays_none(self) -> None:
+        """Not 1.0 — restore has to skip the assignment rather than clobber a
+        concurrent -volume with a fabricated default."""
+        snapshot = GuildPlaybackSnapshot(state=GuildStateData())
+        assert snapshot.stored_volume is None
+
+    def test_an_explicit_zero_is_not_mistaken_for_unset(self) -> None:
+        """0.0 is falsy and a real choice — muted."""
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData(), config=GuildConfig(volume=0.0)
+        )
+        assert snapshot.stored_volume == 0.0
+
+    def test_an_out_of_domain_volume_in_both_hashes_is_no_stored_volume(
+        self,
+    ) -> None:
+        """set_volume writes both copies with one string, so a hand-edit that
+        reached both leaves restore nothing to assign: the player stays at 100%."""
+        raw = {b"volume": b"1.5"}
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData.from_redis(raw), config=GuildConfig.from_redis(raw)
+        )
+        assert snapshot.stored_volume is None
+
+    def test_an_out_of_domain_config_volume_falls_back_to_the_legacy_copy(
+        self,
+    ) -> None:
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData.from_redis({b"volume": b"0.3"}),
+            config=GuildConfig.from_redis({b"volume": b"1.5"}),
+        )
+        assert snapshot.stored_volume == 0.3
+
+
 class TestGuildConfigTimezone:
     """The zone a guild renders ETAs in. Stored as an IANA name and resolved at
     read time, because the tz database belongs to the host, not to the value."""
@@ -2077,14 +2176,21 @@ class TestConfigFieldNames:
     not drift from the constants spelled out on the classes."""
 
     def test_the_alias_is_the_config_fieldmembers(self) -> None:
+        from typing import get_args
 
         assert set(get_args(ConfigFieldName.__value__)) == members(ConfigField)
 
     def test_every_field_but_volume_is_resettable_by_name(self) -> None:
         """volume has its own reset, which also clears the legacy :state copy."""
+        from typing import get_args
 
         resettable = set(get_args(ResettableConfigField.__value__))
         assert resettable == members(ConfigField) - {ConfigField.VOLUME}
+
+    def test_the_bot_alias_is_the_bot_fieldmembers(self) -> None:
+        from typing import get_args
+
+        assert set(get_args(BotConfigFieldName.__value__)) == members(BotConfigField)
 
     def test_is_config_field(self) -> None:
         assert is_config_field("slow_notice_secs")
