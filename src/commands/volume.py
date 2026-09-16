@@ -1,15 +1,25 @@
-"""`-volume` — set playback level 0-100, applied from the next song."""
+"""`-volume` — set playback level 0-100, applied two songs later."""
 
 import discord
 from discord.ext import commands
 
+from src.guild_state import GuildConfig
 from src.musicplayer import MusicPlayer
+from src.settings import GuildSettings
 from src.util import notice_embed
 
 
-async def run(ctx: commands.Context, volume: str, *, mp: MusicPlayer) -> None:
-    """`-volume` — set playback level 0-100, applied from the next song. The
-    reply claims persistence only when the write landed."""
+async def run(
+    ctx: commands.Context,
+    volume: str,
+    *,
+    mp: MusicPlayer,
+    guild_settings: GuildSettings,
+) -> None:
+    """`-volume` — set playback level 0-100. The level is baked into a source's
+    FFmpeg filter when it is built and the prefetch builds one song ahead, so this
+    lands two songs out unless nothing is built yet. The reply claims persistence
+    only when the write landed."""
     try:
         volume_pct = int(volume)
     except ValueError:
@@ -25,10 +35,13 @@ async def run(ctx: commands.Context, volume: str, *, mp: MusicPlayer) -> None:
             embed=notice_embed("Volume must be between 0 and 100", discord.Color.red())
         )
         return
-    mp.volume = volume_pct / 100
-    persisted = False
-    if mp.store is not None:
-        persisted = await mp.store.set_volume(mp.volume)
+    assert ctx.guild is not None  # validate_commands admits guild members only
+    # The commit assigns mp.volume, after the store call: a restore checking in
+    # between finds the write's stamp rather than overwriting the new level.
+    result = await guild_settings.write(
+        ctx.guild.id, GuildConfig(volume=volume_pct / 100), player=mp
+    )
+    persisted = result.persisted
     durability = (
         "It is saved for this server."
         if persisted
@@ -37,7 +50,8 @@ async def run(ctx: commands.Context, volume: str, *, mp: MusicPlayer) -> None:
     )
     await ctx.send(
         embed=notice_embed(
-            f"Set volume to {volume_pct}% (takes effect on next song). " + durability,
+            f"Set volume to {volume_pct}% (usually takes effect two songs from now). "
+            + durability,
             discord.Color.blue(),
         )
     )

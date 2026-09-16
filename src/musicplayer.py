@@ -36,11 +36,16 @@ from src.guild_queue import (
 )
 from src.guild_state import (
     DEFAULT_TIMEZONE,
+    DEFAULT_VOLUME,
+    DEFAULT_IDLE_TIMEOUT_SECS,
+    ConfigField,
+    GuildConfig,
     HistoryEntry,
     NowPlayingData,
     SongQueueEntry,
 )
 from src.redis_client import GuildRedisStore
+from src.settings import WriteMode
 from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
@@ -96,10 +101,9 @@ class EtaWalk:
         return replace(self, cumulative_secs=self.cumulative_secs + remaining)
 
 
-# TODO: every guild's ETAs still render in DEFAULT_TIMEZONE, and in one zone per
-# guild rather than per viewer. queue_embed()'s "Est. playing at" and the NP
-# "Estimated finish" read GuildConfig.timezone, but nothing writes it (set_timezone
-# has no caller). Owed: a write path, then per-viewer rendering (<t:epoch:R>).
+# TODO: ETAs render in one zone per guild, never per viewer: queue_embed()'s
+# "Est. playing at" and the NP "Estimated finish" read GuildConfig.timezone, which
+# -settings timezone sets. Owed: per-viewer rendering (<t:epoch:R>).
 
 
 def _fmt_total_duration(secs: int) -> str:
@@ -152,9 +156,13 @@ _RESUME_EOF_MARGIN_SECS = 10
 _SONG_COMPLETE_MARGIN_SECS = 5
 
 # ── Playback gate ────────────────────────────────
-# How long loop() waits for a voice connection before tearing the player down.
-# Matches the idle queue_get() timeout.
-_PLAYBACK_GATE_TIMEOUT = 300
+# How long loop() waits for a voice connection before tearing the player down:
+# the idle-timeout default.
+_PLAYBACK_GATE_TIMEOUT = DEFAULT_IDLE_TIMEOUT_SECS
+
+# Bound on resolving an entry the loop has dequeued, whatever the server's idle
+# timeout: that setting bounds only the wait for the entry.
+_IN_BAND_RESOLVE_TIMEOUT_SECS = 300.0
 
 # Ceiling on the start transaction, the one Redis write under the queue's bulk
 # mutex; the pool sets no socket_timeout. Past it the song plays unpersisted and
@@ -436,7 +444,7 @@ class MusicPlayer:
         self._last_stream_error: Optional[StreamFailure] = None
         self.play_next = asyncio.Event()
         self.play_message: Optional[discord.Embed] = None
-        self.volume = 1.0
+        self.volume = DEFAULT_VOLUME
         # Replaced at restore from GuildConfig.
         self.timezone = ZoneInfo(DEFAULT_TIMEZONE)
 
@@ -901,16 +909,29 @@ class MusicPlayer:
 
     # ── State restore ─────────────────────────────────────────────────────────
 
+    def _adopt_cached_settings(self) -> None:
+        """The volume and zone the settings cache holds, taken before any read. The
+        cache keeps a write that did not reach Redis, which seed() never replaces,
+        and it is all a player has without a store or a readable snapshot."""
+        cached = self._cog.guild_settings.peek(self._guild.id)
+        if cached is None:
+            return
+        if cached.volume is not None:
+            self.volume = cached.volume
+        self.timezone = cached.tzinfo()
+
     async def _restore_state(self) -> None:
         """Restore queue, history, and volume from Redis after a restart. Runs as a
         background task; waits for bot ready so guild members are cached. loop()
         waits on _restore_complete before its first queue_get(): the crash-recovered
         head injected here was never on the Redis list, so an LPOP for it would
         delete an unrelated, still-queued song."""
+        self._adopt_cached_settings()
         if self.store is None:
             self._restore_read_failed = True
             self._restore_complete.set()
             return
+        settings = self._cog.guild_settings
         try:
             await self.bot.wait_until_ready()
             with _tracer.start_as_current_span(
@@ -918,35 +939,45 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    # One pipelined read: state hash, pending queue, now-playing
-                    # snapshot, newest history.
-                    snapshot = await self.store.get_playback_snapshot()
-                    if snapshot is None:
-                        # Read failed — abort rather than proceed with fabricated
-                        # defaults. `finally` still sets _restore_complete.
-                        self._restore_read_failed = True
-                        log.warning(
-                            f"State restore aborted for guild {self._guild.id}: "
-                            f"Redis unavailable"
+                    # Registered from immediately before the read through the SEED
+                    # write: a settings write committing after `started` stamps
+                    # above it, and seed() leaves that field alone.
+                    with settings.reading() as started:
+                        # One pipelined read: state hash, pending queue, now-playing
+                        # snapshot, newest history.
+                        snapshot = await self.store.get_playback_snapshot()
+                        if snapshot is None:
+                            # Read failed — abort rather than proceed with fabricated
+                            # defaults. `finally` still sets _restore_complete.
+                            self._restore_read_failed = True
+                            log.warning(
+                                f"State restore aborted for guild {self._guild.id}: "
+                                f"Redis unavailable"
+                            )
+                            return
+                        # The one stamp check, gating the zone, the volume and the
+                        # migration alike. Nothing is awaited from here to the SEED.
+                        accepted = settings.seed(
+                            self._guild.id, snapshot.config, started=started
                         )
-                        return
+                        if ConfigField.TIMEZONE in accepted:
+                            # tzinfo() degrades an unset or unusable name.
+                            self.timezone = snapshot.config.tzinfo()
+                        # Config, then the legacy :state copy; both are in domain.
+                        stored_volume = snapshot.stored_volume
+                        if ConfigField.VOLUME in accepted and stored_volume is not None:
+                            self.volume = stored_volume
+                            if snapshot.config.volume is None:
+                                # Seed the legacy value into config, once. The write
+                                # path re-checks `started` under the guild's lock: a
+                                # volume write or reset can commit while it waits.
+                                await settings.write(
+                                    self._guild.id,
+                                    GuildConfig(volume=stored_volume),
+                                    mode=WriteMode.SEED,
+                                    since=started,
+                                )
                     guild_state = snapshot.state
-
-                    # Unconditional: tzinfo() already degrades to the default for
-                    # an unset or unusable name.
-                    self.timezone = snapshot.config.tzinfo()
-
-                    stored_volume = snapshot.stored_volume
-                    # Only when a value was stored: an unconditional assign would
-                    # clobber a concurrent -volume with the default.
-                    if stored_volume is not None:
-                        self.volume = stored_volume
-                        # Seed a pre-move value from the 24h-TTL state hash into
-                        # config, once. migrate_volume (HSETNX), NOT set_volume: a
-                        # -volume that landed since this snapshot was read must not
-                        # be overwritten by the older value.
-                        if snapshot.config.volume is None and self.store is not None:
-                            await self.store.migrate_volume(stored_volume)
 
                     # Display snapshot, so -now works if a song was playing.
                     if snapshot.now_playing is not None:
@@ -1921,7 +1952,9 @@ class MusicPlayer:
         self._spawn_background(asyncio.to_thread(song.cleanup))
 
     def _requeued_form(self, song: YTDL) -> QueueObject:
-        """The QueueObject a completed prefetch goes back on the queue as."""
+        """The QueueObject a built source came from, with every field it carries:
+        what a completed prefetch goes back on the queue as, and what a volume
+        rebuild is built from."""
         # Dropping a field here restarts a neutralized resume entry from 0:00,
         # loses a ?t= offset, or zeroes the ask this play was queued against.
         return QueueObject(
@@ -2303,8 +2336,9 @@ class MusicPlayer:
         )
 
     async def _progress_updater(self, song: YTDL) -> None:
-        interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
         while True:
+            # Read per tick: a change lands after the tick in progress.
+            interval = self._cog.guild_settings.np_refresh_secs(self._guild.id)
             await asyncio.sleep(interval)
             vc = self._guild.voice_client
             if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
@@ -2482,8 +2516,11 @@ class MusicPlayer:
                         source = None
                     else:
                         source = None
+                        idle_secs = self._cog.guild_settings.idle_timeout_secs(
+                            self._guild.id
+                        )
                         try:
-                            async with async_timeout.timeout(300):
+                            async with async_timeout.timeout(idle_secs) as idle:
                                 source = await self.queue_get()
                                 claim_outstanding = True
                                 # Safe before the resolve: a YTSource is persisted
@@ -2493,6 +2530,10 @@ class MusicPlayer:
                                 # Re-read: a clear() during the blocking get
                                 # belongs to the queue this item came from.
                                 commit_generation = self.queue.generation
+                                idle.reschedule(
+                                    asyncio.get_running_loop().time()
+                                    + _IN_BAND_RESOLVE_TIMEOUT_SECS
+                                )
                                 source = await self._resolve_source(source)
                         except asyncio.TimeoutError:
                             log.warning("Queue timed out, disconnecting")

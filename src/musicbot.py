@@ -1123,7 +1123,8 @@ class MusicBot(commands.Cog):
             "song after it ahead of time, at whatever the level was then, so a "
             "change usually lands **two songs** from here — sooner only if "
             "nothing has been built yet. It is saved per server, so it still "
-            "applies after a restart."
+            "applies after a restart. `-settings volume` shows and changes the "
+            "same saved level."
         ),
         extras={"category": "Playback", "examples": ["-volume 50", "-vol 100"]},
     )
@@ -1131,7 +1132,9 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.volume")
     async def volume(self, ctx: commands.Context, volume: str) -> None:
         try:
-            await volume_cmd.run(ctx, volume, mp=self.get_mp(ctx))
+            await volume_cmd.run(
+                ctx, volume, mp=self.get_mp(ctx), guild_settings=self.guild_settings
+            )
         except Exception as e:
             await self._command_error(ctx, e)
 

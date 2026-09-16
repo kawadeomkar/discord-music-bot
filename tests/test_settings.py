@@ -2129,3 +2129,122 @@ async def redis_client_scan(redis: aioredis.Redis) -> list[int]:
     from src.redis_client import scan_guild_config_ids
 
     return await scan_guild_config_ids(redis, timeout=1.0) or []
+
+
+class TestGuildConfigHasOneWriter:
+    """Every store method that writes guild:{id}:config is called from
+    src/settings.py alone. A shortcut writing Redis directly would desynchronize
+    the cache from its first call."""
+
+    _WRITERS = frozenset(
+        {
+            "set_volume",
+            "migrate_volume",
+            "set_debug_mode",
+            "set_timezone",
+            "update_config",
+            "reset_config_fields",
+            "reset_volume",
+            "clear_config",
+        }
+    )
+
+    def test_only_settings_calls_them(self) -> None:
+        offenders = []
+        for path in sorted(Path("src").rglob("*.py")):
+            if path.name == "settings.py" and path.parent.name == "src":
+                continue
+            for node in ast.walk(ast.parse(path.read_text())):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in self._WRITERS
+                ):
+                    offenders.append(f"{path}:{node.lineno} {node.func.attr}")
+        assert not offenders
+
+    def test_the_walk_sees_the_writers_it_exempts(self) -> None:
+        tree = ast.parse(Path("src/settings.py").read_text())
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert self._WRITERS <= called
+
+
+def _awaits_reaching_guild_settings(tree: ast.AST) -> list[tuple[str, int]]:
+    """(function, line) for each await on guild_settings, directly or through a
+    local name bound to an expression that mentions it."""
+    found: list[tuple[str, int]] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        aliases = {
+            target.id
+            for node in ast.walk(func)
+            if isinstance(node, ast.Assign)
+            and "guild_settings" in ast.unparse(node.value)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Await):
+                continue
+            text = ast.unparse(node.value)
+            if "guild_settings" in text or any(
+                text.startswith(f"{alias}.") for alias in aliases
+            ):
+                found.append((func.name, node.lineno))
+    return found
+
+
+class TestHotPathsNeverAwaitSettings:
+    """The pool has no socket_timeout, so a hot path that awaited a settings read
+    would hang for as long as Redis stalls. Hot paths read synchronously."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "peek",
+            "is_complete",
+            "is_persisted",
+            "unsaved",
+            "reading",
+            "seed",
+            "idle_timeout_secs",
+            "alone_timeout_secs",
+            "np_refresh_secs",
+            "slow_notice_secs",
+            "queue_progress_delay_secs",
+        ],
+    )
+    def test_the_synchronous_surface_is_plain_functions(self, name: str) -> None:
+        import inspect
+
+        assert not inspect.iscoroutinefunction(getattr(GuildSettings, name))
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "src/recovery.py",
+            "src/commands/play.py",
+            "src/play_pipeline.py",
+            "src/play_placement.py",
+        ],
+    )
+    def test_no_hot_path_module_awaits_it(self, path: str) -> None:
+        assert _awaits_reaching_guild_settings(ast.parse(Path(path).read_text())) == []
+
+    def test_debug_build_inputs_does_not_await_it(self) -> None:
+        tree = ast.parse(Path("src/commands/debug.py").read_text())
+        assert [
+            hit
+            for hit in _awaits_reaching_guild_settings(tree)
+            if hit[0] == "build_inputs"
+        ] == []
+
+    def test_the_player_awaits_it_once_for_the_restore_seed(self) -> None:
+        tree = ast.parse(Path("src/musicplayer.py").read_text())
+        hits = _awaits_reaching_guild_settings(tree)
+        assert [name for name, _ in hits] == ["_restore_state"]

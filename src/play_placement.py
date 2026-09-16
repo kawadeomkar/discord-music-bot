@@ -21,7 +21,6 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import config
-from src.config import PLAY_SLOW_NOTICE_SECS
 from src.musicplayer import MusicPlayer
 from src.util import (
     DASHES,
@@ -297,21 +296,26 @@ async def slow_resolve_notice(
     ctx: commands.Context,
     *,
     query: str,
+    delay: Optional[float],
     debug_suffix: Optional[str] = None,
     request_settled: Optional[asyncio.Event] = None,
 ) -> AsyncGenerator[None]:
-    """Say that `query` is still being looked up once it outlives
-    PLAY_SLOW_NOTICE_SECS, and take the message back when `request_settled` is set
-    or the block exits, whichever comes first.
+    """Say that `query` is still being looked up once it outlives `delay`, and
+    take the message back when `request_settled` is set or the block exits,
+    whichever comes first. `delay` is required, so every call site reads the
+    server's slow-notice when it enters; None is off and arms nothing.
 
     ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the Now
     Playing host, so deleting it would drag the live progress bar onto it.
     Bypassing it also skips debug-mode decoration, hence `debug_suffix`.
     See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait."""
+    if delay is None:
+        yield
+        return
     settled = asyncio.Event()
 
     async def _post() -> None:
-        if await set_within(settled, PLAY_SLOW_NOTICE_SECS):
+        if await set_within(settled, delay):
             # Landed inside the delay, which is the common case: say nothing.
             return
         span = trace.get_current_span()
