@@ -23,15 +23,17 @@ from src.debug import DebugSettings
 from src.guild_state import (
     CONFIG_DOMAIN,
     OFF_SECS,
+    BotConfig,
     BotConfigField,
     ConfigField,
     GuildConfig,
 )
-from src.redis_client import GuildRedisStore
+from src.redis_client import BotConfigStore, GuildRedisStore
 from src.musicplayer import _fmt_total_duration
 from src.settings import (
     SETTINGS,
     TIMEZONE_REDIRECTS,
+    BotSettings,
     GuildSettings,
     Parsed,
     Refusal,
@@ -1161,6 +1163,525 @@ class TestRefusalsNeverQuoteTheInput:
 # ── BotSettings ───────────────────────────────────────────────────────────────
 
 _APP_ID = 123456789012345678
+
+
+# ── BotSettings ───────────────────────────────────────────────────────────────
+
+_APP_ID = 123456789012345678
+
+
+def _bot(*, application_id: int | None = _APP_ID, cog: Any = None) -> MagicMock:
+    bot = MagicMock()
+    bot.application_id = application_id
+    bot.get_cog = MagicMock(return_value=cog)
+    return bot
+
+
+def _cog_with_debug_settings() -> MagicMock:
+    cog = MagicMock()
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
+    return cog
+
+
+async def _store(redis: aioredis.Redis, stored: BotConfig) -> None:
+    assert await BotConfigStore(redis, _APP_ID).update_config(stored)
+
+
+class TestBotSettingsHydrate:
+    """The stored overrides reach config's accessors, and only in-bounds ones."""
+
+    async def test_in_bounds_overrides_are_applied_and_listed_once(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        await _store(
+            fake_redis, BotConfig(heartbeat_interval_secs=5.0, play_inflight_max=4)
+        )
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+
+        await bot_settings.hydrate()
+
+        assert config.heartbeat_interval_secs() == 5.0
+        assert config.play_inflight_max() == 4
+        assert bot_settings.hydrated is True
+        assert (
+            f"bot settings applied from bot:{_APP_ID}:config: "
+            "heartbeat=5s, play-inflight-max=4"
+        ) in caplog.text
+
+    async def test_a_failed_read_is_retried_until_one_lands(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redis down at boot must not leave the stored overrides unapplied until a
+        session-loss READY or a restart."""
+        monkeypatch.setattr(settings, "_HYDRATE_RETRY_FIRST_SECS", 0.001)
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=5.0))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        real = BotConfigStore.read_config
+        reads = 0
+
+        async def fails_twice(store: BotConfigStore) -> Any:
+            nonlocal reads
+            reads += 1
+            return None if reads <= 2 else await real(store)
+
+        with patch.object(BotConfigStore, "read_config", new=fails_twice):
+            async with asyncio.timeout(2):
+                await bot_settings.hydrate_until_read()
+
+        assert (reads, bot_settings.hydrated, bot_settings.unread) == (3, True, False)
+        assert config.heartbeat_interval_secs() == 5.0
+
+    async def test_a_key_that_is_not_a_hash_is_read_once_as_unset(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """No read can change it, so retried as a failed read it would keep the
+        bot card's warning up for the life of the process."""
+        await fake_redis.set(BotConfigStore(fake_redis, _APP_ID).config_key(), b"x")
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        async with asyncio.timeout(0.5):
+            await bot_settings.hydrate_until_read()
+        assert (bot_settings.hydrated, bot_settings.unread) == (True, False)
+
+    @pytest.mark.parametrize("ignore_stored", [True, False])
+    async def test_nothing_to_read_returns_at_once(self, ignore_stored: bool) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=ignore_stored)
+        async with asyncio.timeout(1):
+            await bot_settings.hydrate_until_read()
+        assert bot_settings.unread is False
+
+    async def test_a_value_outside_the_current_bounds_is_skipped_with_a_warning(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The key outlives builds: a stored value from a build with other bounds
+        must neither apply nor abort."""
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=0.5))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+
+        await bot_settings.hydrate()
+
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert "heartbeat=0.5" in caplog.text and "ignored" in caplog.text
+        assert bot_settings.hydrated is True
+
+    async def test_an_override_shadowing_a_set_variable_names_every_way_out(
+        self,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("PLAY_INFLIGHT_MAX", "16")
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+
+        await BotSettings(_bot(), redis=fake_redis, ignore_stored=False).hydrate()
+
+        warning = next(
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "overrides" in r.getMessage()
+        )
+        assert "PLAY_INFLIGHT_MAX=16" in warning
+        assert "-settings bot play-inflight-max reset" in warning
+        assert f"just bot-settings reset {_APP_ID}" in warning
+        assert "BOT_SETTINGS_OVERRIDES=ignore" in warning
+
+    async def test_an_override_of_an_unset_variable_draws_no_warning(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+        await BotSettings(_bot(), redis=fake_redis, ignore_stored=False).hydrate()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    async def test_ignore_makes_no_read_and_warns_once(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=True)
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(side_effect=AssertionError)
+        ) as read:
+            await bot_settings.hydrate()
+            await bot_settings.hydrate()
+
+        read.assert_not_called()
+        assert config.override("PLAY_INFLIGHT_MAX") is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "BOT_SETTINGS_OVERRIDES=ignore" in warnings[0].getMessage()
+        assert f"bot:{_APP_ID}:config" in warnings[0].getMessage()
+
+    async def test_no_application_id_makes_no_read(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Unit tests never log in; the key would otherwise be bot:None:config."""
+        bot_settings = BotSettings(
+            _bot(application_id=None), redis=fake_redis, ignore_stored=False
+        )
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(side_effect=AssertionError)
+        ) as read:
+            await bot_settings.hydrate()
+        read.assert_not_called()
+        assert bot_settings.hydrated is False
+
+    async def test_a_failed_read_runs_on_environment_values_and_can_retry(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=5.0))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        with patch.object(fake_redis, "hgetall", side_effect=RuntimeError("down")):
+            await bot_settings.hydrate()
+
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert bot_settings.hydrated is False
+        assert "running on environment values" in caplog.text
+
+        await bot_settings.hydrate()
+        assert config.heartbeat_interval_secs() == 5.0
+
+    async def test_a_stalled_read_gives_up_within_the_timeout(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "CONFIG_IO_TIMEOUT_SECS", 0.05)
+
+        async def stalled(*_: object) -> None:
+            await asyncio.Event().wait()
+
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        with patch.object(BotConfigStore, "read_config", new=stalled):
+            async with asyncio.timeout(5):
+                await bot_settings.hydrate()
+        assert bot_settings.hydrated is False
+
+    async def test_a_knob_changed_during_the_read_keeps_the_new_value(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        stored = BotConfig(heartbeat_interval_secs=5.0, ping_tick_secs=2.0)
+
+        async def read_then_operator_applies(_: object) -> BotConfig:
+            bot_settings.apply(_spec("heartbeat"), 7.0)
+            return stored
+
+        with patch.object(
+            BotConfigStore, "read_config", new=read_then_operator_applies
+        ):
+            await bot_settings.hydrate()
+
+        assert config.heartbeat_interval_secs() == 7.0
+        assert config.ping_tick_secs() == 2.0
+
+
+class TestBotSettingsWrite:
+    """A -settings bot change: stored, then applied, one at a time."""
+
+    async def test_a_write_stores_then_applies_and_reports_what_it_replaced(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        first = await bot_settings.write(spec, 5.0)
+        assert (first.applied, first.persisted, first.previous) == (True, True, None)
+        second = await bot_settings.write(spec, 6.0)
+        assert second.previous == 5.0
+        assert config.heartbeat_interval_secs() == 6.0
+        stored = await BotConfigStore(fake_redis, _APP_ID).read_config()
+        assert stored == BotConfig(heartbeat_interval_secs=6.0)
+
+    async def test_a_reset_deletes_the_stored_value_and_the_override(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("play-inflight-max")
+        await bot_settings.write(spec, 8)
+        result = await bot_settings.write_reset(spec)
+        assert (result.persisted, result.previous) == (True, 8)
+        assert config.override("PLAY_INFLIGHT_MAX") is None
+        assert await BotConfigStore(fake_redis, _APP_ID).read_config() == BotConfig()
+
+    async def test_an_unconfirmed_write_applies_marked_until_one_lands(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        with patch.object(
+            BotConfigStore, "update_config", new=AsyncMock(return_value=False)
+        ):
+            result = await bot_settings.write(spec, 5.0)
+        assert (result.applied, result.persisted) == (True, False)
+        assert config.heartbeat_interval_secs() == 5.0
+        assert not bot_settings.is_persisted(spec)
+        await bot_settings.write(spec, 5.0)
+        assert bot_settings.is_persisted(spec)
+
+    async def test_an_unconfirmed_reset_is_marked_until_one_lands(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        await bot_settings.write(spec, 5.0)
+        with patch.object(
+            BotConfigStore, "reset_config_fields", new=AsyncMock(return_value=False)
+        ):
+            result = await bot_settings.write_reset(spec)
+        assert (result.applied, result.persisted) == (True, False)
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert not bot_settings.is_persisted(spec)
+        await bot_settings.write_reset(spec)
+        assert bot_settings.is_persisted(spec)
+
+    async def test_a_later_hydrate_keeps_an_unsaved_write(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Hydration failed, so a later READY reads again. A write made between the
+        two did not reach Redis, and that read must not put the stored 4s back."""
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=4.0))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(return_value=None)
+        ):
+            await bot_settings.hydrate()
+        with patch.object(
+            BotConfigStore, "update_config", new=AsyncMock(return_value=False)
+        ):
+            await bot_settings.write(spec, 10.0)
+
+        await bot_settings.hydrate()
+
+        assert bot_settings.hydrated is True
+        assert config.heartbeat_interval_secs() == 10.0
+        assert not bot_settings.is_persisted(spec)
+
+    async def test_a_later_hydrate_keeps_an_unsaved_reset(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        await _store(fake_redis, BotConfig(play_inflight_max=1))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("play-inflight-max")
+        with patch.object(
+            BotConfigStore, "read_config", new=AsyncMock(return_value=None)
+        ):
+            await bot_settings.hydrate()
+        with patch.object(
+            BotConfigStore, "reset_config_fields", new=AsyncMock(return_value=False)
+        ):
+            await bot_settings.write_reset(spec)
+
+        await bot_settings.hydrate()
+
+        assert config.override("PLAY_INFLIGHT_MAX") is None
+        assert not bot_settings.is_persisted(spec)
+
+    async def test_a_stalled_store_reports_not_saved_within_the_timeout(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "CONFIG_IO_TIMEOUT_SECS", 0.05)
+        never = asyncio.Event()
+
+        async def _stall(*_args: Any, **_kwargs: Any) -> bool:
+            await never.wait()
+            return True
+
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        with patch.object(BotConfigStore, "update_config", new=_stall):
+            async with asyncio.timeout(2):
+                result = await bot_settings.write(_spec("heartbeat"), 5.0)
+        assert result.persisted is False
+
+    async def test_while_ignored_nothing_is_sent_or_changed(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=True)
+        update = AsyncMock(return_value=True)
+        reset = AsyncMock(return_value=True)
+        with (
+            patch.object(BotConfigStore, "update_config", new=update),
+            patch.object(BotConfigStore, "reset_config_fields", new=reset),
+        ):
+            written = await bot_settings.write(_spec("heartbeat"), 5.0)
+            cleared = await bot_settings.write_reset(_spec("heartbeat"))
+        assert (written.applied, cleared.applied) == (False, False)
+        update.assert_not_awaited()
+        reset.assert_not_awaited()
+        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+
+    async def test_concurrent_writes_end_on_the_last_in_redis_and_in_memory(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Without the lock a slow first store call would land after the second's
+        and leave Redis holding one value while the process runs the other."""
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        spec = _spec("heartbeat")
+        real = BotConfigStore.update_config
+        release = asyncio.Event()
+        calls = 0
+
+        async def _first_is_slow(store: BotConfigStore, change: BotConfig) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await release.wait()
+            return await real(store, change)
+
+        with patch.object(BotConfigStore, "update_config", new=_first_is_slow):
+            first = asyncio.create_task(bot_settings.write(spec, 5.0))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(bot_settings.write(spec, 6.0))
+            await asyncio.sleep(0.01)
+            release.set()
+            await asyncio.gather(first, second)
+        assert config.heartbeat_interval_secs() == 6.0
+        stored = await BotConfigStore(fake_redis, _APP_ID).read_config()
+        assert stored is not None and stored.heartbeat_interval_secs == 6.0
+
+    async def test_a_hydrate_during_the_store_call_does_not_undo_the_write(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """The store call comes before the override, so a startup read that began
+        during it sees the knob stamped after it and leaves the knob alone. Applied
+        first, that read would put the old stored value back."""
+        await _store(fake_redis, BotConfig(heartbeat_interval_secs=4.0))
+        bot_settings = BotSettings(_bot(), redis=fake_redis, ignore_stored=False)
+        real = BotConfigStore.update_config
+        release = asyncio.Event()
+
+        async def _slow(store: BotConfigStore, change: BotConfig) -> bool:
+            await release.wait()
+            return await real(store, change)
+
+        with patch.object(BotConfigStore, "update_config", new=_slow):
+            writing = asyncio.create_task(bot_settings.write(_spec("heartbeat"), 5.0))
+            await asyncio.sleep(0)
+            await bot_settings.hydrate()
+            release.set()
+            await writing
+        assert config.heartbeat_interval_secs() == 5.0
+
+    @pytest.mark.parametrize("key", ["debug-default", "volume"])
+    async def test_only_a_stored_bot_setting_is_written(self, key: str) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        spec = next(s for s in SETTINGS if s.key == key)
+        with pytest.raises(ValueError):
+            await bot_settings.write(spec, True if key == "debug-default" else 50)
+
+    async def test_a_value_the_registry_refuses_raises(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        with pytest.raises(ValueError):
+            await bot_settings.write(_spec("heartbeat"), 1.0)
+
+
+class TestBotSettingsApply:
+    def test_apply_and_reset_move_the_accessor(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        assert bot_settings.apply(_spec("heartbeat"), 5.0) is True
+        assert config.heartbeat_interval_secs() == 5.0
+        assert bot_settings.reset(_spec("heartbeat")) is True
+        assert config.heartbeat_interval_secs() == config.HEARTBEAT_INTERVAL_SECS
+
+    def test_a_count_is_applied_as_an_int(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        bot_settings.apply(_spec("play-inflight-max"), 4)
+        assert type(config.play_inflight_max()) is int
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [("heartbeat", 1.0), ("heartbeat", float("nan")), ("play-inflight-max", 2.5)],
+    )
+    def test_a_value_the_registry_refuses_raises(self, key: str, value: float) -> None:
+        """Input is refused before it gets here; reaching apply with one is a bug."""
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        with pytest.raises(ValueError):
+            bot_settings.apply(_spec(key), value)
+
+    def test_a_server_setting_raises(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
+        with pytest.raises(ValueError):
+            bot_settings.apply(_spec("volume"), 50)
+
+    def test_while_ignored_a_stored_setting_is_refused_and_unchanged(self) -> None:
+        bot_settings = BotSettings(_bot(), redis=None, ignore_stored=True)
+        config.set_override("HEARTBEAT_INTERVAL_SECS", 9.0)
+        assert bot_settings.apply(_spec("heartbeat"), 5.0) is False
+        assert bot_settings.reset(_spec("heartbeat")) is False
+        assert config.heartbeat_interval_secs() == 9.0
+
+
+class TestDebugDefaultIsSessionOnly:
+    """debug-default decides what every server that never chose publishes, so it
+    lasts until a restart and is never stored."""
+
+    async def test_apply_and_reset_reach_the_cogs_debug_settings(self) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=None, ignore_stored=False)
+        try:
+            assert bot_settings.apply(_spec("debug-default"), True) is True
+            assert cog.debug_settings.default is True
+            assert cog.debug_settings.enabled(42) is True
+            assert bot_settings.reset(_spec("debug-default")) is True
+            assert cog.debug_settings.default is False
+        finally:
+            await cog.debug_settings.aclose()
+
+    async def test_it_is_settable_while_stored_settings_are_ignored(self) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=None, ignore_stored=True)
+        try:
+            assert bot_settings.apply(_spec("debug-default"), True) is True
+            assert cog.debug_settings.default is True
+        finally:
+            await cog.debug_settings.aclose()
+
+    async def test_no_path_touches_the_store(self, fake_redis: aioredis.Redis) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=fake_redis, ignore_stored=False)
+        boom = AsyncMock(side_effect=AssertionError("debug-default reached the store"))
+        try:
+            with (
+                patch.object(BotConfigStore, "update_config", new=boom),
+                patch.object(BotConfigStore, "reset_config_fields", new=boom),
+            ):
+                bot_settings.apply(_spec("debug-default"), True)
+                bot_settings.reset(_spec("debug-default"))
+            assert (
+                await BotConfigStore(fake_redis, _APP_ID).read_config() == BotConfig()
+            )
+        finally:
+            await cog.debug_settings.aclose()
+
+    async def test_a_reloaded_cog_gets_the_session_value_and_a_restart_does_not(
+        self,
+    ) -> None:
+        cog = _cog_with_debug_settings()
+        bot_settings = BotSettings(_bot(cog=cog), redis=None, ignore_stored=False)
+        reloaded = DebugSettings()
+        reloaded._default = False
+        restarted = DebugSettings()
+        restarted._default = False
+        try:
+            bot_settings.apply(_spec("debug-default"), True)
+            bot_settings.reapply_debug_default(reloaded)
+            assert reloaded.default is True
+
+            BotSettings(_bot(), redis=None, ignore_stored=False).reapply_debug_default(
+                restarted
+            )
+            assert restarted.default is False
+        finally:
+            for debug_settings in (cog.debug_settings, reloaded, restarted):
+                await debug_settings.aclose()
+
+    async def test_a_value_set_before_the_cog_loads_is_held(self) -> None:
+        bot_settings = BotSettings(_bot(cog=None), redis=None, ignore_stored=False)
+        assert bot_settings.apply(_spec("debug-default"), True) is True
+        late = DebugSettings()
+        late._default = False
+        try:
+            bot_settings.reapply_debug_default(late)
+            assert late.default is True
+        finally:
+            await late.aclose()
 
 
 # ── GuildSettings ─────────────────────────────────────────────────────────────

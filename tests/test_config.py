@@ -1419,6 +1419,29 @@ class TestBotKnobOverrides:
             importlib.reload(config)
 
 
+class TestBotSettingsOverridesIgnored:
+    @pytest.mark.parametrize(
+        ("raw", "ignored"),
+        [(None, False), ("", False), ("apply", False), (" Ignore ", True)],
+    )
+    def test_the_accepted_values(
+        self, monkeypatch: pytest.MonkeyPatch, raw: Optional[str], ignored: bool
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
+        else:
+            monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", raw)
+        assert config.bot_settings_overrides_ignored() is ignored
+
+    @pytest.mark.parametrize("raw", ["true", "ignored", "off"])
+    def test_anything_else_raises_naming_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", raw)
+        with pytest.raises(ValueError, match="BOT_SETTINGS_OVERRIDES"):
+            config.bot_settings_overrides_ignored()
+
+
 class TestLivenessInterval:
     """The touch cadence is refused at import outside 1-60s, so a value that would
     spin the loop or outlast the HEALTHCHECK's 90s staleness window never runs."""

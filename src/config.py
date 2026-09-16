@@ -428,6 +428,23 @@ def debug_mode_default() -> bool:
     return _parse_bool_env("DEBUG_MODE")
 
 
+def bot_settings_overrides_ignored() -> bool:
+    """BOT_SETTINGS_OVERRIDES: `ignore` runs the process on environment and code
+    values, never reading bot:{application_id}:config; unset, empty and `apply`
+    apply what is stored. Anything else raises, so setup_hook reads it before
+    anything that could swallow the error."""
+    raw = os.environ.get("BOT_SETTINGS_OVERRIDES")
+    value = (raw or "").strip().lower()
+    if value in ("", "apply"):
+        return False
+    if value == "ignore":
+        return True
+    raise ValueError(
+        "BOT_SETTINGS_OVERRIDES must be apply or ignore (case-insensitive); "
+        f"got {raw!r}"
+    )
+
+
 def debug_prometheus_url() -> Optional[str]:
     """Prometheus holding this deployment's container metrics, which -debug's
     Postgres block reads CPU/memory from; None leaves that row at `n/a`."""

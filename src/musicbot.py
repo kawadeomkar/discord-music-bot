@@ -174,9 +174,19 @@ class MusicBot(commands.Cog):
         # Claimed by the first on_ready: the orphan sweep runs once per process.
         self._orphan_sweep_claimed = False
 
+    @property
+    def bot_settings(self) -> Optional[settings_registry.BotSettings]:
+        """MusicBotApp's, built in setup_hook; None on a bot that never ran it."""
+        found = getattr(self.bot, "bot_settings", None)
+        return found if isinstance(found, settings_registry.BotSettings) else None
+
     async def cog_load(self) -> None:
         """Spawn the settings hydration and the Spotify credential probe.
         discord.py awaits this inside setup_hook, so nothing here blocks."""
+        # A reloaded cog starts from DEBUG_MODE; the operator's session default
+        # outlives it.
+        if (bot_settings := self.bot_settings) is not None:
+            bot_settings.reapply_debug_default(self.debug_settings)
         # At load, not only on toggles (see RuntimeSampler.apply); the hydration
         # re-syncs once the stored choices land.
         self.debug_settings.sync_sampler()

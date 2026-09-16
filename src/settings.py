@@ -13,6 +13,7 @@ writer.
 import asyncio
 import difflib
 import math
+import os
 import re
 from collections.abc import (
     AsyncIterator,
@@ -28,10 +29,11 @@ from enum import Enum
 from fractions import Fraction
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol
+from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol, cast
 from zoneinfo import ZoneInfo
 
 import redis.asyncio as aioredis
+from discord.ext import commands
 
 from src import config, guild_state
 from src.guild_state import (
@@ -42,16 +44,20 @@ from src.guild_state import (
     DEFAULT_TIMEZONE,
     DEFAULT_VOLUME,
     OFF_SECS,
+    BotConfig,
     BotConfigField,
     BotConfigFieldName,
     ConfigField,
     ConfigFieldName,
     GuildConfig,
+    is_bot_config_field,
     is_config_field,
     valid_timezone,
 )
 from src.queue_progress import card_ceiling
 from src.redis_client import (
+    BOT_CONFIG_KEY,
+    BotConfigStore,
     GuildRedisStore,
     iter_guild_configs,
     read_config_writers,
@@ -1543,6 +1549,8 @@ def allowed_text(spec: SettingSpec, *, now: bool = False) -> str:
     return f"{format_value(spec, lo)}–{format_value(spec, hi)}{off}"
 
 
+# ── Bot settings: the operator's overrides of config's accessors ─────────────
+
 # Every Redis call a settings path awaits runs under this. The pool has no
 # socket_timeout, so a Redis that accepts connections and then stops answering
 # would otherwise hold the caller for good.
@@ -1564,6 +1572,271 @@ async def _bounded[T](call: Awaitable[T], fallback: T, *, timed_out: str = "") -
         if timed_out:
             log.warning(timed_out)
         return fallback
+
+
+def _set_knob(attr: config.FloatKnob | config.IntKnob, value: SettingValue) -> None:
+    """config.set_override, narrowed from the registry's value union for the type
+    checker; set_override refuses a value of the wrong type at run time."""
+    if config.is_int_knob(attr):
+        config.set_override(attr, cast(int, value))
+    else:
+        config.set_override(attr, cast(float, value))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BotWriteResult:
+    # False: stored bot settings are ignored, and nothing changed.
+    applied: bool
+    # The store call returned True inside CONFIG_IO_TIMEOUT_SECS. False is "not
+    # confirmed", not "not written": a pipeline sends before it reads replies.
+    persisted: bool
+    # The override in force immediately before this write; None while the knob
+    # ran on its environment baseline.
+    previous: Optional[float]
+
+
+class BotSettings:
+    """The operator's bot-wide settings for this process. hydrate() applies what
+    bot:{application_id}:config holds; write() and write_reset() store one setting
+    there and apply it, and apply() and reset() change one in memory alone.
+    debug-default is never stored: it is held here, so a cog reload can hand it to
+    the new cog's DebugSettings. The one src/ caller of config.set_override and
+    config.clear_override. Built in setup_hook.
+    See docs/ARCHITECTURE.md#settings-resolution."""
+
+    def __init__(
+        self,
+        bot: commands.Bot | commands.AutoShardedBot,
+        *,
+        redis: Optional[aioredis.Redis],
+        ignore_stored: bool,
+    ) -> None:
+        self._bot = bot
+        self._redis = redis
+        # BOT_SETTINGS_OVERRIDES=ignore: the key is never read, and a stored
+        # setting cannot be changed.
+        self.ignore_stored = ignore_stored
+        # False until a read of the key succeeded, or there is none to make.
+        self.hydrated = False
+        self._debug_default: Optional[bool] = None
+        # apply() and reset() stamp their knob, so a hydrate whose read straddled
+        # one leaves that knob as the command set it.
+        self._seq = 0
+        self._changed_at: dict[str, int] = {}
+        # One stored write at a time, so Redis and the override end on the same
+        # last write.
+        self._write_lock = asyncio.Lock()
+        # Knobs whose last write or reset did not reach Redis.
+        self._unpersisted: set[str] = set()
+
+    def _debug_settings(self) -> Optional[DebugSettings]:
+        # Looked up at call time, so a reloaded cog is the one that receives it.
+        return getattr(self._bot.get_cog("MusicBot"), "debug_settings", None)
+
+    def _stamp(self, attr: str) -> None:
+        self._seq += 1
+        self._changed_at[attr] = self._seq
+
+    def apply(self, spec: SettingSpec, value: SettingValue) -> bool:
+        """Make `value` this process's setting. False, with nothing changed, for a
+        stored setting while stored ones are ignored. A value the registry refuses
+        raises ValueError: every caller has already refused it as input."""
+        if spec.scope is not SettingScope.BOT or not in_bounds(spec, value):
+            raise ValueError(f"{spec.key}={value!r} is not a bot setting value")
+        if spec.field is None:
+            if not isinstance(value, bool):
+                raise TypeError(f"{spec.key} takes on or off; got {value!r}")
+            self._debug_default = value
+            if (debug_settings := self._debug_settings()) is not None:
+                debug_settings.set_default_override(value)
+            return True
+        if self.ignore_stored:
+            return False
+        _, attr = self._stored(spec)
+        _set_knob(attr, value)
+        self._stamp(attr)
+        return True
+
+    def reset(self, spec: SettingSpec) -> bool:
+        """Return the setting to its environment value (debug-default: to
+        DEBUG_MODE). False, with nothing changed, as for apply()."""
+        if spec.scope is not SettingScope.BOT:
+            raise ValueError(f"{spec.key} is not a bot setting")
+        if spec.field is None:
+            self._debug_default = None
+            if (debug_settings := self._debug_settings()) is not None:
+                debug_settings.set_default_override(None)
+            return True
+        if self.ignore_stored:
+            return False
+        _, attr = self._stored(spec)
+        config.clear_override(attr)
+        self._stamp(attr)
+        return True
+
+    def is_persisted(self, spec: SettingSpec) -> bool:
+        """False while the setting's last write or reset had not reached Redis."""
+        return spec.attr not in self._unpersisted
+
+    @property
+    def unread(self) -> bool:
+        """True while stored overrides may exist that no read has applied yet."""
+        return not self.hydrated and self._redis is not None and not self.ignore_stored
+
+    def unsaved(self) -> frozenset[str]:
+        """The keys of the settings whose last write or reset had not reached Redis."""
+        return frozenset(
+            spec.key for spec in _STORED_BOT_SPECS if spec.attr in self._unpersisted
+        )
+
+    def _stored(
+        self, spec: SettingSpec
+    ) -> tuple[BotConfigFieldName, config.FloatKnob | config.IntKnob]:
+        """A stored bot setting's hash field and the knob it overrides; every bot
+        spec but debug-default has both (registry invariant 10)."""
+        if (
+            spec.scope is not SettingScope.BOT
+            or spec.field is None
+            or spec.attr is None
+            or not is_bot_config_field(spec.field)
+        ):
+            raise ValueError(f"{spec.key} is not a stored bot setting")
+        return spec.field, spec.attr
+
+    async def _stored_change(
+        self,
+        spec: SettingSpec,
+        call: Callable[[BotConfigStore], Awaitable[bool]],
+        change: Callable[[], object],
+    ) -> BotWriteResult:
+        """write()'s and write_reset()'s order: under the write lock, the store
+        call, bounded, then the in-memory change, marked unsaved when the call was
+        not confirmed. While stored settings are ignored, nothing."""
+        _, attr = self._stored(spec)
+        if self.ignore_stored:
+            return BotWriteResult(
+                applied=False, persisted=False, previous=config.override(attr)
+            )
+        async with self._write_lock:
+            previous = config.override(attr)
+            application_id = self._bot.application_id
+            persisted = False
+            if self._redis is not None and application_id is not None:
+                persisted = await _bounded(
+                    call(BotConfigStore(self._redis, application_id)),
+                    False,
+                    timed_out="bot config write timed out; not confirmed",
+                )
+            change()
+            if persisted:
+                self._unpersisted.discard(attr)
+            else:
+                self._unpersisted.add(attr)
+            return BotWriteResult(applied=True, persisted=persisted, previous=previous)
+
+    async def write(self, spec: SettingSpec, value: SettingValue) -> BotWriteResult:
+        """Store `value` in bot:{application_id}:config, then apply it. The store
+        call comes first, under CONFIG_IO_TIMEOUT_SECS; one that is not confirmed
+        still applies, marked unsaved until a later write or reset lands. While
+        stored settings are ignored it makes no store call and changes nothing."""
+        field, _ = self._stored(spec)
+        if not in_bounds(spec, value) or isinstance(value, (bool, str)):
+            raise ValueError(f"{spec.key}={value!r} is not a bot setting value")
+        stored = replace(BotConfig(), **{field: value})
+        return await self._stored_change(
+            spec,
+            lambda store: store.update_config(stored),
+            lambda: self.apply(spec, value),
+        )
+
+    async def write_reset(self, spec: SettingSpec) -> BotWriteResult:
+        """Delete the stored value, then return the knob to its environment
+        value, in write()'s order. An unconfirmed delete still resets this process;
+        the stored value can return at the next start."""
+        field, _ = self._stored(spec)
+        return await self._stored_change(
+            spec,
+            lambda store: store.reset_config_fields(field),
+            lambda: self.reset(spec),
+        )
+
+    def reapply_debug_default(self, debug_settings: DebugSettings) -> None:
+        """Give a newly loaded cog this session's debug-default."""
+        if self._debug_default is not None:
+            debug_settings.set_default_override(self._debug_default)
+
+    async def hydrate_until_read(self) -> None:
+        """hydrate(), repeated with the guild retry's backoff while its read fails,
+        so Redis down at boot does not leave the stored overrides unapplied for the
+        life of the process. Returns early without an application id, which READY
+        supplies."""
+        delay = _HYDRATE_RETRY_FIRST_SECS
+        while True:
+            await self.hydrate()
+            if not self.unread or self._bot.application_id is None:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _HYDRATE_RETRY_MAX_SECS)
+
+    async def hydrate(self) -> None:
+        """Apply every stored override, reading under CONFIG_IO_TIMEOUT_SECS.
+        Never raises. A failed read leaves every knob on its environment value
+        and `hydrated` False, for hydrate_until_read to retry. A knob changed while
+        the read ran, or whose last write or reset did not reach Redis, keeps its
+        value. A
+        stored value outside the registry's current bounds is skipped with a
+        WARNING, never applied: the key outlives builds, and its bounds can change
+        between them."""
+        application_id = self._bot.application_id
+        if self.hydrated or self._redis is None or application_id is None:
+            return
+        key = BOT_CONFIG_KEY.format(application_id=application_id)
+        if self.ignore_stored:
+            log.warning(
+                f"BOT_SETTINGS_OVERRIDES=ignore: {key} is not read, so every bot "
+                "setting runs on its environment or code value"
+            )
+            self.hydrated = True
+            return
+        started = self._seq
+        stored = await _bounded(
+            BotConfigStore(self._redis, application_id).read_config(), None
+        )
+        if stored is None:
+            log.warning(
+                f"bot settings unavailable ({key} could not be read); running on "
+                "environment values"
+            )
+            return
+        applied: list[str] = []
+        for spec in _STORED_BOT_SPECS:
+            if spec.field is None or spec.attr is None or spec.env is None:
+                continue
+            value: Optional[float] = getattr(stored, spec.field)
+            if (
+                value is None
+                or self._changed_at.get(spec.attr, 0) > started
+                or spec.attr in self._unpersisted
+            ):
+                continue
+            if not in_bounds(spec, value):
+                log.warning(
+                    f"bot setting {spec.key}={value!r} in {key} is outside "
+                    f"{allowed_text(spec)}; ignored"
+                )
+                continue
+            _set_knob(spec.attr, value)
+            shown = f"{spec.key}={format_value(spec, value)}"
+            applied.append(shown)
+            if env_value := (os.environ.get(spec.env) or "").strip():
+                log.warning(
+                    f"bot setting {shown} ({key}) overrides {spec.env}={env_value}; "
+                    f"undo with -settings bot {spec.key} reset, just bot-settings "
+                    f"reset {application_id}, or BOT_SETTINGS_OVERRIDES=ignore"
+                )
+        if applied:
+            log.info(f"bot settings applied from {key}: {', '.join(applied)}")
+        self.hydrated = True
 
 
 # ── Server settings: the guild:{id}:config cache and its one writer ──────────
