@@ -2,9 +2,9 @@
 
 Extraction is half GIL-bound (JSON parsing, signature decryption, format
 selection), so processes rather than threads. Each worker costs a full CPython +
-yt-dlp import (~80–120 MB RSS), hence the conservative YTDLP_POOL_WORKERS
-default. Only lifecycle lives here: the callable is supplied per call (run()),
-which is what lets tests swap in a thread-pool-backed instance.
+yt-dlp import (~80–120 MB RSS), hence the conservative default for
+config.YTDLP_POOL_WORKERS. Only lifecycle lives here: the callable is supplied per
+call (run()), which is what lets tests swap in a thread-pool-backed instance.
 
 Pickle contract for what crosses the boundary: docs/ARCHITECTURE.md#yt-dlp-process-boundary.
 """
@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing
-import os
 import pickle
 import sys
 import threading
@@ -31,6 +30,7 @@ from typing import Any, Optional, TypeVar
 import structlog
 from opentelemetry import trace
 
+from src import config
 from src.telemetry import configure_worker_logging
 from src.util import get_logger
 
@@ -38,7 +38,6 @@ log = get_logger(__name__)
 
 T = TypeVar("T")
 
-_DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
 # How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30
 # with retries=10 can outlive any shutdown.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
@@ -173,7 +172,7 @@ class YtdlpPool:
 
     def __init__(
         self,
-        max_workers: int = _DEFAULT_WORKERS,
+        max_workers: int = config.YTDLP_POOL_WORKERS,
         executor_factory: Optional[Callable[[], Executor]] = None,
         name: str = "yt-dlp extraction",
         progress_sink: Optional[Callable[[Any], None]] = None,
@@ -203,7 +202,7 @@ class YtdlpPool:
     @property
     def max_workers(self) -> int:
         """Worker count this pool runs with, for callers sizing their own bounds
-        against it — YTDLP_POOL_WORKERS stays read in one place."""
+        against it — config.YTDLP_POOL_WORKERS stays read in one place."""
         return self._max_workers
 
     def _spawn_process_pool(self) -> Executor:

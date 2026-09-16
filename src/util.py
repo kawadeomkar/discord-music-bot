@@ -417,6 +417,11 @@ def truncate_embed_title(title: str) -> str:
     return truncate(title, EMBED_TITLE_LIMIT)
 
 
+# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`.
+# iOS turns a typed `--` into a single em dash.
+DASHES: Final[str] = "-‐‑‒–—―−"
+
+
 # Debug mode's suffix starts a line of its own. See docs/ARCHITECTURE.md#debug-footer-seams.
 FOOTER_SUFFIX_SEP = "\n"
 

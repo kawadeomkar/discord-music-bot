@@ -20,7 +20,7 @@ from discord.ext import commands
 from src.musicbot import MusicBot
 from src import util
 from src.util import channel_claim
-from src.config import PLAY_RESOLVE_CONCURRENCY
+from src import config
 from src.play_placement import (
     PlaceStalled,
     PlayArgs,
@@ -184,14 +184,14 @@ class TestPlayRegistry:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = mock_mp()
-        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 2):
+        config.set_override("PLAY_INFLIGHT_MAX", 2)
+        admit(music_bot, mock_ctx, mp)
+        admit(music_bot, mock_ctx, mp)
+        with (
+            recording_span() as span,
+            pytest.raises(commands.MaxConcurrencyReached) as excinfo,
+        ):
             admit(music_bot, mock_ctx, mp)
-            admit(music_bot, mock_ctx, mp)
-            with (
-                recording_span() as span,
-                pytest.raises(commands.MaxConcurrencyReached) as excinfo,
-            ):
-                admit(music_bot, mock_ctx, mp)
 
         # Recorded before the cap check: the declined request carries the count
         # it would have joined, and nothing else counts declines.
@@ -207,9 +207,9 @@ class TestPlayRegistry:
         other = MagicMock()
         other.guild = MagicMock()
         other.guild.id = mock_ctx.guild.id + 1
-        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
-            admit(music_bot, mock_ctx, mp)
-            admit(music_bot, other, mp)  # no raise
+        config.set_override("PLAY_INFLIGHT_MAX", 1)
+        admit(music_bot, mock_ctx, mp)
+        admit(music_bot, other, mp)  # no raise
 
     def test_the_drop_stamp_signals_each_request_it_names(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -276,13 +276,13 @@ class TestPlayRegistry:
         mp = mock_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot._command_error = AsyncMock()
-        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
-            admit(music_bot, mock_ctx, mp)
-            with (
-                no_typing("src.commands.play.background_typing"),
-                pytest.raises(commands.MaxConcurrencyReached),
-            ):
-                await command_callback(MusicBot.play)(music_bot, mock_ctx, url="x")
+        config.set_override("PLAY_INFLIGHT_MAX", 1)
+        admit(music_bot, mock_ctx, mp)
+        with (
+            no_typing("src.commands.play.background_typing"),
+            pytest.raises(commands.MaxConcurrencyReached),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="x")
         music_bot._command_error.assert_not_awaited()
 
     async def test_the_decline_names_the_cap_not_a_single_slot(
@@ -310,9 +310,26 @@ def _extracted_song(video_id: str) -> dict[str, Any]:
 
 
 class TestResolveConcurrency:
-    """PLAY_INFLIGHT_MAX bounds what a guild holds in memory; this bounds what it
+    """The in-flight cap bounds what a guild holds in memory; this bounds what it
     holds of the shared, process-wide yt-dlp pool. Asserted at the EXTRACTION, which
     is where the slot is taken — around the resolve it also caught cache hits."""
+
+    def test_a_change_applies_once_the_guild_is_rebuilt(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A built semaphore cannot be resized, so a guild with requests in flight
+        keeps the bound it was built with, and takes the new one once idle."""
+        mp = mock_mp()
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 1)
+        first = admit(music_bot, mock_ctx, mp)
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 3)
+        second = admit(music_bot, mock_ctx, mp)
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        assert plays.resolves._value == 1
+        music_bot._plays.retire(first)
+        music_bot._plays.retire(second)
+        admit(music_bot, mock_ctx, mp)
+        assert music_bot._plays._guilds[play_key(mock_ctx)].resolves._value == 3
 
     async def test_a_guild_holds_at_most_that_many_workers_at_once(
         self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -336,9 +353,9 @@ class TestResolveConcurrency:
             live -= 1
             return _extracted_song("x")
 
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
         with (
             no_typing("src.commands.play.background_typing"),
-            patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
             patch("src.youtube._run_extract", new=_extract),
         ):
             tasks = [
@@ -385,9 +402,9 @@ class TestResolveConcurrency:
             await release.wait()
             return _extracted_song("x")
 
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
         with (
             no_typing("src.commands.play.background_typing"),
-            patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
             patch("src.youtube._run_extract", new=_extract),
         ):
             holding = [
@@ -599,10 +616,10 @@ class TestResolveSlot:
         """The whole point of the split: a 5,547-track playlist runs 99s inside the
         slot and must not be cut off by the bound on queueing FOR one."""
         req = admit(music_bot, mock_ctx, mock_mp())
-        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
-            async with music_bot._plays.resolve_slot(req):
-                # Comfortably past the wait bound, inside the slot.
-                await asyncio.sleep(0.15)
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        async with music_bot._plays.resolve_slot(req):
+            # Comfortably past the wait bound, inside the slot.
+            await asyncio.sleep(0.15)
 
     async def test_a_slot_that_never_frees_expires_the_wait(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -610,11 +627,11 @@ class TestResolveSlot:
         req = admit(music_bot, mock_ctx, mock_mp())
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
         # Take every slot and never give one back.
-        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+        for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
         with (
-            patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05),
             recording_span() as span,
             pytest.raises(ResolveWaitExpired),
         ):
@@ -629,21 +646,43 @@ class TestResolveSlot:
         would hand out a permit the guild never held, uncapping the bound."""
         req = admit(music_bot, mock_ctx, mock_mp())
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
-        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+        for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
-        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
-            with pytest.raises(ResolveWaitExpired):
-                async with music_bot._plays.resolve_slot(req):
-                    pass  # pragma: no cover
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        with pytest.raises(ResolveWaitExpired):
+            async with music_bot._plays.resolve_slot(req):
+                pass  # pragma: no cover
         assert plays.resolves.locked()
+
+    async def test_the_expiry_names_the_wait_that_ran(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Read once on entry: a change landing mid-wait neither stretches this
+        wait nor makes its message quote a bound it never had."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        for _ in range(config.play_resolve_concurrency()):
+            await plays.resolves.acquire()
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+
+        async def _wait() -> None:
+            async with music_bot._plays.resolve_slot(req):
+                pass  # pragma: no cover - never acquired
+
+        waiting = asyncio.create_task(_wait())
+        await asyncio.sleep(0)
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 300.0)
+        with pytest.raises(ResolveWaitExpired, match=r"within 0\.05s"):
+            async with asyncio.timeout(2):
+                await waiting
 
     async def test_a_slot_freed_inside_the_bound_is_taken(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         req = admit(music_bot, mock_ctx, mock_mp())
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
-        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+        for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
         async def _free() -> None:
@@ -651,9 +690,9 @@ class TestResolveSlot:
             plays.resolves.release()
 
         freeing = asyncio.create_task(_free())
-        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 5.0):
-            async with music_bot._plays.resolve_slot(req):
-                entered = True
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 5.0)
+        async with music_bot._plays.resolve_slot(req):
+            entered = True
         await freeing
         assert entered
 

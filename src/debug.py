@@ -28,11 +28,7 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import config
-from src.config import (
-    DEBUG_DEADLINE_SECS,
-    DEBUG_TICK_SECS,
-    debug_mode_default,
-)
+from src.config import debug_mode_default
 from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth, read_guild_configs
@@ -308,7 +304,11 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         kind=_ConfigKind.VALUE,
         fallback=str(config.POSTGRES_STATEMENT_CACHE),
     ),
-    _ConfigVar(name="YTDLP_POOL_WORKERS", kind=_ConfigKind.VALUE, fallback="4"),
+    _ConfigVar(
+        name="YTDLP_POOL_WORKERS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.YTDLP_POOL_WORKERS),
+    ),
     _ConfigVar(
         name="PLAY_INFLIGHT_MAX",
         kind=_ConfigKind.VALUE,
@@ -884,6 +884,13 @@ class RuntimeSnapshot:
 _FIRST_SAMPLE_SECS = 0.5
 
 
+def sample_interval_secs() -> float:
+    """The runtime sampler's period: the bot's Now Playing tick, the fastest
+    surface that renders a snapshot, read at the call. Floored so a tiny tick
+    cannot spin /proc reads, capped so a long one cannot stale command replies."""
+    return max(1.0, min(5.0, config.now_playing_update_interval_secs()))
+
+
 class RuntimeSampler:
     """A background sampler feeding the debug footer on the Now Playing tick's
     cadence. Background because CPU% needs a wall-clock window and a response
@@ -891,11 +898,6 @@ class RuntimeSampler:
     old. The tick's own scheduling drift IS the loop-lag measurement. One
     instance, held on the cog: a module global would outlive a cog reload and
     leak the task."""
-
-    # Tied to the NP tick, the fastest surface that renders a snapshot. Floored
-    # so a tiny tick cannot spin /proc reads, capped so a long one cannot stale
-    # command replies.
-    INTERVAL_SECS = max(1.0, min(5.0, config.NOW_PLAYING_UPDATE_INTERVAL_SECS))
 
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task[None]] = None
@@ -946,7 +948,7 @@ class RuntimeSampler:
         # First sample on a short delay, so `-debug --enable` does not answer
         # with a footer carrying no runtime numbers; not instant, since cpu%
         # needs a window and start() took the baseline.
-        delay = min(_FIRST_SAMPLE_SECS, self.INTERVAL_SECS)
+        delay = min(_FIRST_SAMPLE_SECS, sample_interval_secs())
         while True:
             expected = loop.time() + delay
             await asyncio.sleep(delay)
@@ -954,7 +956,8 @@ class RuntimeSampler:
                 self._snapshot = self._sample(max(0.0, (loop.time() - expected) * 1000))
             except Exception as e:  # noqa: BLE001 — one bad tick must not end the loop
                 log.warning(f"runtime sample failed: {type(e).__name__}: {e}")
-            delay = self.INTERVAL_SECS
+            # Re-read each tick: a bot-setting change lands within one interval.
+            delay = sample_interval_secs()
 
     def _sample(self, lag_ms: float) -> RuntimeSnapshot:
         previous, self._cpu = self._cpu, read_cpu_sample()
@@ -1685,8 +1688,8 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
             render_snapshot_embed(ctx, inputs, blocks=blocks, source=source)
         ],
         prepare=_prepare,
-        tick_secs=DEBUG_TICK_SECS,
-        deadline_secs=DEBUG_DEADLINE_SECS,
+        tick_secs=config.debug_tick_secs(),
+        deadline_secs=config.debug_deadline_secs(),
     )
 
     span.set_attribute("debug.enabled", inputs.debug_enabled)

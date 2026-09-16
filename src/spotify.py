@@ -19,7 +19,7 @@ from src.redis_client import (
     spotify_token_get_with_ttl,
     spotify_token_set,
 )
-from src.config import PLAY_RESOLVE_WAIT_SECS
+from src import config
 from src.telemetry import get_tracer
 from src.util import ProgressFn, get_logger
 
@@ -244,13 +244,12 @@ class SpotifyPlaylistTooSlowError(Exception):
 
 
 class SpotifyBusyError(Exception):
-    """No playlist walk slot came free within PLAY_RESOLVE_WAIT_SECS. Nothing was
-    sent to Spotify, so unlike a rate limit a retry costs nothing."""
+    """No playlist walk slot came free within the resolve wait, `wait_secs`: the
+    bound that ran. Nothing was sent to Spotify, so unlike a rate limit a retry
+    costs nothing."""
 
-    def __init__(self) -> None:
-        super().__init__(
-            f"no spotify playlist walk slot within {PLAY_RESOLVE_WAIT_SECS}s"
-        )
+    def __init__(self, wait_secs: float) -> None:
+        super().__init__(f"no spotify playlist walk slot within {wait_secs}s")
 
     @property
     def user_message(self) -> str:
@@ -658,11 +657,12 @@ class Spotify:
             # alone: a joiner issues none and must not queue for a slot it will
             # not use. Same placement, and the same reason, as _extract_once's.
             slot = _playlist_slot()
+            wait_secs = config.play_resolve_wait_secs()
             try:
-                async with asyncio.timeout(PLAY_RESOLVE_WAIT_SECS):
+                async with asyncio.timeout(wait_secs):
                     await slot.acquire()
             except TimeoutError as e:
-                raise SpotifyBusyError() from e
+                raise SpotifyBusyError(wait_secs) from e
             try:
                 playlist, complete = await fetch()
             finally:

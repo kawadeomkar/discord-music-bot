@@ -20,14 +20,11 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
-from src.config import (
-    PLAY_INFLIGHT_MAX,
-    PLAY_RESOLVE_CONCURRENCY,
-    PLAY_RESOLVE_WAIT_SECS,
-    PLAY_SLOW_NOTICE_SECS,
-)
+from src import config
+from src.config import PLAY_SLOW_NOTICE_SECS
 from src.musicplayer import MusicPlayer
 from src.util import (
+    DASHES,
     ECHO_ROW_MAX,
     get_logger,
     PoolSlotUnavailable,
@@ -103,13 +100,10 @@ def resolve_mode_for(placement: Placement) -> ResolveMode:
     return ResolveMode.FLAT_OK
 
 
-# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`.
-# iOS turns a typed `--` into a single em dash.
-_DASHES: Final[str] = "-‐‑‒–—―−"
 # Built from _FLAG_MODES' keys, so a renamed flag cannot leave a stale near-miss.
 # The group is the flag minus its dashes; split_play_args re-attaches them.
 _NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
-    f"[{_DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
+    f"[{DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
 )
 
 
@@ -242,15 +236,16 @@ class PlaceStalled(Exception):
 
 
 class ResolveWaitExpired(PoolSlotUnavailable):
-    """PLAY_RESOLVE_WAIT_SECS elapsed queueing for one of the guild's resolve
-    slots, before any yt-dlp work began. Raised in place of a wait with no end:
-    the caller renders it, so the request that never started says so.
+    """The resolve wait elapsed queueing for one of the guild's resolve slots,
+    before any yt-dlp work began. Raised in place of a wait with no end: the
+    caller renders it, so the request that never started says so. `wait_secs` is
+    the bound that ran, which a setting changed mid-wait does not alter.
 
     PoolSlotUnavailable, so the extraction single-flight can tell this guild's
     exhausted budget from a failure of the extraction itself and re-elect."""
 
-    def __init__(self) -> None:
-        super().__init__(f"resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
+    def __init__(self, wait_secs: float) -> None:
+        super().__init__(f"resolve slot never freed within {wait_secs}s")
 
 
 class ResolveSlot:
@@ -267,8 +262,10 @@ class ResolveSlot:
 
     async def __aenter__(self) -> None:
         waited = time.monotonic()
+        # Read once: the timeout, the log and the error all name the wait that ran.
+        wait_secs = config.play_resolve_wait_secs()
         try:
-            async with asyncio.timeout(PLAY_RESOLVE_WAIT_SECS):
+            async with asyncio.timeout(wait_secs):
                 await self._sem.acquire()
         except TimeoutError as e:
             # Nothing was acquired, and __aexit__ does not run for an __aenter__
@@ -277,8 +274,8 @@ class ResolveSlot:
             span = trace.get_current_span()
             span.set_attribute("play.resolve_wait_expired", True)
             record_span_error(span, e)
-            log.warning(f"Resolve slot never freed within {PLAY_RESOLVE_WAIT_SECS}s")
-            raise ResolveWaitExpired() from e
+            log.warning(f"Resolve slot never freed within {wait_secs}s")
+            raise ResolveWaitExpired(wait_secs) from e
         trace.get_current_span().set_attribute(
             "play.resolve_wait_secs", round(time.monotonic() - waited, 3)
         )
@@ -411,12 +408,14 @@ class _GuildPlays:
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         # Arrival order — the drop reports read it back as sent order. Capped at
-        # PLAY_INFLIGHT_MAX, so a retire's linear removal is bounded.
+        # the in-flight maximum, so a retire's linear removal is bounded.
         self.inflight: list[PlayRequest] = []
         self.join: Optional[asyncio.Task[Any]] = None
-        # PLAY_INFLIGHT_MAX bounds what this guild holds in memory; this bounds what
-        # it holds of the shared yt-dlp pool. Requests wait rather than being refused.
-        self.resolves = asyncio.Semaphore(PLAY_RESOLVE_CONCURRENCY)
+        # The in-flight maximum bounds what this guild holds in memory; this bounds
+        # what it holds of the shared yt-dlp pool. Requests wait rather than being
+        # refused. Read at construction: a built semaphore cannot be resized, so a
+        # change applies once this guild goes idle and is rebuilt.
+        self.resolves = asyncio.Semaphore(config.play_resolve_concurrency())
 
     def idle(self) -> bool:
         return not self.inflight and self.join is None
@@ -439,8 +438,8 @@ class PlayRegistry:
     def register(
         self, ctx: commands.Context, *, query: str, mp: MusicPlayer, mode: PlayMode
     ) -> PlayRequest:
-        """Admit a -play to the guild's in-flight set, or decline it past
-        PLAY_INFLIGHT_MAX. Synchronous from the cap check to the insert, so two
+        """Admit a -play to the guild's in-flight set, or decline it past the
+        in-flight maximum. Synchronous from the cap check to the insert, so two
         dispatches in one tick cannot both pass."""
         span = trace.get_current_span()
         key = play_key(ctx)
@@ -450,11 +449,10 @@ class PlayRegistry:
         # Recorded before the cap check: a declined request carries the count it
         # would have joined, and the span is the only place declines are counted.
         span.set_attribute("play.inflight", len(plays.inflight) + 1)
-        if len(plays.inflight) >= PLAY_INFLIGHT_MAX:
+        cap = config.play_inflight_max()
+        if len(plays.inflight) >= cap:
             span.set_attribute("play.declined", True)
-            raise commands.MaxConcurrencyReached(
-                PLAY_INFLIGHT_MAX, commands.BucketType.guild
-            )
+            raise commands.MaxConcurrencyReached(cap, commands.BucketType.guild)
         req = PlayRequest(
             ctx=ctx,
             guild_id=key,

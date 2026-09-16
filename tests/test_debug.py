@@ -506,6 +506,18 @@ class TestTheSnapshotDoesNotWaitForItsIO:
             debug_enabled=False, debug_overridden=False, players=0, operator=True, **kw
         )
 
+    async def test_the_tick_and_deadline_come_from_the_bot_settings(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The deadline test below would pass on a baseline read, only slower."""
+        config.set_override("DEBUG_TICK_SECS", 2.5)
+        config.set_override("DEBUG_DEADLINE_SECS", 12.0)
+        driver = AsyncMock()
+        with patch("src.debug.run_live_dashboard", new=driver):
+            await debug.run_debug_dashboard(mock_ctx, self._operator())
+        kwargs = driver.call_args.kwargs
+        assert (kwargs["tick_secs"], kwargs["deadline_secs"]) == (2.5, 12.0)
+
     async def test_the_skeleton_shows_placeholders_for_blocks_still_collecting(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -582,8 +594,8 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         """The improvement over one all-or-nothing timeout: a hung dependency costs
         its own block and nothing else."""
         mock_ctx.guild.voice_client = None
-        monkeypatch.setattr(debug, "DEBUG_DEADLINE_SECS", 0.3)
-        monkeypatch.setattr(debug, "DEBUG_TICK_SECS", 0.01)
+        config.set_override("DEBUG_DEADLINE_SECS", 0.3)
+        config.set_override("DEBUG_TICK_SECS", 0.01)
         # The sampler owns a real window; shrink it so only the hung probe is
         # slow enough to miss the deadline.
         monkeypatch.setattr(debug, "_CPU_WINDOW_SECS", 0.0)
@@ -2019,7 +2031,7 @@ class TestRuntimeSampler:
     async def test_tick_produces_a_snapshot(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 0.01)
         sampler = debug.RuntimeSampler()
         try:
             sampler.start()
@@ -2036,7 +2048,7 @@ class TestRuntimeSampler:
     async def test_a_failing_sample_does_not_end_the_loop(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 0.01)
         sampler = debug.RuntimeSampler()
         monkeypatch.setattr(
             sampler, "_sample", MagicMock(side_effect=RuntimeError("boom"))
@@ -2051,18 +2063,51 @@ class TestRuntimeSampler:
     def test_the_interval_tracks_the_now_playing_tick(self) -> None:
         """Sampling slower than the NP tick re-pushes footers whose numbers have
         not moved."""
-        assert debug.RuntimeSampler.INTERVAL_SECS <= (
-            config.NOW_PLAYING_UPDATE_INTERVAL_SECS
-        )
-        assert debug.RuntimeSampler.INTERVAL_SECS >= 1.0  # /proc-read floor
-        assert debug.RuntimeSampler.INTERVAL_SECS <= 5.0  # command replies stay fresh
+        assert debug.sample_interval_secs() == config.NOW_PLAYING_UPDATE_INTERVAL_SECS
+
+    @pytest.mark.parametrize(("tick", "interval"), [(30.0, 5.0), (2.0, 2.0)])
+    def test_the_interval_follows_a_bot_setting_within_its_bounds(
+        self, tick: float, interval: float
+    ) -> None:
+        """Floored for /proc reads, capped so command replies stay fresh."""
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", tick)
+        assert debug.sample_interval_secs() == interval
+
+    def test_the_interval_is_floored_for_proc_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(config, "NOW_PLAYING_UPDATE_INTERVAL_SECS", 0.2)
+        assert debug.sample_interval_secs() == 1.0
+
+    async def test_a_running_sampler_rereads_the_interval_every_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads = 0
+
+        def _interval() -> float:
+            nonlocal reads
+            reads += 1
+            return 0.01
+
+        monkeypatch.setattr(debug, "sample_interval_secs", _interval)
+        monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 0.01)
+        sampler = debug.RuntimeSampler()
+        try:
+            sampler.start()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if reads >= 4:
+                    break
+            assert reads >= 4
+        finally:
+            await sampler.aclose()
 
     async def test_the_first_sample_does_not_wait_a_whole_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A full interval of dead air means `-debug --enable` answers with a footer
         carrying no runtime numbers."""
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 30.0)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 30.0)
         monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 0.01)
         sampler = debug.RuntimeSampler()
         try:
@@ -2071,7 +2116,7 @@ class TestRuntimeSampler:
                 await asyncio.sleep(0.01)
                 if sampler.snapshot is not None:
                     break
-            # Would still be None here if the loop slept INTERVAL_SECS first.
+            # Would still be None here if the loop slept a whole interval first.
             assert sampler.snapshot is not None
         finally:
             await sampler.aclose()
@@ -2079,9 +2124,9 @@ class TestRuntimeSampler:
     async def test_the_first_delay_never_exceeds_the_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A deployment or test that shortens INTERVAL_SECS must not be slowed down
+        """A deployment or test that shortens the interval must not be slowed down
         by the first delay."""
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 0.01)
         monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 30.0)
         sampler = debug.RuntimeSampler()
         try:

@@ -2333,7 +2333,7 @@ class MusicPlayer:
         _TTL_REARM_SECS of playback, so a song outliving GUILD_TTL keeps its queue."""
         rearm_at = time.monotonic() + _TTL_REARM_SECS
         while True:
-            await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
+            await asyncio.sleep(config.heartbeat_interval_secs())
             vc = self._guild.voice_client
             if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
                 return  # song changed under us; loop() owns cancellation

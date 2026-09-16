@@ -34,8 +34,6 @@ from src.dashboard import run_live_dashboard
 from src import config
 from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
-    PING_DEADLINE_SECS,
-    PING_TICK_SECS,
     SpotifyStatus,
     history_archive_enabled,
     using_default_postgres_password,
@@ -522,8 +520,8 @@ async def run_health_dashboard(
         abandon=_abandon,
         render=_render,
         prepare=_prepare,
-        tick_secs=PING_TICK_SECS,
-        deadline_secs=PING_DEADLINE_SECS,
+        tick_secs=config.ping_tick_secs(),
+        deadline_secs=config.ping_deadline_secs(),
     )
 
     for r in results.values():  # self-documenting trace
