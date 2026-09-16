@@ -428,6 +428,30 @@ def truncate_embed_title(title: str) -> str:
 DASHES: Final[str] = "-‐‑‒–—―−"
 
 
+def codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
+    """Lines as one or more codeblock fields within Discord's 1024-char field
+    cap. Splits rather than truncates: a silently clipped config listing reads
+    as a complete one."""
+    fence = 8  # "```\n" + "\n```"
+    fields: list[tuple[str, str]] = []
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        line = truncate(line, EMBED_FIELD_LIMIT - fence)
+        if chunk and size + len(line) + 1 + fence > EMBED_FIELD_LIMIT:
+            fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
+    return fields
+
+
+def _fence(lines: list[str]) -> str:
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
 # Debug mode's suffix starts a line of its own. See docs/ARCHITECTURE.md#debug-footer-seams.
 FOOTER_SUFFIX_SEP = "\n"
 

@@ -27,6 +27,7 @@ from src.util import (
     _typing_keepalive,
     background_typing,
     cancel_task,
+    codeblock_fields,
     fmt_duration,
     fmt_seconds,
     get_logger,
@@ -302,6 +303,24 @@ class TestFmtSeconds:
     @pytest.mark.parametrize("secs", [0.05, 0.1, 0.25, 0.5, 3, 60, 120, 600])
     def test_reads_back_as_the_same_float(self, secs: float) -> None:
         assert float(fmt_seconds(secs).removesuffix("s")) == secs
+
+
+class TestCodeblockFields:
+    def test_short_block_is_one_field(self) -> None:
+        fields = codeblock_fields("Config", ["a", "b"])
+        assert fields == [("Config", "```\na\nb\n```")]
+
+    def test_long_block_splits_rather_than_truncating(self) -> None:
+        """Discord's field cap is 1024. A config listing clipped in place would
+        read as a complete one, which is worse than showing none."""
+        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
+        fields = codeblock_fields("Config", lines)
+        assert len(fields) > 1
+        assert all(len(value) <= 1024 for _, value in fields)
+        assert fields[1][0] == "Config (cont.)"
+        rendered = "".join(value for _, value in fields)
+        for line in lines:
+            assert line in rendered
 
 
 class TestIsOperator:

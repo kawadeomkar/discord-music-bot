@@ -35,6 +35,7 @@ from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
 from src.commands import replay as replay_cmd
 from src.commands import resume as resume_cmd
+from src.commands import settings as settings_cmd
 from src.commands import shuffle as shuffle_cmd
 from src.commands import skip as skip_cmd
 from src.commands import stop as stop_cmd
@@ -349,9 +350,10 @@ class MusicBot(commands.Cog):
         try:
             if ctx.guild is None:
                 return
-            # get_mp() CREATES a player: an observation-only command would report
-            # one it just manufactured and leave a 300s gate timeout behind.
-            if ctx.command is not None and ctx.command.extras.get("observation_only"):
+            # get_mp() CREATES a player, and re-homes an existing one to this
+            # channel. A flagged command must do neither: it would act on a player
+            # it just manufactured and leave a 300s gate timeout behind.
+            if ctx.command is not None and ctx.command.extras.get("skips_player_setup"):
                 return
             old_channel = (
                 self.mps[ctx.guild.id].home_channel
@@ -1049,7 +1051,7 @@ class MusicBot(commands.Cog):
         extras={
             "category": "Queue",
             # cog_before_invoke skips get_mp() for it: never touches voice.
-            "observation_only": True,
+            "skips_player_setup": True,
             "examples": ["-analytics", "-an", "-analytics --days 90"],
             "note": (
                 "Available only when this server's host has enabled the "
@@ -1218,18 +1220,19 @@ class MusicBot(commands.Cog):
         brief="diagnostic snapshot; toggle debug mode",
         usage="[--enable | --disable]",
         help=(
-            "Shows what this bot is running: versions, and Discord/voice state for "
-            "this server. For the bot owner it also fills in host details — build, "
-            "configuration, uptime, storage and health checks.\n\n"
+            "Shows what this bot is running: versions, and this server's voice "
+            "state and changed settings. The bot's operator also sees host details — "
+            "build, configuration, uptime, storage and health checks.\n\n"
             "`--enable` turns debug mode on for this server, which adds a footer to "
             "every embed the bot sends here — including the live Now Playing card, "
             "which refreshes its numbers alongside the progress bar. A reply's "
             "footer carries the trace id: paste it to the operator and they can find "
             "the exact request in the logs. (The Now Playing card shows the runtime "
-            "numbers but no trace id — it is re-rendered under a different request "
-            "every few seconds, so any one id there would be misleading.) `--disable` "
-            "turns it back off. The choice is saved for this server and survives "
-            "restarts; a server that has never set it follows the host's default. "
+            "numbers but no trace id: it re-renders under a new request every few "
+            "seconds.) `--disable` turns it back off. The choice is saved and "
+            "survives restarts; a server that never set it follows "
+            "the host's default, or the operator's `-settings bot debug-default` "
+            "until restart. "
             "Toggling needs the **Manage Server** permission.\n\n"
             'Where `-ping` answers "are my dependencies up, and how fast?", this '
             'answers "what is running, and is it configured the way it should be?".'
@@ -1237,7 +1240,7 @@ class MusicBot(commands.Cog):
         extras={
             "category": "Utility",
             # cog_before_invoke skips get_mp() for it: it reports on the player.
-            "observation_only": True,
+            "skips_player_setup": True,
             "examples": ["-debug", "-debug --enable", "-debug --disable"],
             "note": (
                 "Debug mode is per server and only changes what is DISPLAYED — "
@@ -1252,6 +1255,42 @@ class MusicBot(commands.Cog):
     async def debug(self, ctx: commands.Context, *, arg: str = "") -> None:
         try:
             await debug_cmd.run(ctx, arg, cog=self)
+        except Exception as e:
+            await self._command_error(ctx, e)
+
+    @commands.command(
+        name="settings",
+        aliases=["config", "cfg", "prefs"],
+        brief="view or change this server's settings",
+        usage="[bot] [<setting> [<value> | reset]]",
+        help=(
+            "Shows this server's settings: each one's value, what it does, and the "
+            "command that changes it. `-settings bot` does the same for the bot-wide "
+            "settings, for the bot's operator."
+        ),
+        extras={
+            "category": "Utility",
+            # cog_before_invoke neither builds nor re-homes a player for it.
+            "skips_player_setup": True,
+            "examples": [
+                "-settings",
+                "-settings leave-when-idle 10:00",
+                "-settings volume reset",
+            ],
+            "note": (
+                "Changing a setting needs Manage Server. Volume can also be changed "
+                "from the bot's voice channel, or from any voice channel while the "
+                "bot isn't in one. The bot's operator can change any of them."
+            ),
+        },
+    )
+    # No max_concurrency: server writes serialize on GuildSettings' per-guild lock,
+    # bot writes on BotSettings' lock, and every Redis call is bounded, so a
+    # wait=True bucket would only queue views.
+    @_tracer.start_as_current_span("bot.settings")
+    async def settings(self, ctx: commands.Context, *, arg: str = "") -> None:
+        try:
+            await settings_cmd.run(ctx, arg, cog=self)
         except Exception as e:
             await self._command_error(ctx, e)
 
