@@ -584,6 +584,67 @@ class TestVoiceStateConsistency:
             is tasks_created[1]
         )
 
+    async def test_a_restarted_countdown_is_still_cancelled_by_a_rejoin(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Real tasks: a patched create_task never runs the countdown it replaces.
+        The alone branch stores the replacement before that countdown unwinds, so
+        an unwinding countdown that removed the guild's entry unconditionally would
+        leave the replacement running where no rejoin could cancel it. Another bot
+        joining is enough to restart it."""
+        self._wire_bot_user(music_bot)
+        mp = MagicMock()
+        mp.send_with_np = AsyncMock()
+        music_bot.mps[mock_guild.id] = mp
+        watchdog = music_bot.voice_watchdog
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]
+        mock_guild.voice_client = vc
+
+        def _move(*, bot: bool, joined: bool) -> tuple[MagicMock, MagicMock, MagicMock]:
+            member = MagicMock(spec=discord.Member)
+            member.id = 123456789
+            member.bot = bot
+            member.guild = mock_guild
+            before = MagicMock(spec=discord.VoiceState)
+            before.channel = None if joined else vc.channel
+            after = MagicMock(spec=discord.VoiceState)
+            after.channel = vc.channel if joined else None
+            return member, before, after
+
+        started: list[asyncio.Task[Any]] = []
+        with patch.object(music_bot, "cleanup", new=AsyncMock()) as cleanup:
+            try:
+                await music_bot.on_voice_state_update(*_move(bot=False, joined=False))
+                first = watchdog._timers[mock_guild.id]
+                started.append(first)
+                await asyncio.sleep(0)  # into its sleep
+
+                await music_bot.on_voice_state_update(*_move(bot=True, joined=True))
+                replacement = watchdog._timers[mock_guild.id]
+                started.append(replacement)
+                assert replacement is not first
+                await asyncio.wait({first}, timeout=1.0)
+                assert first.done()
+                assert watchdog._timers.get(mock_guild.id) is replacement
+
+                human = MagicMock(spec=discord.Member)
+                human.bot = False
+                vc.channel.members = [bot_member, human]
+                await music_bot.on_voice_state_update(*_move(bot=False, joined=True))
+                done, _ = await asyncio.wait({replacement}, timeout=1.0)
+                assert replacement in done
+                assert mock_guild.id not in watchdog._timers
+                cleanup.assert_not_awaited()
+            finally:
+                for task in started:
+                    task.cancel()
+                await asyncio.gather(*started, return_exceptions=True)
+
     async def test_member_change_in_unrelated_channel_ignored(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -729,9 +790,12 @@ class TestAloneCountdown:
     async def test_timer_removed_from_dict_on_completion(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """The timer entry is removed in the finally block regardless of outcome."""
+        """The countdown's own entry is removed in the finally block. Awaited in
+        this task, so this task is the entry."""
         self._setup_mp(music_bot, mock_guild)
-        music_bot.voice_watchdog._timers[mock_guild.id] = MagicMock()  # sentinel
+        current = asyncio.current_task()
+        assert current is not None
+        music_bot.voice_watchdog._timers[mock_guild.id] = current
 
         bot_member = MagicMock(spec=discord.Member)
         bot_member.bot = True
