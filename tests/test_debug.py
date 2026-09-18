@@ -345,7 +345,7 @@ class TestConfigAllowlist:
                 config._BASELINES, "HEARTBEAT_INTERVAL_SECS", float(env)
             )
         if override is not None:
-            config.set_override("HEARTBEAT_INTERVAL_SECS", override)
+            config.heartbeat_interval_secs.set_override(override)
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "HEARTBEAT_INTERVAL_SECS")
         assert render_config_value(var) == rendered
 
@@ -353,7 +353,7 @@ class TestConfigAllowlist:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("PLAY_INFLIGHT_MAX", raising=False)
-        config.set_override("PLAY_INFLIGHT_MAX", 8)
+        config.play_inflight_max.set_override(8)
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "PLAY_INFLIGHT_MAX")
         assert render_config_value(var) == "8 (bot owner; default 16)"
 
@@ -590,7 +590,7 @@ class TestTheSettingsLine:
         )
 
     def test_a_value_under_the_bots_minimum_names_both(self) -> None:
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         rows = _rows(GuildConfig(np_refresh_secs=2.0))
         assert settings_line(rows, read=True) == (
             "progress-bar-refresh 5s (bot minimum; set here 2s) (1 changed)"
@@ -743,7 +743,7 @@ class TestTheSettingsLine:
         await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
         for knob in config.KNOBS.values():
             cast(config.Knob[float], knob).set_override(knob.baseline)
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 7.25)
+        config.now_playing_update_interval_secs.set_override(7.25)
 
         mock_ctx.bot.is_owner = AsyncMock(return_value=True)
         operator = debug.instant_blocks(
@@ -799,8 +799,8 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         self, mock_ctx: MagicMock
     ) -> None:
         """The deadline test below would pass on a baseline read, only slower."""
-        config.set_override("DEBUG_TICK_SECS", 2.5)
-        config.set_override("DEBUG_DEADLINE_SECS", 12.0)
+        config.debug_tick_secs.set_override(2.5)
+        config.debug_deadline_secs.set_override(12.0)
         driver = AsyncMock()
         with patch("src.debug.run_live_dashboard", new=driver):
             await debug.run_debug_dashboard(mock_ctx, self._operator())
@@ -883,8 +883,8 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         """The improvement over one all-or-nothing timeout: a hung dependency costs
         its own block and nothing else."""
         mock_ctx.guild.voice_client = None
-        config.set_override("DEBUG_DEADLINE_SECS", 0.3)
-        config.set_override("DEBUG_TICK_SECS", 0.01)
+        config.debug_deadline_secs.set_override(0.3)
+        config.debug_tick_secs.set_override(0.01)
         # The sampler owns a real window; shrink it so only the hung probe is
         # slow enough to miss the deadline.
         monkeypatch.setattr(debug, "_CPU_WINDOW_SECS", 0.0)
@@ -2362,7 +2362,7 @@ class TestRuntimeSampler:
         self, tick: float, interval: float
     ) -> None:
         """Floored for /proc reads, capped so command replies stay fresh."""
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", tick)
+        config.now_playing_update_interval_secs.set_override(tick)
         assert debug.sample_interval_secs() == interval
 
     def test_the_interval_is_floored_for_proc_reads(

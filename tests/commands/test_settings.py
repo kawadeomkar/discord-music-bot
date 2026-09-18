@@ -320,7 +320,7 @@ class TestScopes:
         settings_ctx.bot.is_owner = AsyncMock(side_effect=RuntimeError("503"))
         await _invoke(cog, settings_ctx, arg)
         assert _text(settings_ctx) == card.OPERATOR_UNCONFIRMED
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
 
     async def test_the_operator_gets_the_bot_typo_suggestion(
         self, cog: MusicBot, settings_ctx: MagicMock
@@ -348,7 +348,7 @@ class TestScopes:
             "**Heartbeat** is back to **4s**, from `HEARTBEAT_INTERVAL_SECS`. It is "
             f"saved. Changed by {MENTION}."
         )
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
         stored = await _stored_bot(fake_redis_bot)
         assert stored is not None and "heartbeat_interval_secs" not in stored
 
@@ -438,7 +438,7 @@ class TestScopes:
             await _invoke(cog, ctx, "bot debug-default on")
         update.assert_not_awaited()
         reset.assert_not_awaited()
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
         assert cog.debug_settings.default_override is True
 
     @pytest.mark.parametrize(

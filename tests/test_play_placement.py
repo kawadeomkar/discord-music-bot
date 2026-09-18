@@ -184,7 +184,7 @@ class TestPlayRegistry:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = mock_mp()
-        config.set_override("PLAY_INFLIGHT_MAX", 2)
+        config.play_inflight_max.set_override(2)
         admit(music_bot, mock_ctx, mp)
         admit(music_bot, mock_ctx, mp)
         with (
@@ -207,7 +207,7 @@ class TestPlayRegistry:
         other = MagicMock()
         other.guild = MagicMock()
         other.guild.id = mock_ctx.guild.id + 1
-        config.set_override("PLAY_INFLIGHT_MAX", 1)
+        config.play_inflight_max.set_override(1)
         admit(music_bot, mock_ctx, mp)
         admit(music_bot, other, mp)  # no raise
 
@@ -276,7 +276,7 @@ class TestPlayRegistry:
         mp = mock_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot._command_error = AsyncMock()
-        config.set_override("PLAY_INFLIGHT_MAX", 1)
+        config.play_inflight_max.set_override(1)
         admit(music_bot, mock_ctx, mp)
         with (
             no_typing("src.commands.play.background_typing"),
@@ -320,9 +320,9 @@ class TestResolveConcurrency:
         """A built semaphore cannot be resized, so a guild with requests in flight
         keeps the bound it was built with, and takes the new one once idle."""
         mp = mock_mp()
-        config.set_override("PLAY_RESOLVE_CONCURRENCY", 1)
+        config.play_resolve_concurrency.set_override(1)
         first = admit(music_bot, mock_ctx, mp)
-        config.set_override("PLAY_RESOLVE_CONCURRENCY", 3)
+        config.play_resolve_concurrency.set_override(3)
         second = admit(music_bot, mock_ctx, mp)
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
         assert plays.resolves._value == 1
@@ -353,7 +353,7 @@ class TestResolveConcurrency:
             live -= 1
             return _extracted_song("x")
 
-        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
+        config.play_resolve_concurrency.set_override(2)
         with (
             no_typing("src.commands.play.background_typing"),
             patch("src.youtube._run_extract", new=_extract),
@@ -402,7 +402,7 @@ class TestResolveConcurrency:
             await release.wait()
             return _extracted_song("x")
 
-        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
+        config.play_resolve_concurrency.set_override(2)
         with (
             no_typing("src.commands.play.background_typing"),
             patch("src.youtube._run_extract", new=_extract),
@@ -616,7 +616,7 @@ class TestResolveSlot:
         """The whole point of the split: a 5,547-track playlist runs 99s inside the
         slot and must not be cut off by the bound on queueing FOR one."""
         req = admit(music_bot, mock_ctx, mock_mp())
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        config.play_resolve_wait_secs.set_override(0.05)
         async with music_bot._plays.resolve_slot(req):
             # Comfortably past the wait bound, inside the slot.
             await asyncio.sleep(0.15)
@@ -630,7 +630,7 @@ class TestResolveSlot:
         for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        config.play_resolve_wait_secs.set_override(0.05)
         with (
             recording_span() as span,
             pytest.raises(ResolveWaitExpired),
@@ -649,7 +649,7 @@ class TestResolveSlot:
         for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        config.play_resolve_wait_secs.set_override(0.05)
         with pytest.raises(ResolveWaitExpired):
             async with music_bot._plays.resolve_slot(req):
                 pass  # pragma: no cover
@@ -664,7 +664,7 @@ class TestResolveSlot:
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
         for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        config.play_resolve_wait_secs.set_override(0.05)
 
         async def _wait() -> None:
             async with music_bot._plays.resolve_slot(req):
@@ -672,7 +672,7 @@ class TestResolveSlot:
 
         waiting = asyncio.create_task(_wait())
         await asyncio.sleep(0)
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 300.0)
+        config.play_resolve_wait_secs.set_override(300.0)
         with pytest.raises(ResolveWaitExpired, match=r"within 0\.05s"):
             async with asyncio.timeout(2):
                 await waiting
@@ -690,7 +690,7 @@ class TestResolveSlot:
             plays.resolves.release()
 
         freeing = asyncio.create_task(_free())
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 5.0)
+        config.play_resolve_wait_secs.set_override(5.0)
         async with music_bot._plays.resolve_slot(req):
             entered = True
         await freeing

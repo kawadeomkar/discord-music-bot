@@ -535,7 +535,7 @@ class TestOutOfRange:
     def test_np_refresh_follows_the_bots_value_at_the_write(self) -> None:
         spec = _spec("np-refresh")
         assert parse_value(spec, "4s") == Parsed(4.0)
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         result = parse_value(spec, "4s")
         assert isinstance(result, Refusal)
         assert "between **5s** and **30s** here" in result.text
@@ -555,7 +555,7 @@ class TestOutOfRange:
         spec = _spec("queue-progress-max")
         assert parse_value(spec, "120s") == Parsed(120.0)
         monkeypatch.setitem(config._BASELINES, "QUEUE_PROGRESS_DELAY_SECS", 100.0)
-        config.set_override("QUEUE_PROGRESS_TICK_SECS", 15.0)
+        config.queue_progress_tick_secs.set_override(15.0)
         result = parse_value(spec, "125s")
         assert isinstance(result, Refusal)
         assert result.side == "minimum"
@@ -572,7 +572,7 @@ class TestOutOfRange:
     ) -> None:
         spec = _spec("queue-progress-tick")
         assert parse_value(spec, "25s") == Parsed(25.0)
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 100.0)
+        config.queue_progress_max_secs.set_override(100.0)
         result = parse_value(spec, "25s")
         assert isinstance(result, Refusal)
         assert result.side == "maximum"
@@ -584,7 +584,7 @@ class TestOutOfRange:
         """An environment max below the longest delay plus two minimum ticks: no
         value can be written, and both the refusal and the card say why."""
         spec = _spec("queue-progress-tick")
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 64.0)
+        config.queue_progress_max_secs.set_override(64.0)
         result = parse_value(spec, "3s")
         assert isinstance(result, Refusal)
         assert result.side == "maximum"
@@ -599,7 +599,7 @@ class TestOutOfRange:
 
     def test_a_dynamic_floor_is_rounded_to_a_value_that_can_be_typed(self) -> None:
         spec = _spec("np-refresh")
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.333)
+        config.now_playing_update_interval_secs.set_override(3.333)
         assert settings.allowed_text(spec, now=True) == "3.34s–30s"
         assert parse_value(spec, "3.34") == Parsed(3.34)
         assert isinstance(parse_value(spec, "3.33"), Refusal)
@@ -615,17 +615,17 @@ class TestOutOfRange:
         ],
     )
     def test_a_dynamic_bound_that_is_already_a_step_is_not_moved(
-        self, key: str, attr: Any, value: float, typed: str
+        self, key: str, attr: str, value: float, typed: str
     ) -> None:
         """A bound's float can lie just past the hundredth it names. Rounded as is,
         the bound moved one step inward and refused the value that fits exactly."""
         spec = _spec(key)
-        config.set_override(attr, value)
+        cast(config.Knob[float], config.KNOBS[attr.lower()]).set_override(value)
         assert parse_value(spec, typed) == Parsed(float(typed))
 
     def test_a_bot_refresh_slower_than_any_server_value_leaves_no_range(self) -> None:
         spec = _spec("np-refresh")
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 45.0)
+        config.now_playing_update_interval_secs.set_override(45.0)
         why = "the bot refreshes no faster than **45s**"
         result = parse_value(spec, "30")
         assert isinstance(result, Refusal)
@@ -637,7 +637,7 @@ class TestOutOfRange:
 
     def test_a_shape_hint_suggests_a_value_the_write_takes(self) -> None:
         spec = _spec("np-refresh")
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 20.0)
+        config.now_playing_update_interval_secs.set_override(20.0)
         result = parse_value(spec, "fast")
         assert isinstance(result, Refusal)
         assert result.reason is RefusalReason.BAD_SHAPE
@@ -1271,7 +1271,7 @@ class TestBotSettingsHydrate:
 
         await bot_settings.hydrate()
 
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
         assert "heartbeat=0.5" in caplog.text and "ignored" in caplog.text
         assert bot_settings.hydrated is True
 
@@ -1315,7 +1315,7 @@ class TestBotSettingsHydrate:
             await bot_settings.hydrate()
 
         read.assert_not_called()
-        assert config.override("PLAY_INFLIGHT_MAX") is None
+        assert config.play_inflight_max.override() is None
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
         assert "BOT_SETTINGS_OVERRIDES=ignore" in warnings[0].getMessage()
@@ -1343,7 +1343,7 @@ class TestBotSettingsHydrate:
         with patch.object(fake_redis, "hgetall", side_effect=RuntimeError("down")):
             await bot_settings.hydrate()
 
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
         assert bot_settings.hydrated is False
         assert "running on environment values" in caplog.text
 
@@ -1407,7 +1407,7 @@ class TestBotSettingsWrite:
         await bot_settings.write(spec, 8)
         result = await bot_settings.write_reset(spec)
         assert (result.persisted, result.previous) == (True, 8)
-        assert config.override("PLAY_INFLIGHT_MAX") is None
+        assert config.play_inflight_max.override() is None
         assert await BotConfigStore(fake_redis, _APP_ID).read_config() == {}
 
     async def test_an_unconfirmed_write_applies_marked_until_one_lands(
@@ -1436,7 +1436,7 @@ class TestBotSettingsWrite:
         ):
             result = await bot_settings.write_reset(spec)
         assert (result.applied, result.persisted) == (True, False)
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
         assert not bot_settings.is_persisted(spec)
         await bot_settings.write_reset(spec)
         assert bot_settings.is_persisted(spec)
@@ -1481,7 +1481,7 @@ class TestBotSettingsWrite:
 
         await bot_settings.hydrate()
 
-        assert config.override("PLAY_INFLIGHT_MAX") is None
+        assert config.play_inflight_max.override() is None
         assert not bot_settings.is_persisted(spec)
 
     async def test_a_stalled_store_reports_not_saved_within_the_timeout(
@@ -1515,7 +1515,7 @@ class TestBotSettingsWrite:
         assert (written.applied, cleared.applied) == (False, False)
         update.assert_not_awaited()
         reset.assert_not_awaited()
-        assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+        assert config.heartbeat_interval_secs.override() is None
 
     async def test_concurrent_writes_end_on_the_last_in_redis_and_in_memory(
         self, fake_redis: aioredis.Redis
@@ -1616,7 +1616,7 @@ class TestBotSettingsApply:
 
     def test_while_ignored_a_stored_setting_is_refused_and_unchanged(self) -> None:
         bot_settings = BotSettings(_bot(), redis=None, ignore_stored=True)
-        config.set_override("HEARTBEAT_INTERVAL_SECS", 9.0)
+        config.heartbeat_interval_secs.set_override(9.0)
         assert bot_settings.apply(_spec("heartbeat"), 5.0) is False
         assert bot_settings.reset(_spec("heartbeat")) is False
         assert config.heartbeat_interval_secs() == 9.0
@@ -1936,13 +1936,13 @@ class TestGuildSettingsAccessors:
     ) -> None:
         guild_settings = GuildSettings(guild_cog)
         assert guild_settings.np_refresh_secs(_GUILD) == 3.0
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         assert guild_settings.np_refresh_secs(_GUILD) == 5.0  # read at the call
         await guild_settings.write(_GUILD, GuildConfig(np_refresh_secs=10.0))
         assert guild_settings.np_refresh_secs(_GUILD) == 10.0
         await guild_settings.write(_GUILD, GuildConfig(np_refresh_secs=4.0))
         assert guild_settings.np_refresh_secs(_GUILD) == 5.0
-        config.clear_override("NOW_PLAYING_UPDATE_INTERVAL_SECS")
+        config.now_playing_update_interval_secs.clear_override()
         assert guild_settings.np_refresh_secs(_GUILD) == 4.0
 
     async def test_slow_notice_is_the_bots_while_unset_and_none_when_off(
@@ -1950,7 +1950,7 @@ class TestGuildSettingsAccessors:
     ) -> None:
         guild_settings = GuildSettings(guild_cog)
         assert guild_settings.slow_notice_secs(_GUILD) == 6.0
-        config.set_override("PLAY_SLOW_NOTICE_SECS", 8.0)
+        config.play_slow_notice_secs.set_override(8.0)
         assert guild_settings.slow_notice_secs(_GUILD) == 8.0  # read at the call
         await guild_settings.write(_GUILD, GuildConfig(slow_notice_secs=20.0))
         assert guild_settings.slow_notice_secs(_GUILD) == 20.0
@@ -1964,7 +1964,7 @@ class TestGuildSettingsAccessors:
     ) -> None:
         guild_settings = GuildSettings(guild_cog)
         assert guild_settings.queue_progress_delay_secs(_GUILD) == 2.5
-        config.set_override("QUEUE_PROGRESS_DELAY_SECS", 4.0)
+        config.queue_progress_delay_secs.set_override(4.0)
         assert guild_settings.queue_progress_delay_secs(_GUILD) == 4.0
         await guild_settings.write(_GUILD, GuildConfig(queue_progress_delay_secs=45.0))
         assert guild_settings.queue_progress_delay_secs(_GUILD) == 45.0
@@ -2785,8 +2785,11 @@ class TestHotPathsNeverAwaitSettings:
 
 # ── Bot knobs are read at call time ───────────────────────────────────────────
 
-_KNOB_NAMES: frozenset[str] = frozenset(config.FLOAT_KNOBS | config.INT_KNOBS)
-_ACCESSORS: frozenset[str] = frozenset(name.lower() for name in _KNOB_NAMES)
+_ACCESSORS: frozenset[str] = frozenset(config.KNOBS)
+# What reads a knob's environment value past its override. The registry and its
+# cards do, to show both.
+_BASELINE_READS = ("baseline", "_BASELINES")
+_BASELINE_READERS = ("src/settings.py", "src/settings_card.py")
 _OVERRIDE_WRITERS = ("set_override", "clear_override")
 # Every function a pool worker runs, by module. A worker re-imports modules with
 # environment values only, so an override set in the parent never reaches it.
@@ -2821,32 +2824,27 @@ def _scan_knob_reads(
     *,
     config_module: bool = False,
     writer_module: bool = False,
+    baseline_reader: bool = False,
     worker_entries: tuple[str, ...] = (),
 ) -> _KnobReads:
     """One pass per module. Identifiers are matched by name, so an aliased import
-    (`import src.config as c; c.PING_TICK_SECS`) is caught without tracking it.
-    String constants are not identifiers: the registry's env= passes."""
+    (`import src.config as c; c.ping_tick_secs.baseline`) is caught without
+    tracking it. A handle imported by name is no read: it reads when called."""
     reads = _KnobReads([], [], [], [], set())
 
     def at(node: ast.AST) -> str:
         return f"{where}:{getattr(node, 'lineno', 0)}"
 
     for node in ast.walk(tree):
-        if not config_module:
-            if (
-                isinstance(node, (ast.Name, ast.Attribute))
-                and isinstance(node.ctx, ast.Load)
-                and _identifier(node) in _KNOB_NAMES
-            ):
-                reads.baseline.append(at(node))
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module == "src.config"
-                and any(a.name in _KNOB_NAMES or a.name == "*" for a in node.names)
-            ):
-                reads.baseline.append(at(node))
         if (
-            not (writer_module or config_module)
+            not (config_module or baseline_reader)
+            and isinstance(node, (ast.Name, ast.Attribute))
+            and isinstance(node.ctx, ast.Load)
+            and _identifier(node) in _BASELINE_READS
+        ):
+            reads.baseline.append(at(node))
+        if (
+            not writer_module
             and isinstance(node, ast.Call)
             and _identifier(node.func) in _OVERRIDE_WRITERS
         ):
@@ -2906,9 +2904,7 @@ def _scan_knob_reads(
             continue
         seen.add(name)
         for node in ast.walk(functions[name]):
-            if _identifier(node) in _KNOB_NAMES or (
-                isinstance(node, ast.Call) and _identifier(node.func) in _ACCESSORS
-            ):
+            if isinstance(node, ast.Call) and _identifier(node.func) in _ACCESSORS:
                 reads.in_workers.append(at(node))
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 pending.append(node.func.id)
@@ -2929,6 +2925,7 @@ def knob_reads() -> _KnobReads:
             where,
             config_module=where == "src/config.py",
             writer_module=where == "src/settings.py",
+            baseline_reader=where in _BASELINE_READERS,
             worker_entries=_WORKER_ENTRIES.get(where, ()),
         )
         total.baseline.extend(reads.baseline)
@@ -2941,13 +2938,12 @@ def knob_reads() -> _KnobReads:
 
 _EVERY_SHAPE = """\
 from src import config
-from src.config import PING_TICK_SECS
-from src.config import *
+from src.config import ping_tick_secs
 import src.config as c
-a = c.PING_TICK_SECS
+a = c.ping_tick_secs.baseline
 b = config.ping_tick_secs()
 def f(x=config.ping_tick_secs()) -> config.ping_tick_secs():
-    return config.ping_tick_secs() + config.PING_TICK_SECS
+    return config.ping_tick_secs() + config._BASELINES["PING_TICK_SECS"]
 @decorate(config.ping_tick_secs())
 def g(): pass
 class K(Base, flag=config.ping_tick_secs()):
@@ -2957,9 +2953,9 @@ class K(Base, flag=config.ping_tick_secs()):
 lam = lambda q=config.ping_tick_secs(): config.ping_tick_secs()
 type T = config.ping_tick_secs()
 factory = config.ping_tick_secs
-PING_TICK_SECS = 2.0
-config.set_override("PING_TICK_SECS", 1.0)
-clear_override("PING_TICK_SECS")
+d = ping_tick_secs()
+config.ping_tick_secs.set_override(1.0)
+knob.clear_override()
 s = "PING_TICK_SECS"
 def _entry():
     return helper()
@@ -2969,27 +2965,28 @@ def helper():
 
 
 class TestBotKnobsAreReadAtCallTime:
-    """Consumers call a knob's accessor when its value applies. A baseline read and
-    an accessor called at definition time both type-check and both silently ignore
-    a -settings bot override, and the consumer tests would likely pass either,
+    """Consumers call a knob when its value applies. A baseline read and a knob
+    called at definition time both type-check and both silently ignore a
+    -settings bot override, and the consumer tests would likely pass either,
     only slower. See docs/ARCHITECTURE.md#settings-resolution."""
 
     def test_the_walker_reports_every_shape_and_nothing_else(self) -> None:
         reads = _scan_knob_reads(
             ast.parse(_EVERY_SHAPE), "x", worker_entries=("_entry",)
         )
-        assert reads.baseline == ["x:2", "x:3", "x:5", "x:8"]
+        assert reads.baseline == ["x:4", "x:7"]
         assert sorted(reads.definition_time, key=lambda s: int(s[2:])) == [
+            "x:5",
             "x:6",
-            "x:7",
-            "x:9",
+            "x:8",
+            "x:10",
             "x:11",
             "x:12",
-            "x:13",
-            "x:15",
+            "x:14",
+            "x:17",
         ]
-        assert reads.writers == ["x:19", "x:20"]
-        assert reads.in_workers == ["x:25"]
+        assert reads.writers == ["x:18", "x:19"]
+        assert reads.in_workers == ["x:24"]
 
     def test_g1_no_module_reads_a_baseline(self, knob_reads: _KnobReads) -> None:
         assert knob_reads.baseline == []

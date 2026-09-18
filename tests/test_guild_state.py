@@ -2214,8 +2214,9 @@ class TestConfigDomain:
         """The lowest bot value an operator can run; guild_state cannot import config
         to read it, so the two are pinned here."""
 
-        assert CONFIG_DOMAIN[ConfigField.NP_REFRESH].lo == config.env_floor(
-            "NOW_PLAYING_UPDATE_INTERVAL_SECS"
+        assert (
+            CONFIG_DOMAIN[ConfigField.NP_REFRESH].lo
+            == config.now_playing_update_interval_secs.floor
         )
 
     def test_the_timeout_defaults_are_their_domain_floors(self) -> None:

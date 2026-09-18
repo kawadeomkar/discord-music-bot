@@ -3,7 +3,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final, Literal, Optional, TypeIs, cast, get_args, overload
+from typing import Final, Optional, cast
 from urllib.parse import unquote, urlsplit
 
 # Read from the environment alone so importing runs no subprocess. main() may
@@ -294,77 +294,6 @@ play_resolve_wait_secs = _secs(
 play_slow_notice_secs = _secs(
     "PLAY_SLOW_NOTICE_SECS", 6.0, minimum=_MIN_PLAY_SLOW_NOTICE_SECS
 )
-
-# The knobs above, by environment variable, for callers that name one as a string.
-# Literal strings rather than an Enum: a reload of this module would mint new enum
-# classes that a registry built earlier fails isinstance against.
-type FloatKnob = Literal[
-    "NOW_PLAYING_UPDATE_INTERVAL_SECS",
-    "HEARTBEAT_INTERVAL_SECS",
-    "PLAY_SLOW_NOTICE_SECS",
-    "PLAY_RESOLVE_WAIT_SECS",
-    "STREAM_PROBE_TIMEOUT_SECS",
-    "PING_TICK_SECS",
-    "PING_DEADLINE_SECS",
-    "DEBUG_TICK_SECS",
-    "DEBUG_DEADLINE_SECS",
-    "ANALYTICS_RENDER_DEADLINE_SECS",
-    "QUEUE_PROGRESS_DELAY_SECS",
-    "QUEUE_PROGRESS_TICK_SECS",
-    "QUEUE_PROGRESS_MAX_SECS",
-]
-type IntKnob = Literal["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"]
-FLOAT_KNOBS: Final[frozenset[FloatKnob]] = frozenset(get_args(FloatKnob.__value__))
-INT_KNOBS: Final[frozenset[IntKnob]] = frozenset(get_args(IntKnob.__value__))
-
-
-def is_int_knob(knob: FloatKnob | IntKnob) -> TypeIs[IntKnob]:
-    return knob in INT_KNOBS
-
-
-def _by_env(knob: FloatKnob | IntKnob) -> AnyKnob:
-    return KNOBS[knob.lower()]
-
-
-@overload
-def baseline(knob: IntKnob) -> int: ...
-@overload
-def baseline(knob: FloatKnob) -> float: ...
-def baseline(knob: FloatKnob | IntKnob) -> float:
-    return _by_env(knob).baseline
-
-
-def env_floor(knob: FloatKnob | IntKnob) -> float:
-    return _by_env(knob).floor
-
-
-@overload
-def set_override(knob: IntKnob, value: int) -> None: ...
-@overload
-def set_override(knob: FloatKnob, value: float) -> None: ...
-def set_override(knob: FloatKnob | IntKnob, value: float) -> None:
-    # The handle checks the value's type against its own kind at run time.
-    cast(Knob[float], _by_env(knob)).set_override(value)
-
-
-def clear_override(knob: FloatKnob | IntKnob) -> None:
-    _by_env(knob).clear_override()
-
-
-@overload
-def override(knob: IntKnob) -> Optional[int]: ...
-@overload
-def override(knob: FloatKnob) -> Optional[float]: ...
-def override(knob: FloatKnob | IntKnob) -> Optional[float]:
-    return _by_env(knob).override()
-
-
-@overload
-def effective(knob: IntKnob) -> int: ...
-@overload
-def effective(knob: FloatKnob) -> float: ...
-def effective(knob: FloatKnob | IntKnob) -> float:
-    return _by_env(knob)()
 
 
 def _parse_bool_env(name: str) -> bool:

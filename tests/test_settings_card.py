@@ -87,21 +87,21 @@ class TestServerValues:
         assert rows[_spec("debug")] == card.Shown(True, "default")
 
     def test_np_refresh_follows_the_bots_current_value_while_unset(self) -> None:
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         rows = dict(_server_rows(None))
         assert rows[_spec("np-refresh")] == card.Shown(5.0, "default")
 
     def test_a_value_under_the_bots_runs_as_the_bots_and_names_both(self) -> None:
         rows = dict(_server_rows(GuildConfig(np_refresh_secs=4.0)))
         assert rows[_spec("np-refresh")] == card.Shown(4.0, "set here")
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         rows = dict(_server_rows(GuildConfig(np_refresh_secs=4.0)))
         assert rows[_spec("np-refresh")] == card.Shown(5.0, "bot minimum; set here 4s")
 
     def test_a_bot_minimum_renders_as_the_cards_range_prints_it(self) -> None:
         """The range rounds a bound to a value that can be typed; the row naming
         that bound must print the same one."""
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.333)
+        config.now_playing_update_interval_secs.set_override(3.333)
         rows = dict(_server_rows(GuildConfig(np_refresh_secs=3.0)))
         assert rows[_spec("np-refresh")] == card.Shown(3.34, "bot minimum; set here 3s")
 
@@ -152,7 +152,7 @@ class TestBotValues:
             monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
         monkeypatch.setitem(config._BASELINES, "HEARTBEAT_INTERVAL_SECS", 3.0)
         if override is not None:
-            config.set_override("HEARTBEAT_INTERVAL_SECS", override)
+            config.heartbeat_interval_secs.set_override(override)
         shown = card.bot_shown(
             _spec("heartbeat", SettingScope.BOT),
             host_debug_default=False,
@@ -174,14 +174,14 @@ class TestBotValues:
             spec, host_debug_default=False, debug_default_override=None
         )
         assert shown == card.Shown(4, "env, outside chat range")
-        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
+        config.play_resolve_concurrency.set_override(2)
         shown = card.bot_shown(
             spec, host_debug_default=False, debug_default_override=None
         )
         assert shown == card.Shown(2, "bot owner; env 4")
 
     def test_an_unsaved_knob_says_so(self) -> None:
-        config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
+        config.heartbeat_interval_secs.set_override(5.0)
         shown = card.bot_shown(
             _spec("heartbeat", SettingScope.BOT),
             host_debug_default=False,
@@ -276,7 +276,7 @@ class TestServerCard:
         )
 
     def test_a_range_that_follows_the_bot_is_quoted_as_it_stands(self) -> None:
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         embed = card.server_card(
             guild_name="g", rows=_server_rows(None), read_failed=False, operator=False
         )
@@ -338,7 +338,7 @@ class TestBotCard:
     def test_each_setting_shows_its_value_summary_and_command(self) -> None:
         """The server card's shape, not code blocks: a range column would push a
         code-block row past a phone's width."""
-        config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
+        config.heartbeat_interval_secs.set_override(5.0)
         embed = card.bot_card(
             rows=card.bot_rows(host_debug_default=False, debug_default_override=None),
             ignored=False,
@@ -423,7 +423,7 @@ class TestDetail:
 
     def test_a_setting_that_follows_the_bots_value_quotes_it_live(self) -> None:
         spec = _spec("np-refresh")
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         embed = card.detail(spec, card.Shown(5.0, "default"), default=5.0)
         assert embed.description == (
             "**Progress bar refresh** (`np-refresh`; also `progress-bar`, "
