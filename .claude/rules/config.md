@@ -20,7 +20,7 @@ The path-scoped half of CLAUDE.md: its golden rules apply here, and cite by numb
 
 ## Configuration reference (all env vars; `.env` for compose)
 
-The operator can override fifteen of these at runtime with `-settings bot <setting> <value>`
+The operator can override the following at runtime with `-settings bot <setting> <value>`
 (`NOW_PLAYING_UPDATE_INTERVAL_SECS`, `HEARTBEAT_INTERVAL_SECS`, `PLAY_SLOW_NOTICE_SECS`,
 `PLAY_INFLIGHT_MAX`, `PLAY_RESOLVE_CONCURRENCY`, `PLAY_RESOLVE_WAIT_SECS`,
 `STREAM_PROBE_TIMEOUT_SECS`, `PING_TICK_SECS`/`PING_DEADLINE_SECS`,
@@ -78,7 +78,7 @@ can only move it back inside.
 | Primitive | Protects |
 |---|---|
 | `GuildSettings` per-guild write lock (src/settings.py) | `guild:{id}:config`: it is the ONLY writer (`-settings`, `-volume`, `-debug --enable/--disable`, restore's volume migration, guild removal), each write a bounded store call then a synchronous commit that stamps (guild, field) from one sequence counter. A read (restore's `seed`, the startup `hydrate`, `load`) never locks: it skips any field stamped after it began, so a read straddling a write never undoes it. The locks are refcounted and dropped when idle, and `reading()` registrations bound how long stamps and forget marks live. `DebugSettings` is its projection of `debug_mode`. `docs/ARCHITECTURE.md#settings-resolution` |
-| `config`'s override maps (`_FLOAT_OVERRIDES`, `_INT_OVERRIDES`) | each bot knob's `-settings bot` override. One writer, `BotSettings` in src/settings.py (guard G3); read synchronously through the knob's accessor, `config.<knob in lower case>()`, when the value applies — never the UPPER_CASE baseline, never at import (G1, G2), and never in a pool worker (G4). A reload of `config` drops them. `docs/ARCHITECTURE.md#settings-resolution` |
+| `config`'s knob maps (`_OVERRIDES`, `_BASELINES`) | each bot knob's `-settings bot` override and environment value, by variable. One writer of an override, `BotSettings` in src/settings.py (guard G3); read synchronously by calling the knob's handle, `config.<knob in lower case>()`, when the value applies — never its `.baseline`, never at import (G1, G2), and never in a pool worker (G4). A reload of `config` drops them. `docs/ARCHITECTURE.md#settings-resolution` |
 
 ## Recipes
 
@@ -86,10 +86,12 @@ can only move it back inside.
 `ConfigField`, and its name in the `ConfigFieldName` Literal and, unless it has its own
 reset as `volume` does, `ResettableConfigField` → `Optional` field on `GuildConfig` (Optional is not optional — absent
 must keep meaning "follow the host default", or "never chose" collapses into "chose
-the default") → `to_redis` writes it only when set → `from_redis` reads an
-unrecognised value as unset → a numeric field also gets a `CONFIG_DOMAIN` entry in
-`guild_state.py`, which the `-settings` registry's static bounds must equal (a test
-compares them) and outside which `GuildConfig.__post_init__` reads a value as unset →
+the default") → a numeric field gets a `CONFIG_DOMAIN` entry in `guild_state.py`, and that
+entry is its `to_redis` and `from_redis` too: both iterate the domain. The `-settings`
+registry's static bounds must equal it (a test compares them), and outside it
+`GuildConfig.__post_init__` reads a value as unset. A field that is not a number (as
+`debug_mode` and `timezone` are not) gets its own line in both: `to_redis` writes it only
+when set, `from_redis` reads an unrecognised value as unset →
 the store writes it with `GuildRedisStore.update_config`, which PERSISTs and takes
 `writer=`; a field that needs a write-boundary check or a second copy (as `timezone`
 and `volume` do) gets a dedicated writer instead, added to the set `update_config`
@@ -111,19 +113,15 @@ test_redis_client.py and test_settings.py. It goes in `guild:{id}:config`, NOT
 `guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
 any guild idle for a day.
 
-**Add a bot setting** (an owner-tunable, process-wide knob): parse its env baseline in
-`config.py` with `_float_env`/`_int_env` and a named floor → add the name to `FloatKnob` or
-`IntKnob` → add the accessor, `def <name in lowercase>() -> float` returning
-`_FLOAT_OVERRIDES.get("<NAME>", <NAME>)` (the accessor sweep in `test_config.py` fails a
-missing or miswired one) → every consumer calls `config.<name>()` when the value applies. Never
-call it at import, class-body or default-argument time, and never read `<NAME>` itself
-(`TestBotKnobsAreReadAtCallTime` G1/G2) → its stored field in `guild_state.py`: a
-`BotConfigField` constant whose value is `"<name in lowercase>"`, that name in the
-`BotConfigFieldName` Literal, an Optional field on `BotConfig`, and its rows in
-`BotConfig.to_redis` and `from_redis` (`_b_float`, or `_b_count` for a count) → a registry
-`SettingSpec` with `attr` and `env` both `"<NAME>"` and that `field` (invariant 10), and a
-chat range whose minimum is strictly above `config.env_floor("<NAME>")` for a time-valued knob, at
-least equal for a count (invariant 3) → a `-debug` allowlist row with
-`knob="<NAME>"` and no `fallback` → tests set it with `config.set_override`. A value built into
+**Add a bot setting** (an owner-tunable, process-wide knob): declare it once in `config.py`,
+`<name in lowercase> = _secs("<NAME>", default, minimum=<a named floor>)` (`_count` for an
+int). That statement is the env parse, the accessor and the `bot:{id}:config` field → every
+consumer calls `config.<name>()` when the value applies. Never call it at
+import, class-body or default-argument time, and never read its `.baseline`
+(`TestBotKnobsAreReadAtCallTime` G1/G2) → a registry `SettingSpec` with `knob=config.<name>`
+and a chat range whose minimum is strictly above `knob.floor` for a time-valued knob, at least
+equal for a count (invariant 3, which also fails a knob with no spec); the spec is also its
+`-debug` row → tests set it with
+`config.<name>.set_override(value)`. A value built into
 a long-lived object (a semaphore, a session) applies only when that object is rebuilt, and the
 spec's `applies` string says so. No pool worker may read it (G4).
