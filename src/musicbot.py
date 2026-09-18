@@ -1104,9 +1104,11 @@ class MusicBot(commands.Cog):
         usage="<0-100>",
         help=(
             "Sets playback volume as a percentage between 0 and 100.\n\n"
-            "The new level takes effect on the **next** song, not the one "
-            "currently playing. It is saved per server, so it still applies "
-            "after a restart."
+            "It does not change the song playing now. The bot also builds the "
+            "song after it ahead of time, at whatever the level was then, so a "
+            "change usually lands **two songs** from here — sooner only if "
+            "nothing has been built yet. It is saved per server, so it still "
+            "applies after a restart."
         ),
         extras={"category": "Playback", "examples": ["-volume 50", "-vol 100"]},
     )

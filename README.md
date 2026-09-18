@@ -65,7 +65,7 @@ details, aliases, and examples.
 | `-resume` | `r` | Resume from where the song was paused |
 | `-replay` | `rp`, `restart` | Play the current song again from the beginning (nothing is dropped from the queue) |
 | `-stop` | `st` | Stop playback and disconnect, keeping the queue for `-resume` (24h) |
-| `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (applies from the next song; saved per server) |
+| `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (usually applies two songs later, since the next one is built ahead of time; saved per server) |
 
 ### Queue
 
