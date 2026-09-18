@@ -553,6 +553,23 @@ async def read_guild_configs(
     return configs
 
 
+def _wrong_type(reply: object) -> bool:
+    # WRONGTYPE is a plain ResponseError, told apart only by its message.
+    return isinstance(reply, ResponseError) and str(reply).startswith("WRONGTYPE")
+
+
+def _config_hash(reply: object, owner: str) -> dict[bytes, bytes]:
+    """An HGETALL reply for a config key, raising any error it is. A key that is not
+    a hash reads as unset, with a WARNING naming `owner`: no later read can change
+    it, and read as a failure it would be retried, and reported unread, for good."""
+    if _wrong_type(reply):
+        log.warning(f"{owner} config key is not a hash; read as unset")
+        return {}
+    if isinstance(reply, BaseException):
+        raise reply
+    return cast(dict[bytes, bytes], reply)
+
+
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
 
 _P = ParamSpec("_P")
@@ -1052,7 +1069,8 @@ class GuildRedisStore:
         """The complete playback aggregate — state, queue, now-playing, history,
         config — in one pipeline, so a failure aborts the whole snapshot and
         the caller restores everything or nothing. Same error-vs-empty contract
-        as get_guild_state. Not MULTI: recovery holds the guild lock during
+        as get_guild_state, except that a config key that is not a hash reads as
+        unset (_config_hash). Not MULTI: recovery holds the guild lock during
         the window that matters."""
         pipe = self.redis.pipeline()
         pipe.hgetall(self.state_key())
@@ -1060,7 +1078,17 @@ class GuildRedisStore:
         pipe.hgetall(self.now_playing_key())
         pipe.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
         pipe.hgetall(self.config_key())
-        raw_state, raw_queue, raw_np, raw_history, raw_config = await pipe.execute()
+        # Kept because execute() clears command_stack on its way out, and
+        # raise_on_error=False skips the annotation that names the failing leg:
+        # without it a WRONGTYPE says only that some key is the wrong type.
+        sent = list(pipe.command_stack)
+        *replies, config_reply = await pipe.execute(raise_on_error=False)
+        for i, reply in enumerate(replies):
+            if isinstance(reply, Exception):
+                pipe.annotate_exception(reply, i + 1, sent[i][0])
+                raise reply
+        raw_state, raw_queue, raw_np, raw_history = replies
+        raw_config = _config_hash(config_reply, f"[guild:{self.guild_id}]")
         entries = tuple(
             entry
             for entry in (parse_queue_entry(item) for item in raw_queue)

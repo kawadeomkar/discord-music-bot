@@ -1886,6 +1886,32 @@ class TestGetGuildState:
 
 
 class TestGetPlaybackSnapshot:
+    async def test_a_config_key_that_is_not_a_hash_reads_as_unset(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """No read can change it, so read as a failure it would abort every restore
+        of this guild's queue."""
+        await fake_redis.rpush(store.queue_key(), _entry(1).to_redis())
+        await fake_redis.set(store.config_key(), b"not a hash")
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert (snap.queue, snap.config) == ((_entry(1),), GuildConfig())
+
+    async def test_any_other_wrong_type_key_still_fails_the_snapshot(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Failed with the server's own error, not with whatever parsing an error
+        reply as a list raises, and naming the leg, since nothing retried can
+        clear it and the operator has to know WHICH key to look at."""
+        await fake_redis.set(store.config_key(), b"not a hash")
+        await fake_redis.set(store.queue_key(), b"not a list")
+        assert await store.get_playback_snapshot() is None
+        assert "WRONGTYPE" in caplog.text
+        assert store.queue_key() in caplog.text
+
     async def test_returns_state_and_queue_together(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -1970,9 +1996,9 @@ class TestGetPlaybackSnapshot:
             pipe = real_pipeline(*args, **kwargs)
             original_execute = pipe.execute
 
-            async def counted_execute() -> Any:
+            async def counted_execute(**kwargs: Any) -> Any:
                 execute_counts.append(1)
-                return await original_execute()
+                return await original_execute(**kwargs)
 
             mocked(pipe).execute = counted_execute
             return pipe
