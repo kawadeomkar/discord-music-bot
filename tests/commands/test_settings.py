@@ -558,7 +558,7 @@ class TestReplies:
         await _invoke(cog, ctx, "volume 50")
         assert _text(ctx) == (
             "**Volume** is now **50%** for this server (was **100%**, the default). "
-            "It applies from the next song. It is saved for this server. "
+            "It applies two songs from now, since the next one is already built. It is saved for this server. "
             f"Changed by {MENTION}."
         )
         await _invoke(cog, ctx, "volume 80%")
@@ -817,7 +817,7 @@ class TestCard:
         await _invoke(cog, settings_ctx, "vol")
         assert _text(settings_ctx) == (
             "**Volume** (`volume`; also `vol`) — Playback level. Current **100%** "
-            "(default) · Default 100% · Allowed 0%–100% · Applies from the next song "
+            "(default) · Default 100% · Allowed 0%–100% · Applies two songs from now, since the next one is already built "
             "· Can be changed with Manage Server, by the bot's operator, or by anyone "
             "in the bot's voice channel (any voice channel while it isn't in one)."
         )
