@@ -532,10 +532,18 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `DEBUG_DEADLINE_SECS` | | `8.0` | `-debug` snapshot: how long a block may collect before it renders `timed out`. Longer than `-ping`'s because each block does strictly more work (a Postgres stats query, a Prometheus round trip) and a straggler is not retried |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | | `20.0` | `-analytics`: how long to wait for the chart before sending the card without one. Sized for the COLD path, which dominates. Expiry is **silent** — the card still sends, just without its chart — so raise this rather than lower it if charts go missing |
 | `LIVENESS_FILE` | | — (`/tmp/bot-alive` in the image) | Path a loop-resident task touches every `LIVENESS_INTERVAL_SECS`, read by the container `HEALTHCHECK`. A stale mtime (>90s) means the event loop wedged while the process stayed up — something `restart: always` cannot see, because it only observes the process exiting. It **reports**; Compose takes no action on an unhealthy container. Not a dependency probe: a Redis blip must not mark the bot dead. Unset outside Docker, where the task never starts |
-| `LIVENESS_INTERVAL_SECS` | | `15.0` | How often that file is touched. Must stay well under the healthcheck's 90s staleness window |
+| `LIVENESS_INTERVAL_SECS` | | `15.0` | How often that file is touched. Must stay well under the healthcheck's 90s staleness window, so it is accepted between 1 and 60 |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.39.0
+
+**`LIVENESS_INTERVAL_SECS` is now bounded to 1-60 seconds.** It was read with no range
+check, so a value above the container HEALTHCHECK's 90s staleness window made a healthy
+bot report unhealthy between touches, and `0` turned the touch loop into a spin. Either
+now stops the bot at startup, naming the variable, instead of starting. If yours is unset
+or inside that range, nothing changes. Rolling back is only a redeploy.
 
 ## Upgrading to 2.37.0
 
