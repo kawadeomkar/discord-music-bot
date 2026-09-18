@@ -309,6 +309,18 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
+@pytest.fixture(autouse=True)
+def reset_owner_lookup_backoff() -> Iterator[None]:
+    """Forget a failed owner lookup between tests. The deadline is module-global,
+    so one test's raising is_owner would otherwise deny every operator check for
+    the next 60s of the suite."""
+    import src.util as util
+
+    util._owner_lookup_retry_at = 0.0
+    yield
+    util._owner_lookup_retry_at = 0.0
+
+
 @pytest.fixture(autouse=True, scope="session")
 def configure_structlog_for_tests() -> None:
     """Configure structlog with minimal output for tests.

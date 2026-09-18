@@ -287,7 +287,10 @@ class VoiceWatchdog:
         except Exception as e:
             log.error(f"alone countdown error in guild {guild.id}: {e}", exc_info=True)
         finally:
-            self._timers.pop(guild.id, None)
+            # Only our own entry: a restart stores the replacement before this task
+            # processes its cancellation.
+            if self._timers.get(guild.id) is asyncio.current_task():
+                del self._timers[guild.id]
 
 
 def join_succeeded(ctx: commands.Context) -> bool:

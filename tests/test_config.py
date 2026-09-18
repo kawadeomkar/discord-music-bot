@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -430,6 +430,28 @@ class TestFloatEnv:
         monkeypatch.setenv("KNOB", raw)
         with pytest.raises(ValueError, match="KNOB must be a number"):
             _float_env("KNOB", 1.0, minimum=0.05)
+
+    def test_above_the_maximum_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", "60.5")
+        with pytest.raises(ValueError, match="KNOB must be <= 60.0"):
+            _float_env("KNOB", 1.0, minimum=1.0, maximum=60.0)
+
+    @pytest.mark.parametrize("raw", ["1.0", "60.0"])
+    def test_both_bounds_are_inclusive(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        assert _float_env("KNOB", 5.0, minimum=1.0, maximum=60.0) == float(raw)
+
+    def test_no_maximum_leaves_the_top_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Optional, so the existing minimum-only knobs keep accepting any finite
+        value above their floor."""
+        monkeypatch.setenv("KNOB", "1e9")
+        assert _float_env("KNOB", 1.0, minimum=0.05) == 1e9
 
 
 class TestPlayBounds:
@@ -1192,3 +1214,58 @@ class TestDebugPrometheusUrl:
     def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
         assert debug_prometheus_url() == "http://localhost:9090"
+
+
+class TestLivenessInterval:
+    """The touch cadence is refused at import outside 1-60s, so a value that would
+    spin the loop or outlast the HEALTHCHECK's 90s staleness window never runs."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload, as TestPlayBounds does: teardown runs ahead of
+        monkeypatch's own, so a reload here would re-read the value under test."""
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    @staticmethod
+    def _reload(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        return importlib.reload(config)
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_is_the_default(
+        self, raw: Optional[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("LIVENESS_INTERVAL_SECS", raising=False)
+        else:
+            monkeypatch.setenv("LIVENESS_INTERVAL_SECS", raw)
+        assert self._reload(monkeypatch).LIVENESS_INTERVAL_SECS == 15.0
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [("0.5", ">= 1.0"), ("0", ">= 1.0"), ("61", "<= 60.0"), ("90", "<= 60.0")],
+    )
+    def test_outside_the_bounds_refuses_startup(
+        self, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LIVENESS_INTERVAL_SECS", raw)
+        with pytest.raises(
+            ValueError,
+            match=f"LIVENESS_INTERVAL_SECS must be {re.escape(message)}",
+        ):
+            self._reload(monkeypatch)
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [("nan", "a finite number"), ("inf", "a finite number"), ("3s", "a number")],
+    )
+    def test_non_finite_or_garbage_names_the_variable(
+        self, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LIVENESS_INTERVAL_SECS", raw)
+        with pytest.raises(
+            ValueError, match=f"LIVENESS_INTERVAL_SECS must be {message}"
+        ):
+            self._reload(monkeypatch)

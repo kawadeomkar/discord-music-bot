@@ -29,17 +29,14 @@ def infer_environment_from_git() -> Optional[str]:
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
-# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
-# default outside Docker) skips the task.
-LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
-LIVENESS_INTERVAL_SECS: float = float(os.environ.get("LIVENESS_INTERVAL_SECS", "15.0"))
-
 NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
 
 
-def _float_env(name: str, default: float, *, minimum: float) -> float:
+def _float_env(
+    name: str, default: float, *, minimum: float, maximum: Optional[float] = None
+) -> float:
     """Float knob from the environment; empty reads as unset. Non-finite is
     refused separately from the floor: `inf` never expires a dashboard deadline
     (the command then holds its concurrency slot forever) and a tick of 0 turns
@@ -58,7 +55,25 @@ def _float_env(name: str, default: float, *, minimum: float) -> float:
         raise ValueError(f"{name} must be a finite number; got {raw!r}")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}; got {value}")
     return value
+
+
+# The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
+# is capped well under that; the floor keeps the touch a cadence, not a spin.
+_MIN_LIVENESS_SECS: Final[float] = 1.0
+_MAX_LIVENESS_SECS: Final[float] = 60.0
+
+# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
+# default outside Docker) skips the task.
+LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
+LIVENESS_INTERVAL_SECS: float = _float_env(
+    "LIVENESS_INTERVAL_SECS",
+    15.0,
+    minimum=_MIN_LIVENESS_SECS,
+    maximum=_MAX_LIVENESS_SECS,
+)
 
 
 # Floor for every live-dashboard knob: small enough to stay a tuning knob, large

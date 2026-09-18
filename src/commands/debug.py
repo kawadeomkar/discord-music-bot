@@ -11,7 +11,7 @@ from src.config import (
     using_default_postgres_password,
 )
 from src.redis_client import GuildRedisStore
-from src.util import notice_embed
+from src.util import is_operator, notice_embed
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle: musicbot imports this module.
@@ -102,17 +102,6 @@ async def toggle(ctx: commands.Context, action: DebugAction, *, cog: MusicBot) -
             discord.Color.blue(),
         )
     )
-
-
-async def is_operator(ctx: commands.Context) -> bool:
-    """Is the caller the bot owner? Fails CLOSED: is_owner() falls through to
-    an application_info() REST call (no owner_id is configured) and RAISES on
-    failure. discord.py caches the answer, so one round trip per process."""
-    try:
-        return await ctx.bot.is_owner(ctx.author)
-    except Exception as e:  # noqa: BLE001 — an unreachable owner is not an owner
-        log.warning(f"owner check failed, denying: {type(e).__name__}: {e}")
-        return False
 
 
 async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
