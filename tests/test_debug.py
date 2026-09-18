@@ -330,10 +330,12 @@ class TestConfigAllowlist:
         the raw string, and an override names the value it shadows."""
         if env is None:
             monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS", raising=False)
-            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 3.0)
+            monkeypatch.setitem(config._BASELINES, "HEARTBEAT_INTERVAL_SECS", 3.0)
         else:
             monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
-            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", float(env))
+            monkeypatch.setitem(
+                config._BASELINES, "HEARTBEAT_INTERVAL_SECS", float(env)
+            )
         if override is not None:
             config.set_override("HEARTBEAT_INTERVAL_SECS", override)
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "HEARTBEAT_INTERVAL_SECS")
@@ -2348,7 +2350,10 @@ class TestRuntimeSampler:
     def test_the_interval_tracks_the_now_playing_tick(self) -> None:
         """Sampling slower than the NP tick re-pushes footers whose numbers have
         not moved."""
-        assert debug.sample_interval_secs() == config.NOW_PLAYING_UPDATE_INTERVAL_SECS
+        assert (
+            debug.sample_interval_secs()
+            == config.now_playing_update_interval_secs.baseline
+        )
 
     @pytest.mark.parametrize(("tick", "interval"), [(30.0, 5.0), (2.0, 2.0)])
     def test_the_interval_follows_a_bot_setting_within_its_bounds(
@@ -2361,7 +2366,7 @@ class TestRuntimeSampler:
     def test_the_interval_is_floored_for_proc_reads(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(config, "NOW_PLAYING_UPDATE_INTERVAL_SECS", 0.2)
+        monkeypatch.setitem(config._BASELINES, "NOW_PLAYING_UPDATE_INTERVAL_SECS", 0.2)
         assert debug.sample_interval_secs() == 1.0
 
     async def test_a_running_sampler_rereads_the_interval_every_tick(
@@ -3633,12 +3638,15 @@ class TestEveryPlayTunableIsObservable:
         import src.config as config_mod
 
         rows = {var.name for var in _CONFIG_ALLOWLIST}
-        knobs = {
+        constants = {
             name
             for name in vars(config_mod)
+            if name.isupper() and not name.startswith("_")
+        }
+        knobs = {
+            name
+            for name in constants | {k.env for k in config_mod.KNOBS.values()}
             if name.startswith(("PLAY_", "QUEUE_PROGRESS_"))
-            and name.isupper()
-            and not name.startswith("_")
         }
         assert knobs, "no tunables found — the naming convention moved"
         assert knobs <= rows, f"no -debug row for: {sorted(knobs - rows)}"
@@ -3719,7 +3727,7 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id in ("_float_env", "_int_env")
+                and node.func.id in ("_float_env", "_int_env", "_secs", "_count")
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
             ):

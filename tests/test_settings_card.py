@@ -150,7 +150,7 @@ class TestBotValues:
             monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS", raising=False)
         else:
             monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
-        monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 3.0)
+        monkeypatch.setitem(config._BASELINES, "HEARTBEAT_INTERVAL_SECS", 3.0)
         if override is not None:
             config.set_override("HEARTBEAT_INTERVAL_SECS", override)
         shown = card.bot_shown(
@@ -168,7 +168,7 @@ class TestBotValues:
         not have set it."""
         spec = _spec("play-resolve-concurrency", SettingScope.BOT)
         monkeypatch.setenv("PLAY_RESOLVE_CONCURRENCY", "4")
-        monkeypatch.setattr(config, "PLAY_RESOLVE_CONCURRENCY", 4)
+        monkeypatch.setitem(config._BASELINES, "PLAY_RESOLVE_CONCURRENCY", 4)
         monkeypatch.setattr(config, "YTDLP_POOL_WORKERS", 4)
         shown = card.bot_shown(
             spec, host_debug_default=False, debug_default_override=None

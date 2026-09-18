@@ -547,7 +547,7 @@ class TestOutOfRange:
         any setting accepts does, and a write must not undercut it."""
         spec = _spec("queue-progress-max")
         assert parse_value(spec, "120s") == Parsed(120.0)
-        monkeypatch.setattr(config, "QUEUE_PROGRESS_DELAY_SECS", 100.0)
+        monkeypatch.setitem(config._BASELINES, "QUEUE_PROGRESS_DELAY_SECS", 100.0)
         config.set_override("QUEUE_PROGRESS_TICK_SECS", 15.0)
         result = parse_value(spec, "125s")
         assert isinstance(result, Refusal)
@@ -1581,7 +1581,9 @@ class TestBotSettingsApply:
         assert bot_settings.apply(_spec("heartbeat"), 5.0) is True
         assert config.heartbeat_interval_secs() == 5.0
         assert bot_settings.reset(_spec("heartbeat")) is True
-        assert config.heartbeat_interval_secs() == config.HEARTBEAT_INTERVAL_SECS
+        assert (
+            config.heartbeat_interval_secs() == config.heartbeat_interval_secs.baseline
+        )
 
     def test_a_count_is_applied_as_an_int(self) -> None:
         bot_settings = BotSettings(_bot(), redis=None, ignore_stored=False)
@@ -2844,7 +2846,7 @@ def _scan_knob_reads(
             ):
                 reads.baseline.append(at(node))
         if (
-            not writer_module
+            not (writer_module or config_module)
             and isinstance(node, ast.Call)
             and _identifier(node.func) in _OVERRIDE_WRITERS
         ):

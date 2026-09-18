@@ -337,7 +337,7 @@ class TestScopes:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4")
-        monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 4.0)
+        monkeypatch.setitem(config._BASELINES, "HEARTBEAT_INTERVAL_SECS", 4.0)
         ctx = _as_operator(settings_ctx)
         await _invoke(cog, ctx, "bot heartbeat 5s")
         assert "(was **4s**, from `HEARTBEAT_INTERVAL_SECS`)" in _text(ctx)

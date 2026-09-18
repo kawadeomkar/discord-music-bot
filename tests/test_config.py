@@ -32,6 +32,13 @@ from src.config import (
 )
 
 
+def _parsed(module: ModuleType, name: str) -> float:
+    """What `module` parsed from the environment for `name`: a settable knob's
+    baseline, else the module constant."""
+    knob = module.KNOBS.get(name.lower())
+    return getattr(module, name) if knob is None else knob.baseline
+
+
 class TestSpotifyEnabled:
     def test_enabled_when_both_credentials_present(
         self, monkeypatch: pytest.MonkeyPatch
@@ -469,8 +476,8 @@ class TestPlayBounds:
         importlib.reload(config)
 
     def test_defaults(self) -> None:
-        assert config.PLAY_INFLIGHT_MAX == 16
-        assert config.PLAY_RESOLVE_CONCURRENCY == 2
+        assert config.play_inflight_max.baseline == 16
+        assert config.play_resolve_concurrency.baseline == 2
 
     @pytest.mark.parametrize("name", ["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"])
     def test_zero_is_refused_at_import(
@@ -523,7 +530,7 @@ class TestEnvFloors:
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, raw)
-        assert getattr(self._reload(monkeypatch), name) == default
+        assert _parsed(self._reload(monkeypatch), name) == default
 
     @pytest.mark.parametrize(
         ("name", "raw", "message"),
@@ -1306,11 +1313,14 @@ class TestBotKnobDeclarations:
 
     def test_every_knob_names_a_parsed_constant_of_its_type(self) -> None:
         for knob in config.FLOAT_KNOBS:
-            assert type(getattr(config, knob)) is float, knob
+            assert config.KNOBS[knob.lower()].kind is float, knob
             assert type(config.baseline(knob)) is float, knob
         for knob in config.INT_KNOBS:
-            assert type(getattr(config, knob)) is int, knob
+            assert config.KNOBS[knob.lower()].kind is int, knob
             assert type(config.baseline(knob)) is int, knob
+        assert {k.env for k in config.KNOBS.values()} == (
+            config.FLOAT_KNOBS | config.INT_KNOBS
+        )
 
     def test_the_two_sets_are_disjoint(self) -> None:
         assert not config.FLOAT_KNOBS & config.INT_KNOBS
@@ -1322,7 +1332,7 @@ class TestBotKnobDeclarations:
     def test_baseline_is_read_at_call_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(config, "PING_TICK_SECS", 2.5)
+        monkeypatch.setitem(config._BASELINES, "PING_TICK_SECS", 2.5)
         assert config.baseline("PING_TICK_SECS") == 2.5
 
     @pytest.mark.parametrize(
@@ -1343,6 +1353,51 @@ class TestBotKnobDeclarations:
     def test_every_knob_has_a_recorded_floor(self) -> None:
         for knob in config.FLOAT_KNOBS | config.INT_KNOBS:
             assert config.env_floor(knob) >= 0, knob
+
+
+class TestKnobHandle:
+    """A knob is a handle: the name, the kind and the floor. Its values are held by
+    the module, which is what lets a handle outlive a reload."""
+
+    def test_a_handle_names_its_variable_field_kind_and_floor(self) -> None:
+        knob = config.play_inflight_max
+        assert (knob.env, knob.field) == ("PLAY_INFLIGHT_MAX", "play_inflight_max")
+        assert knob.kind is int
+        assert knob.floor == 1
+        assert config.KNOBS[knob.field] is knob
+
+    def test_every_handle_is_the_module_global_named_as_its_field(self) -> None:
+        assert len(config.KNOBS) == 15
+        for field, knob in config.KNOBS.items():
+            assert getattr(config, field) is knob, field
+
+    def test_a_dependent_floor_reads_the_baselines_it_is_built_from(self) -> None:
+        assert config.queue_progress_max_secs.floor == (
+            config.queue_progress_delay_secs.baseline
+            + config.queue_progress_tick_secs.baseline
+        )
+
+    def test_a_handle_held_across_a_reload_reads_the_reloaded_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The -settings registry holds handles built at its own import, and this
+        suite reloads config under it."""
+        held = config.heartbeat_interval_secs
+        # Read first: a handle that kept what it read would pass a test that only
+        # reads afterwards.
+        assert (held.baseline, held()) == (3.0, 3.0)
+        monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4.0")
+        try:
+            importlib.reload(config)
+            assert held is not config.heartbeat_interval_secs
+            assert held.baseline == 4.0
+            config.heartbeat_interval_secs.set_override(9.0)
+            assert (held(), held.override()) == (9.0, 9.0)
+            held.clear_override()
+            assert config.heartbeat_interval_secs() == 4.0
+        finally:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS")
+            importlib.reload(config)
 
 
 class TestBotKnobOverrides:
@@ -1373,7 +1428,7 @@ class TestBotKnobOverrides:
     def test_the_baseline_is_read_at_call_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(config, "PING_TICK_SECS", 2.5)
+        monkeypatch.setitem(config._BASELINES, "PING_TICK_SECS", 2.5)
         assert config.ping_tick_secs() == 2.5
 
     def test_an_int_knob_refuses_a_float_and_a_bool(self) -> None:
