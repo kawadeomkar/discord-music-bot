@@ -475,7 +475,7 @@ def _render_knob(
 ) -> str:
     """`5s (bot owner; env 3s)`: the value and source label the -settings bot
     card shows, so the operator's two views of a knob agree."""
-    spec = knob_spec(knob)
+    spec = knob_spec(config.KNOBS[knob.lower()])
     shown = knob_shown(spec, persisted=spec.key not in unsaved)
     return f"{format_value(spec, shown.value)} ({shown.source})"
 

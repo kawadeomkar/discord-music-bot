@@ -11,7 +11,7 @@ import os
 import re
 from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -121,15 +121,17 @@ class TestRegistryInvariants:
 
     def test_2_every_field_is_a_schema_constant(self) -> None:
         """debug-default is the one spec with no field: it is never stored."""
-        unstored = [spec.key for spec in SETTINGS if spec.field is None]
+        unstored = [
+            spec.key for spec in SETTINGS if spec.field is None and spec.knob is None
+        ]
         assert unstored == ["debug-default"]
         for spec in SETTINGS:
-            if spec.field is None:
-                continue
-            names = members(
-                ConfigField if spec.scope is SettingScope.SERVER else BotConfigField
-            )
-            assert spec.field in names, spec.key
+            if spec.scope is SettingScope.SERVER:
+                assert spec.knob is None, spec.key
+                assert spec.field in members(ConfigField), spec.key
+            elif spec.knob is not None:
+                assert spec.field is None, spec.key
+                assert spec.knob.field in members(BotConfigField), spec.key
 
     def test_2_every_server_field_has_exactly_one_spec(self) -> None:
         """So no stored field lacks a way to show and reset it."""
@@ -139,33 +141,40 @@ class TestRegistryInvariants:
         assert sorted(f for f in server_fields if f) == sorted(members(ConfigField))
 
     def test_2_every_bot_field_has_exactly_one_spec(self) -> None:
-        bot_fields = [
-            spec.field
-            for spec in SETTINGS
-            if spec.scope is SettingScope.BOT and spec.field
-        ]
+        bot_fields = [spec.knob.field for spec in SETTINGS if spec.knob is not None]
         assert sorted(bot_fields) == sorted(members(BotConfigField))
 
     def test_3_every_knob_is_one_bot_spec_above_its_env_floor(self) -> None:
         bot = [spec for spec in SETTINGS if spec.scope is SettingScope.BOT]
-        assert [spec.key for spec in bot if spec.attr is None] == ["debug-default"]
-        attrs = [spec.attr for spec in bot if spec.attr is not None]
-        assert sorted(attrs) == sorted(config.FLOAT_KNOBS | config.INT_KNOBS)
+        assert [spec.key for spec in bot if spec.knob is None] == ["debug-default"]
+        knobs = [spec.knob for spec in bot if spec.knob is not None]
+        assert sorted(k.env for k in knobs) == sorted(
+            k.env for k in config.KNOBS.values()
+        )
         for spec in bot:
-            if spec.attr is None:
+            if spec.knob is None:
                 continue
-            assert spec.env == spec.attr, spec.key
+            # By variable, never identity: a reload of config mints new handles.
+            assert config.KNOBS[spec.knob.field].env == spec.knob.env, spec.key
+            assert spec.env == spec.knob.env, spec.key
             minimum = bound(spec.minimum)
             assert minimum is not None, spec.key
-            floor = config.env_floor(spec.attr)
+            floor = spec.knob.floor
             if spec.kind is SettingKind.COUNT:
-                assert spec.attr in config.INT_KNOBS, spec.key
+                assert spec.knob.kind is int, spec.key
                 assert minimum >= floor, spec.key
             else:
                 # Near the floor a cadence or timeout costs real work per guild; the
                 # environment is where an operator makes that choice on purpose.
-                assert spec.attr in config.FLOAT_KNOBS, spec.key
+                assert spec.knob.kind is float, spec.key
                 assert minimum > floor, spec.key
+
+    def test_3_a_spec_takes_its_variable_from_its_knob_or_names_one(self) -> None:
+        """env is the knob's where there is a knob; only debug-default spells one."""
+        spec = _spec("ping-tick")
+        assert spec.env == "PING_TICK_SECS"
+        with pytest.raises(ValueError, match="both a knob and a variable"):
+            dataclasses.replace(spec, env="PING_TICK_SECS")
 
     def test_4_copy_is_present_and_short(self) -> None:
         for spec in SETTINGS:
@@ -196,16 +205,16 @@ class TestRegistryInvariants:
         for spec in SETTINGS:
             if spec.scope is SettingScope.BOT:
                 assert spec.env in rows, spec.key
-                if spec.attr is not None:
-                    assert rows[spec.env].knob == spec.attr, spec.key
+                if spec.knob is not None:
+                    assert rows[spec.env].knob == spec.knob.env, spec.key
 
     def test_6_values_round_trip_at_their_bounds_and_default(self) -> None:
         # A write-time minimum follows the bot's value. At its lowest, the env
         # floor, a server setting's whole static range is writable.
         for spec in SETTINGS:
             knob = settings.followed_knob(spec)
-            if spec.write_minimum is not None and knob and not config.is_int_knob(knob):
-                config.set_override(knob, config.env_floor(knob))
+            if spec.write_minimum is not None and knob and knob.kind is float:
+                cast(config.Knob[float], knob).set_override(knob.floor)
         checked = 0
         for spec in SETTINGS:
             points: list[float | str | bool] = []
@@ -217,10 +226,10 @@ class TestRegistryInvariants:
                 ]
             if spec.default is not None:
                 points.append(spec.default)
-            elif (knob := spec.attr or settings.followed_knob(spec)) is not None:
+            elif (knob := spec.knob or settings.followed_knob(spec)) is not None:
                 # An exported variable may deliberately sit outside the chat range.
-                if not (os.environ.get(knob) or "").strip():
-                    points.append(config.baseline(knob))
+                if not (os.environ.get(knob.env) or "").strip():
+                    points.append(knob.baseline)
             elif spec.kind is SettingKind.SWITCH:
                 points.append(config.debug_mode_default())
             if spec.kind is SettingKind.SECONDS_OR_OFF:
@@ -298,12 +307,12 @@ class TestRegistryInvariants:
 
     def test_10_wire_names_are_derived(self) -> None:
         for spec in SETTINGS:
+            if spec.knob is not None:
+                assert spec.field is None, spec.key
+                assert spec.knob.field == spec.knob.env.lower(), spec.key
             if spec.field is None:
                 continue
-            if spec.scope is SettingScope.BOT:
-                assert spec.env is not None
-                assert spec.field == spec.env.lower(), spec.key
-            elif spec.key == "debug":
+            if spec.key == "debug":
                 assert spec.field == "debug_mode"  # older than the registry
             else:
                 suffix = "_secs" if spec.kind in _TIME_KINDS else ""
@@ -332,7 +341,7 @@ class TestRegistryInvariants:
                 assert knob is None, spec.key
             elif spec.key != "debug":  # follows DEBUG_MODE, which is not a knob
                 assert knob is not None, spec.key
-                assert [s.attr for s in SETTINGS if s.key == spec.key and s.attr] == [
+                assert [s.knob for s in SETTINGS if s.key == spec.key and s.knob] == [
                     knob
                 ]
 
@@ -2818,7 +2827,7 @@ def _scan_knob_reads(
 ) -> _KnobReads:
     """One pass per module. Identifiers are matched by name, so an aliased import
     (`import src.config as c; c.PING_TICK_SECS`) is caught without tracking it.
-    String constants are not identifiers: the registry's env=/attr= and -debug's
+    String constants are not identifiers: the registry's env= and -debug's
     knob= pass. BotConfigField's constants are wire-field names that two count knobs
     share, so an attribute read off that class is not a knob read."""
     reads = _KnobReads([], [], [], [], set())

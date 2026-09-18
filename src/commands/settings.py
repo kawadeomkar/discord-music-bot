@@ -182,7 +182,7 @@ async def _bot_scope(
         return
     if bot_settings is None:
         raise RuntimeError("bot settings are not set up on this bot")
-    if spec.field is None:
+    if spec.knob is None:
         await _change_debug_default(ctx, request, cog=cog, bot_settings=bot_settings)
         return
     if bot_settings.ignore_stored:

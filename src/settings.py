@@ -45,7 +45,6 @@ from src.guild_state import (
     DEFAULT_VOLUME,
     OFF_SECS,
     BotConfig,
-    BotConfigField,
     BotConfigFieldName,
     ConfigField,
     ConfigFieldName,
@@ -120,8 +119,8 @@ class SettingSpec:
     more: str | None = None
     # Completes "It applies ...".
     applies: str
-    # None only for debug-default, which is never stored.
-    field: ConfigFieldName | BotConfigFieldName | None
+    # Server scope: the guild:{id}:config field.
+    field: ConfigFieldName | None = None
     minimum: Bound | None
     maximum: Bound | None
     # Another setting's current value: checked when a value is written, never on read.
@@ -137,9 +136,18 @@ class SettingSpec:
     # Server scope's code default; None where the value follows a bot setting or
     # DEBUG_MODE, and for every bot spec, whose default is its env baseline.
     default: float | str | None = None
-    # Bot scope only: the env var it overrides, and the config knob holding it.
+    # Bot scope: the knob it overrides. None only for debug-default, which is
+    # never stored.
+    knob: config.AnyKnob | None = None
+    # The variable a bot setting shadows. Taken from the knob where there is one.
     env: str | None = None
-    attr: config.FloatKnob | config.IntKnob | None = None
+
+    def __post_init__(self) -> None:
+        if self.knob is None:
+            return
+        if self.env is not None:
+            raise ValueError(f"{self.key} names both a knob and a variable")
+        object.__setattr__(self, "env", self.knob.env)
 
 
 _NUMERIC_KINDS: Final = frozenset(
@@ -166,14 +174,14 @@ def _longest_card_delay() -> float:
         for spec in SETTINGS
         if spec.key == "queue-progress-delay"
     ]
-    return max([config.baseline("QUEUE_PROGRESS_DELAY_SECS"), *maxima])
+    return max([config.queue_progress_delay_secs.baseline, *maxima])
 
 
 def _queue_progress_max_floor() -> float:
     return card_ceiling(
         _longest_card_delay(),
         config.queue_progress_tick_secs(),
-        config.env_floor("QUEUE_PROGRESS_MAX_SECS"),
+        config.queue_progress_max_secs.floor,
     )
 
 
@@ -324,15 +332,13 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Progress bar refresh",
         summary="How often the Now Playing bar moves.",
         applies="from the next tick",
-        field=BotConfigField.NOW_PLAYING_UPDATE_INTERVAL,
+        knob=config.now_playing_update_interval_secs,
         minimum=3.0,
         maximum=30.0,
         why_minimum=(
             "Every tick edits the card against the channel's rate limit, which the "
             "bot's other messages there share."
         ),
-        env="NOW_PLAYING_UPDATE_INTERVAL_SECS",
-        attr="NOW_PLAYING_UPDATE_INTERVAL_SECS",
     ),
     SettingSpec(
         key="heartbeat",
@@ -343,12 +349,10 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Heartbeat",
         summary="How often a playing server saves its position.",
         applies="from the next tick",
-        field=BotConfigField.HEARTBEAT_INTERVAL,
+        knob=config.heartbeat_interval_secs,
         minimum=2.0,
         maximum=30.0,
         why_minimum="Each beat is a Redis write for every server that is playing.",
-        env="HEARTBEAT_INTERVAL_SECS",
-        attr="HEARTBEAT_INTERVAL_SECS",
     ),
     SettingSpec(
         key="slow-notice",
@@ -359,15 +363,13 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Lookup notice",
         summary="Wait before a slow song lookup posts a notice.",
         applies="from the next -play",
-        field=BotConfigField.PLAY_SLOW_NOTICE,
+        knob=config.play_slow_notice_secs,
         minimum=4.0,
         maximum=60.0,
         why_minimum=(
             "Most lookups finish within 4s, so a shorter delay would post the notice "
             "for ordinary ones."
         ),
-        env="PLAY_SLOW_NOTICE_SECS",
-        attr="PLAY_SLOW_NOTICE_SECS",
     ),
     SettingSpec(
         key="queue-progress-delay",
@@ -378,15 +380,13 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Playlist card",
         summary="Wait before a slow playlist shows a progress card.",
         applies="from the next -play",
-        field=BotConfigField.QUEUE_PROGRESS_DELAY,
+        knob=config.queue_progress_delay_secs,
         minimum=2.0,
         maximum=60.0,
         why_minimum=(
             "A ten-track playlist queues in about 2s, so a shorter delay would put "
             "the card up for ordinary ones."
         ),
-        env="QUEUE_PROGRESS_DELAY_SECS",
-        attr="QUEUE_PROGRESS_DELAY_SECS",
     ),
     SettingSpec(
         key="queue-progress-tick",
@@ -397,7 +397,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Playlist card tick",
         summary="Shortest gap between the playlist card's edits.",
         applies="from the next card",
-        field=BotConfigField.QUEUE_PROGRESS_TICK,
+        knob=config.queue_progress_tick_secs,
         minimum=3.0,
         maximum=30.0,
         write_maximum=_queue_progress_tick_ceiling,
@@ -408,8 +408,6 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
             "the card needs two ticks between its longest delay and queue-progress-max, "
             "so a tick of at most {bound}"
         ),
-        env="QUEUE_PROGRESS_TICK_SECS",
-        attr="QUEUE_PROGRESS_TICK_SECS",
     ),
     SettingSpec(
         key="queue-progress-max",
@@ -421,7 +419,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         summary="How long the playlist card updates before it stops.",
         more='Past it the card says "still working" and stops editing.',
         applies="from the next card",
-        field=BotConfigField.QUEUE_PROGRESS_MAX,
+        knob=config.queue_progress_max_secs,
         minimum=120.0,
         maximum=900.0,
         write_minimum=_queue_progress_max_floor,
@@ -433,8 +431,6 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
             "a card waits up to its longest delay and then needs two ticks, "
             "{bound}, before it can stop"
         ),
-        env="QUEUE_PROGRESS_MAX_SECS",
-        attr="QUEUE_PROGRESS_MAX_SECS",
     ),
     SettingSpec(
         key="play-inflight-max",
@@ -445,11 +441,9 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Inflight max",
         summary="How many -play requests a server can run at once.",
         applies="from the next -play",
-        field=BotConfigField.PLAY_INFLIGHT_MAX,
+        knob=config.play_inflight_max,
         minimum=1,
         maximum=32,
-        env="PLAY_INFLIGHT_MAX",
-        attr="PLAY_INFLIGHT_MAX",
     ),
     SettingSpec(
         key="play-resolve-concurrency",
@@ -460,14 +454,12 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Resolve concurrency",
         summary="Lookup workers one server can use at once.",
         applies="once a server's lookups in progress have all finished",
-        field=BotConfigField.PLAY_RESOLVE_CONCURRENCY,
+        knob=config.play_resolve_concurrency,
         minimum=1,
         maximum=_play_resolve_concurrency_max,
         why_maximum=(
             "One worker stays free, so no one server's lookups can hold the whole pool."
         ),
-        env="PLAY_RESOLVE_CONCURRENCY",
-        attr="PLAY_RESOLVE_CONCURRENCY",
     ),
     SettingSpec(
         key="play-resolve-wait",
@@ -478,15 +470,13 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Resolve wait",
         summary="How long a -play waits for a lookup worker.",
         applies="from the next wait",
-        field=BotConfigField.PLAY_RESOLVE_WAIT,
+        knob=config.play_resolve_wait_secs,
         minimum=30.0,
         maximum=300.0,
         why_minimum=(
             "A pasted burst of links can queue its last request for about half a "
             "minute on a healthy bot."
         ),
-        env="PLAY_RESOLVE_WAIT_SECS",
-        attr="PLAY_RESOLVE_WAIT_SECS",
     ),
     SettingSpec(
         key="stream-probe-timeout",
@@ -497,12 +487,10 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Probe timeout",
         summary="Time limit for checking a song's stream.",
         applies="from the next check",
-        field=BotConfigField.STREAM_PROBE_TIMEOUT,
+        knob=config.stream_probe_timeout_secs,
         minimum=0.5,
         maximum=config.STREAM_PROBE_TIMEOUT_MAX_SECS,
         why_maximum="A song can wait for the check twice before it starts.",
-        env="STREAM_PROBE_TIMEOUT_SECS",
-        attr="STREAM_PROBE_TIMEOUT_SECS",
     ),
     SettingSpec(
         key="ping-tick",
@@ -513,11 +501,9 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Ping tick",
         summary="Shortest gap between -ping's edits.",
         applies="from the next -ping",
-        field=BotConfigField.PING_TICK,
+        knob=config.ping_tick_secs,
         minimum=1.0,
         maximum=5.0,
-        env="PING_TICK_SECS",
-        attr="PING_TICK_SECS",
     ),
     SettingSpec(
         key="ping-deadline",
@@ -528,11 +514,9 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Ping deadline",
         summary="How long -ping waits before marking a check failed.",
         applies="from the next -ping",
-        field=BotConfigField.PING_DEADLINE,
+        knob=config.ping_deadline_secs,
         minimum=1.0,
         maximum=30.0,
-        env="PING_DEADLINE_SECS",
-        attr="PING_DEADLINE_SECS",
     ),
     SettingSpec(
         key="debug-tick",
@@ -543,11 +527,9 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Debug tick",
         summary="Shortest gap between -debug's edits.",
         applies="from the next -debug",
-        field=BotConfigField.DEBUG_TICK,
+        knob=config.debug_tick_secs,
         minimum=1.0,
         maximum=5.0,
-        env="DEBUG_TICK_SECS",
-        attr="DEBUG_TICK_SECS",
     ),
     SettingSpec(
         key="debug-deadline",
@@ -558,12 +540,10 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Debug deadline",
         summary='How long a -debug block collects before "timed out".',
         applies="from the next -debug",
-        field=BotConfigField.DEBUG_DEADLINE,
+        knob=config.debug_deadline_secs,
         minimum=5.0,
         maximum=60.0,
         why_minimum="The database block alone can take about 4s.",
-        env="DEBUG_DEADLINE_SECS",
-        attr="DEBUG_DEADLINE_SECS",
     ),
     SettingSpec(
         key="analytics-deadline",
@@ -574,12 +554,10 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         label="Analytics deadline",
         summary="How long -analytics waits for its chart.",
         applies="from the next -analytics",
-        field=BotConfigField.ANALYTICS_RENDER_DEADLINE,
+        knob=config.analytics_render_deadline_secs,
         minimum=10.0,
         maximum=120.0,
         why_minimum="The first chart after a restart takes about 6s.",
-        env="ANALYTICS_RENDER_DEADLINE_SECS",
-        attr="ANALYTICS_RENDER_DEADLINE_SECS",
     ),
     SettingSpec(
         key="debug-default",
@@ -591,7 +569,6 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         summary="Debug footer for servers that haven't chosen.",
         more="It lasts until the bot restarts.",
         applies="immediately",
-        field=None,
         minimum=None,
         maximum=None,
         env="DEBUG_MODE",
@@ -626,8 +603,9 @@ _SERVER_BY_FIELD: Final[Mapping[str, SettingSpec]] = MappingProxyType(
         if spec.scope is SettingScope.SERVER and spec.field is not None
     }
 )
+# By variable: a handle's identity does not survive a reload of config.
 _BY_KNOB: Final[Mapping[str, SettingSpec]] = MappingProxyType(
-    {spec.attr: spec for spec in SETTINGS if spec.attr is not None}
+    {spec.knob.env: spec for spec in SETTINGS if spec.knob is not None}
 )
 
 
@@ -636,9 +614,9 @@ def server_spec(field: ConfigFieldName) -> SettingSpec:
     return _SERVER_BY_FIELD[field]
 
 
-def knob_spec(knob: config.FloatKnob | config.IntKnob) -> SettingSpec:
+def knob_spec(knob: config.AnyKnob) -> SettingSpec:
     """The bot setting that overrides `knob`."""
-    return _BY_KNOB[knob]
+    return _BY_KNOB[knob.env]
 
 
 def named(token: str, scope: SettingScope) -> SettingSpec | None:
@@ -647,13 +625,13 @@ def named(token: str, scope: SettingScope) -> SettingSpec | None:
     return _BY_NAME[scope].get(_fold(token))
 
 
-def followed_knob(spec: SettingSpec) -> config.FloatKnob | config.IntKnob | None:
+def followed_knob(spec: SettingSpec) -> config.AnyKnob | None:
     """The bot knob a server setting runs on while unset: the one the bot setting
     of the same key overrides. None for a bot setting, or a server one without."""
     if spec.scope is not SettingScope.SERVER:
         return None
     bot = named(spec.key, SettingScope.BOT)
-    return bot.attr if bot is not None else None
+    return bot.knob if bot is not None else None
 
 
 # ── Values: bounds, rendering and conversion to what is stored ──────────────
@@ -1558,7 +1536,7 @@ CONFIG_IO_TIMEOUT_SECS: Final[float] = 2.0
 
 # The bot specs stored in bot:{application_id}:config: every one but debug-default.
 _STORED_BOT_SPECS: Final[tuple[SettingSpec, ...]] = tuple(
-    spec for spec in SETTINGS if spec.scope is SettingScope.BOT and spec.field
+    spec for spec in SETTINGS if spec.scope is SettingScope.BOT and spec.knob
 )
 
 
@@ -1574,13 +1552,10 @@ async def _bounded[T](call: Awaitable[T], fallback: T, *, timed_out: str = "") -
         return fallback
 
 
-def _set_knob(attr: config.FloatKnob | config.IntKnob, value: SettingValue) -> None:
-    """config.set_override, narrowed from the registry's value union for the type
-    checker; set_override refuses a value of the wrong type at run time."""
-    if config.is_int_knob(attr):
-        config.set_override(attr, cast(int, value))
-    else:
-        config.set_override(attr, cast(float, value))
+def _set_knob(knob: config.AnyKnob, value: SettingValue) -> None:
+    """knob.set_override, cast from the registry's value union for the type
+    checker; the handle refuses a value of the wrong type at run time."""
+    cast(config.Knob[float], knob).set_override(cast(float, value))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1600,8 +1575,8 @@ class BotSettings:
     bot:{application_id}:config holds; write() and write_reset() store one setting
     there and apply it, and apply() and reset() change one in memory alone.
     debug-default is never stored: it is held here, so a cog reload can hand it to
-    the new cog's DebugSettings. The one src/ caller of config.set_override and
-    config.clear_override. Built in setup_hook.
+    the new cog's DebugSettings. The one src/ caller of a knob's set_override and
+    clear_override. Built in setup_hook.
     See docs/ARCHITECTURE.md#settings-resolution."""
 
     def __init__(
@@ -1633,9 +1608,9 @@ class BotSettings:
         # Looked up at call time, so a reloaded cog is the one that receives it.
         return getattr(self._bot.get_cog("MusicBot"), "debug_settings", None)
 
-    def _stamp(self, attr: str) -> None:
+    def _stamp(self, knob: config.AnyKnob) -> None:
         self._seq += 1
-        self._changed_at[attr] = self._seq
+        self._changed_at[knob.env] = self._seq
 
     def apply(self, spec: SettingSpec, value: SettingValue) -> bool:
         """Make `value` this process's setting. False, with nothing changed, for a
@@ -1643,7 +1618,7 @@ class BotSettings:
         raises ValueError: every caller has already refused it as input."""
         if spec.scope is not SettingScope.BOT or not in_bounds(spec, value):
             raise ValueError(f"{spec.key}={value!r} is not a bot setting value")
-        if spec.field is None:
+        if spec.knob is None:
             if not isinstance(value, bool):
                 raise TypeError(f"{spec.key} takes on or off; got {value!r}")
             self._debug_default = value
@@ -1652,9 +1627,9 @@ class BotSettings:
             return True
         if self.ignore_stored:
             return False
-        _, attr = self._stored(spec)
-        _set_knob(attr, value)
-        self._stamp(attr)
+        _, knob = self._stored(spec)
+        _set_knob(knob, value)
+        self._stamp(knob)
         return True
 
     def reset(self, spec: SettingSpec) -> bool:
@@ -1662,21 +1637,21 @@ class BotSettings:
         DEBUG_MODE). False, with nothing changed, as for apply()."""
         if spec.scope is not SettingScope.BOT:
             raise ValueError(f"{spec.key} is not a bot setting")
-        if spec.field is None:
+        if spec.knob is None:
             self._debug_default = None
             if (debug_settings := self._debug_settings()) is not None:
                 debug_settings.set_default_override(None)
             return True
         if self.ignore_stored:
             return False
-        _, attr = self._stored(spec)
-        config.clear_override(attr)
-        self._stamp(attr)
+        _, knob = self._stored(spec)
+        knob.clear_override()
+        self._stamp(knob)
         return True
 
     def is_persisted(self, spec: SettingSpec) -> bool:
         """False while the setting's last write or reset had not reached Redis."""
-        return spec.attr not in self._unpersisted
+        return spec.env not in self._unpersisted
 
     @property
     def unread(self) -> bool:
@@ -1686,22 +1661,19 @@ class BotSettings:
     def unsaved(self) -> frozenset[str]:
         """The keys of the settings whose last write or reset had not reached Redis."""
         return frozenset(
-            spec.key for spec in _STORED_BOT_SPECS if spec.attr in self._unpersisted
+            spec.key for spec in _STORED_BOT_SPECS if spec.env in self._unpersisted
         )
 
-    def _stored(
-        self, spec: SettingSpec
-    ) -> tuple[BotConfigFieldName, config.FloatKnob | config.IntKnob]:
+    def _stored(self, spec: SettingSpec) -> tuple[BotConfigFieldName, config.AnyKnob]:
         """A stored bot setting's hash field and the knob it overrides; every bot
-        spec but debug-default has both (registry invariant 10)."""
+        spec but debug-default has a knob (registry invariant 10)."""
         if (
             spec.scope is not SettingScope.BOT
-            or spec.field is None
-            or spec.attr is None
-            or not is_bot_config_field(spec.field)
+            or spec.knob is None
+            or not is_bot_config_field(spec.knob.field)
         ):
             raise ValueError(f"{spec.key} is not a stored bot setting")
-        return spec.field, spec.attr
+        return spec.knob.field, spec.knob
 
     async def _stored_change(
         self,
@@ -1712,13 +1684,13 @@ class BotSettings:
         """write()'s and write_reset()'s order: under the write lock, the store
         call, bounded, then the in-memory change, marked unsaved when the call was
         not confirmed. While stored settings are ignored, nothing."""
-        _, attr = self._stored(spec)
+        _, knob = self._stored(spec)
         if self.ignore_stored:
             return BotWriteResult(
-                applied=False, persisted=False, previous=config.override(attr)
+                applied=False, persisted=False, previous=knob.override()
             )
         async with self._write_lock:
-            previous = config.override(attr)
+            previous = knob.override()
             application_id = self._bot.application_id
             persisted = False
             if self._redis is not None and application_id is not None:
@@ -1729,9 +1701,9 @@ class BotSettings:
                 )
             change()
             if persisted:
-                self._unpersisted.discard(attr)
+                self._unpersisted.discard(knob.env)
             else:
-                self._unpersisted.add(attr)
+                self._unpersisted.add(knob.env)
             return BotWriteResult(applied=True, persisted=persisted, previous=previous)
 
     async def write(self, spec: SettingSpec, value: SettingValue) -> BotWriteResult:
@@ -1810,13 +1782,14 @@ class BotSettings:
             return
         applied: list[str] = []
         for spec in _STORED_BOT_SPECS:
-            if spec.field is None or spec.attr is None or spec.env is None:
+            if spec.knob is None:
                 continue
-            value: Optional[float] = getattr(stored, spec.field)
+            knob = spec.knob
+            value: Optional[float] = getattr(stored, knob.field)
             if (
                 value is None
-                or self._changed_at.get(spec.attr, 0) > started
-                or spec.attr in self._unpersisted
+                or self._changed_at.get(knob.env, 0) > started
+                or knob.env in self._unpersisted
             ):
                 continue
             if not in_bounds(spec, value):
@@ -1825,12 +1798,12 @@ class BotSettings:
                     f"{allowed_text(spec)}; ignored"
                 )
                 continue
-            _set_knob(spec.attr, value)
+            _set_knob(knob, value)
             shown = f"{spec.key}={format_value(spec, value)}"
             applied.append(shown)
-            if env_value := (os.environ.get(spec.env) or "").strip():
+            if env_value := (os.environ.get(knob.env) or "").strip():
                 log.warning(
-                    f"bot setting {shown} ({key}) overrides {spec.env}={env_value}; "
+                    f"bot setting {shown} ({key}) overrides {knob.env}={env_value}; "
                     f"undo with -settings bot {spec.key} reset, just bot-settings "
                     f"reset {application_id}, or BOT_SETTINGS_OVERRIDES=ignore"
                 )

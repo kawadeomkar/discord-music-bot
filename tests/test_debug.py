@@ -733,14 +733,8 @@ class TestTheSettingsLine:
         mock_ctx.guild.voice_client = None
         await cog.guild_settings.hydrate([42])
         await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
-        bot_specs = [s for s in SETTINGS if s.scope is SettingScope.BOT and s.attr]
-        for spec in bot_specs:
-            knob = spec.attr
-            assert knob is not None
-            if config.is_int_knob(knob):
-                config.set_override(knob, config.baseline(knob))
-            else:
-                config.set_override(knob, config.baseline(knob))
+        for knob in config.KNOBS.values():
+            cast(config.Knob[float], knob).set_override(knob.baseline)
         config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 7.25)
 
         mock_ctx.bot.is_owner = AsyncMock(return_value=True)
@@ -757,8 +751,8 @@ class TestTheSettingsLine:
         assert "leave-when-idle 10:00 (1 changed)" in shown
         assert "bot owner;" not in shown
         assert "7.25" not in shown
-        for spec in bot_specs:
-            assert spec.env is not None and spec.env not in shown
+        for knob in config.KNOBS.values():
+            assert knob.env not in shown
 
 
 class TestSafeBlock:
