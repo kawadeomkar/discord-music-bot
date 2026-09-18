@@ -473,6 +473,7 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 | `.claude/rules/state-and-recovery.md` | the Redis schema, the history backfill, crash recovery; the restore, archive and outbox primitives |
 | `.claude/rules/extraction.md` | the yt-dlp pool, client strategy and stream healing, Spotify; the extraction and playlist primitives |
 | `.claude/rules/config.md` | every environment variable, its default and its bounds; the settings primitives |
+| `.claude/rules/commands.md` | command registration, the one-module-per-command rule and the help copy each command carries |
 
 ### Observability
 
@@ -698,172 +699,10 @@ Every environment variable, its default and its bounds: `.claude/rules/config.md
 
 ## Recipes for common changes
 
-**Add a command**: method on `MusicBot` with `@commands.command(name=..., aliases=...,
-brief=..., usage=..., help=..., extras={"category": ..., "examples": [...], "note": ...})`;
-add `@commands.before_invoke(validate_commands)` if it needs the author in voice; open a
-span with `@_tracer.start_as_current_span("bot.<name>")`; every reply an embed; list it
-in help.py's `CATEGORY_COMMANDS`; tests in `tests/commands/test_<command>.py`.
+Each recipe lives in the rule file for the subsystem it changes, and loads with it:
 
-**The body belongs in the command's own module, not on the cog.** The cog keeps only
-what discord.py owns — registration, converters, checks, cooldowns — and one
-`try: await <module>.run(...) except Exception as e: await self._command_error(...)`.
-`run()` takes `ctx`, the flags, and whatever the cog RESOLVES for it (`redis`,
-`archive`, a `MusicPlayer` from `get_mp`), so the module never reaches back into
-`MusicBot` and has no import edge to musicbot.py — or the COG itself, under a
-`TYPE_CHECKING` guard, for the two things only it can do: reach the player registry,
-and run another command through discord.py. **`run()` must not swallow**: the
-`except` has to be the caller's, because `_command_error` logs with `exc_info=True`
-and that only captures the live traceback from inside the handler. **Every command is
-on this pattern**; musicbot.py holds no command logic at all. musicbot.py imports each
-module as `<command>_cmd` — the bare name would be the module inside the like-named
-cog method, which reads as the method and is not.
-
-**Add a persisted per-guild state field**: constant in `StateField` → field with default
-on `GuildStateData` + `from_redis` → the write-path method on `GuildRedisStore` (or
-`_now_playing_state_mapping` if it's per-song) → decide whether it belongs in
-`_TRANSIENT_SONG_FIELDS` / `clear_connection` → tests in test_guild_state.py and
-test_redis_client.py.
-
-**Add a per-guild SETTING** (a durable choice, not runtime state): constant in
-`ConfigField`, and its name in the `ConfigFieldName` Literal and, unless it has its own
-reset as `volume` does, `ResettableConfigField` → `Optional` field on `GuildConfig` (Optional is not optional — absent
-must keep meaning "follow the host default", or "never chose" collapses into "chose
-the default") → `to_redis` writes it only when set → `from_redis` reads an
-unrecognised value as unset → a numeric field also gets a `CONFIG_DOMAIN` entry in
-`guild_state.py`, which the `-settings` registry's static bounds must equal (a test
-compares them) and outside which `GuildConfig.__post_init__` reads a value as unset →
-the store writes it with `GuildRedisStore.update_config`, which PERSISTs and takes
-`writer=`; a field that needs a write-boundary check or a second copy (as `timezone`
-and `volume` do) gets a dedicated writer instead, added to the set `update_config`
-refuses, that PERSISTs, takes `writer=` and
-**encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
-single-field config serializes to exactly that field, so the wire format has one
-definition and a setter cannot drift from what `from_redis` expects), and that
-writer's row in `GuildSettings._dispatch` (src/settings.py), where every other field
-falls through to `update_config`. `_dispatch` is the ONLY caller of the store's config
-writers (`TestGuildConfigHasOneWriter` fails any other), and everything writes through
-`GuildSettings.write`/`reset`, never the store → **validate at the write boundary if
-the value is user-typed** (see `valid_timezone`: a bad value stored here fails
-silently — the write succeeds, the command reports success, and the guild keeps the
-default forever) → a hot path reads it synchronously from `GuildSettings`' cache,
-never by awaiting Redis on a send → a registry `SettingSpec` in the commit that wires
-the code reading it, whose `ConfigField` value is the key with `-` → `_`, plus `_secs`
-for a time value (registry invariants 2 and 10) → tests in test_guild_state.py,
-test_redis_client.py and test_settings.py. It goes in `guild:{id}:config`, NOT
-`guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
-any guild idle for a day.
-
-**Add a bot setting** (an owner-tunable, process-wide knob): parse its env baseline in
-`config.py` with `_float_env`/`_int_env` and a named floor → add the name to `FloatKnob` or
-`IntKnob` → add the accessor, `def <name in lowercase>() -> float` returning
-`_FLOAT_OVERRIDES.get("<NAME>", <NAME>)` (the accessor sweep in `test_config.py` fails a
-missing or miswired one) → every consumer calls `config.<name>()` when the value applies. Never
-call it at import, class-body or default-argument time, and never read `<NAME>` itself
-(`TestBotKnobsAreReadAtCallTime` G1/G2) → its stored field in `guild_state.py`: a
-`BotConfigField` constant whose value is `"<name in lowercase>"`, that name in the
-`BotConfigFieldName` Literal, an Optional field on `BotConfig`, and its rows in
-`BotConfig.to_redis` and `from_redis` (`_b_float`, or `_b_count` for a count) → a registry
-`SettingSpec` with `attr` and `env` both `"<NAME>"` and that `field` (invariant 10), and a
-chat range whose minimum is strictly above `config.env_floor("<NAME>")` for a time-valued knob, at
-least equal for a count (invariant 3) → a `-debug` allowlist row with
-`knob="<NAME>"` and no `fallback` → tests set it with `config.set_override`. A value built into
-a long-lived object (a semaphore, a session) applies only when that object is rebuilt, and the
-spec's `applies` string says so. No pool worker may read it (G4).
-
-**Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
-default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
-`to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
-parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
-instance assignment, and the `cls(...)` call in `yt_stream` in `src/youtube.py`** —
-miss these three and the field is
-silently dropped the moment the queue object becomes a playing song, which is where every
-read of it happens → then **BOTH places a playing song is turned back into a
-QueueObject**: `MusicPlayer._queue_object_of` (the rebuild `_neutralize_prefetch` and
-the volume rebuild in `loop()` share) and `MusicPlayer.interject()`'s resume tail.
-`YTDL.volume` is the one keyword that is never carried: it is the level baked into that
-source, and a requeued song is rebuilt at the level current then. **Not gated on "playback-relevant"** —
-`user_input` and `persisted` are neither, and both were lost through exactly that gap.
-They fail differently: a `YTDL` missing the attribute outright *raises* there and strands
-the prefetch's claim (which is what `persisted` did to every `--now`/`--next` over a
-completed prefetch), while one that merely defaults reappears wrong. Both rebuild sites
-are invisible to pyright unless `_prefetch_task` stays parameterized as
-`asyncio.Task[Optional[YTDL]]`, and invisible to the tests while their song fixtures are
-bare `MagicMock()` — drive the rebuild off a real `YTDL` (the `ytdl_instance` fixture
-takes carried fields as kwargs) so a missing attribute raises in the suite rather than in
-a guild. If it is a DURABLE property of the play rather than of the queue slot, it also
-needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
-`_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song` / `from_crashed_state`**, or a
-crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
-back `None` on the one song that was playing).
-
-**Add a schema migration**: **while no deployment holds the schema, don't** — edit
-`migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,
-so an ALTER sequence would describe upgrades that never happened), then drop and re-create
-the scratch **database** — not just the tables, since the `schema_migrations` row survives
-them and the re-run applies nothing. The trigger for freezing `0001` is a deployed
-database, not a tagged release. Once one exists, editing a migration fails silently and in
-the worst direction: `migrate()` skips a version already in the ledger without reading the
-file, so the change reaches fresh databases only, the deployed one keeps the old shape and
-still passes the version check, and every insert then raises `UndefinedColumnError` —
-which is not in `_POISON`, so the drainer treats it as transient and redelivers onto the
-non-evictable outbox forever. From that point on: new
-`migrations/NNNN_short_name.sql` (numeric prefix, next
-free number — `discover()` rejects duplicates and orders numerically, so `0010` follows
-`0009`) → bump `EXPECTED_SCHEMA_VERSION` in `src/db_migrate.py` (a test asserts the two
-agree) → `just db-migrate` locally → `just test-pg`. Each migration runs in its own
-transaction under `pg_advisory_xact_lock`, so it must be idempotent-safe on retry
-(`IF NOT EXISTS`). `CREATE INDEX CONCURRENTLY` cannot be used — it is illegal inside a
-transaction. After adding one, `DOCKER=1` recipes need no rebuild (`migrations/` is
-bind-mounted) but the runtime image does.
-
-**Add a history-entry field**: `HistoryEntry` in guild_state.py (with a default) →
-**add it to exactly one domain tuple in guild_state.py — `_TEXT_FIELDS`, `_INT4_FIELDS`
-(`integer` columns), `_INT8_FIELDS` (`bigint`), `_EPOCH_FIELDS` (`timestamptz`) or
-`_SLUG_FIELDS` (a machine-minted token, clamped to `^[a-z0-9.-]{0,64}$`) — or
-`__post_init__` silently does not clamp it and the schema lock has a hole** (a test asserts every field is covered, so
-forgetting fails the suite rather than shipping) → check where the added bytes land
-against the outbox's allocator-bin cliff (`docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived`:
-18 bytes once cost 11% of the OOM runway and the next 32 cost another 14%, and the
-curve is NOT monotonic — an unstamped entry measured worse than a larger stamped
-one, so measure every shape a field takes and never just the populated one) → `to_redis`/`parse_history_entry`
-(`.get(..., default)`, so pre-migration wire entries still parse) → the column in
-`migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
-table definition pre-release (free to validate on an empty table); a separate `NOT VALID`
-`ADD CONSTRAINT` once the table holds real rows, so the migration neither scans it nor
-takes ACCESS EXCLUSIVE → `_INSERT_SQL`/`_RECENT_SQL`/`_entry_to_row`/`_row_to_entry` in
-history_archive.py.
-
-**Touch the history outbox**: it is a Redis **stream** with the `drainers` consumer
-group, and four rules are load-bearing rather than stylistic. (1) Settle by ID —
-`retire_outbox`'s transactional `XACK`-then-`XDEL`, in that order; the reverse leaves a
-tombstone, which is unrecoverable. (2) Never `XTRIM MAXLEN`: it means "keep the newest
-n", so a re-send after concurrent `XADD`s destroys a second tranche. `MINID` names an
-absolute ID and is inert on re-send. (3) Always pass `approximate=False` — redis-py's
-default trims nothing on a small real stream while fakeredis models it as exact, so a
-green unit test proves nothing here. (4) `XTRIM` is blind to the PEL, so anything that
-destroys entries must `XACK` them first or they replay forever. Read the outbox section
-of `redis_client.py` and `HistoryOutboxDrainer._enforce_cap` before changing any of it,
-and run `just test-redis` — the unit tier cannot see three of these.
-
-**Bump yt-dlp**: it is exact-pinned; if `bgutil-ytdlp-pot-provider` moves too, bump the
-compose image tag in the same commit. The pin is currently a **nightly** (`.dev0`,
-`allow-prereleases = true`) because the newest stable, 2026.7.4, 403s on the media fetch
-for nearly every video under YouTube's current GVS enforcement — extraction succeeds, so
-the client ladder never degrades and the song dies at ffmpeg with the stream refused.
-**Check for a stable newer than 2026.7.4 before assuming a nightly
-is still required**, and move back to one when it ships — `security.yml`'s weekly
-`ytdlp-stable-watch` job warns when PyPI has one, since nothing else notices a nightly
-quietly becoming permanent. **Rolling the image back reinstates the broken stable**: the
-change is data-safe (nothing new is persisted; both caches are TTL'd and self-heal within
-the hour) but rolling back restores the outage this pin exists to fix, so never do it to
-chase an unrelated symptom. After any dependency change, `just
-test-image-rebuild` before `DOCKER=1` recipes. Watch `_record_serving_format` warnings
-and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
-YouTube-side changes.
-
-**Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
-the loop() bookkeeping comments first; every claim, release, and Redis
-LPOP is accounted for exactly once on every path (success, cleared, resolve-failure,
-stream-failure, cancellation). test_musicplayer.py (13.6k lines) and test_guild_queue.py
-encode these paths — run `just test tests/test_musicplayer.py tests/test_guild_queue.py`
-early and often.
+- `.claude/rules/config.md` — Add a per-guild SETTING, Add a bot setting
+- `.claude/rules/extraction.md` — Bump yt-dlp
+- `.claude/rules/commands.md` — Add a command
+- `.claude/rules/playback.md` — Add a queue-entry field, Touch the playback loop / queue
+- `.claude/rules/state-and-recovery.md` — Add a persisted per-guild state field, Add a schema migration, Add a history-entry field, Touch the history outbox

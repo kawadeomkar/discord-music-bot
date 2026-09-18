@@ -112,3 +112,21 @@ when `_last_author` is whoever typed most recently.
 | `_INFLIGHT_PLAYLISTS` / `_PLAYLIST_SUBSCRIBERS` (src/spotify.py, process-wide) | one walk per playlist, awaited through `asyncio.shield` by every caller, each of whose cards receives the walk's page reports; the job writes the cache itself, so a cancelled caller costs nothing |
 | `_PROGRESS_SUBSCRIBERS` (src/youtube.py, process-wide) | the cards watching a YouTube playlist extraction. Mutated on the event loop, READ on the yt-dlp pool's progress drain thread (`_publish_progress` copies the list before iterating), so a report can never touch the loop |
 | `Spotify._auth_lock` | token refresh double-fire |
+
+## Recipes
+
+**Bump yt-dlp**: it is exact-pinned; if `bgutil-ytdlp-pot-provider` moves too, bump the
+compose image tag in the same commit. The pin is currently a **nightly** (`.dev0`,
+`allow-prereleases = true`) because the newest stable, 2026.7.4, 403s on the media fetch
+for nearly every video under YouTube's current GVS enforcement — extraction succeeds, so
+the client ladder never degrades and the song dies at ffmpeg with the stream refused.
+**Check for a stable newer than 2026.7.4 before assuming a nightly
+is still required**, and move back to one when it ships — `security.yml`'s weekly
+`ytdlp-stable-watch` job warns when PyPI has one, since nothing else notices a nightly
+quietly becoming permanent. **Rolling the image back reinstates the broken stable**: the
+change is data-safe (nothing new is persisted; both caches are TTL'd and self-heal within
+the hour) but rolling back restores the outage this pin exists to fix, so never do it to
+chase an unrelated symptom. After any dependency change, `just
+test-image-rebuild` before `DOCKER=1` recipes. Watch `_record_serving_format` warnings
+and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
+YouTube-side changes.

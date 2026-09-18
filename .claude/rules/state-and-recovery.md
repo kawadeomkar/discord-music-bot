@@ -203,3 +203,60 @@ does not know about. Drop the legacy write, `_legacy_wall_clock_position_at`,
 | `history:outbox` consumer group (Redis) | replaced the `history:drainer` lease. Not mutual exclusion — `XREADGROUP >` gives two drainers **disjoint** entries and `XACK` settles by ID, so a second drainer duplicates work instead of destroying plays it never inserted |
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
+
+## Recipes
+
+**Add a persisted per-guild state field**: constant in `StateField` → field with default
+on `GuildStateData` + `from_redis` → the write-path method on `GuildRedisStore` (or
+`_now_playing_state_mapping` if it's per-song) → decide whether it belongs in
+`_TRANSIENT_SONG_FIELDS` / `clear_connection` → tests in test_guild_state.py and
+test_redis_client.py.
+
+**Add a schema migration**: **while no deployment holds the schema, don't** — edit
+`migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,
+so an ALTER sequence would describe upgrades that never happened), then drop and re-create
+the scratch **database** — not just the tables, since the `schema_migrations` row survives
+them and the re-run applies nothing. The trigger for freezing `0001` is a deployed
+database, not a tagged release. Once one exists, editing a migration fails silently and in
+the worst direction: `migrate()` skips a version already in the ledger without reading the
+file, so the change reaches fresh databases only, the deployed one keeps the old shape and
+still passes the version check, and every insert then raises `UndefinedColumnError` —
+which is not in `_POISON`, so the drainer treats it as transient and redelivers onto the
+non-evictable outbox forever. From that point on: new
+`migrations/NNNN_short_name.sql` (numeric prefix, next
+free number — `discover()` rejects duplicates and orders numerically, so `0010` follows
+`0009`) → bump `EXPECTED_SCHEMA_VERSION` in `src/db_migrate.py` (a test asserts the two
+agree) → `just db-migrate` locally → `just test-pg`. Each migration runs in its own
+transaction under `pg_advisory_xact_lock`, so it must be idempotent-safe on retry
+(`IF NOT EXISTS`). `CREATE INDEX CONCURRENTLY` cannot be used — it is illegal inside a
+transaction. After adding one, `DOCKER=1` recipes need no rebuild (`migrations/` is
+bind-mounted) but the runtime image does.
+
+**Add a history-entry field**: `HistoryEntry` in guild_state.py (with a default) →
+**add it to exactly one domain tuple in guild_state.py — `_TEXT_FIELDS`, `_INT4_FIELDS`
+(`integer` columns), `_INT8_FIELDS` (`bigint`), `_EPOCH_FIELDS` (`timestamptz`) or
+`_SLUG_FIELDS` (a machine-minted token, clamped to `^[a-z0-9.-]{0,64}$`) — or
+`__post_init__` silently does not clamp it and the schema lock has a hole** (a test asserts every field is covered, so
+forgetting fails the suite rather than shipping) → check where the added bytes land
+against the outbox's allocator-bin cliff (`docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived`:
+18 bytes once cost 11% of the OOM runway and the next 32 cost another 14%, and the
+curve is NOT monotonic — an unstamped entry measured worse than a larger stamped
+one, so measure every shape a field takes and never just the populated one) → `to_redis`/`parse_history_entry`
+(`.get(..., default)`, so pre-migration wire entries still parse) → the column in
+`migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
+table definition pre-release (free to validate on an empty table); a separate `NOT VALID`
+`ADD CONSTRAINT` once the table holds real rows, so the migration neither scans it nor
+takes ACCESS EXCLUSIVE → `_INSERT_SQL`/`_RECENT_SQL`/`_entry_to_row`/`_row_to_entry` in
+history_archive.py.
+
+**Touch the history outbox**: it is a Redis **stream** with the `drainers` consumer
+group, and four rules are load-bearing rather than stylistic. (1) Settle by ID —
+`retire_outbox`'s transactional `XACK`-then-`XDEL`, in that order; the reverse leaves a
+tombstone, which is unrecoverable. (2) Never `XTRIM MAXLEN`: it means "keep the newest
+n", so a re-send after concurrent `XADD`s destroys a second tranche. `MINID` names an
+absolute ID and is inert on re-send. (3) Always pass `approximate=False` — redis-py's
+default trims nothing on a small real stream while fakeredis models it as exact, so a
+green unit test proves nothing here. (4) `XTRIM` is blind to the PEL, so anything that
+destroys entries must `XACK` them first or they replay forever. Read the outbox section
+of `redis_client.py` and `HistoryOutboxDrainer._enforce_cap` before changing any of it,
+and run `just test-redis` — the unit tier cannot see three of these.

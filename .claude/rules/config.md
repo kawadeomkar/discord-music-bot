@@ -79,3 +79,51 @@ can only move it back inside.
 |---|---|
 | `GuildSettings` per-guild write lock (src/settings.py) | `guild:{id}:config`: it is the ONLY writer (`-settings`, `-volume`, `-debug --enable/--disable`, restore's volume migration, guild removal), each write a bounded store call then a synchronous commit that stamps (guild, field) from one sequence counter. A read (restore's `seed`, the startup `hydrate`, `load`) never locks: it skips any field stamped after it began, so a read straddling a write never undoes it. The locks are refcounted and dropped when idle, and `reading()` registrations bound how long stamps and forget marks live. `DebugSettings` is its projection of `debug_mode`. `docs/ARCHITECTURE.md#settings-resolution` |
 | `config`'s override maps (`_FLOAT_OVERRIDES`, `_INT_OVERRIDES`) | each bot knob's `-settings bot` override. One writer, `BotSettings` in src/settings.py (guard G3); read synchronously through the knob's accessor, `config.<knob in lower case>()`, when the value applies — never the UPPER_CASE baseline, never at import (G1, G2), and never in a pool worker (G4). A reload of `config` drops them. `docs/ARCHITECTURE.md#settings-resolution` |
+
+## Recipes
+
+**Add a per-guild SETTING** (a durable choice, not runtime state): constant in
+`ConfigField`, and its name in the `ConfigFieldName` Literal and, unless it has its own
+reset as `volume` does, `ResettableConfigField` → `Optional` field on `GuildConfig` (Optional is not optional — absent
+must keep meaning "follow the host default", or "never chose" collapses into "chose
+the default") → `to_redis` writes it only when set → `from_redis` reads an
+unrecognised value as unset → a numeric field also gets a `CONFIG_DOMAIN` entry in
+`guild_state.py`, which the `-settings` registry's static bounds must equal (a test
+compares them) and outside which `GuildConfig.__post_init__` reads a value as unset →
+the store writes it with `GuildRedisStore.update_config`, which PERSISTs and takes
+`writer=`; a field that needs a write-boundary check or a second copy (as `timezone`
+and `volume` do) gets a dedicated writer instead, added to the set `update_config`
+refuses, that PERSISTs, takes `writer=` and
+**encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
+single-field config serializes to exactly that field, so the wire format has one
+definition and a setter cannot drift from what `from_redis` expects), and that
+writer's row in `GuildSettings._dispatch` (src/settings.py), where every other field
+falls through to `update_config`. `_dispatch` is the ONLY caller of the store's config
+writers (`TestGuildConfigHasOneWriter` fails any other), and everything writes through
+`GuildSettings.write`/`reset`, never the store → **validate at the write boundary if
+the value is user-typed** (see `valid_timezone`: a bad value stored here fails
+silently — the write succeeds, the command reports success, and the guild keeps the
+default forever) → a hot path reads it synchronously from `GuildSettings`' cache,
+never by awaiting Redis on a send → a registry `SettingSpec` in the commit that wires
+the code reading it, whose `ConfigField` value is the key with `-` → `_`, plus `_secs`
+for a time value (registry invariants 2 and 10) → tests in test_guild_state.py,
+test_redis_client.py and test_settings.py. It goes in `guild:{id}:config`, NOT
+`guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
+any guild idle for a day.
+
+**Add a bot setting** (an owner-tunable, process-wide knob): parse its env baseline in
+`config.py` with `_float_env`/`_int_env` and a named floor → add the name to `FloatKnob` or
+`IntKnob` → add the accessor, `def <name in lowercase>() -> float` returning
+`_FLOAT_OVERRIDES.get("<NAME>", <NAME>)` (the accessor sweep in `test_config.py` fails a
+missing or miswired one) → every consumer calls `config.<name>()` when the value applies. Never
+call it at import, class-body or default-argument time, and never read `<NAME>` itself
+(`TestBotKnobsAreReadAtCallTime` G1/G2) → its stored field in `guild_state.py`: a
+`BotConfigField` constant whose value is `"<name in lowercase>"`, that name in the
+`BotConfigFieldName` Literal, an Optional field on `BotConfig`, and its rows in
+`BotConfig.to_redis` and `from_redis` (`_b_float`, or `_b_count` for a count) → a registry
+`SettingSpec` with `attr` and `env` both `"<NAME>"` and that `field` (invariant 10), and a
+chat range whose minimum is strictly above `config.env_floor("<NAME>")` for a time-valued knob, at
+least equal for a count (invariant 3) → a `-debug` allowlist row with
+`knob="<NAME>"` and no `fallback` → tests set it with `config.set_override`. A value built into
+a long-lived object (a semaphore, a session) applies only when that object is rebuilt, and the
+spec's `applies` string says so. No pool worker may read it (G4).

@@ -418,3 +418,38 @@ comes first, the next enqueue or the next song start, is the repair, and only a 
 that landed clears the flag. The two bounds stack: the placement lock's insert parks on
 the queue mutex the loop holds for up to `_START_WRITE_TIMEOUT`, so a stalled start write
 can spend the whole placement budget before the insert begins.
+
+## Recipes
+
+**Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
+default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
+`to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
+parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
+instance assignment, and the `cls(...)` call in `yt_stream` in `src/youtube.py`** —
+miss these three and the field is
+silently dropped the moment the queue object becomes a playing song, which is where every
+read of it happens → then **BOTH places a playing song is turned back into a
+QueueObject**: `MusicPlayer._queue_object_of` (the rebuild `_neutralize_prefetch` and
+the volume rebuild in `loop()` share) and `MusicPlayer.interject()`'s resume tail.
+`YTDL.volume` is the one keyword that is never carried: it is the level baked into that
+source, and a requeued song is rebuilt at the level current then. **Not gated on "playback-relevant"** —
+`user_input` and `persisted` are neither, and both were lost through exactly that gap.
+They fail differently: a `YTDL` missing the attribute outright *raises* there and strands
+the prefetch's claim (which is what `persisted` did to every `--now`/`--next` over a
+completed prefetch), while one that merely defaults reappears wrong. Both rebuild sites
+are invisible to pyright unless `_prefetch_task` stays parameterized as
+`asyncio.Task[Optional[YTDL]]`, and invisible to the tests while their song fixtures are
+bare `MagicMock()` — drive the rebuild off a real `YTDL` (the `ytdl_instance` fixture
+takes carried fields as kwargs) so a missing attribute raises in the suite rather than in
+a guild. If it is a DURABLE property of the play rather than of the queue slot, it also
+needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
+`_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song` / `from_crashed_state`**, or a
+crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
+back `None` on the one song that was playing).
+
+**Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
+the loop() bookkeeping comments first; every claim, release, and Redis
+LPOP is accounted for exactly once on every path (success, cleared, resolve-failure,
+stream-failure, cancellation). test_musicplayer.py (13.6k lines) and test_guild_queue.py
+encode these paths — run `just test tests/test_musicplayer.py tests/test_guild_queue.py`
+early and often.
