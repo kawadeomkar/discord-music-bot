@@ -454,8 +454,8 @@ def owner_lookup_backing_off() -> bool:
 
 async def is_operator(ctx: commands.Context) -> bool:
     """Is the caller the bot's operator (discord.py's is_owner)? Fails CLOSED and
-    never raises. is_owner() looks the owner up with application_info() unless a
-    lookup already succeeded, and RAISES when that fails;
+    never raises. is_owner() looks the owner up with application_info() unless
+    OWNER_IDS is set or a lookup already succeeded, and RAISES when that fails;
     a failure answers False for OWNER_LOOKUP_RETRY_SECS without asking again."""
     global _owner_lookup_retry_at
     if owner_lookup_backing_off():

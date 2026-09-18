@@ -153,6 +153,8 @@ class MusicBotApp(commands.AutoShardedBot):
             description="Plays YouTube, Spotify and SoundCloud audio in voice channels.",
             strip_after_prefix=True,
             help_command=MusicHelpCommand(),
+            # Empty is unset to discord.py, which then looks the owner up.
+            owner_ids=config.owner_ids(),
         )
         self._redis_pool = None
         self.redis = None

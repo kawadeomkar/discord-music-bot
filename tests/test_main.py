@@ -73,6 +73,33 @@ class TestAppInitDefaults:
         assert MusicBotApp()._teardown_started is False
 
 
+class TestOwnerIds:
+    """OWNER_IDS is the operator list when set: discord.py answers is_owner from it
+    and never calls application_info()."""
+
+    def test_the_parsed_ids_reach_discord_py(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OWNER_IDS", "123456789012345678, 234567890123456789")
+        assert MusicBotApp().owner_ids == {123456789012345678, 234567890123456789}
+
+    def test_unset_leaves_the_lookup_to_discord_py(self) -> None:
+        app = MusicBotApp()
+        assert not app.owner_ids
+        assert app.owner_id is None
+
+    async def test_a_listed_operator_is_answered_without_a_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OWNER_IDS", "123456789012345678")
+        app = MusicBotApp()
+        lookup = AsyncMock(side_effect=AssertionError("application_info() called"))
+        monkeypatch.setattr(app, "application_info", lookup)
+        assert await app.is_owner(MagicMock(id=123456789012345678)) is True
+        assert await app.is_owner(MagicMock(id=234567890123456789)) is False
+        lookup.assert_not_awaited()
+
+
 class TestSetupHook:
     @pytest.fixture(autouse=True)
     def postgres_configured(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:

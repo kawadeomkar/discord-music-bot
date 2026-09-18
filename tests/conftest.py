@@ -303,9 +303,13 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     the one hundreds of embed assertions encode: with it on, every embed the bot
     sends grows a debug footer — command responses, the Now Playing block at every
     render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
+
+    OWNER_IDS is scrubbed so a shell exporting one cannot make MusicBotApp skip
+    the owner lookup its tests expect.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.delenv("OWNER_IDS", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 

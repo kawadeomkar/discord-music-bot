@@ -497,6 +497,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DISCORD_TOKEN` | ✅ | — | Discord bot token |
+| `OWNER_IDS` | | — | Discord user ids (comma- or space-separated) of the bot's operator: who sees the host details `-debug` keeps owner-only. Unset, it is the application's owner, or every member of its team with the Admin or Developer role, looked up once and kept until restart; set, it is exactly this list. A malformed id refuses startup |
 | `SPOTIFY_CLIENT_ID` | | — | Spotify app client ID (Client Credentials flow). Enables Spotify links; omit both Spotify vars to run without Spotify support |
 | `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |

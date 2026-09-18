@@ -1817,8 +1817,7 @@ and answers to `-status`, `-health` and `-l`, so an ungated advisory would confi
 every member of every guild — permanently, in Discord's retained history — that this
 host runs the public default. The value is a public constant in a GPL repo; the leak
 is the confirmation, not the string. The `is_owner()` await must also be reached only
-when the advisory exists: `MusicBotApp` sets neither `owner_id` nor `owner_ids`, so
-discord.py falls through to `application_info()`, a REST GET that retries ~25 s on a
+when the advisory exists: unless `OWNER_IDS` is set, discord.py falls through to `application_info()`, a REST GET that retries ~25 s on a
 5xx and then raises — ahead of the skeleton send the command promises is immediate.
 
 The default lives in six places with nothing linking them: `src/config.py`,
