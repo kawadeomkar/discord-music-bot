@@ -16,7 +16,7 @@ from redis.asyncio import Redis
 
 from src import config
 from src import settings_card as card
-from src.guild_state import DEFAULT_VOLUME, BotConfig, GuildConfig
+from src.guild_state import DEFAULT_VOLUME, GuildConfig
 from src.musicbot import MusicBot
 from src.redis_client import BotConfigStore, GuildRedisStore
 from src.settings import BotSettings, GuildSettings, WriteResult
@@ -61,7 +61,7 @@ async def bot_settings(cog: MusicBot, fake_redis_bot: Redis) -> BotSettings:
     return bot.bot_settings
 
 
-async def _stored_bot(redis: Redis) -> Any:
+async def _stored_bot(redis: Redis) -> dict[str, float] | None:
     return await BotConfigStore(redis, APP_ID).read_config()
 
 
@@ -245,7 +245,7 @@ class TestDirectMessages:
         )
         assert config.heartbeat_interval_secs() == 5.0
         stored = await _stored_bot(fake_redis_bot)
-        assert stored is not None and stored.heartbeat_interval_secs == 5.0
+        assert stored is not None and stored["heartbeat_interval_secs"] == 5.0
 
     async def test_a_bot_detail_is_shown(self, cog: MusicBot, dm: MagicMock) -> None:
         await _invoke(cog, _as_operator(dm), "bot heartbeat")
@@ -350,7 +350,7 @@ class TestScopes:
         )
         assert config.override("HEARTBEAT_INTERVAL_SECS") is None
         stored = await _stored_bot(fake_redis_bot)
-        assert stored is not None and stored.heartbeat_interval_secs is None
+        assert stored is not None and "heartbeat_interval_secs" not in stored
 
     async def test_a_count_is_written_as_a_whole_number(
         self,
@@ -362,7 +362,7 @@ class TestScopes:
         await _invoke(cog, _as_operator(settings_ctx), "bot play-inflight-max 8")
         assert config.play_inflight_max() == 8
         stored = await _stored_bot(fake_redis_bot)
-        assert stored is not None and stored.play_inflight_max == 8
+        assert stored is not None and stored["play_inflight_max"] == 8
 
     async def test_an_unsaved_bot_write_applies_and_says_so(
         self, cog: MusicBot, settings_ctx: MagicMock, bot_settings: BotSettings
@@ -407,7 +407,7 @@ class TestScopes:
         """A stored 5s no read has applied: the detail must say its 3s may not be
         the value, and a write must not name 3s as what it replaced."""
         await BotConfigStore(fake_redis_bot, APP_ID).update_config(
-            BotConfig(heartbeat_interval_secs=5.0)
+            {"heartbeat_interval_secs": 5.0}
         )
         bot_settings.hydrated = False
         ctx = _as_operator(settings_ctx)

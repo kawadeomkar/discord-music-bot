@@ -14,7 +14,7 @@ import logging
 import math
 import re
 from zoneinfo import ZoneInfo, available_timezones
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from types import MappingProxyType
@@ -180,6 +180,21 @@ def _b_count(raw: dict[bytes, bytes], key: str) -> int | None:
         return None
 
 
+def parse_number_fields(
+    raw: dict[bytes, bytes], *, floats: Iterable[str], counts: Iterable[str]
+) -> dict[str, float]:
+    """The named fields of a raw HGETALL that hold a usable number. An absent,
+    unparseable or non-finite field is left out, and so is a count that is not an
+    exact int: bot:{application_id}:config outlives builds, and one bad field must
+    not cost the rest."""
+    numbers: dict[str, float] = {}
+    for parse, fields in ((_b_float, floats), (_b_count, counts)):
+        for field in fields:
+            if (value := parse(raw, field)) is not None:
+                numbers[field] = value
+    return numbers
+
+
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
 
 
@@ -232,55 +247,6 @@ def is_config_field(name: str) -> TypeIs[ConfigFieldName]:
 # Not a setting: the application id of the bot that last wrote a setting to the
 # hash, stamped by the store's writers when given one. GuildConfig never reads it.
 CONFIG_WRITER_FIELD: Final = "writer_app_id"
-
-
-type BotConfigFieldName = Literal[
-    "now_playing_update_interval_secs",
-    "heartbeat_interval_secs",
-    "play_slow_notice_secs",
-    "play_inflight_max",
-    "play_resolve_concurrency",
-    "play_resolve_wait_secs",
-    "stream_probe_timeout_secs",
-    "ping_tick_secs",
-    "ping_deadline_secs",
-    "debug_tick_secs",
-    "debug_deadline_secs",
-    "analytics_render_deadline_secs",
-    "queue_progress_delay_secs",
-    "queue_progress_tick_secs",
-    "queue_progress_max_secs",
-]
-
-
-ALL_BOT_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
-    get_args(BotConfigFieldName.__value__)
-)
-
-
-def is_bot_config_field(name: str) -> TypeIs[BotConfigFieldName]:
-    return name in ALL_BOT_CONFIG_FIELDS
-
-
-class BotConfigField:
-    """Wire field names for bot:{application_id}:config: each is its env var in
-    lower case, so an override, its config accessor and its variable share a name."""
-
-    NOW_PLAYING_UPDATE_INTERVAL: Final = "now_playing_update_interval_secs"
-    HEARTBEAT_INTERVAL: Final = "heartbeat_interval_secs"
-    PLAY_SLOW_NOTICE: Final = "play_slow_notice_secs"
-    PLAY_INFLIGHT_MAX: Final = "play_inflight_max"
-    PLAY_RESOLVE_CONCURRENCY: Final = "play_resolve_concurrency"
-    PLAY_RESOLVE_WAIT: Final = "play_resolve_wait_secs"
-    STREAM_PROBE_TIMEOUT: Final = "stream_probe_timeout_secs"
-    PING_TICK: Final = "ping_tick_secs"
-    PING_DEADLINE: Final = "ping_deadline_secs"
-    DEBUG_TICK: Final = "debug_tick_secs"
-    DEBUG_DEADLINE: Final = "debug_deadline_secs"
-    ANALYTICS_RENDER_DEADLINE: Final = "analytics_render_deadline_secs"
-    QUEUE_PROGRESS_DELAY: Final = "queue_progress_delay_secs"
-    QUEUE_PROGRESS_TICK: Final = "queue_progress_tick_secs"
-    QUEUE_PROGRESS_MAX: Final = "queue_progress_max_secs"
 
 
 # The zone every guild renders ETAs in until it picks one; the schema layer
@@ -448,90 +414,6 @@ class GuildConfig:
             np_refresh_secs=_b_float(raw, ConfigField.NP_REFRESH),
             slow_notice_secs=_b_float(raw, ConfigField.SLOW_NOTICE),
             queue_progress_delay_secs=_b_float(raw, ConfigField.QUEUE_PROGRESS_DELAY),
-        )
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class BotConfig:
-    """The operator's stored overrides in bot:{application_id}:config, one
-    Optional field per -settings bot knob; absent means "run on the environment
-    value". Only parsing happens here. The bounds are the -settings registry's
-    (settings.in_bounds), and some depend on other knobs, so they are checked
-    where a value is applied, not where it is read."""
-
-    now_playing_update_interval_secs: float | None = None
-    heartbeat_interval_secs: float | None = None
-    play_slow_notice_secs: float | None = None
-    play_inflight_max: int | None = None
-    play_resolve_concurrency: int | None = None
-    play_resolve_wait_secs: float | None = None
-    stream_probe_timeout_secs: float | None = None
-    ping_tick_secs: float | None = None
-    ping_deadline_secs: float | None = None
-    debug_tick_secs: float | None = None
-    debug_deadline_secs: float | None = None
-    analytics_render_deadline_secs: float | None = None
-    queue_progress_delay_secs: float | None = None
-    queue_progress_tick_secs: float | None = None
-    queue_progress_max_secs: float | None = None
-
-    def to_redis(self) -> dict[str, str]:
-        """Only fields with a value, as GuildConfig.to_redis."""
-        wire: tuple[tuple[BotConfigFieldName, float | None], ...] = (
-            (
-                BotConfigField.NOW_PLAYING_UPDATE_INTERVAL,
-                self.now_playing_update_interval_secs,
-            ),
-            (BotConfigField.HEARTBEAT_INTERVAL, self.heartbeat_interval_secs),
-            (BotConfigField.PLAY_SLOW_NOTICE, self.play_slow_notice_secs),
-            (BotConfigField.PLAY_INFLIGHT_MAX, self.play_inflight_max),
-            (BotConfigField.PLAY_RESOLVE_CONCURRENCY, self.play_resolve_concurrency),
-            (BotConfigField.PLAY_RESOLVE_WAIT, self.play_resolve_wait_secs),
-            (BotConfigField.STREAM_PROBE_TIMEOUT, self.stream_probe_timeout_secs),
-            (BotConfigField.PING_TICK, self.ping_tick_secs),
-            (BotConfigField.PING_DEADLINE, self.ping_deadline_secs),
-            (BotConfigField.DEBUG_TICK, self.debug_tick_secs),
-            (BotConfigField.DEBUG_DEADLINE, self.debug_deadline_secs),
-            (
-                BotConfigField.ANALYTICS_RENDER_DEADLINE,
-                self.analytics_render_deadline_secs,
-            ),
-            (BotConfigField.QUEUE_PROGRESS_DELAY, self.queue_progress_delay_secs),
-            (BotConfigField.QUEUE_PROGRESS_TICK, self.queue_progress_tick_secs),
-            (BotConfigField.QUEUE_PROGRESS_MAX, self.queue_progress_max_secs),
-        )
-        return {name: str(value) for name, value in wire if value is not None}
-
-    @classmethod
-    def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
-        """Deserialize raw HGETALL output; an empty dict yields all-unset, and an
-        unparseable or non-finite field reads as unset."""
-        return cls(
-            now_playing_update_interval_secs=_b_float(
-                raw, BotConfigField.NOW_PLAYING_UPDATE_INTERVAL
-            ),
-            heartbeat_interval_secs=_b_float(raw, BotConfigField.HEARTBEAT_INTERVAL),
-            play_slow_notice_secs=_b_float(raw, BotConfigField.PLAY_SLOW_NOTICE),
-            play_inflight_max=_b_count(raw, BotConfigField.PLAY_INFLIGHT_MAX),
-            play_resolve_concurrency=_b_count(
-                raw, BotConfigField.PLAY_RESOLVE_CONCURRENCY
-            ),
-            play_resolve_wait_secs=_b_float(raw, BotConfigField.PLAY_RESOLVE_WAIT),
-            stream_probe_timeout_secs=_b_float(
-                raw, BotConfigField.STREAM_PROBE_TIMEOUT
-            ),
-            ping_tick_secs=_b_float(raw, BotConfigField.PING_TICK),
-            ping_deadline_secs=_b_float(raw, BotConfigField.PING_DEADLINE),
-            debug_tick_secs=_b_float(raw, BotConfigField.DEBUG_TICK),
-            debug_deadline_secs=_b_float(raw, BotConfigField.DEBUG_DEADLINE),
-            analytics_render_deadline_secs=_b_float(
-                raw, BotConfigField.ANALYTICS_RENDER_DEADLINE
-            ),
-            queue_progress_delay_secs=_b_float(
-                raw, BotConfigField.QUEUE_PROGRESS_DELAY
-            ),
-            queue_progress_tick_secs=_b_float(raw, BotConfigField.QUEUE_PROGRESS_TICK),
-            queue_progress_max_secs=_b_float(raw, BotConfigField.QUEUE_PROGRESS_MAX),
         )
 
 

@@ -44,12 +44,9 @@ from src.guild_state import (
     DEFAULT_TIMEZONE,
     DEFAULT_VOLUME,
     OFF_SECS,
-    BotConfig,
-    BotConfigFieldName,
     ConfigField,
     ConfigFieldName,
     GuildConfig,
-    is_bot_config_field,
     is_config_field,
     valid_timezone,
 )
@@ -1627,7 +1624,7 @@ class BotSettings:
             return True
         if self.ignore_stored:
             return False
-        _, knob = self._stored(spec)
+        knob = self._stored(spec)
         _set_knob(knob, value)
         self._stamp(knob)
         return True
@@ -1644,7 +1641,7 @@ class BotSettings:
             return True
         if self.ignore_stored:
             return False
-        _, knob = self._stored(spec)
+        knob = self._stored(spec)
         knob.clear_override()
         self._stamp(knob)
         return True
@@ -1664,16 +1661,12 @@ class BotSettings:
             spec.key for spec in _STORED_BOT_SPECS if spec.env in self._unpersisted
         )
 
-    def _stored(self, spec: SettingSpec) -> tuple[BotConfigFieldName, config.AnyKnob]:
-        """A stored bot setting's hash field and the knob it overrides; every bot
-        spec but debug-default has a knob (registry invariant 10)."""
-        if (
-            spec.scope is not SettingScope.BOT
-            or spec.knob is None
-            or not is_bot_config_field(spec.knob.field)
-        ):
+    def _stored(self, spec: SettingSpec) -> config.AnyKnob:
+        """The knob a stored bot setting overrides; every bot spec but
+        debug-default has one (registry invariant 10)."""
+        if spec.scope is not SettingScope.BOT or spec.knob is None:
             raise ValueError(f"{spec.key} is not a stored bot setting")
-        return spec.knob.field, spec.knob
+        return spec.knob
 
     async def _stored_change(
         self,
@@ -1684,7 +1677,7 @@ class BotSettings:
         """write()'s and write_reset()'s order: under the write lock, the store
         call, bounded, then the in-memory change, marked unsaved when the call was
         not confirmed. While stored settings are ignored, nothing."""
-        _, knob = self._stored(spec)
+        knob = self._stored(spec)
         if self.ignore_stored:
             return BotWriteResult(
                 applied=False, persisted=False, previous=knob.override()
@@ -1711,13 +1704,12 @@ class BotSettings:
         call comes first, under CONFIG_IO_TIMEOUT_SECS; one that is not confirmed
         still applies, marked unsaved until a later write or reset lands. While
         stored settings are ignored it makes no store call and changes nothing."""
-        field, _ = self._stored(spec)
+        field = self._stored(spec).field
         if not in_bounds(spec, value) or isinstance(value, (bool, str)):
             raise ValueError(f"{spec.key}={value!r} is not a bot setting value")
-        stored = replace(BotConfig(), **{field: value})
         return await self._stored_change(
             spec,
-            lambda store: store.update_config(stored),
+            lambda store: store.update_config({field: value}),
             lambda: self.apply(spec, value),
         )
 
@@ -1725,7 +1717,7 @@ class BotSettings:
         """Delete the stored value, then return the knob to its environment
         value, in write()'s order. An unconfirmed delete still resets this process;
         the stored value can return at the next start."""
-        field, _ = self._stored(spec)
+        field = self._stored(spec).field
         return await self._stored_change(
             spec,
             lambda store: store.reset_config_fields(field),
@@ -1785,7 +1777,7 @@ class BotSettings:
             if spec.knob is None:
                 continue
             knob = spec.knob
-            value: Optional[float] = getattr(stored, knob.field)
+            value = stored.get(knob.field)
             if (
                 value is None
                 or self._changed_at.get(knob.env, 0) > started
