@@ -34,6 +34,7 @@ from src.guild_state import DEFAULT_VOLUME, ConfigField
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth
 from src.settings import (
+    SETTINGS,
     SettingSpec,
     card_name,
     format_value,
@@ -270,8 +271,9 @@ def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 3 · CONFIG ALLOWLIST
 # ════════════════════════════════════════════════════════════════════════════
-# An env var absent from _CONFIG_ALLOWLIST does not render at all, so a knob added
-# later opts in at review time and a future secret can never leak by default.
+# An env var absent from _CONFIG_ALLOWLIST does not render at all, so a variable
+# added later opts in at review time and a future secret can never leak by default.
+# A settable knob lists itself: it is a number, and -settings bot shows it already.
 
 
 class _ConfigKind(Enum):
@@ -291,7 +293,7 @@ class _ConfigVar:
     fallback_factory: Optional[Callable[[], str]] = None
     # A knob -settings bot can override: rendered from the value in force and its
     # source at render time, so the row carries no fallback.
-    knob: Optional[config.FloatKnob | config.IntKnob] = None
+    knob: Optional[config.AnyKnob] = None
 
 
 _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
@@ -320,72 +322,17 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         kind=_ConfigKind.VALUE,
         fallback=str(config.YTDLP_POOL_WORKERS),
     ),
-    _ConfigVar(
-        name="PLAY_INFLIGHT_MAX", kind=_ConfigKind.VALUE, knob="PLAY_INFLIGHT_MAX"
-    ),
-    _ConfigVar(
-        name="PLAY_RESOLVE_CONCURRENCY",
-        kind=_ConfigKind.VALUE,
-        knob="PLAY_RESOLVE_CONCURRENCY",
-    ),
-    _ConfigVar(
-        name="PLAY_RESOLVE_WAIT_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="PLAY_RESOLVE_WAIT_SECS",
-    ),
-    _ConfigVar(
-        name="PLAY_SLOW_NOTICE_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="PLAY_SLOW_NOTICE_SECS",
-    ),
-    _ConfigVar(
-        name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="NOW_PLAYING_UPDATE_INTERVAL_SECS",
-    ),
-    _ConfigVar(
-        name="HEARTBEAT_INTERVAL_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="HEARTBEAT_INTERVAL_SECS",
-    ),
-    _ConfigVar(
-        name="STREAM_PROBE_TIMEOUT_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="STREAM_PROBE_TIMEOUT_SECS",
-    ),
-    _ConfigVar(
-        name="ANALYTICS_RENDER_DEADLINE_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="ANALYTICS_RENDER_DEADLINE_SECS",
+    # Every settable knob, in the order the -settings bot card lists them.
+    *(
+        _ConfigVar(name=spec.knob.env, kind=_ConfigKind.VALUE, knob=spec.knob)
+        for spec in SETTINGS
+        if spec.knob is not None
     ),
     _ConfigVar(name="LIVENESS_FILE", kind=_ConfigKind.VALUE),
     _ConfigVar(
         name="LIVENESS_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
         fallback=str(config.LIVENESS_INTERVAL_SECS),
-    ),
-    _ConfigVar(name="PING_TICK_SECS", kind=_ConfigKind.VALUE, knob="PING_TICK_SECS"),
-    _ConfigVar(
-        name="PING_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="PING_DEADLINE_SECS"
-    ),
-    _ConfigVar(name="DEBUG_TICK_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_TICK_SECS"),
-    _ConfigVar(
-        name="DEBUG_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_DEADLINE_SECS"
-    ),
-    _ConfigVar(
-        name="QUEUE_PROGRESS_DELAY_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="QUEUE_PROGRESS_DELAY_SECS",
-    ),
-    _ConfigVar(
-        name="QUEUE_PROGRESS_TICK_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="QUEUE_PROGRESS_TICK_SECS",
-    ),
-    _ConfigVar(
-        name="QUEUE_PROGRESS_MAX_SECS",
-        kind=_ConfigKind.VALUE,
-        knob="QUEUE_PROGRESS_MAX_SECS",
     ),
     _ConfigVar(
         name="POT_PROVIDER_URL", kind=_ConfigKind.URL, fallback="http://127.0.0.1:4416"
@@ -470,12 +417,10 @@ def redact_url(raw: str, *, hide_host: bool = False) -> str:
         return "unparseable"
 
 
-def _render_knob(
-    knob: config.FloatKnob | config.IntKnob, *, unsaved: frozenset[str]
-) -> str:
+def _render_knob(knob: config.AnyKnob, *, unsaved: frozenset[str]) -> str:
     """`5s (bot owner; env 3s)`: the value and source label the -settings bot
     card shows, so the operator's two views of a knob agree."""
-    spec = knob_spec(config.KNOBS[knob.lower()])
+    spec = knob_spec(knob)
     shown = knob_shown(spec, persisted=spec.key not in unsaved)
     return f"{format_value(spec, shown.value)} ({shown.source})"
 

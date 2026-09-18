@@ -206,7 +206,7 @@ class TestRegistryInvariants:
             if spec.scope is SettingScope.BOT:
                 assert spec.env in rows, spec.key
                 if spec.knob is not None:
-                    assert rows[spec.env].knob == spec.knob.env, spec.key
+                    assert rows[spec.env].knob is spec.knob, spec.key
 
     def test_6_values_round_trip_at_their_bounds_and_default(self) -> None:
         # A write-time minimum follows the bot's value. At its lowest, the env

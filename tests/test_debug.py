@@ -304,10 +304,18 @@ class TestConfigAllowlist:
         assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
         assert "leaked" not in "\n".join(config_lines())
 
-    def test_every_settable_knob_is_a_knob_row(self) -> None:
-        knobs = {v.knob for v in _CONFIG_ALLOWLIST if v.knob is not None}
-        assert knobs == config.FLOAT_KNOBS | config.INT_KNOBS
-        assert all(v.knob == v.name for v in _CONFIG_ALLOWLIST if v.knob is not None)
+    def test_the_knob_rows_are_the_bot_card_in_its_order(self) -> None:
+        """One row per settable knob, where the operator's other view of them puts
+        each, and nothing between them."""
+        rows = [v for v in _CONFIG_ALLOWLIST if v.knob is not None]
+        assert [v.name for v in rows] == [
+            spec.knob.env for spec in SETTINGS if spec.knob is not None
+        ]
+        # By variable, never identity: a reload of config mints new handles.
+        assert {v.name for v in rows} == {k.env for k in config.KNOBS.values()}
+        assert all(v.knob is not None and v.name == v.knob.env for v in rows)
+        first = _CONFIG_ALLOWLIST.index(rows[0])
+        assert list(_CONFIG_ALLOWLIST[first : first + len(rows)]) == rows
 
     @pytest.mark.parametrize(
         ("override", "env", "rendered"),
