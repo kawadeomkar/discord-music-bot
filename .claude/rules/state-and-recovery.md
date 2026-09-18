@@ -260,3 +260,78 @@ green unit test proves nothing here. (4) `XTRIM` is blind to the PEL, so anythin
 destroys entries must `XACK` them first or they replay forever. Read the outbox section
 of `redis_client.py` and `HistoryOutboxDrainer._enforce_cap` before changing any of it,
 and run `just test-redis` — the unit tier cannot see three of these.
+
+## Golden rules 5 and 12, in full
+
+CLAUDE.md carries the rule; these are the enumerations behind them.
+
+### 5 — which Redis helpers raise, and which swallow
+
+5. **Redis IO never raises out of `GuildRedisStore` or `BotConfigStore`.** Their methods are
+   wrapped by `@_guild_op` and `@_bot_op` (log a warning prefixed `[guild:{id}]` or
+   `[bot:{application_id}]`, return the default). Everything must degrade gracefully
+   when Redis is down or `store is None` — the in-memory bot keeps working. Keep new
+   store methods on this pattern; never pass a **mutable** `default=` to either
+   decorator (use `default_factory`; `TestStoreOpDefaults` enforces this for both).
+   **The scope is the class, not the module.** The outbox-stream helpers in the same
+   file (`ensure_outbox_group`, `read_outbox_pending`, `read_outbox_new`,
+   `retire_outbox`, `ack_outbox`, `outbox_depth`, `outbox_pending_count`,
+   `outbox_pending_below`, `trim_outbox_below`, `reclaim_outbox_stale`)
+   deliberately DO raise: the drainer's backoff loop is their error handler, and a
+   swallowed error there would look like an empty outbox and silently stall the drain.
+   Do not "fix" them onto the `@_guild_op` pattern. The split is asserted, not assumed
+   (`TestOutboxDrainHelpers::test_helpers_raise_on_redis_error`).
+   `push_history`'s `XADD` leg is on the other side and must stay there — the playback
+   loop cannot die because Redis blinked. The consequence is that the producer can never
+   report a mis-shaped outbox, which is why a `WRONGTYPE` at `history:outbox` aborts
+   **startup** in `setup_hook` instead: that is the only place the signal can be loud.
+   (Enabled mode. With the archive disabled the XADD leg is gated off, `setup_hook`
+   never creates the group, and a mis-shaped key is inert — downgraded to a startup
+   warning by the leftover-outbox probe.)
+
+### 12 — the four non-evictable keys
+
+12. **Redis eviction policy is `volatile-lru` on purpose.** Four keys carry no TTL
+    and none may become an eviction candidate. `history:outbox` holds plays that
+    are not durable in Postgres yet (written only while the archive is enabled — when
+    it is off the key is never created, but the policy must still protect a leftover
+    from an earlier enabled run); evicting one loses that play with no error, no
+    `play_history_rejected` row and no log line. `guild:{id}:history` is PERSISTed
+    and capped at `HISTORY_CACHE_LIMIT` — it is the ONLY source `-history` reads, in
+    both archive modes, so evicting or expiring it answers a guild with silence.
+    `guild:{id}:config` holds a guild's DURABLE choices (debug mode, volume, timezone, idle and alone timeouts, progress-bar refresh, lookup notice, playlist card delay) — evicting it silently reverts a setting the guild chose, with no log
+    line and no error, which is exactly the failure the in-memory version had. It is
+    a fixed handful of fields per guild, written only by an explicit command and
+    deleted on guild removal — or, for a guild removed while the bot was offline, by
+    the startup orphan sweep, which the `writer_app_id` stamp keeps away from the
+    guilds only another bot sharing the Redis is in (a guild both serve shares this key,
+    as it shares every `guild:{id}:*` key) — so it scales with guild count and not with
+    runtime.
+    `bot:{application_id}:config` holds the operator's bot-wide overrides — evicting
+    it silently returns every overridden knob to its environment value at the next
+    start. One hash per application, bounded by the number of bot settings, and
+    written only by `-settings bot`.
+    Never switch the compose Redis to `allkeys-lru`, and never put a TTL on the
+    history or config keys: history is bounded by LENGTH, and config is bounded by
+    the number of settings that exist.
+
+## The two-tier boundary
+
+**discord-music-bot** (v2.39.0, GPL-3.0) is a self-hosted Discord music bot that streams
+audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
+channels. It is a **single-process Python asyncio application** built on discord.py
+(`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
+runtime state (queue, caching, playback position, crash recovery) and — **opt-in,
+default OFF** — **Postgres for durable play history**, fed asynchronously through a
+Redis outbox so the playback loop never awaits the database. The archive is a consent
+gate, not an infrastructure default: `HISTORY_ARCHIVE_ENABLED=true` turns the app side
+on, the `archive` compose profile deploys the database, and a default deployment
+collects nothing long-term (`docs/ARCHITECTURE.md#history-archive-tier`). Playback
+survives bot restarts: on startup the bot rejoins voice and resumes the interrupted
+song from the position it left off.
+
+The boundary is a rule, not a preference: durable records go to Postgres (when the
+operator opted in), runtime and cache state stays in Redis forever. Reads follow the
+same rule in BOTH modes — `-history` is served from the capped Redis list alone (50
+entries per guild, exactly the command's ceiling, written ahead of the archive), and
+Postgres backs the commands that need the permanent record (`-leaderboard`).

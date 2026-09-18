@@ -6,24 +6,16 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.39.0, GPL-3.0) is a self-hosted Discord music bot that streams
-audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
-channels. It is a **single-process Python asyncio application** built on discord.py
-(`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
-runtime state (queue, caching, playback position, crash recovery) and — **opt-in,
-default OFF** — **Postgres for durable play history**, fed asynchronously through a
-Redis outbox so the playback loop never awaits the database. The archive is a consent
-gate, not an infrastructure default: `HISTORY_ARCHIVE_ENABLED=true` turns the app side
-on, the `archive` compose profile deploys the database, and a default deployment
-collects nothing long-term (`docs/ARCHITECTURE.md#history-archive-tier`). Playback
-survives bot restarts: on startup the bot rejoins voice and resumes the interrupted
-song from the position it left off.
+**discord-music-bot** (GPL-3.0) is a self-hosted Discord music bot that streams audio
+from YouTube, Spotify, SoundCloud and any other yt-dlp-supported site into voice
+channels. **Single-process Python asyncio**, on discord.py (`AutoShardedBot`), yt-dlp and
+FFmpeg, over a **two-tier data layer**: Redis for all runtime state, and — **opt-in,
+default OFF** — Postgres for durable play history, fed through a Redis outbox so the
+playback loop never awaits the database. Playback survives restarts: the bot rejoins
+voice and resumes the interrupted song where it left off.
 
-The boundary is a rule, not a preference: durable records go to Postgres (when the
-operator opted in), runtime and cache state stays in Redis forever. Reads follow the
-same rule in BOTH modes — `-history` is served from the capped Redis list alone (50
-entries per guild, exactly the command's ceiling, written ahead of the archive), and
-Postgres backs the commands that need the permanent record (`-leaderboard`).
+The tier boundary is a rule, not a preference, and it governs reads in BOTH modes:
+`.claude/rules/state-and-recovery.md`.
 
 | | |
 |---|---|
@@ -77,27 +69,13 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
 4. **Every user-visible reply is an embed.** `MusicContext.send` prepends the Now Playing
    block to responses; a bare `content` string would render as loose text above the
    block. Use `notice_embed()` / `send_embed()` from `src/util.py`.
-5. **Redis IO never raises out of `GuildRedisStore` or `BotConfigStore`.** Their methods are
-   wrapped by `@_guild_op` and `@_bot_op` (log a warning prefixed `[guild:{id}]` or
-   `[bot:{application_id}]`, return the default). Everything must degrade gracefully
-   when Redis is down or `store is None` — the in-memory bot keeps working. Keep new
-   store methods on this pattern; never pass a **mutable** `default=` to either
-   decorator (use `default_factory`; `TestStoreOpDefaults` enforces this for both).
-   **The scope is the class, not the module.** The outbox-stream helpers in the same
-   file (`ensure_outbox_group`, `read_outbox_pending`, `read_outbox_new`,
-   `retire_outbox`, `ack_outbox`, `outbox_depth`, `outbox_pending_count`,
-   `outbox_pending_below`, `trim_outbox_below`, `reclaim_outbox_stale`)
-   deliberately DO raise: the drainer's backoff loop is their error handler, and a
-   swallowed error there would look like an empty outbox and silently stall the drain.
-   Do not "fix" them onto the `@_guild_op` pattern. The split is asserted, not assumed
-   (`TestOutboxDrainHelpers::test_helpers_raise_on_redis_error`).
-   `push_history`'s `XADD` leg is on the other side and must stay there — the playback
-   loop cannot die because Redis blinked. The consequence is that the producer can never
-   report a mis-shaped outbox, which is why a `WRONGTYPE` at `history:outbox` aborts
-   **startup** in `setup_hook` instead: that is the only place the signal can be loud.
-   (Enabled mode. With the archive disabled the XADD leg is gated off, `setup_hook`
-   never creates the group, and a mis-shaped key is inert — downgraded to a startup
-   warning by the leftover-outbox probe.)
+5. **Redis IO never raises out of `GuildRedisStore` or `BotConfigStore`.** Their methods
+   are wrapped by `@_guild_op` / `@_bot_op` (log a warning, return the default), so the
+   bot keeps working with Redis down or `store is None`. Never pass a **mutable**
+   `default=` — use `default_factory`. **The scope is the class, not the module**: the
+   outbox-stream helpers beside them deliberately DO raise, because the drainer's
+   backoff loop is their error handler. Which helpers, and why `push_history`'s XADD leg
+   sits on the swallowing side: `.claude/rules/state-and-recovery.md`.
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
    enforces eight duplicated name/version pairs — it is a dep of `check` AND its own CI
    step, deliberately: Dependabot opens SEPARATE PRs that each move one half, and those
@@ -123,30 +101,13 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
 11. **`pytest` filterwarnings is `error`.** Any new `DeprecationWarning` fails the suite.
     Add a targeted `ignore:` entry in `[tool.pytest.ini_options]` only with a comment
     explaining what upstream fix removes it (see the existing audioop entry).
-12. **Redis eviction policy is `volatile-lru` on purpose.** Four keys carry no TTL
-    and none may become an eviction candidate. `history:outbox` holds plays that
-    are not durable in Postgres yet (written only while the archive is enabled — when
-    it is off the key is never created, but the policy must still protect a leftover
-    from an earlier enabled run); evicting one loses that play with no error, no
-    `play_history_rejected` row and no log line. `guild:{id}:history` is PERSISTed
-    and capped at `HISTORY_CACHE_LIMIT` — it is the ONLY source `-history` reads, in
-    both archive modes, so evicting or expiring it answers a guild with silence.
-    `guild:{id}:config` holds a guild's DURABLE choices (debug mode, volume, timezone, idle and alone timeouts, progress-bar refresh, lookup notice, playlist card delay) — evicting it silently reverts a setting the guild chose, with no log
-    line and no error, which is exactly the failure the in-memory version had. It is
-    a fixed handful of fields per guild, written only by an explicit command and
-    deleted on guild removal — or, for a guild removed while the bot was offline, by
-    the startup orphan sweep, which the `writer_app_id` stamp keeps away from the
-    guilds only another bot sharing the Redis is in (a guild both serve shares this key,
-    as it shares every `guild:{id}:*` key) — so it scales with guild count and not with
-    runtime.
-    `bot:{application_id}:config` holds the operator's bot-wide overrides — evicting
-    it silently returns every overridden knob to its environment value at the next
-    start. One hash per application, bounded by the number of bot settings, and
-    written only by `-settings bot`.
-    Never switch the compose Redis to `allkeys-lru`, and never put a TTL on the
-    history or config keys: history is bounded by LENGTH, and config is bounded by
-    the number of settings that exist.
-
+12. **Redis eviction policy is `volatile-lru` on purpose.** Four keys carry no TTL and
+    none may become an eviction candidate: `history:outbox`, `guild:{id}:history`,
+    `guild:{id}:config` and `bot:{application_id}:config`. Evicting any of them loses
+    data or a stored choice silently — no error, no log line. Never switch to
+    `allkeys-lru`, and never put a TTL on the history or config keys: history is bounded
+    by LENGTH and config by the number of settings that exist. What each key holds and
+    how it stays bounded: `.claude/rules/state-and-recovery.md`.
 13. **The chat-command surface is not a SemVer API.** Adding, renaming or REMOVING a
     command is a minor bump, not a major one: the version is a deploy tag for a
     self-hosted bot, nothing links against these names, and CI validates only that the
@@ -181,41 +142,15 @@ just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     
 just container-test # build test image, run suite inside it (spec cache OFF) ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
-# Test selection (args forward to pytest). ANY argument means a subset run, so it runs
-# SERIALLY and coverage is skipped — fail_under is a PROJECT floor and one file measures
-# ~26%, which used to fail a green run with exit 1. The gate rides the no-args form —
-# what `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
-# reporting flags rather than a selection, keeps it with COVERAGE_GATE=1.
-#
-# The no-args form is also the ONLY parallel one (`-n auto`), and that is deliberate:
-# the gate is the only way the whole suite runs, so a test that is not parallel-safe
-# fails the pre-push hook and CI instead of rotting a separate "fast" recipe. A subset
-# stays serial because worker startup (~4s flat) cannot amortize over a narrow
-# selection, and because execnet does not forward worker stdout — `-s` is silently
-# swallowed under `-n` and `--pdb` disables it. `just test tests/` is the escape hatch:
-# the whole suite, serially, to reproduce a parallel-only failure.
+# Test selection (args forward to pytest). ANY argument means a subset run: serial,
+# no coverage gate. The no-args form is the only parallel one and the only gated one —
+# why, and the escape hatch for a parallel-only failure: .claude/rules/testing.md
 just test tests/test_youtube.py
 just test -k spotify
 just test --maxfail=1
 
-# Database (operator tools. db-migrate/db-backfill run the LOCAL venv against
-# POSTGRES_URL; setup/backup/restore are shell around pg_dump/psql, no venv needed)
-just setup                 # bootstrap .env with a generated POSTGRES_PASSWORD
-just db-migrate            # apply pending migrations — REQUIRED before the bot serves
-just db-backfill [--dry-run] # move pre-archive Redis history into Postgres — deadline: rules/state-and-recovery.md
-just db-backfill-docker    # same, via the compose one-shot — no local venv
-just db-rejects [n]        # list play_history rows Postgres refused (expected: nothing)
-just outbox [idle_ms]      # outbox health: depth, in-flight, stranded, TOMBSTONES (lost plays)
-just bot-settings [reset <application_id>] # list stored bot overrides, or delete one bot's
-just db-backup             # dump to backups/
-just db-restore FILE [DB]  # restore into a SCRATCH db (live needs CONFIRM=1 + a name)
-
-# Build & deploy
-just image                 # build runtime image :latest and :<git-sha> (no test gate)
-./build_docker.sh          # full pipeline: just check → just image → deploy
-just up [sha]              # deploy an already-built image (never builds; refuses unknown tags)
-just down / restart / logs / ps
-just test-image-rebuild    # required after changing pyproject.toml/poetry.lock
+# Operator and deploy recipes (db-migrate, backfill, outbox, bot-settings,
+# image, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
 ```
 
 `DOCKER=1 just check` (prefix must come BEFORE the recipe) runs any of
@@ -294,50 +229,12 @@ Discord gateway/voice                    YouTube / Spotify / SoundCloud CDNs
    Sidecars: bgutil-pot-provider (:4416, PO tokens), otel-lgtm (:4317 OTLP, :3014 Grafana)
 ```
 
-### Startup and shutdown
-
-`main()` order matters: `setup_telemetry()` first (configures structlog before any
-`get_logger()` resolves), then `DISCORD_TOKEN` check, then `MusicBotApp()` construction
-(inside `main()` only — see golden rule 10). `setup_hook` reads
-`HISTORY_ARCHIVE_ENABLED` **first** (before anything else can consume it — the parser
-raises on garbage, and the next reader is `@_guild_op`-swallowed `push_history`, so
-startup is the only loud place) and `BOT_SETTINGS_OVERRIDES` second, for the same
-reason; creates the Redis pool and `MusicBotApp.bot_settings`, then branches. Enabled: it
-**requires `POSTGRES_URL`** (it raises otherwise — an enabled bot running without the
-archive would XADD onto an outbox nobody drains), constructs `PostgresHistoryArchive`
-(lazy: no connection is made here, so startup never blocks on Postgres) and starts the
-`HistoryOutboxDrainer`. Disabled (the default): `history_archive`/`history_drainer`
-stay `None`, one INFO says so, a set `POSTGRES_URL` is explicitly ignored (the flag,
-never URL presence, is consent), and a leftover outbox from an earlier enabled run
-draws a WARNING naming the un-drained depth (never auto-deleted). Either way it then
-loads the `src.musicbot` extension, spawns `BotSettings.hydrate_until_read()` without
-awaiting it (every knob runs on its env value until it lands; a failed read retries with
-backoff, and the bot card and `-debug` say while it has not landed —
-`docs/ARCHITECTURE.md#settings-resolution`), and fire-and-forgets
-`ytdlp_pool.prewarm(warm_worker)` — then `chart_pool.warm()`, but only while the
-archive is enabled, so a default deployment never spawns the matplotlib worker — so
-the first `-play` doesn't pay worker-spawn, yt-dlp-import or first-`YoutubeDL`
-latency (the pool stays lifecycle-only: the warm-up callable comes from
-`src.youtube`, like every other callable it runs). `MusicBotApp.invoke` also
-short-circuits `--help` anywhere in a command message straight to that command's help
-embed, before voice checks or argument parsing.
-
-`close()` order: `history_drainer.stop()` (final drain, needs Redis AND the archive) →
-`history_archive.close()` — both skipped when the archive tier is off (the attrs are
-`None`) → close Redis pool → `super().close()` → `ytdlp_pool.aclose()`
-→ `chart_pool.aclose()` (inert when the worker was never spawned)
-(10s join timeout, then `terminate_workers()` — an unbounded join measured 61s to exit)
-→ `close_probe_session()` (latches the module closed, so a player loop still running
-during the flush below cannot rebuild a session nothing will close)
-→ `shutdown_telemetry()` via executor (blocking span flush, up to 30s). `close()` is
-one-shot (`_teardown_started`) and **every step is individually guarded**: a hung
-Postgres once made `archive.close()` raise, which skipped every later step permanently.
-
 ### Subsystem detail — `.claude/rules/`
 
-The rest of the architecture, the concurrency primitives and the configuration
-reference live in path-scoped rule files, each loaded when Claude reads a file its
-`paths:` frontmatter names. Read one directly to reason about a subsystem without
+Everything a change needs only while touching its own files lives in path-scoped
+rule files, each loaded when Claude reads or edits a file its `paths:` frontmatter
+names — the architecture, the concurrency primitives, the configuration reference,
+the recipes, the test layout and the build. Read one directly to reason about a subsystem without
 opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 
 | Rule file | Covers |
@@ -346,6 +243,7 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 | `.claude/rules/state-and-recovery.md` | the Redis schema, the history backfill, crash recovery; the restore, archive and outbox primitives |
 | `.claude/rules/extraction.md` | the yt-dlp pool, client strategy and stream healing, Spotify; the extraction and playlist primitives |
 | `.claude/rules/config.md` | every environment variable, its default and its bounds; the settings primitives |
+| `.claude/rules/lifecycle.md` | startup and shutdown order, and the telemetry every log line and span carries |
 | `.claude/rules/layout.md` | the annotated module map: what each file holds and where a change belongs |
 | `.claude/rules/ci-and-build.md` | the CI job graph, the image build and deploy, and every duplicated version pin — enforced and unenforced |
 | `.claude/rules/testing.md` | the test layout, the yt-dlp and Discord seams, fakeredis's divergences, the `pg` and `redis` tiers |
@@ -353,21 +251,13 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 
 ### Observability
 
-structlog JSON to stdout always; when `OTEL_SDK_DISABLED` ≠ true, OTLP gRPC traces +
-logs to `OTEL_EXPORTER_OTLP_ENDPOINT` (compose: Grafana LGTM — Tempo/Loki/Grafana at
-localhost:3014, admin/admin). Every log line carries `environment`, `trace_id`/`span_id`
-when in a span, and command context (`guild_id`, `user_id`, `command`) bound in
-`cog_before_invoke` (which also opens a `command.<name>` span; `cog_after_invoke`
-closes it, `cog_command_error` records onto it). `_DiscordGatewayFilter` drops
-discord.py-internal HTTP spans. Redis and aiohttp are auto-instrumented. Spans embed
-their `trace_id` in error-embed footers (`trace_footer`) so a user report can be joined
-to a trace. **`player.loop.iteration` is a ROOT span**, so one song is one trace — the
-loop task inherits the context that created the player, and an inherited parent files
-every song a guild ever plays under one `-play`. Its id is captured into
-`MusicPlayer._playback_span` at the song's start and printed on the Now Playing card
-and the playback-error notice, which is why both name the same trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env- or owner-tunable)
-probing Discord/Redis/Spotify/Postgres/OTEL and reporting bot/yt-dlp/ffmpeg
-versions; `max_concurrency(1, guild)`.
+structlog JSON to stdout always; OTLP gRPC traces and logs when `OTEL_SDK_DISABLED`
+is not true. Every log line carries `environment`, `trace_id`/`span_id` and the
+command context bound in `cog_before_invoke`. **`player.loop.iteration` is a ROOT
+span**, so one song is one trace.
+
+Startup and shutdown order, and the rest of the telemetry wiring:
+`.claude/rules/lifecycle.md`.
 
 ## Concurrency model — quick reference
 

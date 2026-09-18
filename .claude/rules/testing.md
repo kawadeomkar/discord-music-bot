@@ -1,7 +1,6 @@
 ---
 paths:
   - "tests/**"
-  - "conftest.py"
   - "pyproject.toml"
 ---
 
@@ -105,3 +104,19 @@ plus the traps that make a green run mean nothing if they are broken.
 - Warnings are errors (see golden rule 11). `ENVIRONMENT` is read from the environment
   alone at import (default `development`), so collection runs no git subprocess and a
   detached worktree needs nothing set.
+
+## Why a subset run is serial and ungated
+
+Test selection (args forward to pytest). ANY argument means a subset run, so it runs
+SERIALLY and coverage is skipped — fail_under is a PROJECT floor and one file measures
+~26%, which used to fail a green run with exit 1. The gate rides the no-args form —
+what `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
+reporting flags rather than a selection, keeps it with COVERAGE_GATE=1.
+
+The no-args form is also the ONLY parallel one (`-n auto`), and that is deliberate:
+the gate is the only way the whole suite runs, so a test that is not parallel-safe
+fails the pre-push hook and CI instead of rotting a separate "fast" recipe. A subset
+stays serial because worker startup (~4s flat) cannot amortize over a narrow
+selection, and because execnet does not forward worker stdout — `-s` is silently
+swallowed under `-n` and `--pdb` disables it. `just test tests/` is the escape hatch:
+the whole suite, serially, to reproduce a parallel-only failure.

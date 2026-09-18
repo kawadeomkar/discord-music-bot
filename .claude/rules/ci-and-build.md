@@ -124,3 +124,26 @@ process can read (labels are invisible from inside the container), which is what
 `--build-arg` seam; every caller must **export** `GIT_SHA` before calling it, and CI
 passes `github.sha`. Not a seventh `just pins` pair: the value is derived, not
 duplicated.
+
+## Operator and deploy recipes
+
+```bash
+# Database (operator tools. db-migrate/db-backfill run the LOCAL venv against
+# POSTGRES_URL; setup/backup/restore are shell around pg_dump/psql, no venv needed)
+just setup                 # bootstrap .env with a generated POSTGRES_PASSWORD
+just db-migrate            # apply pending migrations — REQUIRED before the bot serves
+just db-backfill [--dry-run] # move pre-archive Redis history into Postgres — see the state rule
+just db-backfill-docker    # same, via the compose one-shot — no local venv
+just db-rejects [n]        # list play_history rows Postgres refused (expected: nothing)
+just outbox [idle_ms]      # outbox health: depth, in-flight, stranded, TOMBSTONES (lost plays)
+just bot-settings [reset <application_id>] # list stored bot overrides, or delete one bot's
+just db-backup             # dump to backups/
+just db-restore FILE [DB]  # restore into a SCRATCH db (live needs CONFIRM=1 + a name)
+
+# Build & deploy
+just image                 # build runtime image :latest and :<git-sha> (no test gate)
+./build_docker.sh          # full pipeline: just check → just image → deploy
+just up [sha]              # deploy an already-built image (never builds; refuses unknown tags)
+just down / restart / logs / ps
+just test-image-rebuild    # required after changing pyproject.toml/poetry.lock
+```
