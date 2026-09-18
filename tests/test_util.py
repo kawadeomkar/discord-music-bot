@@ -5,9 +5,11 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import discord
 import pytest
 from opentelemetry import trace as trace_api
 
@@ -17,6 +19,7 @@ from src.util import (
     verbatim_code,
     BAR_WIDTH,
     FOOTER_LIMIT,
+    OWNER_LOOKUP_RETRY_SECS,
     current_traceparent,
     traceparent_context,
     _TYPING_HOLDS,
@@ -26,7 +29,9 @@ from src.util import (
     cancel_task,
     fmt_duration,
     get_logger,
+    is_operator,
     join_footer,
+    owner_lookup_backing_off,
     pluralize,
     progress_bar,
     progress_line,
@@ -273,6 +278,58 @@ class TestFmtDuration:
 
     def test_minute_rollover_pads_seconds(self) -> None:
         assert fmt_duration(61) == "1:01"
+
+
+class TestIsOperator:
+    """The operator check -debug, -ping and -settings share. It never raises, and a
+    lookup that raised is not repeated for OWNER_LOOKUP_RETRY_SECS."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        # util's own reference only: the event loop reads time.monotonic too.
+        now = [1000.0]
+        monkeypatch.setattr("src.util.time", SimpleNamespace(monotonic=lambda: now[0]))
+        return now
+
+    async def test_it_answers_what_is_owner_answers(self) -> None:
+        ctx = MagicMock()
+        ctx.bot.is_owner = AsyncMock(return_value=True)
+        assert await is_operator(ctx) is True
+        ctx.bot.is_owner = AsyncMock(return_value=False)
+        assert await is_operator(ctx) is False
+        assert owner_lookup_backing_off() is False
+
+    async def test_a_raising_lookup_denies_without_asking_again_for_a_minute(
+        self, clock: list[float]
+    ) -> None:
+        """is_owner() RAISES when application_info() fails. Each attempt is a REST
+        call discord.py retries for ~25s, so a Discord outage must not cost one per
+        command."""
+        ctx = MagicMock()
+        ctx.bot.is_owner = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=503), "boom")
+        )
+        assert await is_operator(ctx) is False
+        assert owner_lookup_backing_off() is True
+
+        clock[0] += OWNER_LOOKUP_RETRY_SECS - 1
+        assert await is_operator(ctx) is False
+        ctx.bot.is_owner.assert_awaited_once()
+
+        clock[0] += 1
+        ctx.bot.is_owner = AsyncMock(return_value=True)
+        assert owner_lookup_backing_off() is False
+        assert await is_operator(ctx) is True
+        ctx.bot.is_owner.assert_awaited_once()
+
+    async def test_cancellation_is_not_a_failed_lookup(
+        self, clock: list[float]
+    ) -> None:
+        ctx = MagicMock()
+        ctx.bot.is_owner = AsyncMock(side_effect=asyncio.CancelledError)
+        with pytest.raises(asyncio.CancelledError):
+            await is_operator(ctx)
+        assert owner_lookup_backing_off() is False
 
 
 class TestTraceparentRoundTrip:
