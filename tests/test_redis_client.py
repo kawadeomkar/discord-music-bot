@@ -3621,18 +3621,10 @@ class TestGuildConfigStore:
         ):
             assert await store.set_debug_mode(True) is False
 
-    async def test_an_unreachable_redis_reads_as_unset(self, fake_redis: Any) -> None:
-        """Degrades to the host default rather than to an arbitrary one."""
-        store = GuildRedisStore(fake_redis, 42)
-        with patch.object(
-            fake_redis, "hgetall", side_effect=RuntimeError("redis down")
-        ):
-            assert (await store.get_config()).debug_mode is None
-
     async def test_a_timezone_round_trips(self, fake_redis: Any) -> None:
         store = GuildRedisStore(fake_redis, 42)
         assert await store.set_timezone("Europe/London") is True
-        config = await store.get_config()
+        config = await stored_config(store)
         assert config.timezone == "Europe/London"
         assert config.tzinfo() == ZoneInfo("Europe/London")
 

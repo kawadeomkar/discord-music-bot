@@ -10,6 +10,7 @@ from src.config import (
     history_archive_enabled,
     using_default_postgres_password,
 )
+from src import settings_card
 from src.guild_state import ConfigField, GuildConfig
 from src.redis_client import GuildRedisStore
 from src.util import is_operator, notice_embed
@@ -92,12 +93,7 @@ async def toggle(ctx: commands.Context, action: DebugAction, *, cog: MusicBot) -
         "until the bot restarts."
     )
     # Names what enabling publishes, at the moment the choice is made.
-    scope = (
-        " While it is on, every embed here — including the live Now Playing "
-        "card — shows the bot process's load to anyone who can read the channel."
-        if enabled
-        else ""
-    )
+    scope = f" {settings_card.DEBUG_DISCLOSURE}" if enabled else ""
     await ctx.send(
         embed=notice_embed(
             f"Debug mode is now **{'on' if enabled else 'off'}** for this "
@@ -122,11 +118,23 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
     default_password = (
         (using_default_postgres_password() and archive_enabled) if operator else None
     )
+    settings = cog.guild_settings
+    bot_settings = cog.bot_settings
+    rows = (
+        settings_card.server_rows(
+            settings.peek(guild_id),
+            debug_default=cog.debug_settings.default,
+            unsaved=settings.unsaved(guild_id),
+        )
+        if guild_id is not None
+        else []
+    )
     return DebugInputs(
         debug_enabled=cog.debug_settings.enabled(guild_id),
         debug_overridden=cog.debug_settings.has_override(guild_id),
         debug_persisted=guild_id is None
-        or cog.guild_settings.is_persisted(guild_id, ConfigField.DEBUG_MODE),
+        or settings.is_persisted(guild_id, ConfigField.DEBUG_MODE),
+        debug_default_overridden=cog.debug_settings.default_override is not None,
         players=len(cog.mps),
         player=cog.mps.get(guild_id) if guild_id is not None else None,
         redis=cog.redis,
@@ -141,4 +149,8 @@ async def build_inputs(ctx: commands.Context, *, cog: MusicBot) -> DebugInputs:
         default_password=default_password,
         # The card withholds its Runtime block from a non-owner; so must the footer.
         debug_suffix=cog.debug_suffix(ctx, host_metrics=operator),
+        settings=tuple(rows),
+        settings_read=guild_id is None or settings.is_complete(guild_id),
+        bot_unsaved=bot_settings.unsaved() if bot_settings else frozenset(),
+        bot_unread=bot_settings is not None and bot_settings.unread,
     )

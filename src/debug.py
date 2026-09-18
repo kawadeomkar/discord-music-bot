@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Any, Final, Optional, Protocol, cast
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -30,11 +30,21 @@ from opentelemetry import trace
 from src import config
 from src.config import debug_mode_default
 from src.dashboard import run_live_dashboard
+from src.guild_state import DEFAULT_VOLUME, ConfigField
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth
+from src.settings import (
+    SettingSpec,
+    card_name,
+    format_value,
+    knob_spec,
+    server_spec,
+)
+from src.settings_card import DEFAULT, SET_HERE, Shown, knob_shown
 from src.util import (
     FOOTER_SUFFIX_SEP,
     cancel_task,
+    codeblock_fields,
     fmt_duration,
     get_logger,
     join_footer,
@@ -111,9 +121,6 @@ _OPERATOR_NOTICE = (
     "-# Host details (configuration, storage, runtime) are shown to the bot owner "
     "only. Run `-ping` for dependency health."
 )
-
-# Discord's cap on an embed field value; util.py's FOOTER_LIMIT is its footer sibling.
-_FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
 
@@ -282,6 +289,9 @@ class _ConfigVar:
     fallback: Optional[str] = None
     # For a default main() can still replace after this tuple is built.
     fallback_factory: Optional[Callable[[], str]] = None
+    # A knob -settings bot can override: rendered from the value in force and its
+    # source at render time, so the row carries no fallback.
+    knob: Optional[config.FloatKnob | config.IntKnob] = None
 
 
 _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
@@ -291,6 +301,7 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback_factory=lambda: config.ENVIRONMENT,
     ),
     _ConfigVar(name="DEBUG_MODE", kind=_ConfigKind.VALUE, fallback="false"),
+    _ConfigVar(name="BOT_SETTINGS_OVERRIDES", kind=_ConfigKind.VALUE, fallback="apply"),
     _ConfigVar(
         name="HISTORY_ARCHIVE_ENABLED", kind=_ConfigKind.VALUE, fallback="false"
     ),
@@ -310,69 +321,71 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback=str(config.YTDLP_POOL_WORKERS),
     ),
     _ConfigVar(
-        name="PLAY_INFLIGHT_MAX",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_INFLIGHT_MAX),
+        name="PLAY_INFLIGHT_MAX", kind=_ConfigKind.VALUE, knob="PLAY_INFLIGHT_MAX"
     ),
     _ConfigVar(
         name="PLAY_RESOLVE_CONCURRENCY",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_RESOLVE_CONCURRENCY),
+        knob="PLAY_RESOLVE_CONCURRENCY",
     ),
     _ConfigVar(
         name="PLAY_RESOLVE_WAIT_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_RESOLVE_WAIT_SECS),
+        knob="PLAY_RESOLVE_WAIT_SECS",
     ),
     _ConfigVar(
         name="PLAY_SLOW_NOTICE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_SLOW_NOTICE_SECS),
+        knob="PLAY_SLOW_NOTICE_SECS",
     ),
     _ConfigVar(
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
+        knob="NOW_PLAYING_UPDATE_INTERVAL_SECS",
     ),
     _ConfigVar(
         name="HEARTBEAT_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.HEARTBEAT_INTERVAL_SECS),
+        knob="HEARTBEAT_INTERVAL_SECS",
     ),
     _ConfigVar(
-        name="PING_TICK_SECS",
+        name="STREAM_PROBE_TIMEOUT_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PING_TICK_SECS),
+        knob="STREAM_PROBE_TIMEOUT_SECS",
     ),
     _ConfigVar(
-        name="PING_DEADLINE_SECS",
+        name="ANALYTICS_RENDER_DEADLINE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PING_DEADLINE_SECS),
+        knob="ANALYTICS_RENDER_DEADLINE_SECS",
     ),
+    _ConfigVar(name="LIVENESS_FILE", kind=_ConfigKind.VALUE),
     _ConfigVar(
-        name="DEBUG_TICK_SECS",
+        name="LIVENESS_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.DEBUG_TICK_SECS),
+        fallback=str(config.LIVENESS_INTERVAL_SECS),
     ),
+    _ConfigVar(name="PING_TICK_SECS", kind=_ConfigKind.VALUE, knob="PING_TICK_SECS"),
     _ConfigVar(
-        name="DEBUG_DEADLINE_SECS",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.DEBUG_DEADLINE_SECS),
+        name="PING_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="PING_DEADLINE_SECS"
+    ),
+    _ConfigVar(name="DEBUG_TICK_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_TICK_SECS"),
+    _ConfigVar(
+        name="DEBUG_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_DEADLINE_SECS"
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_DELAY_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.QUEUE_PROGRESS_DELAY_SECS),
+        knob="QUEUE_PROGRESS_DELAY_SECS",
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_TICK_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.QUEUE_PROGRESS_TICK_SECS),
+        knob="QUEUE_PROGRESS_TICK_SECS",
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_MAX_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.QUEUE_PROGRESS_MAX_SECS),
+        knob="QUEUE_PROGRESS_MAX_SECS",
     ),
     _ConfigVar(
         name="POT_PROVIDER_URL", kind=_ConfigKind.URL, fallback="http://127.0.0.1:4416"
@@ -457,8 +470,23 @@ def redact_url(raw: str, *, hide_host: bool = False) -> str:
         return "unparseable"
 
 
-def render_config_value(var: _ConfigVar) -> str:
-    """One allowlist row's value, redacted per its kind."""
+def _render_knob(
+    knob: config.FloatKnob | config.IntKnob, *, unsaved: frozenset[str]
+) -> str:
+    """`5s (bot owner; env 3s)`: the value and source label the -settings bot
+    card shows, so the operator's two views of a knob agree."""
+    spec = knob_spec(knob)
+    shown = knob_shown(spec, persisted=spec.key not in unsaved)
+    return f"{format_value(spec, shown.value)} ({shown.source})"
+
+
+def render_config_value(
+    var: _ConfigVar, *, unsaved: frozenset[str] = frozenset()
+) -> str:
+    """One allowlist row's value, redacted per its kind. `unsaved` holds the bot
+    setting keys whose last write or reset did not reach Redis."""
+    if var.knob is not None:
+        return _render_knob(var.knob, unsaved=unsaved)
     raw = os.environ.get(var.name)
     if var.kind is _ConfigKind.SECRET:
         # Presence only: this block has to stay safe to screenshot into an issue.
@@ -471,11 +499,19 @@ def render_config_value(var: _ConfigVar) -> str:
     return raw.strip()
 
 
-def config_lines() -> list[str]:
+def config_lines(
+    *, unsaved: frozenset[str] = frozenset(), unread: bool = False
+) -> list[str]:
+    """`unread`: stored bot overrides have not been read yet, which the overrides
+    row says, since every knob row then shows its environment value."""
     width = max(len(var.name) for var in _CONFIG_ALLOWLIST) + 2
-    return [
-        f"{var.name:<{width}}{render_config_value(var)}" for var in _CONFIG_ALLOWLIST
-    ]
+    lines = []
+    for var in _CONFIG_ALLOWLIST:
+        value = render_config_value(var, unsaved=unsaved)
+        if unread and var.name == "BOT_SETTINGS_OVERRIDES":
+            value += " (stored values not read yet)"
+        lines.append(f"{var.name:<{width}}{value}")
+    return lines
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -494,6 +530,8 @@ class DebugInputs:
     # False only when a toggle's Redis write failed, so the snapshot can say
     # "this session only" rather than claim a durability that did not happen.
     debug_persisted: bool = True
+    # The operator's session debug-default is set (-settings bot debug-default).
+    debug_default_overridden: bool = False
     players: int
     player: Optional[MusicPlayer] = None
     redis: Optional[aioredis.Redis] = None
@@ -510,6 +548,16 @@ class DebugInputs:
     # Debug mode's footer, rendered once by the cog and constant for the loop.
     # None when the guild has debug mode off.
     debug_suffix: Optional[str] = None
+    # This server's settings as -settings renders them, from the cache: the
+    # snapshot never waits on Redis. `settings_read` is False while a stored
+    # value may be missing from it.
+    settings: tuple[tuple[SettingSpec, Shown], ...] = ()
+    settings_read: bool = True
+    # The bot settings whose last write or reset did not reach Redis, by key, so
+    # the Config block marks them as -settings bot does.
+    bot_unsaved: frozenset[str] = frozenset()
+    # Stored bot overrides may exist that no read has applied yet.
+    bot_unread: bool = False
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
@@ -993,14 +1041,48 @@ def _fence_safe(text: str) -> str:
     return truncate(text.replace("`", "'"), 60)
 
 
+def settings_line(rows: Sequence[tuple[SettingSpec, Shown]], *, read: bool) -> str:
+    """The server settings changed here, in registry order, by the names and with
+    the source labels past `set here` the -settings card prints: `leave-when-idle
+    10:00, volume 50% (not saved) (2 changed)`. Server settings only; the bot's are
+    the operator's Config block."""
+    changed = [
+        f"{card_name(spec)} {format_value(spec, shown.value)}"
+        + ("" if shown.source == SET_HERE else f" ({shown.source})")
+        for spec, shown in rows
+        if shown.source != DEFAULT
+    ]
+    unread = "" if read else "stored values not read yet"
+    if not changed:
+        return f"none known ({unread})" if unread else "none changed"
+    count = f"{len(changed)} changed" + (f"; {unread}" if unread else "")
+    return f"{', '.join(changed)} ({count})"
+
+
+_VOLUME_SPEC: Final = server_spec(ConfigField.VOLUME)
+
+
+def _volume_row(
+    mp: Optional[MusicPlayer], rows: Sequence[tuple[SettingSpec, Shown]]
+) -> str:
+    """The live player's level, or with no player this server's Volume setting, as
+    the settings line below renders it."""
+    if mp is not None:
+        return f"{round(mp.volume * 100)}%"
+    shown = next((shown for spec, shown in rows if spec is _VOLUME_SPEC), None)
+    percent = shown.value if shown is not None else DEFAULT_VOLUME * 100
+    return f"{format_value(_VOLUME_SPEC, percent)} (setting; no player)"
+
+
 def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> list[str]:
     mp = inputs.player
     lines = [
         f"player       {'yes' if mp is not None else 'no'}",
         # display_size(), so a claimed-but-not-started song still reads as queued.
         f"queue        {mp.queue.display_size() if mp is not None else 0} queued",
-        f"volume       {round(mp.volume * 100) if mp is not None else 100}%",
+        f"volume       {_volume_row(mp, inputs.settings)}",
         f"debug        {'on' if inputs.debug_enabled else 'off'} ({source})",
+        f"settings     {settings_line(inputs.settings, read=inputs.settings_read)}",
     ]
     vc = guild.voice_client
     if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
@@ -1444,37 +1526,19 @@ async def _outbox_check(
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
-    """Lines as one or more codeblock fields within Discord's 1024-char field
-    cap. Splits rather than truncates: a silently clipped config listing reads
-    as a complete one."""
-    fence = 8  # "```\n" + "\n```"
-    fields: list[tuple[str, str]] = []
-    chunk: list[str] = []
-    size = 0
-    for line in lines:
-        line = truncate(line, _FIELD_LIMIT - fence)
-        if chunk and size + len(line) + 1 + fence > _FIELD_LIMIT:
-            fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
-            chunk, size = [], 0
-        chunk.append(line)
-        size += len(line) + 1
-    if chunk:
-        fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
-    return fields
-
-
-def _fence(lines: list[str]) -> str:
-    return "```\n" + "\n".join(lines) + "\n```"
-
-
-def mode_source(overridden: bool, *, persisted: bool = True) -> str:
+def mode_source(
+    overridden: bool, *, persisted: bool = True, default_overridden: bool = False
+) -> str:
     """Why debug mode is in its current state, rendered inside "Debug mode is
     **on** for this server (...)". "saved here" is a stored choice; "host default"
-    means the guild never chose and follows DEBUG_MODE; "this session only" is a
-    toggle whose Redis write failed, which the toggle already reported."""
+    means the guild never chose and follows DEBUG_MODE, and "bot owner default,
+    until restart" that it follows the operator's session default instead; "this
+    session only" is a toggle whose Redis write failed, which the toggle already
+    reported."""
     if not overridden:
-        return "host default"
+        return (
+            "bot owner default, until restart" if default_overridden else "host default"
+        )
     return "saved here" if persisted else "this session only"
 
 
@@ -1585,7 +1649,10 @@ def instant_blocks(
     blocks: dict[str, list[str]] = {}
     guild = ctx.guild
     if inputs.operator:
-        blocks["Config"] = _safe_block("config", config_lines)
+        blocks["Config"] = _safe_block(
+            "config",
+            lambda: config_lines(unsaved=inputs.bot_unsaved, unread=inputs.bot_unread),
+        )
         blocks["Discord"] = _safe_block(
             "discord", lambda: discord_lines(ctx.bot, players=inputs.players)
         )
@@ -1614,7 +1681,7 @@ def render_snapshot_embed(
         lines = blocks.get(name)
         if lines is None:
             continue
-        for field_name, value in _codeblock_fields(name, lines):
+        for field_name, value in codeblock_fields(name, lines):
             embed.add_field(name=field_name, value=value, inline=False)
     # Published to everyone while the same value is an operator-gated row above;
     # -ping prints this identical footer to every caller, so gating it hides nothing.
@@ -1640,7 +1707,11 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
     stragglers rather than failing the card. A non-operator has no deferred
     blocks, so the driver degrades to a single send with no loop."""
     span = trace.get_current_span()
-    source = mode_source(inputs.debug_overridden, persisted=inputs.debug_persisted)
+    source = mode_source(
+        inputs.debug_overridden,
+        persisted=inputs.debug_persisted,
+        default_overridden=inputs.debug_default_overridden,
+    )
     blocks = instant_blocks(ctx, inputs, source=source)
 
     # Counted before the driver creates its probe tasks — see runtime_lines.

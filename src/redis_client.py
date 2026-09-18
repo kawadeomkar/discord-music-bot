@@ -716,34 +716,6 @@ async def scan_guild_config_ids(
         return None
 
 
-async def read_guild_configs(
-    redis: aioredis.Redis, guild_ids: Sequence[int]
-) -> dict[int, GuildConfig]:
-    """Read many guilds' stored configs, batched onto pipelines. Returns an
-    entry ONLY for a guild whose read happened: a missing guild means "could
-    not read", not the all-unset GuildConfig an absent hash yields, and a
-    caller that caches this must not treat the two alike or a Redis blink reads
-    as every guild un-choosing everything. Pipelined rather than one awaited
-    HGETALL each: the pool RAISES rather than queueing past its cap, so a plain
-    fan-out fails every guild past it."""
-    configs: dict[int, GuildConfig] = {}
-    ids = list(guild_ids)
-    for start in range(0, len(ids), CONFIG_READ_BATCH):
-        batch = ids[start : start + CONFIG_READ_BATCH]
-        try:
-            # transaction=False: independent reads with nothing to make atomic.
-            pipe = redis.pipeline(transaction=False)
-            for guild_id in batch:
-                pipe.hgetall(GUILD_CONFIG_KEY.format(guild_id=guild_id))
-            replies = await pipe.execute()
-        except Exception as e:  # noqa: BLE001 — reported by omission, see above
-            log.warning(f"config read failed for {len(batch)} guilds: {e}")
-            continue
-        for guild_id, raw in zip(batch, replies):
-            configs[guild_id] = GuildConfig.from_redis(cast(dict[bytes, bytes], raw))
-    return configs
-
-
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
 
 _P = ParamSpec("_P")
@@ -1434,15 +1406,6 @@ class GuildRedisStore:
         await self.redis.hdel(self.config_key(), *fields)
         return True
 
-    @_guild_op(default_factory=GuildConfig)
-    async def get_config(self) -> GuildConfig:
-        """This guild's stored preferences; all-unset when nothing is stored OR
-        Redis is unreachable — the same answer, since unset means "follow the
-        host default" and an outage should degrade to the host's configuration."""
-        raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.config_key()))
-        return GuildConfig.from_redis(raw)
-
-    @_guild_op(default=False)
     @_guild_op(default=False)
     async def set_debug_mode(
         self, enabled: bool, *, writer: Optional[int] = None

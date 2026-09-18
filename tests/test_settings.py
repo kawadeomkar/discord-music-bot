@@ -19,7 +19,7 @@ import pytest
 import redis.asyncio as aioredis
 
 from src import config, guild_state, redis_client, settings
-from src.debug import DebugSettings
+from src.debug import _CONFIG_ALLOWLIST, DebugSettings
 from src.guild_state import (
     CONFIG_DOMAIN,
     OFF_SECS,
@@ -190,6 +190,14 @@ class TestRegistryInvariants:
                     assert side is not None, (
                         f"{spec.key}: a reason for a bound it lacks"
                     )
+
+    def test_5_every_bot_env_has_a_debug_row(self) -> None:
+        rows = {var.name: var for var in _CONFIG_ALLOWLIST}
+        for spec in SETTINGS:
+            if spec.scope is SettingScope.BOT:
+                assert spec.env in rows, spec.key
+                if spec.attr is not None:
+                    assert rows[spec.env].knob == spec.attr, spec.key
 
     def test_6_values_round_trip_at_their_bounds_and_default(self) -> None:
         # A write-time minimum follows the bot's value. At its lowest, the env
@@ -1158,11 +1166,6 @@ class TestRefusalsNeverQuoteTheInput:
         assert any(
             r.reason is RefusalReason.WRONG_SCOPE for r in self._refusals("HeArTbEaT")
         )
-
-
-# ── BotSettings ───────────────────────────────────────────────────────────────
-
-_APP_ID = 123456789012345678
 
 
 # ── BotSettings ───────────────────────────────────────────────────────────────
@@ -2769,3 +2772,240 @@ class TestHotPathsNeverAwaitSettings:
         tree = ast.parse(Path("src/musicplayer.py").read_text())
         hits = _awaits_reaching_guild_settings(tree)
         assert [name for name, _ in hits] == ["_restore_state"]
+
+
+# ── Bot knobs are read at call time ───────────────────────────────────────────
+
+_KNOB_NAMES: frozenset[str] = frozenset(config.FLOAT_KNOBS | config.INT_KNOBS)
+_ACCESSORS: frozenset[str] = frozenset(name.lower() for name in _KNOB_NAMES)
+_OVERRIDE_WRITERS = ("set_override", "clear_override")
+# Every function a pool worker runs, by module. A worker re-imports modules with
+# environment values only, so an override set in the parent never reaches it.
+_WORKER_ENTRIES: dict[str, tuple[str, ...]] = {
+    "src/youtube.py": ("_ytdlp_extract", "warm_worker"),
+    "src/analytics_render.py": ("render_dashboard",),
+    "src/chart_pool.py": ("_warm_worker",),
+    "src/ytdlp_pool.py": ("_warmup_noop", "_worker_init"),
+}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _KnobReads:
+    baseline: list[str]  # G1
+    definition_time: list[str]  # G2
+    writers: list[str]  # G3
+    in_workers: list[str]  # G4
+    worker_entries: set[str]
+
+
+def _identifier(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _scan_knob_reads(
+    tree: ast.Module,
+    where: str,
+    *,
+    config_module: bool = False,
+    writer_module: bool = False,
+    worker_entries: tuple[str, ...] = (),
+) -> _KnobReads:
+    """One pass per module. Identifiers are matched by name, so an aliased import
+    (`import src.config as c; c.PING_TICK_SECS`) is caught without tracking it.
+    String constants are not identifiers: the registry's env=/attr= and -debug's
+    knob= pass. BotConfigField's constants are wire-field names that two count knobs
+    share, so an attribute read off that class is not a knob read."""
+    reads = _KnobReads([], [], [], [], set())
+
+    def at(node: ast.AST) -> str:
+        return f"{where}:{getattr(node, 'lineno', 0)}"
+
+    for node in ast.walk(tree):
+        if not config_module:
+            if (
+                isinstance(node, (ast.Name, ast.Attribute))
+                and isinstance(node.ctx, ast.Load)
+                and _identifier(node) in _KNOB_NAMES
+                and not (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "BotConfigField"
+                )
+            ):
+                reads.baseline.append(at(node))
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "src.config"
+                and any(a.name in _KNOB_NAMES or a.name == "*" for a in node.names)
+            ):
+                reads.baseline.append(at(node))
+        if (
+            not writer_module
+            and isinstance(node, ast.Call)
+            and _identifier(node.func) in _OVERRIDE_WRITERS
+        ):
+            reads.writers.append(at(node))
+
+    def visit(node: ast.AST, definition_time: bool) -> None:
+        """G2. What runs when a module is imported or a def/class statement runs:
+        module and class bodies, decorators and parameter defaults. Function and
+        lambda bodies run later; annotations are lazy (PEP 649), and so is a
+        `type` alias's value."""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if not isinstance(node, ast.Lambda):
+                for decorator in node.decorator_list:
+                    visit(decorator, definition_time)
+            for default in [*node.args.defaults, *node.args.kw_defaults]:
+                if default is not None:
+                    visit(default, definition_time)
+            body = [node.body] if isinstance(node, ast.Lambda) else node.body
+            for statement in body:
+                visit(statement, False)
+            return
+        if isinstance(node, ast.ClassDef):
+            for part in [*node.decorator_list, *node.bases, *node.keywords]:
+                visit(part, definition_time)
+            for statement in node.body:
+                visit(statement, definition_time)
+            return
+        if isinstance(node, ast.AnnAssign):
+            if node.value is not None:
+                visit(node.value, definition_time)
+            return
+        if isinstance(node, (ast.TypeAlias, ast.arg)):
+            return
+        if (
+            definition_time
+            and isinstance(node, ast.Call)
+            and _identifier(node.func) in _ACCESSORS
+        ):
+            reads.definition_time.append(at(node))
+        for child in ast.iter_child_nodes(node):
+            visit(child, definition_time)
+
+    if not config_module:
+        visit(tree, True)
+
+    # G4: each entry, and every same-module function it calls by bare name.
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    reads.worker_entries.update(e for e in worker_entries if e in functions)
+    pending, seen = list(worker_entries), set[str]()
+    while pending:
+        name = pending.pop()
+        if name in seen or name not in functions:
+            continue
+        seen.add(name)
+        for node in ast.walk(functions[name]):
+            if _identifier(node) in _KNOB_NAMES or (
+                isinstance(node, ast.Call) and _identifier(node.func) in _ACCESSORS
+            ):
+                reads.in_workers.append(at(node))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                pending.append(node.func.id)
+    return reads
+
+
+@pytest.fixture(scope="module")
+def knob_reads() -> _KnobReads:
+    """Every src/ module parsed once, from the package's own path, not the CWD."""
+    import src
+
+    root = Path(src.__file__).parent
+    total = _KnobReads([], [], [], [], set())
+    for path in sorted(root.rglob("*.py")):
+        where = path.relative_to(root.parent).as_posix()
+        reads = _scan_knob_reads(
+            ast.parse(path.read_text()),
+            where,
+            config_module=where == "src/config.py",
+            writer_module=where == "src/settings.py",
+            worker_entries=_WORKER_ENTRIES.get(where, ()),
+        )
+        total.baseline.extend(reads.baseline)
+        total.definition_time.extend(reads.definition_time)
+        total.writers.extend(reads.writers)
+        total.in_workers.extend(reads.in_workers)
+        total.worker_entries.update(f"{where}:{e}" for e in reads.worker_entries)
+    return total
+
+
+_EVERY_SHAPE = """\
+from src import config
+from src.config import PING_TICK_SECS
+from src.config import *
+import src.config as c
+a = c.PING_TICK_SECS
+b = config.ping_tick_secs()
+def f(x=config.ping_tick_secs()) -> config.ping_tick_secs():
+    return config.ping_tick_secs() + config.PING_TICK_SECS
+@decorate(config.ping_tick_secs())
+def g(): pass
+class K(Base, flag=config.ping_tick_secs()):
+    y = config.ping_tick_secs()
+    z: float = config.ping_tick_secs()
+    w: config.ping_tick_secs() = 1.0
+lam = lambda q=config.ping_tick_secs(): config.ping_tick_secs()
+type T = config.ping_tick_secs()
+factory = config.ping_tick_secs
+BotConfigField.PLAY_INFLIGHT_MAX
+PING_TICK_SECS = 2.0
+config.set_override("PING_TICK_SECS", 1.0)
+clear_override("PING_TICK_SECS")
+s = "PING_TICK_SECS"
+def _entry():
+    return helper()
+def helper():
+    return config.ping_tick_secs()
+"""
+
+
+class TestBotKnobsAreReadAtCallTime:
+    """Consumers call a knob's accessor when its value applies. A baseline read and
+    an accessor called at definition time both type-check and both silently ignore
+    a -settings bot override, and the consumer tests would likely pass either,
+    only slower. See docs/ARCHITECTURE.md#settings-resolution."""
+
+    def test_the_walker_reports_every_shape_and_nothing_else(self) -> None:
+        reads = _scan_knob_reads(
+            ast.parse(_EVERY_SHAPE), "x", worker_entries=("_entry",)
+        )
+        assert reads.baseline == ["x:2", "x:3", "x:5", "x:8"]
+        assert sorted(reads.definition_time, key=lambda s: int(s[2:])) == [
+            "x:6",
+            "x:7",
+            "x:9",
+            "x:11",
+            "x:12",
+            "x:13",
+            "x:15",
+        ]
+        assert reads.writers == ["x:20", "x:21"]
+        assert reads.in_workers == ["x:26"]
+
+    def test_g1_no_module_reads_a_baseline(self, knob_reads: _KnobReads) -> None:
+        assert knob_reads.baseline == []
+
+    def test_g2_no_accessor_is_called_at_definition_time(
+        self, knob_reads: _KnobReads
+    ) -> None:
+        assert knob_reads.definition_time == []
+
+    def test_g3_only_settings_writes_an_override(self, knob_reads: _KnobReads) -> None:
+        assert knob_reads.writers == []
+
+    def test_g4_no_pool_worker_reads_a_knob(self, knob_reads: _KnobReads) -> None:
+        assert knob_reads.in_workers == []
+        # A renamed entry would leave this clause checking nothing.
+        assert knob_reads.worker_entries == {
+            f"{where}:{entry}"
+            for where, entries in _WORKER_ENTRIES.items()
+            for entry in entries
+        }

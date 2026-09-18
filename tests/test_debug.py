@@ -4,6 +4,7 @@ built to be screenshotted into an issue, so a value that should never render is 
 credential leak rather than a cosmetic bug."""
 
 import asyncio
+import dataclasses
 import os
 import re
 import time
@@ -20,11 +21,12 @@ from redis.asyncio import Redis
 from discord.ext import commands
 from opentelemetry import trace as trace_api
 
-from src import config, debug
+from src import config, debug, settings_card
 from src.commands import debug as debug_cmd
 from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
+from src.settings import SETTINGS, BotSettings, SettingScope
 from src.musicbot import MusicBot as MusicBotCog
 from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, cancel_task, spawn_background
 from src.guild_queue import QueueObject
@@ -35,7 +37,6 @@ from src.debug import (
     DebugInputs,
     _CONFIG_ALLOWLIST,
     _ConfigKind,
-    _codeblock_fields,
     run_debug_dashboard,
     config_lines,
     discord_lines,
@@ -43,6 +44,7 @@ from src.debug import (
     parse_debug_arg,
     redact_url,
     render_config_value,
+    settings_line,
     unknown_arg_message,
 )
 
@@ -302,27 +304,79 @@ class TestConfigAllowlist:
         assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
         assert "leaked" not in "\n".join(config_lines())
 
+    def test_every_settable_knob_is_a_knob_row(self) -> None:
+        knobs = {v.knob for v in _CONFIG_ALLOWLIST if v.knob is not None}
+        assert knobs == config.FLOAT_KNOBS | config.INT_KNOBS
+        assert all(v.knob == v.name for v in _CONFIG_ALLOWLIST if v.knob is not None)
+
+    @pytest.mark.parametrize(
+        ("override", "env", "rendered"),
+        [
+            (None, None, "3s (default)"),
+            (None, "4", "4s (env)"),
+            (None, "0.5", "0.5s (env, outside chat range)"),
+            (5.0, "4", "5s (bot owner; env 4s)"),
+            (5.0, None, "5s (bot owner; default 3s)"),
+        ],
+    )
+    def test_a_knob_row_renders_the_value_in_force_and_its_source(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        override: float | None,
+        env: str | None,
+        rendered: str,
+    ) -> None:
+        """The `-settings bot` card's labels. "env" shows the parsed baseline, not
+        the raw string, and an override names the value it shadows."""
+        if env is None:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS", raising=False)
+            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 3.0)
+        else:
+            monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
+            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", float(env))
+        if override is not None:
+            config.set_override("HEARTBEAT_INTERVAL_SECS", override)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "HEARTBEAT_INTERVAL_SECS")
+        assert render_config_value(var) == rendered
+
+    def test_a_count_knob_renders_as_a_whole_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PLAY_INFLIGHT_MAX", raising=False)
+        config.set_override("PLAY_INFLIGHT_MAX", 8)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "PLAY_INFLIGHT_MAX")
+        assert render_config_value(var) == "8 (bot owner; default 16)"
+
+    @pytest.mark.parametrize("unread", [True, False])
+    def test_the_overrides_row_says_when_stored_values_are_unread(
+        self, monkeypatch: pytest.MonkeyPatch, unread: bool
+    ) -> None:
+        monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
+        row = next(
+            line
+            for line in config_lines(unread=unread)
+            if "BOT_SETTINGS_OVERRIDES" in line
+        )
+        assert row.endswith("(stored values not read yet)") is unread
+
     def test_no_duplicate_rows(self) -> None:
         names = [v.name for v in _CONFIG_ALLOWLIST]
         assert len(names) == len(set(names))
 
-
-class TestCodeblockFields:
-    def test_short_block_is_one_field(self) -> None:
-        fields = _codeblock_fields("Config", ["a", "b"])
-        assert fields == [("Config", "```\na\nb\n```")]
-
-    def test_long_block_splits_rather_than_truncating(self) -> None:
-        """Discord's field cap is 1024. A config listing clipped in place would
-        read as a complete one, which is worse than showing none."""
-        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
-        fields = _codeblock_fields("Config", lines)
-        assert len(fields) > 1
-        assert all(len(value) <= 1024 for _, value in fields)
-        assert fields[1][0] == "Config (cont.)"
-        rendered = "".join(value for _, value in fields)
-        for line in lines:
-            assert line in rendered
+    @pytest.mark.parametrize(
+        ("name", "unset", "value"),
+        [
+            ("BOT_SETTINGS_OVERRIDES", "apply (default)", "ignore"),
+        ],
+    )
+    def test_the_operator_variables_render_what_is_in_force(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, unset: str, value: str
+    ) -> None:
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == name)
+        monkeypatch.delenv(name, raising=False)
+        assert render_config_value(var) == unset
+        monkeypatch.setenv(name, value)
+        assert render_config_value(var) == value
 
 
 class TestDiscordBlock:
@@ -378,6 +432,26 @@ class TestGuildBlock:
         assert "player       yes" in lines
         assert "queue        0 queued" in lines
         assert "volume       50%" in lines
+
+    def test_with_no_player_the_volume_row_is_the_setting(
+        self, mock_guild: MagicMock
+    ) -> None:
+        mock_guild.voice_client = None
+        rows = settings_card.server_rows(
+            GuildConfig(volume=0.5), debug_default=False, unsaved=frozenset()
+        )
+        inputs = dataclasses.replace(self._inputs(), settings=tuple(rows))
+        lines = guild_lines(mock_guild, inputs, source="saved here")
+        assert "volume       50% (setting; no player)" in lines
+        assert "settings     volume 50% (1 changed)" in lines
+
+    def test_with_no_player_and_no_rows_the_volume_row_is_the_default(
+        self, mock_guild: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_guild.voice_client = None
+        monkeypatch.setattr(debug, "DEFAULT_VOLUME", 0.8)
+        lines = guild_lines(mock_guild, self._inputs(), source="saved here")
+        assert "volume       80% (setting; no player)" in lines
 
     async def test_a_claimed_song_still_counts_as_queued(
         self,
@@ -472,6 +546,217 @@ class TestGuildBlock:
         assert "voice ws     21 ms (avg 23 ms)" in lines
         assert "connect ✅" in lines
         assert "speak ⚠️" in lines
+
+
+def _rows(
+    stored: GuildConfig, *, unsaved: frozenset[str] = frozenset()
+) -> list[tuple[Any, settings_card.Shown]]:
+    return settings_card.server_rows(stored, debug_default=False, unsaved=unsaved)
+
+
+class TestTheSettingsLine:
+    """ "This server" lists the settings changed here, from the cache, with the
+    -settings card's labels. Everyone sees the block, so it carries server keys only."""
+
+    def test_lists_only_the_changed_keys_in_registry_order(self) -> None:
+        rows = _rows(GuildConfig(idle_timeout_secs=600.0, timezone="Europe/London"))
+        assert (
+            settings_line(rows, read=True)
+            == "timezone Europe/London, leave-when-idle 10:00 (2 changed)"
+        )
+
+    def test_nothing_changed(self) -> None:
+        assert settings_line(_rows(GuildConfig()), read=True) == "none changed"
+
+    def test_a_write_that_did_not_reach_redis_is_marked(self) -> None:
+        """A reset that did not persist is a change too: Redis still holds the old
+        value, which returns at the next restart."""
+        rows = _rows(
+            GuildConfig(volume=0.5),
+            unsaved=frozenset({"volume", "idle_timeout_secs"}),
+        )
+        assert settings_line(rows, read=True) == (
+            "volume 50% (not saved), leave-when-idle 5:00 (not saved) (2 changed)"
+        )
+
+    def test_a_value_under_the_bots_minimum_names_both(self) -> None:
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        rows = _rows(GuildConfig(np_refresh_secs=2.0))
+        assert settings_line(rows, read=True) == (
+            "progress-bar-refresh 5s (bot minimum; set here 2s) (1 changed)"
+        )
+
+    def test_an_unread_cache_is_not_reported_as_unchanged(self) -> None:
+        """-debug is how a Redis outage gets diagnosed, and a boot with Redis down
+        leaves every guild unread: "none changed" would be false exactly then."""
+        assert (
+            settings_line(_rows(GuildConfig()), read=False)
+            == "none known (stored values not read yet)"
+        )
+        assert settings_line(_rows(GuildConfig(volume=0.5)), read=False) == (
+            "volume 50% (1 changed; stored values not read yet)"
+        )
+
+    def test_the_row_is_in_the_guild_block(self, mock_guild: MagicMock) -> None:
+        mock_guild.voice_client = None
+        inputs = DebugInputs(
+            debug_enabled=False,
+            debug_overridden=False,
+            players=0,
+            settings=tuple(_rows(GuildConfig(alone_timeout_secs=30.0))),
+        )
+        lines = guild_lines(mock_guild, inputs, source="host default")
+        assert "settings     leave-when-alone 0:30 (1 changed)" in lines
+
+    def test_every_setting_changed_and_unsaved_still_fits_its_field(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        stored = GuildConfig(
+            volume=0.05,
+            timezone="America/Argentina/Buenos_Aires",
+            idle_timeout_secs=1800.0,
+            alone_timeout_secs=120.0,
+            np_refresh_secs=30.0,
+            slow_notice_secs=60.0,
+            queue_progress_delay_secs=60.0,
+            debug_mode=True,
+        )
+        rows = _rows(stored, unsaved=frozenset(stored.to_redis()))
+        inputs = DebugInputs(
+            debug_enabled=True,
+            debug_overridden=True,
+            players=0,
+            settings=tuple(rows),
+            settings_read=False,
+        )
+        mock_ctx.guild.voice_client = None
+        embed = debug.render_snapshot_embed(
+            mock_ctx,
+            inputs,
+            blocks=debug.instant_blocks(mock_ctx, inputs, source="saved here"),
+            source="saved here",
+        )
+        server = [f for f in embed.fields if (f.name or "").startswith("This server")]
+        assert len(server) == 1 and len(server[0].value or "") <= 1024
+        assert "(8 changed; stored values not read yet)" in (server[0].value or "")
+
+    async def test_a_change_reaches_the_card(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
+
+        embed = await _snapshot(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        )
+
+        server = next(f for f in embed.fields if f.name == "This server")
+        assert "settings     leave-when-idle 10:00 (1 changed)" in (server.value or "")
+
+    async def test_the_card_sends_while_redis_never_answers(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The operator's view, which is how a Redis outage gets diagnosed: the line
+        reads the cache, so the skeleton sends while the Redis probe still waits."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(volume=0.5))
+
+        async def stalled(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        sent = asyncio.Event()
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+
+        async def send(**_: object) -> MagicMock:
+            sent.set()
+            return message
+
+        mock_ctx.channel.send = AsyncMock(side_effect=send)
+        redis = cast(Any, cog.redis)
+        with (
+            patch.object(redis, "execute_command", new=stalled),
+            patch.object(GuildRedisStore, "read_config", new=stalled),
+        ):
+            async with asyncio.timeout(2):
+                inputs = await debug_cmd.build_inputs(mock_ctx, cog=cog)
+            assert inputs.operator
+            task = asyncio.create_task(run_debug_dashboard(mock_ctx, inputs))
+            try:
+                async with asyncio.timeout(2):
+                    await sent.wait()
+            finally:
+                await cancel_task(task)
+
+        call = mock_ctx.channel.send.await_args
+        assert call is not None
+        embed = cast(discord.Embed, call.kwargs["embeds"][0])
+        server = next(f for f in embed.fields if f.name == "This server")
+        assert "settings     volume 50% (1 changed)" in (server.value or "")
+
+    async def test_an_unsaved_bot_setting_is_marked_in_the_config_block(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The label -settings bot shows: a write that did not reach Redis is gone
+        at the next start, and the Config block must not show it as the owner's."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.voice_client = None
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        bot_settings = BotSettings(cog.bot, redis=None, ignore_stored=False)
+        cast(Any, cog.bot).bot_settings = bot_settings
+        heartbeat = next(
+            s for s in SETTINGS if s.key == "heartbeat" and s.scope is SettingScope.BOT
+        )
+        await bot_settings.write(heartbeat, 5.0)
+
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        blocks = debug.instant_blocks(mock_ctx, inputs, source="x")
+
+        row = next(line for line in blocks["Config"] if "HEARTBEAT_INTERVAL" in line)
+        assert row.endswith("5s (not saved)")
+
+    async def test_a_non_operator_sees_this_servers_settings_and_none_of_the_bots(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """Bot values are the operator's Config block. The line leaves out a server
+        key still following the bot, so its value is not disclosed here either."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
+        bot_specs = [s for s in SETTINGS if s.scope is SettingScope.BOT and s.attr]
+        for spec in bot_specs:
+            knob = spec.attr
+            assert knob is not None
+            if config.is_int_knob(knob):
+                config.set_override(knob, config.baseline(knob))
+            else:
+                config.set_override(knob, config.baseline(knob))
+        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 7.25)
+
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        operator = debug.instant_blocks(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog), source="x"
+        )
+        assert "bot owner;" in "\n".join(operator["Config"])
+
+        mock_ctx.bot.is_owner = AsyncMock(return_value=False)
+        embed = await _snapshot(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        )
+        shown = str(embed.to_dict())
+        assert "leave-when-idle 10:00 (1 changed)" in shown
+        assert "bot owner;" not in shown
+        assert "7.25" not in shown
+        for spec in bot_specs:
+            assert spec.env is not None and spec.env not in shown
 
 
 class TestSafeBlock:
@@ -1104,7 +1389,7 @@ class TestSnapshotEmbed:
         )
         names = [f.name for f in embed.fields]
         # Config outgrew Discord's 1024-char field cap once it carried -debug's own
-        # loop tunables, so _codeblock_fields splits it — the continuation keeps the
+        # loop tunables, so codeblock_fields splits it — the continuation keeps the
         # block's position rather than moving to the end.
         assert names == [
             "Build",
@@ -2958,6 +3243,66 @@ class TestDebugSamplerLifecycle:
             await music_bot.debug_settings._sampler.aclose()
 
 
+class TestTheOperatorsSessionDefault:
+    """`-settings bot debug-default` replaces DEBUG_MODE for this process only.
+    `_default` stays the environment's value, so the tests that assign it keep
+    meaning what they meant."""
+
+    async def test_the_override_beats_the_environment_and_none_restores_it(
+        self, music_bot: MusicBotCog
+    ) -> None:
+        settings = music_bot.debug_settings
+        settings.set_default_override(True)
+        assert settings.default is True
+        assert settings.enabled(42) is True
+        assert settings.enabled(None) is True
+        settings.set_default_override(None)
+        assert settings.default is False
+        assert settings.enabled(42) is False
+        await settings.aclose()
+
+    async def test_a_guilds_own_choice_still_wins(self, music_bot: MusicBotCog) -> None:
+        settings = music_bot.debug_settings
+        settings._overrides[42] = False
+        settings.set_default_override(True)
+        assert settings.enabled(42) is False
+        await settings.aclose()
+
+    async def test_the_sampler_follows_it(self, music_bot: MusicBotCog) -> None:
+        settings = music_bot.debug_settings
+        settings.set_default_override(True)
+        assert settings._sampler.running is True
+        settings.set_default_override(None)
+        assert settings._sampler.running is False
+
+    async def test_turning_it_on_in_production_warns(
+        self,
+        music_bot: MusicBotCog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        music_bot.debug_settings.set_default_override(True)
+        assert "debug mode's default is on in production" in caplog.text
+        await music_bot.debug_settings.aclose()
+
+    async def test_a_cog_reload_keeps_it(self, music_bot: MusicBotCog) -> None:
+        """cog_load hands the new cog's DebugSettings what BotSettings holds."""
+        from src.settings import SETTINGS, BotSettings
+
+        spec = next(s for s in SETTINGS if s.key == "debug-default")
+        bot_settings = BotSettings(music_bot.bot, redis=None, ignore_stored=False)
+        cast(Any, music_bot.bot).bot_settings = bot_settings
+        bot_settings.apply(spec, True)
+        music_bot.debug_settings = debug.DebugSettings()
+        music_bot.debug_settings._default = False
+
+        await music_bot.cog_load()
+
+        assert music_bot.debug_settings.default is True
+        await music_bot.cog_unload()
+
+
 class TestDebugModeIsPerGuildAndDurable:
     """DEBUG_MODE is the default every guild starts from; each guild can pin its own
     choice, and that choice now outlives a restart."""
@@ -3205,6 +3550,19 @@ class TestDebugModeIsPerGuildAndDurable:
         assert inputs.debug_persisted is False
         assert debug.mode_source(True, persisted=False) == "this session only"
 
+    async def test_a_server_following_the_operators_session_default_says_so(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.id = 42
+        music_bot_with_redis.debug_settings.set_default_override(True)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
+        assert inputs.debug_default_overridden is True
+        assert (
+            debug.mode_source(False, default_overridden=True)
+            == "bot owner default, until restart"
+        )
+        assert debug.mode_source(True, default_overridden=True) == "saved here"
+
     async def test_a_write_that_lands_reports_as_saved(
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
@@ -3296,6 +3654,10 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
 
         checked = 0
         for var in _CONFIG_ALLOWLIST:
+            if var.knob is not None:
+                # Rendered from the value in force, never from a stored copy.
+                assert var.fallback is None and var.fallback_factory is None, var.name
+                continue
             if var.kind is not _ConfigKind.VALUE:
                 continue
             default = getattr(config, var.name, None)
@@ -3329,6 +3691,9 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
             name_node, fallback = kwargs.get("name"), kwargs.get("fallback")
             if not isinstance(name_node, ast.Constant) or fallback is None:
                 continue
+            if "knob" in kwargs:
+                literal_rows.append(f"{name_node.value} (knob= with fallback=)")
+                continue
             default = getattr(config, str(name_node.value), None)
             if not isinstance(default, (int, float)) or isinstance(default, bool):
                 continue
@@ -3338,3 +3703,28 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
         assert literal_rows == [], (
             f"hardcoded fallbacks that must read config.py: {literal_rows}"
         )
+
+    def test_every_env_knob_config_parses_has_a_row(self) -> None:
+        """A knob config.py parses from the environment but -debug does not list is
+        a value the operator cannot see from chat. Discovered from the parse calls
+        themselves, so a knob added later without a row fails here."""
+        import ast
+        import inspect
+
+        from src import config
+        from src.debug import _CONFIG_ALLOWLIST
+
+        parsed: set[str] = set()
+        for node in ast.walk(ast.parse(inspect.getsource(config))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("_float_env", "_int_env")
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                parsed.add(str(node.args[0].value))
+
+        assert "NOW_PLAYING_UPDATE_INTERVAL_SECS" in parsed, "discovery found nothing"
+        rows = {var.name for var in _CONFIG_ALLOWLIST}
+        assert sorted(parsed - rows) == []
