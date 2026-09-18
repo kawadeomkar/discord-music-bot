@@ -369,17 +369,11 @@ class GuildConfig:
             mapping[ConfigField.DEBUG_MODE] = "1" if self.debug_mode else "0"
         if self.timezone is not None:
             mapping[ConfigField.TIMEZONE] = self.timezone
-        numbers: tuple[tuple[ConfigFieldName, float | None], ...] = (
-            (ConfigField.VOLUME, self.volume),
-            (ConfigField.IDLE_TIMEOUT, self.idle_timeout_secs),
-            (ConfigField.ALONE_TIMEOUT, self.alone_timeout_secs),
-            (ConfigField.NP_REFRESH, self.np_refresh_secs),
-            (ConfigField.SLOW_NOTICE, self.slow_notice_secs),
-            (ConfigField.QUEUE_PROGRESS_DELAY, self.queue_progress_delay_secs),
-        )
-        mapping.update(
-            {field: str(value) for field, value in numbers if value is not None}
-        )
+        # Every numeric field is in CONFIG_DOMAIN, under its attribute's name.
+        for field in CONFIG_DOMAIN:
+            value: float | None = getattr(self, field)
+            if value is not None:
+                mapping[field] = str(value)
         return mapping
 
     def tzinfo(self) -> ZoneInfo:
@@ -407,13 +401,8 @@ class GuildConfig:
         builds, and one bad field must not cost the guild its whole config."""
         return cls(
             debug_mode={"1": True, "0": False}.get(_b_str(raw, ConfigField.DEBUG_MODE)),
-            volume=_b_float(raw, ConfigField.VOLUME),
             timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
-            idle_timeout_secs=_b_float(raw, ConfigField.IDLE_TIMEOUT),
-            alone_timeout_secs=_b_float(raw, ConfigField.ALONE_TIMEOUT),
-            np_refresh_secs=_b_float(raw, ConfigField.NP_REFRESH),
-            slow_notice_secs=_b_float(raw, ConfigField.SLOW_NOTICE),
-            queue_progress_delay_secs=_b_float(raw, ConfigField.QUEUE_PROGRESS_DELAY),
+            **{field: _b_float(raw, field) for field in CONFIG_DOMAIN},
         )
 
 
