@@ -80,7 +80,11 @@ See `docs/ARCHITECTURE.md#yt-dlp-client-strategy` for the measurements behind bo
 
 **FFmpeg**: `YTDL(discord.FFmpegOpusAudio)` with
 `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` and `-vn`; `?t=`/interject
-seeks via `-ss`; volume via `-filter:a volume=` (which is why `-volume` applies from the
+seeks are a **two-pass `-ss`** — `-ss N` before `-i` for the HTTP range request, `-ss 0`
+after it to drop the pre-roll that lands in. Output-side alone downloads and decodes
+from 0:00, which YouTube throttles to a stall on a deep offset; input-side alone lands
+on the nearest webm cluster, measured **5–10s early**, which `position_secs` would then
+overstate everywhere. Volume via `-filter:a volume=` (which is why `-volume` applies from the
 song after next — the prefetch has already built the next one at the old level, and
 rebuilding it would re-request a signed URL that may since have been revoked).
 `read()` counts frames → `elapsed_secs`/`position_secs` is the single source

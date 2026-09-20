@@ -1529,7 +1529,7 @@ Span conventions worth knowing:
 ```mermaid
 flowchart LR
     YT["YouTube CDN\n(signed HTTPS stream)"]
-    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Output: Opus frames\n- Volume filter (if ≠ 1.0)\n- Seek offset (-ss N, if ts set)"]
+    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Output: Opus frames\n- Volume filter (if ≠ 1.0)\n- Seek: -ss N before -i, -ss 0 after"]
     Reader["discord.py reader thread\n(reads Opus frames from FFmpeg stdout\n→ YTDL.read() counts frames)"]
     VC["Discord Voice UDP\n(Opus + NaCl encryption)"]
     User["Discord Client\n(decodes Opus)"]
@@ -1541,14 +1541,21 @@ flowchart LR
 ```
 
 **FFmpeg flags:**
-- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop
-- `options`: `-vn` (audio only); extended with `-ss {ts}` for timestamp seeks and `-filter:a volume={v}` for non-unity volume
+- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
+- `options`: `-vn` (audio only); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and pause confirmation.
 
 **Timestamp seek**: a `?t=N` URL parameter is carried on `QueueObject.ts` → FFmpeg `-ss N` → recorded as `YTDL.start_offset` so position surfaces and the backdated `play_start_epoch` agree.
+
+The seek is deliberately **two-pass**, and both halves were measured before shipping — each single-sided form is wrong in one direction:
+
+- **output side alone** (`-ss` after `-i`): accurate, but ffmpeg opens the stream at 0:00 and decodes its way to the offset, so a crash-recovered song 40 min in pulls 40 min of audio through the CDN before its first frame.
+- **input side alone** (`-ss` before `-i`): a real HTTP range request, but it lands on the nearest webm cluster **before** the target — measured 5–10 s early across offsets, on live googlevideo and on the same stream saved to disk, under both libopus and copy. `-accurate_seek` is already the default and does not fix it. Since `position_secs = start_offset + elapsed`, that error would land on every position surface and a `-playnow` resume would replay audio.
+
+Shipping form is `-ss N` before `-i` **plus** `-ss 0` after it: the range request is kept, and the output-side threshold drops the pre-roll it lands in (that pre-roll carries negative timestamps, which is what makes 0 the right threshold). Measured back to ±0.02 s at every offset.
 
 ---
 

@@ -818,9 +818,13 @@ async def close_probe_session() -> None:
 async def _probe_stream_url(stream_url: str) -> StreamProbe:
     """What YouTube will do with this URL right now. A revoked URL makes ffmpeg
     403 and exit, which discord.py cannot tell from a song that ended, so probe
-    exactly as ffmpeg opens it: a plain GET, no Range (a revoked URL still
-    answers 206 to a ranged GET, and googlevideo rejects HEAD). The body is
-    never read. A probe that never completed is UNCONFIRMED, not DEAD.
+    with a plain GET, no Range (a revoked URL still answers 206 to a ranged GET,
+    and googlevideo rejects HEAD). The body is never read. A probe that never
+    completed is UNCONFIRMED, not DEAD.
+
+    For a song with a start offset this is stricter than ffmpeg's own open, which
+    is a range request (see yt_stream's seek): a URL that serves a full GET serves
+    a ranged one.
 
     The URL goes in pre-encoded: yarl requotes a plain string, which decodes the
     %3D/%3B inside an HLS manifest's SIGNED path and earns a 403 on a URL ffmpeg
@@ -1724,10 +1728,15 @@ class YTDL(discord.FFmpegOpusAudio):
         )
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
-        if qo.ts is not None:
+        if qo.ts:
+            # Two-pass seek, both halves load-bearing: the input seek makes the HTTP
+            # range request, and `-ss 0` on the output drops the pre-roll it lands
+            # in. Input-side alone lands 5-10s early; output-side alone downloads
+            # from 0:00. See docs/ARCHITECTURE.md#audio-pipeline.
             # No user notice here: prefetch constructs this while the previous
             # song still plays. MusicPlayer's start path announces the offset.
-            ffmpeg_opts["options"] += f" -ss {qo.ts}"
+            ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
+            ffmpeg_opts["options"] += " -ss 0"
         if volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 
