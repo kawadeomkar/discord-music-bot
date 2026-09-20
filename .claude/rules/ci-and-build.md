@@ -8,6 +8,7 @@ paths:
   - "build_common.sh"
   - "build_docker.sh"
   - "deploy_docker.sh"
+  - "scripts/deploy.sh"
   - "pyproject.toml"
   - "poetry.lock"
 ---
@@ -143,8 +144,9 @@ just db-backup             # dump to backups/
 just db-restore FILE [DB]  # restore into a SCRATCH db (live needs CONFIRM=1 + a name)
 
 # Build & deploy
-just image                 # build runtime image :latest and :<git-sha> (no test gate)
-./build_docker.sh          # full pipeline: just check → just image → deploy
+just build                 # build runtime image :latest and :<git-sha> (no test gate)
+./build_docker.sh          # full pipeline: just check → just build → deploy
+just deploy                # pull → build → deploy the current branch, no gate (scripts/deploy.sh)
 just up [sha]              # deploy an already-built image (never builds; refuses unknown tags)
 just down / restart / logs / ps
 just test-image-rebuild    # required after changing pyproject.toml/poetry.lock

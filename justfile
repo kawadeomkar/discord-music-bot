@@ -764,7 +764,7 @@ services:
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
 # A raw `docker compose` still works — it just never deploys the archive tier.
 [doc('Run `docker compose` with the archive profile derived from HISTORY_ARCHIVE_ENABLED')]
-[group('deploy')]
+[group('ops')]
 compose *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1069,8 +1069,8 @@ db-restore FILE DB='':
 # a gate you cannot skip is a gate you route around.
 
 # Build the runtime image as :latest and :<git-sha> — no test gate
-[group('build')]
-image:
+[group('ops')]
+build:
     #!/usr/bin/env bash
     set -euo pipefail
     source ./build_common.sh
@@ -1090,7 +1090,7 @@ image:
     CHART_EXTRAS= build_runtime_image "{{ IMAGE }}:latest-slim" "{{ IMAGE }}:$tag-slim"
 
 # Deploy an already-built image; pass a git sha to roll back
-[group('deploy')]
+[group('ops')]
 up TAG='':
     # Quoted: unquoted, `just up '*'` globbed against the repo root and `just up "a b"`
     # passed two arguments. Both ended at the deploy guard's refusal, but naming a tag
@@ -1098,8 +1098,28 @@ up TAG='':
     # rather than none, which is why deploy_docker.sh tests `-n "${1:-}"` and not `$#`.
     ./deploy_docker.sh "{{ TAG }}"
 
+# Pull the current branch, build the image, and (re)deploy the containers — the "catch up
+# to origin and refresh my stack" shortcut, and the first-run "clone and start the
+# containers" path (compose creates them when none exist, rebuilds/recreates only the bot
+# container when they do).
+#
+# Delegates to scripts/deploy.sh rather than chaining `build`/`up` here, on purpose: that
+# script is the no-`just` entry point a regular user runs (`./scripts/deploy.sh` with only
+# Docker installed), and routing the recipe through it keeps the two a SINGLE code path
+# that cannot drift. The step-by-step rationale (best-effort --ff-only pull, tag matching,
+# why no gate) lives in that script now.
+#
+# NO test gate — for the gated build → check → deploy use ./build_docker.sh; to gate by
+# hand first, run `just check` (or `just ci`) and then this.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Pull the current branch, build the image, and (re)deploy the containers (no gate)')]
+[group('ops')]
+deploy:
+    ./scripts/deploy.sh
+
 # Stop the compose stack (volumes are kept)
-[group('deploy')]
+[group('ops')]
 down:
     # --profile archive is load-bearing, not decoration. `docker compose down`
     # with the profile INACTIVE removes only un-profiled containers and leaves
@@ -1114,23 +1134,23 @@ down:
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text
-# said "recreate", which sent `image && restart` down a path that silently kept running
+# said "recreate", which sent `build && restart` down a path that silently kept running
 # the old code. Use `just up` to deploy.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Restart the running bot in place — does NOT pick up a new image (use `just up`)')]
-[group('deploy')]
+[group('ops')]
 restart:
     docker compose restart discord-music-bot
 
 # Follow the bot's logs
-[group('deploy')]
+[group('ops')]
 logs *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     docker compose logs -f discord-music-bot "$@"
 
 # Show compose service status
-[group('deploy')]
+[group('ops')]
 ps:
     docker compose ps

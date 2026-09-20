@@ -373,10 +373,10 @@ count, so there is nothing to configure.
 
 | Recipe | Does |
 |---|---|
-| `just image` | Build the runtime image as `:latest` and `:<git-sha>`, plus the `-slim` pair without the chart renderer — no test gate |
+| `just build` | Build the runtime image as `:latest` and `:<git-sha>`, plus the `-slim` pair without the chart renderer — no test gate |
 
-`just image` has no test gate; the gate lives in the pipeline
-(`./build_docker.sh`). Use `just image` when you want the artifact and have already
+`just build` has no test gate; the gate lives in the pipeline
+(`./build_docker.sh`). Use `just build` when you want the artifact and have already
 run `just check`.
 
 **Database** — see [Operating the play-history archive](#operating-the-play-history-archive)
@@ -403,12 +403,19 @@ external one. A value already exported in your shell wins over `.env`, so
 
 | Recipe | Does |
 |---|---|
+| `just deploy` | Pull the current branch, build the image, and (re)deploy the containers — all three steps, no test gate. Covers a first run (no image, no containers) as well as a refresh |
 | `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA. With `HISTORY_ARCHIVE_ENABLED=true` it also deploys Postgres and applies pending migrations first, aborting the deploy if they fail |
 | `just down` | Stop the compose stack (volumes are kept) |
 | `just restart` | Restart the running bot in place — does **not** pick up a new image |
 | `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
 | `just ps` | Show compose service status |
 | `just compose <args>` | Any `docker compose` command, with the `archive` profile derived from the flag |
+
+`just deploy` needs no prior `just build`: it fast-forwards to `origin/<branch>`
+(best-effort — offline or diverged falls through to the current tree), builds, and
+deploys exactly the SHA it built. It builds the full image only, not the `-slim`
+pair, and it has no test gate — the gated form is `./build_docker.sh`. On a host
+without `just`, `./scripts/deploy.sh` is the same code path.
 
 `just up` never builds. If no image exists for the current commit it fails rather
 than letting Compose build one and label it with that SHA — see
@@ -425,8 +432,11 @@ just fmt && just check
 # Gate, build and deploy in one step
 ./build_docker.sh
 
+# Pull, build and deploy in one step — no gate
+just deploy
+
 # The same steps individually
-just check && just image && just up
+just check && just build && just up
 
 # Inspect a running deployment, then roll back
 just logs
@@ -453,7 +463,7 @@ The Compose stack runs the bot plus its supporting services:
 
 # Or the individual steps
 just check            # lint + type-check + tests (the gate)
-just image            # build the runtime image, no gate
+just build            # build the runtime image, no gate
 ./deploy_docker.sh    # deploy the image already built for HEAD
 
 # Just the essentials (bot + Redis, no observability/PO-token sidecar)
@@ -856,7 +866,7 @@ just db-backfill --dry-run   # count what would move, write nothing
 just db-backfill             # do it
 
 # Docker-only host (no local venv). Build FIRST — see below:
-just image
+just build
 just db-backfill-docker --dry-run
 just db-backfill-docker
 
@@ -865,7 +875,7 @@ just db-backfill-docker
 COMPOSE_PROFILES=archive docker compose run --rm db-backfill --dry-run
 ```
 
-**The Docker path needs `just image` first, and the order is build → backfill → deploy.**
+**The Docker path needs `just build` first, and the order is build → backfill → deploy.**
 `docker compose run` uses a locally-present tag and will not rebuild a stale one, but
 `db-backfill` is pinned to `discord-music-bot:${GIT_SHA:-latest}` — the tag your *running*
 deployment already has. On a host that has not built this commit yet, that image predates
@@ -876,7 +886,7 @@ the backfill and the run ends at:
 ```
 
 It fails loudly rather than silently, but the obvious reaction ("deploy the new image
-first, then backfill") is the unrecoverable direction. `just image` builds and tags
+first, then backfill") is the unrecoverable direction. `just build` builds and tags
 without deploying anything, which is why it is a separate step from `./build_docker.sh`.
 
 Rehearse with `--dry-run` first: it checks the database is reachable and migrated, then

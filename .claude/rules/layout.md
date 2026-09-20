@@ -87,7 +87,8 @@ docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for 
 tests/                # one test_<module>.py per src module, commands/ mirroring src/commands/,
                       # + conftest.py (seams) + helpers.py + mock_spec_cache.py
                       # test_pg_integration.py / test_redis_integration.py are the opt-in tiers
-justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh compose them
+justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh
+                      # compose them, and scripts/deploy.sh is `just deploy`'s no-`just` twin
 Dockerfile            # 3 stages: builder (deps) → test (adds test+lint groups) → runtime (ffmpeg, no poetry)
 docker-compose.yml    # bot (host network) + redis + postgres + db-migrate (one-shot,
                       # `archive` profile) + db-backfill (one-shot, `ops` profile, run by
