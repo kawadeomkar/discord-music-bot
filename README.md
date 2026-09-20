@@ -564,6 +564,29 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.43.0
+
+**Spotify album links now queue.** `-play https://open.spotify.com/album/…` takes the
+whole album, the way a playlist link already did: under `--now` and `--next` too, with
+the same live card while a long one is read, and one `-remove <the link>` takes it back
+out. The confirmation names the album, its artists and its cover. An album is read once
+and kept for 24 hours; Spotify is asked again after that.
+
+Three smaller changes to what a pasted Spotify link does:
+
+- **A share link from a non-English client works.** Spotify's own share sheet produces
+  `open.spotify.com/intl-de/album/…`; the locale segment used to make the link fail.
+- **A link the bot cannot queue says so.** An `/artist/` or `/show/` link, or one with no
+  id, used to answer with a Python exception. It now names the three kinds it takes.
+- **A link pasted as `<link>`** (how Discord sends one whose preview you suppressed) is
+  read as the link inside.
+
+If Spotify stops sending an album or playlist before its own count of it, the
+confirmation is now preceded by a line saying some songs may be missing, instead of
+reporting the partial count as the whole. Nothing to configure, and no data moves.
+Rolling back is only a redeploy; the album cache entries an older build never reads
+expire on their own.
+
 ## Upgrading to 2.40.0
 
 **Three settings now refuse startup when they are out of range**, the way the other
