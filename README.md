@@ -403,12 +403,19 @@ external one. A value already exported in your shell wins over `.env`, so
 
 | Recipe | Does |
 |---|---|
+| `just deploy` | Pull the current branch, build the image, and (re)deploy the containers — all three steps, no test gate. Covers a first run (no image, no containers) as well as a refresh |
 | `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA. With `HISTORY_ARCHIVE_ENABLED=true` it also deploys Postgres and applies pending migrations first, aborting the deploy if they fail |
 | `just down` | Stop the compose stack (volumes are kept) |
 | `just restart` | Restart the running bot in place — does **not** pick up a new image |
 | `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
 | `just ps` | Show compose service status |
 | `just compose <args>` | Any `docker compose` command, with the `archive` profile derived from the flag |
+
+`just deploy` needs no prior `just build`: it fast-forwards to `origin/<branch>`
+(best-effort — offline or diverged falls through to the current tree), builds, and
+deploys exactly the SHA it built. It builds the full image only, not the `-slim`
+pair, and it has no test gate — the gated form is `./build_docker.sh`. On a host
+without `just`, `./scripts/deploy.sh` is the same code path.
 
 `just up` never builds. If no image exists for the current commit it fails rather
 than letting Compose build one and label it with that SHA — see
@@ -424,6 +431,9 @@ just fmt && just check
 
 # Gate, build and deploy in one step
 ./build_docker.sh
+
+# Pull, build and deploy in one step — no gate
+just deploy
 
 # The same steps individually
 just check && just build && just up

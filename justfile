@@ -1098,6 +1098,26 @@ up TAG='':
     # rather than none, which is why deploy_docker.sh tests `-n "${1:-}"` and not `$#`.
     ./deploy_docker.sh "{{ TAG }}"
 
+# Pull the current branch, build the image, and (re)deploy the containers — the "catch up
+# to origin and refresh my stack" shortcut, and the first-run "clone and start the
+# containers" path (compose creates them when none exist, rebuilds/recreates only the bot
+# container when they do).
+#
+# Delegates to scripts/deploy.sh rather than chaining `build`/`up` here, on purpose: that
+# script is the no-`just` entry point a regular user runs (`./scripts/deploy.sh` with only
+# Docker installed), and routing the recipe through it keeps the two a SINGLE code path
+# that cannot drift. The step-by-step rationale (best-effort --ff-only pull, tag matching,
+# why no gate) lives in that script now.
+#
+# NO test gate — for the gated build → check → deploy use ./build_docker.sh; to gate by
+# hand first, run `just check` (or `just ci`) and then this.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Pull the current branch, build the image, and (re)deploy the containers (no gate)')]
+[group('ops')]
+deploy:
+    ./scripts/deploy.sh
+
 # Stop the compose stack (volumes are kept)
 [group('ops')]
 down:

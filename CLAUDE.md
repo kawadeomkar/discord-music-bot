@@ -150,7 +150,7 @@ just test -k spotify
 just test --maxfail=1
 
 # Operator and deploy recipes (db-migrate, backfill, outbox, bot-settings,
-# build, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
+# build, deploy, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
 ```
 
 fmt/fmt-check/lint/types/test/check run **inside the test image by default** — no local
@@ -180,7 +180,8 @@ src/commands/      ONE MODULE PER COMMAND, each exposing run()
 migrations/        NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  the only tracked file under docs/ (golden rule 2)
 tests/             one test_<module>.py per src module, commands/ mirroring src/commands/
-justfile           every dev command; build_*.sh / deploy_docker.sh compose them
+justfile           every dev command; build_*.sh / deploy_docker.sh compose them;
+                   scripts/deploy.sh is `just deploy`'s no-`just` twin
 Dockerfile         3 stages: builder (deps) → test (+ test/lint groups) → runtime
 docker-compose.yml bot + redis + postgres (archive profile) + pot-provider + otel-lgtm
 .github/workflows/ ci.yml, security.yml (pip-audit), todo-to-issue.yml
