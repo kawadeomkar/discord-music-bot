@@ -14,6 +14,8 @@ services:
         GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
+    # Linux only. On Docker Desktop the daemon runs in a VM, where this is a
+    # no-op and the bot cannot reach Redis or the OTLP endpoint on localhost.
     network_mode: host
     env_file:
     - .env
@@ -41,9 +43,10 @@ services:
       # metrics stack lives on another host.
       - DEBUG_PROMETHEUS_URL=${DEBUG_PROMETHEUS_URL:-http://localhost:${PROMETHEUS_HOST_PORT:-9090}}
       # Off by default; `true` starts every server with debug mode on. This is the
-      # default for servers that have NEVER run `-debug --enable`/`--disable` —
-      # that choice is per server, persisted to guild:{id}:config, and wins over
-      # this value across restarts.
+      # default for servers that have NEVER chosen with `-debug --enable`/`--disable`
+      # or `-settings debug` — that choice is per server, persisted to
+      # guild:{id}:config, and wins over this value across restarts. The operator's
+      # `-settings bot debug-default` replaces this value until the bot restarts.
       - DEBUG_MODE
       #
       # Built from the same POSTGRES_* vars as the postgres service below, so
@@ -81,7 +84,15 @@ services:
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
-      - ytdlp-cache:/root/.cache/yt-dlp
+      # Path follows HOME for the non-root `app` user in the Dockerfile; the two
+      # move together.
+      #
+      # Docker seeds ownership only into an EMPTY volume, so a ytdlp-cache
+      # carried over from the root-owned path stays root:root and uid 10001
+      # cannot write it: yt-dlp logs `PermissionError: [Errno 13]` per store and
+      # nothing persists, which startup logs as a warning. Repair it in place —
+      #   docker exec -u 0 discord-music-bot chown -R 10001:10001 /home/app/.cache/yt-dlp
+      - ytdlp-cache:/home/app/.cache/yt-dlp
     depends_on:
       redis:
         condition: service_healthy
@@ -101,14 +112,14 @@ services:
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
       # bgutil-pot-provider is intentionally NOT in depends_on either: the bot is
-      # fully functional without it (web_safari degrades to token-less, android_vr
+      # fully functional without it (the fallback client degrades to token-less, the primary
       # is untouched).
 
   redis:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Three kinds of key deliberately carry NO TTL
+    # volatile-lru, NOT allkeys-lru. Four kinds of key deliberately carry NO TTL
     # and must never become eviction candidates:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
@@ -125,13 +136,22 @@ services:
     #                       full archive behind it. Bounded by length, never by
     #                       time: ~24 KB per guild, permanently.
     #   guild:{id}:config   a guild's DURABLE choices — debug mode, volume,
-    #                       timezone. Evicting one silently reverts a setting the
-    #                       guild chose, with no log line and no error, which is
+    #                       timezone, idle and alone timeouts, progress-bar
+    #                       refresh, lookup notice, playlist card delay.
+    #                       Evicting one silently reverts a setting the guild
+    #                       chose, with no log line and no error, which is
     #                       exactly the failure moving these out of the 24h-TTL
     #                       state hash was meant to fix. A handful of fields per
-    #                       guild (~160 B), written only by an explicit command
-    #                       and deleted on guild removal, so it scales with guild
-    #                       count and not with runtime.
+    #                       guild (~300 B with all eight set), written only by
+    #                       an explicit command and deleted on guild removal
+    #                       (or, for a guild removed while the bot was offline,
+    #                       by the startup orphan sweep), so it scales with
+    #                       guild count and not with runtime.
+    #   bot:{application_id}:config
+    #                       the operator's bot-wide -settings bot overrides, one
+    #                       hash per application. Evicting it returns every
+    #                       overridden knob to its environment value at the next
+    #                       start. Bounded by the number of bot settings.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
     # so volatile-lru preserves cache-eviction behavior for them.
@@ -317,7 +337,7 @@ services:
         condition: service_started
 
   bgutil-pot-provider:
-    # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
+    # Mints GVS Proof-of-Origin tokens so yt-dlp's fallback client can serve audio
     # client. Version must match the
     # bgutil-ytdlp-pot-provider pin in pyproject.toml — plugin and server are
     # released in lockstep; bump both together.
@@ -385,6 +405,8 @@ services:
       - ./grafana/dashboards/discord-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/discord-provider.yaml:ro
       - ./grafana/dashboards/json:/var/lib/grafana/dashboards/discord:ro
     environment:
+      # Dev credentials, safe only while this service is unpublished beyond the
+      # host. Replace them anywhere it is reachable.
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:

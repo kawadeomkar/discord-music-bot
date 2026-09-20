@@ -1,8 +1,12 @@
 .venv/
 venv/
-__pycache__/
-*.pyc
-*.pyo
+# Recursive globs: a bare `__pycache__/` matches only the context ROOT, so the
+# host's src/__pycache__ and tests/__pycache__ were being copied into the image --
+# including .pyc files for interpreters the runtime image does not have. That made a
+# locally built image differ from a CI one, which builds from a clean checkout.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
 .pytest_cache/
 .mypy_cache/
 .coverage

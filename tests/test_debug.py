@@ -4,11 +4,12 @@ built to be screenshotted into an issue, so a value that should never render is 
 credential leak rather than a cosmetic bug."""
 
 import asyncio
+import dataclasses
 import os
 import re
 import time
 from pathlib import Path
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,21 +21,22 @@ from redis.asyncio import Redis
 from discord.ext import commands
 from opentelemetry import trace as trace_api
 
-from src import config, debug
+from src import config, debug, settings_card
+from src.commands import debug as debug_cmd
 from src.guild_state import GuildConfig
 from src.history_archive import ArchiveStats
 from src.redis_client import GuildRedisStore
+from src.settings import SETTINGS, BotSettings, SettingScope
 from src.musicbot import MusicBot as MusicBotCog
-from src.util import spawn_background
-from tests.helpers import command_callback
+from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, cancel_task, spawn_background
+from src.guild_queue import QueueObject
+from tests.helpers import command_callback, seed_queue, stored_config
 from src.musicplayer import MusicPlayer
-from src.youtube import QueueObject
 from src.debug import (
     DebugAction,
     DebugInputs,
     _CONFIG_ALLOWLIST,
     _ConfigKind,
-    _codeblock_fields,
     run_debug_dashboard,
     config_lines,
     discord_lines,
@@ -42,6 +44,7 @@ from src.debug import (
     parse_debug_arg,
     redact_url,
     render_config_value,
+    settings_line,
     unknown_arg_message,
 )
 
@@ -280,6 +283,18 @@ class TestConfigAllowlist:
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "YTDLP_POOL_WORKERS")
         assert render_config_value(var) == "4 (default)"
 
+    def test_the_environment_default_is_read_at_render_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() infers ENVIRONMENT from the git branch when the var is unset, and
+        src.main imports this module — so a fallback stored at import freezes the
+        pre-inference value and this row contradicts the host block on the same card.
+        """
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.setattr(config, "ENVIRONMENT", "task/some-branch")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "ENVIRONMENT")
+        assert render_config_value(var) == "task/some-branch (default)"
+
     def test_unlisted_variable_never_renders(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -289,27 +304,89 @@ class TestConfigAllowlist:
         assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
         assert "leaked" not in "\n".join(config_lines())
 
+    def test_the_knob_rows_are_the_bot_card_in_its_order(self) -> None:
+        """One row per settable knob, where the operator's other view of them puts
+        each, and nothing between them."""
+        rows = [v for v in _CONFIG_ALLOWLIST if v.knob is not None]
+        assert [v.name for v in rows] == [
+            spec.knob.env for spec in SETTINGS if spec.knob is not None
+        ]
+        # By variable, never identity: a reload of config mints new handles.
+        assert {v.name for v in rows} == {k.env for k in config.KNOBS.values()}
+        assert all(v.knob is not None and v.name == v.knob.env for v in rows)
+        first = _CONFIG_ALLOWLIST.index(rows[0])
+        assert list(_CONFIG_ALLOWLIST[first : first + len(rows)]) == rows
+
+    @pytest.mark.parametrize(
+        ("override", "env", "rendered"),
+        [
+            (None, None, "3s (default)"),
+            (None, "4", "4s (env)"),
+            (None, "0.5", "0.5s (env, outside chat range)"),
+            (5.0, "4", "5s (bot owner; env 4s)"),
+            (5.0, None, "5s (bot owner; default 3s)"),
+        ],
+    )
+    def test_a_knob_row_renders_the_value_in_force_and_its_source(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        override: float | None,
+        env: str | None,
+        rendered: str,
+    ) -> None:
+        """The `-settings bot` card's labels. "env" shows the parsed baseline, not
+        the raw string, and an override names the value it shadows."""
+        if env is None:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS", raising=False)
+            monkeypatch.setitem(config._BASELINES, "HEARTBEAT_INTERVAL_SECS", 3.0)
+        else:
+            monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
+            monkeypatch.setitem(
+                config._BASELINES, "HEARTBEAT_INTERVAL_SECS", float(env)
+            )
+        if override is not None:
+            config.heartbeat_interval_secs.set_override(override)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "HEARTBEAT_INTERVAL_SECS")
+        assert render_config_value(var) == rendered
+
+    def test_a_count_knob_renders_as_a_whole_number(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PLAY_INFLIGHT_MAX", raising=False)
+        config.play_inflight_max.set_override(8)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "PLAY_INFLIGHT_MAX")
+        assert render_config_value(var) == "8 (bot owner; default 16)"
+
+    @pytest.mark.parametrize("unread", [True, False])
+    def test_the_overrides_row_says_when_stored_values_are_unread(
+        self, monkeypatch: pytest.MonkeyPatch, unread: bool
+    ) -> None:
+        monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
+        row = next(
+            line
+            for line in config_lines(unread=unread)
+            if "BOT_SETTINGS_OVERRIDES" in line
+        )
+        assert row.endswith("(stored values not read yet)") is unread
+
     def test_no_duplicate_rows(self) -> None:
         names = [v.name for v in _CONFIG_ALLOWLIST]
         assert len(names) == len(set(names))
 
-
-class TestCodeblockFields:
-    def test_short_block_is_one_field(self) -> None:
-        fields = _codeblock_fields("Config", ["a", "b"])
-        assert fields == [("Config", "```\na\nb\n```")]
-
-    def test_long_block_splits_rather_than_truncating(self) -> None:
-        """Discord's field cap is 1024. A config listing clipped in place would
-        read as a complete one, which is worse than showing none."""
-        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
-        fields = _codeblock_fields("Config", lines)
-        assert len(fields) > 1
-        assert all(len(value) <= 1024 for _, value in fields)
-        assert fields[1][0] == "Config (cont.)"
-        rendered = "".join(value for _, value in fields)
-        for line in lines:
-            assert line in rendered
+    @pytest.mark.parametrize(
+        ("name", "unset", "value"),
+        [
+            ("BOT_SETTINGS_OVERRIDES", "apply (default)", "ignore"),
+        ],
+    )
+    def test_the_operator_variables_render_what_is_in_force(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, unset: str, value: str
+    ) -> None:
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == name)
+        monkeypatch.delenv(name, raising=False)
+        assert render_config_value(var) == unset
+        monkeypatch.setenv(name, value)
+        assert render_config_value(var) == value
 
 
 class TestDiscordBlock:
@@ -366,35 +443,50 @@ class TestGuildBlock:
         assert "queue        0 queued" in lines
         assert "volume       50%" in lines
 
-    async def test_the_queue_row_counts_a_claimed_but_unstarted_song(
-        self, mock_guild: MagicMock, music_player: MusicPlayer, mock_author: MagicMock
+    def test_with_no_player_the_volume_row_is_the_setting(
+        self, mock_guild: MagicMock
     ) -> None:
-        """The row is display_size(), not qsize().
-
-        They differ by exactly the in-flight head — the song the loop has
-        claimed and is still resolving — and they are one token apart over the
-        same two fields, so a swap back compiles, type-checks, and reads as
-        `0 queued` to a user whose song is being resolved right now. On an empty
-        queue the two agree, which is the only state the sibling above covers.
-        """
         mock_guild.voice_client = None
-        await music_player.queue.put(
-            [
-                QueueObject("https://yt.com/v=1", "One", mock_author),
-                QueueObject("https://yt.com/v=2", "Two", mock_author),
-            ]
+        rows = settings_card.server_rows(
+            GuildConfig(volume=0.5), debug_default=False, unsaved=frozenset()
         )
-        await music_player.queue.get()  # the loop claims the head, unsettled
-        assert music_player.queue.qsize() == 1  # what the swapped-back call reads
+        inputs = dataclasses.replace(self._inputs(), settings=tuple(rows))
+        lines = guild_lines(mock_guild, inputs, source="saved here")
+        assert "volume       50% (setting; no player)" in lines
+        assert "settings     volume 50% (1 changed)" in lines
+
+    def test_with_no_player_and_no_rows_the_volume_row_is_the_default(
+        self, mock_guild: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_guild.voice_client = None
+        monkeypatch.setattr(debug, "DEFAULT_VOLUME", 0.8)
+        lines = guild_lines(mock_guild, self._inputs(), source="saved here")
+        assert "volume       80% (setting; no player)" in lines
+
+    async def test_a_claimed_song_still_counts_as_queued(
+        self,
+        mock_guild: MagicMock,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+    ) -> None:
+        """The row renders display_size(), the number -queue shows. On qsize() it
+        drops a song the loop has claimed but not yet started — which is most of
+        every song — and an operator reading two depths from two commands cannot
+        tell which one is lying."""
+        mock_guild.voice_client = None
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/watch?v=claimed", "Claimed", mock_author),
+        )
+        await music_player.queue.get()
+        assert music_player.queue.qsize() == 0
 
         lines = "\n".join(
             guild_lines(
-                mock_guild,
-                self._inputs(player=cast(Optional[MusicPlayer], music_player)),
-                source="saved here",
+                mock_guild, self._inputs(player=music_player), source="saved here"
             )
         )
-        assert "queue        2 queued" in lines
+        assert "queue        1 queued" in lines
 
     @pytest.mark.parametrize(
         "name",
@@ -466,6 +558,211 @@ class TestGuildBlock:
         assert "speak ⚠️" in lines
 
 
+def _rows(
+    stored: GuildConfig, *, unsaved: frozenset[str] = frozenset()
+) -> list[tuple[Any, settings_card.Shown]]:
+    return settings_card.server_rows(stored, debug_default=False, unsaved=unsaved)
+
+
+class TestTheSettingsLine:
+    """ "This server" lists the settings changed here, from the cache, with the
+    -settings card's labels. Everyone sees the block, so it carries server keys only."""
+
+    def test_lists_only_the_changed_keys_in_registry_order(self) -> None:
+        rows = _rows(GuildConfig(idle_timeout_secs=600.0, timezone="Europe/London"))
+        assert (
+            settings_line(rows, read=True)
+            == "timezone Europe/London, leave-when-idle 10:00 (2 changed)"
+        )
+
+    def test_nothing_changed(self) -> None:
+        assert settings_line(_rows(GuildConfig()), read=True) == "none changed"
+
+    def test_a_write_that_did_not_reach_redis_is_marked(self) -> None:
+        """A reset that did not persist is a change too: Redis still holds the old
+        value, which returns at the next restart."""
+        rows = _rows(
+            GuildConfig(volume=0.5),
+            unsaved=frozenset({"volume", "idle_timeout_secs"}),
+        )
+        assert settings_line(rows, read=True) == (
+            "volume 50% (not saved), leave-when-idle 5:00 (not saved) (2 changed)"
+        )
+
+    def test_a_value_under_the_bots_minimum_names_both(self) -> None:
+        config.now_playing_update_interval_secs.set_override(5.0)
+        rows = _rows(GuildConfig(np_refresh_secs=2.0))
+        assert settings_line(rows, read=True) == (
+            "progress-bar-refresh 5s (bot minimum; set here 2s) (1 changed)"
+        )
+
+    def test_an_unread_cache_is_not_reported_as_unchanged(self) -> None:
+        """-debug is how a Redis outage gets diagnosed, and a boot with Redis down
+        leaves every guild unread: "none changed" would be false exactly then."""
+        assert (
+            settings_line(_rows(GuildConfig()), read=False)
+            == "none known (stored values not read yet)"
+        )
+        assert settings_line(_rows(GuildConfig(volume=0.5)), read=False) == (
+            "volume 50% (1 changed; stored values not read yet)"
+        )
+
+    def test_the_row_is_in_the_guild_block(self, mock_guild: MagicMock) -> None:
+        mock_guild.voice_client = None
+        inputs = DebugInputs(
+            debug_enabled=False,
+            debug_overridden=False,
+            players=0,
+            settings=tuple(_rows(GuildConfig(alone_timeout_secs=30.0))),
+        )
+        lines = guild_lines(mock_guild, inputs, source="host default")
+        assert "settings     leave-when-alone 0:30 (1 changed)" in lines
+
+    def test_every_setting_changed_and_unsaved_still_fits_its_field(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        stored = GuildConfig(
+            volume=0.05,
+            timezone="America/Argentina/Buenos_Aires",
+            idle_timeout_secs=1800.0,
+            alone_timeout_secs=120.0,
+            np_refresh_secs=30.0,
+            slow_notice_secs=60.0,
+            queue_progress_delay_secs=60.0,
+            debug_mode=True,
+        )
+        rows = _rows(stored, unsaved=frozenset(stored.to_redis()))
+        inputs = DebugInputs(
+            debug_enabled=True,
+            debug_overridden=True,
+            players=0,
+            settings=tuple(rows),
+            settings_read=False,
+        )
+        mock_ctx.guild.voice_client = None
+        embed = debug.render_snapshot_embed(
+            mock_ctx,
+            inputs,
+            blocks=debug.instant_blocks(mock_ctx, inputs, source="saved here"),
+            source="saved here",
+        )
+        server = [f for f in embed.fields if (f.name or "").startswith("This server")]
+        assert len(server) == 1 and len(server[0].value or "") <= 1024
+        assert "(8 changed; stored values not read yet)" in (server[0].value or "")
+
+    async def test_a_change_reaches_the_card(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
+
+        embed = await _snapshot(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        )
+
+        server = next(f for f in embed.fields if f.name == "This server")
+        assert "settings     leave-when-idle 10:00 (1 changed)" in (server.value or "")
+
+    async def test_the_card_sends_while_redis_never_answers(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The operator's view, which is how a Redis outage gets diagnosed: the line
+        reads the cache, so the skeleton sends while the Redis probe still waits."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(volume=0.5))
+
+        async def stalled(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        sent = asyncio.Event()
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+
+        async def send(**_: object) -> MagicMock:
+            sent.set()
+            return message
+
+        mock_ctx.channel.send = AsyncMock(side_effect=send)
+        redis = cast(Any, cog.redis)
+        with (
+            patch.object(redis, "execute_command", new=stalled),
+            patch.object(GuildRedisStore, "read_config", new=stalled),
+        ):
+            async with asyncio.timeout(2):
+                inputs = await debug_cmd.build_inputs(mock_ctx, cog=cog)
+            assert inputs.operator
+            task = asyncio.create_task(run_debug_dashboard(mock_ctx, inputs))
+            try:
+                async with asyncio.timeout(2):
+                    await sent.wait()
+            finally:
+                await cancel_task(task)
+
+        call = mock_ctx.channel.send.await_args
+        assert call is not None
+        embed = cast(discord.Embed, call.kwargs["embeds"][0])
+        server = next(f for f in embed.fields if f.name == "This server")
+        assert "settings     volume 50% (1 changed)" in (server.value or "")
+
+    async def test_an_unsaved_bot_setting_is_marked_in_the_config_block(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The label -settings bot shows: a write that did not reach Redis is gone
+        at the next start, and the Config block must not show it as the owner's."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.voice_client = None
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        bot_settings = BotSettings(cog.bot, redis=None, ignore_stored=False)
+        cast(Any, cog.bot).bot_settings = bot_settings
+        heartbeat = next(
+            s for s in SETTINGS if s.key == "heartbeat" and s.scope is SettingScope.BOT
+        )
+        await bot_settings.write(heartbeat, 5.0)
+
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        blocks = debug.instant_blocks(mock_ctx, inputs, source="x")
+
+        row = next(line for line in blocks["Config"] if "HEARTBEAT_INTERVAL" in line)
+        assert row.endswith("5s (not saved)")
+
+    async def test_a_non_operator_sees_this_servers_settings_and_none_of_the_bots(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """Bot values are the operator's Config block. The line leaves out a server
+        key still following the bot, so its value is not disclosed here either."""
+        cog = music_bot_with_redis
+        mock_ctx.guild.id = 42
+        mock_ctx.guild.voice_client = None
+        await cog.guild_settings.hydrate([42])
+        await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
+        for knob in config.KNOBS.values():
+            cast(config.Knob[float], knob).set_override(knob.baseline)
+        config.now_playing_update_interval_secs.set_override(7.25)
+
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        operator = debug.instant_blocks(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog), source="x"
+        )
+        assert "bot owner;" in "\n".join(operator["Config"])
+
+        mock_ctx.bot.is_owner = AsyncMock(return_value=False)
+        embed = await _snapshot(
+            mock_ctx, await debug_cmd.build_inputs(mock_ctx, cog=cog)
+        )
+        shown = str(embed.to_dict())
+        assert "leave-when-idle 10:00 (1 changed)" in shown
+        assert "bot owner;" not in shown
+        assert "7.25" not in shown
+        for knob in config.KNOBS.values():
+            assert knob.env not in shown
+
+
 class TestSafeBlock:
     async def test_a_broken_collector_does_not_take_the_embed_down(
         self, mock_ctx: MagicMock
@@ -497,6 +794,18 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         return DebugInputs(
             debug_enabled=False, debug_overridden=False, players=0, operator=True, **kw
         )
+
+    async def test_the_tick_and_deadline_come_from_the_bot_settings(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The deadline test below would pass on a baseline read, only slower."""
+        config.debug_tick_secs.set_override(2.5)
+        config.debug_deadline_secs.set_override(12.0)
+        driver = AsyncMock()
+        with patch("src.debug.run_live_dashboard", new=driver):
+            await debug.run_debug_dashboard(mock_ctx, self._operator())
+        kwargs = driver.call_args.kwargs
+        assert (kwargs["tick_secs"], kwargs["deadline_secs"]) == (2.5, 12.0)
 
     async def test_the_skeleton_shows_placeholders_for_blocks_still_collecting(
         self, mock_ctx: MagicMock
@@ -574,8 +883,8 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         """The improvement over one all-or-nothing timeout: a hung dependency costs
         its own block and nothing else."""
         mock_ctx.guild.voice_client = None
-        monkeypatch.setattr(debug, "DEBUG_DEADLINE_SECS", 0.3)
-        monkeypatch.setattr(debug, "DEBUG_TICK_SECS", 0.01)
+        config.debug_deadline_secs.set_override(0.3)
+        config.debug_tick_secs.set_override(0.01)
         # The sampler owns a real window; shrink it so only the hung probe is
         # slow enough to miss the deadline.
         monkeypatch.setattr(debug, "_CPU_WINDOW_SECS", 0.0)
@@ -753,7 +1062,7 @@ class TestDecorationIsIdempotent:
         debug.decorate_embeds([embed], shard_id=1)
         debug.decorate_embeds([embed], shard_id=2)
         text = embed.footer.text or ""
-        assert text.startswith("Avg Bitrate: 128 kbps · ")
+        assert text.startswith("Avg Bitrate: 128 kbps\n")
         assert text.count("Avg Bitrate") == 1
         assert text.count(debug._DEBUG_MARK) == 1
         assert "shard 2" in text
@@ -778,42 +1087,45 @@ class TestDecorationIsIdempotent:
         debug.decorate_embeds([embed], span=span, elapsed_ms=2.0)
         assert (embed.footer.text or "").count(TestTraceIdInTheFooter.HEX) == 1
 
-    def test_nothing_to_show_strips_a_stale_suffix(self) -> None:
+    def test_turning_debug_off_strips_the_suffix(self) -> None:
+        """decorate_embeds always has the environment to show, so removing a suffix
+        is the strip path's job — what a guild sees after `-debug --disable`."""
         embed = discord.Embed(title="x")
         debug.decorate_embeds([embed], shard_id=0)
         assert embed.footer.text is not None
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.footer.text is None
 
-    def test_nothing_to_show_restores_the_original_footer(self) -> None:
+    def test_the_strip_restores_the_original_footer(self) -> None:
         embed = discord.Embed(title="x")
         embed.set_footer(text="environment: test")
         debug.decorate_embeds([embed], shard_id=0)
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.footer.text == "environment: test"
 
-    def test_a_doubled_legacy_suffix_is_fully_replaced(self) -> None:
-        """Pre-idempotency footers can carry two suffixes; the first mark is the
-        boundary, so one decoration heals the whole tail."""
+    def test_a_doubled_suffix_is_fully_replaced(self) -> None:
+        """A footer carrying two suffixes; the first mark is the boundary, so one
+        decoration heals the whole tail."""
         embed = discord.Embed(title="x")
         embed.set_footer(
-            text=f"base · {debug._DEBUG_MARK} 3 ms · {debug._DEBUG_MARK} 4 ms"
+            text=f"base\n{debug._DEBUG_MARK} 3 ms\n{debug._DEBUG_MARK} 4 ms"
         )
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"base · {debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == (
+            f"base\n{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
 
-    def test_an_undecorated_footer_is_left_exactly_alone(self) -> None:
-        """Nothing to add and nothing stale to strip. Reachable: debug on, in a DM
-        (no shard), before the sampler's first tick, outside a command span."""
+    def test_a_footers_icon_survives_decoration(self) -> None:
+        """The icon rides with the text, so it must survive a footer growing one."""
         embed = discord.Embed(title="x")
         embed.set_footer(text="environment: test", icon_url="https://e/i.png")
         debug.decorate_embeds([embed])
-        assert embed.footer.text == "environment: test"
+        assert (embed.footer.text or "").startswith("environment: test\n")
         assert embed.footer.icon_url == "https://e/i.png"
 
-    def test_an_empty_footer_stays_empty(self) -> None:
+    def test_an_undecorated_embed_stays_empty_while_debug_is_off(self) -> None:
         embed = discord.Embed(title="x")
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.footer.text is None
 
     def test_a_footer_that_is_only_a_suffix_loses_its_icon_too(self) -> None:
@@ -822,29 +1134,32 @@ class TestDecorationIsIdempotent:
         embed.set_footer(
             text=f"{debug._DEBUG_MARK} shard 0", icon_url="https://e/i.png"
         )
-        debug.decorate_embeds([embed])
+        debug.strip_debug_footers([embed])
         assert embed.to_dict().get("footer") in (None, {})
 
     def test_a_near_limit_footer_keeps_accepting_a_fresh_suffix(self) -> None:
-        """The clip falls on the base. Truncating the join cuts the ` · 🐞 `
-        boundary off, after which no suffix is ever accepted again."""
+        """The clip falls on the base, so a footer already at the limit still gets a
+        whole suffix on a line of its own rather than a half-written one."""
         embed = discord.Embed(title="x")
-        embed.set_footer(text="B" * (debug.FOOTER_LIMIT - 4))
+        embed.set_footer(text="B" * (FOOTER_LIMIT - 4))
         debug.decorate_embeds([embed], elapsed_ms=5.0, shard_id=0)
         assert "5 ms" in (embed.footer.text or "")
         debug.decorate_embeds([embed], elapsed_ms=9.0, shard_id=0)
         text = embed.footer.text or ""
         assert text.count(debug._DEBUG_MARK) == 1
         assert "9 ms" in text and "5 ms" not in text
-        assert len(text) <= debug.FOOTER_LIMIT
+        assert len(text) <= FOOTER_LIMIT
 
     def test_a_mark_that_is_not_a_suffix_takes_the_tail_with_it(self) -> None:
-        """The first mark is the boundary, so anything after it is discarded. Safe
-        only while no bot-authored footer contains one — asserted below."""
+        """The first mark is the boundary wherever it sits, so anything after it is
+        discarded and one decoration is all a footer ever carries. Safe only while no
+        bot-authored footer contains one — asserted below."""
         embed = discord.Embed(title="x")
         embed.set_footer(text=f"a · {debug._DEBUG_MARK} b · c")
         debug.decorate_embeds([embed], shard_id=0)
-        assert embed.footer.text == f"a · {debug._DEBUG_MARK} shard 0"
+        assert embed.footer.text == (
+            f"a · \n{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
 
     def test_no_footer_the_bot_writes_contains_the_mark(self) -> None:
         """The invariant the test above depends on. `-debug`'s own mark is in its
@@ -859,6 +1174,119 @@ class TestDecorationIsIdempotent:
                 if debug._DEBUG_MARK in match.group(1):
                     offenders.append(f"{path}: {match.group(1)[:60]}")
         assert not offenders, offenders
+
+
+class TestTheEnvironmentSegment:
+    """Which deployment the card came from. It leads the suffix, because everything
+    after it describes that deployment."""
+
+    def test_it_leads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        assert debug.debug_footer(shard_id=0) == (
+            f"{debug._DEBUG_MARK} production · shard 0"
+        )
+
+    def test_no_caller_can_name_a_different_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It is a property of the process, not of the request, so it is read here
+        rather than passed — and read late, since main() may infer it from the git
+        branch long after this module is imported."""
+        monkeypatch.setattr(config, "ENVIRONMENT", "staging")
+        assert "staging" in debug.debug_footer(shard_id=0)
+
+    def test_the_dashboards_suppress_it_like_a_trace(self) -> None:
+        """Both cards open their own footer with `environment: <name>`, and twice in
+        one line reads as two deployments."""
+        assert debug.debug_footer(shard_id=0, skip_environment=True) == (
+            f"{debug._DEBUG_MARK} shard 0"
+        )
+
+    def test_the_dashboard_suffix_leaves_it_out(self) -> None:
+        settings = debug.DebugSettings()
+        settings._default = True
+        settings._sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=1.0, mem_percent=2.0, lag_ms=0.5, tasks=3, pool_workers=4
+        )
+        suffix = settings.footer(None) or ""
+        assert "cpu 1%" in suffix
+        assert config.ENVIRONMENT not in suffix
+
+
+class TestOneDecorationEntryPoint:
+    """Every embed the bot sends is decorated through DebugSettings.decorate, so the
+    environment, the shard and the runtime figures are assembled once. A seam that
+    forgot a segment used to be possible; now there is nowhere to forget it."""
+
+    @staticmethod
+    def _settings(guild_id: int, *, on: bool) -> debug.DebugSettings:
+        settings = debug.DebugSettings()
+        settings._overrides[guild_id] = on
+        settings._sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=5.0, mem_percent=6.0, lag_ms=0.5, tasks=3, pool_workers=4
+        )
+        return settings
+
+    def test_it_carries_every_segment_the_caller_did_not_pass(self) -> None:
+        guild = MagicMock(spec=discord.Guild)
+        guild.id, guild.shard_id = 7, 2
+        embed = discord.Embed(title="x")
+        self._settings(7, on=True).decorate([embed], guild)
+        footer = embed.footer.text or ""
+        assert config.ENVIRONMENT in footer
+        assert "shard 2" in footer and "cpu 5%" in footer
+
+    def test_a_dm_has_no_guild_and_still_decorates(self) -> None:
+        settings = debug.DebugSettings()
+        settings._default = True
+        embed = discord.Embed(title="x")
+        settings.decorate([embed], None)
+        footer = embed.footer.text or ""
+        assert config.ENVIRONMENT in footer
+        assert "shard" not in footer
+
+    def test_off_strips_rather_than_skips(self) -> None:
+        """play_message and a host's cached embeds outlive a mid-song --disable."""
+        guild = MagicMock(spec=discord.Guild)
+        guild.id, guild.shard_id = 7, 2
+        embed = discord.Embed(title="x")
+        embed.set_footer(text=f"base\n{debug._DEBUG_MARK} shard 2")
+        self._settings(7, on=False).decorate([embed], guild)
+        assert embed.footer.text == "base"
+
+
+class TestTheSuffixStartsItsOwnLine:
+    """The embed's own footer and the debug suffix are two separate things to read,
+    and a footer near the card's width wraps wherever the width falls — mid-segment,
+    so joined inline they render as one paragraph. The suffix begins a line instead,
+    which also puts the mark in the same place on every card."""
+
+    def test_an_existing_footer_keeps_its_own_line(self) -> None:
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="Avg Bitrate: 128 kbps | Acodec: opus")
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text == (
+            "Avg Bitrate: 128 kbps | Acodec: opus\n"
+            f"{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
+
+    def test_a_suffix_with_no_footer_under_it_gets_no_break(self) -> None:
+        """Nothing to separate it from: the suffix IS the footer, and a leading break
+        would render the card with an empty first line."""
+        embed = discord.Embed(title="x")
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text == (
+            f"{debug._DEBUG_MARK} {config.ENVIRONMENT} · shard 0"
+        )
+
+    def test_stripping_takes_the_break_with_the_suffix(self) -> None:
+        """A --disable mid-song restores the footer exactly, not a footer with a
+        blank line under it."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="environment: test")
+        debug.decorate_embeds([embed], shard_id=0)
+        debug.strip_debug_footers([embed])
+        assert embed.footer.text == "environment: test"
 
 
 class TestOperatorGate:
@@ -965,7 +1393,7 @@ class TestSnapshotEmbed:
         )
         names = [f.name for f in embed.fields]
         # Config outgrew Discord's 1024-char field cap once it carried -debug's own
-        # loop tunables, so _codeblock_fields splits it — the continuation keeps the
+        # loop tunables, so codeblock_fields splits it — the continuation keeps the
         # block's position rather than moving to the end.
         assert names == [
             "Build",
@@ -1052,7 +1480,8 @@ class TestSnapshotEmbed:
         )
         footer = embed.footer.text or ""
         assert footer.startswith("environment: ")
-        assert footer.endswith("🐞 shard 0 · cpu 9%")
+        assert footer.endswith("\n🐞 shard 0 · cpu 9%")
+        assert "🐞" not in footer.split("\n")[0]
 
     async def test_footer_has_no_suffix_by_default(self, mock_ctx: MagicMock) -> None:
         mock_ctx.guild = None
@@ -1066,6 +1495,15 @@ class TestSnapshotEmbed:
 class TestDebugCardCarriesTheSuffixEndToEnd:
     """The cog→card wiring, driven through the real command. TestSnapshotEmbed above
     hand-builds a DebugInputs, so it pins only the renderer's concatenation."""
+
+    @pytest.fixture(autouse=True)
+    def _fixed_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The footer opens with `environment: {config.ENVIRONMENT}`, which in CI is
+        the branch slug. The withheld-metrics test below greps the WHOLE footer for
+        labels like "pool ", so a branch named task/analytics-4-pool made it fail on
+        its own name — and equally would any branch ending in cpu, mem, lag or tasks.
+        Pinned by setattr, not setenv: config reads the variable once at import."""
+        monkeypatch.setattr(config, "ENVIRONMENT", "testing")
 
     @staticmethod
     def _enable(cog: MusicBotCog, ctx: MagicMock) -> None:
@@ -1123,7 +1561,7 @@ class TestDebugSuffixBuilder:
     def test_none_while_the_guild_has_debug_off(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        assert music_bot._debug_suffix(mock_ctx) is None
+        assert music_bot.debug_suffix(mock_ctx) is None
 
     def test_carries_shard_and_runtime_but_never_a_trace(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
@@ -1137,7 +1575,7 @@ class TestDebugSuffixBuilder:
             cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
         )
         with trace_api.use_span(TestTraceIdInTheFooter._span(), end_on_exit=False):
-            suffix = music_bot._debug_suffix(mock_ctx)
+            suffix = music_bot.debug_suffix(mock_ctx)
         assert suffix is not None
         assert "shard 4" in suffix and "cpu 9%" in suffix
         assert "trace" not in suffix
@@ -1152,7 +1590,7 @@ class TestDebugSuffixBuilder:
         music_bot.debug_settings._sampler._snapshot = debug.RuntimeSnapshot(
             cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
         )
-        suffix = music_bot._debug_suffix(mock_ctx) or ""
+        suffix = music_bot.debug_suffix(mock_ctx) or ""
         assert "cpu 9%" in suffix
         assert "shard" not in suffix
 
@@ -1163,7 +1601,7 @@ class TestDebugSuffixBuilder:
         None` stops a lone 🐞 reaching the card."""
         mock_ctx.guild = None
         music_bot.debug_settings._default = True
-        assert music_bot._debug_suffix(mock_ctx) is None
+        assert music_bot.debug_suffix(mock_ctx) is None
 
     def test_the_first_segment_is_the_shard_not_an_elapsed_time(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
@@ -1172,7 +1610,7 @@ class TestDebugSuffixBuilder:
         debug_footer puts first — would differ every tick."""
         music_bot.debug_settings._overrides[mock_ctx.guild.id] = True
         mock_ctx.guild.shard_id = 0
-        suffix = music_bot._debug_suffix(mock_ctx) or ""
+        suffix = music_bot.debug_suffix(mock_ctx) or ""
         assert suffix.removeprefix("🐞 ").split(" · ")[0] == "shard 0"
 
 
@@ -1386,6 +1824,28 @@ class TestRuntimeBlock:
         line = next(line for line in debug.runtime_lines() if line.startswith("uptime"))
         assert "<t:" not in line
         assert line == "uptime       1:02:05"
+
+    async def test_both_process_pools_are_reported(self) -> None:
+        """The chart pool is reported even when it has never spawned, which is the
+        common case: "not spawned" is the answer to "why is this bot not holding
+        173MB of matplotlib", and an absent row reads as a missing feature."""
+        lines = debug.runtime_lines(tasks=3)
+        chart = next(line for line in lines if line.startswith("chart pool"))
+        assert "1 worker" in chart
+        assert "not spawned" in chart
+        assert any(line.startswith("yt-dlp pool") for line in lines)
+
+    async def test_the_chart_pool_row_reads_the_patched_pool(self) -> None:
+        """conftest's use_thread_chart_pool patches src.chart_pool.chart_pool, so
+        this must resolve the name per call — a captured reference would report the
+        production singleton's state instead, silently, and -debug would answer for
+        a pool nothing in the process is using."""
+        import src.chart_pool as chart_pool_mod
+        from src.ytdlp_pool import YtdlpPool
+
+        with patch.object(chart_pool_mod, "chart_pool", YtdlpPool(max_workers=9)):
+            assert debug.chart_pool_state().max_workers == 9
+            assert "9 worker" in "".join(debug.runtime_lines(tasks=1))
 
 
 class TestGitSha:
@@ -1860,7 +2320,7 @@ class TestRuntimeSampler:
     async def test_tick_produces_a_snapshot(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 0.01)
         sampler = debug.RuntimeSampler()
         try:
             sampler.start()
@@ -1877,7 +2337,7 @@ class TestRuntimeSampler:
     async def test_a_failing_sample_does_not_end_the_loop(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 0.01)
         sampler = debug.RuntimeSampler()
         monkeypatch.setattr(
             sampler, "_sample", MagicMock(side_effect=RuntimeError("boom"))
@@ -1892,18 +2352,54 @@ class TestRuntimeSampler:
     def test_the_interval_tracks_the_now_playing_tick(self) -> None:
         """Sampling slower than the NP tick re-pushes footers whose numbers have
         not moved."""
-        assert debug.RuntimeSampler.INTERVAL_SECS <= (
-            config.NOW_PLAYING_UPDATE_INTERVAL_SECS
+        assert (
+            debug.sample_interval_secs()
+            == config.now_playing_update_interval_secs.baseline
         )
-        assert debug.RuntimeSampler.INTERVAL_SECS >= 1.0  # /proc-read floor
-        assert debug.RuntimeSampler.INTERVAL_SECS <= 5.0  # command replies stay fresh
+
+    @pytest.mark.parametrize(("tick", "interval"), [(30.0, 5.0), (2.0, 2.0)])
+    def test_the_interval_follows_a_bot_setting_within_its_bounds(
+        self, tick: float, interval: float
+    ) -> None:
+        """Floored for /proc reads, capped so command replies stay fresh."""
+        config.now_playing_update_interval_secs.set_override(tick)
+        assert debug.sample_interval_secs() == interval
+
+    def test_the_interval_is_floored_for_proc_reads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(config._BASELINES, "NOW_PLAYING_UPDATE_INTERVAL_SECS", 0.2)
+        assert debug.sample_interval_secs() == 1.0
+
+    async def test_a_running_sampler_rereads_the_interval_every_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reads = 0
+
+        def _interval() -> float:
+            nonlocal reads
+            reads += 1
+            return 0.01
+
+        monkeypatch.setattr(debug, "sample_interval_secs", _interval)
+        monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 0.01)
+        sampler = debug.RuntimeSampler()
+        try:
+            sampler.start()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if reads >= 4:
+                    break
+            assert reads >= 4
+        finally:
+            await sampler.aclose()
 
     async def test_the_first_sample_does_not_wait_a_whole_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A full interval of dead air means `-debug --enable` answers with a footer
         carrying no runtime numbers."""
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 30.0)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 30.0)
         monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 0.01)
         sampler = debug.RuntimeSampler()
         try:
@@ -1912,7 +2408,7 @@ class TestRuntimeSampler:
                 await asyncio.sleep(0.01)
                 if sampler.snapshot is not None:
                     break
-            # Would still be None here if the loop slept INTERVAL_SECS first.
+            # Would still be None here if the loop slept a whole interval first.
             assert sampler.snapshot is not None
         finally:
             await sampler.aclose()
@@ -1920,9 +2416,9 @@ class TestRuntimeSampler:
     async def test_the_first_delay_never_exceeds_the_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A deployment or test that shortens INTERVAL_SECS must not be slowed down
+        """A deployment or test that shortens the interval must not be slowed down
         by the first delay."""
-        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "sample_interval_secs", lambda: 0.01)
         monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 30.0)
         sampler = debug.RuntimeSampler()
         try:
@@ -1961,10 +2457,10 @@ class TestFooterRuntimeSegment:
 
     def test_full_segment(self) -> None:
         footer = debug.debug_footer(
-            elapsed_ms=412, shard_id=0, runtime=self._snapshot()
+            elapsed_ms=412, shard_id=0, runtime=self._snapshot(), skip_environment=True
         )
         assert footer == (
-            "🐞 412 ms · shard 0 · cpu 12% · mem 88% · lag 2.1 ms · tasks 87 · pool 4"
+            "🐞 412 ms · shard 0 · cpu 12% · mem 88% · lag 2.1 ms\ntasks 87 · pool 4"
         )
 
     def test_missing_rates_are_omitted_not_zeroed(self) -> None:
@@ -1978,7 +2474,58 @@ class TestFooterRuntimeSegment:
         assert "lag 2.1 ms" in footer
 
     def test_no_snapshot_yields_no_runtime_segment(self) -> None:
-        assert debug.debug_footer(elapsed_ms=1, shard_id=0) == "🐞 1 ms · shard 0"
+        assert (
+            debug.debug_footer(elapsed_ms=1, shard_id=0, skip_environment=True)
+            == "🐞 1 ms · shard 0"
+        )
+
+
+class TestTheSuffixBreaksItsOwnLines:
+    """Where the request ran, then what it counted. Discord wraps at the card's
+    width, so a suffix that does not break itself breaks mid-segment."""
+
+    def _span(self) -> trace_api.Span:
+        return trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+
+    def _snapshot(self) -> debug.RuntimeSnapshot:
+        return debug.RuntimeSnapshot(
+            cpu_percent=1.0, mem_percent=6.0, lag_ms=1.4, tasks=9, pool_workers=4
+        )
+
+    def test_the_counts_and_the_trace_share_the_second_line(self) -> None:
+        where, counts = debug.debug_footer(
+            span=self._span(), shard_id=0, runtime=self._snapshot()
+        ).split(FOOTER_SUFFIX_SEP)
+        assert where.endswith("lag 1.4 ms")
+        assert counts.startswith("tasks 9 · pool 4 · trace ")
+
+    def test_the_trace_alone_still_takes_the_second_line(self) -> None:
+        """The 32-hex id is what makes the break certain, so it is on the counts
+        side whether or not the sampler has produced a snapshot to join it."""
+        assert (
+            debug.debug_footer(span=self._span(), shard_id=0)
+            .split(FOOTER_SUFFIX_SEP)[1]
+            .startswith("trace ")
+        )
+
+    def test_no_break_is_written_with_nothing_to_put_after_it(self) -> None:
+        assert FOOTER_SUFFIX_SEP not in debug.debug_footer(shard_id=0)
+
+    def test_the_mark_leads_the_first_line_only(self) -> None:
+        """_strip_debug_suffix cuts from the mark, so a second one on the counts
+        line would leave that line behind on a --disable."""
+        footer = debug.debug_footer(
+            span=self._span(), shard_id=0, runtime=self._snapshot()
+        )
+        assert footer.count(debug._DEBUG_MARK) == 1
+        assert debug._strip_debug_suffix(f"base{FOOTER_SUFFIX_SEP}{footer}") == "base"
 
 
 class TestContainerMetrics:
@@ -2039,8 +2586,8 @@ class TestContainerMetrics:
 
     def _patch_session(
         self, monkeypatch: pytest.MonkeyPatch, session: MagicMock
-    ) -> AsyncMock:
-        factory = AsyncMock(return_value=session)
+    ) -> MagicMock:
+        factory = MagicMock(return_value=session)
         monkeypatch.setattr(debug, "_prometheus_session", factory)
         return factory
 
@@ -2089,7 +2636,7 @@ class TestContainerMetrics:
         factory = self._patch_session(monkeypatch, self._session(self._payload()))
         assert await debug.read_container_metrics(None, "discord-postgres") is None
         assert await debug.read_container_metrics("", "discord-postgres") is None
-        factory.assert_not_awaited()
+        factory.assert_not_called()
 
     async def test_absent_series_is_not_an_error(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2201,33 +2748,33 @@ class TestPrometheusSession:
         """aiohttp's default total timeout is FIVE MINUTES. Without this kwarg a
         black-holed metrics endpoint holds the Postgres probe far past -debug's own
         8s deadline, and the compose comment calls that port unauthenticated."""
-        session = await debug._prometheus_session()
+        session = debug._prometheus_session()
         assert session.timeout.total == debug._PROMETHEUS_TIMEOUT_SECS
 
     async def test_one_session_serves_the_process(self) -> None:
         """A session per query paid an extra connect every time — a full TCP (plus
         TLS) handshake against anything not on loopback."""
-        first = await debug._prometheus_session()
-        assert await debug._prometheus_session() is first
+        first = debug._prometheus_session()
+        assert debug._prometheus_session() is first
 
     async def test_a_closed_session_is_replaced(self) -> None:
         """cog_unload closes it; the next -debug must not be handed the corpse."""
-        first = await debug._prometheus_session()
+        first = debug._prometheus_session()
         await first.close()
-        second = await debug._prometheus_session()
+        second = debug._prometheus_session()
         assert second is not first and not second.closed
 
     async def test_close_really_closes_and_clears_the_cache(self) -> None:
         """The one test that drove cog_unload had a None cache, so a no-op body was
         green while leaking a connector per reload."""
-        session = await debug._prometheus_session()
+        session = debug._prometheus_session()
         await debug.close_prometheus_session()
         assert session.closed
         assert debug._prometheus_session_cache is None
 
     async def test_closing_twice_is_safe(self) -> None:
         """cog_unload can run after a teardown that already closed it."""
-        await debug._prometheus_session()
+        debug._prometheus_session()
         await debug.close_prometheus_session()
         await debug.close_prometheus_session()
         assert debug._prometheus_session_cache is None
@@ -2493,9 +3040,10 @@ class TestGuardsMutationTestingFound:
         assert "⚠️" not in row
 
     def test_a_footer_with_nothing_to_say_is_empty(self) -> None:
-        """Not a bare mark. A DM reply in the first seconds after DEBUG_MODE=true has
-        no elapsed time, no shard and no snapshot — the marker alone is noise."""
-        assert debug.debug_footer() == ""
+        """Not a bare mark. The dashboards suppress the environment (they print it
+        themselves) and the trace, so on a -debug in a DM before the sampler's first
+        tick there is nothing left — and the marker alone is noise."""
+        assert debug.debug_footer(skip_environment=True) == ""
 
     def test_a_warming_up_voice_client_does_not_claim_an_average(self) -> None:
         """latency is inf until the first heartbeat ACK. If average_latency happens
@@ -2622,7 +3170,7 @@ class TestDebugSamplerLifecycle:
     async def test_unload_cancels_an_in_flight_hydration(
         self, music_bot_with_redis: MusicBotCog
     ) -> None:
-        """_hydrate_debug ends in sync_sampler, and nothing else
+        """_hydrate_configs ends in sync_sampler, and nothing else
         ever cancels _restore_tasks. Parked mid-read across cog_unload it resumed
         afterwards and started a FRESH sampler task holding the dead cog — a
         permanent leak per reload_extension."""
@@ -2633,13 +3181,15 @@ class TestDebugSamplerLifecycle:
         assert cog.debug_settings._sampler.running is True
         reading, released = asyncio.Event(), asyncio.Event()
 
-        async def parks_until_released(*_a: object, **_k: object) -> dict[int, Any]:
+        async def parks_until_released(
+            *_a: object, **_k: object
+        ) -> AsyncGenerator[dict[int, Any]]:
             reading.set()
             await released.wait()
-            return {42: GuildConfig(debug_mode=True)}
+            yield {42: GuildConfig(debug_mode=True)}
 
-        with patch("src.debug.read_guild_configs", new=parks_until_released):
-            task = spawn_background(cog._hydrate_debug(), cog._restore_tasks)
+        with patch("src.settings.iter_guild_configs", new=parks_until_released):
+            task = spawn_background(cog._hydrate_configs(), cog._restore_tasks)
             await reading.wait()
             await cog.cog_unload()
             # Would resume the hydration if it had survived the unload.
@@ -2700,6 +3250,66 @@ class TestDebugSamplerLifecycle:
             await music_bot.debug_settings._sampler.aclose()
 
 
+class TestTheOperatorsSessionDefault:
+    """`-settings bot debug-default` replaces DEBUG_MODE for this process only.
+    `_default` stays the environment's value, so the tests that assign it keep
+    meaning what they meant."""
+
+    async def test_the_override_beats_the_environment_and_none_restores_it(
+        self, music_bot: MusicBotCog
+    ) -> None:
+        settings = music_bot.debug_settings
+        settings.set_default_override(True)
+        assert settings.default is True
+        assert settings.enabled(42) is True
+        assert settings.enabled(None) is True
+        settings.set_default_override(None)
+        assert settings.default is False
+        assert settings.enabled(42) is False
+        await settings.aclose()
+
+    async def test_a_guilds_own_choice_still_wins(self, music_bot: MusicBotCog) -> None:
+        settings = music_bot.debug_settings
+        settings._overrides[42] = False
+        settings.set_default_override(True)
+        assert settings.enabled(42) is False
+        await settings.aclose()
+
+    async def test_the_sampler_follows_it(self, music_bot: MusicBotCog) -> None:
+        settings = music_bot.debug_settings
+        settings.set_default_override(True)
+        assert settings._sampler.running is True
+        settings.set_default_override(None)
+        assert settings._sampler.running is False
+
+    async def test_turning_it_on_in_production_warns(
+        self,
+        music_bot: MusicBotCog,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(config, "ENVIRONMENT", "production")
+        music_bot.debug_settings.set_default_override(True)
+        assert "debug mode's default is on in production" in caplog.text
+        await music_bot.debug_settings.aclose()
+
+    async def test_a_cog_reload_keeps_it(self, music_bot: MusicBotCog) -> None:
+        """cog_load hands the new cog's DebugSettings what BotSettings holds."""
+        from src.settings import SETTINGS, BotSettings
+
+        spec = next(s for s in SETTINGS if s.key == "debug-default")
+        bot_settings = BotSettings(music_bot.bot, redis=None, ignore_stored=False)
+        cast(Any, music_bot.bot).bot_settings = bot_settings
+        bot_settings.apply(spec, True)
+        music_bot.debug_settings = debug.DebugSettings()
+        music_bot.debug_settings._default = False
+
+        await music_bot.cog_load()
+
+        assert music_bot.debug_settings.default is True
+        await music_bot.cog_unload()
+
+
 class TestDebugModeIsPerGuildAndDurable:
     """DEBUG_MODE is the default every guild starts from; each guild can pin its own
     choice, and that choice now outlives a restart."""
@@ -2740,11 +3350,11 @@ class TestDebugModeIsPerGuildAndDurable:
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug.DebugAction.ENABLE
+        await debug_cmd.toggle(
+            mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
         )
         store = GuildRedisStore(cast(Any, music_bot_with_redis.redis), 42)
-        assert (await store.get_config()).debug_mode is True
+        assert (await stored_config(store)).debug_mode is True
 
     async def test_a_stored_choice_is_restored_on_startup(
         self, music_bot_with_redis: MusicBotCog
@@ -2756,7 +3366,7 @@ class TestDebugModeIsPerGuildAndDurable:
         self._guilds(music_bot_with_redis, 111, 222, 333)
         music_bot_with_redis.debug_settings._overrides = {}
 
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
 
         assert music_bot_with_redis.debug_settings._overrides == {111: True, 222: False}
         # 333 never chose, so it is absent rather than cached — caching it would
@@ -2767,14 +3377,14 @@ class TestDebugModeIsPerGuildAndDurable:
         self, music_bot_with_redis: MusicBotCog, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._guilds(music_bot_with_redis, 333)
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
         monkeypatch.setattr(music_bot_with_redis.debug_settings, "_default", True)
         assert music_bot_with_redis.debug_settings.enabled(333) is True
 
     async def test_hydration_survives_an_unreachable_redis(
         self, music_bot_with_redis: MusicBotCog
     ) -> None:
-        """read_guild_configs reports a failed batch by omission, so startup
+        """iter_guild_configs reports a failed batch by omission, so startup
         degrades to the host default rather than dying."""
         self._guilds(music_bot_with_redis, 111)
         with patch.object(
@@ -2782,8 +3392,61 @@ class TestDebugModeIsPerGuildAndDurable:
             "pipeline",
             side_effect=RuntimeError("down"),
         ):
-            await music_bot_with_redis._hydrate_debug()
+            await music_bot_with_redis._hydrate_configs()
         assert music_bot_with_redis.debug_settings._overrides == {}
+        (retry,) = music_bot_with_redis._hydrate_retries
+        assert not retry.done()
+        await cancel_task(retry)
+
+    async def test_a_joined_guild_is_read_into_the_cache(
+        self, music_bot_with_redis: MusicBotCog
+    ) -> None:
+        cog = music_bot_with_redis
+        await GuildRedisStore(cast(Any, cog.redis), 444).set_debug_mode(True)
+        guild = MagicMock(spec=discord.Guild, id=444)
+
+        await cog.on_guild_join(guild)
+
+        assert cog.guild_settings.is_complete(444)
+        assert cog.debug_settings.enabled(444) is True
+        assert not cog._hydrate_retries
+
+    async def test_a_joined_guilds_retry_runs_beside_the_full_one(
+        self, music_bot_with_redis: MusicBotCog
+    ) -> None:
+        """A join during an outage covers one guild; cancelling the full pass's
+        retry for it would leave every other unread guild on defaults for good."""
+        cog = music_bot_with_redis
+        self._guilds(cog, 111, 222)
+        with patch.object(
+            cast(Any, cog.redis), "pipeline", side_effect=RuntimeError("down")
+        ):
+            await cog._hydrate_configs()
+            (full,) = cog._hydrate_retries
+            await cog._hydrate_configs([333])
+        # A cancel() lands at the task's next step.
+        await asyncio.sleep(0)
+        assert not full.done()
+        assert len(cog._hydrate_retries) == 2
+        await asyncio.gather(*(cancel_task(t) for t in list(cog._hydrate_retries)))
+
+    async def test_a_full_pass_replaces_every_earlier_retry(
+        self, music_bot_with_redis: MusicBotCog
+    ) -> None:
+        cog = music_bot_with_redis
+        self._guilds(cog, 111, 222)
+        with patch.object(
+            cast(Any, cog.redis), "pipeline", side_effect=RuntimeError("down")
+        ):
+            await cog._hydrate_configs()
+            await cog._hydrate_configs([333])
+            earlier = set(cog._hydrate_retries)
+            await cog._hydrate_configs()
+        await asyncio.gather(*earlier, return_exceptions=True)
+        assert all(task.cancelled() for task in earlier)
+        (latest,) = cog._hydrate_retries
+        assert latest not in earlier and not latest.done()
+        await cancel_task(latest)
 
     async def test_a_failed_read_does_not_discard_a_correct_stored_choice(
         self, music_bot_with_redis: MusicBotCog
@@ -2804,10 +3467,13 @@ class TestDebugModeIsPerGuildAndDurable:
         music_bot_with_redis.debug_settings._overrides = {111: False}
 
         with patch.object(redis, "pipeline", side_effect=RuntimeError("down")):
-            await music_bot_with_redis._hydrate_debug()
+            await music_bot_with_redis._hydrate_configs()
 
         assert music_bot_with_redis.debug_settings._overrides == {111: False}
         assert music_bot_with_redis.debug_settings.enabled(111) is False
+        (retry,) = music_bot_with_redis._hydrate_retries
+        assert not retry.done()
+        await cancel_task(retry)
 
     async def test_a_read_that_succeeds_still_evicts_a_removed_choice(
         self, music_bot_with_redis: MusicBotCog
@@ -2818,7 +3484,7 @@ class TestDebugModeIsPerGuildAndDurable:
         self._guilds(music_bot_with_redis, 111)
         music_bot_with_redis.debug_settings._overrides = {111: True}
 
-        await music_bot_with_redis._hydrate_debug()
+        await music_bot_with_redis._hydrate_configs()
 
         assert 111 not in music_bot_with_redis.debug_settings._overrides
 
@@ -2835,15 +3501,17 @@ class TestDebugModeIsPerGuildAndDurable:
         music_bot_with_redis.debug_settings._overrides = {42: False}
         mock_ctx.guild.id = 42
 
-        async def read_then_user_toggles(*_a: object, **_k: object) -> dict[int, Any]:
+        async def read_then_user_toggles(
+            *_a: object, **_k: object
+        ) -> AsyncGenerator[dict[int, Any]]:
             # The read has resolved; the toggle lands before the loop applies it.
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug.DebugAction.ENABLE
+            await debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
             )
-            return {42: GuildConfig(debug_mode=False)}  # what the read saw
+            yield {42: GuildConfig(debug_mode=False)}  # what the read saw
 
-        with patch("src.debug.read_guild_configs", new=read_then_user_toggles):
-            await music_bot_with_redis._hydrate_debug()
+        with patch("src.settings.iter_guild_configs", new=read_then_user_toggles):
+            await music_bot_with_redis._hydrate_configs()
 
         assert music_bot_with_redis.debug_settings.enabled(42) is True
 
@@ -2858,8 +3526,8 @@ class TestDebugModeIsPerGuildAndDurable:
             "pipeline",
             side_effect=RuntimeError("down"),
         ):
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug.DebugAction.ENABLE
+            await debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
             )
         description = mock_ctx.send.await_args.kwargs["embed"].description
         assert "could not be saved" in description
@@ -2879,49 +3547,71 @@ class TestDebugModeIsPerGuildAndDurable:
             "pipeline",
             side_effect=RuntimeError("down"),
         ):
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug.DebugAction.ENABLE
+            await debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
             )
 
-        inputs = await music_bot_with_redis._debug_inputs(mock_ctx)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
 
         assert inputs.debug_overridden is True
         assert inputs.debug_persisted is False
         assert debug.mode_source(True, persisted=False) == "this session only"
 
+    async def test_a_server_following_the_operators_session_default_says_so(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.id = 42
+        music_bot_with_redis.debug_settings.set_default_override(True)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
+        assert inputs.debug_default_overridden is True
+        assert (
+            debug.mode_source(False, default_overridden=True)
+            == "bot owner default, until restart"
+        )
+        assert debug.mode_source(True, default_overridden=True) == "saved here"
+
     async def test_a_write_that_lands_reports_as_saved(
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug.DebugAction.ENABLE
+        await debug_cmd.toggle(
+            mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
         )
-        inputs = await music_bot_with_redis._debug_inputs(mock_ctx)
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot_with_redis)
         assert inputs.debug_persisted is True
-
-    async def test_hydration_clears_a_stale_unpersisted_mark(
-        self, music_bot_with_redis: MusicBotCog
-    ) -> None:
-        """Redis came back and the durable copy agrees, so the warning must stop."""
-        redis = cast(Any, music_bot_with_redis.redis)
-        await GuildRedisStore(redis, 111).set_debug_mode(True)
-        self._guilds(music_bot_with_redis, 111)
-        music_bot_with_redis.debug_settings._unpersisted.add(111)
-
-        await music_bot_with_redis._hydrate_debug()
-
-        assert 111 not in music_bot_with_redis.debug_settings._unpersisted
 
     async def test_a_successful_write_says_it_is_saved(
         self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug.DebugAction.ENABLE
+        await debug_cmd.toggle(
+            mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
         )
         description = mock_ctx.send.await_args.kwargs["embed"].description
         assert "saved for this server" in description
         assert "could not be saved" not in description
+
+    async def test_racing_writers_agree_in_redis_the_cache_and_the_footer(
+        self, music_bot_with_redis: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """-debug --enable and another debug_mode write in the same guild serialize
+        on GuildSettings' lock, so the last commit is what all three hold."""
+        mock_ctx.guild.id = 42
+        guild_settings = music_bot_with_redis.guild_settings
+        await asyncio.gather(
+            debug_cmd.toggle(
+                mock_ctx, debug.DebugAction.ENABLE, cog=music_bot_with_redis
+            ),
+            guild_settings.write(42, GuildConfig(debug_mode=False)),
+        )
+        stored = await GuildRedisStore(
+            cast(Any, music_bot_with_redis.redis), 42
+        ).read_config()
+        assert stored is not None
+        cached = guild_settings.peek(42)
+        assert cached is not None
+        assert stored.debug_mode == cached.debug_mode
+        assert music_bot_with_redis.debug_settings.enabled(42) is cached.debug_mode
 
     async def test_leaving_a_guild_drops_the_stored_choice(
         self, music_bot_with_redis: MusicBotCog
@@ -2936,4 +3626,115 @@ class TestDebugModeIsPerGuildAndDurable:
         await music_bot_with_redis.on_guild_remove(guild)
 
         assert 111 not in music_bot_with_redis.debug_settings._overrides
-        assert (await GuildRedisStore(redis, 111).get_config()).debug_mode is None
+        assert (await stored_config(GuildRedisStore(redis, 111))).debug_mode is None
+
+
+class TestEveryPlayTunableIsObservable:
+    """-debug's config block is the operator's only in-band view of what the
+    process is running with. The sibling class checks that rows PRESENT are
+    derived from config; nothing checked that a knob HAS a row, so two shipped
+    invisible — one of them a 120s bound, and CLAUDE.md defined it by reference
+    from another row's prose while having no row of its own."""
+
+    def test_every_play_and_card_knob_has_a_row(self) -> None:
+        import src.config as config_mod
+
+        rows = {var.name for var in _CONFIG_ALLOWLIST}
+        constants = {
+            name
+            for name in vars(config_mod)
+            if name.isupper() and not name.startswith("_")
+        }
+        knobs = {
+            name
+            for name in constants | {k.env for k in config_mod.KNOBS.values()}
+            if name.startswith(("PLAY_", "QUEUE_PROGRESS_"))
+        }
+        assert knobs, "no tunables found — the naming convention moved"
+        assert knobs <= rows, f"no -debug row for: {sorted(knobs - rows)}"
+
+
+class TestTheConfigAllowlistFallbacksTrackTheDefaults:
+    """`-debug` renders the fallback when a variable is unset, so a hardcoded copy
+    that drifts from config.py reports a default the process is not running with."""
+
+    def test_every_fallback_matches_its_config_default(self) -> None:
+        from src import config
+        from src.debug import _CONFIG_ALLOWLIST, _ConfigKind
+
+        checked = 0
+        for var in _CONFIG_ALLOWLIST:
+            if var.knob is not None:
+                # Rendered from the value in force, never from a stored copy.
+                assert var.fallback is None and var.fallback_factory is None, var.name
+                continue
+            if var.kind is not _ConfigKind.VALUE:
+                continue
+            default = getattr(config, var.name, None)
+            if default is None or not isinstance(default, (int, float)):
+                # Only the numeric tunables: ENVIRONMENT's fallback is a label for
+                # "unset", not a copy of the value config.py resolved at import.
+                continue
+            checked += 1
+            assert var.fallback == str(default), var.name
+        assert checked >= 3, "the reflection found nothing to check"
+
+    def test_a_numeric_fallback_is_derived_and_not_a_literal(self) -> None:
+        """The equality above cannot fail while the literal happens to match today's
+        default — the defect is drift, which only a later edit to config.py exposes.
+        So the shape is asserted instead: these rows must READ the constant."""
+        import ast
+        import inspect
+
+        from src import config, debug
+
+        tree = ast.parse(inspect.getsource(debug))
+        literal_rows: list[str] = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_ConfigVar"
+            ):
+                continue
+            kwargs = {k.arg: k.value for k in node.keywords}
+            name_node, fallback = kwargs.get("name"), kwargs.get("fallback")
+            if not isinstance(name_node, ast.Constant) or fallback is None:
+                continue
+            if "knob" in kwargs:
+                literal_rows.append(f"{name_node.value} (knob= with fallback=)")
+                continue
+            default = getattr(config, str(name_node.value), None)
+            if not isinstance(default, (int, float)) or isinstance(default, bool):
+                continue
+            if isinstance(fallback, ast.Constant):
+                literal_rows.append(str(name_node.value))
+
+        assert literal_rows == [], (
+            f"hardcoded fallbacks that must read config.py: {literal_rows}"
+        )
+
+    def test_every_env_knob_config_parses_has_a_row(self) -> None:
+        """A knob config.py parses from the environment but -debug does not list is
+        a value the operator cannot see from chat. Discovered from the parse calls
+        themselves, so a knob added later without a row fails here."""
+        import ast
+        import inspect
+
+        from src import config
+        from src.debug import _CONFIG_ALLOWLIST
+
+        parsed: set[str] = set()
+        for node in ast.walk(ast.parse(inspect.getsource(config))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("_float_env", "_int_env", "_secs", "_count")
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                parsed.add(str(node.args[0].value))
+
+        assert "NOW_PLAYING_UPDATE_INTERVAL_SECS" in parsed, "discovery found nothing"
+        rows = {var.name for var in _CONFIG_ALLOWLIST}
+        assert sorted(parsed - rows) == []

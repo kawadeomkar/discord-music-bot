@@ -1,36 +1,36 @@
 """Lifecycle for the process pool that runs yt-dlp extraction.
 
-Extraction is only half I/O — JSON parsing, signature decryption and format selection
-are GIL-bound, so processes (not threads) give concurrent extractions real parallelism
-instead of contention that also starves the voice heartbeat. Each worker costs a full
-CPython + yt-dlp import (~80–120 MB RSS), hence the conservative YTDLP_POOL_WORKERS
-default. Lifecycle is all this module owns: the callable is supplied per call (run()),
-which is what lets tests swap in a thread-pool-backed instance.
+Extraction is half GIL-bound (JSON parsing, signature decryption, format
+selection), so processes rather than threads. Each worker costs a full CPython +
+yt-dlp import (~80–120 MB RSS), hence the conservative default for
+config.YTDLP_POOL_WORKERS. Only lifecycle lives here: the callable is supplied per
+call (run()), which is what lets tests swap in a thread-pool-backed instance.
 
-What crosses the process boundary, and the pickle contract each side owes:
-docs/ARCHITECTURE.md#yt-dlp-process-boundary.
+Pickle contract for what crosses the boundary: docs/ARCHITECTURE.md#yt-dlp-process-boundary.
 """
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
-import os
 import pickle
 import sys
 import threading
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
-from concurrent.futures import Executor, ProcessPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from logging.handlers import QueueListener
+from queue import Empty
 from typing import Any, Optional, TypeVar
 
 import structlog
 from opentelemetry import trace
 
+from src import config
 from src.telemetry import configure_worker_logging
 from src.util import get_logger
 
@@ -38,36 +38,65 @@ log = get_logger(__name__)
 
 T = TypeVar("T")
 
-_DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
-# How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30 with
-# retries=10 can outlive any shutdown. Mirrors loop.shutdown_default_executor()'s.
+# How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30
+# with retries=10 can outlive any shutdown.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
+
+# Explicit, because multiprocessing.Queue() defaults to maxsize=0 and sizes its
+# semaphore at SEM_VALUE_MAX (32,767 here): 30,000 put_nowait calls were measured
+# to raise no Full at all, so the drop-on-full a progress producer relies on would
+# never happen and the worker would buffer without bound instead.
+_PROGRESS_QUEUE_MAX = 256
+# The drain polls rather than blocking, so stopping it never writes to a queue a
+# SIGTERMed worker may have left holding _wlock.
+_PROGRESS_POLL_SECS = 0.2
+_PROGRESS_JOIN_SECS = 2.0
+
+# Set in each worker by _worker_init. None in the parent, and None under the test
+# seam, where an executor_factory is supplied and the initializer never runs.
+_PROGRESS_Q: Optional[Any] = None
+
+
+def worker_progress_queue() -> Optional[Any]:
+    """The worker's progress transport, or None when the pool was built without
+    one. Read per call rather than captured: a worker's module globals are set by
+    the initializer, after import. This module owns the transport and knows
+    nothing about what rides it."""
+    return _PROGRESS_Q
 
 
 def _warmup_noop() -> None:
-    """Submitted by prewarm() to force a worker to spawn and import yt-dlp before the
-    first real extraction pays that cost. Module-level so it is picklable."""
+    """Submitted by prewarm() to force a worker to spawn and import yt-dlp.
+    Module-level so it is picklable."""
     return None
 
 
-def _worker_init(log_queue: Optional[Any] = None) -> None:
-    """Per-worker setup, hardened so it can never raise: per the stdlib contract
-    (verified on 3.14.6) an initializer that raises makes every pending AND future submit
-    raise BrokenProcessPool, and run()'s heal-once retry cannot help since a rebuilt pool
-    runs the same initializer. Unstructured worker logs beat bricking all extraction —
-    reported on stderr, because what just failed is the logging configuration.
-    """
+def _worker_init(
+    log_queue: Optional[Any] = None, progress_queue: Optional[Any] = None
+) -> None:
+    """Per-worker setup that can never raise: an initializer that raises makes
+    every pending and future submit raise BrokenProcessPool, and the heal-once
+    retry runs the same initializer. Reported on stderr, because what just
+    failed is the logging configuration."""
+    global _PROGRESS_Q
+    _PROGRESS_Q = progress_queue
+    if progress_queue is not None:
+        # Progress is advisory, so dropping the tail is correct — and it has to
+        # be dropped: at worker exit Queue._finalize_join JOINS the feeder thread,
+        # which is blocked in send_bytes once the parent stops reading, so the
+        # worker cannot exit and shutdown burns its full timeout every time.
+        progress_queue.cancel_join_thread()
     try:
         configure_worker_logging(log_queue)
     except Exception:
-        print("yt-dlp worker logging setup failed:", file=sys.stderr)
+        print("worker logging setup failed:", file=sys.stderr)
         traceback.print_exc()
 
 
 def _trace_carrier() -> dict[str, str]:
-    """The parent's trace context as picklable strings for a worker to rebind. Workers
-    have no TracerProvider, so get_current_span() is always invalid there and correlation
-    must be carried explicitly. Empty when no span is active (prewarm, tests)."""
+    """The parent's trace context as picklable strings. Workers have no
+    TracerProvider, so correlation must be carried explicitly. Empty when no
+    span is active."""
     ctx = trace.get_current_span().get_span_context()
     if not ctx.is_valid:
         return {}
@@ -78,20 +107,18 @@ def _trace_carrier() -> dict[str, str]:
 
 
 def _call_with_context(carrier: dict[str, str], fn: Callable[..., T], *args: Any) -> T:
-    """Bind the parent's trace context, then run fn through the picklable-error net.
-    Runs in the worker (or the test thread). bound_contextvars resets on exit, so the
-    worker's next job does not inherit a stale trace_id."""
+    """Bind the parent's trace context, then run fn through the picklable-error
+    net. bound_contextvars resets on exit, so the worker's next job does not
+    inherit a stale trace_id."""
     with structlog.contextvars.bound_contextvars(**carrier):
         return _picklable_call(fn, *args)
 
 
 class RemoteCallError(Exception):
-    """Generic picklable stand-in for a worker exception that can't cross the boundary.
-    Every field must have a default: BaseException.__reduce__ rebuilds as `cls(*args)`,
-    so a required positional *serialises* fine in the worker and then fails to *unpickle*
-    in the parent's executor-manager thread, bricking the pool. Same rule as
-    ExtractionError in src/youtube.py.
-    """
+    """Picklable stand-in for a worker exception that cannot cross the boundary.
+    Every field must have a default: BaseException.__reduce__ rebuilds as
+    `cls(*args)`, and a required positional fails to unpickle in the parent's
+    executor thread, bricking the pool. Same rule as ExtractionError."""
 
     def __init__(self, message: str = "", original_type: str = "") -> None:
         super().__init__(message)
@@ -100,10 +127,9 @@ class RemoteCallError(Exception):
 
 
 def _picklable_call(fn: Callable[..., T], *args: Any) -> T:
-    """Run fn(*args) in the worker, guaranteeing whatever propagates survives pickling.
-    BrokenExecutor is re-raised untouched: it is the parent's healing signal, and a real
-    one never originates in a worker anyway.
-    """
+    """Run fn(*args) in the worker, guaranteeing whatever propagates survives
+    pickling. BrokenExecutor is re-raised untouched: it is the parent's healing
+    signal."""
     try:
         return fn(*args)
     except BrokenExecutor:
@@ -119,18 +145,16 @@ def _picklable_call(fn: Callable[..., T], *args: Any) -> T:
 
 
 class PoolClosedError(RuntimeError):
-    """Raised when work is submitted after shutdown(). An error rather than a silent
-    rebuild: a submit during shutdown means a background task outlived close(), and fresh
-    workers spawned to serve it would be orphaned (nothing joins a pool created after the
-    join). Subclasses RuntimeError to match the stdlib's submit-after-shutdown contract.
-    """
+    """Raised when work is submitted after shutdown(): a submit then means a
+    background task outlived close(), and fresh workers spawned for it would be
+    orphaned. RuntimeError matches the stdlib's submit-after-shutdown contract."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PoolState:
-    """The pool's lifecycle as -debug reports it. `spawned` is False until the first
-    extraction — the executor is lazy — and `generation` counts executors BUILT, so
-    a value above 1 means a worker died abnormally and the pool was healed."""
+    """The pool's lifecycle as -debug reports it. `spawned` is False until the
+    first extraction; `generation` counts executors BUILT, so a value above 1
+    means a worker died and the pool was healed."""
 
     max_workers: int
     spawned: bool
@@ -139,57 +163,140 @@ class PoolState:
 
 
 class YtdlpPool:
-    """The process's yt-dlp extraction pool: lazy creation, break-healing, shutdown.
-    One instance per process, held by src.youtube. Deliberately not a singleton — tests
-    build their own with a thread-pool factory, since a ProcessPoolExecutor pickles the
-    submitted callable and the MagicMock patched onto _ytdlp_extract is unpicklable. The
-    executor is lazy because under spawn/forkserver each worker re-imports the parent's
-    modules, and an eager pool would have every worker construct a nested one.
-    """
+    """A process pool with lazy creation, heal-once on BrokenProcessPool, an
+    off-loop join and worker-log plumbing. One instance per consumer (yt-dlp in
+    src.youtube, the chart renderer in src.chart_pool), distinguished by `name`
+    in log lines and PoolClosedError. Lazy because under spawn/forkserver each
+    worker re-imports the parent's modules, and an eager pool would have every
+    worker construct a nested one."""
 
     def __init__(
         self,
-        max_workers: int = _DEFAULT_WORKERS,
+        max_workers: int = config.YTDLP_POOL_WORKERS,
         executor_factory: Optional[Callable[[], Executor]] = None,
+        name: str = "yt-dlp extraction",
+        progress_sink: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self._max_workers = max_workers
+        self._name = name
+        # What a worker's progress messages are handed to, on the drain THREAD.
+        # It must not block and must not touch the event loop. None (the default,
+        # and the chart pool's) builds no queue and no drain at all.
+        self._progress_sink = progress_sink
+        self._progress_queue: Optional[Any] = None
+        self._progress_thread: Optional[threading.Thread] = None
+        self._progress_stop = threading.Event()
         self._executor_factory = executor_factory or self._spawn_process_pool
         self._executor: Optional[Executor] = None
         self._closed = False
-        # Monotonic per executor built, so "the pool broke" logs from before and after a
-        # rebuild are distinguishable and repeated breaks don't look like one break.
+        # Per executor built, so break logs before and after a rebuild differ.
         self._generation = 0
-        # Guards _executor, _closed and _generation. Defence in depth — aclose() keeps
-        # every mutation on the loop thread — but shutdown() may run from atexit/signal.
+        # Guards _executor, _closed and _generation; shutdown() may run from
+        # atexit/signal, off the loop thread.
         self._lock = threading.Lock()
-        # Worker-log plumbing. Pool-scoped, not executor-scoped: built on the first real
-        # spawn and reused across break-heal rebuilds, since the listener forwards to the
-        # parent's root handlers regardless of generation. None under the test seam.
+        # Worker-log plumbing, pool-scoped: built on the first real spawn and
+        # reused across break-heal rebuilds. None under the test seam.
         self._log_queue: Optional[Any] = None
         self._log_listener: Optional[QueueListener] = None
 
+    @property
+    def max_workers(self) -> int:
+        """Worker count this pool runs with, for callers sizing their own bounds
+        against it — config.YTDLP_POOL_WORKERS stays read in one place."""
+        return self._max_workers
+
     def _spawn_process_pool(self) -> Executor:
-        # initializer runs _worker_init() per worker so yt-dlp's warnings reach the
-        # parent structured. Cheap under the lock: __init__ does not spawn.
+        # Cheap under the lock: ProcessPoolExecutor.__init__ does not spawn.
         if self._log_listener is None:
-            # respect_handler_level=True so a worker DEBUG record is not force-emitted
-            # by an INFO handler. Takes the root handlers live at spawn time — post-
-            # setup_telemetry() in production, so worker records reach Loki.
+            # respect_handler_level=True so a worker DEBUG record is not
+            # force-emitted by an INFO handler. Takes the root handlers live at
+            # spawn time — post-setup_telemetry() in production.
             self._log_queue = multiprocessing.Queue()
             self._log_listener = QueueListener(
                 self._log_queue, *logging.root.handlers, respect_handler_level=True
             )
             self._log_listener.start()
+        self._start_progress_drain()
         return ProcessPoolExecutor(
             max_workers=self._max_workers,
             initializer=_worker_init,
-            initargs=(self._log_queue,),
+            initargs=(self._log_queue, self._progress_queue),
         )
 
+    def _start_progress_drain(self) -> None:
+        """Build the progress queue and the thread that drains it.
+
+        Rebuilt on a break-heal, unlike the log listener beside it, and for a
+        reason the log queue does not share: a worker SIGKILLed between
+        Queue._feed's wacquire() and wrelease() holds the write lock forever.
+        _sem never drains, and after _PROGRESS_QUEUE_MAX puts every put_nowait
+        raises Full — silently, permanently, for the life of the process. Reusing
+        the queue across a heal is exactly the case where that has happened."""
+        if self._progress_sink is None:
+            return
+        # Not joined: this runs under _lock, from _acquire on the event loop, and
+        # the old drain leaves on its own within _PROGRESS_POLL_SECS of the flag.
+        self._stop_progress_drain(join=False)
+        self._progress_queue = multiprocessing.Queue(maxsize=_PROGRESS_QUEUE_MAX)
+        # A fresh flag, not a cleared one: _stop_progress_drain set the old one,
+        # and the thread below must not start already told to stop.
+        self._progress_stop = threading.Event()
+        self._progress_thread = threading.Thread(
+            target=self._drain_progress,
+            args=(self._progress_queue, self._progress_stop),
+            name=f"{self._name}-progress",
+            daemon=True,
+        )
+        self._progress_thread.start()
+
+    def _drain_progress(self, queue: Any, stop: threading.Event) -> None:
+        """Drain worker progress on a THREAD, like the QueueListener beside it.
+        get_nowait measured at 38.4 µs/op and a playlist's messages arrive in a
+        burst — on the event loop that is starvation, delaying every other guild's
+        Now Playing edit and the playback loop's song handoff."""
+        while not stop.is_set():
+            try:
+                message = queue.get(timeout=_PROGRESS_POLL_SECS)
+            except Empty:
+                continue
+            except Exception as e:
+                # A closed queue at shutdown is expected and says nothing; any
+                # other cause ends progress for the life of this executor, so it
+                # must not be the one failure that leaves no line anywhere.
+                if not stop.is_set():
+                    log.warning(f"{self._name} progress drain stopped: {e!r}")
+                return
+            sink = self._progress_sink
+            if sink is None:
+                continue
+            try:
+                sink(message)
+            except Exception as e:
+                log.warning(f"{self._name} progress sink failed: {e!r}")
+
+    def _stop_progress_drain(self, *, join: bool = True) -> None:
+        """Stop the drain and drop the queue. Stopping is a FLAG rather than a
+        sentinel message, which makes the workers' state irrelevant: after
+        terminate_workers() the queue's _wlock is a POSIX semaphore a worker
+        SIGTERMed mid-write never released, so a parent write could block here
+        forever. Idempotent, because a break-heal calls it before rebuilding.
+
+        close() releases the parent's own handle and feeder thread. It does NOT
+        stop the drain — this side reads, and closing a queue does not interrupt
+        a blocked get — so it is cleanup rather than a backstop for the flag."""
+        thread, queue = self._progress_thread, self._progress_queue
+        self._progress_thread = self._progress_queue = None
+        self._progress_stop.set()
+        if thread is not None and join:
+            thread.join(timeout=_PROGRESS_JOIN_SECS)
+        if queue is not None:
+            with contextlib.suppress(Exception):
+                queue.close()
+
     def _stop_log_listener(self) -> None:
-        """Drain and stop the listener. Must run only after the workers are gone
-        (join or terminate): stop() enqueues a sentinel and drains what is already
-        queued, so stopping while workers still emit discards their final records."""
+        """Drain and stop the listener. Only after the workers are gone: stop()
+        drains what is already queued, so stopping while workers still emit
+        discards their final records."""
         listener = self._log_listener
         self._log_listener = None
         self._log_queue = None
@@ -203,9 +310,7 @@ class YtdlpPool:
 
     @property
     def state(self) -> PoolState:
-        """A read-only lifecycle snapshot for -debug. Deliberately only what the
-        pool already tracks: an in-flight or completed-extraction counter would be
-        bookkeeping on the hot path for a diagnostic line."""
+        """A read-only lifecycle snapshot for -debug."""
         with self._lock:
             return PoolState(
                 max_workers=self._max_workers,
@@ -218,7 +323,7 @@ class YtdlpPool:
         """The live executor, building it on first use. Raises once shut down."""
         with self._lock:
             if self._closed:
-                raise PoolClosedError("yt-dlp extraction pool is shut down")
+                raise PoolClosedError(f"{self._name} pool is shut down")
             if self._executor is None:
                 self._executor = self._executor_factory()
                 self._generation += 1
@@ -226,10 +331,9 @@ class YtdlpPool:
 
     def _replace(self, broken: Executor) -> None:
         """Drop `broken` so the next _acquire() builds a fresh executor.
-        Identity-checked: when two concurrent extractions both hit BrokenProcessPool,
-        only the first discards — the second would throw away the healthy replacement.
-        Shut down without waiting; a broken pool never accepts work anyway.
-        """
+        Identity-checked: when two concurrent extractions both hit
+        BrokenProcessPool, the second must not throw away the healthy
+        replacement."""
         with self._lock:
             if self._executor is not broken:
                 return
@@ -237,15 +341,12 @@ class YtdlpPool:
         try:
             broken.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
-            log.debug(f"discarding broken yt-dlp pool raised: {e}")
+            log.debug(f"discarding broken {self._name} pool raised: {e}")
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
-        """Run `fn(*args)` in the pool, healing a broken pool once. A ProcessPoolExecutor
-        breaks permanently when a worker dies abnormally (most plausibly the OOM killer),
-        after which every submit raises BrokenProcessPool for the life of the process; a
-        second failure propagates. `fn` is a parameter, never stored — looked up in the
-        caller's module at call time, which keeps `patch(...)` on it working.
-        """
+        """Run `fn(*args)` in the pool, healing a broken pool once (a worker
+        killed by OOM breaks the executor permanently); a second failure
+        propagates. `fn` is never stored, so `patch(...)` on it keeps working."""
         loop = asyncio.get_running_loop()
         carrier = _trace_carrier()
         executor = self._acquire()
@@ -255,41 +356,50 @@ class YtdlpPool:
             )
         except BrokenProcessPool:
             log.warning(
-                f"yt-dlp process pool #{self._generation} broke (a worker died) — "
-                "rebuilding and retrying once"
+                f"{self._name} process pool #{self._generation} broke (a worker "
+                "died) — rebuilding and retrying once"
             )
             self._replace(executor)
             return await loop.run_in_executor(
                 self._acquire(), _call_with_context, carrier, fn, *args
             )
 
-    def prewarm(self) -> None:
-        """Spawn the workers now (from setup_hook) so the first -play doesn't absorb
-        process-spawn + yt-dlp-import latency. Fire-and-forget: submits one no-op per
-        worker and returns without awaiting them."""
+    def prewarm(self, warm: Callable[[], Any] = _warmup_noop) -> None:
+        """Spawn the workers now so the first real call does not pay spawn and
+        import latency. Fire-and-forget: submits `warm` once per worker. The
+        default no-op warms only what a worker pays on the way up (all of
+        yt-dlp's cost); the chart pool passes a callable that imports
+        matplotlib. Must be picklable, hence module-level."""
         executor = self._acquire()
         if not isinstance(executor, ProcessPoolExecutor):
             return  # a thread pool (tests) has nothing to spawn
         for _ in range(self._max_workers):
-            executor.submit(_warmup_noop)
+            # Through _call_with_context like every run() call: it flattens a yt-dlp
+            # exception, which otherwise fails to unpickle and bricks the pool.
+            # concurrent.futures never reports an unretrieved exception the way
+            # asyncio does, so without the callback a warm that raises is silent.
+            executor.submit(_call_with_context, {}, warm).add_done_callback(
+                self._log_warm_failure
+            )
+
+    def _log_warm_failure(self, future: Future[Any]) -> None:
+        error = future.exception()
+        if error is not None:
+            log.warning(f"{self._name} worker warm failed: {error}")
 
     def _close(self) -> Optional[Executor]:
-        """Mark the pool closed and unpublish its executor, returning it to be joined.
-        The join is the caller's business because it blocks: holding the lock across it
-        would stall every concurrent run() for nothing.
-        """
+        """Mark the pool closed and unpublish its executor, returning it to be
+        joined by the caller: the join blocks, and holding the lock across it
+        would stall every concurrent run()."""
         with self._lock:
             self._closed = True
             executor, self._executor = self._executor, None
         return executor
 
     async def aclose(self, timeout: float = _SHUTDOWN_TIMEOUT_SECS) -> None:
-        """Close the pool from the event loop: flip the flag here, join off-thread, so
-        cross-thread mutation is structurally impossible rather than merely locked
-        (modelled on loop.shutdown_default_executor()). A join that outruns `timeout` is
-        abandoned, not awaited — nothing can cancel a thread mid-join, but the exiting
-        process takes it along.
-        """
+        """Close from the event loop: flip the flag here, join off-thread. A
+        join that outruns `timeout` is abandoned — nothing can cancel a thread
+        mid-join, but the exiting process takes it along."""
         executor = self._close()
         if executor is not None:
             loop = asyncio.get_running_loop()
@@ -299,30 +409,29 @@ class YtdlpPool:
                     await loop.run_in_executor(None, join)
             except TimeoutError:
                 log.warning(
-                    f"yt-dlp pool #{self._generation} did not finish joining within "
-                    f"{timeout}s — terminating its workers"
+                    f"{self._name} pool #{self._generation} did not finish joining "
+                    f"within {timeout}s — terminating its workers"
                 )
-                # shutdown(wait=False) does not bound exit: the abandoned join keeps
-                # the manager thread alive and _python_exit joins it at interpreter
-                # exit. Measured: 61s with an in-flight extraction, 3.4s once SIGTERMed.
+                # shutdown(wait=False) does not bound exit: the abandoned join
+                # keeps the manager thread alive and _python_exit joins it at
+                # interpreter exit (61s measured with an in-flight extraction).
                 if isinstance(executor, ProcessPoolExecutor):
                     executor.terminate_workers()
                 else:
                     executor.shutdown(wait=False, cancel_futures=True)
-        # Unconditional even when _close() returned None: a concurrent _replace() during
-        # a break-heal can null the executor out while leaving the listener running, and
-        # an early return would leak that thread for the life of the process. With an
-        # executor this still runs only after its workers are gone (join or terminate).
+        # Unconditional: a concurrent _replace() during a break-heal can null
+        # the executor while leaving the listener running, and an early return
+        # would leak that thread for the life of the process.
         self._stop_log_listener()
+        self._stop_progress_drain()
 
     def shutdown(self, wait: bool = True) -> None:
-        """Synchronous close, for a caller with no event loop to await. Used by tests;
-        production flows through aclose(). Deliberately not an atexit or signal handler
-        despite the shape inviting it: discord.py already routes SIGTERM and
-        KeyboardInterrupt through the bot's close(). Blocking by default, idempotent,
-        safe when no executor was created; after this, submits raise PoolClosedError.
-        """
+        """Synchronous close for a caller with no event loop (tests; production
+        flows through aclose()). Not an atexit or signal handler: discord.py
+        already routes SIGTERM and KeyboardInterrupt through the bot's close().
+        Idempotent; after this, submits raise PoolClosedError."""
         executor = self._close()
         if executor is not None:
             executor.shutdown(wait=wait, cancel_futures=True)
         self._stop_log_listener()
+        self._stop_progress_drain()

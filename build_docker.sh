@@ -6,7 +6,7 @@
 # here reimplements any of them — keeping its own copy of the gate is exactly how
 # the old build.sh drifted out of sync with CI while still reporting success.
 #
-# Need only one step? `just check`, `just image`, `./deploy_docker.sh`.
+# Need only one step? `just check`, `just build`, `./deploy_docker.sh`.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -36,6 +36,11 @@ export GIT_SHA
 
 # `:latest` too — docker-compose.yml falls back to it when GIT_SHA is unset, so a
 # bare `docker compose up` still runs whatever was last built here.
+#
+# The full shape only, unlike `just build`, which also builds the `-slim` pair. This
+# path builds what the next line deploys; a slim image nothing is about to run would
+# be a second dependency resolve on every deploy. Deploy slim by building it there
+# and passing its tag to ./deploy_docker.sh.
 echo "Building runtime image"
 build_runtime_image "$IMAGE_NAME:latest" "$IMAGE_NAME:$GIT_SHA"
 

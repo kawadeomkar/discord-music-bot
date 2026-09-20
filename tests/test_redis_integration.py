@@ -51,28 +51,31 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import HistoryEntry, SongQueueEntry
+from src.guild_state import GuildConfig, HistoryEntry, SongQueueEntry
 from src.redis_client import (
+    GUILD_CONFIG_KEY,
+    GUILD_STATE_KEY,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
     HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
+    BotConfigStore,
     GuildRedisStore,
     ack_outbox,
     ensure_outbox_group,
     outbox_depth,
     outbox_pending_below,
     outbox_pending_count,
-    read_guild_configs,
     read_outbox_new,
     read_outbox_pending,
     reclaim_outbox_stale,
     retire_outbox,
+    scan_guild_config_ids,
     trim_outbox_below,
 )
 
-from tests.helpers import bind_loopback_only, tier_enabled
+from tests.helpers import bind_loopback_only, read_all_configs, tier_enabled
 
 # REDIS_TEST_URL enables the tier on its own, for the same reason
 # POSTGRES_TEST_URL does in the pg tier: a CI job that supplied the server but
@@ -632,6 +635,76 @@ class TestOutboxKeyIsNonEvictable:
         assert await redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
 
+_GUILD_CONFIG_WRITES: list[Any] = [
+    pytest.param(lambda s: s.set_volume(0.5, writer=1234), id="set_volume"),
+    pytest.param(lambda s: s.migrate_volume(0.5, writer=1234), id="migrate_volume"),
+    pytest.param(lambda s: s.set_debug_mode(True, writer=1234), id="set_debug_mode"),
+    pytest.param(
+        lambda s: s.set_timezone("Europe/London", writer=1234), id="set_timezone"
+    ),
+    pytest.param(
+        lambda s: s.update_config(GuildConfig(idle_timeout_secs=600.0), writer=1234),
+        id="update_config",
+    ),
+]
+
+
+class TestConfigKeysAreNonEvictable:
+    """Golden rule 12 against a real server: every config write PERSISTs its key.
+    Each key is seeded with a TTL first, because `ttl == -1` on a key nothing ever
+    expired passes whether or not the PERSIST ran."""
+
+    @pytest.mark.parametrize("write", _GUILD_CONFIG_WRITES)
+    async def test_every_guild_config_write_persists(
+        self, redis: aioredis.Redis, write: Any
+    ) -> None:
+        store = GuildRedisStore(redis, 42)
+        await redis.hset(store.config_key(), "debug_mode", "1")
+        await redis.expire(store.config_key(), 600)
+
+        assert await write(store) is True
+
+        assert await redis.ttl(store.config_key()) == -1
+
+    async def test_the_bot_config_write_persists(self, redis: aioredis.Redis) -> None:
+        bot_store = BotConfigStore(redis, application_id=1234)
+        await redis.hset(bot_store.config_key(), "ping_tick_secs", "2.0")
+        await redis.expire(bot_store.config_key(), 600)
+
+        assert await bot_store.update_config({"play_inflight_max": 4}) is True
+
+        assert await redis.ttl(bot_store.config_key()) == -1
+
+
+class TestConfigKeyScanWalksTheCursor:
+    """fakeredis answers SCAN in one page, so only a real server exercises the
+    loop that follows the cursor."""
+
+    async def test_every_config_id_comes_back_across_pages(
+        self, redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ids = list(range(1, 2501))
+        pipe = redis.pipeline(transaction=False)
+        for guild_id in ids:
+            pipe.hset(GUILD_CONFIG_KEY.format(guild_id=guild_id), "debug_mode", "1")
+            pipe.hset(GUILD_STATE_KEY.format(guild_id=guild_id), "volume", "0.5")
+        await pipe.execute()
+        calls = 0
+        real_scan = redis.scan
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return await real_scan(*args, **kwargs)
+
+        monkeypatch.setattr(redis, "scan", counting)
+
+        found = await scan_guild_config_ids(redis, timeout=5.0)
+
+        assert calls > 1
+        assert sorted(found or []) == ids
+
+
 class TestConfigReadsSurviveTheConnectionCap:
     """The divergence this tier exists for. fakeredis has no connection pool, so a
     per-guild fan-out looks perfect there and fails on a real server the moment a
@@ -660,16 +733,16 @@ class TestConfigReadsSurviveTheConnectionCap:
                 await GuildRedisStore(client, guild_id).set_debug_mode(True)
 
             naive = await asyncio.gather(
-                *(GuildRedisStore(client, g).get_config() for g in ids)
+                *(GuildRedisStore(client, g).read_config() for g in ids)
             )
 
-            assert sum(c.debug_mode is True for c in naive) == 20
+            assert sum(c is not None and c.debug_mode is True for c in naive) == 20
         finally:
             await client.flushdb()
             await client.aclose()
             await pool.disconnect()
 
-    async def test_read_guild_configs_resolves_every_guild(
+    async def test_iter_guild_configs_resolves_every_guild(
         self, redis_url: str
     ) -> None:
         """And the fix, against the same server and the same cap."""
@@ -680,10 +753,61 @@ class TestConfigReadsSurviveTheConnectionCap:
             for guild_id in ids:
                 await GuildRedisStore(client, guild_id).set_debug_mode(True)
 
-            configs = await read_guild_configs(client, ids)
+            configs = await read_all_configs(client, ids)
 
             assert sorted(configs) == ids
             assert all(c.debug_mode is True for c in configs.values())
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+    async def test_a_wrong_type_key_reads_as_unset_and_spares_its_batch(
+        self, redis_url: str
+    ) -> None:
+        """A pipeline run with raise_on_error=False hands each error back in its
+        slot; that a real server's WRONGTYPE arrives there as a ResponseError is
+        what the per-guild handling relies on."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            await GuildRedisStore(client, 1).set_debug_mode(True)
+            await client.set("guild:2:config", b"not a hash")
+            await GuildRedisStore(client, 3).set_debug_mode(False)
+
+            configs = await read_all_configs(client, [1, 2, 3])
+
+            assert configs == {
+                1: GuildConfig(debug_mode=True),
+                2: GuildConfig(),
+                3: GuildConfig(debug_mode=False),
+            }
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+    async def test_every_config_reader_reads_a_wrong_type_key_as_unset(
+        self, redis_url: str
+    ) -> None:
+        """The snapshot's pipeline is a MULTI, where a real server returns
+        WRONGTYPE inside EXEC's reply rather than raising at queue time."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            store = GuildRedisStore(client, 1)
+            await client.set(store.config_key(), b"not a hash")
+            await client.rpush(store.queue_key(), b"entry")
+            bot_store = BotConfigStore(client, 99)
+            await client.set(bot_store.config_key(), b"not a hash")
+
+            snapshot = await store.get_playback_snapshot()
+
+            assert await store.read_config() == GuildConfig()
+            assert snapshot is not None and snapshot.config == GuildConfig()
+            assert await bot_store.read_config() == {}
+            await client.set(store.queue_key(), b"not a list")
+            assert await store.get_playback_snapshot() is None
         finally:
             await client.flushdb()
             await client.aclose()
@@ -950,3 +1074,80 @@ class TestLremRemovalPath:
         await store.remove_queue_entries([self._entry(1)])
 
         assert await redis.exists(store.queue_key()) == 0
+
+
+class TestRecoveryLockCompareAndDelete:
+    """`release_recovery_lock` — WATCH/MULTI compare-and-delete against a real
+    server. This is the tier the WATCH-over-Lua choice was made for: fakeredis
+    accepts the commands, but only a real server settles whether a WATCH is
+    actually invalidated by a write from another connection, which is the entire
+    guarantee. Deleting a lease this store no longer owns admits a second
+    restore of the same guild."""
+
+    async def test_release_deletes_only_the_lease_this_store_acquired(
+        self, redis: aioredis.Redis
+    ) -> None:
+        first = GuildRedisStore(redis, guild_id=7)
+        assert await first.acquire_recovery_lock() is True
+
+        # The lease elapses mid-restore and the next attempt takes it.
+        await redis.delete(first._recovery_lock_key())
+        second = GuildRedisStore(redis, guild_id=7)
+        assert await second.acquire_recovery_lock() is True
+        token = second._recovery_lock_token
+        assert token is not None
+
+        await first.release_recovery_lock()  # the late release
+
+        assert await redis.get(first._recovery_lock_key()) == token.encode()
+
+    async def test_exec_aborts_when_the_key_changes_hands_after_the_watch(
+        self,
+        redis: aioredis.Redis,
+        redis_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The window the compare alone cannot close: the value still matches at
+        GET and is stolen before EXEC. WATCH is per-CONNECTION, so the steal has
+        to come from a second client — a same-connection write would not
+        invalidate anything and would prove nothing."""
+        store = GuildRedisStore(redis, guild_id=8)
+        assert await store.acquire_recovery_lock() is True
+        key = store._recovery_lock_key()
+
+        thief = aioredis.Redis.from_url(redis_url, decode_responses=False)
+        real_pipeline = redis.pipeline
+
+        class _StealAfterGet:
+            """Pipeline wrapper that lets a second client take the key between
+            this pipeline's GET and its EXEC."""
+
+            def __init__(self, pipe: Any) -> None:
+                self._pipe = pipe
+
+            async def __aenter__(self) -> _StealAfterGet:
+                await self._pipe.__aenter__()
+                return self
+
+            async def __aexit__(self, *exc: Any) -> Any:
+                return await self._pipe.__aexit__(*exc)
+
+            async def get(self, name: Any) -> Any:
+                value = await self._pipe.get(name)
+                await thief.set(key, b"the-next-attempts-token", ex=60)
+                return value
+
+            def __getattr__(self, attr: str) -> Any:
+                return getattr(self._pipe, attr)
+
+        try:
+            monkeypatch.setattr(
+                redis,
+                "pipeline",
+                lambda *a, **k: _StealAfterGet(real_pipeline(*a, **k)),
+            )
+            await store.release_recovery_lock()  # must not raise
+
+            assert await redis.get(key) == b"the-next-attempts-token"
+        finally:
+            await thief.aclose()

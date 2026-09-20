@@ -13,6 +13,15 @@ inputs:
       cache key. Ignored when `install` is false.
     required: false
     default: ''
+  extras:
+    description: >-
+      Poetry extras passed to --extras. Defaults to `charts` because every job that
+      installs needs it: pyright resolves matplotlib's imports in analytics_render,
+      and the suite renders real figures. The extra exists to keep matplotlib out of
+      the slim runtime IMAGE, not out of CI, where venv size buys nothing. Folded
+      into the cache key. Ignored when `install` is false.
+    required: false
+    default: 'charts'
   install:
     description: >-
       Whether to create the virtualenv at all. Set false for jobs that only need
@@ -57,7 +66,10 @@ runs:
       shell: bash
       env:
         GROUPS: ${{ inputs.groups }}
-      run: echo "groups=${GROUPS//,/-}" >> "$GITHUB_OUTPUT"
+        EXTRAS: ${{ inputs.extras }}
+      run: |
+        echo "groups=${GROUPS//,/-}" >> "$GITHUB_OUTPUT"
+        echo "extras=${EXTRAS//,/-}" >> "$GITHUB_OUTPUT"
 
     # The group set is part of the key directly, so a caller cannot change `groups`
     # and forget to bump the prefix. No restore-keys: a near-miss restore hands
@@ -69,7 +81,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: .venv
-        key: venv-${{ inputs.cache-prefix }}-${{ steps.cache_key.outputs.groups }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
+        key: venv-${{ inputs.cache-prefix }}-${{ steps.cache_key.outputs.groups }}-x${{ steps.cache_key.outputs.extras }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
 
     # poetry.toml commits virtualenvs.in-project, so the venv lands at .venv/
     # and matches the cache path above without a `poetry config` call here.
@@ -82,4 +94,9 @@ runs:
     - name: Install dependencies
       if: inputs.install == 'true'
       shell: bash
-      run: poetry sync --only=${{ inputs.groups }} --no-root
+      env:
+        GROUPS: ${{ inputs.groups }}
+        EXTRAS: ${{ inputs.extras }}
+      # ${EXTRAS:+...} so an empty `extras` omits the flag rather than passing a
+      # bare --extras with no value, which poetry rejects.
+      run: poetry sync --only="$GROUPS" ${EXTRAS:+--extras "$EXTRAS"} --no-root

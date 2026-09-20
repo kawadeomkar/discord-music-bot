@@ -28,7 +28,7 @@ jobs:
     name: Python Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # install: false — `poetry export` reads poetry.lock and never touches a
       # virtualenv, so this job used to build the full lint environment (pyright plus
@@ -50,3 +50,37 @@ jobs:
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           inputs: requirements-audit.txt
+
+  # The yt-dlp pin is currently a NIGHTLY (.dev0), taken because the newest stable
+  # 403s on the media fetch. Nothing else notices when that stops being necessary:
+  # `just pins` compares the pinned string against the docs, not against PyPI, and a
+  # nightly left in place quietly becomes permanent. Reports only — a newer stable is
+  # news, not a failure, and this must never block a merge.
+  ytdlp-stable-watch:
+    name: yt-dlp stable release watch
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the pin against the newest stable on PyPI
+        run: |
+          set -euo pipefail
+          pinned="$(sed -n 's/^yt-dlp = { version = "\([^"]*\)".*$/\1/p' pyproject.toml)"
+          stable="$(curl -fsSL https://pypi.org/pypi/yt-dlp/json | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])')"
+          echo "pinned=$pinned  newest stable=$stable"
+          case "$pinned" in
+            *dev*)
+              # Strip the nightly suffix so the comparison is date-against-date.
+              base="${pinned%%.dev*}"
+              newest="$(printf '%s\n%s\n' "$base" "$stable" | sort -V | tail -1)"
+              if [ "$newest" = "$stable" ] && [ "$stable" != "$base" ]; then
+                echo "::warning title=yt-dlp stable available::Pinned nightly $pinned is older than stable $stable. Re-test the media fetch and move back to a stable pin if it holds."
+              else
+                echo "No stable newer than the pinned nightly yet; the nightly is still required."
+              fi
+              ;;
+            *)
+              echo "Pin is already a stable release; nothing to watch."
+              ;;
+          esac
