@@ -186,11 +186,20 @@ class GuildQueue:
         "_generation",
         "_mirror_dirty",
         "_listed",
+        "_user_lookup",
     )
 
-    def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
+    def __init__(
+        self,
+        guild: discord.Guild,
+        store: Optional[GuildRedisStore],
+        *,
+        user_lookup: Optional[Callable[[int], Optional[discord.User]]] = None,
+    ) -> None:
         self._guild = guild
         self._store = store
+        # Bot.get_user: the second leg _rehydrate resolves a requester through.
+        self._user_lookup = user_lookup
         # _items[:_cursor] claimed but unsettled, _items[_cursor:] pending.
         self._items: deque[QueueItem] = deque()
         self._cursor = 0
@@ -724,8 +733,10 @@ class GuildQueue:
     ) -> Optional[QueueItem]:
         """At-rest entry → live queue item, the one construction path for
         everything coming back from Redis. A SongQueueEntry needs a requester:
-        the persisted member ID, else requester_fallback, else guild.owner, else
-        dropped."""
+        the persisted ID as a guild member, else through the user cache, else
+        requester_fallback, else guild.owner, else dropped. The two caches are
+        MusicPlayer._resolve_requester's, so a member who left keeps their songs
+        and their lazy searches under one requester."""
         if isinstance(entry, SearchQueueEntry):
             return YTSource(
                 ytsearch=entry.ytsearch,
@@ -743,6 +754,8 @@ class GuildQueue:
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
             requester = self._guild.get_member(entry.requester_id)
+            if requester is None and self._user_lookup is not None:
+                requester = self._user_lookup(entry.requester_id)
         if requester is None:
             requester = (
                 requester_fallback

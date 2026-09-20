@@ -58,6 +58,7 @@ from src.util import (
     record_span_error,
     trace_footer,
     traceparent_context,
+    EMBED_TITLE_LIMIT,
     safe_label,
     truncate,
     truncate_embed_title,
@@ -451,7 +452,7 @@ class MusicPlayer:
         self.store = (
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
         )
-        self.queue = GuildQueue(guild, self.store)
+        self.queue = GuildQueue(guild, self.store, user_lookup=bot.get_user)
         # Only the DRAINER is wired in: history writes nudge it, nothing here reads
         # Postgres back. It lives on the app, present exactly when
         # HISTORY_ARCHIVE_ENABLED, so a None drainer wires the None notify
@@ -779,7 +780,7 @@ class MusicPlayer:
         stopped."""
         head = self.queue.peek_next()
         if isinstance(head, QueueObject) and not is_persisted(head) and head.title:
-            value = f"**{truncate_embed_title(head.title)}**"
+            value = f"**{safe_label(head.title, EMBED_TITLE_LIMIT)}**"
             if head.ts:
                 value += f"\n`{fmt_duration(head.ts)}`"
                 if head.duration:
@@ -789,7 +790,7 @@ class MusicPlayer:
         last = self.history.latest
         if last is None or not last.title:
             return None
-        value = f"**{truncate_embed_title(last.title)}**"
+        value = f"**{safe_label(last.title, EMBED_TITLE_LIMIT)}**"
         value += f"\n`{fmt_duration(last.played_secs)}`"
         if last.duration_secs > 0:
             value += f" / `{fmt_duration(last.duration_secs)}`"
@@ -816,7 +817,9 @@ class MusicPlayer:
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
-                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
+                # Discord renders markdown here, and a title is yt-dlp's.
+                f"Playing now: {safe_label(started.title, EMBED_TITLE_LIMIT)} - "
+                f"({started.webpage_url})\n\n"
                 f"**{count}** {songs} from the previous session "
                 f"{verb} after it."
             ),
