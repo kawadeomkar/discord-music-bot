@@ -764,7 +764,7 @@ services:
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
 # A raw `docker compose` still works — it just never deploys the archive tier.
 [doc('Run `docker compose` with the archive profile derived from HISTORY_ARCHIVE_ENABLED')]
-[group('deploy')]
+[group('ops')]
 compose *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1069,7 +1069,7 @@ db-restore FILE DB='':
 # a gate you cannot skip is a gate you route around.
 
 # Build the runtime image as :latest and :<git-sha> — no test gate
-[group('build')]
+[group('ops')]
 image:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1090,7 +1090,7 @@ image:
     CHART_EXTRAS= build_runtime_image "{{ IMAGE }}:latest-slim" "{{ IMAGE }}:$tag-slim"
 
 # Deploy an already-built image; pass a git sha to roll back
-[group('deploy')]
+[group('ops')]
 up TAG='':
     # Quoted: unquoted, `just up '*'` globbed against the repo root and `just up "a b"`
     # passed two arguments. Both ended at the deploy guard's refusal, but naming a tag
@@ -1099,7 +1099,7 @@ up TAG='':
     ./deploy_docker.sh "{{ TAG }}"
 
 # Stop the compose stack (volumes are kept)
-[group('deploy')]
+[group('ops')]
 down:
     # --profile archive is load-bearing, not decoration. `docker compose down`
     # with the profile INACTIVE removes only un-profiled containers and leaves
@@ -1119,18 +1119,18 @@ down:
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Restart the running bot in place — does NOT pick up a new image (use `just up`)')]
-[group('deploy')]
+[group('ops')]
 restart:
     docker compose restart discord-music-bot
 
 # Follow the bot's logs
-[group('deploy')]
+[group('ops')]
 logs *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     docker compose logs -f discord-music-bot "$@"
 
 # Show compose service status
-[group('deploy')]
+[group('ops')]
 ps:
     docker compose ps
