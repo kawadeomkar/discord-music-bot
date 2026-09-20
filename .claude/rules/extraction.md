@@ -107,8 +107,10 @@ the playlist's path through `queue_source`, the card and every placement; page 1
 `GET /v1/albums/{id}` unslotted, pages 2+ take a walk slot (below), a 403 maps to
 `SpotifyPlaylistForbiddenError` as the playlist's does, and it is cached only when the
 walk counted exactly the album's `total` and kept a title.
-`parse_url` drops a share link's `/intl-xx/` segment, and a Spotify link of a type the
-bot does not queue, or with no id, raises `UnsupportedSpotifyLinkError` — not a
+Either walk that ends before Spotify's own count sets `SpotifyPlaylist.short`, which the
+queued card and the `--now` path turn into a notice. `parse_url` drops a share link's
+`/intl-xx/` segment, and a Spotify link of a type the bot does not queue, with no id, or
+with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
 `ValueError`, which `parse_input` would turn into a YouTube search for the link.
 
 ## Concurrency primitives
