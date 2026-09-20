@@ -45,7 +45,7 @@ from src.sources import (
     parse_url,
     timestamp_warning,
 )
-from src.spotify import SpotifyPlaylist
+from src.spotify import SpotifyPlaylist, SpotifyTrack
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     admit,
@@ -2630,6 +2630,55 @@ class TestSpotifyAlbum:
         ]
         assert {t.user_input for t in tracks} == {_ORIGIN}
         assert {t.requester_id for t in tracks} == {mock_ctx.author.id}
+
+    async def test_the_queued_searches_carry_what_a_listing_shows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        rows = [
+            SpotifyTrack(
+                name="DNA.",
+                artists=["Kendrick Lamar"],
+                duration_secs=185,
+                url="https://open.spotify.com/track/dna",
+            ),
+            SpotifyTrack(name="YAH.", artists=[], duration_secs=None, url=None),
+        ]
+        mp = await self._enqueue(
+            music_bot,
+            mock_ctx,
+            ResolvedSpotifyPlaylist(
+                titles=["DNA. Kendrick Lamar", "YAH. Kendrick Lamar"], tracks=rows
+            ),
+        )
+
+        (tracks,) = mp.queue_put.await_args.args
+        assert [(t.title, t.uploader, t.duration, t.webpage_url) for t in tracks] == [
+            ("DNA.", "Kendrick Lamar", 185, "https://open.spotify.com/track/dna"),
+            ("YAH.", None, None, None),
+        ]
+        # What is searched for is still the name with its artists.
+        assert tracks[0].ytsearch == "ytsearch:DNA. Kendrick Lamar"
+
+    async def test_queue_source_carries_the_walks_rows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        rows = [SpotifyTrack(name="One", artists=["A"], duration_secs=1, url=None)]
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(
+            return_value=_album_walk(titles=["One A"], tracks=rows)
+        )
+
+        result = await play_pipeline.queue_source(
+            mock_ctx,
+            source,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            mode=ResolveMode.FLAT_OK,
+            cog=music_bot,
+        )
+
+        assert isinstance(result, ResolvedSpotifyPlaylist) and result.tracks == rows
 
     async def test_now_takes_the_whole_album_head_first(
         self, music_bot: MusicBot, mock_ctx: MagicMock

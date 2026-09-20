@@ -1,11 +1,16 @@
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Final, Literal, Optional, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Final, Literal, Optional, Union
 from urllib.parse import parse_qs, urlsplit
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.util import get_logger, safe_label
+
+if TYPE_CHECKING:
+    # Annotation only: parsing stays free of the Spotify client.
+    from src.spotify import SpotifyTrack
 
 log = get_logger(__name__)
 
@@ -218,14 +223,23 @@ def collection_noun(
 
 
 def spotify_playlist_to_ytsearch(
-    titles: list[str], *, analytics: Analytics, origin: str, requester_id: int
+    titles: list[str],
+    *,
+    analytics: Analytics,
+    origin: str,
+    requester_id: int,
+    tracks: Sequence[SpotifyTrack] = (),
 ) -> list[YTSource]:
     """Spotify album or playlist tracks as lazy YouTube searches, each resolved
     at dequeue. The Spotify token, the ask-time analytics (the head's; per-track
     positions derive from it), `origin` (the pasted collection link) and the
     requester are set here, the last point that knows where these came from.
     `requester_id` has no default: a track without one is attributed at dequeue to
-    whoever ran a command most recently."""
+    whoever ran a command most recently. `tracks` is `titles` as a listing shows
+    them, index for index; without it the searches carry no display fields."""
+    rows: Sequence[Optional[SpotifyTrack]] = (
+        tracks if len(tracks) == len(titles) else [None] * len(titles)
+    )
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
@@ -234,8 +248,12 @@ def spotify_playlist_to_ytsearch(
             analytics=replace(analytics, queue_position=analytics.queue_position + i),
             user_input=origin,
             requester_id=requester_id,
+            title=row.name if row else None,
+            uploader=", ".join(row.artists) or None if row else None,
+            duration=row.duration_secs if row else None,
+            webpage_url=row.url if row else None,
         )
-        for i, title in enumerate(titles)
+        for i, (title, row) in enumerate(zip(titles, rows))
     ]
 
 

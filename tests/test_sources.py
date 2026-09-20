@@ -598,6 +598,43 @@ class TestSpotifyPlaylistToYTSearch:
         with pytest.raises(TypeError, match="requester_id"):
             spotify_playlist_to_ytsearch(["a"], analytics=_ANALYTICS, origin=_ORIGIN)  # pyright: ignore[reportCallIssue]
 
+    def test_a_track_row_becomes_the_searchs_display_fields(self) -> None:
+        from src.spotify import SpotifyTrack
+
+        rows = [
+            SpotifyTrack(
+                name="LOYALTY.",
+                artists=["Kendrick Lamar", "Rihanna"],
+                duration_secs=227,
+                url="https://open.spotify.com/track/abc",
+            )
+        ]
+        (source,) = spotify_playlist_to_ytsearch(
+            ["LOYALTY. Kendrick Lamar Rihanna"],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=7,
+            tracks=rows,
+        )
+        assert source.ytsearch == "ytsearch:LOYALTY. Kendrick Lamar Rihanna"
+        assert (source.title, source.uploader, source.duration, source.webpage_url) == (
+            "LOYALTY.",
+            "Kendrick Lamar, Rihanna",
+            227,
+            "https://open.spotify.com/track/abc",
+        )
+
+    def test_without_rows_a_search_has_nothing_to_show(self) -> None:
+        (source,) = spotify_playlist_to_ytsearch(
+            ["a"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=7
+        )
+        assert (source.title, source.uploader, source.duration, source.webpage_url) == (
+            None,
+            None,
+            None,
+            None,
+        )
+
 
 class TestYTSourcePlaylistUrl:
     """`YTSource.playlist_url` — the single spelling of the

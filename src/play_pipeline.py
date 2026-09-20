@@ -40,7 +40,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
     timestamp_warning,
 )
-from src.spotify import SpotifyPlaylist
+from src.spotify import SpotifyPlaylist, SpotifyTrack
 from src.telemetry import get_tracer
 from src.queue_progress import enqueue_progress, is_collection
 from src.queue_rows import queue_runtime
@@ -137,6 +137,7 @@ class ResolvedSpotifyPlaylist:
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
     short: bool = False
+    tracks: list[SpotifyTrack] = field(default_factory=list)
 
 
 @dataclass
@@ -278,10 +279,18 @@ def collection_note(
 
 
 async def _searches_for(
-    titles: Sequence[str], *, analytics: Analytics, origin: str, requester_id: int
+    titles: Sequence[str],
+    *,
+    analytics: Analytics,
+    origin: str,
+    requester_id: int,
+    rows: Sequence[SpotifyTrack] = (),
 ) -> list[YTSource]:
     """spotify_playlist_to_ytsearch, a chunk per event-loop turn. Positions count on
-    from `analytics` across chunks, as they would in one call."""
+    from `analytics` across chunks, as they would in one call. `rows` is the walk's
+    display rows, one per title."""
+    if len(rows) != len(titles):
+        rows = ()
     tracks: list[YTSource] = []
     for start in range(0, len(titles), _SEARCH_BUILD_CHUNK):
         if start:
@@ -293,6 +302,7 @@ async def _searches_for(
             ),
             origin=origin,
             requester_id=requester_id,
+            tracks=rows[start : start + _SEARCH_BUILD_CHUNK],
         )
     return tracks
 
@@ -449,6 +459,7 @@ async def queue_source(
             artists=playlist.artists,
             thumbnail=playlist.thumbnail,
             short=playlist.short,
+            tracks=playlist.tracks,
         )
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
@@ -560,6 +571,7 @@ async def enqueue_playlist(
             analytics=replace(analytics, queue_position=provisional),
             origin=origin,
             requester_id=ctx.author.id,
+            rows=qobj.tracks,
         )
         log.info(f"spotify {collection_noun(source)} track count: {len(tracks)}")
         async with cog._plays.place(req) as verdict:
@@ -791,6 +803,7 @@ async def _resolve_interjection_source(
             analytics=analytics,
             origin=origin,
             requester_id=ctx.author.id,
+            rows=playlist.tracks,
         )
         # The head takes the full path — it has to be playable to interrupt
         # with. The rest stay lazy searches, resolved at dequeue.

@@ -1179,8 +1179,8 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
-| `spotify:album_tracks:v1:{id}` | String | The playlist object's shape, plus `artists` and `thumbnail`. Written only by a non-empty walk that counted exactly the album's `total` | 24 h |
+| `spotify:playlist:v4:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
+| `spotify:album_tracks:v2:{id}` | String | The playlist object's shape, plus `artists` and `thumbnail`. Written only by a non-empty walk that counted exactly the album's `total` | 24 h |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1521,8 +1521,8 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:v3:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
-| `album(id)` | `spotify:album_tracks:v1:{id}` | 24 h | The same `SpotifyPlaylist` shape, plus the album's `artists` and cover `thumbnail`. Page 1 rides `GET /v1/albums/{id}`, so a one-page album is one request and takes no walk slot; later pages follow its `next` cursor inside one. Cached only when the walk counted exactly the album's `total` and kept at least one title — see [Spotify playlist paging](#spotify-playlist-paging) |
+| `playlist(id)` | `spotify:playlist:v4:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
+| `album(id)` | `spotify:album_tracks:v2:{id}` | 24 h | The same `SpotifyPlaylist` shape, plus the album's `artists` and cover `thumbnail`. Page 1 rides `GET /v1/albums/{id}`, so a one-page album is one request and takes no walk slot; later pages follow its `next` cursor inside one. Cached only when the walk counted exactly the album's `total` and kept at least one title — see [Spotify playlist paging](#spotify-playlist-paging) |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 

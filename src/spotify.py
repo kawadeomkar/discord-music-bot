@@ -76,6 +76,19 @@ _TOKEN_EXPIRY_MARGIN_SECS = 60
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class SpotifyTrack:
+    """One walked track as a listing shows it: its own name, apart from the search
+    string it is queued as. The length and the link are what Spotify sent, so
+    either may be missing. Its own class because nothing else can hold it here:
+    the queue's search entry belongs to the parse layer and needs a requester."""
+
+    name: str
+    artists: list[str]
+    duration_secs: Optional[int]
+    url: Optional[str]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SpotifyPlaylist:
     """One collection walk, a playlist's or an album's. `titles` is what gets
     queued; the rest describes it to the confirmation. `unavailable` counts ITEMS
@@ -83,7 +96,8 @@ class SpotifyPlaylist:
     `duration_partial` when any of them carried no `duration_ms`. `artists` and
     `thumbnail` are an album's: the playlist endpoints walked here carry neither.
     `short` says the walk ended before Spotify's own count of the collection; a
-    short walk is never cached, so the cached shape has no field for it."""
+    short walk is never cached, so the cached shape has no field for it. `tracks`
+    is `titles` as a listing shows them, index for index, or empty."""
 
     name: Optional[str]
     titles: list[str]
@@ -93,6 +107,14 @@ class SpotifyPlaylist:
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
     short: bool = False
+    tracks: list[SpotifyTrack] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.tracks and len(self.tracks) != len(self.titles):
+            raise ValueError(
+                f"{len(self.tracks)} tracks for {len(self.titles)} titles: the two "
+                "are read by index"
+            )
 
 
 def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
@@ -106,6 +128,9 @@ def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
         "unavailable": playlist.unavailable,
         "artists": playlist.artists,
         "thumbnail": playlist.thumbnail,
+        "tracks": [
+            [t.name, t.artists, t.duration_secs, t.url] for t in playlist.tracks
+        ],
     }
 
 
@@ -131,9 +156,33 @@ def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
             unavailable=int(entry.get("unavailable", 0)),
             artists=[str(a) for a in artists] if isinstance(artists, list) else [],
             thumbnail=thumbnail if isinstance(thumbnail, str) and thumbnail else None,
+            tracks=_tracks_from_cache(entry.get("tracks"), len(titles)),
         )
     except TypeError, ValueError:
         return None
+
+
+def _tracks_from_cache(raw: object, count: int) -> list[SpotifyTrack]:
+    """The cached display rows, or [] when they are absent, malformed or not one
+    per title: the titles still queue, as searches with nothing to show."""
+    if not isinstance(raw, list) or len(raw) != count:
+        return []
+    tracks: list[SpotifyTrack] = []
+    for row in cast(list[Any], raw):
+        if not isinstance(row, list) or len(row) != 4:
+            return []
+        name, artists, secs, url = cast(list[Any], row)
+        if not isinstance(name, str) or not isinstance(artists, list):
+            return []
+        tracks.append(
+            SpotifyTrack(
+                name=name,
+                artists=[str(a) for a in cast(list[Any], artists)],
+                duration_secs=secs if isinstance(secs, int) else None,
+                url=_str_or_none(url),
+            )
+        )
+    return tracks
 
 
 # Every caller awaiting a walk, leader and joiners alike, keyed like the cache: a
@@ -170,6 +219,22 @@ def _str_or_none(value: object) -> Optional[str]:
 def _list_or_empty(value: object) -> list[Any]:
     """A list from a response field, else []."""
     return cast(list[Any], value) if isinstance(value, list) else []
+
+
+def _track_row(track: dict[str, Any]) -> SpotifyTrack:
+    """A walked track's display row. The caller has checked it has a name."""
+    ms = track.get("duration_ms")
+    links = track.get("external_urls")
+    return SpotifyTrack(
+        name=track["name"],
+        artists=[
+            name
+            for a in _list_or_empty(track.get("artists"))
+            if isinstance(a, dict) and (name := _str_or_none(a.get("name"))) is not None
+        ],
+        duration_secs=ms // 1000 if isinstance(ms, int) else None,
+        url=_str_or_none(links.get("spotify")) if isinstance(links, dict) else None,
+    )
 
 
 def _track_search_title(track: dict[str, Any]) -> str:
@@ -613,7 +678,7 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
         # Versioned by the VALUE's shape: under a 1h TTL, a deploy that changes it
         # would otherwise be answered from the previous build's entries.
-        cache_key = f"spotify:playlist:v3:{pid}"
+        cache_key = f"spotify:playlist:v4:{pid}"
 
         async def fetch() -> tuple[SpotifyPlaylist, bool]:
             # Under `fields` Spotify answers with only the keys named, so `next`
@@ -621,10 +686,14 @@ class Spotify:
             # terminate, without the second progress has no denominator.
             url = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
             params: Optional[dict[str, Union[str, int]]] = {
-                "fields": "items(track(name,artists(name),duration_ms)),next,total",
+                "fields": (
+                    "items(track(name,artists(name),duration_ms,"
+                    "external_urls(spotify))),next,total"
+                ),
                 "limit": _PLAYLIST_PAGE_SIZE,
             }
             titles: list[str] = []
+            tracks: list[SpotifyTrack] = []
             duration_ms = 0
             duration_partial = False
             unavailable = 0
@@ -666,6 +735,7 @@ class Spotify:
                                 unavailable += 1
                                 continue
                             titles.append(_track_search_title(track))
+                            tracks.append(_track_row(track))
                             ms = track.get("duration_ms")
                             if isinstance(ms, int):
                                 duration_ms += ms
@@ -726,6 +796,7 @@ class Spotify:
                 duration_partial=duration_partial,
                 unavailable=unavailable,
                 short=not complete,
+                tracks=tracks,
             )
             return playlist, complete
 
@@ -812,7 +883,7 @@ class Spotify:
         """
         trace.get_current_span().set_attribute("spotify.album_id", aid)
         # Versioned by the value's shape, as the playlist key is.
-        cache_key = f"spotify:album_tracks:v1:{aid}"
+        cache_key = f"spotify:album_tracks:v2:{aid}"
         cached = _playlist_from_cache(await cache_get(self._redis, cache_key))
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
@@ -823,6 +894,7 @@ class Spotify:
         artists: list[str] = []
         thumbnail: Optional[str] = None
         titles: list[str] = []
+        tracks: list[SpotifyTrack] = []
         duration_ms = 0
         duration_partial = False
         unavailable = 0
@@ -866,8 +938,8 @@ class Spotify:
                         )
                         if cover_url is not None and cover_url.startswith("https://"):
                             thumbnail = cover_url
-                        tracks = resp.get("tracks")
-                        page = tracks if isinstance(tracks, dict) else {}
+                        paging = resp.get("tracks")
+                        page = paging if isinstance(paging, dict) else {}
                         raw_total = page.get("total")
                         total = raw_total if isinstance(raw_total, int) else None
                         if total is not None:
@@ -888,6 +960,7 @@ class Spotify:
                             unavailable += 1
                             continue
                         titles.append(_track_search_title(track))
+                        tracks.append(_track_row(track))
                         ms = track.get("duration_ms")
                         if isinstance(ms, int):
                             duration_ms += ms
@@ -947,6 +1020,7 @@ class Spotify:
             artists=artists,
             thumbnail=thumbnail,
             short=short,
+            tracks=tracks,
         )
         if short:
             span.set_attribute("spotify.album_short", True)
