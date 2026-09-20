@@ -13,7 +13,7 @@ from typing import Optional, Union
 import discord
 
 from src.guild_queue import QueueItem
-from src.util import fmt_duration, safe_label, truncate
+from src.util import fmt_duration, safe_label
 from src.youtube import QueueObject
 
 # Nothing bounds a yt-dlp title or uploader, and every row of a listing shares
@@ -41,6 +41,13 @@ class EtaWalk:
         if remaining is None:
             return replace(self, uncertain=True)
         return replace(self, cumulative_secs=self.cumulative_secs + remaining)
+
+    def advance_estimate(self, secs: int) -> EtaWalk:
+        """The next state after an item whose length is someone else's figure: the
+        seconds count, and every time after it is approximate."""
+        return replace(
+            self, cumulative_secs=self.cumulative_secs + secs, uncertain=True
+        )
 
 
 def fmt_total_duration(secs: int) -> str:
@@ -87,8 +94,13 @@ def remaining_secs(item: QueueObject) -> Optional[int]:
 
 
 def advance_walk(walk: EtaWalk, item: QueueItem) -> EtaWalk:
-    """The walk after `item` has played."""
-    return walk.advance(remaining_secs(item) if isinstance(item, QueueObject) else None)
+    """The walk after `item` has played. An unresolved search counts the length it
+    carries, which is Spotify's and not the YouTube match's, as an estimate."""
+    if isinstance(item, QueueObject):
+        return walk.advance(remaining_secs(item))
+    if item.duration is not None:
+        return walk.advance_estimate(item.duration)
+    return walk.advance(None)
 
 
 def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
@@ -99,7 +111,12 @@ def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
     total_secs = 0
     partial = False
     for item in items:
-        remaining = remaining_secs(item) if isinstance(item, QueueObject) else None
+        if isinstance(item, QueueObject):
+            remaining = remaining_secs(item)
+        else:
+            # A search's length is an estimate: it counts, and the total says so.
+            remaining = item.duration
+            partial = True
         if remaining is not None:
             total_secs += remaining
         else:
@@ -117,32 +134,40 @@ def queue_row(
 ) -> str:
     """One listing row: `index`, the linked title, its length and the clock time
     `walk` gives it; with `byline`, a second line naming the channel and the
-    requester. `walk` is the state BEFORE this item."""
+    requester. `walk` is the state BEFORE this item. An unresolved search renders
+    the same row from its display fields (the artists stand in for the channel),
+    and one that carries none is its search text and "resolving..."."""
     eta = fmt_eta(
         now + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
     )
-    if not isinstance(item, QueueObject):
+    if isinstance(item, QueueObject):
+        if item.is_resume and item.ts:
+            note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
+        elif item.ts:
+            note = f"  ·  starts at `{item.ts}s`"
+        else:
+            note = ""
+        who = requester_mention(item.requester)
+        by = "Unknown channel"
+    elif item.title:
+        note = ""
+        who = f"<@{item.requester_id}>" if item.requester_id else "Unknown"
+        by = "Unknown artist"
+    else:
         search = safe_label(
             (item.ytsearch or item.url or "?").removeprefix("ytsearch:"), ROW_TITLE_MAX
         )
         return f"`{index}` {search} · *resolving...*"
     # Capped and sanitized: a "]" in a masked link's label would close it early.
-    title = safe_label(item.title, ROW_TITLE_MAX) or "Unknown"
-    dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
-    if item.is_resume and item.ts:
-        ts_note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
-    elif item.ts:
-        ts_note = f"  ·  starts at `{item.ts}s`"
-    else:
-        ts_note = ""
-    line = (
-        f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note}"
-        f" · Est. playing at {eta}"
+    title = safe_label(item.title or "", ROW_TITLE_MAX) or "Unknown"
+    linked = (
+        f"[**{title}**]({item.webpage_url})" if item.webpage_url else f"**{title}**"
     )
+    dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
+    line = f"`{index}` {linked} · `{dur}`{note} · Est. playing at {eta}"
     if not byline:
         return line
-    channel = truncate(item.uploader or "", ROW_BYLINE_MAX) or "Unknown channel"
-    return f"{line}\n{channel} · {requester_mention(item.requester)}"
+    return f"{line}\n{safe_label(item.uploader or '', ROW_BYLINE_MAX) or by} · {who}"
 
 
 def queue_rows(

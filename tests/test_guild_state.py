@@ -678,6 +678,42 @@ class TestSearchQueueEntryWire:
         assert isinstance(parsed, SearchQueueEntry)
         assert parsed.requester_id == 424242424242424242
 
+    def test_the_display_fields_round_trip(self) -> None:
+        """What -queue shows for an unresolved Spotify track has to survive a
+        restart, or a restored queue reads "resolving..." again."""
+        source = YTSource(
+            ytsearch="ytsearch:DNA. Kendrick Lamar",
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
+        parsed = parse_queue_entry(SearchQueueEntry.from_ytsource(source).to_redis())
+        assert isinstance(parsed, SearchQueueEntry)
+        assert (parsed.title, parsed.uploader, parsed.duration, parsed.webpage_url) == (
+            "DNA.",
+            "Kendrick Lamar",
+            185,
+            "https://open.spotify.com/track/abc",
+        )
+
+    def test_absent_display_fields_write_no_keys(self) -> None:
+        """A typed search, and any entry queued before the fields existed, must
+        serialize to the bytes already on the list, or its LREM misses."""
+        raw = SearchQueueEntry(ytsearch="ytsearch:x").to_redis()
+        for key in (b"title", b"uploader", b"duration", b"webpage_url"):
+            assert key not in raw
+
+    def test_an_entry_without_display_fields_parses_them_as_none(self) -> None:
+        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
+        assert isinstance(entry, SearchQueueEntry)
+        assert (entry.title, entry.uploader, entry.duration, entry.webpage_url) == (
+            None,
+            None,
+            None,
+            None,
+        )
+
     def test_an_unknown_requester_writes_no_key(self) -> None:
         """An entry queued before searches carried a requester must serialize to the
         bytes already on the list, or removing it misses LREM and rebuilds."""

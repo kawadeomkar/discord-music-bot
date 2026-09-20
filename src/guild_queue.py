@@ -146,10 +146,12 @@ def _to_entry(item: QueueItem) -> QueueEntry:
 
 
 def item_label(item: QueueItem) -> str:
-    """What to call a queued item in a reply. A YTSource is an unresolved search
-    with no `title`, so its term stands in, `ytsearch:` prefix off."""
+    """What to call a queued item in a reply. An unresolved search that carries no
+    title of its own is called by its term, `ytsearch:` prefix off."""
+    if item.title:
+        return item.title
     if isinstance(item, QueueObject):
-        return item.title or "?"
+        return "?"
     return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
@@ -750,6 +752,10 @@ class GuildQueue:
                 user_input=entry.user_input,
                 query_source=entry.query_source,
                 requester_id=entry.requester_id,
+                title=entry.title,
+                uploader=entry.uploader,
+                duration=entry.duration,
+                webpage_url=entry.webpage_url,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:

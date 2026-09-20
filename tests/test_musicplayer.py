@@ -1564,7 +1564,7 @@ class TestQueueRemoveWithAPrefetch:
         outcome = await music_player.queue_remove("https://yt.com/v=0")
 
         assert outcome.positions == [1]
-        assert [i.webpage_url for i in music_player.queue.display_items()] == [  # pyright: ignore[reportAttributeAccessIssue]
+        assert [i.webpage_url for i in music_player.queue.display_items()] == [
             f"https://yt.com/v={n}" for n in range(1, 8)
         ]
         await asyncio.gather(*list(music_player._background_tasks))
@@ -7193,6 +7193,28 @@ class TestQueueEntryCard:
         assert "[x](http://evil)" not in body
         assert "](https://yt.com/v=1)" in body
         assert body.count("](") == 1
+
+    def test_an_unresolved_track_renders_the_fields_it_was_queued_with(
+        self, music_player: MusicPlayer
+    ) -> None:
+        seed_queue(
+            music_player.queue,
+            YTSource(
+                ytsearch="ytsearch:DNA. Kendrick Lamar",
+                process=True,
+                requester_id=4242,
+                title="DNA.",
+                uploader="Kendrick Lamar",
+                duration=185,
+                webpage_url="https://open.spotify.com/track/abc",
+            ),
+        )
+
+        lines = self._next_up_body(music_player).split("\n")
+        assert lines[0] == "Requested by: [<@4242>]"
+        assert lines[1] == "[**DNA.**](https://open.spotify.com/track/abc)"
+        assert lines[2] == "Artist: Kendrick Lamar  ·  Duration: `3:05`"
+        assert lines[3].startswith("Est. playing at ")
 
     def test_unresolved_ytsource_renders_resolving(
         self, music_player: MusicPlayer

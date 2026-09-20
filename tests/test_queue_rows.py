@@ -112,6 +112,79 @@ class TestQueueRow:
         assert line.endswith("*resolving...*")
 
 
+def _track(**kwargs: Any) -> YTSource:
+    """An unresolved Spotify track, with the display fields it is queued with."""
+    fields: dict[str, Any] = {
+        "ytsearch": "ytsearch:DNA. Kendrick Lamar",
+        "requester_id": 4242,
+        "title": "DNA.",
+        "uploader": "Kendrick Lamar",
+        "duration": 185,
+        "webpage_url": "https://open.spotify.com/track/abc",
+        **kwargs,
+    }
+    return YTSource(**fields)
+
+
+class TestAnUnresolvedTrackRow:
+    """A Spotify track that has not reached YouTube yet renders the song row from
+    the fields it was queued with."""
+
+    def test_it_is_the_song_row_with_the_artists_where_the_channel_goes(self) -> None:
+        assert queue_row(_track(), 3, now=_NOW, walk=_START) == (
+            "`3` [**DNA.**](https://open.spotify.com/track/abc) · `3:05` · "
+            "Est. playing at **9:41 PM PDT**\n"
+            "Kendrick Lamar · <@4242>"
+        )
+
+    def test_without_a_link_the_title_is_bold_text(self) -> None:
+        row = queue_row(
+            _track(webpage_url=None), 3, now=_NOW, walk=_START, byline=False
+        )
+        assert row.startswith("`3` **DNA.** · `3:05`")
+
+    def test_missing_pieces_have_placeholders(self) -> None:
+        row = queue_row(
+            _track(uploader=None, duration=None, requester_id=None),
+            1,
+            now=_NOW,
+            walk=_START,
+        )
+        assert "`?:??`" in row
+        assert row.endswith("Unknown artist · Unknown")
+
+    def test_a_track_queued_without_display_fields_is_its_search_text(self) -> None:
+        row = queue_row(_track(title=None), 1, now=_NOW, walk=_START)
+        assert row == "`1` DNA. Kendrick Lamar · *resolving...*"
+
+    def test_spotifys_text_cannot_style_the_row(self) -> None:
+        hostile = "[x](https://evil.example)"
+        row = queue_row(
+            _track(title=hostile, uploader=hostile), 1, now=_NOW, walk=_START
+        )
+        assert "](https://evil.example)" not in row
+
+    def test_its_length_counts_and_marks_what_follows_approximate(
+        self, mock_author: MagicMock
+    ) -> None:
+        """Spotify's length is not the YouTube match's."""
+        assert advance_walk(_START, _track()) == EtaWalk(180 + 185, True)
+        rows = queue_rows(
+            [_track(), _song(mock_author)],
+            first_index=1,
+            now=_NOW,
+            walk=_START,
+            byline=False,
+        ).split("\n")
+        assert "Est. playing at **9:41 PM PDT**" in rows[0]
+        assert "Est. playing at ~**9:44 PM PDT**" in rows[1]
+
+    def test_the_runtime_counts_it_and_stays_approximate(
+        self, mock_author: MagicMock
+    ) -> None:
+        assert queue_runtime([_song(mock_author), _track()]) == (60 + 185, True)
+
+
 class TestQueueRows:
     def test_no_items_is_no_text(self) -> None:
         assert queue_rows([], first_index=1, now=_NOW, walk=_START) == ""

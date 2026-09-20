@@ -164,6 +164,14 @@ class YTSource:
     # has to survive Redis. None on parse-time sources, which resolve inside the
     # command that built them, and on entries queued before the field existed.
     requester_id: Optional[int] = None
+    # What a listing shows while the search is unresolved, under the names a
+    # resolved song uses: the track's own title, its artists, its length in
+    # seconds, and the page the title links to. A Spotify track's; None on a
+    # typed search. The length is Spotify's, so an ETA built on it is an estimate.
+    title: Optional[str] = None
+    uploader: Optional[str] = None
+    duration: Optional[int] = None
+    webpage_url: Optional[str] = None
 
     @property
     def playlist_url(self) -> str:

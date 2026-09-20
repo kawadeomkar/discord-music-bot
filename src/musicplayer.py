@@ -1287,12 +1287,33 @@ class MusicPlayer:
             now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
         )
         if not isinstance(item, QueueObject):
-            # Unresolved Spotify-playlist entry: only the search term exists yet.
-            search = safe_label(
-                (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
-                _NEXT_UP_TITLE_MAX,
+            if not item.title:
+                # A search with no display fields: only its term exists yet.
+                search = safe_label(
+                    (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
+                    _NEXT_UP_TITLE_MAX,
+                )
+                return f"{search}\n*resolving...*"
+            # An unresolved Spotify track, from the fields it was queued with.
+            title = safe_label(item.title, _NEXT_UP_TITLE_MAX)
+            linked = (
+                f"[**{title}**]({item.webpage_url})"
+                if item.webpage_url
+                else f"**{title}**"
             )
-            return f"{search}\n*resolving...*"
+            artist = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown"
+            length = (
+                fmt_duration(item.duration) if item.duration is not None else "?:??"
+            )
+            who = f"<@{item.requester_id}>" if item.requester_id else "Unknown"
+            return "\n".join(
+                [
+                    f"Requested by: [{who}]",
+                    linked,
+                    f"Artist: {artist}  ·  Duration: `{length}`",
+                    f"Est. playing at {eta}",
+                ]
+            )
         # Sanitized and capped: a "]" in a masked link's label would close it early.
         title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
         channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"

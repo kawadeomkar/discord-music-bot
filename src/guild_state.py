@@ -623,7 +623,8 @@ class NowPlayingData:
 
 class QueueEntryField:
     TYPE: Final[str] = "type"
-    # "qobj" entries
+    # "qobj" entries. webpage_url, title, duration and uploader are also a
+    # search's display fields, written there only when known.
     WEBPAGE_URL: Final[str] = "webpage_url"
     TITLE: Final[str] = "title"
     REQUESTER_ID: Final[str] = "requester_id"
@@ -840,6 +841,11 @@ class SearchQueueEntry:
     # Who queued it. None, never 0, on an entry written before the field existed:
     # the resolve at dequeue routes None to the fallback requester.
     requester_id: int | None = None
+    # What a listing shows until the search resolves (YTSource's display fields).
+    title: str | None = None
+    uploader: str | None = None
+    duration: int | None = None
+    webpage_url: str | None = None
 
     @classmethod
     def from_ytsource(cls, source: YTSource) -> Self:
@@ -853,6 +859,10 @@ class SearchQueueEntry:
             queue_position=source.analytics.queue_position,
             query_source=source.query_source,
             requester_id=source.requester_id,
+            title=source.title,
+            uploader=source.uploader,
+            duration=source.duration,
+            webpage_url=source.webpage_url,
         )
 
     def to_redis(self) -> bytes:
@@ -871,6 +881,14 @@ class SearchQueueEntry:
         # to the bytes already on the list, or its LREM misses and rebuilds.
         if self.requester_id is not None:
             fields[QueueEntryField.REQUESTER_ID] = self.requester_id
+        for key, value in (
+            (QueueEntryField.TITLE, self.title),
+            (QueueEntryField.UPLOADER, self.uploader),
+            (QueueEntryField.DURATION, self.duration),
+            (QueueEntryField.WEBPAGE_URL, self.webpage_url),
+        ):
+            if value is not None:
+                fields[key] = value
         return orjson.dumps(fields)
 
 
@@ -897,6 +915,10 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
                 query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
                 # No default: absent stays None, which is not requester 0.
                 requester_id=d.get(QueueEntryField.REQUESTER_ID),
+                title=d.get(QueueEntryField.TITLE),
+                uploader=d.get(QueueEntryField.UPLOADER),
+                duration=d.get(QueueEntryField.DURATION),
+                webpage_url=d.get(QueueEntryField.WEBPAGE_URL),
             )
         return SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],
