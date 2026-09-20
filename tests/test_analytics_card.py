@@ -885,7 +885,7 @@ class TestChartFallback:
             await asyncio.sleep(3600)
             return b""
 
-        config.set_override("ANALYTICS_RENDER_DEADLINE_SECS", 0.01)
+        config.analytics_render_deadline_secs.set_override(0.01)
         # Bounded: at the environment's 20s deadline this would pass, only slower.
         with patch("src.chart_pool.chart_pool.run", AsyncMock(side_effect=_hang)):
             async with asyncio.timeout(2):
@@ -1005,7 +1005,7 @@ class TestPngCache:
         music_bot.history_archive = _fake_archive(
             _metrics(today_start_epoch=time.time())
         )
-        config.set_override("ANALYTICS_RENDER_DEADLINE_SECS", 0.01)
+        config.analytics_render_deadline_secs.set_override(0.01)
         with (
             patch("src.chart_pool.chart_pool.run", _slow),
             patch("src.analytics_card.analytics_png_get", AsyncMock(return_value=None)),

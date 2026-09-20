@@ -1252,7 +1252,7 @@ class TestSpotifyPlaylistPaging:
     ) -> None:
         """The 120s walk budget starts after the slot is taken, so a small playlist
         behind two 10,000-track walks otherwise waits minutes with nothing sent."""
-        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        config.play_resolve_wait_secs.set_override(0.05)
         slot = spotify_module._playlist_slot()
         for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
             await slot.acquire()

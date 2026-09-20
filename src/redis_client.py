@@ -33,11 +33,9 @@ from redis.typing import EncodableT, FieldT
 
 from src import config
 from src.guild_state import (
-    ALL_BOT_CONFIG_FIELDS,
+    parse_number_fields,
     CONFIG_DOMAIN,
     CONFIG_WRITER_FIELD,
-    BotConfig,
-    BotConfigFieldName,
     ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
@@ -66,7 +64,7 @@ GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 # setting that expires after a day idle reverts for reasons the user cannot
 # see. See GuildConfig and _pipe_expire_all.
 GUILD_CONFIG_KEY = "guild:{guild_id}:config"
-# An operator's overrides of the bot-wide knobs (BotConfig). Keyed by application
+# An operator's overrides of the bot-wide knobs, by knob field. Keyed by application
 # id, so a dev bot and a prod bot sharing one Redis cannot retune each other.
 # No TTL, like GUILD_CONFIG_KEY.
 BOT_CONFIG_KEY = "bot:{application_id}:config"
@@ -1580,25 +1578,32 @@ class BotConfigStore:
         return BOT_CONFIG_KEY.format(application_id=self.application_id)
 
     @_bot_op(default=None)
-    async def read_config(self) -> Optional[BotConfig]:
-        """The stored overrides, or None when the read failed. A key that is not a
-        hash reads as unset (_config_hash)."""
+    async def read_config(self) -> Optional[dict[str, float]]:
+        """The stored overrides by knob field, or None when the read failed. A key
+        that is not a hash reads as unset (_config_hash). Only parsing happens
+        here: the bounds are the -settings registry's, checked where a value is
+        applied."""
         raw = await _read_config_hash(
             self.redis, self.config_key(), f"[bot:{self.application_id}]"
         )
-        return BotConfig.from_redis(raw)
+        knobs = config.KNOBS.values()
+        return parse_number_fields(
+            raw,
+            floats=[k.field for k in knobs if k.kind is float],
+            counts=[k.field for k in knobs if k.kind is int],
+        )
 
     @_bot_op(default=False)
-    async def update_config(self, config: BotConfig) -> bool:
-        """Persist the fields `config` sets. True when it landed; a config that
-        sets none is refused with nothing sent. PERSIST, because this key must
-        never be an eviction candidate."""
-        mapping = config.to_redis()
-        if not mapping:
+    async def update_config(self, values: Mapping[str, float]) -> bool:
+        """Persist overrides by knob field. True when it landed; refused, with
+        nothing sent, when it sets none or names a field no knob has. PERSIST,
+        because this key must never be an eviction candidate."""
+        if not values or not config.KNOBS.keys() >= values.keys():
             log.warning(
-                f"[bot:{self.application_id}] update_config refused: no field set"
+                f"[bot:{self.application_id}] update_config refused: {dict(values)!r}"
             )
             return False
+        mapping = {field: str(value) for field, value in values.items()}
         pipe = self.redis.pipeline()
         pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
         pipe.persist(self.config_key())
@@ -1606,11 +1611,11 @@ class BotConfigStore:
         return True
 
     @_bot_op(default=False)
-    async def reset_config_fields(self, *fields: BotConfigFieldName) -> bool:
+    async def reset_config_fields(self, *fields: str) -> bool:
         """Delete stored overrides, so each knob runs on its environment value.
         True when it landed; refused, with nothing sent, when it names no field or
         one this hash does not hold."""
-        if not fields or not ALL_BOT_CONFIG_FIELDS.issuperset(fields):
+        if not fields or not config.KNOBS.keys() >= set(fields):
             log.warning(
                 f"[bot:{self.application_id}] reset_config_fields refused: {fields!r}"
             )

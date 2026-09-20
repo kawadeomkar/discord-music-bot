@@ -84,7 +84,7 @@ _FAST_DELAY = 0.01
 
 
 def _fast() -> None:
-    config.set_override("QUEUE_PROGRESS_TICK_SECS", 0.01)
+    config.queue_progress_tick_secs.set_override(0.01)
 
 
 def _text(embeds: list[discord.Embed]) -> str:
@@ -603,7 +603,7 @@ class TestTheCardsOwnBounds:
             queue_progress, "time", SimpleNamespace(monotonic=lambda: clock[0])
         )
         _fast()
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.001)
+        config.queue_progress_max_secs.set_override(0.001)
         message = card_ctx.channel.send.return_value
         titles: list[str] = []
 
@@ -781,7 +781,7 @@ class TestCardTelemetry:
     ) -> None:
         _fast()
         if outcome == "stalled":
-            config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
+            config.queue_progress_max_secs.set_override(0.03)
         if outcome == "send_failed":
             card_ctx.channel.send.side_effect = discord.HTTPException(
                 MagicMock(status=403), "Missing Permissions"
@@ -812,7 +812,7 @@ class TestTheCeiling:
         retries lets one page hold 300s with no aggregate bound across 56 of them.
         """
         _fast()
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
+        config.queue_progress_max_secs.set_override(0.03)
         message = card_ctx.channel.send.return_value
 
         def _stalled() -> bool:
@@ -845,7 +845,7 @@ class TestTheCeiling:
         self, card_ctx: MagicMock
     ) -> None:
         _fast()
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
+        config.queue_progress_max_secs.set_override(0.03)
         message = card_ctx.channel.send.return_value
         message.edit.side_effect = discord.NotFound(MagicMock(status=404), "gone")
 
@@ -926,7 +926,7 @@ class TestTheStalledRender:
         whenever the previous edit was recent, and the card never says it stalled.
         """
         _fast()
-        config.set_override("QUEUE_PROGRESS_MAX_SECS", 0.03)
+        config.queue_progress_max_secs.set_override(0.03)
         monkeypatch.setattr(
             queue_progress, "LiveMessage", lambda _tick: LiveMessage(3600.0)
         )
