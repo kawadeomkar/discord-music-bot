@@ -3,6 +3,7 @@
 import redis.asyncio as aioredis
 import time
 import asyncio
+from collections.abc import Iterator
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1771,6 +1772,21 @@ def _album(tracks: dict[str, Any], **identity: Any) -> dict[str, Any]:
     }
 
 
+def _endless_album(*, total: int, per_page: int) -> Iterator[dict[str, Any]]:
+    """An album whose cursor advances forever: page 1 as the album object, then
+    bare tracks pages, each naming a new `next`."""
+    page_no = 0
+    while True:
+        titles = [f"P{page_no}T{i}" for i in range(per_page)]
+        tracks = _album_tracks_page(
+            titles,
+            total=total,
+            next_url=f"https://api.spotify.com/v1/next/{page_no + 1}",
+        )
+        yield _album(tracks) if page_no == 0 else tracks
+        page_no += 1
+
+
 class TestSpotifyAlbum:
     async def test_one_request_returns_the_tracks_and_the_identity(
         self, spotify: Spotify
@@ -1878,17 +1894,62 @@ class TestSpotifyAlbum:
         self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(spotify_module, "_MAX_PLAYLIST_PAGES", 3)
-        cursor = "https://api.spotify.com/v1/next"
-        tracks = _album_tracks_page(["T"], total=999, next_url=cursor)
+        responses = _endless_album(total=999, per_page=1)
         with patch.object(
-            spotify,
-            "http_call",
-            new=AsyncMock(side_effect=[_album(tracks), tracks, tracks]),
+            spotify, "http_call", new=AsyncMock(side_effect=responses)
         ) as call:
             album = await spotify.album("aid_loop")
 
         assert call.await_count == 3
         assert len(album.titles) == 3
+
+    async def test_the_page_cap_is_the_albums_own_size_plus_slack(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """A cursor that keeps advancing past the album: 30 tracks at 10 a page is
+        3 pages, so the walk stops at 5, and what it overshot is not cached."""
+        responses = _endless_album(total=30, per_page=10)
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=responses)
+        ) as call:
+            album = await spotify.album("aid_over")
+
+        assert call.await_count == 5
+        assert len(album.titles) == 50
+        assert await fake_redis.get("spotify:album_tracks:v1:aid_over") is None
+
+    async def test_a_cursor_that_stops_advancing_ends_the_walk_uncached(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        cursor = "https://api.spotify.com/v1/next"
+        page = _album_tracks_page(
+            [f"T{i}" for i in range(10)], total=30, next_url=cursor
+        )
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=[_album(page), page, page])
+        ) as call:
+            album = await spotify.album("aid_stuck")
+
+        assert call.await_count == 2
+        assert len(album.titles) == 20
+        assert await fake_redis.get("spotify:album_tracks:v1:aid_stuck") is None
+
+    async def test_a_failed_later_page_fails_the_album_and_caches_nothing(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        first = _album(
+            _album_tracks_page(
+                ["T0"], total=2, next_url="https://api.spotify.com/v1/next/1"
+            )
+        )
+        failure = SpotifyRequestError(500, "https://api.spotify.com/v1/next/1")
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=[first, failure])
+        ):
+            with pytest.raises(SpotifyRequestError):
+                await spotify.album("aid_500")
+
+        assert await fake_redis.get("spotify:album_tracks:v1:aid_500") is None
 
     async def test_a_hung_page_is_reported_as_a_slow_album(
         self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
@@ -1905,6 +1966,43 @@ class TestSpotifyAlbum:
         assert raised.value.whole_walk is False
         assert "that album" in raised.value.user_message
 
+    async def test_an_album_that_uses_its_whole_budget_does_not_advise_a_retry(
+        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(spotify_module, "_PLAYLIST_WALK_TIMEOUT_SECS", 0.08)
+        responses = _endless_album(total=1000, per_page=1)
+
+        async def _steady(*_: Any, **__: Any) -> dict[str, Any]:
+            await asyncio.sleep(0.02)
+            return next(responses)
+
+        with patch.object(spotify, "http_call", new=_steady):
+            with pytest.raises(SpotifyPlaylistTooSlowError) as caught:
+                await spotify.album("aid_big")
+
+        assert caught.value.whole_walk
+        assert "That Spotify album is too large" in caught.value.user_message
+        assert "try again" not in caught.value.user_message
+
+    async def test_a_403_is_a_refused_album_not_bad_credentials(
+        self, spotify: Spotify
+    ) -> None:
+        refusal = SpotifyAuthError(403, "endpoint: https://api.spotify.com/v1/albums/x")
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=refusal)):
+            with pytest.raises(SpotifyPlaylistForbiddenError) as caught:
+                await spotify.album("aid_403")
+
+        assert caught.value.user_message == (
+            "Spotify won't share that album's tracks with this bot."
+        )
+
+    async def test_a_401_stays_a_credentials_error(self, spotify: Spotify) -> None:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=SpotifyAuthError(401))
+        ):
+            with pytest.raises(SpotifyAuthError):
+                await spotify.album("aid_401")
+
     async def test_the_page_bound_is_handed_to_http_call_as_its_429_deadline(
         self, spotify: Spotify
     ) -> None:
@@ -1915,6 +2013,109 @@ class TestSpotifyAlbum:
             await spotify.album("aid_deadline")
 
         assert call.await_args_list[0].kwargs["deadline"] is not None
+
+
+class TestSpotifyAlbumWalkSlot:
+    """Page 1 is one request, as a track link is. Pages 2+ are a walk, and share
+    the playlist walks' process-wide slots."""
+
+    @staticmethod
+    def _two_pages() -> list[dict[str, Any]]:
+        cursor = "https://api.spotify.com/v1/next/1"
+        return [
+            _album(_album_tracks_page(["T0"], total=2, next_url=cursor)),
+            _album_tracks_page(["T1"], total=2, next_url=None),
+        ]
+
+    async def test_a_one_page_album_takes_no_slot(self, spotify: Spotify) -> None:
+        slot = spotify_module._playlist_slot()
+        for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
+            await slot.acquire()
+        page = _album_tracks_page(["T"], total=1, next_url=None)
+        try:
+            with patch.object(
+                spotify, "http_call", new=AsyncMock(return_value=_album(page))
+            ):
+                album = await spotify.album("aid_one_page")
+        finally:
+            for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
+                slot.release()
+
+        assert album.titles == ["T A"]
+
+    async def test_later_pages_hold_a_slot_and_give_it_back(
+        self, spotify: Spotify
+    ) -> None:
+        slot = spotify_module._playlist_slot()
+        free = spotify_module._PLAYLIST_WALK_CONCURRENCY
+        responses = self._two_pages()
+        held: list[int] = []
+
+        async def _call(*_: Any, **__: Any) -> dict[str, Any]:
+            held.append(free - slot._value)
+            return responses.pop(0)
+
+        with patch.object(spotify, "http_call", new=_call):
+            await spotify.album("aid_slot")
+
+        assert held == [0, 1]
+        assert slot._value == free
+
+    async def test_the_slot_comes_back_when_a_later_page_fails(
+        self, spotify: Spotify
+    ) -> None:
+        slot = spotify_module._playlist_slot()
+        responses = [self._two_pages()[0], SpotifyRequestError(500, "next")]
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=responses)):
+            with pytest.raises(SpotifyRequestError):
+                await spotify.album("aid_slot_fail")
+
+        assert slot._value == spotify_module._PLAYLIST_WALK_CONCURRENCY
+
+    async def test_no_free_slot_says_spotify_is_busy(self, spotify: Spotify) -> None:
+        config.play_resolve_wait_secs.set_override(0.05)
+        slot = spotify_module._playlist_slot()
+        for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
+            await slot.acquire()
+        try:
+            with patch.object(
+                spotify, "http_call", new=AsyncMock(side_effect=self._two_pages())
+            ) as call:
+                with pytest.raises(SpotifyBusyError):
+                    await spotify.album("aid_busy")
+        finally:
+            for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
+                slot.release()
+
+        assert call.await_count == 1
+
+    async def test_a_walk_that_finished_during_the_wait_answers_this_one(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """N pastes of one album: the first walk writes the cache, and the rest
+        read it once they hold the slot."""
+        finished = SpotifyPlaylist(
+            name="Discovery",
+            titles=["T0 A", "T1 A"],
+            duration_secs=360,
+            duration_partial=False,
+            unavailable=0,
+        )
+        first = self._two_pages()[0]
+
+        async def _call(*_: Any, **__: Any) -> dict[str, Any]:
+            await fake_redis.set(
+                "spotify:album_tracks:v1:aid_shared",
+                orjson.dumps(spotify_module._playlist_to_cache(finished)),
+            )
+            return first
+
+        call = AsyncMock(side_effect=_call)
+        with patch.object(spotify, "http_call", new=call):
+            album = await spotify.album("aid_shared")
+
+        assert album == finished
+        assert call.await_count == 1
 
 
 class TestSpotifyAlbumCache:

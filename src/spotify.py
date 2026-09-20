@@ -172,7 +172,13 @@ class SpotifyAuthError(Exception):
 
     @property
     def user_message(self) -> str:
-        """`detail` is the request endpoint, which must not reach an embed."""
+        """`detail` is the request endpoint, which must not reach an embed. Only a
+        401 speaks about the credentials; a 403 refuses one request."""
+        if self.status == 403:
+            return (
+                "Spotify refused that request (HTTP 403). If it keeps happening, "
+                "the server owner should check this bot's Spotify app."
+            )
         return (
             "Spotify isn't accepting this bot's credentials right now — the "
             "server owner needs to check them. Try a YouTube or SoundCloud link, "
@@ -281,17 +287,32 @@ class SpotifyBusyError(Exception):
 
 
 class SpotifyPlaylistForbiddenError(Exception):
-    """Spotify refused this app a playlist's tracks while the credentials work:
-    a 403 on the tracks endpoint, or a page with no `items` at all. Distinct from
-    SpotifyAuthError, which would tell an operator to rotate good credentials."""
+    """Spotify refused this app a playlist's or an album's tracks while the
+    credentials work: a 403 on the walk, or a playlist page with no `items` at
+    all. Distinct from SpotifyAuthError, which would tell an operator to rotate
+    good credentials."""
 
-    def __init__(self, pid: str, detail: str) -> None:
+    def __init__(self, pid: str, detail: str, *, noun: str = "playlist") -> None:
         self.pid = pid
-        super().__init__(f"spotify playlist {pid}: {detail}")
+        self.noun = noun
+        super().__init__(f"spotify {noun} {pid}: {detail}")
 
     @property
     def user_message(self) -> str:
-        return "Spotify won't share that playlist's tracks with this bot."
+        return f"Spotify won't share that {self.noun}'s tracks with this bot."
+
+
+async def _acquire_walk_slot() -> asyncio.Semaphore:
+    """A walk slot for the caller to release, or SpotifyBusyError once the resolve
+    wait has run with none free."""
+    slot = _playlist_slot()
+    wait_secs = config.play_resolve_wait_secs()
+    try:
+        async with asyncio.timeout(wait_secs):
+            await slot.acquire()
+    except TimeoutError as e:
+        raise SpotifyBusyError(wait_secs) from e
+    return slot
 
 
 def _playlist_slot() -> asyncio.Semaphore:
@@ -677,13 +698,7 @@ class Spotify:
             # The slot is taken INSIDE the single flight, around the requests
             # alone: a joiner issues none and must not queue for a slot it will
             # not use. Same placement, and the same reason, as _extract_once's.
-            slot = _playlist_slot()
-            wait_secs = config.play_resolve_wait_secs()
-            try:
-                async with asyncio.timeout(wait_secs):
-                    await slot.acquire()
-            except TimeoutError as e:
-                raise SpotifyBusyError(wait_secs) from e
+            slot = await _acquire_walk_slot()
             try:
                 playlist, complete = await fetch()
             finally:
@@ -735,16 +750,18 @@ class Spotify:
             return None
         return name
 
-    def _forbidden(self, pid: str, detail: str) -> SpotifyPlaylistForbiddenError:
-        """The playlist refusal, logged once for the operator: the credentials work,
-        so it is the app's access, not something to rotate. See README's Spotify
+    def _forbidden(
+        self, pid: str, detail: str, *, noun: str = "playlist"
+    ) -> SpotifyPlaylistForbiddenError:
+        """The refusal, logged once for the operator: the credentials work, so it is
+        the app's access, not something to rotate. See README's Spotify
         requirements."""
         log.error(
-            f"spotify refused playlist {pid} ({detail}); a Development Mode app "
+            f"spotify refused {noun} {pid} ({detail}); a Development Mode app "
             "can be refused another user's playlist tracks — see README "
             "#requirements"
         )
-        return SpotifyPlaylistForbiddenError(pid, detail)
+        return SpotifyPlaylistForbiddenError(pid, detail, noun=noun)
 
     @_tracer.start_as_current_span("spotify.album")
     async def album(
@@ -753,10 +770,10 @@ class Spotify:
         """An album in the playlist's shape, plus its artists and cover; cached 24h.
 
         Page 1 rides GET /v1/albums/{id}, which returns the album's identity AND its
-        first tracks page, so a one-page album is one request. Later pages follow
-        that paging object's `next` cursor, under the playlist walk's bounds. No
-        walk slot and no single flight: an album is a handful of requests where a
-        playlist is up to a hundred. `on_progress` reports as playlist()'s does.
+        first tracks page, so a one-page album is one request and takes no walk
+        slot, as a track link takes none. Later pages follow that paging object's
+        `next` cursor inside a slot, under the playlist walk's page and walk bounds.
+        `on_progress` reports as playlist()'s does.
         """
         trace.get_current_span().set_attribute("spotify.album_id", aid)
         # Versioned by the value's shape, as the playlist key is.
@@ -777,15 +794,22 @@ class Spotify:
         total: Optional[int] = None
         walked = 0
         pages = 0
+        page_cap = _MAX_PLAYLIST_PAGES
+        slot: Optional[asyncio.Semaphore] = None
         walk = asyncio.timeout(_PLAYLIST_WALK_TIMEOUT_SECS)
         try:
             async with walk:
                 while True:
                     async with asyncio.timeout(_PLAYLIST_PAGE_TIMEOUT_SECS) as bound:
                         bounds = (bound.when(), walk.when())
-                        resp = await self.http_call(
-                            url, deadline=min(t for t in bounds if t is not None)
-                        )
+                        try:
+                            resp = await self.http_call(
+                                url, deadline=min(t for t in bounds if t is not None)
+                            )
+                        except SpotifyAuthError as e:
+                            if e.status != 403:
+                                raise
+                            raise self._forbidden(aid, "HTTP 403", noun="album") from e
                     if pages == 0:
                         # The album object; every later response IS a tracks page.
                         raw_name = resp.get("name")
@@ -801,6 +825,11 @@ class Spotify:
                         thumbnail = images[0].get("url") if images else None
                         page = resp.get("tracks") or {}
                         total = page.get("total")
+                        if isinstance(total, int):
+                            # The cursor carries page 1's stride forward. +2 is
+                            # slack for a `total` that under-reports.
+                            stride = len(page.get("items") or []) or 50
+                            page_cap = min(page_cap, -(-total // stride) + 2)
                     else:
                         page = resp
                     pages += 1
@@ -826,17 +855,36 @@ class Spotify:
                         # The bearer token goes wherever this walk goes.
                         log.error(f"spotify album {aid}: refusing off-origin cursor")
                         break
-                    if pages >= _MAX_PLAYLIST_PAGES:
+                    if next_url == url:
+                        log.error(f"spotify album {aid}: cursor stopped advancing")
+                        break
+                    if pages >= page_cap:
                         log.error(
                             f"spotify album {aid} still had pages after "
-                            f"{_MAX_PLAYLIST_PAGES}; stopping at {walked} items"
+                            f"{page_cap}; stopping at {walked} items"
                         )
                         break
+                    if slot is None:
+                        slot = await _acquire_walk_slot()
+                        # The walk budget starts once the slot is held, and a
+                        # walk that finished during the wait answers this one.
+                        walk.reschedule(
+                            asyncio.get_running_loop().time()
+                            + _PLAYLIST_WALK_TIMEOUT_SECS
+                        )
+                        cached = _playlist_from_cache(
+                            await cache_get(self._redis, cache_key)
+                        )
+                        if cached is not None:
+                            return cached
                     url = next_url
         except TimeoutError as e:
             raise SpotifyPlaylistTooSlowError(
                 pages, len(titles), whole_walk=walk.expired(), noun="album"
             ) from e
+        finally:
+            if slot is not None:
+                slot.release()
         span = trace.get_current_span()
         span.set_attribute("spotify.track_count", len(titles))
         span.set_attribute("spotify.album_pages", pages)
@@ -849,9 +897,10 @@ class Spotify:
             artists=artists,
             thumbnail=thumbnail,
         )
-        # Only a whole, non-empty walk: a truncation cached here would be served as
-        # the album for 24h, and an empty result is more likely a malformed response.
-        if titles and total is not None and walked >= total:
+        # Exactly the album's own total, and at least one title. An album never
+        # changes, so anything else is a short walk, a cursor that repeated, or a
+        # malformed response, and a cache write would serve it for 24h.
+        if titles and walked == total:
             await cache_set(
                 self._redis, cache_key, _playlist_to_cache(album), _ALBUM_TTL
             )
