@@ -416,6 +416,11 @@ def mock_author() -> MagicMock:
     member = MagicMock(spec=discord.Member)
     member.id = 222222222222222222
     member.name = "testuser"
+    # A real string, not left to the spec: HistoryEntry.requester_name reads this,
+    # and orjson refuses a MagicMock — so every push_history in the suite would fail
+    # to serialize and any assertion on guild:{id}:history would pass vacuously,
+    # whether or not the write it means to pin was ever attempted.
+    member.display_name = "testuser"
     member.mention = "<@222222222222222222>"
     member.voice = MagicMock()
     member.voice.channel = MagicMock(spec=discord.VoiceChannel)
@@ -570,6 +575,10 @@ def mock_song() -> MagicMock:
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
     # writes the real clock here, and the epoch clamp raises on a MagicMock.
     song.played_at = 0.0
+    # Retry state a real YTDL always has, as real values: the loop's retry guard
+    # compares stream_attempts to an int.
+    song.stream_attempts = 0
+    song.failed_format_ids = frozenset()
     # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
     # reads `traceparent` off it to link this song's trace to the extraction that
     # minted its URL, and a MagicMock there would be a str where a str is parsed.

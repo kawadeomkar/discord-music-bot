@@ -43,6 +43,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
     - [Spotify playlist paging](#spotify-playlist-paging)
     - [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)
+    - [Stream-retry ladder](#stream-retry-ladder)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
@@ -95,7 +96,7 @@ graph TD
 | Discord client | `discord.py` 2.7.1 | Gateway, voice, commands framework |
 | Audio extraction | `yt-dlp` 2026.8.18.122307.dev0 (pinned to a **nightly**; `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so yt-dlp's fallback client stays available |
 | PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so the fallback client's formats are served at all |
-| Codec | FFmpeg (system, installed in the runtime image) | Decode + re-encode to Opus for Discord |
+| Codec | FFmpeg (system, installed in the runtime image) | Remux Opus straight through (`-c:a copy`) when the serve already is 20 ms stereo Opus and volume is 1.0; decode + re-encode to Opus otherwise |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
 | Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
 | Serialization | `orjson` | Fast JSON serialization for Redis payloads |
@@ -1155,7 +1156,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
 | `analytics:png:v{n}:{guild_id}:{days}:{digest}` | Bytes | the rendered chart, keyed by a digest of the aggregate it was drawn from so a stale entry MISSES rather than pairing an old chart with fresh numbers. Raw bytes, not orjson — that would base64 it for a 33% penalty | to the next UTC midnight |
 | `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
-| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
+| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, 1.28 KB/rung measured, taking an entry from 4.66 KB to 8.49 KB of payload and 5.22 KB to 10.34 KB resident (it crosses jemalloc's 8192 size class) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
 | `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
@@ -1529,7 +1530,7 @@ Span conventions worth knowing:
 ```mermaid
 flowchart LR
     YT["YouTube CDN\n(signed HTTPS stream)"]
-    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Output: Opus frames\n- Volume filter (if ≠ 1.0)\n- Seek: -ss N before -i, -ss 0 after"]
+    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Seek: -ss N before -i, -ss 0 after\n- Output: Opus frames (remuxed when eligible)\n- Volume filter (encoder path only)"]
     Reader["discord.py reader thread\n(reads Opus frames from FFmpeg stdout\n→ YTDL.read() counts frames)"]
     VC["Discord Voice UDP\n(Opus + NaCl encryption)"]
     User["Discord Client\n(decodes Opus)"]
@@ -1542,9 +1543,21 @@ flowchart LR
 
 **FFmpeg flags:**
 - `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
-- `options`: `-vn` (audio only); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume
+- `options`: `-vn` (audio only); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
+
+**Opus passthrough.** Discord speaks Opus and most of what YouTube serves already is Opus, so `YTDL` passes `codec="copy"` to `FFmpegOpusAudio` and the stream is remuxed rather than decoded and re-encoded — saving a full lossy generation and ~3.9 s of CPU per 213 s song. `_passthrough_codec` (src/youtube.py) is the gate, and every clause of it is load-bearing, because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k` discord.py always emits:
+
+| Clause | Why |
+|---|---|
+| no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Volume is the only source today. |
+| `audio_channels in (1, 2)` | a 5.1 serve copied verbatim reaches Discord as 6-channel multistream Opus and clients decode only the front pair, silently losing centre-channel vocals. yt-dlp ranks `channels` **above** `acodec` when sorting, so `bestaudio` does select itag 338 where it exists. Absent means re-encode. |
+| `format_id` in `{249, 250, 251}` | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly; SoundCloud's `http_opus` is exactly the case this excludes. |
+
+Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
+
+Three differences are accepted, and ffmpeg warns about none of them, since no encoder is instantiated to ignore them: a mono source stays mono rather than being upmixed; the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band forward error correction, so packet loss on the voice path produces dropouts libopus used to conceal. YouTube's files carry no FEC of their own, which makes that last one a real regression for lossy listeners and the reason to keep the gate narrow rather than widen it.
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and pause confirmation.
 
@@ -2012,6 +2025,101 @@ A YouTube playlist resolve is one `extract_info` call in a pool worker that retu
 
 **What the suite cannot see, and why.** `[tool.coverage.run]` is `branch = true` with `source = ["src"]` and no `concurrency = "multiprocessing"`, so lines executed in a worker earn zero coverage. The autouse `use_thread_ytdlp_pool` fixture supplies its own `executor_factory`, so `_worker_init` never runs and **nothing is pickled** — an unpicklable callback would pass `just check` and break only inside a container, which is why `_count_entry` is module-level with the request id bound by `functools.partial`, and why one test pickles that partial directly. "Extracted count == input count" needs yt-dlp's real `_match_entry` loop and has no offline form; the callable is covered directly for every entry shape, and one real round trip through the progress queue sits beside `tests/test_ytdlp_pool.py`'s spawned-worker tests.
 
+### Stream-retry ladder
+
+One extraction already contains every URL the bot could want, so the recovery rule is
+**retry sideways before retrying in place**: the next audio format under the same
+extraction, not the same format under a fresh one.
+
+The ladder is mined in the worker (`_mine_audio_candidates`), because `_slim_info`
+drops `formats` and after that the alternative URLs are gone from the process. It keeps
+the top `_STREAM_CANDIDATES` (3) audio-only formats, best first, with candidate 0 being
+the format yt-dlp itself selected — so "candidate 0" and "the URL the probe already
+validated" are the same thing, an identity `_probe_candidate_ladder` then maintains by
+rewriting the ladder on **every** promotion (see below). Three filters are load-bearing
+rather than cosmetic: storyboards also carry `vcodec: none` (the `acodec` test is what
+removes them, and yt-dlp writes the string `"none"` there, not `None`), and `-drc`
+variants and foreign-language dubs would make a fallback quietly change what the song
+*sounds* like. A muxed selection gets a one-rung ladder — itself — since that rung
+already means the audio-only path is degraded, and walking sideways across muxed
+formats is not a recovery worth having.
+
+The ladder rides the existing `ytdl:stream:{webpage_url}` entry (1.28 KB/rung
+measured, URL-dominated — which roughly doubles the entry, and slightly more than
+doubles its resident cost, since the result lands just past jemalloc's 8192 size
+class). That key is TTL'd and evictable, so it carries none of the
+non-evictable-key obligations in [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
+Entries written before the ladder existed parse as a one-rung ladder, so wire-compat
+needs no version field.
+
+At probe time `_probe_candidate_ladder` walks it and **promotes the winner wholesale** —
+URL plus format shape — so `_record_serving_format`, the source's `abr`/`asr`/`acodec`
+and every span attribute describe what is really playing rather than what was
+originally selected. Two consequences follow, and both are behavior rather than
+bookkeeping:
+
+- **A promotion rewrites the cache entry**, with the dead rungs ahead of the winner
+  pruned. Left alone, a cached ladder whose head is dead re-probes that same dead URL
+  on every play until the TTL lapses, re-diagnosing a failure it already knows. The
+  rewrite is unconditional rather than gated on a non-zero index: `deprioritize`
+  reorders the walk, so a winner can land at index 0 while still differing from the
+  entry's stored head — and a retry always re-caches (it invalidates first, so its
+  resolve is a fresh extraction), which would otherwise persist a ladder headed by the
+  very format that just failed and discard everything the retry learned.
+- **Re-extraction is the last resort, not the first.** A fallback probe costs ~100 ms
+  against a 3–5 s extraction that would re-select the *same* format anyway — which
+  cures a stale URL but does nothing against format-level enforcement (the yt-dlp#16150
+  shape, where the format dies again immediately under a fresh signature). Only when
+  every rung is dead is the entry dropped and re-extracted, then walked once more.
+
+The walk shares two things with the rest of the resolve. A freshly extracted info-dict
+is copied before it is walked: `_extract_once` hands every joiner the same dict, and a
+promotion rewrites the one it is given. And the `probed_at` shortcut (see
+[Warming the stream cache](#warming-the-stream-cache)) is not taken for a format in
+`failed_format_ids`, so a retry whose entry was re-warmed in the meantime still walks
+past the format that burned.
+
+Prefetch deliberately probes only the head: walking all three per song would tax every
+play for the rare failure.
+
+**The second failure window is playback time.** A URL revoked in the seconds between
+the probe and ffmpeg's first read reaches the loop as `stream_failed` — zero frames plus
+an ffmpeg error. That song now gets `_STREAM_PLAY_ATTEMPTS` (3) plays in total:
+`_retry_failed_stream` re-queues it at the front carrying the attempt it spent and the
+format that burned, and the fresh resolve deprioritizes that format. Deprioritizes, not
+skips — a single-format video would otherwise have nothing left to try, and the common
+cause here (revocation, not enforcement) is cured by a fresh URL for the same format.
+
+Three placements inside that iteration are load-bearing:
+
+- **The decision, and `_neutralize_prefetch()`, run where `stream_failed` is computed**,
+  not beside the requeue at the iteration tail. By the tail the loop has claimed
+  `_prefetch_task` into a local, so a neutralize there reads `None`, no-ops, and the
+  already-resolved next song plays *instead of* the retry — exactly the failure that
+  call exists to prevent. The requeue itself goes through `queue_put_next`, which hands
+  back any claim a command (`-shuffle`, `-remove`, `-replay`) opened in the slot
+  between the decision and the put.
+- **The history write is suppressed while a retry is pending.** A retried fragment never
+  records; the terminal attempt records exactly once. Without that, a stream-failed
+  resume tail writes twice — once on `heard_before`, once when the retry succeeds — and
+  Postgres' `(guild_id, played_at, webpage_url)` dedup index collapses the pair while
+  `guild:{id}:history`, the only list `-history` reads, keeps both.
+- **The retry carries no start stamp unless audio was actually heard.** `played_at`
+  means "audio started"; keeping the failed attempt's would also make `_flush_played`
+  write a 0-second play if `-clear` destroyed the retry first.
+
+`stream_attempts`/`failed_format_ids` are runtime-only — never on the Redis wire. A
+crash mid-retry resets the counter, which costs a restarted bot a few more attempts at a
+dead song and saves the whole `QueueEntryField`/parse-path surface. They are inherited
+by `_requeued_form` (a prefetched retry has not played, so its chain is live) and
+deliberately **reset** by `interject()`'s resume tail (that song is producing audio,
+which ends the chain, and a format blacklisted at 0:00 may be healthy again by the time
+a deeply-stacked tail resolves).
+
+Mid-song death stays out of scope: it produced audio and earned its history entry, and
+retrying it means resuming at the death position — a different feature this machinery
+makes cheap to add later.
+
 ### yt-dlp process boundary
 
 Four things cross into the worker processes, each with its own contract:
@@ -2023,6 +2131,9 @@ Four things cross into the worker processes, each with its own contract:
   `patch("src.youtube._ytdlp_extract")` in the suite.
 - **The result** — `_slim_info` is what makes it picklable at all; a raw
   `process=True` info dict carries live objects and commonly 100 KB–1 MB nobody reads.
+  It is also the last point at which the *whole* format ladder exists, which is why the
+  fallback audio URLs are mined into `audio_candidates` here rather than anywhere the
+  parent could do it (see [Stream-retry ladder](#stream-retry-ladder)).
 - **The exception** — flattened in the worker by `_classify_ytdlp_error`, where the
   structure still exists (yt-dlp's own exceptions carry live tracebacks and cannot
   cross). **Every field of the flattened error needs a default**: a required

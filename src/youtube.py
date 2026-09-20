@@ -214,6 +214,23 @@ class _YTDLVideoInfoRequired(TypedDict):
     webpage_url: str
 
 
+class AudioCandidate(TypedDict, total=False):
+    """One rung of a song's audio ladder, mined in the worker before `formats` is
+    dropped. Field-for-field the shape a candidate promotes onto the info-dict it came
+    from (_CANDIDATE_FIELDS), so a fallback URL that wins the probe is indistinguishable
+    downstream from one yt-dlp selected itself.
+    """
+
+    url: str
+    format_id: str
+    acodec: str
+    abr: float
+    asr: int
+    protocol: str
+    vcodec: str
+    audio_channels: int
+
+
 class YTDLVideoMetadata(TypedDict, total=False):
     """The descriptive half of an info-dict, what _enrich_queueobject() and
     _record_serving_format() read."""
@@ -234,11 +251,18 @@ class YTDLVideoMetadata(TypedDict, total=False):
     abr: float
     asr: int
     acodec: str
+    # Channel count of the served format. _passthrough_codec refuses more than
+    # two: `-c:a copy` also copies OpusHead, and clients decode only the front pair.
+    audio_channels: int
     # Format shape, mirrored in _STREAM_CACHE_FIELDS: how _record_serving_format
     # tells an audio-only serve from a degraded muxed/HLS one.
     format_id: str
     protocol: str
     vcodec: str
+    # The song's audio ladder, best first, candidate[0] being the format above.
+    # Mined in the worker (_mine_audio_candidates) and walked at probe time, so a
+    # revoked URL costs one sideways probe instead of the song.
+    audio_candidates: list[AudioCandidate]
 
 
 class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
@@ -280,7 +304,8 @@ class YTDLExtractResult(YTDLEntry, total=False):
 
 # Collections no caller reads once process=True has hoisted the served format's
 # fields to the top level; commonly 100 KB-1 MB pickled worker->parent, so
-# dropped in the worker. _STREAM_CACHE_FIELDS is what callers do consume.
+# dropped in the worker. _STREAM_CACHE_FIELDS is what callers do consume. The
+# fallback audio ladder is mined out of `formats` first (see _slim_info).
 _UNUSED_INFO_COLLECTIONS = frozenset(
     {
         "formats",
@@ -297,6 +322,75 @@ _UNUSED_INFO_COLLECTIONS = frozenset(
 
 # Bound at import so slimming survives tests patching `youtube_dl.YoutubeDL`.
 _sanitize_info = youtube_dl.YoutubeDL.sanitize_info
+
+# Audio URLs one extraction keeps, INCLUDING the format yt-dlp selected — so three
+# keeps the selection plus its two best alternatives. Only the alternatives are
+# stored; the selection is already at the top level (see _candidate_ladder).
+_STREAM_CANDIDATES = 3
+
+# The per-format fields a candidate carries, and exactly the shape a winner promotes
+# onto the info-dict — one tuple for both directions, so everything downstream
+# describes the URL actually being played.
+_CANDIDATE_FIELDS = (
+    "url",
+    "format_id",
+    "acodec",
+    "abr",
+    "asr",
+    "protocol",
+    "vcodec",
+    "audio_channels",
+)
+
+
+def _candidate_shape(fmt: dict[str, Any]) -> AudioCandidate:
+    """Slim one format down to the candidate fields it actually carries. Absent keys
+    stay absent rather than becoming None, so a promoted candidate never contradicts
+    YTDLVideoInfo's non-optional types."""
+    return cast(
+        AudioCandidate, {k: fmt[k] for k in _CANDIDATE_FIELDS if fmt.get(k) is not None}
+    )
+
+
+def _mine_audio_candidates(node: dict[str, Any]) -> list[AudioCandidate]:
+    """The audio URLs worth trying for one video, best first — mined in the worker
+    because _slim_info drops `formats` and these URLs exist nowhere else afterwards.
+
+    yt-dlp sorts `formats` worst→best, so the walk is reversed. `-drc` variants and
+    foreign-language dubs are skipped so a fallback never changes what the song sounds
+    like. See docs/ARCHITECTURE.md#stream-retry-ladder.
+    """
+    formats = node.get("formats")
+    if not isinstance(formats, list) or not node.get("url"):
+        # No format list (extract_flat entries) or no selected stream: nothing to mine.
+        return []
+    if node.get("vcodec") not in (None, "none"):
+        # A muxed selection already means the audio-only path is degraded, so it gets
+        # no alternatives — only the rung 0 _candidate_ladder synthesizes.
+        return []
+    language = node.get("language")
+    ladder: list[AudioCandidate] = []
+    for fmt in reversed(formats):
+        if not isinstance(fmt, dict) or not fmt.get("url"):
+            continue
+        if fmt.get("vcodec") not in (None, "none"):
+            continue
+        if fmt.get("acodec") in (None, "none"):
+            continue
+        if str(fmt.get("format_id") or "").endswith("-drc"):
+            continue
+        if language is not None and fmt.get("language") not in (None, language):
+            continue
+        ladder.append(_candidate_shape(fmt))
+    # The selected format is dropped here, not stored: it already sits at the top
+    # level of the dict this list rides on, and _candidate_ladder synthesizes it back
+    # as rung 0. That keeps "rung 0 is the selected format" true by construction.
+    selected_id = node.get("format_id")
+    if ladder and ladder[0].get("format_id") == selected_id:
+        ladder = ladder[1:]
+    else:
+        ladder = [c for c in ladder if c.get("format_id") != selected_id]
+    return ladder[: _STREAM_CANDIDATES - 1]
 
 
 def select_search_entry(
@@ -356,21 +450,23 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     sanitize_info() reduces the live objects of a process=True info-dict to JSON
     primitives (without which every extraction fails to pickle), then the large
     unread collections are dropped, top level and per `entries` element — after
-    the one thumbnail URL callers render is lifted out of one of them."""
+    the one thumbnail URL callers render, and the audio ladder the stream retry
+    walks, are lifted out of them."""
     info = _sanitize_info(info)
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
-    _lift_thumbnail(info)
-    for key in _UNUSED_INFO_COLLECTIONS:
-        info.pop(key, None)
     entries = info.get("entries")
+    nodes = [info]
     if isinstance(entries, list):
-        for entry in entries:
-            if isinstance(entry, dict):
-                _lift_thumbnail(entry)
-                for key in _UNUSED_INFO_COLLECTIONS:
-                    entry.pop(key, None)
+        nodes.extend(entry for entry in entries if isinstance(entry, dict))
+    for node in nodes:
+        _lift_thumbnail(node)
+        candidates = _mine_audio_candidates(node)
+        if candidates:
+            node["audio_candidates"] = candidates
+        for key in _UNUSED_INFO_COLLECTIONS:
+            node.pop(key, None)
     # cast: the checker cannot verify yt-dlp's untyped dict conforms.
     return cast(YTDLExtractResult, info)
 
@@ -617,10 +713,17 @@ _STREAM_CACHE_FIELDS = frozenset(
         "abr",
         "asr",
         "acodec",
+        # Absent reads as re-encode in _passthrough_codec, so a cache hit must
+        # carry it or passthrough silently stops applying.
+        "audio_channels",
         # Format shape, so cache hits stay attributable (_record_serving_format).
         "format_id",
         "protocol",
         "vcodec",
+        # The mined fallback ladder, ~1.28 KB/rung, so a revoked URL costs a
+        # sideways probe rather than a re-extraction. This key is TTL'd and
+        # evictable, so it carries no golden-rule-12 obligation.
+        "audio_candidates",
     }
 )
 
@@ -642,6 +745,12 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
     span.set_attribute("ytdl.protocol", str(data.get("protocol")))
     audio_only = data.get("vcodec") in (None, "none")
     span.set_attribute("ytdl.audio_only", audio_only)
+    # Whether this serve is eligible for the remux path, attributed here rather than
+    # only at construction, so a guild that stopped getting passthrough is visible
+    # alongside the format that replaced it.
+    span.set_attribute(
+        "ytdl.opus_passthrough", _passthrough_codec(data, filtered=False) is not None
+    )
     if not audio_only and format_id not in _DEGRADED_FORMAT_WARNED:
         _DEGRADED_FORMAT_WARNED.add(format_id)
         log.warning(
@@ -730,6 +839,56 @@ def _playlist_cache_key(url: str) -> str:
     without its repeats."""
     list_id = parse_qs(urlparse(url).query).get("list", [""])[0]
     return f"ytdl:playlist:v3:{list_id or url}"
+
+
+# The only formats this bot remuxes rather than re-encodes: YouTube's 20ms-framed
+# Opus itags. The allowlist IS the frame-duration check, since the info-dict reports
+# no frame duration and "opus" alone cannot be trusted to mean 20ms.
+_PASSTHROUGH_FORMAT_IDS = frozenset({"249", "250", "251"})
+
+# OpusHead + OpusTags, which RFC 7845 mandates at the head of every Ogg Opus stream.
+# discord.py yields them from read() like audio, so YTDL discounts exactly two.
+_OGG_HEADER_PACKETS = 2
+
+
+def _audio_filters(volume: float) -> list[str]:
+    """The -filter:a chain for one song, in application order.
+
+    The ONLY place a filter enters the argv. _passthrough_codec refuses whenever
+    this is non-empty, so a filter added here disables the remux path by
+    construction rather than by a second test that could disagree with it.
+    """
+    filters = []
+    if volume != 1.0:
+        filters.append(f"volume={volume}")
+    return filters
+
+
+def _passthrough_codec(data: YTDLVideoMetadata, *, filtered: bool) -> Optional[str]:
+    """ "copy" when this song can be remuxed instead of re-encoded, else None, which
+    leaves discord.py's `-c:a libopus` default.
+
+    All four clauses are load-bearing, because `-c:a copy` also discards the
+    `-ac 2 -ar 48000 -b:a 128k` discord.py always passes: ffmpeg refuses copy
+    alongside a filtergraph, a >2-channel serve reaches Discord as multistream that
+    clients decode only the front pair of, and the itag allowlist stands in for the
+    frame duration the info-dict does not report. Absent fields mean re-encode.
+
+    `filtered` is whether _audio_filters produced anything, not a re-derivation of
+    why. ffmpeg exits 234 with zero bytes on copy-plus-filtergraph, which the player
+    reports as a refused stream and spends the whole retry budget on.
+
+    See docs/ARCHITECTURE.md#audio-pipeline.
+    """
+    if filtered:
+        return None
+    if not str(data.get("acodec") or "").startswith("opus"):
+        return None
+    if data.get("audio_channels") not in (1, 2):
+        return None
+    if str(data.get("format_id") or "") not in _PASSTHROUGH_FORMAT_IDS:
+        return None
+    return "copy"
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -895,6 +1054,20 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
         return _record_probe_outcome(StreamProbe.UNCONFIRMED)
 
 
+async def _entry_ttl(redis: Optional[aioredis.Redis], cache_key: str) -> Optional[int]:
+    """Seconds left on a cache entry, or None when that cannot be established. The
+    caller reads None as "no ceiling", so every uncertain answer maps to None rather
+    than to a number that would shorten a legitimate write."""
+    if redis is None:
+        return None
+    try:
+        ttl = await redis.ttl(cache_key)
+    except Exception as e:
+        log.warning(f"could not read TTL for {cache_key}: {e}")
+        return None
+    return ttl if isinstance(ttl, int) and ttl > 0 else None
+
+
 async def _cache_stream(
     redis: Optional[aioredis.Redis],
     cache_key: str,
@@ -905,9 +1078,11 @@ async def _cache_stream(
 ) -> bool:
     """Persist a probed stream URL. True when an entry was written, False when the URL
     isn't worth caching (no usable expiry). `max_ttl` caps the lifetime below the URL's
-    own — used for a URL that could not be confirmed. `probed` stamps the entry as
-    CONFIRMED playable just now, which is what lets a play seconds later skip its own
-    probe; an unconfirmed entry must never carry it."""
+    own: _STREAM_URL_MAX_TTL is measured from now, so re-caching a URL this call did
+    not just extract would hand an old extraction a full fresh lifetime. Used by a
+    ladder promotion and by a URL that could not be confirmed. `probed` stamps the
+    entry as CONFIRMED playable just now, which is what lets a play seconds later
+    skip its own probe; an unconfirmed entry must never carry it."""
     # Absent keys are dropped, not written as None: `{"title": None}` would contradict
     # YTDLVideoInfo, which types title as str and treats absent fields as *missing*.
     stripped: dict[str, Any] = {
@@ -920,9 +1095,9 @@ async def _cache_stream(
     if probed:
         stripped["probed_at"] = time.time()
     ttl = _stream_url_ttl(data.get("url", ""))
-    if ttl:
-        if max_ttl is not None:
-            ttl = min(ttl, max_ttl)
+    if ttl is not None and max_ttl is not None:
+        ttl = min(ttl, max_ttl)
+    if ttl and ttl > 0:
         await cache_set(redis, cache_key, stripped, ttl)
         return True
     return False
@@ -1085,6 +1260,11 @@ class QueueObject:
     # tail INHERITS it so every fragment of one play records the same start;
     # 0.0 = not played yet.
     played_at: float = 0.0
+    # Stream-retry state, runtime only (never on the Redis wire): plays already
+    # spent on this song whose stream never opened, and the formats that failed.
+    # A crash resets both. See MusicPlayer._retry_failed_stream.
+    stream_attempts: int = 0
+    failed_format_ids: frozenset[str] = frozenset()
     # The NP card the interrupted fragment left frozen, set on a resume tail at
     # the fragment's iteration end and consumed when the tail starts. The ids
     # survive a restart, the ref does not, and only the ref can strip-edit a
@@ -1461,6 +1641,9 @@ class YTDL(discord.FFmpegOpusAudio):
         start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
+        codec: Optional[str] = None,
+        stream_attempts: int = 0,
+        failed_format_ids: frozenset[str] = frozenset(),
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
@@ -1475,14 +1658,22 @@ class YTDL(discord.FFmpegOpusAudio):
         np_host_ref: Optional[NpHostRef] = None,
         is_replay: bool = False,
     ) -> None:
+        # codec=None keeps discord.py's `-c:a libopus` default; "copy" remuxes.
         super().__init__(
-            url, executable="ffmpeg", before_options=before_options, options=options
+            url,
+            executable="ffmpeg",
+            before_options=before_options,
+            options=options,
+            codec=codec,
         )
 
         self.requester = requester
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
         self.start_offset: int = start_offset
+        # Retry state carried from the QueueObject.
+        self.stream_attempts: int = stream_attempts
+        self.failed_format_ids: frozenset[str] = failed_format_ids
         # Interjection flags carried from the QueueObject (see its field
         # comments). A resume tail and _neutralize_prefetch rebuild a QueueObject
         # from these, so every field the queue entry has must survive here.
@@ -1524,22 +1715,31 @@ class YTDL(discord.FFmpegOpusAudio):
         self.acodec = data.get("acodec")
 
         self._frames_read: int = 0
+        self._packets_read: int = 0
 
     def __getitem__(self, item: str) -> Any:
         return self.__getattribute__(item)
 
     def read(self) -> bytes:
-        """Read the next audio frame, tracking frame count for elapsed_secs."""
+        """Read the next packet, counting the AUDIO ones for elapsed_secs.
+
+        The first two are never audio — discord.py yields OpusHead and OpusTags like
+        any other packet — so counting them both skewed every position surface and
+        made produced_audio true for a stream that emitted nothing else.
+        """
         data = super().read()
         if data:
-            self._frames_read += 1
+            self._packets_read += 1
+            if self._packets_read > _OGG_HEADER_PACKETS:
+                self._frames_read += 1
         return data
 
     @property
     def produced_audio(self) -> bool:
-        """False when ffmpeg exited without delivering a frame (typically a 403
-        on a revoked URL). discord.py hands that to `after` like a finished
-        song, so the frame count is what tells them apart."""
+        """False when ffmpeg exited without delivering an audio frame: the stream
+        never opened (typically a 403 on a revoked URL), or produced only its
+        container headers. discord.py hands either to `after` like a finished
+        song, so this count is what tells them apart."""
         return self._frames_read > 0
 
     @property
@@ -1611,6 +1811,75 @@ class YTDL(discord.FFmpegOpusAudio):
             return True
         return False
 
+    @staticmethod
+    def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
+        """The audio URLs to try for this song, best first.
+
+        Rung 0 is always synthesized from the top level, because that IS the selected
+        format — `audio_candidates` stores only the alternatives behind it. So "rung 0
+        and the URL the probe already validated are the same thing" holds by
+        construction rather than by maintenance, and entries cached before the ladder
+        existed (or extractors exposing no format list) need no special case: they
+        simply have no alternatives."""
+        if not data.get("url"):
+            return []
+        alternatives = data.get("audio_candidates") or []
+        return [_candidate_shape(cast(dict[str, Any], data)), *alternatives]
+
+    @classmethod
+    async def _probe_candidate_ladder(
+        cls, data: YTDLVideoInfo, *, deprioritize: frozenset[str] = frozenset()
+    ) -> tuple[StreamProbe, Optional[int]]:
+        """Probe the ladder in order and promote the first URL YouTube will actually
+        serve onto `data`, returning the verdict and the index it settled on.
+
+        Only DEAD advances a rung. UNCONFIRMED stops the walk where it stands and
+        promotes that rung, because every candidate shares one host and one `expire`
+        — so a probe that could not complete here will not complete for the next one
+        either. Promoting rather than returning the head is what keeps a rung already
+        proven DEAD from being served unverified.
+
+        `deprioritize` names formats that failed a previous play. They move to the
+        BACK of the walk rather than being removed, so a single-format video still
+        has something to try. See docs/ARCHITECTURE.md#stream-retry-ladder.
+        """
+        ladder = cls._candidate_ladder(data)
+        if deprioritize:
+            tainted = [c for c in ladder if str(c.get("format_id")) in deprioritize]
+            ladder = [
+                c for c in ladder if str(c.get("format_id")) not in deprioritize
+            ] + tainted
+        span = trace.get_current_span()
+        span.set_attribute("ytdl.candidates", len(ladder))
+        for index, candidate in enumerate(ladder):
+            probe = await _probe_stream_url(candidate.get("url", ""))
+            if probe is StreamProbe.DEAD:
+                continue
+            if candidate.get("format_id") != data.get("format_id"):
+                log.warning(
+                    f"audio format {data.get('format_id')} is not being served for "
+                    f"{data.get('webpage_url')} — falling back to "
+                    f"{candidate.get('format_id')}"
+                )
+                # Replace, not merge: _candidate_shape drops keys the format does
+                # not carry, so a rung with no `abr`/`asr` would otherwise inherit
+                # the dead format's numbers and advertise a bitrate nothing is using.
+                # The cast is because the checker cannot see that AudioCandidate's
+                # keys are a subset of YTDLVideoInfo's.
+                promoted = cast(dict[str, Any], data)
+                for stale in _CANDIDATE_FIELDS:
+                    promoted.pop(stale, None)
+                promoted.update(candidate)
+            # Unconditional, NOT `if index:` — `deprioritize` reorders the walk, so
+            # a winner can land at index 0 while still differing from the stored head.
+            # The winner is rung 0 now, so only what follows it is stored, and the
+            # rungs ahead of it rotate to the BACK rather than being deleted: a rung
+            # dies for reasons that pass, and demotion lets it recover.
+            data["audio_candidates"] = ladder[index + 1 :] + ladder[:index]
+            span.set_attribute("ytdl.candidate_index", index)
+            return probe, index
+        return StreamProbe.DEAD, None
+
     @classmethod
     async def _resolve_playable_stream(
         cls,
@@ -1620,8 +1889,12 @@ class YTDL(discord.FFmpegOpusAudio):
         allow_reextract: bool = True,
     ) -> YTDLVideoInfo:
         """Resolve a song to stream data whose URL YouTube will serve. Every URL
-        is probed first (a revoked one fails as silence, nothing logged); a
-        revoked cached URL is dropped and re-extracted once.
+        is probed first (a revoked one fails as silence, nothing logged).
+
+        Sideways before in place: one extraction carries the whole audio ladder,
+        so a dead URL costs a probe of the next format rather than a re-extraction
+        that would re-select the same one. Only when every rung is dead is the
+        entry dropped and re-extracted once.
 
         UNCONFIRMED is not DEAD: the URL still plays and is cached only briefly.
         A cached one is dropped and re-extracted for a freshly signed URL on the
@@ -1635,6 +1908,9 @@ class YTDL(discord.FFmpegOpusAudio):
 
         data = await _stream_cache_get(redis, cache_key)
         span.set_attribute("ytdl.cache_hit", data is not None)
+        # Read BEFORE a promotion rewrites the entry: it is the ceiling a re-cache of
+        # a not-freshly-extracted URL must respect (see _cache_stream's max_ttl).
+        remaining_ttl = await _entry_ttl(redis, cache_key) if data is not None else None
 
         extractions = 0
         while True:
@@ -1657,21 +1933,42 @@ class YTDL(discord.FFmpegOpusAudio):
                     raise RuntimeError("Could not extract stream data")
                 extracted_fresh = True
 
-            if not extracted_fresh and _probe_is_recent(data):
+            if (
+                not extracted_fresh
+                and _probe_is_recent(data)
+                and str(data.get("format_id")) not in qo.failed_format_ids
+            ):
                 # The resolve probed this URL seconds ago and cached the verdict with
                 # it. Re-probing spends a network round trip to re-confirm a signature
-                # good for half an hour.
+                # good for half an hour. A format that already failed a play of this
+                # song walks the ladder instead.
                 span.set_attribute("ytdl.probe_reused", True)
                 _record_serving_format(data)
                 return data
 
-            probe = await _probe_stream_url(data.get("url", ""))
+            if extracted_fresh:
+                # _extract_once hands every joiner the same dict, and the walk
+                # below promotes onto the one it is given.
+                data = cast(YTDLVideoInfo, dict(data))
+            probe, winner = await cls._probe_candidate_ladder(
+                data, deprioritize=qo.failed_format_ids
+            )
             span.set_attribute("ytdl.stream_probe", probe.value)
 
             if probe is StreamProbe.PLAYABLE:
                 _record_serving_format(data)
-                if extracted_fresh:
-                    await _cache_stream(redis, cache_key, data, probed=True)
+                # A promotion rewrites the entry too, else a cached ladder whose head
+                # is dead re-probes it every play until the TTL lapses. (winner is
+                # never None on PLAYABLE; the comparison is for the type checker.)
+                promoted = winner is not None and winner > 0
+                if extracted_fresh or promoted:
+                    await _cache_stream(
+                        redis,
+                        cache_key,
+                        data,
+                        max_ttl=None if extracted_fresh else remaining_ttl,
+                        probed=True,
+                    )
                 return data
 
             if probe is StreamProbe.UNCONFIRMED:
@@ -1705,18 +2002,18 @@ class YTDL(discord.FFmpegOpusAudio):
             if not extracted_fresh:
                 # Only a cached URL has an entry to drop.
                 log.warning(
-                    f"YouTube revoked the cached stream URL for {qo.webpage_url} "
-                    "— dropping it from the cache and re-extracting"
+                    f"YouTube revoked every cached audio URL for {qo.webpage_url} "
+                    "— dropping the entry and re-extracting"
                 )
                 await cache_del(redis, cache_key)
             elif extractions < _MAX_STREAM_EXTRACTIONS:
                 log.warning(
-                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    f"every freshly extracted audio URL for {qo.webpage_url} probed "
                     "dead — re-extracting with the budget that remains"
                 )
             else:
                 log.warning(
-                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    f"every freshly extracted audio URL for {qo.webpage_url} probed "
                     "dead — giving up"
                 )
             data = None
@@ -1757,8 +2054,13 @@ class YTDL(discord.FFmpegOpusAudio):
             # song still plays. MusicPlayer's start path announces the offset.
             ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
             ffmpeg_opts["options"] += " -ss 0"
-        if volume != 1.0:
-            ffmpeg_opts["options"] += f" -filter:a volume={volume}"
+        # Chain first, codec second: ffmpeg refuses `-c:a copy` alongside any
+        # filtergraph, and asking _audio_filters what it produced keeps the two
+        # from disagreeing when a filter is added.
+        filters = _audio_filters(volume)
+        codec = _passthrough_codec(data, filtered=bool(filters))
+        if filters:
+            ffmpeg_opts["options"] += f" -filter:a {','.join(filters)}"
 
         return cls(
             channel,
@@ -1768,6 +2070,9 @@ class YTDL(discord.FFmpegOpusAudio):
             start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
+            codec=codec,
+            stream_attempts=qo.stream_attempts,
+            failed_format_ids=qo.failed_format_ids,
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,

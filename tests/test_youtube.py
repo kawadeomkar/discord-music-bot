@@ -1,6 +1,7 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import copy
 import pathlib
 import contextlib
 import logging
@@ -36,9 +37,12 @@ from src.youtube import (
     YTDL,
     YTDL_OPTS,
     QueueObject,
+    _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
     _cache_stream,
+    _OGG_HEADER_PACKETS,
+    _STREAM_CANDIDATES,
     _UNUSED_INFO_COLLECTIONS,
     _YT_PLAYLIST_TTL,
     _YT_SOURCE_FRESH_SECS,
@@ -46,6 +50,8 @@ from src.youtube import (
     _source_cache_key,
     _source_entry_is_stale,
     _YTDL_FLAT_SEARCH_OPTS,
+    _mine_audio_candidates,
+    select_search_entry,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
@@ -184,7 +190,11 @@ class TestYTDLElapsedSecs:
     """Elapsed-time tracking by counting YTDL.read() calls — deterministic, no
     time-mocking. Patches the parent FFmpegOpusAudio.read() (what super().read()
     resolves to) rather than the real _packet_iter, which noop_ffmpeg_init
-    never sets up."""
+    never sets up.
+
+    Every count here is offset by _OGG_HEADER_PACKETS: the first two packets of any
+    Ogg Opus stream are OpusHead and OpusTags, which discord.py yields like audio and
+    YTDL deliberately does not count."""
 
     def test_zero_before_any_read(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
@@ -195,7 +205,8 @@ class TestYTDLElapsedSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            song.read()
+            for _ in range(_OGG_HEADER_PACKETS + 1):
+                song.read()
         assert song.elapsed_secs == pytest.approx(0.02)
 
     def test_accumulates_across_multiple_reads(
@@ -203,7 +214,7 @@ class TestYTDLElapsedSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.elapsed_secs == pytest.approx(0.10)
 
@@ -235,7 +246,7 @@ class TestYTDLPositionSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.position_secs == song.elapsed_secs == pytest.approx(0.10)
 
@@ -243,7 +254,7 @@ class TestYTDLPositionSecs:
         song = ytdl_instance()
         song.start_offset = 90
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.position_secs == pytest.approx(90.10)
 
@@ -1575,6 +1586,7 @@ class TestYTStream:
             executable: str,
             before_options: str,
             options: str,
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -1611,6 +1623,7 @@ class TestYTStream:
             executable: str,
             before_options: str,
             options: str,
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -2352,6 +2365,341 @@ class TestRevokedStreamUrl:
         assert await _probe_stream_url("") is StreamProbe.DEAD
 
 
+class TestCandidateLadderWalk:
+    """A revoked URL used to cost a 3-5s re-extraction that re-selected the same
+    format — curing a stale URL but not a format YouTube stopped serving. The ladder
+    walks sideways first: next format, ~100ms probe, same extraction."""
+
+    def _laddered(self, webpage_url: str, *format_ids: str) -> YTDLVideoInfo:
+        """Stream data whose ladder is the given formats, best first: the head is the
+        selected format at the top level, and only the ALTERNATIVES are stored under
+        audio_candidates — the shape _cache_stream persists."""
+        ladder = [_fmt(fid, "opus", 129.0, 48000) for fid in format_ids]
+        return _fake_ytdl_data(
+            webpage_url=webpage_url,
+            audio_candidates=ladder[1:],
+            **{k: ladder[0][k] for k in _CANDIDATE_FIELDS},
+        )
+
+    async def _cache(self, fake_redis: aioredis.Redis, data: YTDLVideoInfo) -> None:
+        await fake_redis.set(
+            f"ytdl:stream:{data['webpage_url']}", orjson.dumps(data), ex=1800
+        )
+
+    async def _play(
+        self, fake_redis: aioredis.Redis, webpage_url: str, author: Any, **kwargs: Any
+    ) -> YTDL:
+        qobj = QueueObject(webpage_url, "Laddered Song", author)
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            return await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis, **kwargs
+            )
+
+    async def test_a_dead_head_falls_sideways_without_re_extracting(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The headline behavior: the second rung plays, and yt-dlp is never called."""
+        url = "https://yt.com/v=sideways"
+        await self._cache(fake_redis, self._laddered(url, "251", "140", "249"))
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        mock_extract.assert_not_called()
+        assert song.data.get("format_id") == "140"
+        assert song.url == song.data["url"]
+
+    async def test_a_promotion_leaves_the_shared_extraction_result_alone(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """_extract_once hands every joiner of one extraction the same dict, and the
+        stream warm reads it while this resolve walks. A promotion written onto it
+        would have the warm cache one format's URL under another's shape."""
+        url = "https://yt.com/v=shared"
+        shared = self._laddered(url, "251", "140")
+        before = copy.deepcopy(shared)
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        with patch("src.youtube._extract_once", new=AsyncMock(return_value=shared)):
+            resolved = await YTDL._resolve_playable_stream(
+                QueueObject(url, "Shared", mock_ctx.author), fake_redis
+            )
+
+        assert resolved.get("format_id") == "140"
+        assert shared == before
+
+    async def test_a_deprioritized_promotion_still_rewrites_the_ladder(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The retry path's cache coherence, and it is the COMMON path rather than an
+        edge case: _retry_failed_stream invalidates the entry first, so every retry
+        resolves fresh, walks with the failed format deprioritized, and re-caches.
+
+        The reorder means the winner can land at index 0 while still differing from
+        the format the entry was built around — so a rewrite gated on a non-zero
+        index would persist `format_id: 140` over a ladder still headed by 251, and
+        the next play would probe the blacklisted rung first, discard what the retry
+        learned, and warn about the wrong format until the TTL lapsed.
+        """
+        url = "https://yt.com/v=retryladder"
+        playable_urls.side_effect = [
+            StreamProbe.PLAYABLE
+        ]  # 140, walked first, is healthy
+
+        qobj = QueueObject(
+            url,
+            "Laddered Song",
+            mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
+        )
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                return_value=self._laddered(url, "251", "140", "249"),
+            ),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "140"
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None, "the promotion must have re-cached the entry"
+        cached = orjson.loads(cast(bytes, raw))
+        assert cached["format_id"] == "140"
+        # Asserted through the reconstruction, which is the only thing a later play
+        # walks: rung 0 must be the URL this probe validated. Storing the head
+        # separately is what USED to let the two disagree.
+        ladder = YTDL._candidate_ladder(cast(YTDLVideoInfo, cached))
+        ids = [c.get("format_id") for c in ladder]
+        assert ids[0] == "140"
+        # 251 is not dropped — it is demoted, since the usual cause is a URL revoked
+        # between probe and first read, which a fresh extraction cures.
+        assert "251" in ids
+
+    async def test_the_winner_is_promoted_wholesale(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Not just the URL: the whole format shape, so _record_serving_format and
+        YTDL's abr/asr/acodec describe what is actually playing."""
+        url = "https://yt.com/v=promote"
+        data = self._laddered(url, "251", "140")
+        cast(dict[str, Any], data)["audio_candidates"][0].update(
+            acodec="mp4a.40.2", abr=130.0, asr=44100
+        )
+        await self._cache(fake_redis, data)
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.acodec == "mp4a.40.2"
+        assert song.asr == 44100
+
+    async def test_a_promotion_rewrites_the_cache_entry(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Without the rewrite, the next play re-probes the same dead URL every time
+        until the TTL lapses — re-diagnosing a failure already known."""
+        url = "https://yt.com/v=rewrite"
+        await self._cache(fake_redis, self._laddered(url, "251", "140", "249"))
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        await self._play(fake_redis, url, mock_ctx.author)
+
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None
+        cached = orjson.loads(raw)
+        assert cached["format_id"] == "140"
+        # The winner is the top-level format now, so what is STORED is what follows
+        # it — and the rung that failed is DEMOTED rather than deleted: deleting it
+        # left two promotions pinning a single worst rung for the rest of the TTL with
+        # nothing to fall back to, and a rung can fail for reasons that pass (one CDN
+        # host 503ing) and deserve a later retry.
+        assert [c["format_id"] for c in cached["audio_candidates"]] == ["249", "251"]
+
+    async def test_a_promotion_clears_the_dead_formats_metadata(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The promotion REPLACES the format shape rather than merging over it.
+        _candidate_shape omits keys a format does not carry, so a merge left the dead
+        format's abr/asr in place and the Now Playing footer advertised a bitrate the
+        stream was not using."""
+        url = "https://yt.com/v=stale"
+        data = self._laddered(url, "251", "140")
+        alternative = cast(dict[str, Any], data)["audio_candidates"][0]
+        del alternative["abr"]
+        del alternative["asr"]
+        await self._cache(fake_redis, data)
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.data.get("format_id") == "140"
+        assert song.abr is None
+        assert song.asr is None
+
+    async def test_a_promotion_does_not_extend_the_entrys_life(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A promotion re-caches URLs from an extraction that may be nearly 30 minutes
+        old. _STREAM_URL_MAX_TTL is measured from now, so an unbounded rewrite would
+        hand them another full window — and two promotions ~90 minutes from one
+        extraction — widening exactly the "probe says 200, ffmpeg 403s" gap the probe
+        exists to close."""
+        url = "https://yt.com/v=ttlcap"
+        key = f"ytdl:stream:{url}"
+        await fake_redis.set(
+            key, orjson.dumps(self._laddered(url, "251", "140")), ex=100
+        )
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        await self._play(fake_redis, url, mock_ctx.author)
+
+        ttl = await fake_redis.ttl(key)
+        assert 0 < ttl <= 100, f"the entry's life was extended to {ttl}s"
+
+    async def test_a_healthy_head_rewrites_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The common path stays one probe and zero writes."""
+        url = "https://yt.com/v=healthy"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        with patch("src.youtube.cache_set") as mock_set:
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        mock_set.assert_not_called()
+        assert playable_urls.await_count == 1
+        assert song.data.get("format_id") == "251"
+
+    async def test_a_whole_dead_ladder_falls_back_to_re_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Sideways first, in place second: only when every rung is dead does the
+        entry get dropped and re-extracted."""
+        url = "https://yt.com/v=all_dead"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        fresh = self._laddered(url, "251")
+        cast(dict[str, Any], fresh)["title"] = "Fresh Song"
+        playable_urls.side_effect = [
+            StreamProbe.DEAD,
+            StreamProbe.DEAD,
+            StreamProbe.PLAYABLE,
+        ]
+
+        with patch("src.youtube._ytdlp_extract", return_value=fresh) as mock_extract:
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        mock_extract.assert_called_once()
+        assert song.title == "Fresh Song"
+
+    async def test_a_fresh_extraction_walks_its_own_ladder(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A cache miss gets the same treatment, and caches the rung that survived."""
+        url = "https://yt.com/v=fresh_ladder"
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=self._laddered(url, "251", "140")
+        ):
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.data.get("format_id") == "140"
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None
+        assert orjson.loads(raw)["format_id"] == "140"
+
+    async def test_a_failed_format_is_tried_last_not_skipped(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A format that just 403'd mid-play is suspect, so the retry walks the
+        others first — but it is deprioritized, never removed: a single-format
+        video would otherwise have nothing left to try."""
+        url = "https://yt.com/v=retry"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        qobj = QueueObject(
+            url, "Retrying Song", mock_ctx.author, failed_format_ids=frozenset({"251"})
+        )
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "140"
+
+    async def test_the_only_format_is_still_tried_after_it_failed(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Filtering instead of reordering would make the retry a guaranteed
+        failure here — and "revoked between the probe and ffmpeg's first read", the
+        common case, is cured by a fresh URL for the same format."""
+        url = "https://yt.com/v=single"
+        await self._cache(fake_redis, self._laddered(url, "251"))
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        qobj = QueueObject(
+            url, "Single Format", mock_ctx.author, failed_format_ids=frozenset({"251"})
+        )
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "251"
+
+    async def test_entries_cached_before_the_ladder_existed_still_play(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Wire-compat: a pre-upgrade entry carries one URL and no candidates, which
+        must read as a one-rung ladder rather than an empty one."""
+        url = "https://yt.com/v=legacy"
+        legacy = _fake_ytdl_data(webpage_url=url, title="Legacy Song")
+        await self._cache(fake_redis, legacy)
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.title == "Legacy Song"
+        assert song.url == legacy["url"]
+
+    async def test_an_unconfirmed_rung_ends_the_walk(
+        self, playable_urls: AsyncMock
+    ) -> None:
+        """The ladder and the tri-state probe meet here. Every rung shares one host and
+        one `expire`, so a probe that could not complete for the head will not complete
+        for the rest: walking on would spend STREAM_PROBE_TIMEOUT per rung to learn
+        nothing, then report a song dead that ffmpeg was never asked to play."""
+        data = self._laddered("https://yt.com/v=blocked", "251", "140", "249")
+        playable_urls.return_value = StreamProbe.UNCONFIRMED
+
+        verdict, index = await YTDL._probe_candidate_ladder(data)
+
+        assert verdict is StreamProbe.UNCONFIRMED
+        assert index == 0
+        assert playable_urls.await_count == 1
+
+    async def test_an_unconfirmed_walk_does_not_serve_a_rung_proven_dead(
+        self, playable_urls: AsyncMock
+    ) -> None:
+        """Stopping is not the same as standing still: the rungs already refused stay
+        refused, so the walk promotes the rung it stopped ON. Returning the head
+        instead would hand the caller a URL this very walk watched YouTube revoke."""
+        data = self._laddered("https://yt.com/v=mixed", "251", "140", "249")
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.UNCONFIRMED]
+
+        verdict, index = await YTDL._probe_candidate_ladder(data)
+
+        assert verdict is StreamProbe.UNCONFIRMED
+        assert index == 1
+        assert data.get("format_id") == "140"
+
+
 class TestStreamCache:
     async def test_cache_hit_skips_executor(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -2667,6 +3015,193 @@ class TestPrefetchStream:
         assert cached is None
 
 
+class TestOpusPassthrough:
+    """Discord speaks Opus and ~90% of what YouTube serves here already IS Opus, so
+    the encoder was spending a full lossy generation to arrive at the same thing.
+    `codec="copy"` remuxes instead. discord.py resolves `codec` to 'copy' only for
+    ('opus', 'libopus', 'copy') and to 'libopus' for everything else, INCLUDING None
+    — so the gate is a plain codec string, and None is today's behavior."""
+
+    async def _ffmpeg_args(self, **data_overrides: Any) -> tuple[Optional[str], str]:
+        """The codec AND the output options yt_stream hands FFmpegOpusAudio.
+
+        Both, together, because they encode one invariant across two code paths:
+        ffmpeg REFUSES `-c:a copy` alongside any filtergraph. Capturing only the
+        codec is what let a mutation that always appends the volume filter survive
+        the whole suite.
+        """
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            options: Optional[str] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["options"] = options or ""
+
+        volume = data_overrides.pop("volume", 1.0)
+        # A remuxable YouTube serve, spelled out: opus, stereo, and one of the itags
+        # known to be 20ms-framed. Every clause of the gate is defeatable per test.
+        data: dict[str, Any] = {
+            "acodec": "opus",
+            "audio_channels": 2,
+            "format_id": "251",
+        }
+        data.update(data_overrides)
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data(**data)),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject("https://yt.com/v=x", "Song", MagicMock()),
+                AsyncMock(spec=discord.TextChannel),
+                volume=volume,
+            )
+        return captured["codec"], captured["options"]
+
+    async def _codec(self, **data_overrides: Any) -> Optional[str]:
+        """The codec yt_stream hands FFmpegOpusAudio for this serve."""
+        codec, _ = await self._ffmpeg_args(**data_overrides)
+        return codec
+
+    async def test_an_opus_serve_is_remuxed(self) -> None:
+        assert await self._codec() == "copy"
+
+    async def test_an_aac_serve_is_still_encoded(self) -> None:
+        """The muxed fallback rungs (itag 18, HLS 91-96) carry AAC."""
+        assert await self._codec(acodec="mp4a.40.2", format_id="18") is None
+
+    async def test_a_volume_filter_forces_the_encoder(self) -> None:
+        """A filter has to touch samples, so it cannot ride the copy path."""
+        assert await self._codec(volume=0.5) is None
+
+    async def test_any_filter_forces_the_encoder_not_just_volume(self) -> None:
+        """The invariant is "a filtergraph exists", not "volume is non-unity".
+
+        Volume is only today's filter source. This stands in a future one (the
+        per-guild loudness setting is the next) by making _audio_filters emit a
+        filter yt_stream knows nothing about: the copy path must still refuse, or
+        ffmpeg exits 234 with zero bytes and the player reports a refused stream.
+        """
+        with patch("src.youtube._audio_filters", return_value=["dynaudnorm"]):
+            codec, options = await self._ffmpeg_args()
+        assert codec is None
+        assert "-filter:a dynaudnorm" in options
+
+    async def test_filters_are_joined_into_one_chain(self) -> None:
+        """One -filter:a, comma-separated — a second flag would silently replace
+        the first rather than adding to it."""
+        with patch("src.youtube._audio_filters", return_value=["volume=0.5", "anull"]):
+            _, options = await self._ffmpeg_args()
+        assert options.count("-filter:a") == 1
+        assert "-filter:a volume=0.5,anull" in options
+
+    async def test_a_missing_codec_is_not_assumed_to_be_opus(self) -> None:
+        """Pre-upgrade cache entries and extractors that report nothing must fall to
+        the encoder, not be guessed into a remux that ffmpeg would then refuse."""
+        assert await self._codec(acodec=None) is None
+
+    async def test_a_surround_serve_is_never_remuxed(self) -> None:
+        """`-c:a copy` copies OpusHead too, so a 5.1 stream reaches Discord as
+        6-channel multistream and clients decode only the front pair — centre-channel
+        vocals silently vanish. yt-dlp sorts `channels` ABOVE `acodec`, so bestaudio
+        really does select itag 338 on videos that carry it; `-ac 2` used to downmix.
+        """
+        assert await self._codec(audio_channels=6, format_id="338") is None
+
+    async def test_an_unknown_channel_count_is_not_assumed_to_be_stereo(self) -> None:
+        """Not every extractor populates audio_channels, and the safe reading of
+        absent is "re-encode" — the encoder path is correct for every input."""
+        assert await self._codec(audio_channels=None) is None
+
+    async def test_a_mono_serve_is_remuxed(self) -> None:
+        """Mono stays mono rather than being upmixed by `-ac 2`, which is the honest
+        rendering of the source and decodes correctly at the client."""
+        assert await self._codec(audio_channels=1) == "copy"
+
+    async def test_an_opus_format_outside_the_allowlist_is_encoded(self) -> None:
+        """Packet duration is the reason. `read()` counts packets and every position
+        surface is frames x 20ms, but Opus may legally be 60ms-framed — which plays
+        at 3x speed and reads a third of its true position. yt-dlp reports no frame
+        duration, so anything but YouTube's known-20ms itags takes the encoder.
+        SoundCloud's http_opus is exactly this case.
+        """
+        assert await self._codec(format_id="http_opus_0_0") is None
+
+    async def test_the_volume_filter_and_the_copy_codec_are_mutually_exclusive(
+        self,
+    ) -> None:
+        """The invariant, asserted directly rather than inferred from two separate
+        tests: ffmpeg exits 234 with zero bytes on `-c:a copy` plus `-filter:a`, and
+        the player would blame YouTube and burn the whole retry budget for it.
+        """
+        for volume in (1.0, 0.5, 2.0):
+            codec, options = await self._ffmpeg_args(volume=volume)
+            assert codec != "copy" or "-filter:a" not in options, (
+                f"volume={volume} produced codec={codec!r} options={options!r}"
+            )
+
+
+class TestYTStreamCarriedFields:
+    """A playing song becomes a QueueObject again — a neutralized prefetch, an
+    interjection's resume tail, a stream retry — so anything QueueObject carries and
+    YTDL does not is silently dropped at that rebuild. `user_input` and `persisted`
+    have each been lost this way before."""
+
+    async def _stream(self, qobj: QueueObject) -> YTDL:
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            return await YTDL.yt_stream(qobj, AsyncMock(spec=discord.TextChannel))
+
+    async def test_user_input_survives(self, mock_ctx: MagicMock) -> None:
+        """The only surviving record of the collection link -remove matches on: a
+        search entry's ytsearch is a title this code generated."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                user_input="https://open.spotify.com/album/abc",
+            )
+        )
+        assert song.user_input == "https://open.spotify.com/album/abc"
+
+    async def test_persisted_survives(self, mock_ctx: MagicMock) -> None:
+        """A crash-recovered song was never RPUSHed to the Redis list. Rebuilt as
+        persisted=True, its next dequeue LPOPs an entry that belongs to an unrelated
+        still-queued song — deleting it, with no error."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                persisted=False,
+            )
+        )
+        assert song.persisted is False
+
+    async def test_retry_state_survives(self, mock_ctx: MagicMock) -> None:
+        """The loop reads both off the PLAYING song to decide whether to retry."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                stream_attempts=2,
+                failed_format_ids=frozenset({"251"}),
+            )
+        )
+        assert song.stream_attempts == 2
+        assert song.failed_format_ids == frozenset({"251"})
+
+
 class TestYTStreamInterjectionFlags:
     async def test_flags_carried_onto_ytdl(self, mock_ctx: MagicMock) -> None:
         fake_data = _fake_ytdl_data()
@@ -2720,6 +3255,7 @@ class TestYTStreamInterjectionFlags:
             executable: str,
             before_options: Optional[str],
             options: Optional[str],
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["before_options"] = before_options
@@ -2843,6 +3379,7 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
         "abr": 128,
         "asr": 44100,
         "acodec": "opus",
+        "audio_channels": 2,
         "format_id": "251",
         "protocol": "https",
         "vcodec": "none",
@@ -2859,6 +3396,193 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+def _audio_ladder() -> list[dict[str, Any]]:
+    """A YouTube format list shaped the way a real one is: sorted worst→best, and
+    carrying every kind of entry a naive audio filter would wrongly admit —
+    storyboards (audio-less but `vcodec: none`), a DRC variant, a dubbed track, and
+    the video-only rungs."""
+    return [
+        {"format_id": "sb0", "url": "https://sb", "vcodec": "none", "acodec": "none"},
+        _fmt("139", "mp4a.40.5", 49.0, 22050),
+        _fmt("249", "opus", 46.0, 48000),
+        _fmt("251-drc", "opus", 129.0, 48000),
+        _fmt("251-1", "opus", 129.0, 48000, language="es"),
+        _fmt("140", "mp4a.40.2", 130.0, 44100),
+        _fmt("251", "opus", 129.0, 48000, language="en"),
+        {"format_id": "137", "url": "https://137", "vcodec": "avc1", "acodec": "none"},
+    ]
+
+
+def _fmt(
+    format_id: str, acodec: str, abr: float, asr: int, **extra: Any
+) -> dict[str, Any]:
+    """One audio-only format, with the expire param _stream_url_ttl needs to consider
+    the URL cacheable."""
+    return {
+        "format_id": format_id,
+        "url": f"https://r2.googlevideo.com/{format_id}?expire={int(time.time()) + 7200}",
+        "vcodec": "none",
+        "acodec": acodec,
+        "abr": abr,
+        "asr": asr,
+        "protocol": "https",
+        "audio_channels": 2,
+        **extra,
+    }
+
+
+class TestAudioCandidateMining:
+    """The fallback ladder is mined in the worker because _slim_info drops `formats` —
+    after that the alternative URLs exist nowhere, which is why one dead URL used to
+    cost the whole song."""
+
+    def _mine(self, **overrides: Any) -> list[dict[str, Any]]:
+        fields: dict[str, Any] = {
+            "formats": _audio_ladder(),
+            "format_id": "251",
+            "language": "en",
+            **overrides,
+        }
+        return cast(
+            list[dict[str, Any]], _mine_audio_candidates(_realistic_raw_info(**fields))
+        )
+
+    def test_keeps_the_top_rungs_best_first(self) -> None:
+        """yt-dlp sorts worst→best, so the ladder is walked in reverse. What is KEPT
+        is the alternatives behind the selection — 251 is the selection here, and it
+        is not stored because _candidate_ladder synthesizes it from the top level."""
+        assert [c["format_id"] for c in self._mine()] == ["140", "249"]
+
+    def test_the_selected_format_is_never_stored_twice(self) -> None:
+        """Rung 0 is the selected format, and it already exists at the top level of
+        the dict this list rides on. Storing it again duplicated a ~1.1 KB signed URL
+        byte for byte — and made "rung 0 is the selection" an invariant to maintain
+        rather than one that cannot be violated."""
+        assert "251" not in [c["format_id"] for c in self._mine()]
+
+    def test_the_selection_is_dropped_wherever_the_sort_put_it(self) -> None:
+        """The selected format is excluded even when it is not the best-sorted one,
+        so it cannot reappear as its own fallback."""
+        assert [c["format_id"] for c in self._mine(format_id="140")] == ["251", "249"]
+
+    def test_storyboards_and_drc_and_dubs_are_excluded(self) -> None:
+        """Storyboards carry `vcodec: none` too (the acodec test is what removes
+        them); a `-drc` variant or a foreign-language dub would silently change what
+        the song sounds like."""
+        ids = [c["format_id"] for c in self._mine()]
+        assert "sb0" not in ids and "137" not in ids
+        assert "251-drc" not in ids and "251-1" not in ids
+
+    def test_a_storyboard_is_excluded_by_the_filter_and_not_by_the_cap(self) -> None:
+        """Deliberately fewer real audio formats than _STREAM_CANDIDATES, so the slice
+        cannot be what drops the storyboard — only the acodec test can.
+
+        yt-dlp writes the STRING "none" here, not None, so narrowing that check to an
+        identity test against None removes the only branch that ever fires in
+        production. A storyboard promoted as audio would probe 200 (it is a real
+        JPEG mosaic) and be served to the voice channel as the song.
+        """
+        candidates = self._mine(
+            formats=[
+                {
+                    "format_id": "sb0",
+                    "url": "https://sb0",
+                    "vcodec": "none",
+                    "acodec": "none",
+                },
+                {
+                    "format_id": "sb1",
+                    "url": "https://sb1",
+                    "vcodec": "none",
+                    "acodec": "none",
+                },
+                _fmt("249", "opus", 46.0, 48000),
+                _fmt("251", "opus", 129.0, 48000),
+            ],
+            language=None,
+        )
+        # 251 is the selection, so 249 is the only alternative — and the storyboards
+        # can only have been removed by the acodec test, not by the cap.
+        assert [c["format_id"] for c in candidates] == ["249"]
+        assert len(candidates) < _STREAM_CANDIDATES - 1
+
+    def test_language_less_formats_survive_a_language_selection(self) -> None:
+        """Absent language means "the only track", not "a different one"."""
+        assert "140" in [c["format_id"] for c in self._mine()]
+
+    def test_muxed_selection_gets_no_alternatives(self) -> None:
+        """The muxed rung already means the audio-only path is degraded; walking
+        sideways across muxed formats is not a recovery worth having. It still plays,
+        via the rung 0 _candidate_ladder synthesizes from the top level."""
+        assert self._mine(format_id="18", vcodec="avc1.42001E") == []
+
+    def test_no_format_list_mines_nothing(self) -> None:
+        """extract_flat playlist entries carry no formats and no stream URL."""
+        assert _mine_audio_candidates({"url": "https://x", "title": "t"}) == []
+        assert _mine_audio_candidates({"formats": _audio_ladder()}) == []
+
+    def test_candidates_are_capped(self) -> None:
+        assert len(self._mine()) <= _STREAM_CANDIDATES
+
+    def test_a_field_the_format_lacks_stays_absent(self) -> None:
+        """Absent must not become None. A candidate promotes wholesale via
+        data.update(), so a fabricated `asr: None` would overwrite the real
+        top-level value with nothing — contradicting YTDLVideoInfo's non-optional
+        types and making the NP footer advertise a sample rate the stream lacks.
+
+        Asserting on the KEYS, because an all-None candidate satisfies a
+        set-equality check against _CANDIDATE_FIELDS just as well as a full one.
+        """
+        sparse = _fmt("249", "opus", 46.0, 48000)
+        del sparse["asr"]
+        del sparse["abr"]
+        candidates = self._mine(
+            formats=[sparse, _fmt("251", "opus", 129.0, 48000)],
+            format_id="251",
+            language=None,
+        )
+
+        assert "asr" not in candidates[0]
+        assert "abr" not in candidates[0]
+        assert candidates[0]["format_id"] == "249"
+
+    def test_only_the_candidate_fields_are_carried(self) -> None:
+        """A candidate promotes wholesale onto the info-dict, so a stray key here
+        would overwrite a top-level field with a per-format one. Every candidate field
+        is also a cached field, or a promotion would not survive the round trip."""
+        assert set(self._mine()[0]) == set(_CANDIDATE_FIELDS)
+        assert set(_CANDIDATE_FIELDS) <= set(_STREAM_CACHE_FIELDS)
+
+
+class TestSearchEntryPicker:
+    """One rule, two callers: yt_source picks the entry to play and `just
+    ytdl-formats` reports on it. Two copies would drift, and the diagnostic built to
+    answer "what would the bot play?" would then answer for a different song."""
+
+    def test_an_entry_with_a_stream_url_wins(self) -> None:
+        entries = [
+            {"_type": "url", "id": "a"},
+            {"_type": "video", "id": "b", "url": "https://b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries))
+        assert chosen is not None and chosen.get("id") == "b"
+
+    def test_the_first_non_playlist_entry_is_the_fallback(self) -> None:
+        """No entry carries a URL — an unrecognised shape still plays rather than
+        failing outright, which is why this is not `next(..., None)`."""
+        entries = [
+            {"_type": "playlist", "id": "p"},
+            {"_type": "video", "id": "a"},
+            {"_type": "video", "id": "b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries))
+        assert chosen is not None and chosen.get("id") == "a"
+
+    def test_nothing_playable_is_none_not_an_index_error(self) -> None:
+        """An all-playlist result used to IndexError inside the diagnostic."""
+        assert select_search_entry(cast(Any, [{"_type": "playlist"}, None])) is None
 
 
 class TestFlatEntryMapper:
@@ -3370,6 +4094,29 @@ class TestProbeReuse:
         resolved = await YTDL._resolve_playable_stream(qobj, fake_redis)
         assert resolved["webpage_url"] == "https://yt.com/v=recent"
         playable_urls.assert_not_awaited()
+
+    async def test_a_format_that_failed_a_play_is_not_served_from_a_recent_verdict(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A retry invalidates its entry, but a warm can rewrite it before the retry
+        resolves. The stamp says the URL answered a probe; the play says the format
+        produced no audio, and the play is what the retry is acting on."""
+        qobj = QueueObject(
+            "https://yt.com/v=burned",
+            "Burned",
+            mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
+        )
+        cached = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=burned",
+            format_id="251",
+            probed_at=time.time(),
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=burned", orjson.dumps(cached)
+        )
+        await YTDL._resolve_playable_stream(qobj, fake_redis)
+        playable_urls.assert_awaited()
 
     async def test_a_stale_stamp_is_probed_as_before(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
@@ -4262,6 +5009,47 @@ class TestSlimInfoReturnContract:
         slim = cast(dict[str, Any], _slim_info(wrapper))
         assert slim["entries"][0]["thumbnail"] == "https://img/2.jpg"
         assert "thumbnails" not in slim["entries"][0]
+
+    def test_slimming_mines_the_audio_ladder_before_dropping_formats(self) -> None:
+        """The ONE integration point of the whole retry ladder.
+
+        `formats` is dropped in the same pass, so if the ladder is not attached here
+        it exists nowhere afterwards and every fallback URL is gone for good. Nothing
+        else in the suite covers it — the mining tests hand-build `audio_candidates`
+        into a fixture, and every extraction test patches out _slim_info's caller — so
+        without this the entire feature can be deleted with the suite still green.
+        """
+        raw = _realistic_raw_info(
+            formats=_audio_ladder(), format_id="251", language="en"
+        )
+        slim = cast(dict[str, Any], _slim_info(raw))
+        assert [c["format_id"] for c in slim["audio_candidates"]] == ["140", "249"]
+        assert slim["format_id"] == "251"  # rung 0, carried at the top level
+        assert "formats" not in slim
+        # Cheap enough to ship, and picklable — it crosses the boundary every time.
+        pickle.loads(pickle.dumps(slim))
+
+    def test_each_search_entry_is_mined_too(self) -> None:
+        """yt_source narrows to an entry, so an unmined one reaches playback with no
+        ladder and silently falls back to single-URL behaviour."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [
+                _realistic_raw_info(
+                    formats=_audio_ladder(), format_id="251", language="en"
+                )
+            ],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        entry = slim["entries"][0]
+        assert [c["format_id"] for c in entry["audio_candidates"]] == ["140", "249"]
+        assert "formats" not in entry
+
+    def test_an_entry_with_no_formats_gets_no_ladder_key(self) -> None:
+        """extract_flat playlist entries carry no `formats`, and must not gain an
+        empty key — _candidate_ladder's legacy path is what serves them."""
+        slim = cast(dict[str, Any], _slim_info({"url": "https://x", "title": "t"}))
+        assert "audio_candidates" not in slim
 
     def test_slim_info_passes_none_through(self) -> None:
         """A failed extract_info returns None; callers branch on `data is None`, so
