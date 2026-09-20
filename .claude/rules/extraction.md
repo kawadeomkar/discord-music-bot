@@ -161,6 +161,10 @@ quietly becoming permanent. **Rolling the image back reinstates the broken stabl
 change is data-safe (nothing new is persisted; both caches are TTL'd and self-heal within
 the hour) but rolling back restores the outage this pin exists to fix, so never do it to
 chase an unrelated symptom. After any dependency change, `just
-test-image-rebuild` before `DOCKER=1` recipes. Watch `_record_serving_format` warnings
+test-image-rebuild` before `DOCKER=1` recipes. Then run **`just ytdl-formats <url>`**
+against a real video and reconcile what it prints with the format claims in
+`src/youtube.py` (the client ladder, `_STREAM_CANDIDATES`, the passthrough itag
+allowlist) — those claims are empirical and both YouTube and yt-dlp move under them.
+Watch `_record_serving_format` warnings
 and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
 YouTube-side changes.

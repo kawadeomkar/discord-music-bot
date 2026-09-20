@@ -51,7 +51,10 @@ src/
 ├── guild_state.py    # Pure Redis schema: frozen value objects, field constants, orjson wire formats
 ├── redis_client.py   # Connection pool, GuildRedisStore (@_guild_op), cache helpers, recovery lock
 ├── youtube.py        # yt-dlp integration: caches, stream probe/heal, YTDL audio source, worker fn
-├── ytdlp_pool.py     # ProcessPoolExecutor lifecycle: lazy spawn, break-healing, worker log plumbing
+├── ytdlp_pool.py     # ProcessPoolExecutor lifecycle: lazy spawn, break-healing, worker recycling,
+│                     # worker log plumbing
+├── ytdl_formats.py   # `just ytdl-formats <url>`: the format yt-dlp selects and the fallback
+│                     # ladder the retry would walk. A diagnostic; run at every yt-dlp bump
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source;
 │                     # is_mix (a YouTube Mix, which yt-dlp walks window by window)
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached); the playlist
