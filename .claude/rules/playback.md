@@ -5,12 +5,13 @@ paths:
   - "src/play_placement.py"
   - "src/play_pipeline.py"
   - "src/queue_progress.py"
+  - "src/queue_rows.py"
   - "src/musicbot.py"
   - "src/main.py"
   - "src/util.py"
   - "src/commands/{clear,join,jump,now,pause,play,queue,remove,replay,resume,shuffle,skip,stop,volume}.py"
   - "src/commands/_common.py"
-  - "tests/test_{musicplayer,guild_queue,play_placement,play_pipeline,queue_progress,musicbot,main,util}.py"
+  - "tests/test_{musicplayer,guild_queue,play_placement,play_pipeline,queue_progress,queue_rows,musicbot,main,util}.py"
   - "tests/commands/test_{clear,join,now,pause,play,queue,remove,replay,resume,shuffle,skip,stop,volume}.py"
 ---
 

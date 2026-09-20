@@ -40,15 +40,16 @@ from src.guild_state import (
 from src.redis_client import GuildRedisStore
 from src import config, musicplayer
 from src.commands import replay as replay_cmd
+from src.queue_rows import advance_walk, queue_row
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
     _START_WRITE_TIMEOUT,
     _reached_end,
-    _fmt_eta,
+    fmt_eta,
     _fmt_finish_time,
-    _fmt_total_duration,
-    _requester_mention,
+    fmt_total_duration,
+    requester_mention,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
@@ -195,34 +196,34 @@ class TestOutboxNotifyWiring:
 
 class TestFmtTotalDuration:
     def test_seconds_only(self) -> None:
-        assert _fmt_total_duration(45) == "45s"
+        assert fmt_total_duration(45) == "45s"
 
     def test_minutes_and_seconds(self) -> None:
-        assert _fmt_total_duration(185) == "3m 5s"
+        assert fmt_total_duration(185) == "3m 5s"
 
     def test_hours_minutes_seconds(self) -> None:
-        assert _fmt_total_duration(3723) == "1h 2m 3s"
+        assert fmt_total_duration(3723) == "1h 2m 3s"
 
     def test_zero(self) -> None:
-        assert _fmt_total_duration(0) == "0s"
+        assert fmt_total_duration(0) == "0s"
 
     def test_exactly_one_hour(self) -> None:
-        assert _fmt_total_duration(3600) == "1h"
+        assert fmt_total_duration(3600) == "1h"
 
     def test_hours_no_minutes_with_seconds(self) -> None:
         # Regression: 1h 0m 45s previously showed as "1h" (seconds dropped)
-        assert _fmt_total_duration(3645) == "1h 45s"
+        assert fmt_total_duration(3645) == "1h 45s"
 
     def test_hours_and_minutes_no_seconds(self) -> None:
-        assert _fmt_total_duration(3780) == "1h 3m"
+        assert fmt_total_duration(3780) == "1h 3m"
 
 
 class TestRequesterMention:
     def test_returns_mention_when_present(self, mock_author: MagicMock) -> None:
-        assert _requester_mention(mock_author) == mock_author.mention
+        assert requester_mention(mock_author) == mock_author.mention
 
     def test_returns_unknown_when_none(self) -> None:
-        assert _requester_mention(None) == "Unknown"
+        assert requester_mention(None) == "Unknown"
 
 
 class TestFmtFinishTime:
@@ -239,7 +240,7 @@ class TestFmtFinishTime:
         assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
 
     def test_no_uncertainty_prefix(self) -> None:
-        # Unlike _fmt_eta(), a song's own remaining duration is never
+        # Unlike fmt_eta(), a song's own remaining duration is never
         # uncertain — no "~" prefix and no bold markdown wrapping.
         result = _fmt_finish_time(90, ZoneInfo(DEFAULT_TIMEZONE))
         assert not result.startswith("~")
@@ -2608,7 +2609,7 @@ class TestEtaWalkTo:
 
     def _eta_at(self, mp: MusicPlayer, index: int) -> str:
         now_pst, walk = mp._eta_walk_to(index)
-        return _fmt_eta(
+        return fmt_eta(
             now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
         )
 
@@ -2680,14 +2681,12 @@ class TestEtaWalkTo:
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60),
         )
         now_pst, walk = music_player._queue_eta_seed()
-        _, walk = music_player._format_queue_line(
-            music_player.queue._items[0], 1, now_pst, walk
-        )
-        expected_line, _ = music_player._format_queue_line(
+        walk = advance_walk(walk, music_player.queue._items[0])
+        expected_line = queue_row(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
             2,
-            now_pst,
-            walk,
+            now=now_pst,
+            walk=walk,
         )
         assert self._eta_at(music_player, 2) in expected_line
 
@@ -2731,7 +2730,7 @@ class TestPlaylistFacts:
         assert first == "Total Duration: **10m**  ·  Songs ahead: **2**"
         now_pst, walk = music_player._eta_walk_to(3)
         eta = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
-        assert second == f"Est. playing at {_fmt_eta(eta, walk.uncertain)}"
+        assert second == f"Est. playing at {fmt_eta(eta, walk.uncertain)}"
         assert not second.startswith("Est. playing at ~")
 
     def test_a_lazy_track_ahead_makes_the_start_time_approximate(
@@ -7102,7 +7101,7 @@ class TestPrefetchedHeadIsShownResolved:
 
 class TestQueueEntryCard:
     """The block's "Up next" and the -play confirmation are one renderer. The
-    -queue page keeps _format_queue_line: a row and a card are different jobs."""
+    -queue page keeps queue_rows.queue_row: a row and a card are different jobs."""
 
     @staticmethod
     def _next_up_body(mp: MusicPlayer) -> str:
@@ -7223,7 +7222,7 @@ class TestQueueEntryCard:
         # Derived from the SEED, not from _eta_walk_to — an expectation computed
         # by the code under test moves with it and asserts nothing.
         now_pst, seed = music_player._queue_eta_seed()
-        expected = _fmt_eta(
+        expected = fmt_eta(
             now_pst + datetime.timedelta(seconds=seed.cumulative_secs + 1200),
             seed.uncertain,
         )
@@ -11563,36 +11562,6 @@ class TestStartOffsetAnnounce:
         assert "🐞" in (embed.footer.text or "")
 
 
-class TestRemainingSecs:
-    def test_normal_item_full_duration(self, queue_obj: QueueObject) -> None:
-        from src.musicplayer import _remaining_secs
-
-        assert _remaining_secs(queue_obj) == 210
-
-    def test_resume_entry_counts_only_tail(self, mock_author: MagicMock) -> None:
-        from src.musicplayer import _remaining_secs
-
-        item = QueueObject(
-            "https://yt.com/v=1", "T", mock_author, ts=150, duration=210, is_resume=True
-        )
-        assert _remaining_secs(item) == 60
-
-    def test_unknown_duration_is_none(self, queue_obj_no_meta: QueueObject) -> None:
-        from src.musicplayer import _remaining_secs
-
-        assert _remaining_secs(queue_obj_no_meta) is None
-
-    def test_non_resume_ts_does_not_shrink_duration(
-        self, mock_author: MagicMock
-    ) -> None:
-        # A ?t= start offset is a playback preference, not a shorter song —
-        # only resume entries are known to play just their tail.
-        from src.musicplayer import _remaining_secs
-
-        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=150, duration=210)
-        assert _remaining_secs(item) == 210
-
-
 class TestResumeEntryDisplay:
     async def test_queue_embed_shows_resume_note(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -13497,41 +13466,6 @@ class TestGuildTimezoneOnRestore:
         music_player.timezone = ZoneInfo("Europe/London")
         rendered = _fmt_finish_time(90, music_player.timezone)
         assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
-
-
-class TestQueueLinesCannotForgeALink:
-    """`_format_queue_line` renders the title inside a masked link's LABEL, and
-    yt-dlp titles are uploader-chosen. An unbalanced `]` closes the label early
-    and re-points the link at whatever the title puts after it — under the bot's
-    name, in a message a member only had to get queued to trigger.
-
-    This was the inconsistency the -remove work introduced: its own Songs field
-    escaped, and the queue embed it sends 30ms later did not."""
-
-    def test_a_hostile_title_cannot_close_the_label(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        item = QueueObject(
-            "https://yt.com/v=1",
-            "Song](https://evil.example) [FREE NITRO",
-            mock_author,
-            duration=100,
-        )
-        now, walk = music_player._queue_eta_seed()
-        line, _ = music_player._format_queue_line(item, 1, now, walk)
-        assert "](https://evil.example)" not in line
-        assert "[FREE NITRO" not in line
-        # The real destination is still the one the queue holds.
-        assert "](https://yt.com/v=1)" in line
-
-    def test_an_unresolved_search_is_sanitized_too(
-        self, music_player: MusicPlayer
-    ) -> None:
-        """The resolving line renders user-typed text straight into a description."""
-        item = YTSource(ytsearch="ytsearch:[click](https://evil.example)", process=True)
-        now, walk = music_player._queue_eta_seed()
-        line, _ = music_player._format_queue_line(item, 1, now, walk)
-        assert "[" not in line and "](" not in line
 
 
 class TestRetiredFlag:

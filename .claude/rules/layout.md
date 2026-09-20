@@ -25,6 +25,8 @@ src/
 │                     # keeps the commands; the grammar and the registry are tested in
 │                     # test_play_placement.py, the placement itself in commands/test_play.py)
 ├── guild_queue.py    # GuildQueue — one deque + cursor, the mirror writer, bulk-mutation mutex
+├── queue_rows.py     # one queued item as a row of text, and the ETA walk down a listing (pure);
+│                     # every listing of queue items renders through it
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres) and its embeds; the command body is commands/history.py
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
 ├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), the alone-in-channel leave watchdog, and the two cold-start helpers -play and -resume share

@@ -22,6 +22,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
    - [Now Playing Host Model](#now-playing-host-model)
+   - [Queue rows](#queue-rows)
    - [Queue progress card](#queue-progress-card)
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
@@ -973,6 +974,19 @@ tick. That is the footer reporting live values; debug mode is opt-in per guild a
 default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
+
+---
+
+### Queue rows
+
+`src/queue_rows.py` renders one queued item as a row of text, and owns the ETA walk that runs down a listing. It is pure: no player, no queue, no Discord call. `-queue` is its first caller, and a listing reads the same wherever it appears because there is one formatter:
+
+```
+`index` [**title**](link) · `length` · Est. playing at **9:41 PM PDT**
+channel · @requester                                   (with a byline)
+```
+
+`queue_rows` numbers rows from a `first_index`, chains the `EtaWalk` from the state its caller seeds (the playing song's remaining time, then every item ahead), and ends in `*... and N more*`. It is bounded twice: `ROW_LIMIT` rows, and `ROWS_BUDGET` characters, because ten rows at both caps pass an embed description's 4,096 on their own. Two-line rows are set apart by a blank line and one-line rows are not. An unknown length marks the walk uncertain, and every later time renders with a `~`.
 
 ---
 

@@ -1,0 +1,177 @@
+"""One queued item as a row of text, and the ETA walk that runs down the rows.
+
+Pure: no player, no queue, no Discord call. `-queue`, the queued-collection card
+and the single-entry cards all render a queue item through here, so an item
+reads the same wherever it is listed. See docs/ARCHITECTURE.md#queue-rows.
+"""
+
+import datetime
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import Optional, Union
+
+import discord
+
+from src.guild_queue import QueueItem
+from src.util import fmt_duration, safe_label, truncate
+from src.youtube import QueueObject
+
+# Nothing bounds a yt-dlp title or uploader, and every row of a listing shares
+# one 4096-character embed description.
+ROW_TITLE_MAX = 200
+ROW_BYLINE_MAX = 200
+# Rows a listing shows before its "... and N more".
+ROW_LIMIT = 10
+# Characters a listing's rows may use. Ten rows at both caps, with their links,
+# pass 4096 on their own, so the count is not the only bound.
+ROWS_BUDGET = 3400
+
+
+@dataclass(frozen=True)
+class EtaWalk:
+    """Accumulator for the queue's ETA walk; `now_pst` is invariant across a walk
+    and passed alongside. Frozen: advancing is `replace()` + rebind."""
+
+    cumulative_secs: int
+    uncertain: bool
+
+    def advance(self, remaining: Optional[int]) -> EtaWalk:
+        """The next walk state after an item whose remaining time is `remaining`,
+        or None when its duration is unknown."""
+        if remaining is None:
+            return replace(self, uncertain=True)
+        return replace(self, cumulative_secs=self.cumulative_secs + remaining)
+
+
+def fmt_total_duration(secs: int) -> str:
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    parts: list[str] = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s:
+        parts.append(f"{s}s")
+    return " ".join(parts) or "0s"
+
+
+def fmt_clock_time(dt: datetime.datetime) -> str:
+    """A wall-clock time with the zone it is in, read off the datetime."""
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    # tzname(), not strftime("%Z"): same output, ~50x cheaper, and this runs on
+    # every NP tick. None is possible for a naive datetime, hence the `or ""`.
+    return f"{hour}:{dt.minute:02d} {ampm} {dt.tzname() or ''}".rstrip()
+
+
+def fmt_eta(est_dt: datetime.datetime, uncertain: bool) -> str:
+    prefix = "~" if uncertain else ""
+    return f"{prefix}**{fmt_clock_time(est_dt)}**"
+
+
+def requester_mention(
+    requester: Optional[Union[discord.User, discord.Member]],
+) -> str:
+    return requester.mention if requester else "Unknown"
+
+
+def remaining_secs(item: QueueObject) -> Optional[int]:
+    """A queued item's expected playtime: full duration, minus the resume offset
+    for a resume entry, which plays only its tail."""
+    if item.duration is None:
+        return None
+    if item.is_resume and item.ts:
+        return max(0, item.duration - item.ts)
+    return item.duration
+
+
+def advance_walk(walk: EtaWalk, item: QueueItem) -> EtaWalk:
+    """The walk after `item` has played."""
+    return walk.advance(remaining_secs(item) if isinstance(item, QueueObject) else None)
+
+
+def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
+    """Total remaining playtime of queued items, and whether any duration was
+    unknown (the total is then a lower bound, flagged with "~"). Shared by
+    queue_embed(), the resume notices and the queued-playlist card so they can't
+    disagree."""
+    total_secs = 0
+    partial = False
+    for item in items:
+        remaining = remaining_secs(item) if isinstance(item, QueueObject) else None
+        if remaining is not None:
+            total_secs += remaining
+        else:
+            partial = True
+    return total_secs, partial
+
+
+def queue_row(
+    item: QueueItem,
+    index: int,
+    *,
+    now: datetime.datetime,
+    walk: EtaWalk,
+    byline: bool = True,
+) -> str:
+    """One listing row: `index`, the linked title, its length and the clock time
+    `walk` gives it; with `byline`, a second line naming the channel and the
+    requester. `walk` is the state BEFORE this item."""
+    eta = fmt_eta(
+        now + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
+    )
+    if not isinstance(item, QueueObject):
+        search = safe_label(
+            (item.ytsearch or item.url or "?").removeprefix("ytsearch:"), ROW_TITLE_MAX
+        )
+        return f"`{index}` {search} · *resolving...*"
+    # Capped and sanitized: a "]" in a masked link's label would close it early.
+    title = safe_label(item.title, ROW_TITLE_MAX) or "Unknown"
+    dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
+    if item.is_resume and item.ts:
+        ts_note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
+    elif item.ts:
+        ts_note = f"  ·  starts at `{item.ts}s`"
+    else:
+        ts_note = ""
+    line = (
+        f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note}"
+        f" · Est. playing at {eta}"
+    )
+    if not byline:
+        return line
+    channel = truncate(item.uploader or "", ROW_BYLINE_MAX) or "Unknown channel"
+    return f"{line}\n{channel} · {requester_mention(item.requester)}"
+
+
+def queue_rows(
+    items: Sequence[QueueItem],
+    *,
+    first_index: int,
+    now: datetime.datetime,
+    walk: EtaWalk,
+    byline: bool = True,
+    limit: int = ROW_LIMIT,
+    budget: int = ROWS_BUDGET,
+) -> str:
+    """The first rows of `items`, numbered from `first_index`, chaining the ETA
+    walk from `walk`, then "... and N more" for the rest. Bounded by `limit` rows
+    AND by `budget` characters, so a listing of long titles ends early rather
+    than overflowing the description. Two-line rows are set apart by a blank
+    line, one-line rows are not. "" for no items."""
+    gap = "\n\n" if byline else "\n"
+    rows: list[str] = []
+    used = 0
+    for offset, item in enumerate(items[:limit]):
+        row = queue_row(item, first_index + offset, now=now, walk=walk, byline=byline)
+        # The first row always shows: a listing of one row is never empty.
+        if rows and used + len(gap) + len(row) > budget:
+            break
+        rows.append(row)
+        used += len(gap) + len(row)
+        walk = advance_walk(walk, item)
+    more = len(items) - len(rows)
+    if more > 0:
+        rows.append(f"*... and {more} more*")
+    return gap.join(rows)

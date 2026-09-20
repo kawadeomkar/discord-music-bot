@@ -20,7 +20,7 @@ from discord.ext import commands
 
 from src.guild_queue import QueueItem
 from src.guild_state import Analytics
-from src.musicplayer import InterjectOutcome, MusicPlayer, queue_runtime
+from src.musicplayer import InterjectOutcome, MusicPlayer
 from src.play_placement import (
     Placement,
     PlayRequest,
@@ -43,6 +43,7 @@ from src.sources import (
 from src.spotify import SpotifyPlaylist
 from src.telemetry import get_tracer
 from src.queue_progress import enqueue_progress, is_collection
+from src.queue_rows import queue_runtime
 from src.util import (
     ECHO_MAX,
     QUEUE_MESSAGE_ROWS_PLUS_ONE,
