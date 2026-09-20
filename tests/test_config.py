@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import pytest
 
@@ -30,6 +30,13 @@ from src.config import (
     spotify_enabled,
     using_default_postgres_password,
 )
+
+
+def _parsed(module: ModuleType, name: str) -> float:
+    """What `module` parsed from the environment for `name`: a settable knob's
+    baseline, else the module constant."""
+    knob = module.KNOBS.get(name.lower())
+    return getattr(module, name) if knob is None else knob.baseline
 
 
 class TestSpotifyEnabled:
@@ -469,8 +476,8 @@ class TestPlayBounds:
         importlib.reload(config)
 
     def test_defaults(self) -> None:
-        assert config.PLAY_INFLIGHT_MAX == 16
-        assert config.PLAY_RESOLVE_CONCURRENCY == 2
+        assert config.play_inflight_max.baseline == 16
+        assert config.play_resolve_concurrency.baseline == 2
 
     @pytest.mark.parametrize("name", ["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"])
     def test_zero_is_refused_at_import(
@@ -523,7 +530,7 @@ class TestEnvFloors:
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, raw)
-        assert getattr(self._reload(monkeypatch), name) == default
+        assert _parsed(self._reload(monkeypatch), name) == default
 
     @pytest.mark.parametrize(
         ("name", "raw", "message"),
@@ -1304,26 +1311,19 @@ class TestDebugPrometheusUrl:
 class TestBotKnobDeclarations:
     """The names -settings may override, and what the registry asserts against."""
 
-    def test_every_knob_names_a_parsed_constant_of_its_type(self) -> None:
-        for knob in config.FLOAT_KNOBS:
-            assert type(getattr(config, knob)) is float, knob
-            assert type(config.baseline(knob)) is float, knob
-        for knob in config.INT_KNOBS:
-            assert type(getattr(config, knob)) is int, knob
-            assert type(config.baseline(knob)) is int, knob
+    def test_every_baseline_is_of_its_knobs_kind(self) -> None:
+        for field, knob in config.KNOBS.items():
+            assert type(knob.baseline) is knob.kind, field
 
-    def test_the_two_sets_are_disjoint(self) -> None:
-        assert not config.FLOAT_KNOBS & config.INT_KNOBS
-
-    def test_is_int_knob(self) -> None:
-        assert config.is_int_knob("PLAY_INFLIGHT_MAX")
-        assert not config.is_int_knob("PING_TICK_SECS")
+    def test_the_count_knobs(self) -> None:
+        counts = {field for field, knob in config.KNOBS.items() if knob.kind is int}
+        assert counts == {"play_inflight_max", "play_resolve_concurrency"}
 
     def test_baseline_is_read_at_call_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(config, "PING_TICK_SECS", 2.5)
-        assert config.baseline("PING_TICK_SECS") == 2.5
+        monkeypatch.setitem(config._BASELINES, "PING_TICK_SECS", 2.5)
+        assert config.ping_tick_secs.baseline == 2.5
 
     @pytest.mark.parametrize(
         ("knob", "floor"),
@@ -1335,14 +1335,55 @@ class TestBotKnobDeclarations:
             ("PLAY_INFLIGHT_MAX", 1),
         ],
     )
-    def test_env_floor_is_the_minimum_the_parse_enforced(
-        self, knob: config.FloatKnob | config.IntKnob, floor: float
+    def test_floor_is_the_minimum_the_parse_enforced(
+        self, knob: str, floor: float
     ) -> None:
-        assert config.env_floor(knob) == floor
+        assert config.KNOBS[knob.lower()].floor == floor
 
-    def test_every_knob_has_a_recorded_floor(self) -> None:
-        for knob in config.FLOAT_KNOBS | config.INT_KNOBS:
-            assert config.env_floor(knob) >= 0, knob
+
+class TestKnobHandle:
+    """A knob is a handle: the name, the kind and the floor. Its values are held by
+    the module, which is what lets a handle outlive a reload."""
+
+    def test_a_handle_names_its_variable_field_kind_and_floor(self) -> None:
+        knob = config.play_inflight_max
+        assert (knob.env, knob.field) == ("PLAY_INFLIGHT_MAX", "play_inflight_max")
+        assert knob.kind is int
+        assert knob.floor == 1
+        assert config.KNOBS[knob.field] is knob
+
+    def test_every_handle_is_the_module_global_named_as_its_field(self) -> None:
+        assert len(config.KNOBS) == 15
+        for field, knob in config.KNOBS.items():
+            assert getattr(config, field) is knob, field
+
+    def test_a_dependent_floor_reads_the_baselines_it_is_built_from(self) -> None:
+        assert config.queue_progress_max_secs.floor == (
+            config.queue_progress_delay_secs.baseline
+            + config.queue_progress_tick_secs.baseline
+        )
+
+    def test_a_handle_held_across_a_reload_reads_the_reloaded_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The -settings registry holds handles built at its own import, and this
+        suite reloads config under it."""
+        held = config.heartbeat_interval_secs
+        # Read first: a handle that kept what it read would pass a test that only
+        # reads afterwards.
+        assert (held.baseline, held()) == (3.0, 3.0)
+        monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4.0")
+        try:
+            importlib.reload(config)
+            assert held is not config.heartbeat_interval_secs
+            assert held.baseline == 4.0
+            config.heartbeat_interval_secs.set_override(9.0)
+            assert (held(), held.override()) == (9.0, 9.0)
+            held.clear_override()
+            assert config.heartbeat_interval_secs() == 4.0
+        finally:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS")
+            importlib.reload(config)
 
 
 class TestBotKnobOverrides:
@@ -1350,54 +1391,46 @@ class TestBotKnobOverrides:
     set_override, which type-checks the value; conftest clears every override after
     each test."""
 
-    @pytest.mark.parametrize("knob", sorted(config.FLOAT_KNOBS | config.INT_KNOBS))
-    def test_each_accessor_returns_the_override_then_the_baseline(
-        self, knob: config.FloatKnob | config.IntKnob
-    ) -> None:
-        """One accessor per knob, named as the knob in lower case: a missing or
-        miswired one fails here."""
-        accessor = getattr(config, knob.lower())
-        assert accessor() == config.baseline(knob)
-        value = config.baseline(knob) + 1
-        if config.is_int_knob(knob):
-            config.set_override(knob, int(value))
-        else:
-            config.set_override(knob, float(value))
-        assert accessor() == value
-        assert config.effective(knob) == value
-        assert config.override(knob) == value
-        config.clear_override(knob)
-        assert accessor() == config.baseline(knob)
-        assert config.override(knob) is None
+    @pytest.mark.parametrize("field", sorted(config.KNOBS))
+    def test_each_knob_returns_the_override_then_the_baseline(self, field: str) -> None:
+        knob = cast(config.Knob[float], config.KNOBS[field])
+        assert knob() == knob.baseline
+        value = knob.kind(knob.baseline + 1)
+        knob.set_override(value)
+        assert (knob(), knob.override()) == (value, value)
+        assert type(knob()) is knob.kind
+        knob.clear_override()
+        assert knob() == knob.baseline
+        assert knob.override() is None
 
     def test_the_baseline_is_read_at_call_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(config, "PING_TICK_SECS", 2.5)
+        monkeypatch.setitem(config._BASELINES, "PING_TICK_SECS", 2.5)
         assert config.ping_tick_secs() == 2.5
 
     def test_an_int_knob_refuses_a_float_and_a_bool(self) -> None:
         with pytest.raises(TypeError):
-            config.set_override("PLAY_INFLIGHT_MAX", 2.5)  # pyright: ignore[reportCallIssue, reportArgumentType]
+            config.play_inflight_max.set_override(2.5)  # pyright: ignore[reportArgumentType]
         with pytest.raises(TypeError):
-            config.set_override("PLAY_INFLIGHT_MAX", True)
-        assert config.override("PLAY_INFLIGHT_MAX") is None
+            config.play_inflight_max.set_override(True)
+        assert config.play_inflight_max.override() is None
 
     def test_a_float_knob_takes_an_int_as_a_float_and_refuses_a_bool(self) -> None:
-        config.set_override("PING_TICK_SECS", 2)
+        config.ping_tick_secs.set_override(2)
         assert type(config.ping_tick_secs()) is float
         with pytest.raises(TypeError):
-            config.set_override("PING_TICK_SECS", True)
+            config.ping_tick_secs.set_override(True)
 
     def test_no_bounds_are_checked(self) -> None:
         """The registry owns the bounds; tests drive sub-floor values through here."""
-        config.set_override("PING_TICK_SECS", 0.0)
+        config.ping_tick_secs.set_override(0.0)
         assert config.ping_tick_secs() == 0.0
 
     def test_an_int_knob_keeps_its_type(self) -> None:
-        config.set_override("PLAY_RESOLVE_CONCURRENCY", 3)
+        config.play_resolve_concurrency.set_override(3)
         assert type(config.play_resolve_concurrency()) is int
-        assert type(config.effective("PLAY_RESOLVE_CONCURRENCY")) is int
+        assert type(config.play_resolve_concurrency()) is int
 
     def test_a_reload_drops_every_override(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1408,11 +1441,11 @@ class TestBotKnobOverrides:
         import importlib
 
         accessor = config.heartbeat_interval_secs
-        config.set_override("HEARTBEAT_INTERVAL_SECS", 9.0)
+        config.heartbeat_interval_secs.set_override(9.0)
         monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4.0")
         try:
             importlib.reload(config)
-            assert config.override("HEARTBEAT_INTERVAL_SECS") is None
+            assert config.heartbeat_interval_secs.override() is None
             assert accessor() == 4.0
         finally:
             monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS")

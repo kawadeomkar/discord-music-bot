@@ -42,9 +42,10 @@ plus the traps that make a green run mean nothing if they are broken.
   existing assertions encode it. Disabled-mode behavior is covered by explicit tests
   that monkeypatch the flag per case — which wins over the fixture (same MonkeyPatch
   instance, later call). Don't "fix" the fixture to match the ship default.
-- **Bot knobs in tests** are set with `config.set_override(<knob>, value)` in the test body.
+- **Bot knobs in tests** are set with `config.<knob>.set_override(value)` in the test body.
   Don't patch a consumer module's copy (there is none), and don't use `monkeypatch.setitem` on
-  the private maps (pyright does not check that value). The autouse `clear_bot_knob_overrides`
+  `_OVERRIDES` (pyright does not check that value). To stand in for an ENVIRONMENT value,
+  which has no setter, `monkeypatch.setitem(config._BASELINES, "<NAME>", value)`. The autouse `clear_bot_knob_overrides`
   clears every override after each test. `monkeypatch.setattr(config, "<KNOB>", v)` patches the
   env **baseline**, which an override shadows. Use it only for tests about the baseline.
 - Redis in tests is `fakeredis`; Discord objects are `MagicMock(spec=...)` doubles,

@@ -51,7 +51,7 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import BotConfig, GuildConfig, HistoryEntry, SongQueueEntry
+from src.guild_state import GuildConfig, HistoryEntry, SongQueueEntry
 from src.redis_client import (
     GUILD_CONFIG_KEY,
     GUILD_STATE_KEY,
@@ -671,7 +671,7 @@ class TestConfigKeysAreNonEvictable:
         await redis.hset(bot_store.config_key(), "ping_tick_secs", "2.0")
         await redis.expire(bot_store.config_key(), 600)
 
-        assert await bot_store.update_config(BotConfig(play_inflight_max=4)) is True
+        assert await bot_store.update_config({"play_inflight_max": 4}) is True
 
         assert await redis.ttl(bot_store.config_key()) == -1
 
@@ -805,7 +805,7 @@ class TestConfigReadsSurviveTheConnectionCap:
 
             assert await store.read_config() == GuildConfig()
             assert snapshot is not None and snapshot.config == GuildConfig()
-            assert await bot_store.read_config() == BotConfig()
+            assert await bot_store.read_config() == {}
             await client.set(store.queue_key(), b"not a list")
             assert await store.get_playback_snapshot() is None
         finally:

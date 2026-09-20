@@ -4563,10 +4563,10 @@ class TestProbeSessionSharing:
         monkeypatch.setattr(youtube, "_get_probe_session", lambda: session)
 
         assert await _probe_stream_url("https://cdn/x") is StreamProbe.PLAYABLE
-        config.set_override("STREAM_PROBE_TIMEOUT_SECS", 0.7)
+        config.stream_probe_timeout_secs.set_override(0.7)
         assert await _probe_stream_url("https://cdn/x") is StreamProbe.PLAYABLE
         totals = [c.kwargs["timeout"].total for c in session.get.call_args_list]
-        assert totals == [config.STREAM_PROBE_TIMEOUT_SECS, 0.7]
+        assert totals == [config.stream_probe_timeout_secs.baseline, 0.7]
 
     async def test_probe_connector_is_unbounded(self) -> None:
         """One connector serves every guild now. aiohttp's default limit of 100

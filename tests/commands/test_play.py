@@ -3327,7 +3327,7 @@ class TestTheSlowNoticeIsTheServers:
         cog = music_bot_with_redis
         mock_ctx.voice_client = connected_vc(mock_ctx)
         cog.get_mp = MagicMock(return_value=mock_mp())
-        config.set_override("PLAY_SLOW_NOTICE_SECS", 0.02)
+        config.play_slow_notice_secs.set_override(0.02)
         resolved = song(1, mock_ctx)
 
         async def _slow_resolve(*_args: Any, **_kwargs: Any) -> Any:
@@ -5061,7 +5061,7 @@ class TestQueueProgressCard:
             await asyncio.sleep(0.2)
 
         mock_ctx.message.content = f"-play {self._PLAYLIST}"
-        config.set_override("QUEUE_PROGRESS_DELAY_SECS", 0.05)
+        config.queue_progress_delay_secs.set_override(0.05)
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),

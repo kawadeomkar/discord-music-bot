@@ -166,8 +166,8 @@ class TestPingCommand:
         """A probe still pending at the deadline is cancelled → 'failed', via an edit."""
         message = _ping_message(mock_ctx)
         # Collapse the deadline so the never-returning probe fails at once.
-        config.set_override("PING_TICK_SECS", 0.0)
-        config.set_override("PING_DEADLINE_SECS", 0.0)
+        config.ping_tick_secs.set_override(0.0)
+        config.ping_deadline_secs.set_override(0.0)
 
         never = asyncio.Event()  # never set → the probe hangs until cancelled
 
@@ -190,8 +190,8 @@ class TestPingCommand:
         """The headline behavior: a probe that returns after the skeleton send is
         folded in on a tick and the message is edited from pending → its latency."""
         message = _ping_message(mock_ctx)
-        config.set_override("PING_TICK_SECS", 0.01)
-        config.set_override("PING_DEADLINE_SECS", 5.0)
+        config.ping_tick_secs.set_override(0.01)
+        config.ping_deadline_secs.set_override(5.0)
 
         gate = asyncio.Event()
 
@@ -227,8 +227,8 @@ class TestPingCommand:
         message.edit = AsyncMock(
             side_effect=discord.NotFound(MagicMock(status=404), "gone")
         )
-        config.set_override("PING_TICK_SECS", 0.0)
-        config.set_override("PING_DEADLINE_SECS", 0.0)
+        config.ping_tick_secs.set_override(0.0)
+        config.ping_deadline_secs.set_override(0.0)
 
         never = asyncio.Event()
 
@@ -293,8 +293,8 @@ class TestPingDashboardBounds:
         """The other dashboard tests set these only to shorten a wait, so a baseline
         read would pass them slower rather than fail."""
         _ping_message(mock_ctx)
-        config.set_override("PING_TICK_SECS", 2.5)
-        config.set_override("PING_DEADLINE_SECS", 7.0)
+        config.ping_tick_secs.set_override(2.5)
+        config.ping_deadline_secs.set_override(7.0)
         driver = AsyncMock()
         with _patch_probes(), patch("src.ping.run_live_dashboard", new=driver):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
@@ -975,8 +975,8 @@ class TestDefaultPasswordWarningReachesTheWire:
         probe resolves late — i.e. on exactly the unhealthy deployments most
         likely to be running unattended."""
         message = _ping_message(mock_ctx)
-        config.set_override("PING_TICK_SECS", 0.0)
-        config.set_override("PING_DEADLINE_SECS", 0.0)
+        config.ping_tick_secs.set_override(0.0)
+        config.ping_deadline_secs.set_override(0.0)
 
         never = asyncio.Event()
 
@@ -1003,8 +1003,8 @@ class TestDefaultPasswordWarningReachesTheWire:
         # call sites in run_health_dashboard, and dropping the warning from any
         # one of them survived the suite before these tests existed.
         message = _ping_message(mock_ctx)
-        config.set_override("PING_TICK_SECS", 0.01)
-        config.set_override("PING_DEADLINE_SECS", 5.0)
+        config.ping_tick_secs.set_override(0.01)
+        config.ping_deadline_secs.set_override(5.0)
         gate = asyncio.Event()
 
         async def _gated(*a: Any, **k: Any) -> ProbeResult:
@@ -1079,8 +1079,8 @@ class TestTheAdvisoryIsForTheOperator:
         # the edit paths too, or the advisory leaks on the first late probe.
         mock_ctx.bot.is_owner = AsyncMock(return_value=False)
         message = _ping_message(mock_ctx)
-        config.set_override("PING_TICK_SECS", 0.0)
-        config.set_override("PING_DEADLINE_SECS", 0.0)
+        config.ping_tick_secs.set_override(0.0)
+        config.ping_deadline_secs.set_override(0.0)
 
         never = asyncio.Event()
 

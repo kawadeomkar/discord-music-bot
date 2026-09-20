@@ -11,7 +11,6 @@ from typing import Final, Optional
 
 import discord
 
-from src import config
 from src.guild_state import ConfigField, GuildConfig
 from src.settings import (
     SETTINGS,
@@ -97,7 +96,7 @@ def server_default(spec: SettingSpec, *, debug_default: bool) -> SettingValue:
     if spec.field == ConfigField.DEBUG_MODE:
         return debug_default
     if (knob := followed_knob(spec)) is not None:
-        return config.effective(knob)
+        return knob()
     raise ValueError(f"{spec.key} has no server default")
 
 
@@ -152,7 +151,7 @@ def bot_shown(
 ) -> Shown:
     """A bot setting as the operator's views render it: knob_shown for a knob,
     and debug-default's session override over its host value."""
-    if spec.attr is not None:
+    if spec.knob is not None:
         return knob_shown(spec, persisted=persisted)
     origin = "env" if _env_set(spec) else "default"
     if debug_default_override is None:
@@ -165,13 +164,13 @@ def knob_shown(spec: SettingSpec, *, persisted: bool = True) -> Shown:
     """A knob's value in force, and where it comes from: `bot owner; env 3s` for
     an override, `not saved` for one whose write did not reach Redis, `env,
     outside chat range` for an environment value chat could not set."""
-    if spec.attr is None:
+    if spec.knob is None:
         raise ValueError(f"{spec.key} names no config knob")
     origin = "env" if _env_set(spec) else "default"
-    override = config.override(spec.attr)
-    baseline = config.baseline(spec.attr)
+    override = spec.knob.override()
+    baseline = spec.knob.baseline
     if not persisted:
-        return Shown(config.effective(spec.attr), NOT_SAVED)
+        return Shown(spec.knob(), NOT_SAVED)
     if override is None:
         # Honoured as set; a chat write can only move it back inside.
         if not in_bounds(spec, baseline):
@@ -401,9 +400,9 @@ _DEBUG_FOOTER_LABEL: Final = server_spec(ConfigField.DEBUG_MODE).label
 
 def _baseline(spec: SettingSpec) -> tuple[SettingValue, Optional[str]]:
     """A knob's environment value, and the variable it came from, if one is set."""
-    if spec.attr is None:
+    if spec.knob is None:
         raise ValueError(f"{spec.key} names no config knob")
-    return config.baseline(spec.attr), spec.env if _env_set(spec) else None
+    return spec.knob.baseline, spec.env if _env_set(spec) else None
 
 
 def bot_set_reply(

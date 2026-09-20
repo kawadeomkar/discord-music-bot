@@ -22,9 +22,9 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.exceptions import WatchError
 
 import src.redis_client as redis_client
+from src import config
 from src.guild_state import (
     CONFIG_WRITER_FIELD,
-    BotConfig,
     ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
@@ -1850,7 +1850,7 @@ class TestConfigWritesUseTheSchemaEncoder:
         self, fake_redis: aioredis.Redis
     ) -> None:
         bot_store = BotConfigStore(fake_redis, application_id=1234)
-        change = BotConfig(play_inflight_max=4, heartbeat_interval_secs=5.0)
+        change = {"play_inflight_max": 4, "heartbeat_interval_secs": 5.0}
         assert await bot_store.update_config(change) is True
         assert await bot_store.read_config() == change
 
@@ -1858,7 +1858,7 @@ class TestConfigWritesUseTheSchemaEncoder:
         self, fake_redis: aioredis.Redis
     ) -> None:
         bot_store = BotConfigStore(fake_redis, application_id=1234)
-        await bot_store.update_config(BotConfig(ping_tick_secs=2.0))
+        await bot_store.update_config({"ping_tick_secs": 2.0})
         assert set(await fake_redis.hgetall(bot_store.config_key())) == {
             b"ping_tick_secs"
         }
@@ -2312,7 +2312,7 @@ class TestBotConfigStore:
     ) -> None:
         bot_store = BotConfigStore(fake_redis, application_id=1234)
         await fake_redis.set(bot_store.config_key(), b"not a hash")
-        assert await bot_store.read_config() == BotConfig()
+        assert await bot_store.read_config() == {}
 
     async def test_two_applications_on_one_redis_do_not_share_overrides(
         self, fake_redis: aioredis.Redis
@@ -2320,13 +2320,13 @@ class TestBotConfigStore:
         """A dev bot run against the compose Redis must not retune prod."""
         dev = BotConfigStore(fake_redis, application_id=1)
         prod = BotConfigStore(fake_redis, application_id=2)
-        await dev.update_config(BotConfig(play_inflight_max=1))
-        assert await prod.read_config() == BotConfig()
+        await dev.update_config({"play_inflight_max": 1})
+        assert await prod.read_config() == {}
 
     async def test_nothing_stored_is_an_all_unset_config_not_none(
         self, fake_redis: aioredis.Redis
     ) -> None:
-        assert await BotConfigStore(fake_redis, 1).read_config() == BotConfig()
+        assert await BotConfigStore(fake_redis, 1).read_config() == {}
 
     async def test_the_write_clears_an_expiry_it_finds(
         self, fake_redis: aioredis.Redis
@@ -2334,14 +2334,14 @@ class TestBotConfigStore:
         bot_store = BotConfigStore(fake_redis, 1)
         await fake_redis.hset(bot_store.config_key(), "ping_tick_secs", "2.0")
         await fake_redis.expire(bot_store.config_key(), 60)
-        assert await bot_store.update_config(BotConfig(debug_tick_secs=2.0)) is True
+        assert await bot_store.update_config({"debug_tick_secs": 2.0}) is True
         assert await fake_redis.ttl(bot_store.config_key()) == -1
 
     async def test_an_empty_config_is_refused_with_nothing_sent(
         self, fake_redis: aioredis.Redis
     ) -> None:
         bot_store = BotConfigStore(fake_redis, 1)
-        assert await bot_store.update_config(BotConfig()) is False
+        assert await bot_store.update_config({}) is False
         assert await fake_redis.exists(bot_store.config_key()) == 0
 
     async def test_reset_deletes_only_the_named_fields(
@@ -2349,27 +2349,51 @@ class TestBotConfigStore:
     ) -> None:
         bot_store = BotConfigStore(fake_redis, 1)
         await bot_store.update_config(
-            BotConfig(play_inflight_max=4, heartbeat_interval_secs=5.0)
+            {"play_inflight_max": 4, "heartbeat_interval_secs": 5.0}
         )
         assert await bot_store.reset_config_fields("play_inflight_max") is True
-        assert await bot_store.read_config() == BotConfig(heartbeat_interval_secs=5.0)
+        assert await bot_store.read_config() == {"heartbeat_interval_secs": 5.0}
+
+    @pytest.mark.parametrize("field", sorted(config.KNOBS))
+    async def test_every_knob_round_trips_under_its_field(
+        self, field: str, fake_redis: aioredis.Redis
+    ) -> None:
+        """The hash field is the knob's variable in lower case, holding str(value):
+        what a build before the knobs were handles wrote, and reads back."""
+        knob = config.KNOBS[field]
+        value = 2 if knob.kind is int else 2.5
+        bot_store = BotConfigStore(fake_redis, 1)
+        assert await bot_store.update_config({field: value}) is True
+        raw = await fake_redis.hgetall(bot_store.config_key())
+        assert raw == {knob.env.lower().encode(): str(value).encode()}
+        stored = await bot_store.read_config()
+        assert stored == {field: value}
+        assert stored is not None and type(stored[field]) is knob.kind
+
+    async def test_update_refuses_a_field_no_knob_has(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, 1)
+        assert await bot_store.update_config({"volume": 0.5}) is False
+        assert await bot_store.update_config({"ping_tick_secs": 2.0, "x": 1}) is False
+        assert await fake_redis.exists(bot_store.config_key()) == 0
 
     async def test_reset_refuses_no_fields_and_unknown_ones(
         self, fake_redis: aioredis.Redis
     ) -> None:
         bot_store = BotConfigStore(fake_redis, 1)
-        await bot_store.update_config(BotConfig(play_inflight_max=4))
+        await bot_store.update_config({"play_inflight_max": 4})
         assert await bot_store.reset_config_fields() is False
-        refused = await bot_store.reset_config_fields("volume")  # pyright: ignore[reportArgumentType]
+        refused = await bot_store.reset_config_fields("volume")
         assert refused is False
-        assert await bot_store.read_config() == BotConfig(play_inflight_max=4)
+        assert await bot_store.read_config() == {"play_inflight_max": 4}
 
     async def test_every_method_swallows_redis_errors(
         self, broken_store: GuildRedisStore, caplog: pytest.LogCaptureFixture
     ) -> None:
         bot_store = BotConfigStore(broken_store.redis, application_id=1234)
         assert await bot_store.read_config() is None
-        assert await bot_store.update_config(BotConfig(ping_tick_secs=2.0)) is False
+        assert await bot_store.update_config({"ping_tick_secs": 2.0}) is False
         assert await bot_store.reset_config_fields("ping_tick_secs") is False
         assert "[bot:1234] read_config failed" in caplog.text
 
@@ -3605,7 +3629,7 @@ class TestGuildConfigStore:
         store = GuildRedisStore(fake_redis, 42)
         bot_store = BotConfigStore(fake_redis, application_id=42)
         await store.set_debug_mode(True)
-        await bot_store.update_config(BotConfig(ping_tick_secs=2.0))
+        await bot_store.update_config({"ping_tick_secs": 2.0})
         await store.refresh_ttl()
         assert await fake_redis.ttl(store.config_key()) == -1
         assert await fake_redis.ttl(bot_store.config_key()) == -1

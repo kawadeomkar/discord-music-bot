@@ -20,9 +20,6 @@ from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     Analytics,
-    BotConfig,
-    BotConfigField,
-    BotConfigFieldName,
     CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
     OFF_SECS,
@@ -43,6 +40,7 @@ from src.guild_state import (
     parse_queue_entry,
     serialize_history_entry,
     valid_timezone,
+    parse_number_fields,
 )
 from tests.helpers import members
 
@@ -1964,32 +1962,22 @@ class TestGuildConfigNumericFields:
         assert config.debug_mode is True
 
 
-_BOT_COUNT_FIELDS = frozenset(knob.lower() for knob in config.INT_KNOBS)
+class TestParseNumberFields:
+    """bot:{application_id}:config's parser. Parsing only: which fields exist is
+    the caller's to say, and the bounds are the registry's."""
 
+    def test_nothing_stored_is_nothing_parsed(self) -> None:
+        assert parse_number_fields({}, floats=["a"], counts=["n"]) == {}
 
-class TestBotConfig:
-    """bot:{application_id}:config's value object. Parsing only: the bounds are
-    the registry's."""
+    def test_a_float_and_a_count_keep_their_types(self) -> None:
+        raw = {b"a": b"2.5", b"n": b"2"}
+        parsed = parse_number_fields(raw, floats=["a"], counts=["n"])
+        assert parsed == {"a": 2.5, "n": 2}
+        assert (type(parsed["a"]), type(parsed["n"])) == (float, int)
 
-    def test_every_attribute_is_its_wire_name(self) -> None:
-        names = {f.name for f in dataclasses.fields(BotConfig)}
-        assert names == members(BotConfigField)
-
-    def test_the_count_fields_are_the_int_knobs(self) -> None:
-        ints = {f.name for f in dataclasses.fields(BotConfig) if f.type == (int | None)}
-        assert ints == _BOT_COUNT_FIELDS
-
-    def test_nothing_stored_is_all_unset(self) -> None:
-        assert BotConfig.from_redis({}) == BotConfig()
-        assert BotConfig().to_redis() == {}
-
-    @pytest.mark.parametrize("field", sorted(get_args(BotConfigFieldName.__value__)))
-    def test_each_field_round_trips(self, field: str) -> None:
-        value: float = 2 if field in _BOT_COUNT_FIELDS else 2.5
-        bot_config = dataclasses.replace(BotConfig(), **{field: value})
-        assert bot_config.to_redis() == {field: str(value)}
-        raw = {field.encode(): str(value).encode()}
-        assert BotConfig.from_redis(raw) == bot_config
+    def test_a_field_nobody_named_is_not_read(self) -> None:
+        raw = {b"a": b"2.5", b"writer_app_id": b"1", b"volume": b"0.5"}
+        assert parse_number_fields(raw, floats=["a"], counts=[]) == {"a": 2.5}
 
     @pytest.mark.parametrize("raw", [b"2.5", b"2.0", b"nan", b"two"])
     def test_a_count_is_read_exactly(
@@ -1997,19 +1985,25 @@ class TestBotConfig:
     ) -> None:
         """Not _b_opt_int: its float fallback reads 2.5 as 2."""
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            parsed = BotConfig.from_redis({b"play_inflight_max": raw})
-        assert parsed.play_inflight_max is None
+            parsed = parse_number_fields({b"n": raw}, floats=[], counts=["n"])
+        assert parsed == {}
         assert _guild_state_warnings(caplog) == 1
 
     @pytest.mark.parametrize("raw", [b"nan", b"inf", b"soon"])
     def test_an_unusable_float_reads_as_unset(self, raw: bytes) -> None:
-        assert BotConfig.from_redis({b"heartbeat_interval_secs": raw}) == BotConfig()
+        assert parse_number_fields({b"a": raw}, floats=["a"], counts=[]) == {}
+
+    def test_one_bad_field_does_not_cost_the_rest(self) -> None:
+        raw = {b"a": b"soon", b"b": b"4.0", b"n": b"2.5", b"m": b"3"}
+        parsed = parse_number_fields(raw, floats=["a", "b"], counts=["n", "m"])
+        assert parsed == {"b": 4.0, "m": 3}
 
     def test_a_parseable_value_is_kept_whatever_its_bounds(self) -> None:
-        raw = {b"ping_tick_secs": b"0", b"play_resolve_concurrency": b"-3"}
-        parsed = BotConfig.from_redis(raw)
-        assert parsed.ping_tick_secs == 0.0
-        assert parsed.play_resolve_concurrency == -3
+        raw = {b"a": b"0", b"n": b"-3"}
+        assert parse_number_fields(raw, floats=["a"], counts=["n"]) == {
+            "a": 0.0,
+            "n": -3,
+        }
 
 
 class TestStoredVolumeMigration:
@@ -2176,21 +2170,14 @@ class TestConfigFieldNames:
     not drift from the constants spelled out on the classes."""
 
     def test_the_alias_is_the_config_fieldmembers(self) -> None:
-        from typing import get_args
 
         assert set(get_args(ConfigFieldName.__value__)) == members(ConfigField)
 
     def test_every_field_but_volume_is_resettable_by_name(self) -> None:
         """volume has its own reset, which also clears the legacy :state copy."""
-        from typing import get_args
 
         resettable = set(get_args(ResettableConfigField.__value__))
         assert resettable == members(ConfigField) - {ConfigField.VOLUME}
-
-    def test_the_bot_alias_is_the_bot_fieldmembers(self) -> None:
-        from typing import get_args
-
-        assert set(get_args(BotConfigFieldName.__value__)) == members(BotConfigField)
 
     def test_is_config_field(self) -> None:
         assert is_config_field("slow_notice_secs")
@@ -2226,10 +2213,10 @@ class TestConfigDomain:
     def test_np_refresh_floor_is_the_bot_knob_env_floor(self) -> None:
         """The lowest bot value an operator can run; guild_state cannot import config
         to read it, so the two are pinned here."""
-        from src import config
 
-        assert CONFIG_DOMAIN[ConfigField.NP_REFRESH].lo == config.env_floor(
-            "NOW_PLAYING_UPDATE_INTERVAL_SECS"
+        assert (
+            CONFIG_DOMAIN[ConfigField.NP_REFRESH].lo
+            == config.now_playing_update_interval_secs.floor
         )
 
     def test_the_timeout_defaults_are_their_domain_floors(self) -> None:

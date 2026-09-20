@@ -255,7 +255,10 @@ class TestBotSettingsStartup:
             assert hydration is not None and not hydration.done()
             assert app.bot_settings is not None
             assert app.bot_settings.hydrated is False
-            assert config.heartbeat_interval_secs() == config.HEARTBEAT_INTERVAL_SECS
+            assert (
+                config.heartbeat_interval_secs()
+                == config.heartbeat_interval_secs.baseline
+            )
             hydration.cancel()
 
     async def test_the_flag_reaches_bot_settings(

@@ -387,13 +387,13 @@ def settle_youtube_background_jobs() -> Iterator[None]:
 @pytest.fixture(autouse=True)
 def clear_bot_knob_overrides() -> Iterator[None]:
     """Clear every config knob override after each test, pass or fail. Tests set
-    one with config.set_override, which type-checks the value; an override left
+    one with the knob's set_override, which type-checks the value; an override left
     behind would reach every later test that reads the knob's accessor."""
     from src import config
 
     yield
-    for knob in config.FLOAT_KNOBS | config.INT_KNOBS:
-        config.clear_override(knob)
+    for knob in config.KNOBS.values():
+        knob.clear_override()
 
 
 @pytest.fixture

@@ -6471,7 +6471,7 @@ class TestProgressUpdater:
             if len(slept) == 1:
                 await guild_settings.write(guild_id, GuildConfig(np_refresh_secs=10.0))
             elif len(slept) == 2:
-                config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 12.0)
+                config.now_playing_update_interval_secs.set_override(12.0)
             else:
                 raise asyncio.CancelledError()
 
@@ -12967,7 +12967,7 @@ class TestHeartbeatUpdater:
         async def _sleep(secs: float) -> None:
             slept.append(secs)
             if len(slept) == 1:
-                config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
+                config.heartbeat_interval_secs.set_override(5.0)
             else:
                 raise asyncio.CancelledError()
 

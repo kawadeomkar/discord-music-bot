@@ -304,10 +304,18 @@ class TestConfigAllowlist:
         assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
         assert "leaked" not in "\n".join(config_lines())
 
-    def test_every_settable_knob_is_a_knob_row(self) -> None:
-        knobs = {v.knob for v in _CONFIG_ALLOWLIST if v.knob is not None}
-        assert knobs == config.FLOAT_KNOBS | config.INT_KNOBS
-        assert all(v.knob == v.name for v in _CONFIG_ALLOWLIST if v.knob is not None)
+    def test_the_knob_rows_are_the_bot_card_in_its_order(self) -> None:
+        """One row per settable knob, where the operator's other view of them puts
+        each, and nothing between them."""
+        rows = [v for v in _CONFIG_ALLOWLIST if v.knob is not None]
+        assert [v.name for v in rows] == [
+            spec.knob.env for spec in SETTINGS if spec.knob is not None
+        ]
+        # By variable, never identity: a reload of config mints new handles.
+        assert {v.name for v in rows} == {k.env for k in config.KNOBS.values()}
+        assert all(v.knob is not None and v.name == v.knob.env for v in rows)
+        first = _CONFIG_ALLOWLIST.index(rows[0])
+        assert list(_CONFIG_ALLOWLIST[first : first + len(rows)]) == rows
 
     @pytest.mark.parametrize(
         ("override", "env", "rendered"),
@@ -330,12 +338,14 @@ class TestConfigAllowlist:
         the raw string, and an override names the value it shadows."""
         if env is None:
             monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS", raising=False)
-            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", 3.0)
+            monkeypatch.setitem(config._BASELINES, "HEARTBEAT_INTERVAL_SECS", 3.0)
         else:
             monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", env)
-            monkeypatch.setattr(config, "HEARTBEAT_INTERVAL_SECS", float(env))
+            monkeypatch.setitem(
+                config._BASELINES, "HEARTBEAT_INTERVAL_SECS", float(env)
+            )
         if override is not None:
-            config.set_override("HEARTBEAT_INTERVAL_SECS", override)
+            config.heartbeat_interval_secs.set_override(override)
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "HEARTBEAT_INTERVAL_SECS")
         assert render_config_value(var) == rendered
 
@@ -343,7 +353,7 @@ class TestConfigAllowlist:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("PLAY_INFLIGHT_MAX", raising=False)
-        config.set_override("PLAY_INFLIGHT_MAX", 8)
+        config.play_inflight_max.set_override(8)
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "PLAY_INFLIGHT_MAX")
         assert render_config_value(var) == "8 (bot owner; default 16)"
 
@@ -580,7 +590,7 @@ class TestTheSettingsLine:
         )
 
     def test_a_value_under_the_bots_minimum_names_both(self) -> None:
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 5.0)
+        config.now_playing_update_interval_secs.set_override(5.0)
         rows = _rows(GuildConfig(np_refresh_secs=2.0))
         assert settings_line(rows, read=True) == (
             "progress-bar-refresh 5s (bot minimum; set here 2s) (1 changed)"
@@ -731,15 +741,9 @@ class TestTheSettingsLine:
         mock_ctx.guild.voice_client = None
         await cog.guild_settings.hydrate([42])
         await cog.guild_settings.write(42, GuildConfig(idle_timeout_secs=600.0))
-        bot_specs = [s for s in SETTINGS if s.scope is SettingScope.BOT and s.attr]
-        for spec in bot_specs:
-            knob = spec.attr
-            assert knob is not None
-            if config.is_int_knob(knob):
-                config.set_override(knob, config.baseline(knob))
-            else:
-                config.set_override(knob, config.baseline(knob))
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 7.25)
+        for knob in config.KNOBS.values():
+            cast(config.Knob[float], knob).set_override(knob.baseline)
+        config.now_playing_update_interval_secs.set_override(7.25)
 
         mock_ctx.bot.is_owner = AsyncMock(return_value=True)
         operator = debug.instant_blocks(
@@ -755,8 +759,8 @@ class TestTheSettingsLine:
         assert "leave-when-idle 10:00 (1 changed)" in shown
         assert "bot owner;" not in shown
         assert "7.25" not in shown
-        for spec in bot_specs:
-            assert spec.env is not None and spec.env not in shown
+        for knob in config.KNOBS.values():
+            assert knob.env not in shown
 
 
 class TestSafeBlock:
@@ -795,8 +799,8 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         self, mock_ctx: MagicMock
     ) -> None:
         """The deadline test below would pass on a baseline read, only slower."""
-        config.set_override("DEBUG_TICK_SECS", 2.5)
-        config.set_override("DEBUG_DEADLINE_SECS", 12.0)
+        config.debug_tick_secs.set_override(2.5)
+        config.debug_deadline_secs.set_override(12.0)
         driver = AsyncMock()
         with patch("src.debug.run_live_dashboard", new=driver):
             await debug.run_debug_dashboard(mock_ctx, self._operator())
@@ -879,8 +883,8 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         """The improvement over one all-or-nothing timeout: a hung dependency costs
         its own block and nothing else."""
         mock_ctx.guild.voice_client = None
-        config.set_override("DEBUG_DEADLINE_SECS", 0.3)
-        config.set_override("DEBUG_TICK_SECS", 0.01)
+        config.debug_deadline_secs.set_override(0.3)
+        config.debug_tick_secs.set_override(0.01)
         # The sampler owns a real window; shrink it so only the hung probe is
         # slow enough to miss the deadline.
         monkeypatch.setattr(debug, "_CPU_WINDOW_SECS", 0.0)
@@ -2348,20 +2352,23 @@ class TestRuntimeSampler:
     def test_the_interval_tracks_the_now_playing_tick(self) -> None:
         """Sampling slower than the NP tick re-pushes footers whose numbers have
         not moved."""
-        assert debug.sample_interval_secs() == config.NOW_PLAYING_UPDATE_INTERVAL_SECS
+        assert (
+            debug.sample_interval_secs()
+            == config.now_playing_update_interval_secs.baseline
+        )
 
     @pytest.mark.parametrize(("tick", "interval"), [(30.0, 5.0), (2.0, 2.0)])
     def test_the_interval_follows_a_bot_setting_within_its_bounds(
         self, tick: float, interval: float
     ) -> None:
         """Floored for /proc reads, capped so command replies stay fresh."""
-        config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", tick)
+        config.now_playing_update_interval_secs.set_override(tick)
         assert debug.sample_interval_secs() == interval
 
     def test_the_interval_is_floored_for_proc_reads(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(config, "NOW_PLAYING_UPDATE_INTERVAL_SECS", 0.2)
+        monkeypatch.setitem(config._BASELINES, "NOW_PLAYING_UPDATE_INTERVAL_SECS", 0.2)
         assert debug.sample_interval_secs() == 1.0
 
     async def test_a_running_sampler_rereads_the_interval_every_tick(
@@ -3633,12 +3640,15 @@ class TestEveryPlayTunableIsObservable:
         import src.config as config_mod
 
         rows = {var.name for var in _CONFIG_ALLOWLIST}
-        knobs = {
+        constants = {
             name
             for name in vars(config_mod)
+            if name.isupper() and not name.startswith("_")
+        }
+        knobs = {
+            name
+            for name in constants | {k.env for k in config_mod.KNOBS.values()}
             if name.startswith(("PLAY_", "QUEUE_PROGRESS_"))
-            and name.isupper()
-            and not name.startswith("_")
         }
         assert knobs, "no tunables found — the naming convention moved"
         assert knobs <= rows, f"no -debug row for: {sorted(knobs - rows)}"
@@ -3719,7 +3729,7 @@ class TestTheConfigAllowlistFallbacksTrackTheDefaults:
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id in ("_float_env", "_int_env")
+                and node.func.id in ("_float_env", "_int_env", "_secs", "_count")
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
             ):
