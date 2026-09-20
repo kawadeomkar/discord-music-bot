@@ -316,6 +316,39 @@ class TestParseUrlSpotify:
         assert exc_info.value.__cause__ is None
         assert exc_info.value.__suppress_context__ is True
 
+    @pytest.mark.parametrize(
+        "segment",
+        ["**x**||y||`z`", "\u202e" * 1970, "\\" * 1970, "[x](y)"],
+        ids=["markdown", "bidi-run", "backslash-run", "brackets"],
+    )
+    def test_the_echoed_type_cannot_style_or_overflow_the_embed(
+        self, segment: str
+    ) -> None:
+        """The message is an embed description: Discord renders markdown there and
+        400s the send past 4,096 characters, which leaves the user with no reply."""
+        with pytest.raises(UnsupportedSpotifyLinkError) as raised:
+            parse_url(f"https://open.spotify.com/{segment}/1")
+
+        message = raised.value.user_message
+        assert len(message) < 300
+        for mark in ("**", "||", "`", "[", "]"):
+            assert mark not in message.replace("\\" + mark[0], "")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://open.spotify.com/",
+            "https://open.spotify.com/intl-de",
+            "https://open.spotify.com/intl-de/",
+        ],
+    )
+    def test_a_link_with_no_type_is_not_quoted_as_an_empty_one(self, url: str) -> None:
+        with pytest.raises(UnsupportedSpotifyLinkError) as raised:
+            parse_url(url)
+
+        assert "''" not in raised.value.user_message
+        assert "track, playlist or album" in raised.value.user_message
+
     def test_the_canonical_url_drops_the_locale_and_the_share_parameters(self) -> None:
         source = parse_url(
             "https://open.spotify.com/intl-de/album/6WgSCcRfaXuBVfM2TpV0Kl?si=abc"

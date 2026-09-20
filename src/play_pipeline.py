@@ -33,6 +33,7 @@ from src.sources import (
     SpotifyType,
     YTSource,
     YTType,
+    collection_noun,
     parse_input,
     query_source_of,
     spotify_playlist_to_ytsearch,
@@ -110,15 +111,17 @@ class PlaylistIndexError(PlaylistInputError):
 
 
 class EmptyPlaylistError(PlaylistInputError):
-    """A playlist that resolved to nothing queueable. Vague about the cause:
+    """A collection that resolved to nothing queueable. Vague about the cause:
     yt-dlp drops unavailable entries before this code sees them, so "empty" and
-    "every video is private" are indistinguishable here."""
+    "every video is private" are indistinguishable here. An album's tracks are
+    Spotify's, so its copy names no video."""
 
-    def __init__(self) -> None:
+    def __init__(self, noun: str = "playlist") -> None:
+        tracks = "track on it" if noun == "album" else "video in it"
         super().__init__(
-            "playlist resolved to no tracks",
-            "That playlist has no songs I can queue — it may be empty, or every "
-            "video in it may be private or unavailable.",
+            f"{noun} resolved to no tracks",
+            f"That {noun} has no songs I can queue — it may be empty, or every "
+            f"{tracks} may be private or unavailable.",
         )
 
 
@@ -217,13 +220,6 @@ def with_queue_position(item: QueueItem, position: int) -> QueueItem:
     return replace(item, analytics=analytics)
 
 
-def collection_noun(source: Union[SpotifySource, YTSource, SoundcloudSource]) -> str:
-    """What the replies call a collection: a Spotify album is the one that is not
-    a playlist."""
-    is_album = isinstance(source, SpotifySource) and source.type is SpotifyType.ALBUM
-    return "album" if is_album else "playlist"
-
-
 def _is_spotify_collection(
     source: Union[SpotifySource, YTSource, SoundcloudSource],
 ) -> TypeGuard[SpotifySource]:
@@ -237,12 +233,12 @@ async def _spotify_collection(
     source: SpotifySource, *, on_progress: Optional[ProgressFn], cog: MusicBot
 ) -> SpotifyPlaylist:
     """Walk a Spotify playlist or album. Raises on an empty one: the enqueue would
-    otherwise confirm "Queued playlist" with 👍 over nothing queued."""
+    otherwise confirm it queued with 👍 over nothing queued."""
     spotify = cog._require_spotify()
     walk = spotify.album if source.type is SpotifyType.ALBUM else spotify.playlist
     collection = await walk(source.id, on_progress=on_progress)
     if not collection.titles:
-        raise EmptyPlaylistError()
+        raise EmptyPlaylistError(collection_noun(source))
     return collection
 
 

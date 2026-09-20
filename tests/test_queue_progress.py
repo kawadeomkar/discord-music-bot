@@ -280,6 +280,21 @@ class TestRenderProgressCard:
         assert "Plays next once it's queued." in body
         assert "⚠️ bad timestamp" in body
 
+    @pytest.mark.parametrize("phase", list(EnqueuePhase))
+    def test_the_title_names_what_was_pasted(self, phase: EnqueuePhase) -> None:
+        """The confirmation that follows says "Queued album"; a card calling the
+        same link a playlist disagrees with it."""
+        titles = {
+            noun: render_progress_card(
+                EnqueueProgress(phase=phase),
+                elapsed_secs=1.0,
+                details=_details(noun=noun),
+            )[0].title
+            for noun in ("playlist", "album")
+        }
+        assert titles["playlist"] is not None and "that playlist…" in titles["playlist"]
+        assert titles["album"] is not None and "that album…" in titles["album"]
+
     def test_the_debug_footer_is_threaded_through(self) -> None:
         """channel.send bypasses MusicContext.send, and with it debug-mode
         decoration, so the caller pre-renders the suffix once."""
@@ -359,6 +374,16 @@ class TestTheDelayThreshold:
             await asyncio.sleep(0.08)
 
         card_ctx.channel.send.assert_awaited_once()
+
+    async def test_an_albums_card_calls_it_an_album(self, card_ctx: MagicMock) -> None:
+        _fast()
+        album = SpotifySource(SpotifyType.ALBUM, "aid")
+
+        async with enqueue_progress(card_ctx, album, delay=_FAST_DELAY):
+            await asyncio.sleep(0.08)
+
+        (embed,) = card_ctx.channel.send.await_args.kwargs["embeds"]
+        assert embed.title == "Working on that album…"
 
     async def test_the_card_never_goes_through_ctx_send(
         self, card_ctx: MagicMock
@@ -625,7 +650,7 @@ class TestTheCardsOwnBounds:
                 while not any("Still working" in t for t in titles):
                     await asyncio.sleep(0.005)
 
-        assert titles[0] == queue_progress._TITLE
+        assert titles[0] == "Working on that playlist…"
 
     async def test_a_teardown_does_not_wait_on_a_wedged_driver(
         self, card_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch

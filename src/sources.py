@@ -39,6 +39,8 @@ def parse_timestamp(raw: str) -> Optional[int]:
 # The unparseable `t=` is quoted inside a sentence, and a pasted URL fragment
 # can be arbitrarily long.
 _TIMESTAMP_ECHO_MAX = 40
+# Likewise the path segment an unsupported Spotify link names as its type.
+_SPOTIFY_KIND_ECHO_MAX = 40
 
 
 def timestamp_warning(
@@ -191,6 +193,15 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
+def collection_noun(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> str:
+    """What the replies call a collection: a Spotify album is the one that is not
+    a playlist."""
+    is_album = isinstance(source, SpotifySource) and source.type is SpotifyType.ALBUM
+    return "album" if is_album else "playlist"
+
+
 def spotify_playlist_to_ytsearch(
     titles: list[str], *, analytics: Analytics, origin: str, requester_id: int
 ) -> list[YTSource]:
@@ -310,9 +321,13 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
         except ValueError:
             values = [t.value for t in SpotifyType]
             supported = ", ".join(values[:-1]) + f" or {values[-1]}"
+            # The segment is the user's own text on its way into an embed.
+            shown = safe_label(kind, _SPOTIFY_KIND_ECHO_MAX)
             # `from None`: the enum lookup's ValueError is not the user's error.
             raise UnsupportedSpotifyLinkError(
-                f"Spotify {kind!r} links aren't supported — try a {supported} link."
+                f"Spotify '{shown}' links aren't supported — try a {supported} link."
+                if shown
+                else f"That Spotify link doesn't point at a {supported}."
             ) from None
         if len(path) < 2 or not path[1]:
             raise UnsupportedSpotifyLinkError(

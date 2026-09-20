@@ -2403,7 +2403,7 @@ class TestSpotifyAlbum:
         source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.album = AsyncMock(return_value=_album_walk(titles=[]))
-        with pytest.raises(EmptyPlaylistError):
+        with pytest.raises(EmptyPlaylistError) as raised:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
@@ -2412,6 +2412,10 @@ class TestSpotifyAlbum:
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
             )
+
+        assert raised.value.user_message.startswith("That album has no songs")
+        assert "playlist" not in raised.value.user_message
+        assert "video" not in raised.value.user_message
 
     async def test_a_disabled_spotify_refuses_an_album_before_any_request(
         self, music_bot: MusicBot, mock_ctx: MagicMock
