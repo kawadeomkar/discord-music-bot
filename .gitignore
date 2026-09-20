@@ -10,8 +10,11 @@ docs/*
 
 # Claude Code. CLAUDE.md is deliberately NOT ignored — it is the working guide to
 # this codebase and has to reach anyone who clones, same as docs/ARCHITECTURE.md.
-# .claude/ stays local: it holds per-developer settings and session state.
-.claude/
+# .claude/ stays local: it holds per-developer settings and session state. rules/ is
+# the exception — the path-scoped half of CLAUDE.md. The negation needs `.claude/*`:
+# git cannot re-include a file whose parent directory is excluded.
+.claude/*
+!.claude/rules/
 
 # PyCharm and misc
 .idea
