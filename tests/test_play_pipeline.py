@@ -161,6 +161,9 @@ class TestQueueSource:
         assert isinstance(result, QueueObject)
 
 
+_ROWS = "`1` [**Song A**](https://x) · `3:00` · Est. playing at **9:41 PM PDT**"
+
+
 def _enqueue_mp(mock_ctx: MagicMock) -> MagicMock:
     """The player enqueue_playlist places into. Spec'd, so a MusicPlayer attribute
     the enqueue starts reading raises here rather than auto-vivifying."""
@@ -174,6 +177,8 @@ def _enqueue_mp(mock_ctx: MagicMock) -> MagicMock:
     mp.settle_prefetch = AsyncMock()
     # A str, not auto-vivified: the card joins it into its description.
     mp.playlist_facts = MagicMock(return_value="Total Duration: **3m**")
+    # The shared rows, rendered by the player after the put.
+    mp.queued_rows = MagicMock(return_value=_ROWS)
     mp.queue.display_size = MagicMock(return_value=0)
     mp.enqueue_depth = MagicMock(return_value=0)
     mock_ctx.message.add_reaction = AsyncMock()
@@ -217,7 +222,9 @@ class TestEnqueuePlaylist:
 
         description = mock_ctx.send.call_args.kwargs["embed"].description
         assert "[**Biteki**](https://open.spotify.com/playlist/pid123)" in description
-        mp.playlist_facts.assert_called_once_with(ahead=0, runtime=(3723, True))
+        mp.playlist_facts.assert_called_once_with(
+            ahead=0, runtime=(3723, True), eta=False
+        )
 
     async def test_a_playlist_card_has_no_artist_line_and_no_cover(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -261,7 +268,9 @@ class TestEnqueuePlaylist:
 
         description = mock_ctx.send.call_args.kwargs["embed"].description
         assert f"[**Road Trip**]({source.playlist_url})" in description
-        mp.playlist_facts.assert_called_once_with(ahead=0, runtime=(100, True))
+        mp.playlist_facts.assert_called_once_with(
+            ahead=0, runtime=(100, True), eta=False
+        )
 
     async def test_the_facts_sit_between_the_heading_and_the_titles(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -281,7 +290,7 @@ class TestEnqueuePlaylist:
         assert lines[1].startswith("[**Biteki**]")
         assert lines[2] == "Total Duration: **3m**"
         assert lines[3] == ""
-        assert "Song A" in lines[4]
+        assert lines[4] == _ROWS
 
     @pytest.mark.parametrize(
         "name,heading",
@@ -448,7 +457,8 @@ class TestEnqueuePlaylist:
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "2 songs" in embed.title
         assert source.url in embed.description
-        assert "Track 1" in embed.description
+        assert embed.description.endswith(_ROWS)
+        mp.queued_rows.assert_called_once_with(qobjs, ahead=0)
 
     async def test_yt_embed_states_the_skipped_songs(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -578,7 +588,7 @@ class TestEnqueuePlaylist:
 
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Queued playlist" in embed.title
-        assert "Song A" in embed.description
+        assert embed.description.endswith(_ROWS)
 
     async def test_a_spotify_playlist_stamps_who_queued_every_track(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -645,14 +655,17 @@ class TestEnqueuePlaylist:
         assert "1 song" in mock_ctx.send.call_args[1]["embed"].title
         assert "1 songs" not in mock_ctx.send.call_args[1]["embed"].title
 
-    async def test_a_long_playlist_confirmation_ends_in_the_mark(
+    async def test_the_rows_are_the_players_for_exactly_what_was_queued(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """queue_message appends its "..." only while `len(lines) < len(songs)`,
-        so handing it exactly ten silently drops the one thing that says there
-        are more. Both branches slice; both must slice to eleven."""
+        """The card lists through MusicPlayer.queued_rows, after the put, so its
+        rows are -queue's: the same objects, in the slots they took."""
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         mp = _enqueue_mp(mock_ctx)
+        order: list[str] = []
+        mp.queue_put.side_effect = lambda *_a, **_k: order.append("put")
+        mp.queued_rows.side_effect = lambda *_a, **_k: order.append("rows") or _ROWS
+        mp.queue.display_size = MagicMock(return_value=4)
 
         await play_pipeline.enqueue_playlist(
             mock_ctx,
@@ -665,35 +678,18 @@ class TestEnqueuePlaylist:
             cog=music_bot,
         )
 
-        description = mock_ctx.send.call_args[1]["embed"].description
-        assert "..." in description
-        assert "Song 9" in description and "Song 10" not in description
+        assert order == ["put", "rows"]
+        (queued,) = mp.queue_put.await_args.args
+        rows_call = mp.queued_rows.call_args
+        assert rows_call.args[0] is queued or list(rows_call.args[0]) == list(queued)
+        assert rows_call.kwargs == {"ahead": 4}
 
-    async def test_a_short_playlist_confirmation_does_not(
+    async def test_the_card_escapes_no_track_titles_of_its_own(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
-        mp = _enqueue_mp(mock_ctx)
-
-        await play_pipeline.enqueue_playlist(
-            mock_ctx,
-            source,
-            ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(3)]),
-            mp,
-            admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            cog=music_bot,
-        )
-
-        assert "..." not in mock_ctx.send.call_args[1]["embed"].description
-
-    async def test_only_the_shown_titles_are_escaped(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """safe_label over all 10,000 titles to render ten measured 53ms of
-        uninterrupted event-loop time, right before the place lock. Counting the
-        calls is the only way to see it: the embed is identical either way."""
+        """Escaping 10,000 titles to show ten measured 53ms of event-loop time,
+        right before the place lock. The rows are the shared helper's, which
+        formats only what it shows, so the card itself touches the heading alone."""
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         mp = _enqueue_mp(mock_ctx)
         seen: list[str] = []
@@ -706,7 +702,9 @@ class TestEnqueuePlaylist:
             await play_pipeline.enqueue_playlist(
                 mock_ctx,
                 source,
-                ResolvedSpotifyPlaylist(titles=[f"Song {n}" for n in range(500)]),
+                ResolvedSpotifyPlaylist(
+                    titles=[f"Song {n}" for n in range(500)], name="Biteki"
+                ),
                 mp,
                 admit(music_bot, mock_ctx, mp),
                 analytics=_ANALYTICS,
@@ -714,9 +712,7 @@ class TestEnqueuePlaylist:
                 cog=music_bot,
             )
 
-        # Eleven, not five hundred: ten rendered plus the one that only exists
-        # so queue_message knows there are more.
-        assert len(seen) == 11
+        assert seen == ["Biteki"]
 
     async def test_spotify_calls_queue_put_with_prefetch_false(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2514,7 +2510,10 @@ class TestSpotifyAlbum:
         assert lines[2] == "by Daft Punk, Romanthony"
         # The facts line is the player's; what reaches it is the album's runtime.
         assert lines[3] == mp.playlist_facts.return_value
-        mp.playlist_facts.assert_called_once_with(ahead=0, runtime=(531, False))
+        # Approximate: the lengths are Spotify's, not the YouTube matches'.
+        mp.playlist_facts.assert_called_once_with(
+            ahead=0, runtime=(531, True), eta=False
+        )
         assert card.thumbnail.url == "https://i.scdn.co/cover"
 
     async def test_an_artist_name_cannot_style_the_card(

@@ -236,6 +236,16 @@ class TestQueueRows:
         assert len(text) <= 1500 + len("\n\n*... and 99 more*")
         assert text.endswith(f"*... and {ROW_LIMIT - shown} more*")
 
+    def test_only_the_rows_shown_are_formatted(self, mock_author: MagicMock) -> None:
+        """A 10,000-track playlist is listed by formatting ten of them."""
+        from unittest.mock import patch
+
+        items = [_song(mock_author, n) for n in range(500)]
+        with patch("src.queue_rows.safe_label", side_effect=lambda t, _w: t) as escape:
+            queue_rows(items, first_index=1, now=_NOW, walk=_START, byline=False)
+
+        assert escape.call_count == ROW_LIMIT
+
     def test_one_oversized_row_still_shows(self, mock_author: MagicMock) -> None:
         text = queue_rows(
             [_song(mock_author)], first_index=1, now=_NOW, walk=_START, budget=1

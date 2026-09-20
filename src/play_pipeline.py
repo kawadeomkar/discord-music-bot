@@ -11,7 +11,6 @@ because nothing outside this pipeline constructs them.
 import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
-from itertools import islice
 from typing import TYPE_CHECKING, Any, Optional, TypeGuard, Union, assert_never
 from collections.abc import Awaitable, Callable, Sequence
 
@@ -46,14 +45,12 @@ from src.queue_progress import enqueue_progress, is_collection
 from src.queue_rows import queue_runtime
 from src.util import (
     ECHO_MAX,
-    QUEUE_MESSAGE_ROWS_PLUS_ONE,
     ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
     get_logger,
     notice_embed,
     pluralize,
-    queue_message,
     safe_label,
     send_embed,
     truncate_embed_title,
@@ -548,21 +545,13 @@ async def enqueue_playlist(
     if isinstance(qobj, ResolvedSpotifyPlaylist):
         titles = qobj.titles
         count = len(titles)
-        # islice, not the whole list: queue_message renders ten, and escaping a
-        # 10,000-title playlist to show ten measured 53ms of event-loop time on
-        # the -play path. The count is what says the playlist was taken in full,
-        # which is the only place a user can see that it no longer stops at 100.
-        shown_titles = queue_message(
-            [
-                safe_label(t, ECHO_ROW_MAX)
-                for t in islice(titles, QUEUE_MESSAGE_ROWS_PLUS_ONE)
-            ]
-        )
         link = source.url if isinstance(source, SpotifySource) else None
         heading = [_playlist_heading(qobj.name, link)]
         if qobj.artists:
             heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
-        runtime = (qobj.duration_secs, qobj.duration_partial)
+        # Spotify's lengths, not the YouTube matches', so the total is approximate
+        # here as it is in -queue.
+        runtime = (qobj.duration_secs, True)
         # Built outside the lock: one YTSource per title, and the depth it
         # is minted against is almost always still the depth at the insert.
         provisional = _head_depth(mp, placement)
@@ -598,12 +587,6 @@ async def enqueue_playlist(
                 f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
                 f"earlier {pluralize(qobj.skipped, 'song')}"
             )
-        shown_titles = queue_message(
-            [
-                safe_label(q.title, ECHO_ROW_MAX)
-                for q in islice(tracks, QUEUE_MESSAGE_ROWS_PLUS_ONE)
-            ]
-        )
         runtime = queue_runtime(tracks)
         # Minted before the lock: at 5,000 tracks the pass is milliseconds of
         # event-loop time every sibling -play would wait out (_rebase_positions).
@@ -624,9 +607,11 @@ async def enqueue_playlist(
     await release_hold()
     # After the put, like the single-song card, so the facts describe the slot taken.
     header = [f"Requested by: [{ctx.author.mention}]", *heading]
-    header.append(mp.playlist_facts(ahead=ahead, runtime=runtime))
+    # Every row carries its own start time, so the facts line does not.
+    header.append(mp.playlist_facts(ahead=ahead, runtime=runtime, eta=False))
     body = [line for line in header if line]
-    description = "\n".join(body) + f"\n\n{shown_titles}"
+    # The rows -queue will show for these tracks, read after the put.
+    description = "\n".join(body) + f"\n\n{mp.queued_rows(tracks, ahead=ahead)}"
     if warning:
         description += f"\n\n{warning}"
     noun = collection_noun(source)

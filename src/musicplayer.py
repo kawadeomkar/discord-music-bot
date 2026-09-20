@@ -1373,11 +1373,34 @@ class MusicPlayer:
             warning=warning,
         )
 
-    def playlist_facts(self, *, ahead: int, runtime: tuple[int, bool]) -> str:
+    def queued_rows(self, tracks: Sequence[QueueItem], *, ahead: int) -> str:
+        """The rows of a collection just queued, as -queue lists them: numbered by
+        the slot each took and timed by the walk to the first. Read after the
+        insert. The first track is located by identity; one a concurrent -clear
+        already took renders from `ahead`, the depth the insert saw."""
+        if not tracks:
+            return ""
+        first = next(
+            (
+                index
+                for index, queued in enumerate(self.queue.display_items(), 1)
+                if queued is tracks[0]
+            ),
+            ahead + 1,
+        )
+        now_pst, walk = self._eta_walk_to(first)
+        return queue_rows(
+            tracks, first_index=first, now=now_pst, walk=walk, byline=False
+        )
+
+    def playlist_facts(
+        self, *, ahead: int, runtime: tuple[int, bool], eta: bool = True
+    ) -> str:
         """The queued-playlist card's facts, read after the insert like the single-song
         card's: total runtime (queue_runtime's shape), the queued songs that play
         before it, and when its first song starts. A playlist that starts at once
-        has no start time to give."""
+        has no start time to give, and a card whose rows carry their own times
+        passes `eta=False`."""
         runtime_secs, partial = runtime
         facts = []
         if runtime_secs > 0:
@@ -1388,10 +1411,12 @@ class MusicPlayer:
         if ahead:
             facts.append(f"Songs ahead: **{ahead}**")
         lines = ["  ·  ".join(facts)] if facts else []
+        if not eta:
+            return "\n".join(lines)
         now_pst, walk = self._eta_walk_to(ahead + 1)
         if walk.cumulative_secs or walk.uncertain:
-            eta = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
-            lines.append(f"Est. playing at {fmt_eta(eta, walk.uncertain)}")
+            start = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+            lines.append(f"Est. playing at {fmt_eta(start, walk.uncertain)}")
         return "\n".join(lines)
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:

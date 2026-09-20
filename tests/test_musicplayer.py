@@ -2751,6 +2751,94 @@ class TestPlaylistFacts:
         assert "Songs ahead" not in facts
         assert "Est. playing at" in facts
 
+    def test_a_card_whose_rows_carry_the_times_asks_for_none(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        facts = music_player.playlist_facts(ahead=0, runtime=(600, True), eta=False)
+        assert facts == "Total Duration: **~10m**"
+
+
+def _album_track(n: int, secs: int) -> YTSource:
+    return YTSource(
+        ytsearch=f"ytsearch:Track {n} Artist",
+        requester_id=4242,
+        title=f"Track {n}",
+        uploader="Artist",
+        duration=secs,
+        webpage_url=f"https://open.spotify.com/track/{n}",
+    )
+
+
+class TestQueuedRows:
+    """The rows a queued-collection card lists: -queue's own, for the slots the
+    tracks took."""
+
+    def test_rows_are_numbered_by_the_slot_each_track_took(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        ahead = QueueObject("https://yt.com/v=1", "Ahead", mock_author, duration=60)
+        tracks = [_album_track(1, 100), _album_track(2, 200)]
+        seed_queue(music_player.queue, ahead, *tracks)
+
+        first, second = music_player.queued_rows(tracks, ahead=1).split("\n")
+
+        assert first.startswith("`2` [**Track 1**](https://open.spotify.com/track/1)")
+        assert second.startswith("`3` [**Track 2**]")
+        # One line each: on the card every row would repeat one requester.
+        assert "<@4242>" not in first
+
+    def test_the_times_continue_from_the_songs_ahead(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        ahead = QueueObject("https://yt.com/v=1", "Ahead", mock_author, duration=60)
+        tracks = [_album_track(1, 100), _album_track(2, 200)]
+        seed_queue(music_player.queue, ahead, *tracks)
+
+        first, second = music_player.queued_rows(tracks, ahead=1).split("\n")
+
+        now_pst, walk = music_player._eta_walk_to(2)
+        start = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        assert f"Est. playing at {fmt_eta(start, False)}" in first
+        # Behind a Spotify length, which is an estimate.
+        later = start + datetime.timedelta(seconds=100)
+        assert f"Est. playing at {fmt_eta(later, True)}" in second
+
+    def test_they_are_the_rows_queue_shows_for_the_same_tracks(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        tracks = [_album_track(1, 100), _album_track(2, 200)]
+        seed_queue(music_player.queue, *tracks)
+
+        card = music_player.queued_rows(tracks, ahead=0).split("\n")
+        queue = described(music_player.queue_embed())
+
+        for row in card:
+            assert row in queue
+
+    def test_a_collection_a_clear_already_took_renders_from_the_depth_it_saw(
+        self, music_player: MusicPlayer
+    ) -> None:
+        rows = music_player.queued_rows([_album_track(1, 100)], ahead=6)
+        assert rows.startswith("`7` ")
+
+    def test_past_ten_tracks_the_rest_are_counted(
+        self, music_player: MusicPlayer
+    ) -> None:
+        tracks = [_album_track(n, 60) for n in range(14)]
+        seed_queue(music_player.queue, *tracks)
+
+        rows = music_player.queued_rows(tracks, ahead=0).split("\n")
+
+        assert len(rows) == 11
+        assert rows[-1] == "*... and 4 more*"
+
+    def test_nothing_queued_is_no_rows(self, music_player: MusicPlayer) -> None:
+        assert music_player.queued_rows([], ahead=0) == ""
+
 
 class TestBuildNowPlayingEmbed:
     def test_returns_discord_embed(
