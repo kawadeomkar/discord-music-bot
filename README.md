@@ -299,6 +299,10 @@ native path (`DOCKER=0`) is faster: the difference is container startup, paid on
 invocation, and it dominates the short recipes (a bare `just lint` is ~0.05s native
 against ~0.6s containerized). It needs the Python toolchain installed by `just install`.
 
+`just test-pg` and `just test-redis` always run against the local venv, whatever
+`DOCKER` says: each starts its own server container or dials one on the host, and the
+test image can do neither. They need `just install` as well as Docker.
+
 **Setup**
 
 | Recipe | Does |

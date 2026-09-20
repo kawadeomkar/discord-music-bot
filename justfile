@@ -70,6 +70,8 @@ VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } e
 # recipe (`DOCKER=0 just check`, not `just check DOCKER=0` — that is a "recipe not
 # found" error).
 #
+# test-pg and test-redis do not honour the switch: see PYTEST_NATIVE.
+#
 # Automated callers that must mirror CI pin DOCKER=0 so they stay native like CI
 # itself: ci.yml's lint/test jobs, build_common.sh's deploy gate, and all five pre-push
 # hooks. Flip the default here and those pins are what keep them from silently moving
@@ -126,6 +128,11 @@ RUFF := if DOCKER == "1" { DOCKER_RUN_USER + ' ruff' } else { quote(VENV_BIN / '
 PYRIGHT := if DOCKER == "1" { DOCKER_RUN_USER + ' pyright --pythonpath /app/.venv/bin/python' } else { quote(VENV_BIN / 'pyright') + ' --pythonpath ' + quote(VENV_BIN / 'python') }
 PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { quote(VENV_BIN / 'pytest') }
 
+# The integration tiers run the venv's pytest under either DOCKER value. A tier test
+# starts a container through the Docker socket, or dials the server CI publishes on
+# the runner's localhost; the test image reaches neither.
+PYTEST_NATIVE := quote(VENV_BIN / 'pytest')
+
 [private]
 default:
     @{{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
@@ -171,6 +178,11 @@ test-image-rebuild:
 [private]
 _venv:
     @test -x {{ quote(VENV_BIN / 'pre-commit') }} || { echo "No usable venv at {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }
+
+# The tiers' counterpart to _tools, which under DOCKER=1 checks the image and not the venv.
+[private]
+_venv_pytest:
+    @test -x {{ PYTEST_NATIVE }} || { echo "pytest not found in {{ VENV_BIN }}/ — test-pg and test-redis run against the venv under either DOCKER value: run 'just install' first." >&2; exit 1; }
 
 # Make sure the ONE tool this check calls actually exists, on whichever path is selected.
 #
@@ -304,10 +316,10 @@ test *ARGS: (_tools 'pytest')
 # The tiers are 99 and 49 tests behind a container start; nothing to parallelize.
 [doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
 [group('check')]
-test-pg *ARGS: (_tools 'pytest')
+test-pg *ARGS: _venv_pytest
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_PG_TESTS=1 {{ PYTEST }} -p no:xdist -m pg --no-cov --tb=short -q "$@"
+    RUN_PG_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m pg --no-cov --tb=short -q "$@"
 
 # Opt-in real-Redis tier (testcontainers; needs Docker)
 #
@@ -320,10 +332,10 @@ test-pg *ARGS: (_tools 'pytest')
 # rather than a description. Its sibling test-pg carries both attributes.
 [doc('Run the real-Redis integration tier (needs Docker, or REDIS_TEST_URL)')]
 [group('check')]
-test-redis *ARGS: (_tools 'pytest')
+test-redis *ARGS: _venv_pytest
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_REDIS_TESTS=1 {{ PYTEST }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
+    RUN_REDIS_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
 
 # Check this file's own formatting (~0.01s)
 [group('check')]

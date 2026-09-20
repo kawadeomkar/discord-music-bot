@@ -157,7 +157,9 @@ fmt/fmt-check/lint/types/test/check run **inside the test image by default** —
 Python/Poetry/Node needed. `src/`, `tests/`, `pyproject.toml` are bind-mounted;
 formatting runs as your uid. `DOCKER=0 just check` (prefix must come BEFORE the recipe)
 opts back out to the local venv, which is what CI's lint/test jobs, `build_common.sh`'s
-deploy gate and the pre-push hooks pin so they keep mirroring CI.
+deploy gate and the pre-push hooks pin so they keep mirroring CI. `test-pg` and
+`test-redis` run against the venv under either value: the image reaches neither the
+Docker socket nor a server on the host.
 
 Run the bot locally: `just setup`, then `just services` (Redis always; Postgres +
 `db-migrate` only when `.env` sets `HISTORY_ARCHIVE_ENABLED=true`), then **`just run`**.
