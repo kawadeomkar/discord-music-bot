@@ -31,7 +31,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
 - **Per-guild isolation** — every server gets its own player, queue, history, and volume
-- **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
+- **Queue management** — shuffle, clear, remove by link (one album or playlist link takes out every track it queued), per-song ETA estimates,
   persistent play history
 - **Opt-in play-history archive** — off by default, and a default deployment keeps
   nothing long-term: the newest 50 plays per guild live in Redis and no Postgres is
@@ -78,7 +78,7 @@ details, aliases, and examples.
 | `-analytics [--days N]` | `an` | A six-panel chart of this server's listening — plays per day by source, when it listens, listening time, how much of each song gets played, song lengths and queue wait — plus top listeners, artists and songs. `--days` is one of 7, 30, 90, 365; the window covers COMPLETE UTC days, so today is not included — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
-| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one playlist link takes back out every track it queued |
+| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one album or playlist link takes back out every track it queued |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
 
 ### Utility

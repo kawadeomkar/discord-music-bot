@@ -81,7 +81,7 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   behind it is a network round trip. Everything that reads that cache joins the
   same job through `_stream_cache_get`, so nothing extracts the URL twice.
   See docs/ARCHITECTURE.md#resolve-mode and #warming-the-stream-cache.
-  Spotify track → title search; Spotify playlist → titles → YTSource ytsearch
+  Spotify track → title search; Spotify album/playlist → titles → YTSource ytsearch
   entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
   QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
   playlists, so a 10,000-track paste yields to the event loop between chunks).
