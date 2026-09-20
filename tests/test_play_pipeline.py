@@ -33,7 +33,7 @@ from src.play_pipeline import (
     collection_note,
 )
 from src.redis_client import GuildRedisStore
-from src.util import ECHO_MAX
+from src.util import ECHO_MAX, ECHO_ROW_MAX
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -2520,6 +2520,80 @@ class TestSpotifyAlbum:
         assert card.title == "Queued playlist — 1 song"
         assert "\nby " not in card.description
         assert card.thumbnail.url is None
+
+    async def test_a_walk_spotify_ended_early_says_so_above_the_card(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The card's count is what was queued; only this says the link holds more."""
+        await self._enqueue(
+            music_bot, mock_ctx, ResolvedSpotifyPlaylist(titles=["A"], short=True)
+        )
+
+        notice, card = mock_ctx.send.await_args.kwargs["embeds"]
+        assert notice.color == discord.Color.orange()
+        assert "stopped sending this album early" in notice.description
+        assert card.title == "Queued album — 1 song"
+
+    async def test_a_whole_walk_sends_the_card_alone(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        await self._enqueue(
+            music_bot, mock_ctx, ResolvedSpotifyPlaylist(titles=["A"], short=False)
+        )
+
+        assert "embeds" not in mock_ctx.send.await_args.kwargs
+
+    async def test_queue_source_carries_a_short_walk(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(return_value=_album_walk(short=True))
+
+        result = await play_pipeline.queue_source(
+            mock_ctx,
+            source,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            mode=ResolveMode.FLAT_OK,
+            cog=music_bot,
+        )
+
+        assert isinstance(result, ResolvedSpotifyPlaylist) and result.short
+
+    async def test_now_over_a_short_walk_says_so_before_it_interrupts(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(
+            return_value=_album_walk(titles=["Head", "Two"], short=True)
+        )
+        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        with patch(
+            "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
+        ):
+            await play_pipeline._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN, cog=music_bot
+            )
+
+        notice = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "stopped sending this album early" in notice
+
+    async def test_a_compilations_artist_line_is_clamped_to_a_row(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        await self._enqueue(
+            music_bot,
+            mock_ctx,
+            ResolvedSpotifyPlaylist(
+                titles=["T"], name="N", artists=[f"Artist {i}" for i in range(40)]
+            ),
+        )
+
+        lines = mock_ctx.send.call_args.kwargs["embed"].description.split("\n")
+        assert lines[2].startswith("by Artist 0, Artist 1")
+        assert len(lines[2]) <= len("by ") + ECHO_ROW_MAX
 
     async def test_the_unavailable_notice_calls_it_an_album(
         self, music_bot: MusicBot, mock_ctx: MagicMock

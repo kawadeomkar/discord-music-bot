@@ -124,8 +124,8 @@ class EmptyPlaylistError(PlaylistInputError):
 class ResolvedSpotifyPlaylist:
     """A Spotify playlist or album resolved to track titles, still needing
     per-title YouTube search resolution. The rest is what the enqueue embed
-    reports: lengths are Spotify's, not the YouTube matches', and `artists` and
-    `thumbnail` are an album's."""
+    reports: lengths are Spotify's, not the YouTube matches', `artists` and
+    `thumbnail` are an album's, and `short` is a walk Spotify ended early."""
 
     titles: list[str]
     name: Optional[str] = None
@@ -134,6 +134,7 @@ class ResolvedSpotifyPlaylist:
     unavailable: int = 0
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
+    short: bool = False
 
 
 @dataclass
@@ -235,6 +236,16 @@ async def _spotify_collection(
     if not collection.titles:
         raise EmptyPlaylistError(collection_noun(source))
     return collection
+
+
+def short_walk_notice(noun: str) -> discord.Embed:
+    """Said when Spotify ended a walk before its own count of the collection: the
+    confirmation's song count is what was queued, not what the link holds."""
+    return notice_embed(
+        f"Spotify stopped sending this {noun} early, so some of its songs may be "
+        "missing from the queue.",
+        discord.Color.orange(),
+    )
 
 
 def collection_note(
@@ -435,6 +446,7 @@ async def queue_source(
             unavailable=playlist.unavailable,
             artists=playlist.artists,
             thumbnail=playlist.thumbnail,
+            short=playlist.short,
         )
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
@@ -614,6 +626,8 @@ async def enqueue_playlist(
             ),
         )
     ]
+    if isinstance(qobj, ResolvedSpotifyPlaylist) and qobj.short:
+        embeds.insert(0, short_walk_notice(noun))
     if qobj.unavailable:
         n = qobj.unavailable
         embeds.insert(
@@ -768,6 +782,8 @@ async def _resolve_interjection_source(
     )
     if _is_spotify_collection(source):
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
+        if playlist.short:
+            await ctx.send(embed=short_walk_notice(collection_noun(source)))
         yts = await _searches_for(
             playlist.titles,
             analytics=analytics,

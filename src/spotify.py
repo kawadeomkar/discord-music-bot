@@ -77,7 +77,9 @@ class SpotifyPlaylist:
     queued; the rest describes it to the confirmation. `unavailable` counts ITEMS
     walked and not kept, and `duration_secs` sums the kept tracks only, marked
     `duration_partial` when any of them carried no `duration_ms`. `artists` and
-    `thumbnail` are an album's: the playlist endpoints walked here carry neither."""
+    `thumbnail` are an album's: the playlist endpoints walked here carry neither.
+    `short` says the walk ended before Spotify's own count of the collection; a
+    short walk is never cached, so the cached shape has no field for it."""
 
     name: Optional[str]
     titles: list[str]
@@ -86,6 +88,7 @@ class SpotifyPlaylist:
     unavailable: int
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
+    short: bool = False
 
 
 def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
@@ -140,21 +143,41 @@ _PLAYLIST_SUBSCRIBERS: dict[str, list[ProgressFn]] = {}
 _INFLIGHT_PLAYLISTS: dict[str, asyncio.Future[SpotifyPlaylist]] = {}
 
 
+def _report(report: ProgressFn, done: int, total: Optional[int]) -> None:
+    """One page's report to one card. A card that raises loses its tick, never
+    the walk."""
+    try:
+        report(done, total)
+    except Exception as e:
+        log.warning(f"spotify progress subscriber failed: {e!r}")
+
+
 def _publish(key: str, done: int, total: Optional[int]) -> None:
     """Hand one page's report to every caller awaiting that walk."""
     for report in list(_PLAYLIST_SUBSCRIBERS.get(key, ())):
-        try:
-            report(done, total)
-        except Exception as e:
-            log.warning(f"spotify playlist progress subscriber failed: {e!r}")
+        _report(report, done, total)
+
+
+def _str_or_none(value: object) -> Optional[str]:
+    """A non-empty str from a response field, else None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _list_or_empty(value: object) -> list[Any]:
+    """A list from a response field, else []."""
+    return cast(list[Any], value) if isinstance(value, list) else []
 
 
 def _track_search_title(track: dict[str, Any]) -> str:
     """ "<name> <artist1> <artist2> ...", the yt-dlp search string a Spotify
-    track resolves to. Shared by track() and playlist()."""
+    track resolves to. Shared by track(), playlist() and album()."""
     # artists defaulted: a playlist can hold a podcast episode, which carries a
-    # name and no artists at all.
-    return track["name"] + "".join(f" {a['name']}" for a in track.get("artists") or [])
+    # name and no artists at all. A nameless artist adds nothing to the search.
+    return track["name"] + "".join(
+        f" {name}"
+        for a in _list_or_empty(track.get("artists"))
+        if isinstance(a, dict) and (name := _str_or_none(a.get("name"))) is not None
+    )
 
 
 class SpotifyAuthError(Exception):
@@ -691,6 +714,7 @@ class Spotify:
                 duration_secs=duration_ms // 1000,
                 duration_partial=duration_partial,
                 unavailable=unavailable,
+                short=not complete,
             )
             return playlist, complete
 
@@ -810,34 +834,46 @@ class Spotify:
                             if e.status != 403:
                                 raise
                             raise self._forbidden(aid, "HTTP 403", noun="album") from e
+                    if not isinstance(resp, dict):
+                        raise SpotifyRequestError(502, url)
                     if pages == 0:
                         # The album object; every later response IS a tracks page.
-                        raw_name = resp.get("name")
-                        name = (
-                            raw_name if isinstance(raw_name, str) and raw_name else None
-                        )
+                        # Its identity decorates the card, so a malformed part of
+                        # it is dropped rather than failing the album.
+                        name = _str_or_none(resp.get("name"))
                         artists = [
-                            a["name"]
-                            for a in resp.get("artists") or []
-                            if a.get("name")
+                            artist
+                            for a in _list_or_empty(resp.get("artists"))
+                            if isinstance(a, dict)
+                            and (artist := _str_or_none(a.get("name"))) is not None
                         ]
-                        images = resp.get("images") or []
-                        thumbnail = images[0].get("url") if images else None
-                        page = resp.get("tracks") or {}
-                        total = page.get("total")
-                        if isinstance(total, int):
+                        cover = next(iter(_list_or_empty(resp.get("images"))), None)
+                        cover_url = (
+                            _str_or_none(cover.get("url"))
+                            if isinstance(cover, dict)
+                            else None
+                        )
+                        if cover_url is not None and cover_url.startswith("https://"):
+                            thumbnail = cover_url
+                        tracks = resp.get("tracks")
+                        page = tracks if isinstance(tracks, dict) else {}
+                        raw_total = page.get("total")
+                        total = raw_total if isinstance(raw_total, int) else None
+                        if total is not None:
                             # The cursor carries page 1's stride forward. +2 is
                             # slack for a `total` that under-reports.
-                            stride = len(page.get("items") or []) or 50
+                            stride = len(_list_or_empty(page.get("items"))) or 50
                             page_cap = min(page_cap, -(-total // stride) + 2)
                     else:
                         page = resp
                     pages += 1
-                    items = page.get("items") or []
+                    items = _list_or_empty(page.get("items"))
                     walked += len(items)
                     for track in items:
                         # An album item IS the track: no `track` wrapper.
-                        if not isinstance(track, dict) or not track.get("name"):
+                        if not isinstance(track, dict) or not _str_or_none(
+                            track.get("name")
+                        ):
                             unavailable += 1
                             continue
                         titles.append(_track_search_title(track))
@@ -847,7 +883,7 @@ class Spotify:
                         else:
                             duration_partial = True
                     if on_progress is not None:
-                        on_progress(walked, total)
+                        _report(on_progress, walked, total)
                     next_url = page.get("next")
                     if not next_url:
                         break
@@ -888,6 +924,9 @@ class Spotify:
         span = trace.get_current_span()
         span.set_attribute("spotify.track_count", len(titles))
         span.set_attribute("spotify.album_pages", pages)
+        # Exactly the album's own total. An album never changes, so anything else
+        # is a short walk, a cursor that repeated, or a malformed response.
+        short = walked != total
         album = SpotifyPlaylist(
             name=name,
             titles=titles,
@@ -896,20 +935,22 @@ class Spotify:
             unavailable=unavailable,
             artists=artists,
             thumbnail=thumbnail,
+            short=short,
         )
-        # Exactly the album's own total, and at least one title. An album never
-        # changes, so anything else is a short walk, a cursor that repeated, or a
-        # malformed response, and a cache write would serve it for 24h.
-        if titles and walked == total:
-            await cache_set(
-                self._redis, cache_key, _playlist_to_cache(album), _ALBUM_TTL
-            )
-        else:
+        if short:
             span.set_attribute("spotify.album_short", True)
             log.error(
                 f"spotify album {aid} walked {walked} of {total} items in "
                 f"{pages} pages; not cached"
             )
+        elif titles:
+            # A cache write would serve a wrong walk as the album for 24h, and an
+            # empty one is likelier a malformed response than an empty album.
+            await cache_set(
+                self._redis, cache_key, _playlist_to_cache(album), _ALBUM_TTL
+            )
+        else:
+            log.debug(f"spotify album {aid} kept no titles; not cached")
         return album
 
     @_tracer.start_as_current_span("spotify.artists")
