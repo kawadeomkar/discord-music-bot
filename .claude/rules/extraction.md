@@ -20,7 +20,14 @@ decryption, format selection), so it runs on a `ProcessPoolExecutor`
 (`YTDLP_POOL_WORKERS`, default 4; ~80–120 MB RSS each). Lifecycle only — the callable is
 supplied per call, which is the seam tests use. Lazy creation (workers re-import parent
 modules under spawn); `prewarm()` from setup_hook; a `BrokenProcessPool` (e.g. OOM-killed
-worker) is healed by rebuild-and-retry ONCE; worker logs travel a
+worker) is healed by rebuild-and-retry ONCE, and `max_tasks_per_child=16`
+(`_MAX_TASKS_PER_CHILD`) replaces a worker before it grows enough to get there — RSS
+climbs ~5 MB per extraction and never flattens, so 16 caps a worker near 300 MB. The
+start method is passed EXPLICITLY (`_pool_context`): a task budget with no `mp_context`
+makes CPython force `spawn`, which on Linux replaces 3.14's forkserver default and
+measured 23–30× slower worker startup. The chart pool opts out
+(`recycle_workers=False`): its one worker would re-import matplotlib on every
+replacement. Worker logs travel a
 multiprocessing Queue → parent `QueueListener` → the parent's handlers (so yt-dlp's
 SABR/PO-token/signature warnings — the early-warning system for YouTube rule changes —
 reach Loki structured, with `worker_id` and propagated `trace_id`). A second, OPT-IN queue

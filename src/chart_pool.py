@@ -13,7 +13,9 @@ from src.ytdlp_pool import YtdlpPool
 
 # Resolve per call: a from-import captures the object and misses conftest's
 # thread-backed replacement.
-chart_pool: Final[YtdlpPool] = YtdlpPool(max_workers=1, name="chart render")
+chart_pool: Final[YtdlpPool] = YtdlpPool(
+    max_workers=1, name="chart render", recycle_workers=False
+)
 
 
 def _warm_worker() -> None:
