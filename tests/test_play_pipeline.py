@@ -1074,7 +1074,7 @@ class TestEnqueueSingle:
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         mp = MagicMock()
-        mp.queue.qsize.return_value = 0
+        mp.queue.display_size.return_value = 0
         mp.queue_put = AsyncMock()
 
         await play_pipeline.enqueue_single(
@@ -1090,6 +1090,26 @@ class TestEnqueueSingle:
         mock_ctx.send.assert_not_awaited()
 
 
+class TestASongBehindTheInFlightHeadIsConfirmed:
+    async def test_a_claimed_song_still_resolving_counts_as_something_ahead(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """While the loop holds the only queued song and resolves it, nothing is
+        pending and nothing is playing, and this -play queues behind it anyway."""
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        mp = mock_mp()
+        mp.queue.qsize = MagicMock(return_value=0)
+        mp.queue.display_size = MagicMock(return_value=1)
+        mp.queue.peek_next = MagicMock(return_value=None)
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        await play_pipeline.enqueue_single(
+            mock_ctx, qobj, mp, admit(music_bot, mock_ctx, mp), cog=music_bot
+        )
+
+        mp.build_queued_song_embed.assert_called_once()
+
+
 class TestTimestampWarningReachesTheUser:
     @staticmethod
     def _bad_ts_source() -> Any:
@@ -1098,8 +1118,7 @@ class TestTimestampWarningReachesTheUser:
     async def test_it_rides_the_queued_song_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        mp = mock_mp()
-        mp.queue.qsize = MagicMock(return_value=3)  # something already queued
+        mp = mock_mp(qsize=3)  # something already queued
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         await play_pipeline.enqueue_single(
@@ -1122,7 +1141,6 @@ class TestTimestampWarningReachesTheUser:
         song" embed at all. Riding that embed alone would drop the warning in
         the most ordinary case there is."""
         mp = mock_mp()
-        mp.queue.qsize = MagicMock(return_value=0)
         mock_ctx.voice_client = connected_vc(mock_ctx)
         mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
@@ -1149,8 +1167,7 @@ class TestTimestampWarningReachesTheUser:
         """ "Every exit sends it either way" is the contract, and the flag legs
         build their own embeds. `-p --next <link>?t=bogus` would otherwise lose the
         only word the user gets that the timestamp was ignored."""
-        mp = mock_mp()
-        mp.queue.qsize = MagicMock(return_value=3)
+        mp = mock_mp(qsize=3)
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
         await play_pipeline.enqueue_single(

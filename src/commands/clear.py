@@ -1,6 +1,7 @@
 """`-clear` — empty the queue and list what was dropped."""
 
 import asyncio
+from itertools import islice
 from typing import TYPE_CHECKING
 
 import discord
@@ -10,6 +11,7 @@ from src.musicplayer import MusicPlayer
 from src.play_placement import play_key
 from src.util import (
     ECHO_ROW_MAX,
+    QUEUE_MESSAGE_ROWS_PLUS_ONE,
     notice_embed,
     queue_message,
     safe_label,
@@ -39,7 +41,13 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer, cog: MusicBot) -> None:
         )
         return
     description = (
-        queue_message([safe_label(t, ECHO_ROW_MAX) for t in cleared])
+        # Sliced before the escape: a cleared queue can be 10,000 titles long.
+        queue_message(
+            [
+                safe_label(t, ECHO_ROW_MAX)
+                for t in islice(cleared, QUEUE_MESSAGE_ROWS_PLUS_ONE)
+            ]
+        )
         if cleared
         else "The queue was already empty."
     )

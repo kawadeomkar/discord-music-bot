@@ -44,6 +44,7 @@ from src.telemetry import get_tracer
 from src.queue_progress import enqueue_progress, is_collection
 from src.util import (
     ECHO_MAX,
+    QUEUE_MESSAGE_ROWS_PLUS_ONE,
     ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
@@ -63,12 +64,6 @@ if TYPE_CHECKING:
     from src.musicbot import MusicBot
 
 log = get_logger(__name__)
-
-# One MORE than queue_message renders. It appends its "..." only while
-# `len(lines) < len(songs)`, so handing it exactly ten leaves a 5,000-track
-# playlist looking like a ten-track one — the eleventh is never rendered and
-# exists only to be counted.
-_ECHO_PLUS_ONE = 11
 
 # Searches built per event-loop turn for a Spotify playlist. Measured ~7ms a
 # thousand, which is how long each chunk holds the event loop.
@@ -533,7 +528,10 @@ async def enqueue_playlist(
         # the -play path. The count is what says the playlist was taken in full,
         # which is the only place a user can see that it no longer stops at 100.
         shown_titles = queue_message(
-            [safe_label(t, ECHO_ROW_MAX) for t in islice(titles, _ECHO_PLUS_ONE)]
+            [
+                safe_label(t, ECHO_ROW_MAX)
+                for t in islice(titles, QUEUE_MESSAGE_ROWS_PLUS_ONE)
+            ]
         )
         link = source.url if isinstance(source, SpotifySource) else None
         heading = [_playlist_heading(qobj.name, link)]
@@ -575,7 +573,10 @@ async def enqueue_playlist(
                 f"earlier {pluralize(qobj.skipped, 'song')}"
             )
         shown_titles = queue_message(
-            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, _ECHO_PLUS_ONE)]
+            [
+                safe_label(q.title, ECHO_ROW_MAX)
+                for q in islice(tracks, QUEUE_MESSAGE_ROWS_PLUS_ONE)
+            ]
         )
         runtime = queue_runtime(tracks)
         # Minted before the lock: at 5,000 tracks the pass is milliseconds of
@@ -674,9 +675,11 @@ async def enqueue_single(
     else:
         # A note is the only word the user gets about tracks queued behind
         # this one, so an empty queue does not suppress the field.
+        # display_size(): a song the loop has claimed and is still resolving is
+        # neither pending nor playing, and this one queues behind it all the same.
         should_show_queued = (
             bool(note)
-            or mp.queue.qsize() > 0
+            or mp.queue.display_size() > 0
             or (isinstance(vc, discord.VoiceClient) and vc.is_playing())
         )
         if should_show_queued:

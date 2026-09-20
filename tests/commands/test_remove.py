@@ -161,6 +161,30 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         for field in self._fields(mock_ctx):
             assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
 
+    def _songs_field(self, mock_ctx: MagicMock) -> str:
+        return next(f.value or "" for f in self._fields(mock_ctx) if f.name == "Songs")
+
+    async def test_more_songs_than_the_list_shows_ends_in_the_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """queue_message marks a cut only when handed more rows than it renders."""
+        songs: list[QueueItem] = [_removed_song(i) for i in range(25)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 26))
+        )
+        songs_field = self._songs_field(mock_ctx)
+        assert songs_field.endswith("...")
+        assert songs_field.count("\n") == 10
+
+    async def test_ten_songs_are_listed_without_the_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        songs: list[QueueItem] = [_removed_song(i) for i in range(10)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        assert not self._songs_field(mock_ctx).endswith("...")
+
     async def test_a_playlists_worth_of_positions_fits(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

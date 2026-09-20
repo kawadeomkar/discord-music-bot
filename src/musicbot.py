@@ -99,7 +99,8 @@ _tracer = get_tracer(__name__)
 
 class SpotifyDisabledError(Exception):
     """A Spotify link was played while Spotify is unusable. Carries the
-    SpotifyStatus; the message is user-facing (rendered by _command_error)."""
+    SpotifyStatus; the message is user-facing, and `user_message` is the name
+    _command_error renders without the class-name prefix."""
 
     def __init__(self, status: SpotifyStatus) -> None:
         self.status = status
@@ -117,6 +118,10 @@ class SpotifyDisabledError(Exception):
                 "Try a YouTube or SoundCloud link, or just search by name."
             )
         super().__init__(message)
+
+    @property
+    def user_message(self) -> str:
+        return str(self)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -498,6 +503,7 @@ class MusicBot(commands.Cog):
                     PlaylistInputError,
                     SpotifyAuthError,
                     SpotifyBusyError,
+                    SpotifyDisabledError,
                     SpotifyPlaylistForbiddenError,
                     SpotifyPlaylistTooSlowError,
                     SpotifyRateLimitError,
@@ -574,7 +580,7 @@ class MusicBot(commands.Cog):
                 "-p --next https://youtu.be/dQw4w9WgXcQ",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
-                "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
                 "-play https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
                 "-p https://soundcloud.com/artist/track",
             ],
@@ -619,9 +625,9 @@ class MusicBot(commands.Cog):
             "The same request as `-play --now`, kept as its own command. Takes the "
             "same input as `-play`. If nothing is playing there is nothing to "
             "interrupt, so this behaves exactly like `-play`.\n\n"
-            "A playlist can't be interjected — only its **first track** is played, "
-            "since queueing the whole thing would delay the interrupted song "
-            "indefinitely. Use `-play` for the full playlist."
+            "A playlist or album is taken in full: its first track interrupts, the "
+            "rest queue behind it, and the interrupted song returns after the last "
+            "of them. `-remove` with the same link takes the whole thing back out."
         ),
         extras={
             "category": "Playback",
@@ -665,7 +671,7 @@ class MusicBot(commands.Cog):
             "current song ends. Nothing is interrupted — unlike `-playnow`, whatever "
             "is playing finishes first.\n\n"
             "The same request as `-play --next`, kept as its own command. Takes the "
-            "same input as `-play`, and takes a whole playlist in full.\n\n"
+            "same input as `-play`, and takes a whole playlist or album in full.\n\n"
             "Send it twice and the second one lands behind the first: each takes the "
             "front of the queue as it arrives, so they play in the order you asked."
         ),
@@ -920,7 +926,7 @@ class MusicBot(commands.Cog):
             "examples": [
                 "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 "-remove never gonna give you up",
-                "-remove https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                "-remove https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
             ],
             "note": (
                 "A search term removes what that exact search queued, not "

@@ -28,6 +28,12 @@ _FIELD_VALUE_MAX = 1024
 _TRUNCATION_MARK = "..."
 
 
+# One MORE than queue_message renders. It appends its mark only while
+# `len(lines) < len(songs)`, so a caller that slices before escaping hands it
+# this many: the eleventh row is never rendered and exists only to be counted.
+QUEUE_MESSAGE_ROWS_PLUS_ONE = 11
+
+
 def queue_message(songs: list[str]) -> str:
     """Numbered song list for an embed field, bounded by count AND by length
     (ten 100-char titles compose to 1040). Either overflow ends in the mark."""

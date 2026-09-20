@@ -14,7 +14,7 @@ from discord.ext import commands
 import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_state import Analytics, HistoryEntry
-from src.musicbot import MusicBot
+from src.musicbot import MusicBot, SpotifyDisabledError
 from src.play_placement import check_voice_permissions, play_takes_the_queue
 from src.sources import UnsupportedSpotifyLinkError
 from src.spotify import SpotifyAuthError
@@ -114,8 +114,9 @@ class TestCommandErrorRendering:
         [
             UnsupportedSpotifyLinkError("Spotify 'artist' links aren't supported."),
             SpotifyAuthError(401, "endpoint: https://api.spotify.com/v1/albums/x"),
+            SpotifyDisabledError(SpotifyStatus.DISABLED),
         ],
-        ids=["unsupported-link", "rejected-credentials"],
+        ids=["unsupported-link", "rejected-credentials", "spotify-disabled"],
     )
     async def test_a_spotify_link_failure_renders_its_user_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock, err: Any
