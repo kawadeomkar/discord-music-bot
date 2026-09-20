@@ -1,13 +1,17 @@
 """Tests for `-debug` (src/commands/debug.py): the card, the
 toggle and the inputs it gathers off the cog."""
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from discord.ext import commands
 
+from src import settings_card
 from src.commands import debug as debug_cmd
+from src.guild_state import GuildConfig
+from src.settings import BotSettings
 from src.musicbot import (
     MusicBot,
 )
@@ -250,6 +254,54 @@ class TestDebugInputs:
         assert inputs.player is None
         assert inputs.store is None
         assert inputs.debug_overridden is False
+        assert inputs.settings == ()
+
+    async def test_the_settings_rows_are_this_servers_cached_values(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        guild_id = mock_ctx.guild.id
+        music_bot.redis = fake_redis
+        await music_bot.guild_settings.hydrate([guild_id, 999])
+        await music_bot.guild_settings.write(guild_id, GuildConfig(volume=0.5))
+        await music_bot.guild_settings.write(999, GuildConfig(timezone="Asia/Tokyo"))
+
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
+
+        changed = {
+            spec.key: shown
+            for spec, shown in inputs.settings
+            if shown.source != settings_card.DEFAULT
+        }
+        assert changed == {"volume": settings_card.Shown(50, settings_card.SET_HERE)}
+        assert inputs.settings_read is True
+
+    async def test_unread_bot_settings_reach_the_inputs(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        bot = cast(Any, music_bot.bot)
+        bot.application_id = 1
+        bot.bot_settings = BotSettings(bot, redis=fake_redis, ignore_stored=False)
+        assert (
+            await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
+        ).bot_unread is True
+        await bot.bot_settings.hydrate()
+        assert (
+            await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
+        ).bot_unread is False
+
+    async def test_an_unsaved_write_carries_its_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """No Redis: the write applies in memory only, and the cache was never read."""
+        await music_bot.guild_settings.write(
+            mock_ctx.guild.id, GuildConfig(alone_timeout_secs=30.0)
+        )
+        inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
+        shown = {spec.key: shown for spec, shown in inputs.settings}
+        assert shown["alone-timeout"] == settings_card.Shown(
+            30.0, settings_card.NOT_SAVED
+        )
+        assert inputs.settings_read is False
 
 
 class TestDebugObservesWithoutCreating:
@@ -261,20 +313,30 @@ class TestDebugObservesWithoutCreating:
         """The exemption is driven off extras, so the flag has to be ON the command.
         Asserting it here rather than restating the literal keeps the test from
         passing on a command that lost it."""
-        assert MusicBot.debug.extras.get("observation_only") is True
-        assert MusicBot.play.extras.get("observation_only") is None
+        assert MusicBot.debug.extras.get("skips_player_setup") is True
+        assert MusicBot.play.extras.get("skips_player_setup") is None
 
     async def test_analytics_carries_the_flag_too(self) -> None:
         """-analytics reads the archive and never touches voice. Without the flag
         cog_before_invoke builds a player for it, which starts _restore_state() and
         then parks on the 300s gate before tearing itself down — observed in the
         deployed bot as a gate timeout logged under command=analytics."""
-        assert MusicBot.analytics.extras.get("observation_only") is True
+        assert MusicBot.analytics.extras.get("skips_player_setup") is True
 
-    async def test_debug_does_not_create_a_player(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
+    @pytest.mark.parametrize(
+        "command",
+        [MusicBot.debug, MusicBot.analytics, MusicBot.settings],
+        ids=lambda c: c.name,
+    )
+    async def test_a_flagged_command_does_not_create_a_player(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        command: commands.Command[Any, ..., Any],
     ) -> None:
-        mock_ctx.command.extras = {"observation_only": True}
+        """The command's own extras, never a literal: the flag is a string key, so
+        a literal stays green when only the read site or only the set sites move."""
+        mock_ctx.command.extras = dict(command.extras)
         mock_ctx.guild.voice_client = None
         music_bot.get_mp = MagicMock()
         await music_bot.cog_before_invoke(mock_ctx)

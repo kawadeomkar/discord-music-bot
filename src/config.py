@@ -2,7 +2,7 @@ import math
 import os
 import subprocess
 from enum import Enum
-from typing import Final, Optional
+from typing import Final, Literal, Optional, TypeIs, cast, get_args, overload
 from urllib.parse import unquote, urlsplit
 
 # Read from the environment alone so importing runs no subprocess. main() may
@@ -29,9 +29,10 @@ def infer_environment_from_git() -> Optional[str]:
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
-NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
-    os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
-)
+# The `minimum=` each _float_env/_int_env call enforced, by variable. The -settings
+# registry holds every chat minimum against it, so the floor it checks is the one the
+# parse applied.
+_ENV_FLOORS: Final[dict[str, float]] = {}
 
 
 def _float_env(
@@ -41,6 +42,7 @@ def _float_env(
     refused separately from the floor: `inf` never expires a dashboard deadline
     (the command then holds its concurrency slot forever) and a tick of 0 turns
     the driver's timed wait into a hot spin."""
+    _ENV_FLOORS[name] = minimum
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         # Checked too: a floor derived from other knobs can rise past a default.
@@ -60,28 +62,12 @@ def _float_env(
     return value
 
 
-# The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
-# is capped well under that; the floor keeps the touch a cadence, not a spin.
-_MIN_LIVENESS_SECS: Final[float] = 1.0
-_MAX_LIVENESS_SECS: Final[float] = 60.0
-
-# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
-# default outside Docker) skips the task.
-LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
-LIVENESS_INTERVAL_SECS: float = _float_env(
-    "LIVENESS_INTERVAL_SECS",
-    15.0,
-    minimum=_MIN_LIVENESS_SECS,
-    maximum=_MAX_LIVENESS_SECS,
-)
-
-
 # Floor for every live-dashboard knob: small enough to stay a tuning knob, large
 # enough that the driver's wait is always a real suspension.
 _MIN_DASHBOARD_SECS: Final[float] = 0.05
 
-# -ping's live-edit loop (src/dashboard.py). Constants because the driver reads
-# them every tick.
+# -ping's live-edit loop (src/dashboard.py). Env baselines: -ping reads them through
+# ping_tick_secs() and ping_deadline_secs(), once per invocation.
 PING_TICK_SECS: float = _float_env("PING_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
 PING_DEADLINE_SECS: float = _float_env(
     "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
@@ -123,14 +109,10 @@ QUEUE_PROGRESS_TICK_SECS: float = _float_env(
     "QUEUE_PROGRESS_TICK_SECS", 5.0, minimum=_MIN_QUEUE_TICK_SECS
 )
 
-# The card's own ceiling. Nothing else bounds the work it watches:
-# PLAY_RESOLVE_WAIT_SECS bounds the wait for a slot and deliberately not the
-# extraction inside it, and PLACE_TIMEOUT_SECS bounds 0.01s of a 29s command.
-# Past it the card says so once and stops editing; it is still deleted when the
-# enqueue settles.
-# Floored at delay + tick, the two knobs above it: under the delay the card is born
-# stalled, and under delay + tick it never renders a second frame. Below the floor
-# startup is refused, default included.
+# The card's own ceiling: nothing else bounds the work it watches, since
+# PLAY_RESOLVE_WAIT_SECS bounds the wait for a slot and not the extraction inside
+# it. Past it the card says so once and stops editing, and is deleted when the
+# enqueue settles. Floored at delay + tick; docs/ARCHITECTURE.md#queue-progress-card.
 QUEUE_PROGRESS_MAX_SECS: float = _float_env(
     "QUEUE_PROGRESS_MAX_SECS",
     300.0,
@@ -148,12 +130,51 @@ HEARTBEAT_INTERVAL_SECS: float = _float_env(
     "HEARTBEAT_INTERVAL_SECS", 3.0, minimum=_MIN_HEARTBEAT_SECS
 )
 
+# Every playing tick is a real edit on the channel's 5-edits-per-5s bucket, which the
+# bar shares with every other message the bot edits there.
+_MIN_NOW_PLAYING_SECS: Final[float] = 1.0
+
+# How often the Now Playing card's progress bar is edited.
+NOW_PLAYING_UPDATE_INTERVAL_SECS: float = _float_env(
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0, minimum=_MIN_NOW_PLAYING_SECS
+)
+
+# A probe that does not finish is UNCONFIRMED, so a near-zero cap confirms nothing,
+# and three in a row mark the probe path itself as the fault.
+_MIN_STREAM_PROBE_SECS: Final[float] = 0.1
+
+# Cap on the pre-playback URL probe. Short because a resolve can pay it twice
+# and exceeding it costs a cache entry, not only a verdict; an unconfirmed URL
+# still plays, so firing early is cheap.
+STREAM_PROBE_TIMEOUT_SECS: float = _float_env(
+    "STREAM_PROBE_TIMEOUT_SECS", 2.0, minimum=_MIN_STREAM_PROBE_SECS
+)
+# Not a knob: the most `-settings bot stream-probe-timeout` accepts. A resolve can
+# pay the probe twice, so this is already up to 10s of silence before a song starts.
+STREAM_PROBE_TIMEOUT_MAX_SECS: Final[float] = 5.0
+
+# The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
+# is capped well under that; the floor keeps the touch a cadence, not a spin.
+_MIN_LIVENESS_SECS: Final[float] = 1.0
+_MAX_LIVENESS_SECS: Final[float] = 60.0
+
+# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
+# default outside Docker) skips the task.
+LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
+LIVENESS_INTERVAL_SECS: float = _float_env(
+    "LIVENESS_INTERVAL_SECS",
+    15.0,
+    minimum=_MIN_LIVENESS_SECS,
+    maximum=_MAX_LIVENESS_SECS,
+)
+
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     """Integer knob from the environment; empty reads as unset. Negatives are
     refused: `-1` reads as "no limit" but `if not OUTBOX_MAX` is truthy for it
     and `depth <= OUTBOX_MAX` never holds, so the drainer would trim the whole
     outbox. The message names the variable because it surfaces with no logger."""
+    _ENV_FLOORS[name] = minimum
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -166,6 +187,10 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return value
 
 
+# Extraction worker processes (src/ytdlp_pool.py), ~80–120 MB RSS each. The pool is
+# sized when it spawns, so this is read once and never changes at runtime.
+YTDLP_POOL_WORKERS: int = _int_env("YTDLP_POOL_WORKERS", 4, minimum=1)
+
 # Opt-in ceiling on the history outbox, in entries; 0 is unbounded (the
 # durability contract). A cap destroys the OLDEST entries, which exist nowhere
 # else, so every drop logs ERROR. Enforced after each drain batch and against
@@ -177,21 +202,196 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 # PgBouncer, where each transaction lands on a backend that never saw the handle.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
+# Zero admits nothing: every -play declined, or every resolve waiting on a slot
+# that never opens, with no error to say why.
+_MIN_PLAY_COUNT: Final[int] = 1
+# A shorter wait declines a request whenever every slot is busy at all.
+_MIN_PLAY_RESOLVE_WAIT_SECS: Final[float] = 1.0
+# Below it the notice posts, and is taken back, for nearly every -play.
+_MIN_PLAY_SLOW_NOTICE_SECS: Final[float] = 0.5
+
 # Per-guild ceiling on -play requests ADMITTED at once. Its unit is one coroutine,
 # one open span and one typing keepalive — memory, not pool time, which
 # PLAY_RESOLVE_CONCURRENCY below bounds instead.
-PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=1)
+PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=_MIN_PLAY_COUNT)
 # How many admitted requests may hold a yt-dlp worker at once. The pool is
 # process-wide and FIFO, so a paste burst in one guild queues every other guild's
 # in-band extractions behind it. Half the default pool.
-PLAY_RESOLVE_CONCURRENCY: int = _int_env("PLAY_RESOLVE_CONCURRENCY", 2, minimum=1)
+PLAY_RESOLVE_CONCURRENCY: int = _int_env(
+    "PLAY_RESOLVE_CONCURRENCY", 2, minimum=_MIN_PLAY_COUNT
+)
 # Bound on the WAIT for one of those slots, never on the extraction holding it: a
 # 5,547-track playlist legitimately runs 99s, and cutting it off would fail the
 # request it is serving. See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait.
-PLAY_RESOLVE_WAIT_SECS: float = _float_env("PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=1.0)
+PLAY_RESOLVE_WAIT_SECS: float = _float_env(
+    "PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=_MIN_PLAY_RESOLVE_WAIT_SECS
+)
 # How long a request resolves before it says so. Above the 1–4s a warm resolve
 # takes, so the notice marks the unusual rather than narrating every -play.
-PLAY_SLOW_NOTICE_SECS: float = _float_env("PLAY_SLOW_NOTICE_SECS", 6.0, minimum=0.5)
+PLAY_SLOW_NOTICE_SECS: float = _float_env(
+    "PLAY_SLOW_NOTICE_SECS", 6.0, minimum=_MIN_PLAY_SLOW_NOTICE_SECS
+)
+
+# The tunables `-settings bot` may override, by the name of the constant holding
+# each one's environment value. Literal strings rather than an Enum: a reload of
+# this module would mint new enum classes that a registry built earlier fails
+# isinstance against.
+type FloatKnob = Literal[
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS",
+    "HEARTBEAT_INTERVAL_SECS",
+    "PLAY_SLOW_NOTICE_SECS",
+    "PLAY_RESOLVE_WAIT_SECS",
+    "STREAM_PROBE_TIMEOUT_SECS",
+    "PING_TICK_SECS",
+    "PING_DEADLINE_SECS",
+    "DEBUG_TICK_SECS",
+    "DEBUG_DEADLINE_SECS",
+    "ANALYTICS_RENDER_DEADLINE_SECS",
+    "QUEUE_PROGRESS_DELAY_SECS",
+    "QUEUE_PROGRESS_TICK_SECS",
+    "QUEUE_PROGRESS_MAX_SECS",
+]
+type IntKnob = Literal["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"]
+FLOAT_KNOBS: Final[frozenset[FloatKnob]] = frozenset(get_args(FloatKnob.__value__))
+INT_KNOBS: Final[frozenset[IntKnob]] = frozenset(get_args(IntKnob.__value__))
+
+
+def is_int_knob(knob: FloatKnob | IntKnob) -> TypeIs[IntKnob]:
+    return knob in INT_KNOBS
+
+
+@overload
+def baseline(knob: IntKnob) -> int: ...
+@overload
+def baseline(knob: FloatKnob) -> float: ...
+def baseline(knob: FloatKnob | IntKnob) -> float:
+    """The knob's value as parsed from the environment, read at call time so a
+    reload of this module is what it returns."""
+    return cast(float, globals()[knob])
+
+
+def env_floor(knob: FloatKnob | IntKnob) -> float:
+    """The `minimum=` the environment parse enforced for this knob."""
+    return _ENV_FLOORS[knob]
+
+
+# Settable knobs: each accessor returns a stored -settings bot override, else the
+# UPPER_CASE env baseline. set_override's one caller in src/ is src/settings.py.
+# Consumers call the accessor when the value applies, never the baseline
+# (TestBotKnobsAreReadAtCallTime). See docs/ARCHITECTURE.md#settings-resolution.
+_FLOAT_OVERRIDES: Final[dict[FloatKnob, float]] = {}
+_INT_OVERRIDES: Final[dict[IntKnob, int]] = {}
+
+
+def now_playing_update_interval_secs() -> float:
+    return _FLOAT_OVERRIDES.get(
+        "NOW_PLAYING_UPDATE_INTERVAL_SECS", NOW_PLAYING_UPDATE_INTERVAL_SECS
+    )
+
+
+def heartbeat_interval_secs() -> float:
+    return _FLOAT_OVERRIDES.get("HEARTBEAT_INTERVAL_SECS", HEARTBEAT_INTERVAL_SECS)
+
+
+def play_slow_notice_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PLAY_SLOW_NOTICE_SECS", PLAY_SLOW_NOTICE_SECS)
+
+
+def play_inflight_max() -> int:
+    return _INT_OVERRIDES.get("PLAY_INFLIGHT_MAX", PLAY_INFLIGHT_MAX)
+
+
+def play_resolve_concurrency() -> int:
+    return _INT_OVERRIDES.get("PLAY_RESOLVE_CONCURRENCY", PLAY_RESOLVE_CONCURRENCY)
+
+
+def play_resolve_wait_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PLAY_RESOLVE_WAIT_SECS", PLAY_RESOLVE_WAIT_SECS)
+
+
+def stream_probe_timeout_secs() -> float:
+    return _FLOAT_OVERRIDES.get("STREAM_PROBE_TIMEOUT_SECS", STREAM_PROBE_TIMEOUT_SECS)
+
+
+def ping_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PING_TICK_SECS", PING_TICK_SECS)
+
+
+def ping_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PING_DEADLINE_SECS", PING_DEADLINE_SECS)
+
+
+def debug_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("DEBUG_TICK_SECS", DEBUG_TICK_SECS)
+
+
+def debug_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get("DEBUG_DEADLINE_SECS", DEBUG_DEADLINE_SECS)
+
+
+def analytics_render_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get(
+        "ANALYTICS_RENDER_DEADLINE_SECS", ANALYTICS_RENDER_DEADLINE_SECS
+    )
+
+
+def queue_progress_delay_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_DELAY_SECS", QUEUE_PROGRESS_DELAY_SECS)
+
+
+def queue_progress_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_TICK_SECS", QUEUE_PROGRESS_TICK_SECS)
+
+
+def queue_progress_max_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_MAX_SECS", QUEUE_PROGRESS_MAX_SECS)
+
+
+@overload
+def set_override(knob: IntKnob, value: int) -> None: ...
+@overload
+def set_override(knob: FloatKnob, value: float) -> None: ...
+def set_override(knob: FloatKnob | IntKnob, value: float) -> None:
+    """Make `value` what the knob's accessor returns. Checks the type at run time
+    too — a bool is refused for either kind, a non-int for an int knob — and
+    nothing else: the -settings registry owns the bounds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{knob} override must be a number; got {value!r}")
+    if is_int_knob(knob):
+        if not isinstance(value, int):
+            raise TypeError(f"{knob} override must be an int; got {value!r}")
+        _INT_OVERRIDES[knob] = value
+    else:
+        _FLOAT_OVERRIDES[knob] = float(value)
+
+
+def clear_override(knob: FloatKnob | IntKnob) -> None:
+    """Return the knob's accessor to its environment baseline."""
+    if is_int_knob(knob):
+        _INT_OVERRIDES.pop(knob, None)
+    else:
+        _FLOAT_OVERRIDES.pop(knob, None)
+
+
+@overload
+def override(knob: IntKnob) -> Optional[int]: ...
+@overload
+def override(knob: FloatKnob) -> Optional[float]: ...
+def override(knob: FloatKnob | IntKnob) -> Optional[float]:
+    """The knob's override, or None when it runs on its baseline."""
+    if is_int_knob(knob):
+        return _INT_OVERRIDES.get(knob)
+    return _FLOAT_OVERRIDES.get(knob)
+
+
+@overload
+def effective(knob: IntKnob) -> int: ...
+@overload
+def effective(knob: FloatKnob) -> float: ...
+def effective(knob: FloatKnob | IntKnob) -> float:
+    """What the knob's accessor returns: the override, else the baseline."""
+    value = override(knob)
+    return baseline(knob) if value is None else value
 
 
 def _parse_bool_env(name: str) -> bool:
@@ -221,10 +421,28 @@ def history_archive_enabled() -> bool:
 
 def debug_mode_default() -> bool:
     """Process-wide default for debug mode (observation-only embed footers) for
-    guilds that never ran `-debug --enable/--disable`; a persisted per-guild
-    choice wins over it. Read once by MusicBot.__init__ so garbage aborts
-    startup."""
+    guilds that never chose with `-debug --enable/--disable` or `-settings debug`;
+    a persisted per-guild choice wins over it, and the operator's `-settings bot
+    debug-default` replaces it until restart. Read once by MusicBot.__init__ so
+    garbage aborts startup."""
     return _parse_bool_env("DEBUG_MODE")
+
+
+def bot_settings_overrides_ignored() -> bool:
+    """BOT_SETTINGS_OVERRIDES: `ignore` runs the process on environment and code
+    values, never reading bot:{application_id}:config; unset, empty and `apply`
+    apply what is stored. Anything else raises, so setup_hook reads it before
+    anything that could swallow the error."""
+    raw = os.environ.get("BOT_SETTINGS_OVERRIDES")
+    value = (raw or "").strip().lower()
+    if value in ("", "apply"):
+        return False
+    if value == "ignore":
+        return True
+    raise ValueError(
+        "BOT_SETTINGS_OVERRIDES must be apply or ignore (case-insensitive); "
+        f"got {raw!r}"
+    )
 
 
 def debug_prometheus_url() -> Optional[str]:

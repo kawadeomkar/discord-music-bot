@@ -13,6 +13,7 @@ from src.help import (
     _WIDTH as WIDTH,
 )
 from src.musicbot import MusicBot
+from src.settings import Parsed, SettingScope, SettingSpec, find, parse_value
 
 # Discord's hard caps: an embed field value is 1024 chars, a description 4096.
 FIELD_LIMIT = 1024
@@ -111,6 +112,21 @@ class TestBotHelp:
         body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
         for topic in ("YouTube", "Spotify", "SoundCloud", "Now Playing"):
             assert topic in body
+
+    async def test_the_alone_disconnect_tip_quotes_the_setting(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
+        """Built from the registry, so the tip cannot drift from the default, and
+        the time it quotes can be typed back."""
+        await help_command.command_callback(ctx, command=None)
+        body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
+        assert (
+            "The bot disconnects on its own **0:10** after the last person leaves "
+            "(`-settings leave-when-alone` changes it)."
+        ) in body
+        spec = find("leave-when-alone", SettingScope.SERVER)
+        assert isinstance(spec, SettingSpec) and spec.default is not None
+        assert parse_value(spec, "0:10") == Parsed(spec.default)
 
     async def test_respects_discord_size_limits(
         self, help_command: MusicHelpCommand, ctx: MagicMock
@@ -291,6 +307,28 @@ class TestCommandHelp:
         times per session."""
         playback = CATEGORY_COMMANDS["Playback"]
         assert playback.index("replay") > playback.index("skip")
+
+
+class TestTheSettingsPage:
+    """-help settings points at the card, which lists every setting with the
+    command that changes it, instead of repeating that list."""
+
+    async def test_it_is_a_short_pointer_with_no_settings_list(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
+        await help_command.command_callback(ctx, command="settings")
+        embed = sent_embed(ctx)
+        assert [f.name for f in embed.fields] == [
+            "SYNOPSIS",
+            "DESCRIPTION",
+            "EXAMPLES",
+            "NOTES",
+        ]
+        description = next(
+            f.value or "" for f in embed.fields if f.name == "DESCRIPTION"
+        )
+        assert "the command that changes it" in description
+        assert len(embed) <= 1000
 
 
 class TestErrors:

@@ -20,7 +20,7 @@ from discord.ext import commands
 from src.musicbot import MusicBot
 from src import util
 from src.util import channel_claim
-from src.config import PLAY_RESOLVE_CONCURRENCY
+from src import config
 from src.play_placement import (
     PlaceStalled,
     PlayArgs,
@@ -184,14 +184,14 @@ class TestPlayRegistry:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = mock_mp()
-        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 2):
+        config.set_override("PLAY_INFLIGHT_MAX", 2)
+        admit(music_bot, mock_ctx, mp)
+        admit(music_bot, mock_ctx, mp)
+        with (
+            recording_span() as span,
+            pytest.raises(commands.MaxConcurrencyReached) as excinfo,
+        ):
             admit(music_bot, mock_ctx, mp)
-            admit(music_bot, mock_ctx, mp)
-            with (
-                recording_span() as span,
-                pytest.raises(commands.MaxConcurrencyReached) as excinfo,
-            ):
-                admit(music_bot, mock_ctx, mp)
 
         # Recorded before the cap check: the declined request carries the count
         # it would have joined, and nothing else counts declines.
@@ -207,9 +207,9 @@ class TestPlayRegistry:
         other = MagicMock()
         other.guild = MagicMock()
         other.guild.id = mock_ctx.guild.id + 1
-        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
-            admit(music_bot, mock_ctx, mp)
-            admit(music_bot, other, mp)  # no raise
+        config.set_override("PLAY_INFLIGHT_MAX", 1)
+        admit(music_bot, mock_ctx, mp)
+        admit(music_bot, other, mp)  # no raise
 
     def test_the_drop_stamp_signals_each_request_it_names(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -276,13 +276,13 @@ class TestPlayRegistry:
         mp = mock_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot._command_error = AsyncMock()
-        with patch("src.play_placement.PLAY_INFLIGHT_MAX", 1):
-            admit(music_bot, mock_ctx, mp)
-            with (
-                no_typing("src.commands.play.background_typing"),
-                pytest.raises(commands.MaxConcurrencyReached),
-            ):
-                await command_callback(MusicBot.play)(music_bot, mock_ctx, url="x")
+        config.set_override("PLAY_INFLIGHT_MAX", 1)
+        admit(music_bot, mock_ctx, mp)
+        with (
+            no_typing("src.commands.play.background_typing"),
+            pytest.raises(commands.MaxConcurrencyReached),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="x")
         music_bot._command_error.assert_not_awaited()
 
     async def test_the_decline_names_the_cap_not_a_single_slot(
@@ -310,9 +310,26 @@ def _extracted_song(video_id: str) -> dict[str, Any]:
 
 
 class TestResolveConcurrency:
-    """PLAY_INFLIGHT_MAX bounds what a guild holds in memory; this bounds what it
+    """The in-flight cap bounds what a guild holds in memory; this bounds what it
     holds of the shared, process-wide yt-dlp pool. Asserted at the EXTRACTION, which
     is where the slot is taken — around the resolve it also caught cache hits."""
+
+    def test_a_change_applies_once_the_guild_is_rebuilt(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A built semaphore cannot be resized, so a guild with requests in flight
+        keeps the bound it was built with, and takes the new one once idle."""
+        mp = mock_mp()
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 1)
+        first = admit(music_bot, mock_ctx, mp)
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 3)
+        second = admit(music_bot, mock_ctx, mp)
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        assert plays.resolves._value == 1
+        music_bot._plays.retire(first)
+        music_bot._plays.retire(second)
+        admit(music_bot, mock_ctx, mp)
+        assert music_bot._plays._guilds[play_key(mock_ctx)].resolves._value == 3
 
     async def test_a_guild_holds_at_most_that_many_workers_at_once(
         self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -336,9 +353,9 @@ class TestResolveConcurrency:
             live -= 1
             return _extracted_song("x")
 
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
         with (
             no_typing("src.commands.play.background_typing"),
-            patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
             patch("src.youtube._run_extract", new=_extract),
         ):
             tasks = [
@@ -385,9 +402,9 @@ class TestResolveConcurrency:
             await release.wait()
             return _extracted_song("x")
 
+        config.set_override("PLAY_RESOLVE_CONCURRENCY", 2)
         with (
             no_typing("src.commands.play.background_typing"),
-            patch("src.play_placement.PLAY_RESOLVE_CONCURRENCY", 2),
             patch("src.youtube._run_extract", new=_extract),
         ):
             holding = [
@@ -599,10 +616,10 @@ class TestResolveSlot:
         """The whole point of the split: a 5,547-track playlist runs 99s inside the
         slot and must not be cut off by the bound on queueing FOR one."""
         req = admit(music_bot, mock_ctx, mock_mp())
-        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
-            async with music_bot._plays.resolve_slot(req):
-                # Comfortably past the wait bound, inside the slot.
-                await asyncio.sleep(0.15)
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        async with music_bot._plays.resolve_slot(req):
+            # Comfortably past the wait bound, inside the slot.
+            await asyncio.sleep(0.15)
 
     async def test_a_slot_that_never_frees_expires_the_wait(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -610,11 +627,11 @@ class TestResolveSlot:
         req = admit(music_bot, mock_ctx, mock_mp())
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
         # Take every slot and never give one back.
-        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+        for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
         with (
-            patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05),
             recording_span() as span,
             pytest.raises(ResolveWaitExpired),
         ):
@@ -629,21 +646,43 @@ class TestResolveSlot:
         would hand out a permit the guild never held, uncapping the bound."""
         req = admit(music_bot, mock_ctx, mock_mp())
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
-        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+        for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
-        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 0.05):
-            with pytest.raises(ResolveWaitExpired):
-                async with music_bot._plays.resolve_slot(req):
-                    pass  # pragma: no cover
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+        with pytest.raises(ResolveWaitExpired):
+            async with music_bot._plays.resolve_slot(req):
+                pass  # pragma: no cover
         assert plays.resolves.locked()
+
+    async def test_the_expiry_names_the_wait_that_ran(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Read once on entry: a change landing mid-wait neither stretches this
+        wait nor makes its message quote a bound it never had."""
+        req = admit(music_bot, mock_ctx, mock_mp())
+        plays = music_bot._plays._guilds[play_key(mock_ctx)]
+        for _ in range(config.play_resolve_concurrency()):
+            await plays.resolves.acquire()
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
+
+        async def _wait() -> None:
+            async with music_bot._plays.resolve_slot(req):
+                pass  # pragma: no cover - never acquired
+
+        waiting = asyncio.create_task(_wait())
+        await asyncio.sleep(0)
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 300.0)
+        with pytest.raises(ResolveWaitExpired, match=r"within 0\.05s"):
+            async with asyncio.timeout(2):
+                await waiting
 
     async def test_a_slot_freed_inside_the_bound_is_taken(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         req = admit(music_bot, mock_ctx, mock_mp())
         plays = music_bot._plays._guilds[play_key(mock_ctx)]
-        for _ in range(PLAY_RESOLVE_CONCURRENCY):
+        for _ in range(config.play_resolve_concurrency()):
             await plays.resolves.acquire()
 
         async def _free() -> None:
@@ -651,9 +690,9 @@ class TestResolveSlot:
             plays.resolves.release()
 
         freeing = asyncio.create_task(_free())
-        with patch("src.play_placement.PLAY_RESOLVE_WAIT_SECS", 5.0):
-            async with music_bot._plays.resolve_slot(req):
-                entered = True
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 5.0)
+        async with music_bot._plays.resolve_slot(req):
+            entered = True
         await freeing
         assert entered
 
@@ -681,15 +720,13 @@ class TestSlowResolveNotice:
     serialized, so there is no queue position to report — only that work is on."""
 
     async def test_a_fast_resolve_says_nothing(self, mock_ctx: MagicMock) -> None:
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 5.0):
-            async with slow_resolve_notice(mock_ctx, query="a song"):
-                pass
+        async with slow_resolve_notice(mock_ctx, query="a song", delay=5.0):
+            pass
         mock_ctx.channel.send.assert_not_awaited()
 
     async def test_a_slow_resolve_posts_and_retracts(self, mock_ctx: MagicMock) -> None:
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx, query="a song"):
-                await asyncio.sleep(0.08)
+        async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+            await asyncio.sleep(0.08)
         mock_ctx.channel.send.assert_awaited_once()
         mock_ctx.channel.send.return_value.delete.assert_awaited_once()
 
@@ -698,9 +735,8 @@ class TestSlowResolveNotice:
     ) -> None:
         """ctx.channel.send, not ctx.send: MusicContext.send would adopt this as the
         NP host, and deleting it would drag the live progress bar onto it."""
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx, query="a song"):
-                await asyncio.sleep(0.08)
+        async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+            await asyncio.sleep(0.08)
         mock_ctx.send.assert_not_awaited()
 
     async def test_a_send_that_fails_leaves_the_request_alone(
@@ -709,9 +745,17 @@ class TestSlowResolveNotice:
         mock_ctx.channel.send.side_effect = discord.HTTPException(
             MagicMock(), "no perms"
         )
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx, query="a song"):
-                await asyncio.sleep(0.08)
+        async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+            await asyncio.sleep(0.08)
+
+    async def test_off_arms_nothing(self, mock_ctx: MagicMock) -> None:
+        """A server that turned the notice off gets no poster task, not one whose
+        post never comes."""
+        before = asyncio.all_tasks()
+        async with slow_resolve_notice(mock_ctx, query="a song", delay=None):
+            assert asyncio.all_tasks() == before
+            await asyncio.sleep(0.05)
+        mock_ctx.channel.send.assert_not_awaited()
 
     async def test_the_notice_carries_the_debug_footer(
         self, mock_ctx: MagicMock
@@ -719,18 +763,16 @@ class TestSlowResolveNotice:
         """It sends through ctx.channel.send, which bypasses the decoration
         MusicContext.send applies — so like the two dashboards and the card, the
         footer has to be threaded in."""
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(
-                mock_ctx, query="a song", debug_suffix="trace=abc"
-            ):
-                await asyncio.sleep(0.08)
+        async with slow_resolve_notice(
+            mock_ctx, query="a song", delay=0.02, debug_suffix="trace=abc"
+        ):
+            await asyncio.sleep(0.08)
         embed = mock_ctx.channel.send.await_args.kwargs["embed"]
         assert embed.footer.text == "trace=abc"
 
     async def test_no_footer_means_no_footer(self, mock_ctx: MagicMock) -> None:
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx, query="a song"):
-                await asyncio.sleep(0.08)
+        async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+            await asyncio.sleep(0.08)
         embed = mock_ctx.channel.send.await_args.kwargs["embed"]
         assert embed.footer.text is None
 
@@ -743,9 +785,8 @@ class TestSlowResolveNotice:
         user asked for."""
 
         async def _one() -> None:
-            with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-                async with slow_resolve_notice(mock_ctx, query="a song"):
-                    await asyncio.sleep(0.08)
+            async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+                await asyncio.sleep(0.08)
 
         await asyncio.gather(*(_one() for _ in range(16)))
         mock_ctx.channel.send.assert_awaited_once()
@@ -755,9 +796,8 @@ class TestSlowResolveNotice:
         """Unattributed, B reads A's notice as theirs, and it disappears when A
         lands while B is still resolving."""
         mock_ctx.author.mention = "<@42>"
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(mock_ctx, query="daft *punk*"):
-                await asyncio.sleep(0.08)
+        async with slow_resolve_notice(mock_ctx, query="daft *punk*", delay=0.02):
+            await asyncio.sleep(0.08)
         description = mock_ctx.channel.send.await_args.kwargs["embed"].description
         assert "<@42>" in description
         assert "daft \\*punk\\*" in description  # escaped, not styled
@@ -768,12 +808,11 @@ class TestSlowResolveNotice:
         shown: list[int] = []
 
         async def _one(secs: float) -> None:
-            async with slow_resolve_notice(mock_ctx, query=f"{secs}"):
+            async with slow_resolve_notice(mock_ctx, query=f"{secs}", delay=0.02):
                 await asyncio.sleep(secs)
                 shown.append(mock_ctx.channel.send.await_count)
 
         with (
-            patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02),
             patch("src.play_placement._NOTICE_RETRY_SECS", 0.01),
         ):
             await asyncio.gather(_one(0.06), _one(0.3))
@@ -795,10 +834,9 @@ class TestSlowResolveNotice:
             if outcome == "claimed_elsewhere":
                 held.enter_context(channel_claim(_NOTICE_CLAIM, mock_ctx.channel.id))
             with (
-                patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02),
                 provider.get_tracer("test").start_as_current_span("bot.play"),
             ):
-                async with slow_resolve_notice(mock_ctx, query="a song"):
+                async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
                     await asyncio.sleep(0.08)
 
         (span,) = exporter.get_finished_spans()
@@ -811,9 +849,8 @@ class TestSlowResolveNotice:
         playlist must still be able to say a different request is slow."""
         with channel_claim("queue-progress-card", mock_ctx.channel.id) as card:
             assert card
-            with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-                async with slow_resolve_notice(mock_ctx, query="a song"):
-                    await asyncio.sleep(0.08)
+            async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+                await asyncio.sleep(0.08)
         mock_ctx.channel.send.assert_awaited_once()
 
     async def test_a_fast_resolve_does_not_hold_the_slot(
@@ -821,17 +858,16 @@ class TestSlowResolveNotice:
     ) -> None:
         """Claimed at the send, not at entry: a request that settles inside the
         delay never sends, and must not deny the slot to a slow sibling."""
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.05):
 
-            async def _fast() -> None:
-                async with slow_resolve_notice(mock_ctx, query="a song"):
-                    await asyncio.sleep(0.01)
+        async def _fast() -> None:
+            async with slow_resolve_notice(mock_ctx, query="a song", delay=0.05):
+                await asyncio.sleep(0.01)
 
-            async def _slow() -> None:
-                async with slow_resolve_notice(mock_ctx, query="a song"):
-                    await asyncio.sleep(0.2)
+        async def _slow() -> None:
+            async with slow_resolve_notice(mock_ctx, query="a song", delay=0.05):
+                await asyncio.sleep(0.2)
 
-            await asyncio.gather(_fast(), _slow())
+        await asyncio.gather(_fast(), _slow())
         mock_ctx.channel.send.assert_awaited_once()
 
     async def test_a_cancel_while_joining_the_notice_propagates_and_retracts(
@@ -853,10 +889,9 @@ class TestSlowResolveNotice:
         mock_ctx.channel.send = AsyncMock(side_effect=_send)
 
         async def _body() -> None:
-            with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-                async with slow_resolve_notice(mock_ctx, query="a song"):
-                    async with asyncio.timeout(2):
-                        await sending.wait()
+            async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+                async with asyncio.timeout(2):
+                    await sending.wait()
 
         task = asyncio.create_task(_body())
         async with asyncio.timeout(2):
@@ -875,11 +910,10 @@ class TestSlowResolveNotice:
     async def test_the_body_raising_still_retracts_the_notice(
         self, mock_ctx: MagicMock
     ) -> None:
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            with pytest.raises(RuntimeError):
-                async with slow_resolve_notice(mock_ctx, query="a song"):
-                    await asyncio.sleep(0.08)
-                    raise RuntimeError("resolve failed")
+        with pytest.raises(RuntimeError):
+            async with slow_resolve_notice(mock_ctx, query="a song", delay=0.02):
+                await asyncio.sleep(0.08)
+                raise RuntimeError("resolve failed")
         mock_ctx.channel.send.return_value.delete.assert_awaited_once()
 
     async def test_a_dropped_request_retracts_before_its_resolve_returns(
@@ -890,26 +924,24 @@ class TestSlowResolveNotice:
         say the song "will be queued" beside the reply saying it was dropped."""
         dropped = asyncio.Event()
         message = mock_ctx.channel.send.return_value
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.02):
-            async with slow_resolve_notice(
-                mock_ctx, query="a song", request_settled=dropped
-            ):
-                await asyncio.sleep(0.05)
-                mock_ctx.channel.send.assert_awaited_once()
-                dropped.set()
-                await asyncio.sleep(0.02)
-                message.delete.assert_awaited_once()
-                assert not util._CLAIMED_CHANNELS.get(_NOTICE_CLAIM)
+        async with slow_resolve_notice(
+            mock_ctx, query="a song", delay=0.02, request_settled=dropped
+        ):
+            await asyncio.sleep(0.05)
+            mock_ctx.channel.send.assert_awaited_once()
+            dropped.set()
+            await asyncio.sleep(0.02)
+            message.delete.assert_awaited_once()
+            assert not util._CLAIMED_CHANNELS.get(_NOTICE_CLAIM)
         message.delete.assert_awaited_once()
 
     async def test_a_request_dropped_inside_the_delay_posts_nothing(
         self, mock_ctx: MagicMock
     ) -> None:
         dropped = asyncio.Event()
-        with patch("src.play_placement.PLAY_SLOW_NOTICE_SECS", 0.05):
-            async with slow_resolve_notice(
-                mock_ctx, query="a song", request_settled=dropped
-            ):
-                dropped.set()
-                await asyncio.sleep(0.1)
+        async with slow_resolve_notice(
+            mock_ctx, query="a song", delay=0.05, request_settled=dropped
+        ):
+            dropped.set()
+            await asyncio.sleep(0.1)
         mock_ctx.channel.send.assert_not_awaited()

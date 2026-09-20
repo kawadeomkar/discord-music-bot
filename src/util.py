@@ -363,6 +363,12 @@ def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
     return plural if plural is not None else singular + "s"
 
 
+def fmt_seconds(secs: float) -> str:
+    """Seconds as the shortest text that reads back as the same float: 3.0 → "3s",
+    0.25 → "0.25s". repr() is that shortest form; only its trailing ".0" goes."""
+    return repr(float(secs)).removesuffix(".0") + "s"
+
+
 # Discord's hard limits: an over-length title, footer or field value 400s the
 # whole send(). The field cap matters most for lists a user can grow (removed
 # songs), where the 400 lands after the command has already mutated state.
@@ -415,6 +421,35 @@ def truncate(text: str, limit: int) -> str:
 def truncate_embed_title(title: str) -> str:
     """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
     return truncate(title, EMBED_TITLE_LIMIT)
+
+
+# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`.
+# iOS turns a typed `--` into a single em dash.
+DASHES: Final[str] = "-‐‑‒–—―−"
+
+
+def codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
+    """Lines as one or more codeblock fields within Discord's 1024-char field
+    cap. Splits rather than truncates: a silently clipped config listing reads
+    as a complete one."""
+    fence = 8  # "```\n" + "\n```"
+    fields: list[tuple[str, str]] = []
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        line = truncate(line, EMBED_FIELD_LIMIT - fence)
+        if chunk and size + len(line) + 1 + fence > EMBED_FIELD_LIMIT:
+            fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
+    return fields
+
+
+def _fence(lines: list[str]) -> str:
+    return "```\n" + "\n".join(lines) + "\n```"
 
 
 # Debug mode's suffix starts a line of its own. See docs/ARCHITECTURE.md#debug-footer-seams.

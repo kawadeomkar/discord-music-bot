@@ -13,6 +13,7 @@ import pytest
 from tests.helpers import settle
 from redis.asyncio import Redis
 
+from src import config
 from src import spotify as spotify_module
 from src.spotify import (
     _HTTP_TIMEOUT,
@@ -1247,11 +1248,11 @@ class TestSpotifyPlaylistPaging:
         assert await fake_redis.get("spotify:playlist:v3:pid_abandoned") is not None
 
     async def test_a_walk_that_cannot_get_a_slot_says_spotify_is_busy(
-        self, spotify: Spotify, monkeypatch: pytest.MonkeyPatch
+        self, spotify: Spotify
     ) -> None:
         """The 120s walk budget starts after the slot is taken, so a small playlist
         behind two 10,000-track walks otherwise waits minutes with nothing sent."""
-        monkeypatch.setattr(spotify_module, "PLAY_RESOLVE_WAIT_SECS", 0.05)
+        config.set_override("PLAY_RESOLVE_WAIT_SECS", 0.05)
         slot = spotify_module._playlist_slot()
         for _ in range(spotify_module._PLAYLIST_WALK_CONCURRENCY):
             await slot.acquire()
@@ -1266,6 +1267,7 @@ class TestSpotifyPlaylistPaging:
                 slot.release()
         http_call.assert_not_awaited()
         assert "busy" in excinfo.value.user_message
+        assert "within 0.05s" in str(excinfo.value)
 
     def test_the_walk_slot_follows_the_running_loop(self) -> None:
         """A Semaphore binds to the first loop that waits on it; pytest-asyncio

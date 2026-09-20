@@ -9,6 +9,8 @@ from collections.abc import Mapping, Sequence
 import discord
 from discord.ext import commands
 
+from src.guild_state import DEFAULT_ALONE_TIMEOUT_SECS, ConfigField
+from src.settings import card_name, format_value, server_spec
 from src.util import notice_embed
 
 HELP_COLOR = discord.Color.blurple()
@@ -37,7 +39,7 @@ CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
         "clear",
         "jump",
     ),
-    "Utility": ("help", "join", "ping", "debug"),
+    "Utility": ("help", "join", "settings", "ping", "debug"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"
@@ -62,11 +64,15 @@ SOURCES = (
     "**SoundCloud** — track links."
 )
 
+_ALONE_TIMEOUT = server_spec(ConfigField.ALONE_TIMEOUT)
+
 TIPS = (
     "• Add `--help` to any command — `-play --help` — for its manual, the "
     "same as `-help play`.\n"
     "• `play` pulls the bot into your voice channel — no need to `join` first.\n"
-    "• The bot disconnects on its own 10 seconds after the last person leaves.\n"
+    "• The bot disconnects on its own "
+    f"**{format_value(_ALONE_TIMEOUT, DEFAULT_ALONE_TIMEOUT_SECS)}** after the last "
+    f"person leaves (`-settings {card_name(_ALONE_TIMEOUT)}` changes it).\n"
     "• The **Now Playing** card re-anchors itself to the bottom of the channel "
     "so its live progress bar is never buried by other messages.\n"
     "• Queue, history and volume are saved per server and restored if the bot "

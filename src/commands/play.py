@@ -211,19 +211,23 @@ async def _resolve_and_place(
         # decision and the hold release is exactly what this path may not have.
         progress: Optional[EnqueueProgress] = None
         if is_collection(source):
+            delay = cog.guild_settings.queue_progress_delay_secs(req.guild_id)
             progress = await stack.enter_async_context(
                 enqueue_progress(
                     ctx,
                     source,
+                    delay=delay,
                     placement_note=_placement_note(args.mode),
                     debug_suffix=cog.debug_suffix(ctx),
                     request_settled=req.settled,
                 )
             )
         else:
+            delay = cog.guild_settings.slow_notice_secs(req.guild_id)
             await stack.enter_async_context(
                 slow_resolve_notice(
                     ctx,
+                    delay=delay,
                     query=req.query,
                     debug_suffix=cog.debug_suffix(ctx),
                     request_settled=req.settled,

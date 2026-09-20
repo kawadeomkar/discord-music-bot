@@ -65,7 +65,7 @@ details, aliases, and examples.
 | `-resume` | `r` | Resume from where the song was paused |
 | `-replay` | `rp`, `restart` | Play the current song again from the beginning (nothing is dropped from the queue) |
 | `-stop` | `st` | Stop playback and disconnect, keeping the queue for `-resume` (24h) |
-| `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (usually applies two songs later, since the next one is built ahead of time; saved per server) |
+| `-volume <0–100>` | `v`, `vol`, `sound` | Set playback volume (usually applies two songs later, since the next one is built ahead of time; saved per server). `-settings volume` changes the same saved level |
 
 ### Queue
 
@@ -86,8 +86,9 @@ details, aliases, and examples.
 | Command | Aliases | Description |
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
+| `-settings [<setting> [<value>\|reset]]` | `config`, `cfg`, `prefs` | This server's settings: `-settings` lists them, each with what it does and the command that changes it, `-settings timezone` shows one in full, `-settings timezone Europe/London` changes it and `-settings timezone reset` puts it back. Anyone can look; changing one needs Manage Server, and `volume` can also be changed from the bot's voice channel, or from any voice channel while the bot isn't in one, as with `-volume`. The bot's operator can change them too, and also has `-settings bot`, which shows and changes the bot-wide settings |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
-| `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer on every embed the bot sends there, the live Now Playing card included, carrying the trace id, timing and the bot process's runtime load — and need **Manage Server** |
+| `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions, this server's player/voice state and the settings changed here; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer on every embed the bot sends there, the live Now Playing card included, carrying the trace id, timing and the bot process's runtime load — and need **Manage Server** |
 | `-help [command]` | — | Full command manual |
 
 ### Supported inputs
@@ -380,6 +381,7 @@ run `just check`.
 | `just db-backup` | Dump the play-history database to `backups/` |
 | `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
 | `just outbox [idle_ms]` | Outbox health: depth, in flight, stranded entries, and lost plays |
+| `just bot-settings [reset <application_id>]` | List the stored bot-wide overrides, one hash per bot application; `reset` deletes one bot's, and the bot drops them at its next restart |
 
 These resolve `POSTGRES_URL` from the environment first, then `.env`, and finally by
 building a host DSN from `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/
@@ -492,7 +494,11 @@ it already has. To run a newly built image, use `just up` (or `./deploy_docker.s
 ## Configuration
 
 All configuration is via environment variables (a `.env` file is loaded by Docker
-Compose; for local runs, export them or use your shell's dotenv tooling).
+Compose; for local runs, export them or use your shell's dotenv tooling). The bot's
+operator can also change some of them at runtime with `-settings bot`, within a narrower
+range; a value set that way is stored in Redis and wins over the variable until it is
+reset. A variable you set outside that range still applies, and `-settings bot` marks it
+`outside chat range`. Server settings (`-settings`) live in Redis too.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -512,20 +518,21 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox — meaningful only while the archive is enabled (disabled, the outbox is never written). `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. A drop here is unrecoverable: the Redis history list is capped at 50 entries per guild, so anything older that the cap discards existed only in the outbox. See [Operating the play-history archive](#operating-the-play-history-archive) |
 | `ENVIRONMENT` | | `development`; inferred from the git branch (`main` → `production`) when unset and a repo is present | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
-| `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
+| `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck. Floored at 1 |
 | `PLAY_INFLIGHT_MAX` | | `16` | Per-server ceiling on `-play` requests admitted at once; past it a request is declined. One admitted request is one coroutine, one open span and one typing keepalive, so this bounds memory — pool time is `PLAY_RESOLVE_CONCURRENCY` below. Floored at 1 |
 | `PLAY_RESOLVE_CONCURRENCY` | | `2` | How many of a server's admitted requests may hold a yt-dlp worker at once. The pool above is process-wide and FIFO, so admission alone bounds nothing on it: sixteen pasted links is sixteen jobs against four workers, and what queues behind them includes the extractions other servers' playback loops make between songs. Half the default pool, so no one server can hold all of it; requests wait here rather than being refused, for as long as `PLAY_RESOLVE_WAIT_SECS` allows. Raise it with `YTDLP_POOL_WORKERS`. Floored at 1 |
 | `PLAY_RESOLVE_WAIT_SECS` | | `120.0` | How long a request waits for one of those slots before giving up. Bounds the WAIT alone, never the lookup holding the slot — a 5,547-track playlist legitimately runs 99s, and cutting that off would fail the request it is serving. Waiting is the half that produces nothing, so leaving it unbounded is what makes a busy bot look like a stopped one. Generous on purpose: every second of it can be another member's legitimate lookup, and expiring early is a refusal nobody needed. A request that expires is declined having looked up and queued nothing, so trying again cannot double-queue the song. Floored at 1.0 |
-| `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a single-track `-play` takes before the bot says it is still looking the song up; a playlist shows the live progress card instead. One notice per channel at a time, and the message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5 |
-| `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
-| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
+| `PLAY_SLOW_NOTICE_SECS` | | `6.0` | How long a single-track `-play` takes before the bot says it is still looking the song up; a playlist shows the live progress card instead. One notice per channel at a time, and the message is taken back as soon as the song is queued. Comfortably above the 1–4s a warm lookup takes, so it marks the unusual rather than commenting on every `-play`. Floored at 0.5. A server can set its own with `-settings slow-notice` (4–60s), or turn the notice off |
+| `STREAM_PROBE_TIMEOUT_SECS` | | `2.0` | Cap on the pre-playback probe that checks a stream URL is still live. Deliberately short: a single resolve can pay it twice, and firing early is cheap because an unconfirmed URL still plays — it just is not cached. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine. Floored at 0.1 |
+| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card. Floored at 1.0: every edit counts against the channel's rate limit, which the bot's other messages share. A server can make its own bar slower with `-settings np-refresh`, never faster |
 | `HEARTBEAT_INTERVAL_SECS` | | `3.0` | How often a playing guild records its playback position, which bounds how much audio a crash replays — recovery resumes at the last heartbeat. Floored at 0.5s: each tick is a Redis write per playing guild, not a local timer |
-| `QUEUE_PROGRESS_DELAY_SECS` | | `2.5` | How long a playlist enqueue resolves before the live progress card appears. Above the ~2.0s a ten-track collection takes end to end, so the common case still sees exactly what it saw before. One card per channel. Floored at 0.05 |
+| `QUEUE_PROGRESS_DELAY_SECS` | | `2.5` | How long a playlist enqueue resolves before the live progress card appears. Above the ~2.0s a ten-track collection takes end to end, so the common case still sees exactly what it saw before. One card per channel. Floored at 0.05. A server can set its own with `-settings queue-progress-delay` (2–60s) |
 | `QUEUE_PROGRESS_TICK_SECS` | | `5.0` | How often that card is re-rendered. Higher than the dashboards' 1.0s because it shares a channel with the Now Playing bar's 3.0s edits, and Discord allows ~5 edits per 5s per channel. The card only edits when the render actually changes: a card with a bar costs at most ten edits for a whole enqueue, while one with no total (a YouTube Mix) edits every 5s. Floored at 2.0 |
-| `QUEUE_PROGRESS_MAX_SECS` | | `300.0` | How long the card keeps editing before it settles on "still working" and stops. Not a timeout: the enqueue carries on, and the card is still deleted when it lands. `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a slot, this bounds the editing. Must be at least `QUEUE_PROGRESS_DELAY_SECS` + `QUEUE_PROGRESS_TICK_SECS` (7.5 by default); below that the bot refuses to start |
+| `QUEUE_PROGRESS_MAX_SECS` | | `300.0` | How long the card keeps editing before it settles on "still working" and stops. Not a timeout: the enqueue carries on, and the card is still deleted when it lands. `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a slot, this bounds the editing. Must be at least `QUEUE_PROGRESS_DELAY_SECS` + `QUEUE_PROGRESS_TICK_SECS` (7.5 by default); below that the bot refuses to start. Whatever this says, the ceiling is never below the card's delay plus two ticks, counted from the start of the request |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
 | `PING_DEADLINE_SECS` | | `3.0` | `-ping` health dashboard: how long a probe may run before the row is marked failed |
-| `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-debug --enable`/`--disable` persists to Redis and wins over this value from then on, across restarts. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
+| `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every embed the bot sends in that server — including the Now Playing card, which refreshes its numbers on every progress tick. Note what that publishes: the runtime figures describe the whole bot process, and the Now Playing card shows them to anyone who can read the channel for as long as music plays. Observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-settings debug on`/`off` (or `-debug --enable`/`--disable`, the same choice) persists to Redis and wins over this value from then on, across restarts, until `-settings debug reset`. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. The operator's `-settings bot debug-default on`/`off` replaces this default until the bot restarts; it is never stored. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
+| `BOT_SETTINGS_OVERRIDES` | | `apply` | Set `ignore` to run the bot on its environment and code values, ignoring the bot-wide overrides stored in Redis, and to stop them being changed from chat. The stored values stay: remove the variable and restart to use them again. Anything but `apply` or `ignore` refuses startup. `just bot-settings reset <application_id>` deletes them instead |
 | `DEBUG_PROMETHEUS_URL` | | — (Compose sets `http://localhost:9090`) | Where `-debug` reads the Postgres container's CPU/memory from — the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL. The series come from the `otelcol-metrics` sidecar, which is **opt-in via the `metrics` Compose profile** because it mounts the Docker socket, so on a default `up` that one row reads `n/a (no metrics source)` even though this URL is set and Prometheus answers. Unset, the same row and nothing else changes |
 | `PROMETHEUS_HOST_PORT` | | `9090` | Host port the metrics stack's Prometheus publishes on (loopback only). Read by Compose, never by the bot; `DEBUG_PROMETHEUS_URL`'s default follows it. Change it when something on this machine already owns 9090 — a collision fails the whole `docker compose up`, not just the metrics row |
 | `DEBUG_TICK_SECS` | | `1.0` | `-debug` snapshot: a ceiling on how long the card can be stale, not a polling interval — the loop wakes as soon as a block is ready |
@@ -536,6 +543,23 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.40.0
+
+**Three settings now refuse startup when they are out of range**, the way the other
+tunables already did. Each used to be read with no range check, so an out-of-range value
+reached the loop that uses it:
+
+| Variable | Accepted | What an out-of-range value used to do |
+|---|---|---|
+| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | 1.0 or more | `0` edited the Now Playing card back to back, spending the rate limit the channel's other messages share |
+| `STREAM_PROBE_TIMEOUT_SECS` | 0.1 or more | `0` or a negative value removed the timeout entirely, so a stream host that never answered held a song's start |
+| `YTDLP_POOL_WORKERS` | 1 or more | `0` failed every lookup, each time the pool tried to start |
+
+A value outside its range, `nan` or `inf` now stops the bot at startup instead of
+starting. Something that is not a number already stopped it; the error now names the
+variable. If yours start as before, nothing changes: every default is inside its range.
+Rolling back is only a redeploy.
 
 ## Upgrading to 2.39.0
 
@@ -1083,6 +1107,8 @@ src/
 ├── help.py             # custom man-page-style -help command
 ├── telemetry.py        # OpenTelemetry + structlog setup
 ├── config.py           # ENVIRONMENT detection, tunables
+├── settings.py         # -settings: what chat may change, its ranges and its grammar
+├── settings_card.py    # -settings' cards and replies
 └── util.py             # logging factory, embed helpers, task helpers
 
 tests/                  # one test_*.py per src/ module, plus:

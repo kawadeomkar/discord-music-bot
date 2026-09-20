@@ -830,9 +830,10 @@ db-backfill-docker *ARGS:
     resolve_external_postgres_env
     docker compose run --rm ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-backfill "$@"
 
-# The one Redis-side operator recipe. It exists because XLEN alone cannot tell
-# apart four states that call for four different responses, and working that out
-# by hand during an incident is the wrong time to learn the commands:
+# One of two Redis-side operator recipes (the other is bot-settings). It exists
+# because XLEN alone cannot tell apart four states that call for four different
+# responses, and working that out by hand during an incident is the wrong time to
+# learn the commands:
 #
 #   undelivered        backlog the drainer has not read yet
 #   in flight          delivered, insert not committed — normal, unless it is old
@@ -906,6 +907,45 @@ outbox IDLE_MS='60000':
     echo
     echo "head (oldest 3):"
     r XRANGE "$key" - + COUNT 3 | sed 's/^/  /'
+
+# The operator's stored -settings bot overrides, one bot:{application_id}:config hash
+# per application: a dev and a prod bot sharing this Redis each have their own. A
+# stored override beats the environment, so this is the way out of a harmful one
+# without Discord (BOT_SETTINGS_OVERRIDES=ignore is the other). The application id
+# is an argument, never derived: the listing and every startup log line print it.
+# Scope: the compose Redis only, as with `just outbox`.
+[doc('Stored bot settings: list every bot:*:config, or reset <application_id>')]
+[group('database')]
+bot-settings *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    r() { docker compose exec -T redis redis-cli "$@" | tr -d '\r'; }
+    pattern=bot:*:config
+    case "${1:-}" in
+        "")
+            found=0
+            for k in $(r --scan --pattern "$pattern"); do
+                found=1
+                echo "$k"
+                r HGETALL "$k" | paste - - | sed 's/^/  /'
+            done
+            [ "$found" -eq 1 ] || echo "no stored bot settings ($pattern)"
+            ;;
+        reset)
+            id="${2:-}"
+            if [[ ! "$id" =~ ^[0-9]{17,20}$ ]] || [ "$#" -ne 2 ]; then
+                echo "usage: just bot-settings reset <application_id>  (17-20 digits)" >&2
+                exit 2
+            fi
+            key="bot:${id}:config"
+            echo "deleted $(r DEL "$key") key: $key"
+            echo "A running bot keeps its overrides in memory until it restarts: just restart."
+            ;;
+        *)
+            echo "usage: just bot-settings [reset <application_id>]" >&2
+            exit 2
+            ;;
+    esac
 
 # Rows Postgres refused, parked by record_rejection. Expected to print NOTHING:
 # every entry reaching the drainer is insertable by construction, so a row here

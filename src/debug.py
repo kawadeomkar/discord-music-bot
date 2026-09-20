@@ -17,8 +17,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol, cast
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from typing import TYPE_CHECKING, Any, Final, Optional, Protocol, cast
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
@@ -28,17 +28,23 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import config
-from src.config import (
-    DEBUG_DEADLINE_SECS,
-    DEBUG_TICK_SECS,
-    debug_mode_default,
-)
+from src.config import debug_mode_default
 from src.dashboard import run_live_dashboard
+from src.guild_state import DEFAULT_VOLUME, ConfigField
 from src.ping import bot_version, collect_versions
-from src.redis_client import GuildRedisStore, outbox_depth, read_guild_configs
+from src.redis_client import GuildRedisStore, outbox_depth
+from src.settings import (
+    SettingSpec,
+    card_name,
+    format_value,
+    knob_spec,
+    server_spec,
+)
+from src.settings_card import DEFAULT, SET_HERE, Shown, knob_shown
 from src.util import (
     FOOTER_SUFFIX_SEP,
     cancel_task,
+    codeblock_fields,
     fmt_duration,
     get_logger,
     join_footer,
@@ -115,9 +121,6 @@ _OPERATOR_NOTICE = (
     "-# Host details (configuration, storage, runtime) are shown to the bot owner "
     "only. Run `-ping` for dependency health."
 )
-
-# Discord's cap on an embed field value; util.py's FOOTER_LIMIT is its footer sibling.
-_FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
 
@@ -286,6 +289,9 @@ class _ConfigVar:
     fallback: Optional[str] = None
     # For a default main() can still replace after this tuple is built.
     fallback_factory: Optional[Callable[[], str]] = None
+    # A knob -settings bot can override: rendered from the value in force and its
+    # source at render time, so the row carries no fallback.
+    knob: Optional[config.FloatKnob | config.IntKnob] = None
 
 
 _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
@@ -295,6 +301,7 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback_factory=lambda: config.ENVIRONMENT,
     ),
     _ConfigVar(name="DEBUG_MODE", kind=_ConfigKind.VALUE, fallback="false"),
+    _ConfigVar(name="BOT_SETTINGS_OVERRIDES", kind=_ConfigKind.VALUE, fallback="apply"),
     _ConfigVar(
         name="HISTORY_ARCHIVE_ENABLED", kind=_ConfigKind.VALUE, fallback="false"
     ),
@@ -308,71 +315,77 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         kind=_ConfigKind.VALUE,
         fallback=str(config.POSTGRES_STATEMENT_CACHE),
     ),
-    _ConfigVar(name="YTDLP_POOL_WORKERS", kind=_ConfigKind.VALUE, fallback="4"),
     _ConfigVar(
-        name="PLAY_INFLIGHT_MAX",
+        name="YTDLP_POOL_WORKERS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_INFLIGHT_MAX),
+        fallback=str(config.YTDLP_POOL_WORKERS),
+    ),
+    _ConfigVar(
+        name="PLAY_INFLIGHT_MAX", kind=_ConfigKind.VALUE, knob="PLAY_INFLIGHT_MAX"
     ),
     _ConfigVar(
         name="PLAY_RESOLVE_CONCURRENCY",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_RESOLVE_CONCURRENCY),
+        knob="PLAY_RESOLVE_CONCURRENCY",
     ),
     _ConfigVar(
         name="PLAY_RESOLVE_WAIT_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_RESOLVE_WAIT_SECS),
+        knob="PLAY_RESOLVE_WAIT_SECS",
     ),
     _ConfigVar(
         name="PLAY_SLOW_NOTICE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PLAY_SLOW_NOTICE_SECS),
+        knob="PLAY_SLOW_NOTICE_SECS",
     ),
     _ConfigVar(
         name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
+        knob="NOW_PLAYING_UPDATE_INTERVAL_SECS",
     ),
     _ConfigVar(
         name="HEARTBEAT_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.HEARTBEAT_INTERVAL_SECS),
+        knob="HEARTBEAT_INTERVAL_SECS",
     ),
     _ConfigVar(
-        name="PING_TICK_SECS",
+        name="STREAM_PROBE_TIMEOUT_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PING_TICK_SECS),
+        knob="STREAM_PROBE_TIMEOUT_SECS",
     ),
     _ConfigVar(
-        name="PING_DEADLINE_SECS",
+        name="ANALYTICS_RENDER_DEADLINE_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.PING_DEADLINE_SECS),
+        knob="ANALYTICS_RENDER_DEADLINE_SECS",
     ),
+    _ConfigVar(name="LIVENESS_FILE", kind=_ConfigKind.VALUE),
     _ConfigVar(
-        name="DEBUG_TICK_SECS",
+        name="LIVENESS_INTERVAL_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.DEBUG_TICK_SECS),
+        fallback=str(config.LIVENESS_INTERVAL_SECS),
     ),
+    _ConfigVar(name="PING_TICK_SECS", kind=_ConfigKind.VALUE, knob="PING_TICK_SECS"),
     _ConfigVar(
-        name="DEBUG_DEADLINE_SECS",
-        kind=_ConfigKind.VALUE,
-        fallback=str(config.DEBUG_DEADLINE_SECS),
+        name="PING_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="PING_DEADLINE_SECS"
+    ),
+    _ConfigVar(name="DEBUG_TICK_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_TICK_SECS"),
+    _ConfigVar(
+        name="DEBUG_DEADLINE_SECS", kind=_ConfigKind.VALUE, knob="DEBUG_DEADLINE_SECS"
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_DELAY_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.QUEUE_PROGRESS_DELAY_SECS),
+        knob="QUEUE_PROGRESS_DELAY_SECS",
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_TICK_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.QUEUE_PROGRESS_TICK_SECS),
+        knob="QUEUE_PROGRESS_TICK_SECS",
     ),
     _ConfigVar(
         name="QUEUE_PROGRESS_MAX_SECS",
         kind=_ConfigKind.VALUE,
-        fallback=str(config.QUEUE_PROGRESS_MAX_SECS),
+        knob="QUEUE_PROGRESS_MAX_SECS",
     ),
     _ConfigVar(
         name="POT_PROVIDER_URL", kind=_ConfigKind.URL, fallback="http://127.0.0.1:4416"
@@ -457,8 +470,23 @@ def redact_url(raw: str, *, hide_host: bool = False) -> str:
         return "unparseable"
 
 
-def render_config_value(var: _ConfigVar) -> str:
-    """One allowlist row's value, redacted per its kind."""
+def _render_knob(
+    knob: config.FloatKnob | config.IntKnob, *, unsaved: frozenset[str]
+) -> str:
+    """`5s (bot owner; env 3s)`: the value and source label the -settings bot
+    card shows, so the operator's two views of a knob agree."""
+    spec = knob_spec(knob)
+    shown = knob_shown(spec, persisted=spec.key not in unsaved)
+    return f"{format_value(spec, shown.value)} ({shown.source})"
+
+
+def render_config_value(
+    var: _ConfigVar, *, unsaved: frozenset[str] = frozenset()
+) -> str:
+    """One allowlist row's value, redacted per its kind. `unsaved` holds the bot
+    setting keys whose last write or reset did not reach Redis."""
+    if var.knob is not None:
+        return _render_knob(var.knob, unsaved=unsaved)
     raw = os.environ.get(var.name)
     if var.kind is _ConfigKind.SECRET:
         # Presence only: this block has to stay safe to screenshot into an issue.
@@ -471,11 +499,19 @@ def render_config_value(var: _ConfigVar) -> str:
     return raw.strip()
 
 
-def config_lines() -> list[str]:
+def config_lines(
+    *, unsaved: frozenset[str] = frozenset(), unread: bool = False
+) -> list[str]:
+    """`unread`: stored bot overrides have not been read yet, which the overrides
+    row says, since every knob row then shows its environment value."""
     width = max(len(var.name) for var in _CONFIG_ALLOWLIST) + 2
-    return [
-        f"{var.name:<{width}}{render_config_value(var)}" for var in _CONFIG_ALLOWLIST
-    ]
+    lines = []
+    for var in _CONFIG_ALLOWLIST:
+        value = render_config_value(var, unsaved=unsaved)
+        if unread and var.name == "BOT_SETTINGS_OVERRIDES":
+            value += " (stored values not read yet)"
+        lines.append(f"{var.name:<{width}}{value}")
+    return lines
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -494,6 +530,8 @@ class DebugInputs:
     # False only when a toggle's Redis write failed, so the snapshot can say
     # "this session only" rather than claim a durability that did not happen.
     debug_persisted: bool = True
+    # The operator's session debug-default is set (-settings bot debug-default).
+    debug_default_overridden: bool = False
     players: int
     player: Optional[MusicPlayer] = None
     redis: Optional[aioredis.Redis] = None
@@ -510,6 +548,16 @@ class DebugInputs:
     # Debug mode's footer, rendered once by the cog and constant for the loop.
     # None when the guild has debug mode off.
     debug_suffix: Optional[str] = None
+    # This server's settings as -settings renders them, from the cache: the
+    # snapshot never waits on Redis. `settings_read` is False while a stored
+    # value may be missing from it.
+    settings: tuple[tuple[SettingSpec, Shown], ...] = ()
+    settings_read: bool = True
+    # The bot settings whose last write or reset did not reach Redis, by key, so
+    # the Config block marks them as -settings bot does.
+    bot_unsaved: frozenset[str] = frozenset()
+    # Stored bot overrides may exist that no read has applied yet.
+    bot_unread: bool = False
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
@@ -884,6 +932,13 @@ class RuntimeSnapshot:
 _FIRST_SAMPLE_SECS = 0.5
 
 
+def sample_interval_secs() -> float:
+    """The runtime sampler's period: the bot's Now Playing tick, the fastest
+    surface that renders a snapshot, read at the call. Floored so a tiny tick
+    cannot spin /proc reads, capped so a long one cannot stale command replies."""
+    return max(1.0, min(5.0, config.now_playing_update_interval_secs()))
+
+
 class RuntimeSampler:
     """A background sampler feeding the debug footer on the Now Playing tick's
     cadence. Background because CPU% needs a wall-clock window and a response
@@ -891,11 +946,6 @@ class RuntimeSampler:
     old. The tick's own scheduling drift IS the loop-lag measurement. One
     instance, held on the cog: a module global would outlive a cog reload and
     leak the task."""
-
-    # Tied to the NP tick, the fastest surface that renders a snapshot. Floored
-    # so a tiny tick cannot spin /proc reads, capped so a long one cannot stale
-    # command replies.
-    INTERVAL_SECS = max(1.0, min(5.0, config.NOW_PLAYING_UPDATE_INTERVAL_SECS))
 
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task[None]] = None
@@ -946,7 +996,7 @@ class RuntimeSampler:
         # First sample on a short delay, so `-debug --enable` does not answer
         # with a footer carrying no runtime numbers; not instant, since cpu%
         # needs a window and start() took the baseline.
-        delay = min(_FIRST_SAMPLE_SECS, self.INTERVAL_SECS)
+        delay = min(_FIRST_SAMPLE_SECS, sample_interval_secs())
         while True:
             expected = loop.time() + delay
             await asyncio.sleep(delay)
@@ -954,7 +1004,8 @@ class RuntimeSampler:
                 self._snapshot = self._sample(max(0.0, (loop.time() - expected) * 1000))
             except Exception as e:  # noqa: BLE001 — one bad tick must not end the loop
                 log.warning(f"runtime sample failed: {type(e).__name__}: {e}")
-            delay = self.INTERVAL_SECS
+            # Re-read each tick: a bot-setting change lands within one interval.
+            delay = sample_interval_secs()
 
     def _sample(self, lag_ms: float) -> RuntimeSnapshot:
         previous, self._cpu = self._cpu, read_cpu_sample()
@@ -990,14 +1041,48 @@ def _fence_safe(text: str) -> str:
     return truncate(text.replace("`", "'"), 60)
 
 
+def settings_line(rows: Sequence[tuple[SettingSpec, Shown]], *, read: bool) -> str:
+    """The server settings changed here, in registry order, by the names and with
+    the source labels past `set here` the -settings card prints: `leave-when-idle
+    10:00, volume 50% (not saved) (2 changed)`. Server settings only; the bot's are
+    the operator's Config block."""
+    changed = [
+        f"{card_name(spec)} {format_value(spec, shown.value)}"
+        + ("" if shown.source == SET_HERE else f" ({shown.source})")
+        for spec, shown in rows
+        if shown.source != DEFAULT
+    ]
+    unread = "" if read else "stored values not read yet"
+    if not changed:
+        return f"none known ({unread})" if unread else "none changed"
+    count = f"{len(changed)} changed" + (f"; {unread}" if unread else "")
+    return f"{', '.join(changed)} ({count})"
+
+
+_VOLUME_SPEC: Final = server_spec(ConfigField.VOLUME)
+
+
+def _volume_row(
+    mp: Optional[MusicPlayer], rows: Sequence[tuple[SettingSpec, Shown]]
+) -> str:
+    """The live player's level, or with no player this server's Volume setting, as
+    the settings line below renders it."""
+    if mp is not None:
+        return f"{round(mp.volume * 100)}%"
+    shown = next((shown for spec, shown in rows if spec is _VOLUME_SPEC), None)
+    percent = shown.value if shown is not None else DEFAULT_VOLUME * 100
+    return f"{format_value(_VOLUME_SPEC, percent)} (setting; no player)"
+
+
 def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> list[str]:
     mp = inputs.player
     lines = [
         f"player       {'yes' if mp is not None else 'no'}",
         # display_size(), so a claimed-but-not-started song still reads as queued.
         f"queue        {mp.queue.display_size() if mp is not None else 0} queued",
-        f"volume       {round(mp.volume * 100) if mp is not None else 100}%",
+        f"volume       {_volume_row(mp, inputs.settings)}",
         f"debug        {'on' if inputs.debug_enabled else 'off'} ({source})",
+        f"settings     {settings_line(inputs.settings, read=inputs.settings_read)}",
     ]
     vc = guild.voice_client
     if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
@@ -1441,37 +1526,19 @@ async def _outbox_check(
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
-    """Lines as one or more codeblock fields within Discord's 1024-char field
-    cap. Splits rather than truncates: a silently clipped config listing reads
-    as a complete one."""
-    fence = 8  # "```\n" + "\n```"
-    fields: list[tuple[str, str]] = []
-    chunk: list[str] = []
-    size = 0
-    for line in lines:
-        line = truncate(line, _FIELD_LIMIT - fence)
-        if chunk and size + len(line) + 1 + fence > _FIELD_LIMIT:
-            fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
-            chunk, size = [], 0
-        chunk.append(line)
-        size += len(line) + 1
-    if chunk:
-        fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
-    return fields
-
-
-def _fence(lines: list[str]) -> str:
-    return "```\n" + "\n".join(lines) + "\n```"
-
-
-def mode_source(overridden: bool, *, persisted: bool = True) -> str:
+def mode_source(
+    overridden: bool, *, persisted: bool = True, default_overridden: bool = False
+) -> str:
     """Why debug mode is in its current state, rendered inside "Debug mode is
     **on** for this server (...)". "saved here" is a stored choice; "host default"
-    means the guild never chose and follows DEBUG_MODE; "this session only" is a
-    toggle whose Redis write failed, which the toggle already reported."""
+    means the guild never chose and follows DEBUG_MODE, and "bot owner default,
+    until restart" that it follows the operator's session default instead; "this
+    session only" is a toggle whose Redis write failed, which the toggle already
+    reported."""
     if not overridden:
-        return "host default"
+        return (
+            "bot owner default, until restart" if default_overridden else "host default"
+        )
     return "saved here" if persisted else "this session only"
 
 
@@ -1582,7 +1649,10 @@ def instant_blocks(
     blocks: dict[str, list[str]] = {}
     guild = ctx.guild
     if inputs.operator:
-        blocks["Config"] = _safe_block("config", config_lines)
+        blocks["Config"] = _safe_block(
+            "config",
+            lambda: config_lines(unsaved=inputs.bot_unsaved, unread=inputs.bot_unread),
+        )
         blocks["Discord"] = _safe_block(
             "discord", lambda: discord_lines(ctx.bot, players=inputs.players)
         )
@@ -1611,7 +1681,7 @@ def render_snapshot_embed(
         lines = blocks.get(name)
         if lines is None:
             continue
-        for field_name, value in _codeblock_fields(name, lines):
+        for field_name, value in codeblock_fields(name, lines):
             embed.add_field(name=field_name, value=value, inline=False)
     # Published to everyone while the same value is an operator-gated row above;
     # -ping prints this identical footer to every caller, so gating it hides nothing.
@@ -1637,7 +1707,11 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
     stragglers rather than failing the card. A non-operator has no deferred
     blocks, so the driver degrades to a single send with no loop."""
     span = trace.get_current_span()
-    source = mode_source(inputs.debug_overridden, persisted=inputs.debug_persisted)
+    source = mode_source(
+        inputs.debug_overridden,
+        persisted=inputs.debug_persisted,
+        default_overridden=inputs.debug_default_overridden,
+    )
     blocks = instant_blocks(ctx, inputs, source=source)
 
     # Counted before the driver creates its probe tasks — see runtime_lines.
@@ -1685,8 +1759,8 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
             render_snapshot_embed(ctx, inputs, blocks=blocks, source=source)
         ],
         prepare=_prepare,
-        tick_secs=DEBUG_TICK_SECS,
-        deadline_secs=DEBUG_DEADLINE_SECS,
+        tick_secs=config.debug_tick_secs(),
+        deadline_secs=config.debug_deadline_secs(),
     )
 
     span.set_attribute("debug.enabled", inputs.debug_enabled)
@@ -1703,35 +1777,30 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
 
 
 class DebugSettings:
-    """Per-guild debug-mode state: the durable choice, its read cache, and the
-    sampler feeding the footer. DEBUG_MODE is the default every guild starts
-    from; the durable copy lives in guild:{id}:config and this holds the read
-    cache. One instance per cog, built in MusicBot.__init__."""
+    """Per-guild debug-mode state: each guild's choice, and the sampler feeding
+    the footer. DEBUG_MODE is the default every guild starts from. The durable
+    copy lives in guild:{id}:config, which GuildSettings reads and writes; this is
+    its projection of debug_mode, kept here because every send reads it. One
+    instance per cog, built in MusicBot.__init__."""
 
     __slots__ = (
         "_default",
+        "_default_override",
         "_overrides",
-        "_toggle_seq",
-        "_toggled_at",
-        "_unpersisted",
         "_sampler",
     )
 
     def __init__(self) -> None:
         # Read ONCE, here, so a garbage value aborts startup inside load_extension.
         self._default: bool = debug_mode_default()
+        # The operator's `-settings bot debug-default`, for this process only: never
+        # stored, so a restart returns every guild that never chose to _default.
+        self._default_override: Optional[bool] = None
         # A guild that never chose is ABSENT and follows _default, including when
         # the env var later changes — absence is not False.
         self._overrides: dict[int, bool] = {}
-        # A monotonic stamp bumped by every toggle, and its value at each guild's
-        # last toggle: hydrate() applies a Redis read across an await and uses
-        # these to leave a guild toggled in that window alone. _unpersisted holds
-        # the guilds whose cached value did NOT reach Redis.
-        self._toggle_seq: int = 0
-        self._toggled_at: dict[int, int] = {}
-        self._unpersisted: set[int] = set()
         self._sampler = RuntimeSampler()
-        if self._default and config.ENVIRONMENT == "production":
+        if self.default and config.ENVIRONMENT == "production":
             # Observation-only, so an advisory rather than a refusal.
             log.warning(
                 "DEBUG_MODE is on in production: every command response will "
@@ -1746,13 +1815,26 @@ class DebugSettings:
         (and every DM) follows the host default. Synchronous and in-memory:
         MusicContext.send calls this on every reply."""
         if guild_id is None:
-            return self._default
-        return self._overrides.get(guild_id, self._default)
+            return self.default
+        return self._overrides.get(guild_id, self.default)
 
     @property
     def default(self) -> bool:
-        """The host's DEBUG_MODE, which a guild with no stored choice follows."""
+        """What a guild with no stored choice follows: the operator's session
+        override when one is set, else the host's DEBUG_MODE."""
+        if self._default_override is not None:
+            return self._default_override
         return self._default
+
+    @property
+    def host_default(self) -> bool:
+        """DEBUG_MODE, as read at startup."""
+        return self._default
+
+    @property
+    def default_override(self) -> Optional[bool]:
+        """The operator's session default, or None while DEBUG_MODE applies."""
+        return self._default_override
 
     @property
     def snapshot(self) -> Optional[RuntimeSnapshot]:
@@ -1763,10 +1845,6 @@ class DebugSettings:
     def has_override(self, guild_id: Optional[int]) -> bool:
         """Has this guild made an explicit choice, rather than following the host?"""
         return guild_id is not None and guild_id in self._overrides
-
-    def is_persisted(self, guild_id: Optional[int]) -> bool:
-        """Did this guild's choice reach Redis? True for a guild that never chose."""
-        return guild_id not in self._unpersisted
 
     def footer(
         self, guild: Optional[discord.Guild], *, host_metrics: bool = True
@@ -1814,81 +1892,44 @@ class DebugSettings:
         )
 
     # ── Mutations ─────────────────────────────────────────────────────────────
+    # The stored choices are written by GuildSettings, the one writer of
+    # guild:{id}:config; these project what it read or committed.
 
-    async def hydrate(
-        self, redis: Optional[aioredis.Redis], guilds: Sequence[discord.Guild]
-    ) -> None:
-        """Hydrate the in-memory cache from each guild's stored config. Runs at
-        cog_load and again on every on_ready, so it must be safe to replay. Two
-        skip rules: a guild whose config could not be READ is skipped
-        (read_guild_configs omits it, so "Redis blinked" cannot revert a stored
-        choice to the host default), and a guild toggled while this pass was
-        reading is skipped (the read and the apply straddle an await)."""
-        if redis is None:
-            return
-        guilds = list(guilds)
-        if not guilds:
-            return
-        started = self._toggle_seq
-        configs = await read_guild_configs(redis, [g.id for g in guilds])
-        for guild in guilds:
-            config = configs.get(guild.id)
-            if config is None or self._toggled_at.get(guild.id, 0) > started:
-                continue
-            if config.debug_mode is None:
-                # No stored choice: follow the host default, uncached, or a later
-                # env change would not reach this guild.
-                self._overrides.pop(guild.id, None)
+    def apply_choices(self, choices: Mapping[int, Optional[bool]]) -> None:
+        """Cache each guild's choice; None means none is stored, so the guild
+        follows the default, uncached, and a later default change still reaches
+        it. One sampler re-check for the whole batch. Whether a choice reached
+        Redis is GuildSettings.is_persisted's to answer."""
+        for guild_id, choice in choices.items():
+            if choice is None:
+                self._overrides.pop(guild_id, None)
             else:
-                self._overrides[guild.id] = config.debug_mode
-                self._unpersisted.discard(guild.id)
+                self._overrides[guild_id] = choice
         self.sync_sampler()
 
-    async def toggle(
-        self, redis: Optional[aioredis.Redis], guild_id: int, enabled: bool
-    ) -> bool:
-        """Apply an explicit choice for one guild. Returns whether it reached
-        Redis; the caller reports that."""
-        # Redis FIRST, cache second: a failed write must not leave the cache
-        # claiming a setting the next on_ready would silently undo.
-        persisted = False
-        if redis is not None:
-            persisted = await GuildRedisStore(redis, guild_id).set_debug_mode(enabled)
-        self._overrides[guild_id] = enabled
-        # Stamp this guild so a hydration pass that read BEFORE this write cannot
-        # apply its older value on top of it.
-        self._toggle_seq += 1
-        self._toggled_at[guild_id] = self._toggle_seq
-        if persisted:
-            self._unpersisted.discard(guild_id)
-        else:
-            self._unpersisted.add(guild_id)
-        # The sampler runs only while some guild wants it.
-        self.sync_sampler()
-        log.info(
-            f"debug mode {'enabled' if enabled else 'disabled'} by command",
-            persisted=persisted,
-        )
-        return persisted
-
-    async def forget(self, redis: Optional[aioredis.Redis], guild_id: int) -> None:
-        """Drop a departed guild's override, cache and durable copy alike, or a
-        guild that removes and re-adds the bot silently resumes a setting nobody
-        there chose — and the config key carries no TTL, so it would sit in
-        Redis forever."""
-        self._toggled_at.pop(guild_id, None)
-        self._unpersisted.discard(guild_id)
+    def drop(self, guild_id: int) -> None:
+        """Forget a departed guild's choice."""
         if self._overrides.pop(guild_id, None) is not None:
             self.sync_sampler()
-        if redis is not None:
-            await GuildRedisStore(redis, guild_id).clear_config()
+
+    def set_default_override(self, value: Optional[bool]) -> None:
+        """Replace the default for this process; None returns it to DEBUG_MODE.
+        Called by BotSettings, which holds the value across a cog reload."""
+        self._default_override = value
+        if value and config.ENVIRONMENT == "production":
+            log.warning(
+                "debug mode's default is on in production for this process: every "
+                "server that has not chosen for itself shows the debug footer until "
+                "the bot restarts or the default is reset."
+            )
+        self.sync_sampler()
 
     # ── Sampler lifecycle ─────────────────────────────────────────────────────
 
     def sync_sampler(self) -> None:
         """Run the sampler exactly while some guild is effectively debug-enabled.
         Public because cog_load calls it before any toggle has happened."""
-        self._sampler.apply(wanted=self._default or any(self._overrides.values()))
+        self._sampler.apply(wanted=self.default or any(self._overrides.values()))
 
     async def aclose(self) -> None:
         """Stop the sampler, unconditionally."""

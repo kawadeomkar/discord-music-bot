@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src import config
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_mix
@@ -553,11 +554,6 @@ _SOURCE_REVALIDATIONS: set[asyncio.Task[Any]] = set()
 # carries, so this — not `expire` — keeps a dead URL from being replayed.
 _STREAM_URL_MAX_TTL = 1800  # 30 minutes
 
-# Cap on the pre-playback URL probe. Short because a resolve can pay it twice
-# and exceeding it costs a cache entry, not only a verdict; an unconfirmed URL
-# still plays, so firing early is cheap.
-_STREAM_PROBE_TIMEOUT = float(os.environ.get("STREAM_PROBE_TIMEOUT_SECS", "2.0"))
-
 # Consecutive UNCONFIRMED verdicts before the probe itself, not the URLs, is
 # treated as the fault (blocked egress, DNS): past this, cached URLs are served
 # as-is instead of dropped.
@@ -798,7 +794,9 @@ def _get_probe_session() -> aiohttp.ClientSession:
             # limit=0: the default 100 would queue the 101st probe against its
             # own 2s budget and report a healthy URL as UNCONFIRMED.
             connector=aiohttp.TCPConnector(limit=0),
-            timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT),
+            # A backstop only: every probe passes its own timeout, which replaces
+            # this one. Without one, a request passing none waits aiohttp's 300s.
+            timeout=aiohttp.ClientTimeout(total=config.STREAM_PROBE_TIMEOUT_MAX_SECS),
             cookie_jar=aiohttp.DummyCookieJar(),
             # The Location header is parsed as URL(loc, encoded=not this): a redirect
             # gets the same pre-encoded treatment _probe_target gives the first hop.
@@ -832,9 +830,12 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
     try:
         session = _get_probe_session()
         # read_bufsize=0 + close(), not release(): only the status line matters,
-        # read_bufsize=0 + close(), not release(): only the status line matters,
         # and aiohttp otherwise buffers audio from the moment headers land.
-        async with session.get(_probe_target(stream_url), read_bufsize=0) as response:
+        # Per request, read at the call: a bot-setting change reaches the next probe.
+        timeout = aiohttp.ClientTimeout(total=config.stream_probe_timeout_secs())
+        async with session.get(
+            _probe_target(stream_url), read_bufsize=0, timeout=timeout
+        ) as response:
             # Only a definite client-side refusal is DEAD: 429 and 5xx say "not
             # right now", as a timeout does, and ffmpeg's -reconnect would very
             # likely have played the song.
@@ -1926,9 +1927,8 @@ class YTDL(discord.FFmpegOpusAudio):
             )
             # Warms the stream cache from the same extraction, so queue_put's
             # prefetch_stream is a cache hit. STARTED, not awaited: the reply needs
-            # identity, and the probe behind that write is a network round trip
-            # bounded only by _STREAM_PROBE_TIMEOUT. Whoever reaches the cache first
-            # joins the same job through _stream_cache_get.
+            # identity, and the probe behind that write is a network round trip.
+            # Whoever reaches the cache first joins that job through _stream_cache_get.
             _start_stream_warm(redis, _stream_cache_key(webpage_url), video_data)
             trace.get_current_span().set_attribute("ytdl.stream_warm_started", True)
 

@@ -29,6 +29,8 @@ from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
     DEFAULT_TIMEZONE,
+    ConfigField,
+    GuildConfig,
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
@@ -36,7 +38,7 @@ from src.guild_state import (
     parse_queue_entry,
 )
 from src.redis_client import GuildRedisStore
-from src import musicplayer
+from src import config, musicplayer
 from src.commands import replay as replay_cmd
 from src.musicplayer import (
     MusicPlayer,
@@ -65,6 +67,7 @@ from tests.helpers import (
     queue_object,
     replayed_song,
     seed_queue,
+    stalled_config_reads,
     stub_create_task,
 )
 
@@ -6450,6 +6453,34 @@ class TestProgressUpdater:
 
         assert music_player._np_host_message is new_host
 
+    async def test_the_cadence_is_read_every_tick_and_never_faster_than_the_bot(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """A change lands after the sleep in progress, which keeps its length."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        self._host(music_player)
+        guild_settings = music_player._cog.guild_settings
+        guild_id = music_player._guild.id
+        slept: list[float] = []
+
+        async def _sleep(secs: float) -> None:
+            slept.append(secs)
+            if len(slept) == 1:
+                await guild_settings.write(guild_id, GuildConfig(np_refresh_secs=10.0))
+            elif len(slept) == 2:
+                config.set_override("NOW_PLAYING_UPDATE_INTERVAL_SECS", 12.0)
+            else:
+                raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._progress_updater(mock_song)
+
+        assert slept == [3.0, 10.0, 12.0]
+
     async def test_logs_and_continues_on_http_exception(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -7575,6 +7606,138 @@ class TestRestoreStateTtlRefresh:
 
 
 # ── Loop ──────────────────────────────────────────────────────────────────────
+
+
+class TestIdleTimeout:
+    """The wait for the next song is the server's idle-timeout, read from the cache
+    once per wait; resolving the entry that wait hands over keeps its own bound."""
+
+    @staticmethod
+    def _seed(mp: MusicPlayer, secs: float | None) -> None:
+        guild_settings = mp._cog.guild_settings
+        with guild_settings.reading() as started:
+            guild_settings.seed(
+                mp._guild.id, GuildConfig(idle_timeout_secs=secs), started=started
+            )
+
+    @staticmethod
+    def _stopped(stopped: asyncio.Event) -> Callable[[Any], Awaitable[None]]:
+        async def _stop(_self: Any) -> None:
+            stopped.set()
+
+        return _stop
+
+    @pytest.mark.parametrize(
+        ("stored", "wait"), [(None, 300.0), (600.0, 600.0), (1800.0, 1800.0)]
+    )
+    async def test_the_wait_is_the_servers_idle_timeout(
+        self, music_player: MusicPlayer, stored: float | None, wait: float
+    ) -> None:
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        self._seed(music_player, stored)
+        delays: list[float] = []
+        real_timeout = musicplayer.async_timeout.timeout
+
+        def _spy(delay: float) -> Any:
+            delays.append(delay)
+            return real_timeout(delay)
+
+        stopped = asyncio.Event()
+        with (
+            patch.object(musicplayer.async_timeout, "timeout", _spy),
+            patch.object(
+                MusicPlayer,
+                "queue_get",
+                new=AsyncMock(side_effect=asyncio.TimeoutError()),
+            ),
+            patch.object(MusicPlayer, "stop", new=self._stopped(stopped)),
+        ):
+            await music_player.loop()
+        await asyncio.sleep(0)
+        assert delays == [musicplayer._PLAYBACK_GATE_TIMEOUT, wait]
+        assert stopped.is_set()
+
+    async def test_a_change_applies_from_the_next_wait(
+        self, music_player: MusicPlayer
+    ) -> None:
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        delays: list[float] = []
+        real_timeout = musicplayer.async_timeout.timeout
+
+        def _spy(delay: float) -> Any:
+            delays.append(delay)
+            return real_timeout(delay)
+
+        gets = 0
+
+        async def _get(self_inner: MusicPlayer) -> Never:
+            nonlocal gets
+            gets += 1
+            if gets == 1:
+                # Written during the first wait; the loop's error path starts the next.
+                await self_inner._cog.guild_settings.write(
+                    self_inner._guild.id, GuildConfig(idle_timeout_secs=600.0)
+                )
+                raise RuntimeError("boom")
+            raise asyncio.TimeoutError()
+
+        with (
+            patch.object(musicplayer.async_timeout, "timeout", _spy),
+            patch.object(MusicPlayer, "queue_get", new=_get),
+            patch.object(MusicPlayer, "stop", new=self._stopped(asyncio.Event())),
+        ):
+            await music_player.loop()
+        assert delays == [musicplayer._PLAYBACK_GATE_TIMEOUT, 300.0, 600.0]
+
+    async def test_a_stalled_store_does_not_hold_the_loop_from_its_wait(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The pool has no socket_timeout. The setting comes from the cache, so a
+        Redis that accepts and never answers cannot keep the loop from its wait."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        reached = asyncio.Event()
+
+        async def _get(_self: Any) -> Never:
+            reached.set()
+            raise asyncio.TimeoutError()
+
+        with (
+            stalled_config_reads(),
+            patch.object(MusicPlayer, "queue_get", new=_get),
+            patch.object(MusicPlayer, "stop", new=self._stopped(asyncio.Event())),
+        ):
+            async with asyncio.timeout(1):
+                await music_player.loop()
+        assert reached.is_set()
+
+    async def test_a_wedged_resolve_keeps_its_own_bound_at_the_longest_wait(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Bounded by the setting, a resolve that never returns would hold a guild
+        with songs queued silent for up to 30 minutes."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).return_value = False
+        self._seed(music_player, 1800.0)
+        seed_queue(music_player.queue, queue_obj)
+        never = asyncio.Event()
+
+        async def _wedged(_self: Any, _source: Any) -> Never:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        stopped = asyncio.Event()
+        with (
+            patch("src.musicplayer._IN_BAND_RESOLVE_TIMEOUT_SECS", 0.05),
+            patch.object(MusicPlayer, "_resolve_source", new=_wedged),
+            patch.object(MusicPlayer, "stop", new=self._stopped(stopped)),
+        ):
+            async with asyncio.timeout(2):
+                await music_player.loop()
+        await asyncio.sleep(0)
+        assert stopped.is_set()
 
 
 class TestLoop:
@@ -12791,6 +12954,29 @@ class TestHeartbeatUpdater:
         store.heartbeat.assert_awaited_once()
         assert store.heartbeat.await_args.args[0] == 42.5
 
+    async def test_the_cadence_follows_the_bot_setting_from_the_next_tick(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        music_player.store = AsyncMock(spec=GuildRedisStore)
+        slept: list[float] = []
+
+        async def _sleep(secs: float) -> None:
+            slept.append(secs)
+            if len(slept) == 1:
+                config.set_override("HEARTBEAT_INTERVAL_SECS", 5.0)
+            else:
+                raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)
+
+        assert slept == [3.0, 5.0]
+
     async def test_skips_while_paused(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -13070,6 +13256,173 @@ class TestVolumeMigratesForwardOnRestore:
         before = music_player.volume
         await music_player._restore_state()
         assert music_player.volume == before
+
+
+class TestRestoreOrdersAgainstSettingsWrites:
+    """A settings write or reset can commit at any await of the restore. One stamp
+    check, seed()'s accepted set, gates the zone, the volume and the migration,
+    and the migration re-checks it under the guild's lock."""
+
+    async def test_a_volume_write_after_the_read_is_kept_and_not_migrated(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await fake_redis.hset(store.state_key(), b"volume", b"0.30")
+        guild_settings = mock_ctx.cog.guild_settings
+        real_snapshot = type(store).get_playback_snapshot
+
+        async def snapshot_then_volume(self_: object) -> object:
+            snapshot = await real_snapshot(self_)  # pyright: ignore[reportArgumentType]
+            await guild_settings.write(
+                music_player._guild.id, GuildConfig(volume=0.8), player=music_player
+            )
+            return snapshot
+
+        with patch.object(
+            type(store), "get_playback_snapshot", new=snapshot_then_volume
+        ):
+            await music_player._restore_state()
+
+        assert music_player.volume == 0.8
+        assert await store.read_config() == GuildConfig(volume=0.8)
+
+    async def test_a_timezone_write_after_the_read_survives_restore(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await store.set_timezone("Asia/Tokyo")
+        guild_settings = mock_ctx.cog.guild_settings
+        real_snapshot = type(store).get_playback_snapshot
+
+        async def snapshot_then_zone(self_: object) -> object:
+            snapshot = await real_snapshot(self_)  # pyright: ignore[reportArgumentType]
+            await guild_settings.write(
+                music_player._guild.id,
+                GuildConfig(timezone="Europe/London"),
+                player=music_player,
+            )
+            return snapshot
+
+        with patch.object(type(store), "get_playback_snapshot", new=snapshot_then_zone):
+            await music_player._restore_state()
+
+        assert music_player.timezone == ZoneInfo("Europe/London")
+
+    async def test_a_volume_reset_during_the_migrations_lock_wait_is_not_undone(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis, mock_ctx: MagicMock
+    ) -> None:
+        """A guild with only a legacy volume resets it while the migration waits
+        for the lock. The migration then finds the reset's stamp and writes
+        nothing, so both copies stay deleted."""
+        store = music_player.store
+        assert store is not None
+        await fake_redis.hset(store.state_key(), b"volume", b"0.30")
+        guild_settings = mock_ctx.cog.guild_settings
+        guild_id = music_player._guild.id
+        release = asyncio.Event()
+        real_reset = GuildRedisStore.reset_volume
+        real_snapshot = type(store).get_playback_snapshot
+        reset_task: list[asyncio.Task[Any]] = []
+
+        async def parked_reset(self_: GuildRedisStore) -> bool:
+            await release.wait()
+            return await real_reset(self_)
+
+        async def snapshot_then_reset_takes_the_lock(self_: object) -> object:
+            snapshot = await real_snapshot(self_)  # pyright: ignore[reportArgumentType]
+            reset_task.append(
+                asyncio.create_task(guild_settings.reset(guild_id, ConfigField.VOLUME))
+            )
+            await asyncio.sleep(0)
+            asyncio.get_running_loop().call_later(0.01, release.set)
+            return snapshot
+
+        with (
+            patch.object(GuildRedisStore, "reset_volume", new=parked_reset),
+            patch.object(
+                type(store),
+                "get_playback_snapshot",
+                new=snapshot_then_reset_takes_the_lock,
+            ),
+        ):
+            await music_player._restore_state()
+            await reset_task[0]
+
+        assert not await fake_redis.hexists(store.config_key(), "volume")
+        assert not await fake_redis.hexists(store.state_key(), "volume")
+
+    async def test_an_out_of_domain_volume_in_both_hashes_plays_at_the_default(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await fake_redis.hset(store.state_key(), b"volume", b"1.5")
+        await fake_redis.hset(store.config_key(), b"volume", b"1.5")
+        with patch.object(GuildRedisStore, "migrate_volume", new=AsyncMock()) as seed:
+            await music_player._restore_state()
+        assert music_player.volume == 1.0
+        seed.assert_not_awaited()
+
+
+class TestRestoreAdoptsAnUnsavedSetting:
+    """A write that did not reach Redis stays in the settings cache, and seed()
+    leaves that field alone. A player built after it plays the cached value, not
+    the default and not the older stored one."""
+
+    async def test_an_unsaved_volume_plays_over_the_stored_one(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await store.set_volume(0.8)
+        with patch.object(
+            GuildRedisStore, "set_volume", new=AsyncMock(return_value=False)
+        ):
+            result = await mock_ctx.cog.guild_settings.write(
+                music_player._guild.id, GuildConfig(volume=0.3)
+            )
+        assert result.persisted is False
+
+        await music_player._restore_state()
+
+        assert music_player.volume == 0.3
+        assert await store.read_config() == GuildConfig(volume=0.8)
+
+    async def test_an_unsaved_zone_is_used_over_the_stored_one(
+        self, music_player: MusicPlayer, mock_ctx: MagicMock
+    ) -> None:
+        store = music_player.store
+        assert store is not None
+        await store.set_timezone("Asia/Tokyo")
+        with patch.object(
+            GuildRedisStore, "set_timezone", new=AsyncMock(return_value=False)
+        ):
+            await mock_ctx.cog.guild_settings.write(
+                music_player._guild.id, GuildConfig(timezone="Europe/London")
+            )
+
+        await music_player._restore_state()
+
+        assert music_player.timezone == ZoneInfo("Europe/London")
+
+    async def test_without_redis_the_cached_values_still_apply(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+    ) -> None:
+        guild_settings = mock_ctx.cog.guild_settings
+        await guild_settings.write(mock_guild.id, GuildConfig(volume=0.3))
+        await guild_settings.write(mock_guild.id, GuildConfig(timezone="Europe/London"))
+        player = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog)
+
+        await player._restore_state()
+
+        assert player.volume == 0.3
+        assert player.timezone == ZoneInfo("Europe/London")
 
 
 class TestGuildTimezoneOnRestore:

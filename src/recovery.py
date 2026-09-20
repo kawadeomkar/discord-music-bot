@@ -1,7 +1,7 @@
 """Voice-session lifecycle: rejoining after a restart, and leaving when alone.
 
 restore_guild() is the join side (crash recovery,
-docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the 10s
+docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the
 alone-disconnect countdown), and its bot-was-ejected arm routes straight to
 cog.cleanup(). The two cold-start helpers at the bottom are what -play and
 -resume both do about a join that produced no usable voice client; they live
@@ -24,7 +24,13 @@ from opentelemetry.trace import StatusCode
 from src.musicplayer import MusicPlayer
 from src.redis_client import GuildRedisStore
 from src.telemetry import get_tracer
-from src.util import first_sendable_channel, get_logger, notice_embed, record_span_error
+from src.util import (
+    first_sendable_channel,
+    fmt_duration,
+    get_logger,
+    notice_embed,
+    record_span_error,
+)
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports this module).
@@ -32,10 +38,6 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
-
-# How long the bot waits alone in a voice channel before disconnecting, and the
-# number the countdown notice quotes.
-ALONE_DISCONNECT_SECS = 10
 
 
 @_tracer.start_as_current_span("guild.restore")
@@ -222,19 +224,21 @@ class VoiceWatchdog:
 
         if len(human_members) == 0:
             self.cancel(guild.id)
+            # Read here, synchronously: the countdown's notice, sleep and log all
+            # quote this one number.
+            secs = cog.guild_settings.alone_timeout_secs(guild.id)
             log.info(
-                f"Bot is alone in guild {guild.id}, starting "
-                f"{ALONE_DISCONNECT_SECS}s disconnect timer"
+                f"Bot is alone in guild {guild.id}, starting {secs:g}s disconnect timer"
             )
-            self._timers[guild.id] = asyncio.create_task(self._countdown(guild))
+            self._timers[guild.id] = asyncio.create_task(self._countdown(guild, secs))
         else:
             if guild.id in self._timers:
                 log.info(f"User rejoined guild {guild.id}, cancelling alone timer")
             self.cancel(guild.id)
 
-    async def _countdown(self, guild: discord.Guild) -> None:
-        """Warn the guild's text channel, wait, then disconnect if the bot is
-        still alone. Cancelled if a human rejoins."""
+    async def _countdown(self, guild: discord.Guild, secs: float) -> None:
+        """Warn the guild's text channel, wait `secs`, then disconnect if the bot
+        is still alone. Cancelled if a human rejoins."""
         try:
             mp = self._cog.mps.get(guild.id)
 
@@ -252,7 +256,7 @@ class VoiceWatchdog:
                             title="No users remaining in voice channel",
                             description=(
                                 f"All users have disconnected. The bot will "
-                                f"disconnect in **{ALONE_DISCONNECT_SECS} seconds** "
+                                f"disconnect in **{fmt_duration(int(secs))}** "
                                 f"unless someone rejoins."
                             ),
                             color=discord.Color.orange(),
@@ -263,7 +267,7 @@ class VoiceWatchdog:
                             f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
                         )
 
-            await asyncio.sleep(ALONE_DISCONNECT_SECS)
+            await asyncio.sleep(secs)
 
             # Covers only the post-sleep decision: a span held open across the
             # countdown confuses OTLP exporters and leaks OTel context.
@@ -279,7 +283,7 @@ class VoiceWatchdog:
                 ):
                     log.info(
                         f"Bot still alone in guild {guild.id} after "
-                        f"{ALONE_DISCONNECT_SECS}s — disconnecting"
+                        f"{secs:g}s — disconnecting"
                     )
                     await self._cog.cleanup(guild)
         except asyncio.CancelledError:

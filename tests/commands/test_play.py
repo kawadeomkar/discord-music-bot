@@ -11,8 +11,8 @@ import orjson
 import pytest
 import redis.asyncio as aioredis
 
-from src import play_pipeline
-from src.guild_state import Analytics
+from src import config, play_pipeline
+from src.guild_state import OFF_SECS, Analytics, GuildConfig
 from src.help import CATEGORY_COMMANDS
 from src.musicbot import MusicBot
 from src.play_placement import ResolveWaitExpired
@@ -51,15 +51,16 @@ from tests.helpers import (
     command_callback,
     connected_vc,
     in_authors_channel,
-    recording_span,
-    settle,
-    song,
     mock_mp,
     no_slow_notice,
     no_typing,
     paused_vc,
     playing_vc,
     queue_object,
+    recording_span,
+    settle,
+    song,
+    stalled_config_reads,
     stub_yt_playlist,
 )
 
@@ -3288,6 +3289,65 @@ class TestPlayShowsTyping:
         assert entered == ["typing"]
 
 
+class TestTheSlowNoticeIsTheServers:
+    """-play reads its server's slow-notice as it enters the notice: synchronously,
+    from GuildSettings' cache."""
+
+    @pytest.mark.parametrize(
+        ("stored", "delay"), [(None, 6.0), (20.0, 20.0), (OFF_SECS, None)]
+    )
+    async def test_the_notice_is_handed_the_servers_delay(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        stored: Optional[float],
+        delay: Optional[float],
+    ) -> None:
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
+        play_pipeline.queue_source = AsyncMock(return_value=song(1, mock_ctx))
+        if stored is not None:
+            await music_bot.guild_settings.write(
+                mock_ctx.guild.id, GuildConfig(slow_notice_secs=stored)
+            )
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice") as notice,
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="a")
+        notice.assert_called_once()
+        assert notice.call_args.kwargs["delay"] == delay
+
+    async def test_the_notice_still_posts_when_the_store_stalls(
+        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The pool has no socket_timeout. The delay comes from the cache, so a
+        Redis that accepts and never answers holds neither the request nor its
+        notice."""
+        cog = music_bot_with_redis
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        cog.get_mp = MagicMock(return_value=mock_mp())
+        config.set_override("PLAY_SLOW_NOTICE_SECS", 0.02)
+        resolved = song(1, mock_ctx)
+
+        async def _slow_resolve(*_args: Any, **_kwargs: Any) -> Any:
+            await asyncio.sleep(0.1)
+            return resolved
+
+        play_pipeline.queue_source = _slow_resolve
+        with (
+            no_typing("src.commands.play.background_typing"),
+            stalled_config_reads(),
+        ):
+            async with asyncio.timeout(1):
+                await command_callback(MusicBot.play)(cog, mock_ctx, url="a")
+        posted = [
+            call.kwargs["embed"].description
+            for call in mock_ctx.channel.send.await_args_list
+        ]
+        assert any("Still looking up" in (text or "") for text in posted)
+
+
 class TestSpanDecoratorsNameTheirFunction:
     """A helper inserted between a decorator and the function it was written for
     silently inherits its span: bot.enqueue_playlist once measured a --next-only
@@ -4557,7 +4617,7 @@ class TestResolveWaitExpiredReply:
             no_typing("src.commands.play.background_typing"),
             patch(
                 "src.play_pipeline.queue_source",
-                new=AsyncMock(side_effect=ResolveWaitExpired()),
+                new=AsyncMock(side_effect=ResolveWaitExpired(120.0)),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -4600,7 +4660,7 @@ class TestResolveWaitExpiredReply:
             no_typing("src.commands.play.background_typing"),
             patch(
                 "src.play_pipeline._resolve_interjection_source",
-                new=AsyncMock(side_effect=ResolveWaitExpired()),
+                new=AsyncMock(side_effect=ResolveWaitExpired(120.0)),
             ),
         ):
             # --now: a plain -play over a PLAYING song does not interject.
@@ -4826,6 +4886,45 @@ class TestQueueProgressCard:
 
         assert "nterrupt" in card.last_kwargs["placement_note"]
 
+    async def test_each_entry_point_hands_the_card_its_servers_delay(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """Read from the cache as the card is entered, at both places a playlist
+        can enter one: a plain -play and an interjection over a live song."""
+        first = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
+        self._warm(music_bot, mock_ctx)
+        card = _CardSpy()
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=[first])):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+        assert card.last_kwargs["delay"] == 2.5
+
+        await music_bot.guild_settings.write(
+            mock_ctx.guild.id, GuildConfig(queue_progress_delay_secs=45.0)
+        )
+        card = _CardSpy()
+        with patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=[first])):
+            await self._play(music_bot, mock_ctx, self._PLAYLIST, card)
+        assert card.last_kwargs["delay"] == 45.0
+
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        card = _CardSpy()
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_playlist",
+                new=AsyncMock(return_value=[first]),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._PLAYLIST}"
+            )
+        assert card.last_kwargs["delay"] == 45.0
+
     @pytest.mark.parametrize("cold", [False, True], ids=["warm", "cold"])
     async def test_the_cards_handle_reaches_the_extraction(
         self, music_bot: MusicBot, mock_ctx: MagicMock, cold: bool
@@ -4868,9 +4967,12 @@ class TestQueueProgressCard:
     ) -> None:
         """The other half of the same `if`. A single track over a live song took
         the same 1-4s resolve and said nothing at all, because this entry point
-        only ever armed the card."""
+        only ever armed the card. It waits the server's slow-notice, like -play's."""
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
+        await music_bot.guild_settings.write(
+            mock_ctx.guild.id, GuildConfig(slow_notice_secs=20.0)
+        )
         notice = MagicMock(return_value=contextlib.nullcontext())
         card = _CardSpy()
         qobj = QueueObject("https://yt.com/v=1", "One", mock_ctx.author)
@@ -4889,6 +4991,7 @@ class TestQueueProgressCard:
             )
 
         notice.assert_called_once()
+        assert notice.call_args.kwargs["delay"] == 20.0
         assert card.entered == 0
 
     async def test_the_interjection_card_outlives_the_interrupt(
@@ -4958,10 +5061,10 @@ class TestQueueProgressCard:
             await asyncio.sleep(0.2)
 
         mock_ctx.message.content = f"-play {self._PLAYLIST}"
+        config.set_override("QUEUE_PROGRESS_DELAY_SECS", 0.05)
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch("src.queue_progress.QUEUE_PROGRESS_DELAY_SECS", 0.05),
             patch("src.play_pipeline._reply", new=AsyncMock(side_effect=_slow_reply)),
             patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
