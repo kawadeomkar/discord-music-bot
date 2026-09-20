@@ -26,6 +26,8 @@ def app() -> MusicBotApp:
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
+    instance.bot_settings = None
+    instance._bot_settings_hydration = None
     # history_archive / history_drainer / _liveness_task are deliberately left
     # UNSET: __new__ bypasses __init__ and setup_hook is what assigns them, so
     # unset is exactly the pre-setup_hook state close()'s getattr guard exists
@@ -38,6 +40,8 @@ def app() -> MusicBotApp:
     conn = MagicMock()
     conn.user = None
     conn.guilds = []
+    # Never logged in: BotSettings.hydrate returns at once without an id.
+    conn.application_id = None
     conn.intents = MagicMock()
     conn.intents.voice_states = True
     instance._connection = conn
@@ -122,6 +126,38 @@ class TestSetupHook:
         for ext in EXTENSIONS:
             mock_load.assert_any_await(ext)
 
+    async def test_prewarms_the_pool_with_the_worker_warm_up(
+        self, app: MusicBotApp
+    ) -> None:
+        """The warm-up is a parameter with a default, so a setup_hook that forgot it
+        would still spawn workers, still type-check, and still pay the
+        first-YoutubeDL cost on the first -play. Only this pins the wiring."""
+        from src.youtube import warm_worker
+
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch("src.youtube.ytdlp_pool.prewarm") as mock_prewarm,
+        ):
+            await app.setup_hook()
+
+        mock_prewarm.assert_called_once_with(warm_worker)
+
+    async def test_startup_checks_the_ytdlp_cache_is_writable(
+        self, app: MusicBotApp
+    ) -> None:
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch("src.youtube.ytdlp_pool.prewarm"),
+            patch("src.youtube.warn_if_cache_unwritable") as check,
+        ):
+            await app.setup_hook()
+
+        check.assert_called_once_with()
+
     @pytest.mark.parametrize("value", [None, ""])
     async def test_missing_postgres_url_refuses_to_start(
         self,
@@ -171,6 +207,95 @@ class TestSetupHook:
         mock_drainer.start.assert_called_once()
         assert app.history_archive is mock_archive
         assert app.history_drainer is mock_drainer
+
+
+class TestBotSettingsStartup:
+    """BOT_SETTINGS_OVERRIDES is read before the pool, and hydration never holds
+    setup_hook."""
+
+    @pytest.fixture(autouse=True)
+    def archive_disabled(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        app.history_archive = None
+        app.history_drainer = None
+
+    async def test_garbage_aborts_before_the_pool(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", "ignored")
+        with (
+            patch("src.main.create_redis_pool") as create,
+            pytest.raises(ValueError, match="BOT_SETTINGS_OVERRIDES"),
+        ):
+            await app.setup_hook()
+        create.assert_not_called()
+
+    async def test_setup_hook_returns_while_hydration_is_stalled(
+        self, app: MusicBotApp
+    ) -> None:
+        """Every knob runs on its environment value until the read lands."""
+        stalled = asyncio.Event()
+
+        async def never_answers(_: object) -> None:
+            await stalled.wait()
+
+        app._connection.application_id = 123456789012345678
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch("src.settings.BotConfigStore.read_config", new=never_answers),
+        ):
+            async with asyncio.timeout(5):
+                await app.setup_hook()
+            hydration = app._bot_settings_hydration
+            assert hydration is not None and not hydration.done()
+            assert app.bot_settings is not None
+            assert app.bot_settings.hydrated is False
+            assert config.heartbeat_interval_secs() == config.HEARTBEAT_INTERVAL_SECS
+            hydration.cancel()
+
+    async def test_the_flag_reaches_bot_settings(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", "ignore")
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert app.bot_settings is not None
+        assert app.bot_settings.ignore_stored is True
+
+    async def test_on_ready_retries_a_failed_hydration_once_it_has_ended(
+        self, app: MusicBotApp
+    ) -> None:
+        bot_settings = MagicMock()
+        bot_settings.hydrated = False
+        bot_settings.hydrate_until_read = AsyncMock()
+        app.bot_settings = bot_settings
+        with patch.object(
+            MusicBotApp, "latency", new_callable=PropertyMock, return_value=0.05
+        ):
+            await app.on_ready()
+            task = app._bot_settings_hydration
+            assert task is not None
+            await task
+            # Still running from the last READY: no second read beside it.
+            parked = asyncio.create_task(asyncio.Event().wait())
+            app._bot_settings_hydration = parked
+            await app.on_ready()
+            assert app._bot_settings_hydration is parked
+            parked.cancel()
+            bot_settings.hydrated = True
+            app._bot_settings_hydration = None
+            await app.on_ready()
+        bot_settings.hydrate_until_read.assert_awaited_once()
 
 
 class TestSetupHookDisabledArchive:
@@ -579,6 +704,19 @@ class TestClose:
             await app.close()
         mock_close.assert_not_awaited()
 
+    async def test_a_pending_bot_settings_read_is_cancelled(
+        self, app: MusicBotApp
+    ) -> None:
+        """A retry still sleeping on its backoff would outlive the Redis pool."""
+        app._redis_pool = None
+        pending = asyncio.create_task(asyncio.Event().wait())
+        app._bot_settings_hydration = pending
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await app.close()
+        await asyncio.gather(pending, return_exceptions=True)
+        assert pending.cancelled()
+        assert app._bot_settings_hydration is None
+
     async def test_calls_super_close(self, app: MusicBotApp) -> None:
         app._redis_pool = None
         with patch.object(
@@ -908,6 +1046,65 @@ class TestHelpFlag:
             await app.invoke(ctx)
         mock_super.assert_awaited_once_with(ctx)
         ctx.send_help.assert_not_awaited()
+
+
+class TestCommandNotFound:
+    """Unknown commands are dropped without a log line; everything else keeps
+    discord.py's handling. The prefix is a bare `-` with strip_after_prefix, so a
+    markdown bullet ("- milk") dispatches CommandNotFound for `milk`, which the
+    default handler logs at ERROR with a traceback."""
+
+    def _ctx(self, invoked_with: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.invoked_with = invoked_with
+        return ctx
+
+    async def test_unknown_command_is_dropped(self, app: MusicBotApp) -> None:
+        with patch.object(
+            commands.AutoShardedBot, "on_command_error", new=AsyncMock()
+        ) as mock_super:
+            await app.on_command_error(
+                self._ctx("milk"),
+                commands.CommandNotFound('Command "milk" is not found'),
+            )
+        mock_super.assert_not_awaited()
+
+    async def test_every_other_error_is_delegated(self, app: MusicBotApp) -> None:
+        """The guard is one isinstance, not a blanket swallow: anything else must
+        reach the default, whose command/cog checks are what stop
+        MusicBot.cog_command_error's errors being logged a second time."""
+        ctx = self._ctx("play")
+        error = commands.CheckFailure("nope")
+        with patch.object(
+            commands.AutoShardedBot, "on_command_error", new=AsyncMock()
+        ) as mock_super:
+            await app.on_command_error(ctx, error)
+        mock_super.assert_awaited_once_with(ctx, error)
+
+    async def test_the_logged_token_is_bounded(self, app: MusicBotApp) -> None:
+        """invoked_with is one whitespace-free token and nothing caps its length —
+        a 2,000-character dash-prefixed message must not log whole."""
+        with (
+            patch.object(commands.AutoShardedBot, "on_command_error", new=AsyncMock()),
+            patch("src.main.log") as mock_log,
+        ):
+            await app.on_command_error(
+                self._ctx("x" * 2000), commands.CommandNotFound("...")
+            )
+        logged = mock_log.debug.call_args.args[0]
+        # The cap itself, not a bound loose enough to survive widening it.
+        assert "x" * 32 in logged
+        assert "x" * 33 not in logged
+
+    @pytest.mark.parametrize("token", ["milk", "pn", "playnow", "paly"])
+    async def test_no_token_earns_a_reply(self, app: MusicBotApp, token: str) -> None:
+        """Dropping is silent for the user too — no token gets a did-you-mean. A
+        reply here is reachable from ordinary chat: with strip_after_prefix, a
+        bullet reading "- pn" lands in exactly this branch."""
+        ctx = self._ctx(token)
+        with patch.object(commands.AutoShardedBot, "on_command_error", new=AsyncMock()):
+            await app.on_command_error(ctx, commands.CommandNotFound("..."))
+        ctx.send.assert_not_called()
 
 
 class TestOnReady:

@@ -1,5 +1,6 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import functools
 import os
 import re
 import sys
@@ -7,14 +8,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import aiohttp
 import discord
 import fakeredis
 import pytest
 
-from src import play_pipeline
+from src import play_pipeline, util
 import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
@@ -23,12 +24,21 @@ import src.spotify as spotify_mod
 import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
+from src.guild_state import ANALYTICS_ZERO
 from src.musicbot import MusicBot
+from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
+from src.settings import GuildSettings
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
-from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
+from tests.helpers import (
+    add_settings_state,
+    noop_ffmpeg_init,
+    stub_create_task,
+    tier_enabled,
+)
+from tests.mock_spec_cache import check_for_drift, install as install_mock_spec_cache
 
 # Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
 # is first imported, so a per-test setenv would lose the race with whichever test
@@ -37,6 +47,11 @@ from tests.helpers import noop_ffmpeg_init, stub_create_task, tier_enabled
 # here, which is what would otherwise look like `just test` hanging. Third copy of
 # this path — Dockerfile's test and runtime stages hold the other two (rule 6).
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplcache")
+
+# At import, before any test module is collected, so module-level mocks are
+# covered too. See tests/mock_spec_cache.py and
+# docs/ARCHITECTURE.md#the-mock-spec-cache.
+install_mock_spec_cache()
 
 
 def pytest_collection_modifyitems(
@@ -81,6 +96,34 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def no_leaked_progress_subscribers() -> Iterator[None]:
+    """Assert every progress subscription was released, then clear.
+
+    Same shape as the channel claim below: module state whose leak is silent. A
+    stranded subscriber keeps receiving a later extraction's counts and moves a
+    card nobody is looking at. One test asserted the dict empty; every other one
+    could leave it dirty."""
+    yield
+    leaked = {k: len(v) for k, v in youtube_mod._PROGRESS_SUBSCRIBERS.items() if v}
+    youtube_mod._PROGRESS_SUBSCRIBERS.clear()
+    assert not leaked, f"progress subscribers not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
+def no_leaked_channel_claims() -> Iterator[None]:
+    """Assert every per-channel claim was released, then clear.
+
+    Process-wide state, like _TYPING_HOLDS: a leaked channel id silently
+    suppresses that kind of message in that channel for the life of the process,
+    and only an assertion can tell a released claim from a cleared one. Cleared
+    before the assert so one leak cannot cascade into every later test."""
+    yield
+    leaked = {k: set(v) for k, v in util._CLAIMED_CHANNELS.items() if v}
+    util._CLAIMED_CHANNELS.clear()
+    assert not leaked, f"channel claims not released: {leaked}"
+
+
+@pytest.fixture(autouse=True)
 def reset_probe_streak() -> Iterator[None]:
     """Zero the process-wide unconfirmed-probe streak between tests.
 
@@ -91,8 +134,28 @@ def reset_probe_streak() -> Iterator[None]:
     import src.youtube as youtube
 
     youtube._unconfirmed_streak = 0
+    # Same reason, one dict over: _INFLIGHT_EXTRACTS holds futures bound to the loop
+    # that created them, and pytest-asyncio builds a new loop per test. A test that
+    # abandons a leader would otherwise leave a key later tests await on — a hang in
+    # an unrelated test, not a failure in the one that caused it.
+    youtube._INFLIGHT_EXTRACTS.clear()
     yield
+    youtube._INFLIGHT_EXTRACTS.clear()
     youtube._unconfirmed_streak = 0
+
+
+@pytest.fixture(autouse=True)
+def reset_spotify_walks() -> Iterator[None]:
+    """The Spotify walk registry holds futures bound to the loop that created them,
+    as _INFLIGHT_EXTRACTS does, and a left subscriber would feed a later test's
+    card from an earlier test's walk."""
+    import src.spotify as spotify
+
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
+    yield
+    spotify._INFLIGHT_PLAYLISTS.clear()
+    spotify._PLAYLIST_SUBSCRIBERS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -113,6 +176,11 @@ async def close_shared_http_sessions(
     created: list[tuple[Any, Any]] = []
     original = spotify_mod.Spotify._session_or_create
 
+    # wraps() so the spec cache sees through it: this is autouse, so Spotify is
+    # monkeypatched for every test, and the cog fixtures below snapshot the class
+    # while it is. unwrap() reaching `original` keeps that snapshot honest even if
+    # the two ever differ in async-ness (tests/mock_spec_cache.py).
+    @functools.wraps(original)
     def tracked(self: Any) -> Any:
         session = original(self)
         if not any(s is session for _, s in created):
@@ -135,6 +203,32 @@ async def close_shared_http_sessions(
             owner._session = None
     finally:
         await close_probe_session()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def fail_on_stale_mock_spec_cache() -> Iterator[None]:
+    """Fail the run if a spec class is still mutated at the end of the session.
+
+    The cache snapshots `dir(spec)` the first time it sees a class and answers
+    from that snapshot for the rest of the process, so a `patch.object` or
+    `monkeypatch.setattr` on a spec class poisons every later mock of it. The
+    failure is silent — a mock that is subtly wrong, not one that raises.
+
+    This compares each entry against its class as it stands now, which catches a
+    mutation that outlived the run and not one already reverted. Set
+    MOCK_SPEC_CACHE_STRICT=1 to check where each entry is served instead; that
+    covers the reverted case and names the test holding the patch, at the cost of
+    the cache's speedup. See `check_for_drift` in tests/mock_spec_cache.py.
+    """
+    yield
+    drift = check_for_drift()
+    if drift:
+        raise AssertionError(
+            "tests/mock_spec_cache.py served stale spec data: a spec class was "
+            "mutated after its first spec'd mock, so an unknown number of the "
+            "mocks built in this run came from the pre-mutation snapshot.\n  "
+            + "\n  ".join(drift)
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -215,10 +309,26 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     the one hundreds of embed assertions encode: with it on, every embed the bot
     sends grows a debug footer — command responses, the Now Playing block at every
     render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
+
+    BOT_SETTINGS_OVERRIDES is scrubbed so a shell exporting `ignore` cannot turn
+    every BotSettings test into a refusal.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("DEBUG_MODE", raising=False)
+    monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+
+
+@pytest.fixture(autouse=True)
+def reset_owner_lookup_backoff() -> Iterator[None]:
+    """Forget a failed owner lookup between tests. The deadline is module-global,
+    so one test's raising is_owner would otherwise deny every operator check for
+    the next 60s of the suite."""
+    import src.util as util
+
+    util._owner_lookup_retry_at = 0.0
+    yield
+    util._owner_lookup_retry_at = 0.0
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -250,6 +360,40 @@ def reset_structlog_contextvars() -> Iterator[None]:
     structlog.contextvars.clear_contextvars()
     yield
     structlog.contextvars.clear_contextvars()
+
+
+@pytest.fixture(autouse=True)
+def settle_youtube_background_jobs() -> Iterator[None]:
+    """Drain the two fire-and-forget registries src.youtube keeps between tests.
+
+    Both outlive the call that started them by design — the stream-cache warm the
+    reply does not wait for, and the source-cache revalidation served behind a stale
+    hit. Each test gets its own event loop, so one left pending is a task destroyed
+    on a closed loop, and its patches are long gone by the time it would run.
+    """
+    import src.youtube as youtube
+
+    yield
+    pending = [
+        *youtube._INFLIGHT_STREAM_WARMS.values(),
+        *youtube._SOURCE_REVALIDATIONS,
+    ]
+    for job in pending:
+        job.cancel()
+    youtube._INFLIGHT_STREAM_WARMS.clear()
+    youtube._SOURCE_REVALIDATIONS.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_bot_knob_overrides() -> Iterator[None]:
+    """Clear every config knob override after each test, pass or fail. Tests set
+    one with config.set_override, which type-checks the value; an override left
+    behind would reach every later test that reads the knob's accessor."""
+    from src import config
+
+    yield
+    for knob in config.FLOAT_KNOBS | config.INT_KNOBS:
+        config.clear_override(knob)
 
 
 @pytest.fixture
@@ -296,6 +440,9 @@ def mock_message(mock_author: MagicMock, mock_channel: MagicMock) -> MagicMock:
     message = MagicMock(spec=discord.Message)
     message.author = mock_author
     message.channel = mock_channel
+    # Present because Message carries one, not because the command path reads it:
+    # parse_input takes its search from the bound argument alone. A test that wants
+    # a specific input passes it as `url=`.
     message.content = "-play test song"
     message.add_reaction = AsyncMock()
     # A real tz-aware datetime, as discord.py derives from the message snowflake:
@@ -324,6 +471,16 @@ def mock_ctx(
     # runtime.
     ctx.cog.debug_settings.enabled = MagicMock(return_value=False)
     ctx.cog.debug_settings.snapshot = None
+    # GuildSettings reads these off the cog at call time, and auto-vivified they
+    # are a truthy redis it would write through and a MagicMock application id
+    # HSET cannot encode. A real GuildSettings, not a spec'd mock: its accessors
+    # then return registry defaults, and a test that needs a stored value seeds
+    # it, so GuildConfig's domain check runs. This mock is the cog of every
+    # player the suite builds, including the ones the real get_mp builds.
+    ctx.cog.redis = None
+    ctx.cog.mps = {}
+    ctx.cog.bot.application_id = None
+    ctx.cog.guild_settings = GuildSettings(ctx.cog)
     ctx.send = AsyncMock()
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
@@ -336,9 +493,12 @@ def mock_ctx(
     # Explicit, for the same reason mock_author pins guild_permissions: a bare
     # MagicMock answers `.extras.get("anything")` with a truthy mock, so every
     # command would look like it carried every flag. cog_before_invoke reads
-    # `extras["observation_only"]` to decide whether to skip get_mp(), and an
+    # `extras["skips_player_setup"]` to decide whether to skip get_mp(), and an
     # auto-mock there silently exempts the whole suite.
     ctx.command.extras = {}
+    # A real name, not a MagicMock: check_voice_permissions keys its same-channel
+    # exemption on it, and -play's insert re-runs that check against this author.
+    ctx.command.name = "play"
     return ctx
 
 
@@ -357,6 +517,11 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
     bot.history_drainer = MagicMock()
+    # None, for the same reason: cog_load hands an existing BotSettings this
+    # session's debug-default, and a MagicMock there would turn debug mode on for
+    # every guild. A bot that never logged in has no application id.
+    bot.bot_settings = None
+    bot.application_id = None
     # start() IS reached now: a command wrapper resolves its player as an argument,
     # so get_mp() runs on every path including the early returns a body used to take
     # before it. Without this the loop() coroutine is created, never scheduled by the
@@ -364,6 +529,91 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     # turns into a failure on whichever test the collection lands in.
     bot.loop.create_task = stub_create_task()
     return bot
+
+
+@pytest.fixture
+def mock_song() -> MagicMock:
+    """A mock YTDL-like song object with all metadata attributes."""
+    song = MagicMock()
+    song.title = "Test Song Title"
+    song.requester = MagicMock()
+    song.requester.mention = "<@123456>"
+    song.requester.id = 123456
+    song.requester.display_name = "TestUser"
+    song.webpage_url = "https://www.youtube.com/watch?v=testid"
+    song.duration = "0:03:30"
+    song.uploader = "Test Channel"
+    song.views = 1_000_000
+    song.likes = 50_000
+    song.dislikes = 500
+    song.thumbnail = "https://img.youtube.com/vi/testid/0.jpg"
+    song.duration_secs = 210
+    song.elapsed_secs = 0.0
+    song.start_offset = 0
+    song.abr = 128
+    song.asr = 44100
+    song.acodec = "opus"
+    # Interjection flags a real YTDL always carries — as bare MagicMock attributes
+    # they'd read truthy and trip the loop's start_paused/is_resume gates.
+    song.interjected = False
+    song.is_resume = False
+    song.start_paused = False
+    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+    # clamps its fields into the play_history column domain. query_source likewise
+    # a real string — the slug clamp regex-matches it and a MagicMock raises
+    # TypeError there, exactly as a MagicMock title would.
+    song.analytics = ANALYTICS_ZERO
+    song.query_source = ""
+    # Same reason: the resume tail an interjection builds carries it, and it is
+    # serialized straight to the queue mirror.
+    song.user_input = None
+    # Unstamped, like a song the loop has not started yet: the loop's or-stamp
+    # writes the real clock here, and the epoch clamp raises on a MagicMock.
+    song.played_at = 0.0
+    # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
+    # reads `traceparent` off it to link this song's trace to the extraction that
+    # minted its URL, and a MagicMock there would be a str where a str is parsed.
+    song.data = {}
+    # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
+    # so tests that set either attribute get the derived position automatically.
+    type(song).position_secs = PropertyMock(
+        side_effect=lambda: song.start_offset + song.elapsed_secs
+    )
+    return song
+
+
+@pytest.fixture
+def mock_vc() -> MagicMock:
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    return vc
+
+
+@pytest.fixture
+def live_song(mock_song: MagicMock) -> MagicMock:
+    """mock_song with the interjection flags a real YTDL carries — bare MagicMock
+    attributes would read truthy and trip the loop's is_resume/start_paused
+    gates."""
+    mock_song.interjected = False
+    mock_song.is_resume = False
+    mock_song.start_paused = False
+    # Real values: a bare MagicMock reads truthy for both, and would hide a rebuild
+    # that drops either.
+    mock_song.user_input = "https://open.spotify.com/playlist/live"
+    mock_song.persisted = True
+    return mock_song
+
+
+@pytest.fixture
+def replayer(mock_author: MagicMock) -> MagicMock:
+    """The caller of -replay, distinct from whoever queued the live song: the
+    replay is their ask and both the requester and the analytics must say so."""
+    member = MagicMock(spec=discord.Member)
+    member.id = 424242
+    member.display_name = "Replayer"
+    member.mention = "<@424242>"
+    return member
 
 
 def _patch_xadd_monotonic_ids() -> None:
@@ -418,6 +668,9 @@ def music_player(
     here would ever set them (start() and the -join/-play call sites never run),
     so both are set. Tests exercising either race must clear them again first.
     """
+    # The player's store and GuildSettings share cog.redis in production, so the
+    # restore's SEED write lands on the server its tests read.
+    mock_ctx.cog.redis = fake_redis
     mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
     mp._restore_complete.set()
     mp._playback_gate.set()
@@ -445,7 +698,7 @@ def ytdl_instance(
     import discord as d
     from src.youtube import YTDL, YTDLVideoInfo
 
-    def _make(data: Optional[dict] = None) -> Any:
+    def _make(data: Optional[dict] = None, **carried: Any) -> Any:
         default_data = {
             "url": "https://r2.googlevideo.com/stream?expire=9999999999",
             "webpage_url": "https://www.youtube.com/watch?v=test",
@@ -474,6 +727,10 @@ def ytdl_instance(
                 # construction; the cast is the info-dict shape assertion.
                 data=cast(YTDLVideoInfo, default_data),
                 requester=mock_author,
+                # Carried QueueObject fields, so a test can drive the paths that
+                # read them back off a REAL YTDL rather than a mock that invents
+                # whatever attribute it is asked for.
+                **carried,
             )
 
     return _make
@@ -488,6 +745,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._plays = PlayRegistry()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -513,6 +771,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    add_settings_state(cog)
     return cog
 
 
@@ -536,6 +795,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._plays = PlayRegistry()
     # spec'd, not bare: it supplies the async doubles cog_unload awaits and
     # rejects an attribute Spotify does not have, which is how a renamed method
     # gets caught here rather than passing against a mock that invents it. spec
@@ -559,10 +819,21 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
+    add_settings_state(cog)
     return cog
 
 
-_PLAY_STAGES = ("queue_source", "enqueue_single", "enqueue_playlist")
+_PLAY_STAGES = (
+    "queue_source",
+    "enqueue_single",
+    "enqueue_playlist",
+    "interject_flow",
+    "_resolve_interjection_source",
+)
+
+# The cold-start teardown -play reaches through, stubbed by the routing tests the
+# same way and restored for the same reason.
+_PLAY_CMD_SEAMS = ("abandon_cold_start",)
 
 
 @pytest.fixture(autouse=True)
@@ -573,7 +844,12 @@ def _restore_play_stages() -> Iterator[None]:
     next one runs against the previous one's mock. Here rather than in one test file
     because -play, -playnow and the pipeline's own tests all stub them.
     """
+    from src.commands import play as play_cmd
+
     saved = {name: getattr(play_pipeline, name) for name in _PLAY_STAGES}
+    saved_cmd = {name: getattr(play_cmd, name) for name in _PLAY_CMD_SEAMS}
     yield
     for name, fn in saved.items():
         setattr(play_pipeline, name, fn)
+    for name, fn in saved_cmd.items():
+        setattr(play_cmd, name, fn)

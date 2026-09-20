@@ -2,23 +2,18 @@ import math
 import os
 import subprocess
 from enum import Enum
-from typing import Final, Optional
+from typing import Final, Literal, Optional, TypeIs, cast, get_args, overload
 from urllib.parse import unquote, urlsplit
 
-# The deploy environment, tagged onto every log line and OTel resource. Read
-# from the environment alone, so importing this module runs no subprocess and
-# needs no git repo. main() may replace it before setup_telemetry() — read it as
-# `config.ENVIRONMENT`, never `from src.config import ENVIRONMENT`, or the value
-# binds before that.
+# Read from the environment alone so importing runs no subprocess. main() may
+# replace it before setup_telemetry(): read `config.ENVIRONMENT`, never import
+# the name, or the value binds too early.
 ENVIRONMENT: str = os.environ.get("ENVIRONMENT") or "development"
 
 
 def infer_environment_from_git() -> Optional[str]:
-    """Best-effort deploy-environment name from the current git branch.
-
-    None when the branch cannot be determined: no repo, no git binary, or a
-    detached HEAD, which `git rev-parse --abbrev-ref HEAD` reports as "HEAD" and
-    which is the normal state of a worktree. Never raises."""
+    """Deploy-environment name from the git branch; None when there is no repo,
+    no git binary, or a detached HEAD (reported as "HEAD"). Never raises."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -34,31 +29,25 @@ def infer_environment_from_git() -> Optional[str]:
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
-# Touched by a loop-resident task so the container HEALTHCHECK can tell a wedged
-# event loop from a healthy one. Unset — the default outside Docker — skips the
-# task; nothing reads the file there.
-LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
-LIVENESS_INTERVAL_SECS: float = float(os.environ.get("LIVENESS_INTERVAL_SECS", "15.0"))
-
-NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
-    os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
-)
+# The `minimum=` each _float_env/_int_env call enforced, by variable. The -settings
+# registry holds every chat minimum against it, so the floor it checks is the one the
+# parse applied.
+_ENV_FLOORS: Final[dict[str, float]] = {}
 
 
-def _float_env(name: str, default: float, *, minimum: float) -> float:
-    """Parse a float knob from the environment, or raise a named error.
-
-    Same empty-reads-as-unset rule as _int_env below, and the same reason for raising
-    at import time. Non-finite is refused separately from the floor because `float()`
-    accepts "inf" and "nan" happily and both defeat the dashboard driver in ways a
-    minimum would not catch: `inf` makes the deadline never expire, so the command
-    holds its max_concurrency slot forever and every later run in that guild answers
-    "already running". A tick of 0 is the other half — it turns the driver's timed
-    wait into a hot spin, measured at 0.6 CPU-seconds per wall-second on the loop
-    that also carries voice heartbeats.
-    """
+def _float_env(
+    name: str, default: float, *, minimum: float, maximum: Optional[float] = None
+) -> float:
+    """Float knob from the environment; empty reads as unset. Non-finite is
+    refused separately from the floor: `inf` never expires a dashboard deadline
+    (the command then holds its concurrency slot forever) and a tick of 0 turns
+    the driver's timed wait into a hot spin."""
+    _ENV_FLOORS[name] = minimum
     raw = (os.environ.get(name) or "").strip()
     if not raw:
+        # Checked too: a floor derived from other knobs can rise past a default.
+        if default < minimum:
+            raise ValueError(f"{name} must be >= {minimum}; its default is {default}")
         return default
     try:
         value = float(raw)
@@ -68,69 +57,124 @@ def _float_env(name: str, default: float, *, minimum: float) -> float:
         raise ValueError(f"{name} must be a finite number; got {raw!r}")
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}; got {value}")
     return value
 
 
-# Floor for every live-dashboard knob. Small enough to stay a tuning knob rather than
-# a policy, large enough that the driver's wait is always a real suspension.
+# Floor for every live-dashboard knob: small enough to stay a tuning knob, large
+# enough that the driver's wait is always a real suspension.
 _MIN_DASHBOARD_SECS: Final[float] = 0.05
 
-# -ping's live-edit loop tunables. Constants, not call-time reads: the dashboard
-# reads them every tick. Here rather than in ping.py so this module stays the one
-# place that answers "what does the bot read from the environment?".
+# -ping's live-edit loop (src/dashboard.py). Env baselines: -ping reads them through
+# ping_tick_secs() and ping_deadline_secs(), once per invocation.
 PING_TICK_SECS: float = _float_env("PING_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
 PING_DEADLINE_SECS: float = _float_env(
     "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
 )
 
-# The same two knobs for -debug's live-edit loop (src/dashboard.py drives both).
-# A longer deadline than -ping's: these collectors do strictly more work per block
-# — the Postgres probe brackets a 2s sampling window between two stats queries,
-# plus a Prometheus round trip, against -ping's single reachability probe — and a
-# block that misses the deadline renders "timed out" rather than being retried,
-# so cutting it short loses real data. Keep the deadline comfortably above the
-# ~2.2s floor that window gives the Postgres block, or it times out every time.
+# -debug's live-edit loop. The Postgres block brackets a 2s sampling window plus a
+# Prometheus round trip (~2.2s floor), and a block past the deadline renders
+# "timed out" rather than being retried, so keep the deadline well above that.
 DEBUG_TICK_SECS: float = _float_env("DEBUG_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
 DEBUG_DEADLINE_SECS: float = _float_env(
     "DEBUG_DEADLINE_SECS", 8.0, minimum=_MIN_DASHBOARD_SECS
 )
 
-# How long -analytics waits for its chart before sending the card without one. Sized
-# for the cold path, which dominates. Expiring is silent — the card still sends — so
-# the deadline's job is bounding a wedged worker holding the guild's concurrency
-# slot. It bounds the CALLER: a ProcessPoolExecutor cannot cancel a running call.
+# How long -analytics waits for its chart before sending the card without one.
+# Sized for the cold path; expiring is silent. It bounds the caller, not the
+# worker — a ProcessPoolExecutor cannot cancel a running call.
 # See docs/ARCHITECTURE.md#analytics-rendering.
 ANALYTICS_RENDER_DEADLINE_SECS: float = _float_env(
     "ANALYTICS_RENDER_DEADLINE_SECS", 20.0, minimum=_MIN_DASHBOARD_SECS
 )
 
+# The live card a slow collection enqueue shows (src/queue_progress.py). The delay
+# marks the unusual rather than narrating every -play: a cache-hit playlist
+# resolves in one Redis GET and lands before it fires. Above 2.0s because a
+# measured ten-track enqueue ran 2.03s end to end and does not need a card; the
+# real trigger is a cliff at ~101 tracks, where a second continuation page makes
+# the resolve ~3.1s, so any value between 2.03 and 3.1 behaves identically.
+QUEUE_PROGRESS_DELAY_SECS: float = _float_env(
+    "QUEUE_PROGRESS_DELAY_SECS", 2.5, minimum=_MIN_DASHBOARD_SECS
+)
 
-# Floor for the playback heartbeat. Higher than the dashboard floor because each
-# tick is a Redis write per PLAYING guild rather than a local timer: at 0.05 that
-# is 20 HSET+EXPIRE round trips a second per guild, all of it AOF-appended.
+# The card's own floor, not the dashboards' 0.05: -ping and -debug can share that
+# because their deadlines cap the damage at ~8 edits, and this card has none.
+# Discord allows 5 edits / 5s per CHANNEL — one bucket, shared with the Now
+# Playing bar's 3s cadence, which already spends a third of it.
+_MIN_QUEUE_TICK_SECS: Final[float] = 2.0
+
+QUEUE_PROGRESS_TICK_SECS: float = _float_env(
+    "QUEUE_PROGRESS_TICK_SECS", 5.0, minimum=_MIN_QUEUE_TICK_SECS
+)
+
+# The card's own ceiling: nothing else bounds the work it watches, since
+# PLAY_RESOLVE_WAIT_SECS bounds the wait for a slot and not the extraction inside
+# it. Past it the card says so once and stops editing, and is deleted when the
+# enqueue settles. Floored at delay + tick; docs/ARCHITECTURE.md#queue-progress-card.
+QUEUE_PROGRESS_MAX_SECS: float = _float_env(
+    "QUEUE_PROGRESS_MAX_SECS",
+    300.0,
+    minimum=QUEUE_PROGRESS_DELAY_SECS + QUEUE_PROGRESS_TICK_SECS,
+)
+
+
+# Higher floor than the dashboards: each tick is a Redis write per PLAYING guild,
+# AOF-appended.
 _MIN_HEARTBEAT_SECS: Final[float] = 0.5
 
-# How often a playing guild records its playback position. Bounds the worst-case
-# recovery error: a crash resumes at the last heartbeat, so at most this many
-# seconds replay. Separate knob from the progress bar — that cadence is display.
+# How often a playing guild records its playback position; a crash resumes at the
+# last heartbeat, so at most this many seconds replay.
 HEARTBEAT_INTERVAL_SECS: float = _float_env(
     "HEARTBEAT_INTERVAL_SECS", 3.0, minimum=_MIN_HEARTBEAT_SECS
 )
 
+# Every playing tick is a real edit on the channel's 5-edits-per-5s bucket, which the
+# bar shares with every other message the bot edits there.
+_MIN_NOW_PLAYING_SECS: Final[float] = 1.0
+
+# How often the Now Playing card's progress bar is edited.
+NOW_PLAYING_UPDATE_INTERVAL_SECS: float = _float_env(
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0, minimum=_MIN_NOW_PLAYING_SECS
+)
+
+# A probe that does not finish is UNCONFIRMED, so a near-zero cap confirms nothing,
+# and three in a row mark the probe path itself as the fault.
+_MIN_STREAM_PROBE_SECS: Final[float] = 0.1
+
+# Cap on the pre-playback URL probe. Short because a resolve can pay it twice
+# and exceeding it costs a cache entry, not only a verdict; an unconfirmed URL
+# still plays, so firing early is cheap.
+STREAM_PROBE_TIMEOUT_SECS: float = _float_env(
+    "STREAM_PROBE_TIMEOUT_SECS", 2.0, minimum=_MIN_STREAM_PROBE_SECS
+)
+# Not a knob: the most `-settings bot stream-probe-timeout` accepts. A resolve can
+# pay the probe twice, so this is already up to 10s of silence before a song starts.
+STREAM_PROBE_TIMEOUT_MAX_SECS: Final[float] = 5.0
+
+# The HEALTHCHECK calls the file stale after 90s (Dockerfile), so the touch cadence
+# is capped well under that; the floor keeps the touch a cadence, not a spin.
+_MIN_LIVENESS_SECS: Final[float] = 1.0
+_MAX_LIVENESS_SECS: Final[float] = 60.0
+
+# Touched by a loop-resident task for the container HEALTHCHECK. Unset (the
+# default outside Docker) skips the task.
+LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
+LIVENESS_INTERVAL_SECS: float = _float_env(
+    "LIVENESS_INTERVAL_SECS",
+    15.0,
+    minimum=_MIN_LIVENESS_SECS,
+    maximum=_MAX_LIVENESS_SECS,
+)
+
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
-    """Parse an integer knob from the environment, or raise a named error.
-
-    Empty reads as unset: the bare `KEY=` shape otherwise raises at IMPORT time,
-    before setup_telemetry(), so under compose (`restart: always`) it is an
-    unstructured traceback and an infinite restart loop with nothing in Loki.
-
-    Negatives are refused. `-1` is the near-universal "no limit" idiom and means
-    the OPPOSITE downstream: `if not OUTBOX_MAX` is truthy for -1 and `depth <=
-    OUTBOX_MAX` never true, so the drainer's trim takes the entire outbox — on
-    the success path too, wiping every un-archived play roughly every 30s. The
-    message names the variable because it surfaces with no logger attached.
-    """
+    """Integer knob from the environment; empty reads as unset. Negatives are
+    refused: `-1` reads as "no limit" but `if not OUTBOX_MAX` is truthy for it
+    and `depth <= OUTBOX_MAX` never holds, so the drainer would trim the whole
+    outbox. The message names the variable because it surfaces with no logger."""
+    _ENV_FLOORS[name] = minimum
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
@@ -143,35 +187,216 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     return value
 
 
-# Opt-in ceiling on the Postgres history outbox, in entries. 0 (the default) is
-# unbounded, which is the durability contract — an entry only leaves the outbox
-# once Postgres has it. A cap trades that for bounding a non-evictable key during
-# a long outage; every drop logs at ERROR and is UNRECOVERABLE, since the cap
-# destroys the oldest entries while guild:{id}:history is capped at
-# HISTORY_CACHE_LIMIT, so anything older existed only here. Enforced on the drain
-# success path too, after each 100-entry batch, and it deliberately destroys
-# entries a drainer is holding, ACKing them first (see _enforce_cap) — so size it
-# well above BATCH_SIZE x peak burst, not just above steady-state depth.
-#
-# Sizing: ~520 bytes on the wire, ~625 stored (MEMORY USAGE against
-# redis:7-alpine at 50k stream entries), so 256mb holds roughly 429k un-archived
-# plays. Redis 8 stores the same payload in ~424 bytes; measure on your major.
+# Extraction worker processes (src/ytdlp_pool.py), ~80–120 MB RSS each. The pool is
+# sized when it spawns, so this is read once and never changes at runtime.
+YTDLP_POOL_WORKERS: int = _int_env("YTDLP_POOL_WORKERS", 4, minimum=1)
+
+# Opt-in ceiling on the history outbox, in entries; 0 is unbounded (the
+# durability contract). A cap destroys the OLDEST entries, which exist nowhere
+# else, so every drop logs ERROR. Enforced after each drain batch and against
+# entries a drainer is holding (ACKed first, see _enforce_cap): size it well above
+# BATCH_SIZE × peak burst. ~625 B stored per entry on redis:7.
 HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 
-# asyncpg's prepared-statement cache size, per connection; the default matches
-# asyncpg's own. Set 0 behind PgBouncer in transaction-pooling mode: prepared
-# statements are per-connection state and each transaction gets a different
-# backend, so a cached handle refers to something that backend has never seen.
+# asyncpg statement_cache_size per connection. Set 0 behind a transaction-pooling
+# PgBouncer, where each transaction lands on a backend that never saw the handle.
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
+
+# Zero admits nothing: every -play declined, or every resolve waiting on a slot
+# that never opens, with no error to say why.
+_MIN_PLAY_COUNT: Final[int] = 1
+# A shorter wait declines a request whenever every slot is busy at all.
+_MIN_PLAY_RESOLVE_WAIT_SECS: Final[float] = 1.0
+# Below it the notice posts, and is taken back, for nearly every -play.
+_MIN_PLAY_SLOW_NOTICE_SECS: Final[float] = 0.5
+
+# Per-guild ceiling on -play requests ADMITTED at once. Its unit is one coroutine,
+# one open span and one typing keepalive — memory, not pool time, which
+# PLAY_RESOLVE_CONCURRENCY below bounds instead.
+PLAY_INFLIGHT_MAX: int = _int_env("PLAY_INFLIGHT_MAX", 16, minimum=_MIN_PLAY_COUNT)
+# How many admitted requests may hold a yt-dlp worker at once. The pool is
+# process-wide and FIFO, so a paste burst in one guild queues every other guild's
+# in-band extractions behind it. Half the default pool.
+PLAY_RESOLVE_CONCURRENCY: int = _int_env(
+    "PLAY_RESOLVE_CONCURRENCY", 2, minimum=_MIN_PLAY_COUNT
+)
+# Bound on the WAIT for one of those slots, never on the extraction holding it: a
+# 5,547-track playlist legitimately runs 99s, and cutting it off would fail the
+# request it is serving. See docs/ARCHITECTURE.md#a-resolve-that-has-to-wait.
+PLAY_RESOLVE_WAIT_SECS: float = _float_env(
+    "PLAY_RESOLVE_WAIT_SECS", 120.0, minimum=_MIN_PLAY_RESOLVE_WAIT_SECS
+)
+# How long a request resolves before it says so. Above the 1–4s a warm resolve
+# takes, so the notice marks the unusual rather than narrating every -play.
+PLAY_SLOW_NOTICE_SECS: float = _float_env(
+    "PLAY_SLOW_NOTICE_SECS", 6.0, minimum=_MIN_PLAY_SLOW_NOTICE_SECS
+)
+
+# The tunables `-settings bot` may override, by the name of the constant holding
+# each one's environment value. Literal strings rather than an Enum: a reload of
+# this module would mint new enum classes that a registry built earlier fails
+# isinstance against.
+type FloatKnob = Literal[
+    "NOW_PLAYING_UPDATE_INTERVAL_SECS",
+    "HEARTBEAT_INTERVAL_SECS",
+    "PLAY_SLOW_NOTICE_SECS",
+    "PLAY_RESOLVE_WAIT_SECS",
+    "STREAM_PROBE_TIMEOUT_SECS",
+    "PING_TICK_SECS",
+    "PING_DEADLINE_SECS",
+    "DEBUG_TICK_SECS",
+    "DEBUG_DEADLINE_SECS",
+    "ANALYTICS_RENDER_DEADLINE_SECS",
+    "QUEUE_PROGRESS_DELAY_SECS",
+    "QUEUE_PROGRESS_TICK_SECS",
+    "QUEUE_PROGRESS_MAX_SECS",
+]
+type IntKnob = Literal["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"]
+FLOAT_KNOBS: Final[frozenset[FloatKnob]] = frozenset(get_args(FloatKnob.__value__))
+INT_KNOBS: Final[frozenset[IntKnob]] = frozenset(get_args(IntKnob.__value__))
+
+
+def is_int_knob(knob: FloatKnob | IntKnob) -> TypeIs[IntKnob]:
+    return knob in INT_KNOBS
+
+
+@overload
+def baseline(knob: IntKnob) -> int: ...
+@overload
+def baseline(knob: FloatKnob) -> float: ...
+def baseline(knob: FloatKnob | IntKnob) -> float:
+    """The knob's value as parsed from the environment, read at call time so a
+    reload of this module is what it returns."""
+    return cast(float, globals()[knob])
+
+
+def env_floor(knob: FloatKnob | IntKnob) -> float:
+    """The `minimum=` the environment parse enforced for this knob."""
+    return _ENV_FLOORS[knob]
+
+
+# Settable knobs: each accessor returns a stored -settings bot override, else the
+# UPPER_CASE env baseline. set_override's one caller in src/ is src/settings.py.
+# Consumers call the accessor when the value applies, never the baseline
+# (TestBotKnobsAreReadAtCallTime). See docs/ARCHITECTURE.md#settings-resolution.
+_FLOAT_OVERRIDES: Final[dict[FloatKnob, float]] = {}
+_INT_OVERRIDES: Final[dict[IntKnob, int]] = {}
+
+
+def now_playing_update_interval_secs() -> float:
+    return _FLOAT_OVERRIDES.get(
+        "NOW_PLAYING_UPDATE_INTERVAL_SECS", NOW_PLAYING_UPDATE_INTERVAL_SECS
+    )
+
+
+def heartbeat_interval_secs() -> float:
+    return _FLOAT_OVERRIDES.get("HEARTBEAT_INTERVAL_SECS", HEARTBEAT_INTERVAL_SECS)
+
+
+def play_slow_notice_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PLAY_SLOW_NOTICE_SECS", PLAY_SLOW_NOTICE_SECS)
+
+
+def play_inflight_max() -> int:
+    return _INT_OVERRIDES.get("PLAY_INFLIGHT_MAX", PLAY_INFLIGHT_MAX)
+
+
+def play_resolve_concurrency() -> int:
+    return _INT_OVERRIDES.get("PLAY_RESOLVE_CONCURRENCY", PLAY_RESOLVE_CONCURRENCY)
+
+
+def play_resolve_wait_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PLAY_RESOLVE_WAIT_SECS", PLAY_RESOLVE_WAIT_SECS)
+
+
+def stream_probe_timeout_secs() -> float:
+    return _FLOAT_OVERRIDES.get("STREAM_PROBE_TIMEOUT_SECS", STREAM_PROBE_TIMEOUT_SECS)
+
+
+def ping_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PING_TICK_SECS", PING_TICK_SECS)
+
+
+def ping_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get("PING_DEADLINE_SECS", PING_DEADLINE_SECS)
+
+
+def debug_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("DEBUG_TICK_SECS", DEBUG_TICK_SECS)
+
+
+def debug_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get("DEBUG_DEADLINE_SECS", DEBUG_DEADLINE_SECS)
+
+
+def analytics_render_deadline_secs() -> float:
+    return _FLOAT_OVERRIDES.get(
+        "ANALYTICS_RENDER_DEADLINE_SECS", ANALYTICS_RENDER_DEADLINE_SECS
+    )
+
+
+def queue_progress_delay_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_DELAY_SECS", QUEUE_PROGRESS_DELAY_SECS)
+
+
+def queue_progress_tick_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_TICK_SECS", QUEUE_PROGRESS_TICK_SECS)
+
+
+def queue_progress_max_secs() -> float:
+    return _FLOAT_OVERRIDES.get("QUEUE_PROGRESS_MAX_SECS", QUEUE_PROGRESS_MAX_SECS)
+
+
+@overload
+def set_override(knob: IntKnob, value: int) -> None: ...
+@overload
+def set_override(knob: FloatKnob, value: float) -> None: ...
+def set_override(knob: FloatKnob | IntKnob, value: float) -> None:
+    """Make `value` what the knob's accessor returns. Checks the type at run time
+    too — a bool is refused for either kind, a non-int for an int knob — and
+    nothing else: the -settings registry owns the bounds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{knob} override must be a number; got {value!r}")
+    if is_int_knob(knob):
+        if not isinstance(value, int):
+            raise TypeError(f"{knob} override must be an int; got {value!r}")
+        _INT_OVERRIDES[knob] = value
+    else:
+        _FLOAT_OVERRIDES[knob] = float(value)
+
+
+def clear_override(knob: FloatKnob | IntKnob) -> None:
+    """Return the knob's accessor to its environment baseline."""
+    if is_int_knob(knob):
+        _INT_OVERRIDES.pop(knob, None)
+    else:
+        _FLOAT_OVERRIDES.pop(knob, None)
+
+
+@overload
+def override(knob: IntKnob) -> Optional[int]: ...
+@overload
+def override(knob: FloatKnob) -> Optional[float]: ...
+def override(knob: FloatKnob | IntKnob) -> Optional[float]:
+    """The knob's override, or None when it runs on its baseline."""
+    if is_int_knob(knob):
+        return _INT_OVERRIDES.get(knob)
+    return _FLOAT_OVERRIDES.get(knob)
+
+
+@overload
+def effective(knob: IntKnob) -> int: ...
+@overload
+def effective(knob: FloatKnob) -> float: ...
+def effective(knob: FloatKnob | IntKnob) -> float:
+    """What the knob's accessor returns: the override, else the baseline."""
+    value = override(knob)
+    return baseline(knob) if value is None else value
 
 
 def _parse_bool_env(name: str) -> bool:
-    """Parse a boolean knob, or raise naming it. Unset and empty read as False.
-
-    Parsing is STRICT because of the failure direction: a lenient
-    anything-but-true-is-False rule turns a typo (`=on`) into an operator who
-    believes they flipped the switch while nothing changed.
-    """
+    """Strict boolean knob: unset and empty are False, a typo (`=on`) raises
+    rather than silently reading as off."""
     raw = os.environ.get(name)
     value = (raw or "").strip().lower()
     if not value:
@@ -187,99 +412,64 @@ def _parse_bool_env(name: str) -> bool:
 
 
 def history_archive_enabled() -> bool:
-    """True when the operator has opted in to the Postgres history archive.
-
-    The consent gate for long-term storage. Enabled: POSTGRES_URL required at
-    startup, every play XADDed to history:outbox, the drainer moving it into
-    play_history forever. Disabled — the default — none of that exists; Redis
-    behavior is identical either way. Read at call time (once per song at most).
-
-    Parsing is STRICT (see _parse_bool_env) because of the failure direction: a
-    typo (`HISTORY_ARCHIVE_ENABLED=on`) would otherwise leave an operator
-    believing they enabled archiving while every play goes unrecorded. Unset and
-    empty read as False — collection must be a choice.
-
-    setup_hook must call this before any other consumer: the next reader is
-    @_guild_op-wrapped push_history, where a garbage value becomes one warning per
-    song instead of a startup abort.
-    """
+    """The consent gate for the Postgres archive: POSTGRES_URL required, every
+    play XADDed to history:outbox, the drainer running. Read at call time.
+    setup_hook must read it before push_history does, because @_guild_op would
+    turn a garbage value into one warning per song instead of a startup abort."""
     return _parse_bool_env("HISTORY_ARCHIVE_ENABLED")
 
 
 def debug_mode_default() -> bool:
-    """The process-wide default for debug mode — what a guild gets before anyone
-    runs `-debug --enable`.
-
-    Debug mode is observation-only: it decorates every embed the bot sends with
-    trace/timing/runtime metadata — the live Now Playing card included — and
-    nothing else, so this is safe to leave on. Read ONCE, by
-    MusicBot.__init__, which is what makes a garbage value abort startup inside
-    load_extension.
-
-    This is the default for a guild that has never chosen, and only for as long as
-    it has not: `-debug --enable/--disable` persists to guild:{id}:config and WINS
-    over this value from then on, across restarts. Changing this env var moves every
-    guild that never chose and none that did.
-
-    Parsed by the same strict table as history_archive_enabled — unset and empty
-    are False, and a typo raises rather than silently reading as off — so there is
-    one boolean grammar in this file rather than two.
-    """
+    """Process-wide default for debug mode (observation-only embed footers) for
+    guilds that never chose with `-debug --enable/--disable` or `-settings debug`;
+    a persisted per-guild choice wins over it, and the operator's `-settings bot
+    debug-default` replaces it until restart. Read once by MusicBot.__init__ so
+    garbage aborts startup."""
     return _parse_bool_env("DEBUG_MODE")
 
 
+def bot_settings_overrides_ignored() -> bool:
+    """BOT_SETTINGS_OVERRIDES: `ignore` runs the process on environment and code
+    values, never reading bot:{application_id}:config; unset, empty and `apply`
+    apply what is stored. Anything else raises, so setup_hook reads it before
+    anything that could swallow the error."""
+    raw = os.environ.get("BOT_SETTINGS_OVERRIDES")
+    value = (raw or "").strip().lower()
+    if value in ("", "apply"):
+        return False
+    if value == "ignore":
+        return True
+    raise ValueError(
+        "BOT_SETTINGS_OVERRIDES must be apply or ignore (case-insensitive); "
+        f"got {raw!r}"
+    )
+
+
 def debug_prometheus_url() -> Optional[str]:
-    """Base URL of a Prometheus that holds this deployment's container metrics, or
-    None (the default) to leave the feature off.
-
-    -debug's Postgres block reads container CPU/memory from here, because the bot
-    cannot see another container's cgroup and Postgres reports no OS metrics over
-    SQL. Compose supplies it once otel-lgtm's Prometheus port is published; unset,
-    the row degrades to `n/a (no metrics source)` and nothing else changes.
-
-    Read at call time, like postgres_url, and `or None` collapses unset and
-    exported-but-empty into one absent case.
-    """
+    """Prometheus holding this deployment's container metrics, which -debug's
+    Postgres block reads CPU/memory from; None leaves that row at `n/a`."""
     return (os.environ.get("DEBUG_PROMETHEUS_URL") or "").strip() or None
 
 
 def postgres_url() -> Optional[str]:
-    """The play-history archive's DSN, or None when unset. Read at call time
-    (once at startup, so no hot path). `or None` collapses "unset" and "exported
-    but empty" into one sentinel, so every caller has a single absent-case: a
-    blank line in .env yields "", which is not None but is not a DSN either."""
+    """The archive DSN, or None. `or None` folds "exported but empty" (a blank
+    .env line) into the absent case."""
     return os.environ.get("POSTGRES_URL") or None
 
 
-# The password docker-compose.yml falls back to when .env sets none, so that
-# `docker compose up` works with nothing configured but DISCORD_TOKEN. A
-# first-run convenience and a liability everywhere else, hence the loud
-# detection; only defensible because compose publishes postgres on 127.0.0.1.
-# `.env` is the one supported place the real password is set (setup_env.sh writes
-# it; compose and `just run` read it); a per-install POSTGRES_PASSWORD_FILE was
-# declined — see docs/ARCHITECTURE.md#postgres-credential-handling.
+# What docker-compose.yml falls back to when .env sets none. `.env` is the one
+# supported place the real password is set; see
+# docs/ARCHITECTURE.md#postgres-credential-handling.
 DEFAULT_POSTGRES_PASSWORD: Final[str] = "password"
 
 
 def using_default_postgres_password() -> bool:
-    """True when the archive DSN still carries DEFAULT_POSTGRES_PASSWORD.
+    """True when POSTGRES_URL's userinfo carries DEFAULT_POSTGRES_PASSWORD.
 
-    Parsed out of POSTGRES_URL, not POSTGRES_PASSWORD: the bot only ever sees the
-    assembled DSN, so the password variable is frequently absent from its own
-    environment. SCOPED to the shape this project's tooling produces — userinfo
-    in a DSN assembled from `.env` — so it fails open for three hand-written
-    shapes asyncpg accepts and this misses:
-
-      * `?password=` in the query string. asyncpg honours it; to urlsplit the
-        query is opaque, so this reads as "no password at all".
-      * a password containing an unescaped `@`. asyncpg partitions the netloc on
-        the first `@` and urlsplit on the last, so `u:p@ss@host/db` authenticates
-        as `p` but reads here as `p@ss`.
-      * `PGPASSWORD` exported in the environment. Nothing in this repo sets it.
-
-    None is reachable from compose or `just run`; the full ladder is asyncpg's
-    own, in `asyncpg.connect_utils._parse_connect_dsn_and_args`. Never raises —
-    it feeds a startup warning and a -ping row.
+    Parsed from the DSN because the bot rarely sees POSTGRES_PASSWORD itself.
+    Scoped to the DSN shape this repo's tooling produces; it misses `?password=`
+    in the query, an unescaped `@` in the password, and PGPASSWORD, none of which
+    compose or `just run` emit. Never raises: it feeds a warning and a -ping row.
     """
     url = postgres_url()
     if not url:
@@ -288,37 +478,27 @@ def using_default_postgres_password() -> bool:
         password = urlsplit(url).password
     except ValueError:
         return False
-    # unquote because SplitResult.password does not percent-decode: a DSN
-    # carrying %70assword would otherwise read as a different credential than
-    # the identical one written literally. asyncpg decodes it, so we must too.
+    # SplitResult.password is not percent-decoded; asyncpg decodes, so match it.
     return password is not None and unquote(password) == DEFAULT_POSTGRES_PASSWORD
 
 
 def spotify_enabled() -> bool:
-    """True when both Spotify credentials are present in the environment. Read at
-    call time, not cached, so it tracks the live environment. Gates on presence,
-    not validity: credentials that are set but wrong count as enabled and fail
-    loudly at the first API call."""
+    """Both Spotify credentials present. Presence only: wrong credentials count
+    as enabled and fail at the first API call."""
     return bool(
         os.environ.get("SPOTIFY_CLIENT_ID") and os.environ.get("SPOTIFY_CLIENT_SECRET")
     )
 
 
-# Startup credential probe (MusicBot.cog_load) fetches this one track to confirm
-# the credentials authenticate. Any real ID would do; this one is permanent and
-# memorable — Rick Astley, "Never Gonna Give You Up".
+# Fetched by the startup credential probe (MusicBot.cog_load); any permanent
+# track would do.
 SPOTIFY_TEST_TRACK_ID = "4PTG3Z6ehGkBFwjybzWkR8"
 
 
 class SpotifyStatus(Enum):
-    """Runtime state of the Spotify source, resolved once at startup. Where
-    `spotify_enabled()` answers "are credentials present?", this records whether
-    they actually work, so `MusicBot._require_spotify` and `-ping` can tell a
-    user *why* Spotify links are unavailable."""
+    """Whether the configured Spotify credentials actually work, resolved once at
+    startup, so `_require_spotify` and `-ping` can say why links are unavailable."""
 
-    # No credentials configured.
-    DISABLED = "disabled"
-    # Present but rejected (or the probe failed): links declined as invalid.
-    INVALID = "invalid"
-    # Present and validated against the live API at startup.
-    ENABLED = "enabled"
+    DISABLED = "disabled"  # no credentials configured
+    INVALID = "invalid"  # present but rejected by the live API
+    ENABLED = "enabled"  # present and validated at startup

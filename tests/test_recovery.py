@@ -7,7 +7,7 @@ owns both the extracted module and the cog surface that reaches it.
 """
 
 import asyncio
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from collections.abc import Coroutine
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,10 +18,11 @@ import redis.asyncio as aioredis
 from discord.ext import commands
 from redis.asyncio import Redis
 
+from src.guild_state import GuildConfig
 from src.musicbot import MusicBot
-from src.recovery import join_succeeded, restore_guild
+from src.recovery import VoiceWatchdog, join_succeeded, restore_guild
 from src.redis_client import GuildRedisStore
-from tests.helpers import make_mock_task, mocked, stub_create_task
+from tests.helpers import make_mock_task, mocked, stalled_config_reads, stub_create_task
 
 
 class TestEagerRestore:
@@ -93,33 +94,143 @@ class TestOnReady:
         music_bot.redis = None
         await music_bot.on_ready()  # must not raise, no tasks created
 
-    async def test_creates_restore_task_per_guild(
+    async def test_spawns_one_recovery_task_and_only_the_first_sweeps(
+        self, music_bot_with_redis: MusicBot
+    ) -> None:
+        stub = stub_create_task()
+        with (
+            patch("asyncio.create_task", stub),
+            patch.object(music_bot_with_redis, "_recover_after_ready") as recover,
+        ):
+            await music_bot_with_redis.on_ready()
+            await music_bot_with_redis.on_ready()
+        assert stub.call_count == 2
+        assert [c.kwargs for c in recover.call_args_list] == [
+            {"sweep": True},
+            {"sweep": False},
+        ]
+
+    async def test_recovery_hydrates_before_the_first_restore(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
+        """The hydrate's batches hold one pool connection at a time; the restore
+        fan-out is what reaches the pool's cap, so it starts only after the pass."""
         guilds = list(music_bot_with_redis.bot.guilds)
-        stub = stub_create_task()
+        order: list[str] = []
         passed_guilds = []
+
+        async def _hydrate(ids: Any = None) -> None:
+            # Suspends, as the real read does: spawned restores would run here.
+            await asyncio.sleep(0)
+            order.append("hydrate")
 
         async def _noop() -> None:
             pass
 
-        # Patched where on_ready LOOKS IT UP — musicbot's module globals — not where
-        # it is defined, or the cog keeps calling the real one. Capture happens
-        # synchronously in the spy (before stub_create_task closes the coroutine,
-        # which would prevent the body running).
-        def _spy(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+        def _restore(cog: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
+            # Recorded when the task is spawned, not when it runs.
+            order.append("restore")
             passed_guilds.append(guild)
             return _noop()
 
+        # Patched where the cog LOOKS IT UP — musicbot's module globals — not
+        # where it is defined, or the cog keeps calling the real one.
         with (
-            patch("asyncio.create_task", stub),
-            patch("src.musicbot.restore_guild", _spy),
+            patch.object(music_bot_with_redis, "_hydrate_configs", _hydrate),
+            patch("src.musicbot.restore_guild", _restore),
         ):
-            await music_bot_with_redis.on_ready()
+            await music_bot_with_redis._recover_after_ready()
+            await asyncio.gather(*music_bot_with_redis._restore_tasks)
 
-        # One per guild, plus the one-off config hydration.
-        assert stub.call_count == len(guilds) + 1
+        assert order == ["hydrate", *["restore"] * len(guilds)]
         assert passed_guilds == guilds
+
+
+class TestOrphanSweepRunsAfterRecovery:
+    """The sweep needs a complete guild cache and must not add a connection to the
+    restore fan-out, so it runs once, after every restore it spawned returned."""
+
+    @staticmethod
+    def _gate(
+        cog: MusicBot, *, shard_ids: Any = None, application_id: Any = 42
+    ) -> None:
+        bot = cast(Any, cog.bot)
+        bot.shard_ids = shard_ids
+        bot.application_id = application_id
+
+    async def test_it_runs_only_after_every_restore_returned(
+        self, music_bot_with_redis: MusicBot
+    ) -> None:
+        self._gate(music_bot_with_redis)
+        order: list[str] = []
+        release = asyncio.Event()
+
+        async def _restore(cog: MusicBot, guild: MagicMock) -> None:
+            await release.wait()
+            order.append("restore")
+
+        async def _sweep(**kwargs: Any) -> None:
+            order.append("sweep")
+
+        with (
+            patch.object(music_bot_with_redis, "_hydrate_configs", AsyncMock()),
+            patch("src.musicbot.restore_guild", _restore),
+            patch.object(music_bot_with_redis.guild_settings, "sweep_orphans", _sweep),
+        ):
+            recovery = asyncio.create_task(
+                music_bot_with_redis._recover_after_ready(sweep=True)
+            )
+            await asyncio.sleep(0.01)
+            assert order == []
+            release.set()
+            await recovery
+
+        assert order == ["restore"] * len(music_bot_with_redis.bot.guilds) + ["sweep"]
+
+    @pytest.mark.parametrize(
+        ("sweep", "shard_ids", "application_id"),
+        [(False, None, 42), (True, [0], 42), (True, None, None)],
+        ids=["not-the-first-ready", "a-shard-subset", "no-application-id"],
+    )
+    async def test_it_does_not_run(
+        self,
+        music_bot_with_redis: MusicBot,
+        sweep: bool,
+        shard_ids: Any,
+        application_id: Any,
+    ) -> None:
+        self._gate(
+            music_bot_with_redis, shard_ids=shard_ids, application_id=application_id
+        )
+        sweeper = AsyncMock()
+        with (
+            patch.object(music_bot_with_redis, "_hydrate_configs", AsyncMock()),
+            patch("src.musicbot.restore_guild", AsyncMock()),
+            patch.object(music_bot_with_redis.guild_settings, "sweep_orphans", sweeper),
+        ):
+            await music_bot_with_redis._recover_after_ready(sweep=sweep)
+        sweeper.assert_not_awaited()
+
+    async def test_membership_is_the_bots_guild_cache(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        self._gate(music_bot_with_redis)
+        bot = cast(Any, music_bot_with_redis.bot)
+        bot.get_guild = lambda guild_id: (
+            mock_guild if guild_id == mock_guild.id else None
+        )
+        sweeper = AsyncMock()
+        with (
+            patch.object(music_bot_with_redis, "_hydrate_configs", AsyncMock()),
+            patch("src.musicbot.restore_guild", AsyncMock()),
+            patch.object(music_bot_with_redis.guild_settings, "sweep_orphans", sweeper),
+        ):
+            await music_bot_with_redis._recover_after_ready(sweep=True)
+        call = sweeper.await_args
+        assert call is not None
+        assert call.kwargs["is_member"](mock_guild.id) is True
+        assert call.kwargs["is_member"](1) is False
+        assert call.kwargs["application_id"] == 42
 
 
 class TestRestoreGuildLock:
@@ -584,6 +695,67 @@ class TestVoiceStateConsistency:
             is tasks_created[1]
         )
 
+    async def test_a_restarted_countdown_is_still_cancelled_by_a_rejoin(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Real tasks: a patched create_task never runs the countdown it replaces.
+        The alone branch stores the replacement before that countdown unwinds, so
+        an unwinding countdown that removed the guild's entry unconditionally would
+        leave the replacement running where no rejoin could cancel it. Another bot
+        joining is enough to restart it."""
+        self._wire_bot_user(music_bot)
+        mp = MagicMock()
+        mp.send_with_np = AsyncMock()
+        music_bot.mps[mock_guild.id] = mp
+        watchdog = music_bot.voice_watchdog
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]
+        mock_guild.voice_client = vc
+
+        def _move(*, bot: bool, joined: bool) -> tuple[MagicMock, MagicMock, MagicMock]:
+            member = MagicMock(spec=discord.Member)
+            member.id = 123456789
+            member.bot = bot
+            member.guild = mock_guild
+            before = MagicMock(spec=discord.VoiceState)
+            before.channel = None if joined else vc.channel
+            after = MagicMock(spec=discord.VoiceState)
+            after.channel = vc.channel if joined else None
+            return member, before, after
+
+        started: list[asyncio.Task[Any]] = []
+        with patch.object(music_bot, "cleanup", new=AsyncMock()) as cleanup:
+            try:
+                await music_bot.on_voice_state_update(*_move(bot=False, joined=False))
+                first = watchdog._timers[mock_guild.id]
+                started.append(first)
+                await asyncio.sleep(0)  # into its sleep
+
+                await music_bot.on_voice_state_update(*_move(bot=True, joined=True))
+                replacement = watchdog._timers[mock_guild.id]
+                started.append(replacement)
+                assert replacement is not first
+                await asyncio.wait({first}, timeout=1.0)
+                assert first.done()
+                assert watchdog._timers.get(mock_guild.id) is replacement
+
+                human = MagicMock(spec=discord.Member)
+                human.bot = False
+                vc.channel.members = [bot_member, human]
+                await music_bot.on_voice_state_update(*_move(bot=False, joined=True))
+                done, _ = await asyncio.wait({replacement}, timeout=1.0)
+                assert replacement in done
+                assert mock_guild.id not in watchdog._timers
+                cleanup.assert_not_awaited()
+            finally:
+                for task in started:
+                    task.cancel()
+                await asyncio.gather(*started, return_exceptions=True)
+
     async def test_member_change_in_unrelated_channel_ignored(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -615,6 +787,111 @@ class TestVoiceStateConsistency:
         assert mock_guild.id not in music_bot_with_redis.voice_watchdog._timers
 
 
+class TestAloneTimeoutSetting:
+    """The server's alone-timeout, read once when the countdown starts: the arm log,
+    the notice, the sleep and the disconnect log all quote that one number."""
+
+    @staticmethod
+    def _alone(
+        cog: MusicBot, guild: MagicMock
+    ) -> tuple[MagicMock, MagicMock, MagicMock]:
+        """The last human leaves the bot's channel."""
+        bot_user = MagicMock()
+        bot_user.id = 999999999999999999
+        mocked(cog.bot).user = bot_user
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]
+        guild.voice_client = vc
+        member = MagicMock(spec=discord.Member)
+        member.id = 123456789
+        member.bot = False
+        member.guild = guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = vc.channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = None
+        return member, before, after
+
+    async def test_the_countdown_starts_with_the_servers_value(
+        self,
+        music_bot: MusicBot,
+        mock_guild: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        music_bot.mps[mock_guild.id] = MagicMock()
+        guild_settings = music_bot.guild_settings
+        with guild_settings.reading() as started:
+            guild_settings.seed(
+                mock_guild.id, GuildConfig(alone_timeout_secs=120.0), started=started
+            )
+        countdown = AsyncMock()
+        with (
+            patch.object(VoiceWatchdog, "_countdown", new=countdown),
+            caplog.at_level("INFO", logger="src.recovery"),
+        ):
+            await music_bot.on_voice_state_update(*self._alone(music_bot, mock_guild))
+            await music_bot.voice_watchdog._timers[mock_guild.id]
+        countdown.assert_awaited_once_with(mock_guild, 120.0)
+        assert "starting 120s disconnect timer" in caplog.text
+
+    @pytest.mark.parametrize(("secs", "shown"), [(10.0, "0:10"), (120.0, "2:00")])
+    async def test_notice_sleep_and_log_quote_the_number_passed_in(
+        self,
+        music_bot: MusicBot,
+        mock_guild: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+        secs: float,
+        shown: str,
+    ) -> None:
+        mp = MagicMock()
+        mp.send_with_np = AsyncMock()
+        music_bot.mps[mock_guild.id] = mp
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]
+        mock_guild.voice_client = vc
+        with (
+            patch("asyncio.sleep", new=AsyncMock()) as sleep,
+            patch.object(music_bot, "cleanup", new=AsyncMock()),
+            caplog.at_level("INFO", logger="src.recovery"),
+        ):
+            await music_bot.voice_watchdog._countdown(mock_guild, secs)
+        embed = mp.send_with_np.call_args.kwargs["embed"]
+        assert embed.description == (
+            f"All users have disconnected. The bot will disconnect in **{shown}** "
+            "unless someone rejoins."
+        )
+        sleep.assert_awaited_once_with(secs)
+        # ASCII only: the container's JSON log renderer escapes the dash after it.
+        assert f"still alone in guild {mock_guild.id} after {secs:g}s " in caplog.text
+
+    async def test_the_bot_still_leaves_when_the_store_stalls(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The pool has no socket_timeout. The countdown's number comes from the
+        cache, so a Redis that accepts and never answers cannot keep the bot in
+        its channel."""
+        cog = music_bot_with_redis
+        mp = MagicMock()
+        mp.send_with_np = AsyncMock()
+        cog.mps[mock_guild.id] = mp
+        with (
+            stalled_config_reads(),
+            patch("asyncio.sleep", new=AsyncMock()) as sleep,
+            patch.object(cog, "cleanup", new=AsyncMock()) as cleanup,
+        ):
+            await cog.on_voice_state_update(*self._alone(cog, mock_guild))
+            async with asyncio.timeout(1):
+                await cog.voice_watchdog._timers[mock_guild.id]
+        sleep.assert_awaited_once_with(10.0)
+        cleanup.assert_awaited_once_with(mock_guild)
+
+
 class TestAloneCountdownNotice:
     async def test_notice_routes_through_send_with_np(
         self, music_bot: MusicBot, mock_guild: MagicMock
@@ -627,7 +904,7 @@ class TestAloneCountdownNotice:
         mock_guild.voice_client = None  # post-sleep check: nothing to disconnect
 
         with patch("asyncio.sleep", new=AsyncMock()):
-            await music_bot.voice_watchdog._countdown(mock_guild)
+            await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         mp.send_with_np.assert_awaited_once()
         embed = mp.send_with_np.call_args.kwargs["embed"]
@@ -661,7 +938,7 @@ class TestAloneCountdown:
 
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         mock_cleanup.assert_awaited_once_with(mock_guild)
 
@@ -677,7 +954,7 @@ class TestAloneCountdown:
 
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         mock_cleanup.assert_not_awaited()
 
@@ -689,7 +966,7 @@ class TestAloneCountdown:
 
         with patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         mock_cleanup.assert_not_awaited()
 
@@ -708,7 +985,7 @@ class TestAloneCountdown:
 
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         mock_cleanup.assert_awaited_once_with(mock_guild)
 
@@ -722,16 +999,19 @@ class TestAloneCountdown:
 
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         mock_cleanup.assert_not_awaited()
 
     async def test_timer_removed_from_dict_on_completion(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """The timer entry is removed in the finally block regardless of outcome."""
+        """The countdown's own entry is removed in the finally block. Awaited in
+        this task, so this task is the entry."""
         self._setup_mp(music_bot, mock_guild)
-        music_bot.voice_watchdog._timers[mock_guild.id] = MagicMock()  # sentinel
+        current = asyncio.current_task()
+        assert current is not None
+        music_bot.voice_watchdog._timers[mock_guild.id] = current
 
         bot_member = MagicMock(spec=discord.Member)
         bot_member.bot = True
@@ -739,7 +1019,7 @@ class TestAloneCountdown:
 
         with patch("asyncio.sleep", new=AsyncMock()):
             with patch.object(music_bot, "cleanup", new=AsyncMock()):
-                await music_bot.voice_watchdog._countdown(mock_guild)
+                await music_bot.voice_watchdog._countdown(mock_guild, 10.0)
 
         assert mock_guild.id not in music_bot.voice_watchdog._timers
 

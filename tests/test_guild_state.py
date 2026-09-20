@@ -2,8 +2,9 @@
 
 import dataclasses
 import logging
+from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import discord
 import orjson
@@ -12,15 +13,24 @@ from zoneinfo import ZoneInfo
 import pytest
 from unittest.mock import MagicMock
 
-from src import guild_state
+from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     Analytics,
+    BotConfig,
+    BotConfigField,
+    BotConfigFieldName,
+    CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
+    OFF_SECS,
+    ConfigDomain,
     ConfigField,
+    ConfigFieldName,
+    ResettableConfigField,
+    is_config_field,
     GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -34,6 +44,7 @@ from src.guild_state import (
     serialize_history_entry,
     valid_timezone,
 )
+from tests.helpers import members
 
 
 def _full_state_hash() -> dict[bytes, bytes]:
@@ -115,6 +126,15 @@ class TestGuildStateDataFromRedis:
         # of clobbering live state with a fabricated 1.0 default.
         assert GuildStateData.from_redis({}).volume is None
 
+    def test_a_legacy_volume_outside_the_config_domain_reads_as_unset(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """StateField.VOLUME and ConfigField.VOLUME are one wire name, so one
+        domain: restore falls back to this copy and must never play above 100%."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert GuildStateData.from_redis({b"volume": b"1.5"}).volume is None
+        assert "volume=1.5" in caplog.text
+
     @pytest.mark.parametrize("raw", [b"nan", b"inf", b"-inf"])
     def test_non_finite_float_treated_as_malformed(
         self, raw: Any, caplog: pytest.LogCaptureFixture
@@ -158,7 +178,7 @@ class TestGuildStateDataFromRedis:
     @pytest.mark.parametrize("raw", [b"", b"0", b"true"])
     def test_interjected_anything_but_one_is_false(self, raw: Any) -> None:
         # The write path stores exactly "1" or "" — anything else (including
-        # a missing field on pre-playnow state hashes) reads as False.
+        # a missing field on pre-interjection state hashes) reads as False.
         data = GuildStateData.from_redis({b"current_song_interjected": raw})
         assert data.current_song_interjected is False
 
@@ -397,10 +417,12 @@ class TestNowPlayingDataImmutability:
 
 # Golden wire fixtures — byte literals capturing the current writer output.
 # These pin the wire format in both directions so a rolling restart can mix
-# old and new writers. The _PRE_PLAYNOW golden pins the reader against entries
-# written before the -playnow flags existed (parsed as False).
+# old and new writers. The _PRE_INTERJECTION golden pins the reader against entries
+# written before the interjection flags existed (parsed as False).
 
-_PLAYNOW_FLAGS_FALSE = b'"interjected":false,"is_resume":false,"start_paused":false'
+_INTERJECTION_FLAGS_FALSE = (
+    b'"interjected":false,"is_resume":false,"start_paused":false'
+)
 _ENQUEUE_STAMPS_ZERO = b'"queued_at":0.0,"queue_position":0'
 _QUERY_SOURCE_UNKNOWN = b'"query_source":""'
 # "qobj" only — a search has not played, so SearchQueueEntry carries no such field.
@@ -409,7 +431,7 @@ _PLAYED_AT_UNPLAYED = b'"played_at":0.0'
 _NP_HOST_NONE = b'"np_message_id":0,"np_channel_id":0,"np_dedicated":false'
 _GOLDEN_QOBJ_FULL = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
-    + _PLAYNOW_FLAGS_FALSE
+    + _INTERJECTION_FLAGS_FALSE
     + b","
     + _ENQUEUE_STAMPS_ZERO
     + b","
@@ -422,7 +444,7 @@ _GOLDEN_QOBJ_FULL = (
 )
 _GOLDEN_QOBJ_BARE = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=2","title":"Bare","requester_id":42,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true,'
-    + _PLAYNOW_FLAGS_FALSE
+    + _INTERJECTION_FLAGS_FALSE
     + b","
     + _ENQUEUE_STAMPS_ZERO
     + b","
@@ -435,7 +457,7 @@ _GOLDEN_QOBJ_BARE = (
 )
 _GOLDEN_QOBJ_UNPERSISTED = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=4","title":"Crashed","requester_id":8,"ts":95,"user_input":null,"duration":180,"uploader":null,"thumbnail":null,"persisted":false,'
-    + _PLAYNOW_FLAGS_FALSE
+    + _INTERJECTION_FLAGS_FALSE
     + b","
     + _ENQUEUE_STAMPS_ZERO
     + b","
@@ -446,7 +468,7 @@ _GOLDEN_QOBJ_UNPERSISTED = (
     + _NP_HOST_NONE
     + b"}"
 )
-_GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
+_GOLDEN_QOBJ_PRE_INTERJECTION = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
 _GOLDEN_YTSOURCE = (
     b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,'
     b'"ts":null,"user_input":null,'
@@ -502,12 +524,12 @@ class TestSongQueueEntryWire:
     def test_round_trip(self) -> None:
         assert parse_queue_entry(_FULL_ENTRY.to_redis()) == _FULL_ENTRY
 
-    def test_reader_parses_pre_playnow_entry_with_false_flags(self) -> None:
-        # Entries written before the -playnow fields existed must parse with
+    def test_reader_parses_pre_interjection_entry_with_false_flags(self) -> None:
+        # Entries written before the interjection fields existed must parse with
         # all three flags defaulting False.
-        assert parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW) == _FULL_ENTRY
+        assert parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION) == _FULL_ENTRY
 
-    def test_playnow_flags_round_trip(self) -> None:
+    def test_interjection_flags_round_trip(self) -> None:
         entry = dataclasses.replace(
             _FULL_ENTRY, interjected=True, is_resume=True, start_paused=True
         )
@@ -542,7 +564,7 @@ class TestSongQueueEntryWire:
     def test_reader_defaults_np_host_fields_on_pre_feature_entry(self) -> None:
         # An entry written before the fields existed has no card to dispose of,
         # which is what 0/0/False means — never "delete message 0".
-        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(pre_feature, SongQueueEntry)
         assert (
             pre_feature.np_message_id,
@@ -551,7 +573,7 @@ class TestSongQueueEntryWire:
         ) == (0, 0, False)
 
     def test_played_at_round_trips(self) -> None:
-        # A queued entry carries a nonzero start only when it is a -playnow resume
+        # A queued entry carries a nonzero start only when it is an interjection's
         # tail, which inherits the interrupted song's — so this is the leg that
         # keeps one play from being filed twice under two different moments after
         # a restart.
@@ -565,7 +587,7 @@ class TestSongQueueEntryWire:
         # Entries written before the field existed must parse as unplayed rather
         # than dropping as corrupt.
         assert _FULL_ENTRY.played_at == 0.0
-        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(pre_feature, SongQueueEntry)
         assert pre_feature.played_at == 0.0
 
@@ -591,7 +613,7 @@ class TestSongQueueEntryWire:
         )
         assert SongQueueEntry.from_queue_object(item) == _FULL_ENTRY
 
-    def test_from_queue_object_carries_playnow_flags(self) -> None:
+    def test_from_queue_object_carries_interjection_flags(self) -> None:
         item = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
@@ -613,7 +635,7 @@ class TestSongQueueEntryWire:
 
     def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
         # Entries written before the enqueue stamps existed default both to 0.
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(entry, SongQueueEntry)
         assert (entry.queued_at, entry.queue_position) == (0.0, 0)
 
@@ -642,7 +664,7 @@ class TestSongQueueEntryWire:
         assert parsed.query_source == "tiktok.com"
 
     def test_reader_defaults_query_source_on_a_pre_feature_entry(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(entry, SongQueueEntry)
         assert entry.query_source == ""
 
@@ -652,11 +674,30 @@ class TestSearchQueueEntryWire:
         entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
         assert entry.to_redis() == _GOLDEN_YTSOURCE
 
+    def test_the_requester_round_trips_through_the_lazy_resolve(self) -> None:
+        source = YTSource(ytsearch="ytsearch:x", requester_id=424242424242424242)
+        parsed = parse_queue_entry(SearchQueueEntry.from_ytsource(source).to_redis())
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.requester_id == 424242424242424242
+
+    def test_an_unknown_requester_writes_no_key(self) -> None:
+        """An entry queued before searches carried a requester must serialize to the
+        bytes already on the list, or removing it misses LREM and rebuilds."""
+        entry = SearchQueueEntry.from_ytsource(YTSource(ytsearch="ytsearch:x"))
+        assert entry.requester_id is None
+        assert b"requester_id" not in entry.to_redis()
+
+    def test_a_pre_requester_entry_parses_as_none(self) -> None:
+        # Not 0: None routes to the fallback requester, 0 to member 0, nobody.
+        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
+        assert isinstance(entry, SearchQueueEntry)
+        assert entry.requester_id is None
+
     def test_origin_survives_the_wire(self) -> None:
-        """An unresolved Spotify-album track is the only place the album link still
+        """An unresolved Spotify-playlist track is the only place that link still
         exists: its ytsearch is a title the expansion generated, and the resolved
         YouTube URL it becomes names neither. Drop this field on the wire and
-        -remove <album link> stops matching the moment the bot restarts."""
+        -remove <playlist link> stops matching the moment the bot restarts."""
         album = "https://open.spotify.com/album/abc123"
         entry = SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)
         parsed = parse_queue_entry(entry.to_redis())
@@ -1167,7 +1208,7 @@ class TestHistoryEntryFromSong:
     def test_played_at_is_read_off_the_song(self) -> None:
         # It is a stamp the playback loop wrote at vc.play() and every later
         # fragment inherits, NOT a clock read here: a from_song that called
-        # time.time() would restamp a -playnow resume tail to when the tail
+        # time.time() would restamp an interjection's resume tail to when the tail
         # started, filing one play under two different moments across a redelivery.
         song = _history_song_stub(played_at=1700000000.0)
         entry = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
@@ -1257,7 +1298,7 @@ class TestHistoryEntryFromSong:
 
 
 def _played_tail(**overrides: Any) -> QueueObject:
-    """A -playnow resume tail: the interrupted song parked at the queue front,
+    """An interjection's resume tail: the interrupted song parked at the front,
     carrying the play's start and the absolute position it reached."""
     fields: dict = dict(
         webpage_url="https://yt.com/v=1",
@@ -1278,7 +1319,7 @@ def _played_tail(**overrides: Any) -> QueueObject:
 
 class TestHistoryEntryFromQueueObject:
     """The -clear/-remove write path: a song that played, was interrupted by a
-    -playnow, and had its tail destroyed before it could finish. Nothing else will
+    interjected, and had its tail destroyed before it could finish. Nothing else
     ever record it — the loop's single write site only fires for a song it played
     to the end — so this classmethod is the whole record."""
 
@@ -1364,6 +1405,44 @@ class TestHistoryEntryFromQueueObject:
             HistoryEntry.from_queue_object(_played_tail())  # pyright: ignore[reportCallIssue]
 
 
+class TestSongQueueEntryFromSong:
+    """The write half of the closed loop from_song → HSET state → crash →
+    from_crashed_state → re-queue. Driven off a REAL YTDL so a field the class
+    does not carry raises here rather than at the start transaction."""
+
+    def test_every_parked_field_leaves_the_song(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
+        # Asserted together: a field dropped here is parked as its zero value and
+        # comes back wrong from a crash, silently and only for crashed plays.
+        song = ytdl_instance(
+            None,
+            user_input="https://open.spotify.com/playlist/abc",
+            query_source="spotify.com",
+            interjected=True,
+            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+            played_at=1752530111.0,
+        )
+
+        entry = SongQueueEntry.from_song(song)
+
+        assert (
+            entry.user_input,
+            entry.query_source,
+            entry.interjected,
+            entry.queued_at,
+            entry.queue_position,
+            entry.played_at,
+        ) == (
+            "https://open.spotify.com/playlist/abc",
+            "spotify.com",
+            True,
+            1752530000.5,
+            4,
+            1752530111.0,
+        )
+
+
 class TestCrashedSongRoundTrip:
     """from_song -> the state hash -> from_crashed_state is a closed loop, and a
     field missing from EITHER end is lost silently and only after a crash. Pinned
@@ -1400,11 +1479,9 @@ class TestCrashedSongRoundTrip:
         )
 
     def test_the_loop_closes_through_the_state_hash(self) -> None:
-        """A -playnow resume tail crashing mid-play comes back as a resume tail,
-        still paused, still removable by the link that queued it. Losing any of
-        the three reclassifies it as a fresh song: no resume announcement,
-        _remaining_secs billing the whole duration, a paused stack coming back
-        playing, and the collection link short one track."""
+        """A `-play --now` resume tail crashing mid-play comes back as a resume tail,
+        still paused, still removable by the link that queued it. Losing any of the
+        three reclassifies it as a fresh song."""
         entry = SongQueueEntry.from_song(self._song())
         # The write side's own mapping, so a field this test adds cannot pass by
         # being spelled differently here than in the store.
@@ -1454,11 +1531,10 @@ class TestFromCrashedState:
         assert entry.requester_id is None  # no requester recorded
 
     def test_a_resume_tail_is_still_a_resume_after_a_crash(self) -> None:
-        """is_resume and start_paused are BEHAVIOUR, not attribution. Losing them
-        reclassified a -playnow tail as a fresh song on every restart: no resume
-        announcement, _remaining_secs billing the whole duration instead of the
-        tail so every ETA behind it skewed, the tail's NP-card cleanup silently
-        disabled, and a stack parked while paused coming back playing."""
+        """is_resume and start_paused are BEHAVIOUR, not attribution: without them a
+        resume tail restarts as a fresh song — no resume announcement, the whole
+        duration billed by _remaining_secs, the NP-card cleanup skipped, and a stack
+        parked while paused coming back playing."""
         state = GuildStateData(
             current_song_url="https://yt.com/v=tail",
             current_song_title="Tail",
@@ -1483,7 +1559,7 @@ class TestFromCrashedState:
     def test_interjected_flag_survives_crash(self) -> None:
         # A crash mid-interjection must not demote the recovered song. Attribution
         # only since stacking replaced replace semantics — it is what tells you the
-        # song was queued by -playnow, and nothing branches on it.
+        # song was queued by an interjection, and nothing branches on it.
         state = GuildStateData(
             current_song_url="https://x",
             current_song_title="T",
@@ -1551,6 +1627,28 @@ class TestFromCrashedState:
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.played_at == 0.0
+
+    def test_user_input_survives_crash(self) -> None:
+        # The playing song's queue entry was LPOPed at start, so this hash is the
+        # only at-rest copy of what the user typed. Losing it leaves `-remove
+        # <collection link>` taking out every track of the collection EXCEPT the
+        # one that was playing — the undo the -play flags advertise, minus a song.
+        state = GuildStateData(
+            current_song_url="https://x",
+            current_song_title="T",
+            current_song_user_input="https://open.spotify.com/playlist/abc",
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert entry.user_input == "https://open.spotify.com/playlist/abc"
+
+    def test_user_input_absent_is_none_not_empty(self) -> None:
+        # A hash written by a build that predates the field. None means "unknown";
+        # "" would be a needle that remove_matcher could compare against.
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=None)
+        assert entry is not None
+        assert entry.user_input is None
 
 
 class TestGuildPlaybackSnapshot:
@@ -1767,6 +1865,153 @@ class TestGuildConfig:
         assert GuildConfig.from_redis(raw).debug_mode is None
 
 
+def _guild_state_warnings(caplog: pytest.LogCaptureFixture) -> int:
+    return sum(
+        r.name == "src.guild_state" and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+
+
+_JUST_OUTSIDE = [
+    pytest.param(field, value, id=f"{field}={value}")
+    for field, domain in CONFIG_DOMAIN.items()
+    for value in (domain.lo - 0.01, domain.hi + 0.01)
+]
+
+
+class TestGuildConfigNumericFields:
+    """Every numeric field is held to CONFIG_DOMAIN wherever a GuildConfig is
+    built. This key outlives builds and can be hand-edited, and a value outside
+    the domain is one no -settings write could have stored."""
+
+    def test_every_attribute_is_its_wire_name(self) -> None:
+        """__post_init__ reads each CONFIG_DOMAIN field by its wire name."""
+        names = {f.name for f in dataclasses.fields(GuildConfig)}
+        assert names == members(ConfigField)
+
+    def test_nothing_stored_is_all_unset(self) -> None:
+        assert GuildConfig.from_redis({}) == GuildConfig()
+
+    @pytest.mark.parametrize("field", sorted(CONFIG_DOMAIN))
+    @pytest.mark.parametrize("bound", ["lo", "hi"])
+    def test_a_value_on_either_bound_round_trips(
+        self, field: ConfigFieldName, bound: str
+    ) -> None:
+        value: float = getattr(CONFIG_DOMAIN[field], bound)
+        config = dataclasses.replace(GuildConfig(), **{field: value})
+        assert config.to_redis() == {field: str(value)}
+        raw = {k.encode(): v.encode() for k, v in config.to_redis().items()}
+        assert GuildConfig.from_redis(raw) == config
+
+    @pytest.mark.parametrize(("field", "value"), _JUST_OUTSIDE)
+    def test_just_outside_the_domain_reads_as_unset_with_one_warning(
+        self, field: ConfigFieldName, value: float, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            config = GuildConfig.from_redis({field.encode(): repr(value).encode()})
+        assert getattr(config, field) is None
+        assert _guild_state_warnings(caplog) == 1
+        assert field in caplog.text
+
+    @pytest.mark.parametrize("field", sorted(CONFIG_DOMAIN))
+    @pytest.mark.parametrize("raw", [b"nan", b"inf", b"-inf"])
+    def test_a_non_finite_value_reads_as_unset_with_one_warning(
+        self, field: ConfigFieldName, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            config = GuildConfig.from_redis({field.encode(): raw})
+        assert getattr(config, field) is None
+        assert _guild_state_warnings(caplog) == 1
+
+    def test_a_constructed_non_finite_value_is_refused_too(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A chained comparison is False for NaN; `not (v < lo or v > hi)` is not."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert GuildConfig(np_refresh_secs=float("nan")).np_refresh_secs is None
+        assert _guild_state_warnings(caplog) == 1
+
+    @pytest.mark.parametrize("garbage", [b"soon", b"5m", b"\xff"])
+    def test_garbage_reads_as_unset(self, garbage: bytes) -> None:
+        raw = {ConfigField.IDLE_TIMEOUT.encode(): garbage}
+        assert GuildConfig.from_redis(raw).idle_timeout_secs is None
+
+    def test_off_survives_as_a_set_value(self) -> None:
+        """OFF_SECS is falsy: a truthiness test anywhere on this path would turn a
+        guild's explicit "off" back into "follow the bot"."""
+        config = GuildConfig.from_redis({ConfigField.SLOW_NOTICE.encode(): b"0"})
+        assert config.slow_notice_secs is not None
+        assert config.slow_notice_secs == OFF_SECS
+        assert config.to_redis() == {ConfigField.SLOW_NOTICE: str(OFF_SECS)}
+
+    def test_off_is_refused_where_the_domain_has_no_off(self) -> None:
+        raw = {ConfigField.IDLE_TIMEOUT.encode(): b"0"}
+        assert GuildConfig.from_redis(raw).idle_timeout_secs is None
+
+    def test_a_constructed_out_of_domain_volume_is_unset(self) -> None:
+        assert GuildConfig(volume=1.5).volume is None
+
+    def test_a_refused_field_leaves_the_others(self) -> None:
+        """One bad field costs the guild that field, not its whole config."""
+        raw = {
+            ConfigField.VOLUME.encode(): b"1.5",
+            ConfigField.IDLE_TIMEOUT.encode(): b"600",
+            ConfigField.DEBUG_MODE.encode(): b"1",
+        }
+        config = GuildConfig.from_redis(raw)
+        assert config.volume is None
+        assert config.idle_timeout_secs == 600.0
+        assert config.debug_mode is True
+
+
+_BOT_COUNT_FIELDS = frozenset(knob.lower() for knob in config.INT_KNOBS)
+
+
+class TestBotConfig:
+    """bot:{application_id}:config's value object. Parsing only: the bounds are
+    the registry's."""
+
+    def test_every_attribute_is_its_wire_name(self) -> None:
+        names = {f.name for f in dataclasses.fields(BotConfig)}
+        assert names == members(BotConfigField)
+
+    def test_the_count_fields_are_the_int_knobs(self) -> None:
+        ints = {f.name for f in dataclasses.fields(BotConfig) if f.type == (int | None)}
+        assert ints == _BOT_COUNT_FIELDS
+
+    def test_nothing_stored_is_all_unset(self) -> None:
+        assert BotConfig.from_redis({}) == BotConfig()
+        assert BotConfig().to_redis() == {}
+
+    @pytest.mark.parametrize("field", sorted(get_args(BotConfigFieldName.__value__)))
+    def test_each_field_round_trips(self, field: str) -> None:
+        value: float = 2 if field in _BOT_COUNT_FIELDS else 2.5
+        bot_config = dataclasses.replace(BotConfig(), **{field: value})
+        assert bot_config.to_redis() == {field: str(value)}
+        raw = {field.encode(): str(value).encode()}
+        assert BotConfig.from_redis(raw) == bot_config
+
+    @pytest.mark.parametrize("raw", [b"2.5", b"2.0", b"nan", b"two"])
+    def test_a_count_is_read_exactly(
+        self, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Not _b_opt_int: its float fallback reads 2.5 as 2."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            parsed = BotConfig.from_redis({b"play_inflight_max": raw})
+        assert parsed.play_inflight_max is None
+        assert _guild_state_warnings(caplog) == 1
+
+    @pytest.mark.parametrize("raw", [b"nan", b"inf", b"soon"])
+    def test_an_unusable_float_reads_as_unset(self, raw: bytes) -> None:
+        assert BotConfig.from_redis({b"heartbeat_interval_secs": raw}) == BotConfig()
+
+    def test_a_parseable_value_is_kept_whatever_its_bounds(self) -> None:
+        raw = {b"ping_tick_secs": b"0", b"play_resolve_concurrency": b"-3"}
+        parsed = BotConfig.from_redis(raw)
+        assert parsed.ping_tick_secs == 0.0
+        assert parsed.play_resolve_concurrency == -3
+
+
 class TestStoredVolumeMigration:
     """Volume moved from guild:{id}:state to guild:{id}:config. The fallback is a
     one-release migration path, not a permanent dual-read: dropping the legacy field
@@ -1797,6 +2042,26 @@ class TestStoredVolumeMigration:
         )
         assert snapshot.stored_volume == 0.0
 
+    def test_an_out_of_domain_volume_in_both_hashes_is_no_stored_volume(
+        self,
+    ) -> None:
+        """set_volume writes both copies with one string, so a hand-edit that
+        reached both leaves restore nothing to assign: the player stays at 100%."""
+        raw = {b"volume": b"1.5"}
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData.from_redis(raw), config=GuildConfig.from_redis(raw)
+        )
+        assert snapshot.stored_volume is None
+
+    def test_an_out_of_domain_config_volume_falls_back_to_the_legacy_copy(
+        self,
+    ) -> None:
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData.from_redis({b"volume": b"0.3"}),
+            config=GuildConfig.from_redis({b"volume": b"1.5"}),
+        )
+        assert snapshot.stored_volume == 0.3
+
 
 class TestGuildConfigTimezone:
     """The zone a guild renders ETAs in. Stored as an IANA name and resolved at
@@ -1816,8 +2081,9 @@ class TestGuildConfigTimezone:
         "name", ["Mars/Olympus", "not a zone", "PST", "../../etc/passwd", ""]
     )
     def test_an_unusable_name_falls_back_rather_than_raising(self, name: str) -> None:
-        """The eventual `-options timezone <name>` feeds this user input, and a
-        render path that raises would take the whole embed down. Includes a
+        """A stored name comes back from Redis, where a hand edit or a host whose tz
+        database lacks it can leave one this cannot resolve, and a render path that
+        raises would take the whole embed down. Includes a
         traversal-shaped string: ZoneInfo resolves names against the tz database
         by path, so it must not be handed one that escapes it.
         """
@@ -1859,7 +2125,7 @@ class TestValidTimezone:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Membership alone would reject it, so the length guard only earns its keep
-        by short-circuiting FIRST: `-options` will hand this arbitrary user text, and
+        by short-circuiting FIRST: GuildSettings.write hands it user text, and
         hashing a megabyte string to look it up in a set is work an unauthenticated
         command should not be able to ask for."""
 
@@ -1882,9 +2148,9 @@ class TestUnusableZoneCache:
     def test_a_bad_name_is_only_resolved_and_logged_once(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A failed ZoneInfo lookup is a filesystem miss and it logs. Once -options
-        puts a stored name on a render path, an unresolvable one would pay both on
-        every single render."""
+        """A failed ZoneInfo lookup is a filesystem miss and it logs. A stored name
+        is read on a render path, so an unresolvable one would pay both on every
+        single render."""
         guild_state._UNUSABLE_ZONES.discard("Mars/Olympus")
         config = GuildConfig(timezone="Mars/Olympus")
         with caplog.at_level(logging.WARNING):
@@ -1903,3 +2169,75 @@ class TestUnusableZoneCache:
             assert len(guild_state._UNUSABLE_ZONES) == guild_state._MAX_UNUSABLE_ZONES
         finally:
             guild_state._UNUSABLE_ZONES.clear()
+
+
+class TestConfigFieldNames:
+    """The Literal aliases type every call that names a config field, so they must
+    not drift from the constants spelled out on the classes."""
+
+    def test_the_alias_is_the_config_fieldmembers(self) -> None:
+        from typing import get_args
+
+        assert set(get_args(ConfigFieldName.__value__)) == members(ConfigField)
+
+    def test_every_field_but_volume_is_resettable_by_name(self) -> None:
+        """volume has its own reset, which also clears the legacy :state copy."""
+        from typing import get_args
+
+        resettable = set(get_args(ResettableConfigField.__value__))
+        assert resettable == members(ConfigField) - {ConfigField.VOLUME}
+
+    def test_the_bot_alias_is_the_bot_fieldmembers(self) -> None:
+        from typing import get_args
+
+        assert set(get_args(BotConfigFieldName.__value__)) == members(BotConfigField)
+
+    def test_is_config_field(self) -> None:
+        assert is_config_field("slow_notice_secs")
+        assert not is_config_field("heartbeat_interval_secs")
+        assert not is_config_field("writer_app_id")
+
+
+class TestConfigDomain:
+    @pytest.mark.parametrize(
+        ("value", "admitted"),
+        [
+            (4.0, True),
+            (60.0, True),
+            (3.99, False),
+            (60.01, False),
+            (float("nan"), False),
+            (float("inf"), False),
+        ],
+    )
+    def test_bounds_are_inclusive_and_nan_is_refused(
+        self, value: float, admitted: bool
+    ) -> None:
+        assert ConfigDomain(4.0, 60.0).admits(value) is admitted
+
+    def test_off_is_admitted_only_where_the_domain_says_so(self) -> None:
+        assert ConfigDomain(4.0, 60.0, off=True).admits(OFF_SECS)
+        assert not ConfigDomain(4.0, 60.0).admits(OFF_SECS)
+
+    def test_every_numeric_config_field_has_a_domain(self) -> None:
+        numeric = members(ConfigField) - {ConfigField.DEBUG_MODE, ConfigField.TIMEZONE}
+        assert set(CONFIG_DOMAIN) == numeric
+
+    def test_np_refresh_floor_is_the_bot_knob_env_floor(self) -> None:
+        """The lowest bot value an operator can run; guild_state cannot import config
+        to read it, so the two are pinned here."""
+        from src import config
+
+        assert CONFIG_DOMAIN[ConfigField.NP_REFRESH].lo == config.env_floor(
+            "NOW_PLAYING_UPDATE_INTERVAL_SECS"
+        )
+
+    def test_the_timeout_defaults_are_their_domain_floors(self) -> None:
+        assert (
+            CONFIG_DOMAIN[ConfigField.IDLE_TIMEOUT].lo
+            == guild_state.DEFAULT_IDLE_TIMEOUT_SECS
+        )
+        assert (
+            CONFIG_DOMAIN[ConfigField.ALONE_TIMEOUT].lo
+            == guild_state.DEFAULT_ALONE_TIMEOUT_SECS
+        )

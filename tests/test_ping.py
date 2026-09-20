@@ -14,7 +14,7 @@ from opentelemetry import trace
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from src import dashboard, ping, telemetry
+from src import config, dashboard, ping, telemetry
 from src.debug import RuntimeSnapshot
 from src.config import SpotifyStatus
 from src.ping import (
@@ -162,13 +162,12 @@ class TestPingCommand:
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A probe still pending at the deadline is cancelled → 'failed', via an edit."""
         message = _ping_message(mock_ctx)
         # Collapse the deadline so the never-returning probe fails at once.
-        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.0)
-        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 0.0)
+        config.set_override("PING_TICK_SECS", 0.0)
+        config.set_override("PING_DEADLINE_SECS", 0.0)
 
         never = asyncio.Event()  # never set → the probe hangs until cancelled
 
@@ -187,13 +186,12 @@ class TestPingCommand:
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The headline behavior: a probe that returns after the skeleton send is
         folded in on a tick and the message is edited from pending → its latency."""
         message = _ping_message(mock_ctx)
-        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.01)
-        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 5.0)
+        config.set_override("PING_TICK_SECS", 0.01)
+        config.set_override("PING_DEADLINE_SECS", 5.0)
 
         gate = asyncio.Event()
 
@@ -222,7 +220,6 @@ class TestPingCommand:
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """_safe_edit: a host the user deleted mid-loop (edit → NotFound) must not
         crash the command."""
@@ -230,8 +227,8 @@ class TestPingCommand:
         message.edit = AsyncMock(
             side_effect=discord.NotFound(MagicMock(status=404), "gone")
         )
-        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.0)
-        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 0.0)
+        config.set_override("PING_TICK_SECS", 0.0)
+        config.set_override("PING_DEADLINE_SECS", 0.0)
 
         never = asyncio.Event()
 
@@ -262,7 +259,9 @@ class TestPingCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Regression: -join must post the cheap latency line and
-        must not run the dependency probes."""
+        must not run the dependency probes. The line is SPAWNED — a cold-start
+        -play waits out this whole task before it may place — so the assertion
+        settles the spawned work rather than expecting it inside join()."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.channel = mock_ctx.author.voice.channel
         mock_ctx.guild.change_voice_state = AsyncMock()
@@ -270,6 +269,7 @@ class TestPingCommand:
         mp.store = None
         mp.open_playback_gate = MagicMock()
         music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._restore_tasks = set()
         redis_spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
 
         with (
@@ -279,9 +279,28 @@ class TestPingCommand:
             patch("src.ping.probe_redis", new=redis_spy),
         ):
             await command_callback(MusicBot.join)(music_bot, mock_ctx)
+            assert music_bot._restore_tasks  # spawned, not awaited
+            await asyncio.gather(*tuple(music_bot._restore_tasks))
 
         latency_line.assert_awaited_once()
         redis_spy.assert_not_awaited()  # no health dashboard on the join path
+
+
+class TestPingDashboardBounds:
+    async def test_tick_and_deadline_come_from_the_bot_settings(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The other dashboard tests set these only to shorten a wait, so a baseline
+        read would pass them slower rather than fail."""
+        _ping_message(mock_ctx)
+        config.set_override("PING_TICK_SECS", 2.5)
+        config.set_override("PING_DEADLINE_SECS", 7.0)
+        driver = AsyncMock()
+        with _patch_probes(), patch("src.ping.run_live_dashboard", new=driver):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        driver.assert_awaited_once()
+        kwargs = driver.call_args.kwargs
+        assert (kwargs["tick_secs"], kwargs["deadline_secs"]) == (2.5, 7.0)
 
 
 class TestPingReportsSpotifySource:
@@ -950,15 +969,14 @@ class TestDefaultPasswordWarningReachesTheWire:
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
         on_default: None,
     ) -> None:
         """Every edit re-attaches it, or the advisory disappears the moment a
         probe resolves late — i.e. on exactly the unhealthy deployments most
         likely to be running unattended."""
         message = _ping_message(mock_ctx)
-        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.0)
-        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 0.0)
+        config.set_override("PING_TICK_SECS", 0.0)
+        config.set_override("PING_DEADLINE_SECS", 0.0)
 
         never = asyncio.Event()
 
@@ -979,15 +997,14 @@ class TestDefaultPasswordWarningReachesTheWire:
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
         on_default: None,
     ) -> None:
         # The third write path. Send, tick-edit and deadline-edit are separate
         # call sites in run_health_dashboard, and dropping the warning from any
         # one of them survived the suite before these tests existed.
         message = _ping_message(mock_ctx)
-        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.01)
-        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 5.0)
+        config.set_override("PING_TICK_SECS", 0.01)
+        config.set_override("PING_DEADLINE_SECS", 5.0)
         gate = asyncio.Event()
 
         async def _gated(*a: Any, **k: Any) -> ProbeResult:
@@ -1056,14 +1073,14 @@ class TestTheAdvisoryIsForTheOperator:
         assert "Default database password" not in (embeds[0].title or "")
 
     async def test_a_non_owner_never_sees_it_on_an_edit_either(
-        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+        self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         # The gate is evaluated once, before the send — so it has to hold for
         # the edit paths too, or the advisory leaks on the first late probe.
         mock_ctx.bot.is_owner = AsyncMock(return_value=False)
         message = _ping_message(mock_ctx)
-        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.0)
-        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 0.0)
+        config.set_override("PING_TICK_SECS", 0.0)
+        config.set_override("PING_DEADLINE_SECS", 0.0)
 
         never = asyncio.Event()
 
