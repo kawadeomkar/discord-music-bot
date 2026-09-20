@@ -299,6 +299,29 @@ _UNUSED_INFO_COLLECTIONS = frozenset(
 _sanitize_info = youtube_dl.YoutubeDL.sanitize_info
 
 
+def select_search_entry(
+    entries: list[Optional[YTDLEntry]],
+) -> Optional[YTDLEntry]:
+    """The entry of a search result that would actually be played, or None if the
+    result holds nothing playable.
+
+    Prefers an entry carrying a `url` (the stream URL of a processed result, the
+    watch URL of a flat one), falling back to the first non-playlist entry so an
+    unrecognised shape still plays. Every search this bot builds is a bare
+    `ytsearch:`, which yields exactly one entry, so this only matters on multi-entry
+    shapes.
+
+    Public because `just ytdl-formats` has to make the same choice, and two copies of
+    this rule would drift.
+    """
+    playable = [
+        entry for entry in entries if entry and entry.get("_type", None) != "playlist"
+    ]
+    if not playable:
+        return None
+    return next((entry for entry in playable if entry.get("url")), playable[0])
+
+
 # Every character RFC 3986 allows in a URI unencoded, percent included. A yt-dlp
 # `url` outside this set needs quoting — a raw space or non-ASCII reaches here from
 # the sites URLSource.OTHER allows. Inside it, re-quoting breaks a signed HLS path.
@@ -1302,14 +1325,11 @@ def _first_video_entry(data: YTDLExtractResult) -> Optional[YTDLEntry]:
     if "entries" not in data:
         return data
     # TODO: Validate search results have a usable audio format before accepting.
-    # An entry wins purely by being the first non-playlist result — nothing
-    # checks for an https audio URL at a usable bitrate, so a format-less or
-    # low-quality entry is accepted here and only blows up at stream time,
-    # looking unrelated.
-    for entry in data["entries"]:
-        if entry and entry.get("_type", None) != "playlist":
-            return entry
-    return None
+    # select_search_entry prefers an entry carrying a URL, but nothing checks
+    # for an https audio URL at a usable bitrate, so a format-less or
+    # low-quality entry is accepted when nothing better exists and only blows
+    # up at stream time, looking unrelated.
+    return select_search_entry(data["entries"])
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1905,6 +1925,14 @@ class YTDL(discord.FFmpegOpusAudio):
             log.warning(f"no playable result for {search!r}")
             raise ExtractionError(
                 "Couldn't find anything playable for that.", expected=True
+            )
+        if not selected.get("url"):
+            # This path runs processed, so a result with no stream URL is one
+            # yt-dlp could select no format for. It fails at stream time, where
+            # the error looks unrelated to the search.
+            log.warning(
+                f"search result for {search!r} carries no stream URL "
+                f"(title={selected.get('title')!r}) — playback will likely fail"
             )
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
