@@ -150,7 +150,7 @@ just test -k spotify
 just test --maxfail=1
 
 # Operator and deploy recipes (db-migrate, backfill, outbox, bot-settings,
-# image, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
+# build, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
 ```
 
 fmt/fmt-check/lint/types/test/check run **inside the test image by default** — no local

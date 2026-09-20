@@ -124,7 +124,7 @@ dep_hash() {
 # shells commonly export one — this machine exports ENVIRONMENT=development from its
 # login profile, which makes the branch derivation below dead code and stamps a build
 # from main as `development`. deploy_docker.sh echoes it, but build_docker.sh and
-# `just image` did not, so the value reached `docker build --build-arg` unseen.
+# `just build` did not, so the value reached `docker build --build-arg` unseen.
 resolve_environment() {
     if [ -z "${ENVIRONMENT:-}" ]; then
         local branch
@@ -181,7 +181,7 @@ build_runtime_image() {
     # verified: 3.2 aborts with "tag_args[@]: unbound variable", 5.3 is fine. No
     # current caller passes zero tags, but the header advertises this as variadic for
     # the unmerged k8s branch, so a zero-arg call is a supported shape.
-    # GIT_SHA is the caller's to set (build_docker.sh exports it, `just image`
+    # GIT_SHA is the caller's to set (build_docker.sh exports it, `just build`
     # exports the tag it computed) for the same explicit-propagation reason as
     # ENVIRONMENT. Defaulted here rather than left unset so a caller that forgets
     # bakes a readable "unknown" instead of an empty string.

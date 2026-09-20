@@ -1070,7 +1070,7 @@ db-restore FILE DB='':
 
 # Build the runtime image as :latest and :<git-sha> — no test gate
 [group('ops')]
-image:
+build:
     #!/usr/bin/env bash
     set -euo pipefail
     source ./build_common.sh
@@ -1114,7 +1114,7 @@ down:
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text
-# said "recreate", which sent `image && restart` down a path that silently kept running
+# said "recreate", which sent `build && restart` down a path that silently kept running
 # the old code. Use `just up` to deploy.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
