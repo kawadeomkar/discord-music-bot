@@ -33,6 +33,7 @@ from src.sources import (
     SpotifyType,
     YTSource,
     YTType,
+    CollectionNoun,
     collection_noun,
     parse_input,
     query_source_of,
@@ -111,7 +112,7 @@ class EmptyPlaylistError(PlaylistInputError):
     "every video is private" are indistinguishable here. An album's tracks are
     Spotify's, so its copy names no video."""
 
-    def __init__(self, noun: str = "playlist") -> None:
+    def __init__(self, noun: CollectionNoun = "playlist") -> None:
         tracks = "track on it" if noun == "album" else "video in it"
         super().__init__(
             f"{noun} resolved to no tracks",
@@ -238,7 +239,7 @@ async def _spotify_collection(
     return collection
 
 
-def short_walk_notice(noun: str) -> discord.Embed:
+def short_walk_notice(noun: CollectionNoun) -> discord.Embed:
     """Said when Spotify ended a walk before its own count of the collection: the
     confirmation's song count is what was queued, not what the link holds."""
     return notice_embed(
@@ -254,7 +255,7 @@ def collection_note(
     *,
     returns: str = "",
     head_playing: bool,
-    noun: str = "playlist",
+    noun: CollectionNoun,
 ) -> str:
     """What a `-play` that queued a whole collection tells the user: how many
     tracks landed, when the interrupted song returns, and the `-remove` undo.
@@ -516,7 +517,7 @@ async def enqueue_playlist(
     Spotify playlists arrive as titles needing YouTube search, YouTube playlists
     pre-resolved. Positions are minted at the insert: `analytics` carries the
     ask time and its depth is replaced by the one the head takes."""
-    # A playlist front-inserts in full, in order, under either flag. NEXT goes
+    # A collection front-inserts in full, in order, under either flag. NEXT goes
     # through queue_put_next, for the claim the loop's prefetch holds.
     enqueue = {
         Placement.TAIL: mp.queue_put,
@@ -1016,7 +1017,7 @@ async def interject_flow(
                 f"`{outcome.resume_position_str}`."
             )
         if follow_on:
-            # The interrupted song waits behind the whole playlist, so the reply says
+            # The interrupted song waits behind the whole collection, so the reply says
             # so and names the undo (`-remove <the link>` matches user_input).
             desc += collection_note(
                 url,

@@ -349,6 +349,25 @@ class TestParseUrlSpotify:
         assert "''" not in raised.value.user_message
         assert "track, playlist or album" in raised.value.user_message
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://open.spotify.com/album/ID#frag",
+            "https://open.spotify.com/album/ID&x=1",
+            "https://open.spotify.com/album/../../v1/me",
+            "https://open.spotify.com/album/ID>",
+        ],
+    )
+    def test_an_id_that_is_not_base62_is_refused(self, url: str) -> None:
+        """The id goes into the API path, the cache key and the card's link."""
+        with pytest.raises(UnsupportedSpotifyLinkError, match="doesn't look right"):
+            parse_url(url)
+
+    def test_a_link_with_its_embed_suppressed_parses_like_the_bare_one(self) -> None:
+        source = parse_input("<https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl>")
+        assert isinstance(source, SpotifySource)
+        assert source.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
     def test_the_canonical_url_drops_the_locale_and_the_share_parameters(self) -> None:
         source = parse_url(
             "https://open.spotify.com/intl-de/album/6WgSCcRfaXuBVfM2TpV0Kl?si=abc"
@@ -832,6 +851,21 @@ class TestQuotedArgumentsSurviveConsumeRest:
     def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
         assert unquote_argument('""') == '""'
         assert unquote_argument('"') == '"'
+
+    def test_discords_embed_suppression_wrapper_comes_off_a_link(self) -> None:
+        """`<link>` is how Discord sends a link whose embed the user suppressed,
+        and the `>` otherwise rides into the path."""
+        source = parse_input("<https://www.youtube.com/watch?v=dQw4w9WgXcQ>")
+        assert isinstance(source, YTSource)
+        assert source.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_angle_brackets_around_words_are_the_users_own(self) -> None:
+        assert unquote_argument("<3 this song>") == "<3 this song>"
+        assert unquote_argument("<>") == "<>"
+
+    def test_unwrapping_is_safe_twice(self) -> None:
+        once = unquote_argument("<https://youtu.be/x>")
+        assert unquote_argument(once) == once == "https://youtu.be/x"
 
 
 class TestTimestampWarning:

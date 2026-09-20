@@ -111,7 +111,7 @@ def remove_matcher(needle: str) -> RemoveMatcher:
     def match(item: QueueItem) -> Optional[RemoveMode]:
         if not needle:
             # An unresolved search has url=None, which an empty needle would match
-            # as "" and take out every Spotify-playlist track.
+            # as "" and take out every Spotify collection track.
             return None
         resolved = (
             item.webpage_url if isinstance(item, QueueObject) else (item.url or "")

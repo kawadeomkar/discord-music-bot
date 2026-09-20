@@ -3,7 +3,7 @@ import contextlib
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 from collections.abc import Awaitable, Callable, Iterator
 
 import aiohttp
@@ -22,6 +22,10 @@ from src.redis_client import (
 from src import config
 from src.telemetry import get_tracer
 from src.util import ProgressFn, get_logger
+
+if TYPE_CHECKING:
+    # Annotation only: this client stays free of the input-parsing layer.
+    from src.sources import CollectionNoun
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -264,7 +268,12 @@ class SpotifyPlaylistTooSlowError(Exception):
     retry for the second is advice that cannot work."""
 
     def __init__(
-        self, pages: int, titles: int, *, whole_walk: bool, noun: str = "playlist"
+        self,
+        pages: int,
+        titles: int,
+        *,
+        whole_walk: bool,
+        noun: CollectionNoun = "playlist",
     ) -> None:
         self.pages = pages
         self.titles = titles
@@ -315,7 +324,9 @@ class SpotifyPlaylistForbiddenError(Exception):
     all. Distinct from SpotifyAuthError, which would tell an operator to rotate
     good credentials."""
 
-    def __init__(self, pid: str, detail: str, *, noun: str = "playlist") -> None:
+    def __init__(
+        self, pid: str, detail: str, *, noun: CollectionNoun = "playlist"
+    ) -> None:
         self.pid = pid
         self.noun = noun
         super().__init__(f"spotify {noun} {pid}: {detail}")
@@ -775,7 +786,7 @@ class Spotify:
         return name
 
     def _forbidden(
-        self, pid: str, detail: str, *, noun: str = "playlist"
+        self, pid: str, detail: str, *, noun: CollectionNoun = "playlist"
     ) -> SpotifyPlaylistForbiddenError:
         """The refusal, logged once for the operator: the credentials work, so it is
         the app's access, not something to rotate. See README's Spotify

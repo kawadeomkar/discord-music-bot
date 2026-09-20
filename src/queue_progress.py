@@ -31,6 +31,7 @@ from src.sources import (
     SpotifyType,
     YTSource,
     YTType,
+    CollectionNoun,
     collection_noun,
     is_mix,
     timestamp_warning,
@@ -108,7 +109,7 @@ class CardDetails:
     inside queue_source and does not exist while this is on screen."""
 
     requester: str
-    noun: str = "playlist"
+    noun: CollectionNoun = "playlist"
     playlist_label: str = ""
     warning: str = ""
     placement_note: str = ""
