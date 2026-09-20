@@ -2819,6 +2819,17 @@ class TestQueuedRows:
         for row in card:
             assert row in queue
 
+    def test_the_slot_is_where_the_track_is_not_where_the_insert_expected(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A front insert reports nothing ahead, but it lands behind a song the
+        loop has claimed, which -queue still lists first."""
+        claimed = QueueObject("https://yt.com/v=1", "Claimed", mock_author, duration=60)
+        tracks = [_album_track(1, 100)]
+        seed_queue(music_player.queue, claimed, *tracks)
+
+        assert music_player.queued_rows(tracks, ahead=0).startswith("`2` ")
+
     def test_a_collection_a_clear_already_took_renders_from_the_depth_it_saw(
         self, music_player: MusicPlayer
     ) -> None:
