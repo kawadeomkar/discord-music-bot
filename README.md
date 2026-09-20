@@ -188,7 +188,7 @@ places a copy at `.venv/bin/just`, but a virtualenv's `bin/` is on `PATH` only
 while the environment is activated, and the pre-push git hook does not activate it.
 
 With `just` and Docker, Poetry, Python and FFmpeg are not required: every check
-runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
+runs in a container by default — see [Just recipes](#just-recipes).
 
 ### 1. Create the Discord application
 
@@ -273,17 +273,20 @@ purpose.
 Multi-step pipelines live in the shell scripts (`./build_docker.sh`,
 `./deploy_docker.sh`); the justfile indexes the primitives those scripts compose.
 
-**With only Docker and `just`**, prefix `DOCKER=1` to `fmt`, `fmt-check`, `lint`,
-`types`, `test` or `check` to run it inside the test image instead of a local
-virtualenv. No Python, Poetry or Node is required on the host:
+**Recipes run inside the test image by default** — `fmt`, `fmt-check`, `lint`,
+`types`, `test` and `check` each run in a container, so **with only Docker and `just`**
+a contributor needs no Python, Poetry or Node on the host. Prefix `DOCKER=0` to run a
+recipe against a local virtualenv instead (faster, but needs the Python toolchain from
+`just install`):
 
 ```bash
-DOCKER=1 just check    # the full gate, container-only
-DOCKER=1 just fmt      # ruff rewrites your files, not the image's
+just check             # the full gate, container-only
+just fmt               # ruff rewrites your working tree (bind-mounted), not the image's
+DOCKER=0 just check    # opt out: run against the local venv instead
 ```
 
-The prefix must come **before** the recipe name. `just check DOCKER=1` is an error
-(`just` reads it as a second recipe to run), unlike `make check DOCKER=1`.
+The prefix must come **before** the recipe name. `just check DOCKER=0` is an error
+(`just` reads it as a second recipe to run), unlike `make check DOCKER=0`.
 
 `src/`, `tests/` and `pyproject.toml` are bind-mounted, so the container reads and
 writes your working tree. Formatting runs as your uid, so rewritten files are owned
@@ -291,9 +294,14 @@ by you rather than by root. The image is built automatically the first time; aft
 changing `pyproject.toml` or `poetry.lock`, run `just test-image-rebuild` so the
 container picks up the new dependencies.
 
-The native path is the default because it is faster: the difference is container
-startup, paid on every invocation, and it dominates the short recipes (a bare
-`just lint` is ~0.05s native against ~0.6s containerized).
+Docker is the default so a fresh contributor needs nothing but Docker and `just`. The
+native path (`DOCKER=0`) is faster: the difference is container startup, paid on every
+invocation, and it dominates the short recipes (a bare `just lint` is ~0.05s native
+against ~0.6s containerized). It needs the Python toolchain installed by `just install`.
+
+`just test-pg` and `just test-redis` always run against the local venv, whatever
+`DOCKER` says: each starts its own server container or dials one on the host, and the
+test image can do neither. They need `just install` as well as Docker.
 
 **Setup**
 
@@ -305,9 +313,10 @@ startup, paid on every invocation, and it dominates the short recipes (a bare
 | `just hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
 | `just hooks-run` | Run every hook against every file, not just staged ones |
 | `just hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
-| `just test-image-rebuild` | Rebuild the image `DOCKER=1` uses — needed after a dependency change |
+| `just test-image-rebuild` | Rebuild the test image recipes run in by default — needed after a dependency change |
 
-**Develop** — ordered fastest first
+**Develop** — ordered fastest first (costs are the native `DOCKER=0` path; the default
+container path adds ~0.5s of startup per recipe)
 
 | Recipe | Does | Cost |
 |---|---|---|

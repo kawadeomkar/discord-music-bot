@@ -159,8 +159,12 @@ resolve_environment() {
 # container-test job. That is a different question (does the IMAGE run?) and it
 # belongs in `just ci`, not in front of every deploy.
 run_test_gate() {
-    echo "Running gate: just check"
-    just check
+    # DOCKER=0 pins the NATIVE checks. This gate mirrors CI's lint and test jobs, which
+    # run against a venv — under DOCKER=1 `just check` would build and run the test
+    # image here instead, diverging from the very thing it is meant to reproduce.
+    # Pinned explicitly rather than inherited, so the justfile's default cannot move it.
+    echo "Running gate: DOCKER=0 just check"
+    DOCKER=0 just check
 }
 
 # build_runtime_image <tag> [extra tags...] — the runtime image every pipeline

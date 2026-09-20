@@ -46,9 +46,11 @@ what a maintainer reads before touching a version.
    Poetry IGNORES an unknown extra, so drift builds green and ships an image whose
    charts are silently absent. See `docs/ARCHITECTURE.md#the-charts-extra`.
    The **list** is the pre-push gate: `check`'s dependency list ↔ the five
-   `entry: just <recipe>` pre-push hooks in `.pre-commit-config.yaml`, the same
-   recipes in the same order. Drift runs one way and reports green — a step added to
-   `check` alone simply stops running on push.
+   `entry: env DOCKER=0 just <recipe>` pre-push hooks in `.pre-commit-config.yaml`, the
+   same recipes in the same order. Drift runs one way and reports green — a step added
+   to `check` alone simply stops running on push. The `env DOCKER=0` prefix is matched,
+   not skipped, so a misspelled pin fails here rather than quietly containerizing a
+   hook.
    **Five pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
