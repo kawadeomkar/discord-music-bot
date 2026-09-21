@@ -77,11 +77,11 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    backoff loop is their error handler. Which helpers, and why `push_history`'s XADD leg
    sits on the swallowing side: `.claude/rules/state-and-recovery.md`.
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces eight duplicated name/version pairs — it is a dep of `check` AND its own CI
+   enforces nine duplicated name/version pairs — it is a dep of `check` AND its own CI
    step, deliberately: Dependabot opens SEPARATE PRs that each move one half, and those
-   are validated by CI, never by a local `check`. **Five more pairs are enforced by
-   nothing** (the PO-token sidecar, the published Prometheus port, the otel collector
-   images, `MPLCONFIGDIR`, and the liveness cap against the HEALTHCHECK window), and
+   are validated by CI, never by a local `check`. **Four more pairs are enforced by
+   nothing** (the published Prometheus port, the otel collector images, `MPLCONFIGDIR`,
+   and the liveness cap against the HEALTHCHECK window), and
    every one of them fails green: the build passes and the symptom lands at runtime.
    Both lists, with what each drift looks like: `.claude/rules/ci-and-build.md`.
 7. **Do not create `pyrightconfig.json`.** `[tool.pyright]` in `pyproject.toml` is the
@@ -132,7 +132,7 @@ just fmt            # ruff format + autofix (REWRITES files)     ~0.1s
 just fmt-justfile   # `just --fmt --check` on the justfile        ~0.01s
 just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
-just pins           # assert the eight duplicated version/name pins ~0.02s
+just pins           # assert the nine duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
 just test           # full suite, PARALLEL (-n auto), coverage gated (fail_under=80) ~35s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
