@@ -122,7 +122,7 @@ def redis_url() -> Iterator[str]:
             message=r".*wait_container_is_ready decorator is deprecated.*",
             category=DeprecationWarning,
         )
-        from testcontainers.redis import RedisContainer
+        from testcontainers.community.redis import RedisContainer
 
     container = RedisContainer(_REDIS_IMAGE)
     bind_loopback_only(container, 6379)

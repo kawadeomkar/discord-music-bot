@@ -89,7 +89,7 @@ def admin_dsn() -> Iterator[str]:
         yield external
         return
 
-    from testcontainers.postgres import PostgresContainer
+    from testcontainers.community.postgres import PostgresContainer
 
     pg = PostgresContainer(_PG_IMAGE, username="test", password="test")
     bind_loopback_only(pg, 5432)
