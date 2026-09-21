@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.queue_rows import (
+    eta_at,
     fmt_total_duration,
     requester_mention,
     ROW_BYLINE_MAX,
@@ -372,3 +373,25 @@ class TestRequesterMention:
 
     def test_returns_unknown_when_none(self) -> None:
         assert requester_mention(None) == "Unknown"
+
+
+class TestEtaAcrossADstTransition:
+    """Adding a timedelta to an aware datetime is wall-clock arithmetic: the offset
+    is not renormalized, so a queue spanning a transition lands an hour out and can
+    render a local time that does not exist."""
+
+    # US/Pacific skips 02:00-03:00 on this date.
+    _BEFORE = datetime.datetime(2027, 3, 14, 0, 30, tzinfo=ZoneInfo("US/Pacific"))
+
+    def test_two_hours_over_the_spring_forward_is_two_real_hours(self) -> None:
+        assert fmt_eta(eta_at(self._BEFORE, 7200), False) == "**3:30 AM PDT**"
+
+    def test_it_never_renders_an_hour_that_does_not_exist(self) -> None:
+        """02:00-03:00 is skipped locally, so no span may land inside it."""
+        for secs in range(0, 3 * 3600, 60):
+            rendered = eta_at(self._BEFORE, secs)
+            assert not (rendered.hour == 2 and rendered.tzname() == "PST")
+
+    def test_an_ordinary_span_is_unchanged(self) -> None:
+        plain = datetime.datetime(2026, 9, 20, 21, 38, tzinfo=ZoneInfo("US/Pacific"))
+        assert eta_at(plain, 3600) == plain + datetime.timedelta(seconds=3600)

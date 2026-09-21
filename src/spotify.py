@@ -14,6 +14,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 
 from src.redis_client import (
+    cache_del,
     cache_get,
     cache_set,
     spotify_token_get_with_ttl,
@@ -75,6 +76,22 @@ _playlist_gate_loop: Optional[asyncio.AbstractEventLoop] = None
 _TOKEN_EXPIRY_MARGIN_SECS = 60
 
 
+class SpotifyRowMismatchError(Exception):
+    """A walk produced a different number of display rows than titles. The two are
+    read by index, so a row under the wrong title is worse than no rows; the walk
+    is refused instead. `user_message` keeps the internals out of the channel."""
+
+    def __init__(self, rows: int, titles: int) -> None:
+        super().__init__(f"{rows} rows for {titles} titles: the two are read by index")
+
+    @property
+    def user_message(self) -> str:
+        return (
+            "Spotify sent something I couldn't line up. Try that link again in a "
+            "moment."
+        )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SpotifyTrack:
     """One walked track as a listing shows it: its own name, apart from the search
@@ -110,10 +127,7 @@ class SpotifyPlaylist:
 
     def __post_init__(self) -> None:
         if self.tracks and len(self.tracks) != len(self.titles):
-            raise ValueError(
-                f"{len(self.tracks)} tracks for {len(self.titles)} titles: the two "
-                "are read by index"
-            )
+            raise SpotifyRowMismatchError(len(self.tracks), len(self.titles))
 
 
 # Display rows rebuilt per event-loop turn on a cache HIT. A 10,000-track
@@ -228,6 +242,16 @@ def _list_or_empty(value: object) -> list[Any]:
     return cast(list[Any], value) if isinstance(value, list) else []
 
 
+def _row_url(raw: object) -> Optional[str]:
+    """A track link fit for a masked link's target. A ")" would close the link
+    early and spill the rest of the URL into the listing as text, so a row that
+    fails the shape renders unlinked instead."""
+    url = _str_or_none(raw)
+    if url is None or not url.startswith("https://"):
+        return None
+    return None if any(c in url for c in ") \t\n") else url
+
+
 def _track_row(track: dict[str, Any]) -> SpotifyTrack:
     """A walked track's display row. The caller has checked it has a name."""
     ms = track.get("duration_ms")
@@ -240,7 +264,7 @@ def _track_row(track: dict[str, Any]) -> SpotifyTrack:
             if isinstance(a, dict) and (name := _str_or_none(a.get("name"))) is not None
         ],
         duration_secs=ms // 1000 if isinstance(ms, int) else None,
-        url=_str_or_none(links.get("spotify")) if isinstance(links, dict) else None,
+        url=_row_url(links.get("spotify")) if isinstance(links, dict) else None,
     )
 
 
@@ -896,6 +920,22 @@ class Spotify:
         if cached is not None:
             return cached
 
+        job = _INFLIGHT_PLAYLISTS.get(cache_key)
+        if job is not None:
+            trace.get_current_span().set_attribute("spotify.walk_shared", True)
+        else:
+            job = asyncio.ensure_future(self._album_walk(aid, cache_key))
+            _INFLIGHT_PLAYLISTS[cache_key] = job
+            # Registered before the shield, so the key is gone before any awaiter
+            # resumes and a retry after a failure starts a fresh walk.
+            job.add_done_callback(lambda _f: _INFLIGHT_PLAYLISTS.pop(cache_key, None))
+        # Shielded: the walk is shared, so one caller's cancellation must not take
+        # it from the others.
+        with _subscribed(cache_key, on_progress):
+            return await asyncio.shield(job)
+
+    async def _album_walk(self, aid: str, cache_key: str) -> SpotifyPlaylist:
+        """The album walk itself, run once per album by album()'s single flight."""
         url = self.spotify_endpoint + f"v1/albums/{aid}"
         name: Optional[str] = None
         artists: list[str] = []
@@ -973,8 +1013,7 @@ class Spotify:
                             duration_ms += ms
                         else:
                             duration_partial = True
-                    if on_progress is not None:
-                        _report(on_progress, walked, total)
+                    _publish(cache_key, walked, total)
                     next_url = page.get("next")
                     if not next_url:
                         break
@@ -1041,6 +1080,9 @@ class Spotify:
             await cache_set(
                 self._redis, cache_key, _playlist_to_cache(album), _ALBUM_TTL
             )
+            # The previous version's value is unreadable and unreferenced from here
+            # on, and its 24h TTL would keep it resident beside this one.
+            await cache_del(self._redis, f"spotify:album_tracks:v1:{aid}")
         else:
             log.debug(f"spotify album {aid} kept no titles; not cached")
         return album

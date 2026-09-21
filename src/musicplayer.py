@@ -65,7 +65,9 @@ from src.util import (
     get_logger,
 )
 from src.queue_rows import (
+    ROWS_BUDGET,
     EtaWalk,
+    eta_at,
     advance_walk,
     fmt_clock_time,
     fmt_eta,
@@ -194,7 +196,7 @@ def _clock(secs: float) -> str:
 def _fmt_finish_time(duration_secs: int, tz: ZoneInfo) -> str:
     """Clock time `duration_secs` from now. No uncertainty prefix: a playing song's
     remaining duration is known."""
-    finish_dt = datetime.datetime.now(tz=tz) + datetime.timedelta(seconds=duration_secs)
+    finish_dt = eta_at(datetime.datetime.now(tz=tz), duration_secs)
     return fmt_clock_time(finish_dt)
 
 
@@ -1283,9 +1285,7 @@ class MusicPlayer:
         """The body both single-entry cards render: one labelled fact per line,
         ending with the ETA position `index` earns."""
         now_pst, walk = self._eta_walk_to(index)
-        eta = fmt_eta(
-            now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
-        )
+        eta = fmt_eta(eta_at(now_pst, walk.cumulative_secs), walk.uncertain)
         if not isinstance(item, QueueObject):
             if not item.title:
                 # A search with no display fields: only its term exists yet.
@@ -1362,10 +1362,7 @@ class MusicPlayer:
         """The -play confirmation. `item` is located by identity, so the ETA is the
         one its real position earns; an entry a concurrent -clear removed renders at
         the tail."""
-        items = self.queue.display_items()
-        index = next(
-            (i for i, queued in enumerate(items, 1) if queued is item), len(items) + 1
-        )
+        index = self.queue.display_index(item) or self.queue.display_size() + 1
         return self._build_queue_entry_embed(
             item,
             index=index,
@@ -1374,24 +1371,32 @@ class MusicPlayer:
             warning=warning,
         )
 
-    def queued_rows(self, tracks: Sequence[QueueItem], *, ahead: int) -> str:
-        """The rows of a collection just queued, as -queue lists them: numbered by
-        the slot each took and timed by the walk to the first. Read after the
-        insert. The first track is located by identity; one a concurrent -clear
-        already took renders from `ahead`, the depth the insert saw."""
+    def queued_slot(self, tracks: Sequence[QueueItem], *, ahead: int) -> int:
+        """The 1-based slot a collection just queued actually took. By IDENTITY —
+        a collection may hold the same track twice, and equality would return the
+        first one's slot for both. One a concurrent -clear already took is not
+        there, and falls back to `ahead`, the depth the insert saw."""
+        if not tracks:
+            return ahead + 1
+        return self.queue.display_index(tracks[0]) or ahead + 1
+
+    def queued_rows(
+        self, tracks: Sequence[QueueItem], *, first: int, budget: int = ROWS_BUDGET
+    ) -> str:
+        """The rows of a collection just queued, as -queue lists them: numbered
+        from the slot it took and timed by the walk to it. Read after the insert.
+        `budget` is the room the card has left, so the rows and everything around
+        them share one bound rather than two."""
         if not tracks:
             return ""
-        first = next(
-            (
-                index
-                for index, queued in enumerate(self.queue.display_items(), 1)
-                if queued is tracks[0]
-            ),
-            ahead + 1,
-        )
         now_pst, walk = self._eta_walk_to(first)
         return queue_rows(
-            tracks, first_index=first, now=now_pst, walk=walk, byline=False
+            tracks,
+            first_index=first,
+            now=now_pst,
+            walk=walk,
+            byline=False,
+            budget=budget,
         )
 
     def playlist_facts(
@@ -1416,7 +1421,7 @@ class MusicPlayer:
             return "\n".join(lines)
         now_pst, walk = self._eta_walk_to(ahead + 1)
         if walk.cumulative_secs or walk.uncertain:
-            start = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+            start = eta_at(now_pst, walk.cumulative_secs)
             lines.append(f"Est. playing at {fmt_eta(start, walk.uncertain)}")
         return "\n".join(lines)
 

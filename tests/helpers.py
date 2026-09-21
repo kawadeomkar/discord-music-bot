@@ -282,6 +282,9 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     # The card's rows, for the same reason — and recognizable, so a command-level
     # test can assert the card carries them rather than a Mock's repr.
     mp.queued_rows = MagicMock(return_value=MOCK_QUEUED_ROWS)
+    # An int, not auto-vivified: the card derives "Songs ahead" from it. Mirrors
+    # the real lookup's fallback, which is the depth the insert saw.
+    mp.queued_slot = MagicMock(side_effect=lambda _tracks, *, ahead: ahead + 1)
     mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in

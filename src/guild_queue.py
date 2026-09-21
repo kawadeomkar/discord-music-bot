@@ -525,6 +525,14 @@ class GuildQueue:
         """Snapshot of the queued items in display order."""
         return list(self._items)
 
+    def display_index(self, item: QueueItem) -> Optional[int]:
+        """The 1-based display position of `item`, by IDENTITY, or None when it is
+        no longer queued. Scans the deque rather than a copy of it."""
+        for index, queued in enumerate(self._items, 1):
+            if queued is item:
+                return index
+        return None
+
     def claimed_head(self) -> Optional[QueueItem]:
         """The item a consumer holds at the head, or None when nothing is claimed."""
         return self._items[0] if self._cursor else None

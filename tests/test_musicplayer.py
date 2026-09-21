@@ -24,7 +24,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_history import GuildHistory
-from src.guild_queue import GuildQueue, RemoveMode
+
+from src.guild_queue import GuildQueue, QueueItem, RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
@@ -2736,6 +2737,12 @@ def _album_track(n: int, secs: int) -> YTSource:
     )
 
 
+def _card_rows(mp: MusicPlayer, tracks: Sequence[QueueItem], *, ahead: int) -> str:
+    """What enqueue_playlist builds: ONE slot read, then the rows from it. The
+    card's "Songs ahead" is derived from the same read."""
+    return mp.queued_rows(tracks, first=mp.queued_slot(tracks, ahead=ahead))
+
+
 class TestQueuedRows:
     """The rows a queued-collection card lists: -queue's own, for the slots the
     tracks took."""
@@ -2748,7 +2755,7 @@ class TestQueuedRows:
         tracks = [_album_track(1, 100), _album_track(2, 200)]
         seed_queue(music_player.queue, ahead, *tracks)
 
-        first, second = music_player.queued_rows(tracks, ahead=1).split("\n")
+        first, second = _card_rows(music_player, tracks, ahead=1).split("\n")
 
         assert first.startswith("`2` [**Track 1**](https://open.spotify.com/track/1)")
         assert second.startswith("`3` [**Track 2**]")
@@ -2763,7 +2770,7 @@ class TestQueuedRows:
         tracks = [_album_track(1, 100), _album_track(2, 200)]
         seed_queue(music_player.queue, ahead, *tracks)
 
-        first, second = music_player.queued_rows(tracks, ahead=1).split("\n")
+        first, second = _card_rows(music_player, tracks, ahead=1).split("\n")
 
         now_pst, walk = music_player._eta_walk_to(2)
         start = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
@@ -2779,7 +2786,7 @@ class TestQueuedRows:
         tracks = [_album_track(1, 100), _album_track(2, 200)]
         seed_queue(music_player.queue, *tracks)
 
-        card = music_player.queued_rows(tracks, ahead=0).split("\n")
+        card = _card_rows(music_player, tracks, ahead=0).split("\n")
         queue = described(music_player.queue_embed())
 
         for row in card:
@@ -2794,7 +2801,7 @@ class TestQueuedRows:
         tracks = [_album_track(1, 100)]
         seed_queue(music_player.queue, claimed, *tracks)
 
-        assert music_player.queued_rows(tracks, ahead=0).startswith("`2` ")
+        assert _card_rows(music_player, tracks, ahead=0).startswith("`2` ")
 
     def test_the_slot_is_found_by_identity_not_by_equality(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -2806,13 +2813,13 @@ class TestQueuedRows:
         assert first == second and first is not second
         seed_queue(music_player.queue, first, second)
 
-        assert music_player.queued_rows([first], ahead=0).startswith("`1` ")
-        assert music_player.queued_rows([second], ahead=0).startswith("`2` ")
+        assert _card_rows(music_player, [first], ahead=0).startswith("`1` ")
+        assert _card_rows(music_player, [second], ahead=0).startswith("`2` ")
 
     def test_a_collection_a_clear_already_took_renders_from_the_depth_it_saw(
         self, music_player: MusicPlayer
     ) -> None:
-        rows = music_player.queued_rows([_album_track(1, 100)], ahead=6)
+        rows = _card_rows(music_player, [_album_track(1, 100)], ahead=6)
         assert rows.startswith("`7` ")
 
     def test_past_ten_tracks_the_rest_are_counted(
@@ -2821,13 +2828,13 @@ class TestQueuedRows:
         tracks = [_album_track(n, 60) for n in range(14)]
         seed_queue(music_player.queue, *tracks)
 
-        rows = music_player.queued_rows(tracks, ahead=0).split("\n")
+        rows = _card_rows(music_player, tracks, ahead=0).split("\n")
 
         assert len(rows) == 11
         assert rows[-1] == "*... and 4 more*"
 
     def test_nothing_queued_is_no_rows(self, music_player: MusicPlayer) -> None:
-        assert music_player.queued_rows([], ahead=0) == ""
+        assert _card_rows(music_player, [], ahead=0) == ""
 
 
 class TestBuildNowPlayingEmbed:

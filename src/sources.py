@@ -240,6 +240,17 @@ def spotify_playlist_to_ytsearch(
     rows: Sequence[Optional[SpotifyTrack]] = (
         tracks if len(tracks) == len(titles) else [None] * len(titles)
     )
+    # One joined byline per distinct artist tuple: an album is usually one artist,
+    # and a fresh join per track is the only string this pass keeps for the life of
+    # the queue (measured ~800 KiB over 10,000 tracks).
+    bylines: dict[tuple[str, ...], Optional[str]] = {}
+
+    def byline(row: SpotifyTrack) -> Optional[str]:
+        key = tuple(row.artists)
+        if key not in bylines:
+            bylines[key] = ", ".join(key) or None
+        return bylines[key]
+
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
@@ -249,7 +260,7 @@ def spotify_playlist_to_ytsearch(
             user_input=origin,
             requester_id=requester_id,
             title=row.name if row else None,
-            uploader=", ".join(row.artists) or None if row else None,
+            uploader=byline(row) if row else None,
             duration=row.duration_secs if row else None,
             webpage_url=row.url if row else None,
         )

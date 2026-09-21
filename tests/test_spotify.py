@@ -2125,6 +2125,44 @@ class TestSpotifyAlbum:
         assert album.titles == ["T Real"]
 
 
+class TestARowsLinkIsShapeChecked:
+    """The row's URL is the one field that reaches a masked link's TARGET, where
+    safe_label cannot help: a ")" ends the link early and the rest spills into the
+    listing as text the bot appears to have written."""
+
+    @pytest.mark.parametrize(
+        "raw,kept",
+        [
+            (
+                "https://open.spotify.com/track/abc",
+                "https://open.spotify.com/track/abc",
+            ),
+            ("https://open.spotify.com/track/a)b", None),
+            ("http://open.spotify.com/track/abc", None),
+            ("https://open.spotify.com/track/a b", None),
+            ("", None),
+            (None, None),
+            (42, None),
+        ],
+    )
+    def test_only_a_well_formed_https_link_survives(
+        self, raw: object, kept: Optional[str]
+    ) -> None:
+        assert spotify_module._row_url(raw) == kept
+
+    def test_a_walked_track_with_a_broken_link_still_queues(self) -> None:
+        """The title and length are still worth showing; only the link is dropped."""
+        row = spotify_module._track_row(
+            {
+                "name": "DNA.",
+                "artists": [{"name": "Kendrick Lamar"}],
+                "duration_ms": 185_000,
+                "external_urls": {"spotify": "https://open.spotify.com/track/a)b"},
+            }
+        )
+        assert (row.name, row.duration_secs, row.url) == ("DNA.", 185, None)
+
+
 class TestSpotifyTrackRows:
     """What a listing shows for each walked track, beside the search string it is
     queued as."""
@@ -2238,7 +2276,9 @@ class TestSpotifyTrackRows:
         assert album.tracks == []
 
     def test_rows_that_do_not_line_up_with_the_titles_are_refused(self) -> None:
-        with pytest.raises(ValueError, match="read by index"):
+        """A user-safe type, not a bare ValueError: whatever reaches the channel
+        here has to read as a Spotify problem, not as an internals dump."""
+        with pytest.raises(spotify_module.SpotifyRowMismatchError) as caught:
             SpotifyPlaylist(
                 name=None,
                 titles=["One A", "Two A"],
@@ -2249,6 +2289,8 @@ class TestSpotifyTrackRows:
                     SpotifyTrack(name="One", artists=[], duration_secs=1, url=None)
                 ],
             )
+        assert "read by index" in str(caught.value)
+        assert "couldn't line up" in caught.value.user_message
 
 
 class TestSpotifyAlbumWalkSlot:
@@ -2355,6 +2397,56 @@ class TestSpotifyAlbumWalkSlot:
 
 
 class TestSpotifyAlbumCache:
+    async def test_concurrent_plays_of_one_album_share_a_single_walk(
+        self, spotify: Spotify
+    ) -> None:
+        """A playlist's callers collapse onto one walk; an album's did not, and page
+        1 takes no walk slot either — so N guilds pasting one album link on the same
+        deploy spent N requests of a rate limit that is per APPLICATION."""
+        page = _album_tracks_page(["A", "B"], total=2, next_url=None)
+        started = 0
+
+        async def _slow(_url: str, **_kw: Any) -> dict[str, Any]:
+            nonlocal started
+            started += 1
+            await asyncio.sleep(0)
+            return _album(page)
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=_slow)):
+            walks = await asyncio.gather(
+                *[spotify.album("aid_share") for _ in range(8)]
+            )
+
+        assert started == 1
+        assert all(w is walks[0] for w in walks)
+
+    async def test_a_failed_walk_leaves_no_job_behind(self, spotify: Spotify) -> None:
+        """The in-flight entry is dropped before any awaiter resumes, so the next
+        -play retries rather than re-awaiting a dead future."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            with pytest.raises(RuntimeError):
+                await spotify.album("aid_fail")
+        assert (
+            "spotify:album_tracks:v2:aid_fail" not in spotify_module._INFLIGHT_PLAYLISTS
+        )
+
+    async def test_a_write_drops_the_previous_key_version(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """v1 is unreadable from here on and carries the same 24h TTL, so leaving it
+        costs a day of both copies for every album warm at deploy."""
+        await fake_redis.set("spotify:album_tracks:v1:aid_old", b"{}", ex=86400)
+        page = _album_tracks_page(["A"], total=1, next_url=None)
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=_album(page))
+        ):
+            await spotify.album("aid_old")
+
+        assert await fake_redis.get("spotify:album_tracks:v2:aid_old") is not None
+        assert await fake_redis.get("spotify:album_tracks:v1:aid_old") is None
+
     async def test_every_field_round_trips_and_a_hit_makes_no_request(
         self, spotify: Spotify, fake_redis: Redis
     ) -> None:

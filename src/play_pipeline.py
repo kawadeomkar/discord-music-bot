@@ -45,6 +45,7 @@ from src.queue_progress import enqueue_progress, is_collection
 from src.queue_rows import queue_runtime
 from src.util import (
     ECHO_MAX,
+    EMBED_DESCRIPTION_LIMIT,
     ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
@@ -67,6 +68,9 @@ log = get_logger(__name__)
 # Searches built per event-loop turn for a Spotify playlist. Measured ~7ms a
 # thousand, which is how long each chunk holds the event loop.
 _SEARCH_BUILD_CHUNK = 1000
+
+# Blank lines and the "... and N more" tail the rows add around themselves.
+_DESCRIPTION_MARGIN = 64
 _tracer = get_tracer(__name__)
 
 
@@ -607,12 +611,21 @@ async def enqueue_playlist(
     # waiting for. What follows is a Discord send and a stream warm.
     await release_hold()
     # After the put, like the single-song card, so the facts describe the slot taken.
+    # One read of the queue backs both numbers: "Songs ahead" and the first row's
+    # index disagreed when the loop dequeued between them.
+    first = mp.queued_slot(tracks, ahead=ahead)
     header = [f"Requested by: [{ctx.author.mention}]", *heading]
     # Every row carries its own start time, so the facts line does not.
-    header.append(mp.playlist_facts(ahead=ahead, runtime=runtime, eta=False))
+    header.append(mp.playlist_facts(ahead=first - 1, runtime=runtime, eta=False))
     body = [line for line in header if line]
+    # One bound over the whole description, not just the rows: the heading, the
+    # facts and a timestamp warning are each capped on their own, but their SUM
+    # is what Discord rejects.
+    around = "\n".join(body) + (f"\n\n{warning}" if warning else "")
+    room = EMBED_DESCRIPTION_LIMIT - len(around) - _DESCRIPTION_MARGIN
     # The rows -queue will show for these tracks, read after the put.
-    description = "\n".join(body) + f"\n\n{mp.queued_rows(tracks, ahead=ahead)}"
+    rows = mp.queued_rows(tracks, first=first, budget=max(0, room))
+    description = "\n".join(body) + f"\n\n{rows}"
     if warning:
         description += f"\n\n{warning}"
     noun = collection_noun(source)

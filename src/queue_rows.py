@@ -64,6 +64,15 @@ def fmt_total_duration(secs: int) -> str:
     return " ".join(parts) or "0s"
 
 
+def eta_at(now: datetime.datetime, secs: int) -> datetime.datetime:
+    """`secs` of real time after `now`, in `now`'s zone. Adding a timedelta to an
+    aware datetime is WALL-CLOCK arithmetic, so a span crossing a DST transition
+    lands an hour out and renders a local time that may not exist."""
+    return (now.astimezone(datetime.UTC) + datetime.timedelta(seconds=secs)).astimezone(
+        now.tzinfo
+    )
+
+
 def fmt_clock_time(dt: datetime.datetime) -> str:
     """A wall-clock time with the zone it is in, read off the datetime."""
     hour = dt.hour % 12 or 12
@@ -137,9 +146,7 @@ def queue_row(
     requester. `walk` is the state BEFORE this item. An unresolved search renders
     the same row from its display fields (the artists stand in for the channel),
     and one that carries none is its search text and "resolving..."."""
-    eta = fmt_eta(
-        now + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
-    )
+    eta = fmt_eta(eta_at(now, walk.cumulative_secs), walk.uncertain)
     if isinstance(item, QueueObject):
         if item.is_resume and item.ts:
             note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"

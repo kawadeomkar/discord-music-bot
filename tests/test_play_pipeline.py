@@ -34,7 +34,7 @@ from src.play_pipeline import (
     collection_note,
 )
 from src.redis_client import GuildRedisStore
-from src.util import ECHO_MAX, ECHO_ROW_MAX
+from src.util import ECHO_MAX, ECHO_ROW_MAX, EMBED_DESCRIPTION_LIMIT
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -182,6 +182,9 @@ def _enqueue_mp(mock_ctx: MagicMock) -> MagicMock:
     mp.playlist_facts = MagicMock(return_value="Total Duration: **3m**")
     # The shared rows, rendered by the player after the put.
     mp.queued_rows = MagicMock(return_value=_ROWS)
+    # An int, not auto-vivified: the card derives "Songs ahead" from it. Mirrors
+    # the real lookup's fallback, which is the depth the insert saw.
+    mp.queued_slot = MagicMock(side_effect=lambda _tracks, *, ahead: ahead + 1)
     mp.queue.display_size = MagicMock(return_value=0)
     mp.enqueue_depth = MagicMock(return_value=0)
     mock_ctx.message.add_reaction = AsyncMock()
@@ -467,7 +470,12 @@ class TestEnqueuePlaylist:
         assert "2 songs" in embed.title
         assert source.url in embed.description
         assert embed.description.endswith(_ROWS)
-        mp.queued_rows.assert_called_once_with(qobjs, ahead=0)
+        # The rows come from the slot the tracks took, which also feeds \"Songs ahead\".
+        mp.queued_slot.assert_called_once_with(qobjs, ahead=0)
+        (tracks_arg,), kwargs = mp.queued_rows.call_args
+        assert list(tracks_arg) == list(qobjs) and kwargs["first"] == 1
+        # The rows are bounded by the room the rest of the description left.
+        assert 0 < kwargs["budget"] <= EMBED_DESCRIPTION_LIMIT
 
     async def test_yt_embed_states_the_skipped_songs(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -691,7 +699,34 @@ class TestEnqueuePlaylist:
         (queued,) = mp.queue_put.await_args.args
         rows_call = mp.queued_rows.call_args
         assert rows_call.args[0] is queued or list(rows_call.args[0]) == list(queued)
-        assert rows_call.kwargs == {"ahead": 4}
+        assert rows_call.kwargs["first"] == 5
+
+    async def test_the_whole_description_is_bounded_not_just_the_rows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """ROWS_BUDGET bounds the rows; the heading, the facts line and a timestamp
+        warning are appended around them. Each is capped on its own, but Discord
+        rejects the SUM, and the send happens after the songs are already queued."""
+        mp = _enqueue_mp(mock_ctx)
+        mp.queued_rows = MagicMock(
+            side_effect=lambda _t, *, first, budget: "R" * budget
+        )
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="p" * 22)
+        resolved = ResolvedSpotifyPlaylist(
+            titles=["Song A"],
+            name="N" * 300,
+            artists=["A" * 300],
+            tracks=[
+                SpotifyTrack(
+                    name="Song A", artists=["A"], duration_secs=1, url="https://sp/a"
+                )
+            ],
+        )
+
+        await self._enqueue(music_bot, mock_ctx, mp, source, resolved)
+
+        description = mock_ctx.send.call_args.kwargs["embed"].description
+        assert len(description) <= EMBED_DESCRIPTION_LIMIT
 
     async def test_the_card_escapes_no_track_titles_of_its_own(
         self, music_bot: MusicBot, mock_ctx: MagicMock
