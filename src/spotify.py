@@ -117,6 +117,12 @@ class SpotifyPlaylist:
             )
 
 
+# Display rows rebuilt per event-loop turn on a cache HIT. A 10,000-track
+# collection is ~29ms of solid construction, and a hit takes neither the walk slot
+# nor the single flight, so every caller would pay it on one tick.
+_CACHE_ROWS_CHUNK = 1000
+
+
 def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
     """Plain dict for orjson. Keys spelled out so a field rename cannot silently
     change the cached shape."""
@@ -134,7 +140,7 @@ def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
     }
 
 
-def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
+async def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
     """Rebuild a cached walk; None is a MISS, for a value with no `titles` list
     or an unparseable number. The other fields default, and an absent
     `duration_partial` reads as partial: nothing vouched for that total."""
@@ -156,19 +162,21 @@ def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
             unavailable=int(entry.get("unavailable", 0)),
             artists=[str(a) for a in artists] if isinstance(artists, list) else [],
             thumbnail=thumbnail if isinstance(thumbnail, str) and thumbnail else None,
-            tracks=_tracks_from_cache(entry.get("tracks"), len(titles)),
+            tracks=await _tracks_from_cache(entry.get("tracks"), len(titles)),
         )
     except TypeError, ValueError:
         return None
 
 
-def _tracks_from_cache(raw: object, count: int) -> list[SpotifyTrack]:
+async def _tracks_from_cache(raw: object, count: int) -> list[SpotifyTrack]:
     """The cached display rows, or [] when they are absent, malformed or not one
     per title: the titles still queue, as searches with nothing to show."""
     if not isinstance(raw, list) or len(raw) != count:
         return []
     tracks: list[SpotifyTrack] = []
-    for row in cast(list[Any], raw):
+    for i, row in enumerate(cast(list[Any], raw)):
+        if i and not i % _CACHE_ROWS_CHUNK:
+            await asyncio.sleep(0)
         if not isinstance(row, list) or len(row) != 4:
             return []
         name, artists, secs, url = cast(list[Any], row)
@@ -818,7 +826,7 @@ class Spotify:
             return playlist
 
         # A malformed entry reads as a miss, and the walk overwrites it.
-        cached = _playlist_from_cache(await cache_get(self._redis, cache_key))
+        cached = await _playlist_from_cache(await cache_get(self._redis, cache_key))
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
@@ -884,7 +892,7 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.album_id", aid)
         # Versioned by the value's shape, as the playlist key is.
         cache_key = f"spotify:album_tracks:v2:{aid}"
-        cached = _playlist_from_cache(await cache_get(self._redis, cache_key))
+        cached = await _playlist_from_cache(await cache_get(self._redis, cache_key))
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
@@ -992,7 +1000,7 @@ class Spotify:
                             asyncio.get_running_loop().time()
                             + _PLAYLIST_WALK_TIMEOUT_SECS
                         )
-                        cached = _playlist_from_cache(
+                        cached = await _playlist_from_cache(
                             await cache_get(self._redis, cache_key)
                         )
                         if cached is not None:

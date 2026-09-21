@@ -582,6 +582,14 @@ the upgrade, because the cached copies do not hold the new per-track details. Tr
 already in a queue when you upgrade keep the old `resolving...` row until they play.
 Rolling back is only a redeploy.
 
+**It costs Redis memory.** Holding a name, artists, length and link for every queued track
+makes a saved queue entry about 400 bytes instead of about 270, and roughly triples the
+cached copy of a collection. A 10,000-track playlist that is both queued and cached now
+holds around 6 MB rather than around 3 MB. That matters only if you run enormous
+collections: the bundled Redis is capped at 256 MB, and when it fills it evicts the keys
+that carry a TTL — which includes saved queues, and an evicted queue is not restored after
+a restart. `-queue`, `-remove` and `-clear` are unaffected either way.
+
 ## Upgrading to 2.43.0
 
 **Spotify album links now queue.** `-play https://open.spotify.com/album/…` takes the

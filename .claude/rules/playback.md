@@ -422,7 +422,7 @@ can spend the whole placement budget before the insert begins.
 
 ## Recipes
 
-**The listing row**: every listing of queue items goes through `src/queue_rows.py` — `queue_embed`, `queued_rows` (the queued album/playlist cards) and the single-entry cards. A new surface that lists queue items calls `queue_rows`, never its own format; an unresolved search renders from `YTSource`'s display fields, so a new kind of lazy entry sets those rather than teaching the formatter a new type. See `docs/ARCHITECTURE.md#queue-rows`.
+**The listing row**: every LISTING of queue items goes through `src/queue_rows.py` — `queue_embed` and `queued_rows` (the queued album/playlist cards). The single-entry "Up next" and "Queued song" cards are a separate renderer reading the same fields, so a change to the row format is not automatically a change to them. A new surface that lists queue items calls `queue_rows`, never its own format; an unresolved search renders from `YTSource`'s display fields, so a new kind of lazy entry sets those rather than teaching the formatter a new type. See `docs/ARCHITECTURE.md#queue-rows`.
 
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →

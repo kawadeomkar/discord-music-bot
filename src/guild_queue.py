@@ -55,7 +55,8 @@ QueueItem = Union[QueueObject, YTSource]
 _LREM_MAX_ENTRIES = 16
 
 # Entries serialized and RPUSHed per round trip by a bulk put. Serialization measured
-# ~7.6ms per thousand, which is how long each chunk holds the event loop.
+# ~1.5ms per thousand at ~400 bytes an entry, which is how long each chunk holds the
+# event loop; the RPUSH between chunks is what yields it.
 _PUT_CHUNK = 1000
 
 # Shallow queues rebuild instead: below ~80 survivors a rewrite is under 1ms.

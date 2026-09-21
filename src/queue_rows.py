@@ -1,8 +1,9 @@
 """One queued item as a row of text, and the ETA walk that runs down the rows.
 
-Pure: no player, no queue, no Discord call. `-queue`, the queued-collection card
-and the single-entry cards all render a queue item through here, so an item
-reads the same wherever it is listed. See docs/ARCHITECTURE.md#queue-rows.
+Pure: no player, no queue, no Discord call. `-queue` and the queued-collection
+card list items through here, so a listing reads the same either way. The
+single-entry cards are their own renderer over the same fields — a row and a
+card are different shapes. See docs/ARCHITECTURE.md#queue-rows.
 """
 
 import datetime

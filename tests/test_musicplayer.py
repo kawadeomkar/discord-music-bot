@@ -7315,6 +7315,40 @@ class TestQueueEntryCard:
         assert lines[2] == "Artist: Kendrick Lamar  ·  Duration: `3:05`"
         assert lines[3].startswith("Est. playing at ")
 
+    @pytest.mark.parametrize(
+        "missing,expected",
+        [
+            ("webpage_url", "**DNA.**"),
+            ("uploader", "Artist: Unknown  ·  Duration: `3:05`"),
+            ("duration", "Artist: Kendrick Lamar  ·  Duration: `?:??`"),
+            ("requester_id", "Requested by: [Unknown]"),
+        ],
+    )
+    def test_an_unresolved_track_falls_back_field_by_field(
+        self, music_player: MusicPlayer, missing: str, expected: str
+    ) -> None:
+        """Spotify answers without a duration for a local file, without a link for
+        one too, and the row is built from whatever the walk got. Each field falls
+        back on its own; the happy path above covers none of them."""
+        fields: dict[str, object] = {
+            "requester_id": 4242,
+            "title": "DNA.",
+            "uploader": "Kendrick Lamar",
+            "duration": 185,
+            "webpage_url": "https://open.spotify.com/track/abc",
+        }
+        fields[missing] = None
+        seed_queue(
+            music_player.queue,
+            YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", process=True, **fields),  # pyright: ignore[reportArgumentType]
+        )
+
+        body = self._next_up_body(music_player)
+        assert expected in body
+        # Whatever is missing, the entry is still named and still placed.
+        assert "DNA." in body and "Est. playing at " in body
+        assert "resolving..." not in body
+
     def test_unresolved_ytsource_renders_resolving(
         self, music_player: MusicPlayer
     ) -> None:
