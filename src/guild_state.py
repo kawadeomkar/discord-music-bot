@@ -72,8 +72,8 @@ class StateField:
     # "1" when the playing song was queued by an interjection (attribution only).
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
     # "1" when the playing song is an interjection's resume tail / was parked
-    # paused. is_resume drives the announcement, _remaining_secs and NP-card
-    # cleanup.
+    # paused. is_resume drives the announcement, queue_rows.remaining_secs and
+    # NP-card cleanup.
     CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
     CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
     # Set once at ask time and carried, never rewritten, so a crash-recovered
@@ -761,7 +761,7 @@ class SongQueueEntry:
         FIXME: A song interrupted mid-play by the crash is a resume in everything
         but the flag — `ts` holds the interrupt position while is_resume stays
         false, so the loop announces "Starting song at N seconds" and
-        _remaining_secs bills the whole duration. Synthesizing the flag from
+        queue_rows.remaining_secs bills the whole duration. Synthesizing the flag from
         `ts > 0` would also move the queue display and the interjection wording,
         so it wants its own change.
         """

@@ -2,12 +2,14 @@
 
 import datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from src.queue_rows import (
+    fmt_total_duration,
+    requester_mention,
     ROW_BYLINE_MAX,
     ROW_LIMIT,
     ROW_TITLE_MAX,
@@ -54,13 +56,15 @@ class TestRemainingSecs:
 
 class TestTheWalk:
     def test_a_known_length_adds_its_seconds(self, mock_author: MagicMock) -> None:
-        assert advance_walk(_START, _song(mock_author)) == EtaWalk(240, False)
+        assert advance_walk(_START, _song(mock_author)) == EtaWalk(
+            cumulative_secs=240, uncertain=False
+        )
 
     def test_an_unknown_length_marks_everything_after_it(
         self, mock_author: MagicMock
     ) -> None:
         walk = advance_walk(_START, _song(mock_author, duration=None))
-        assert walk == EtaWalk(180, True)
+        assert walk == EtaWalk(cumulative_secs=180, uncertain=True)
         assert fmt_eta(_NOW, walk.uncertain).startswith("~")
 
     def test_an_unresolved_search_is_an_unknown_length(self) -> None:
@@ -172,7 +176,9 @@ class TestAnUnresolvedTrackRow:
         self, mock_author: MagicMock
     ) -> None:
         """Spotify's length is not the YouTube match's."""
-        assert advance_walk(_START, _track()) == EtaWalk(180 + 185, True)
+        assert advance_walk(_START, _track()) == EtaWalk(
+            cumulative_secs=180 + 185, uncertain=True
+        )
         rows = queue_rows(
             [_track(), _song(mock_author)],
             first_index=1,
@@ -242,13 +248,55 @@ class TestQueueRows:
 
     def test_only_the_rows_shown_are_formatted(self, mock_author: MagicMock) -> None:
         """A 10,000-track playlist is listed by formatting ten of them."""
-        from unittest.mock import patch
-
         items = [_song(mock_author, n) for n in range(500)]
         with patch("src.queue_rows.safe_label", side_effect=lambda t, _w: t) as escape:
             queue_rows(items, first_index=1, now=_NOW, walk=_START, byline=False)
 
         assert escape.call_count == ROW_LIMIT
+
+    @pytest.mark.parametrize("byline,gap", [(True, 2), (False, 1)])
+    def test_a_row_that_exactly_fills_the_budget_is_kept(
+        self, mock_author: MagicMock, byline: bool, gap: int
+    ) -> None:
+        """The boundary the `>` sits on. A budget one character short drops the
+        second row, so `>=` here would cost a row on every listing that fits."""
+        items = [_song(mock_author, n) for n in (1, 2)]
+        one = queue_row(items[0], 1, now=_NOW, walk=_START, byline=byline)
+        two = queue_row(
+            items[1], 2, now=_NOW, walk=advance_walk(_START, items[0]), byline=byline
+        )
+        exact = len(one) + gap + len(two)
+
+        kept = queue_rows(
+            items, first_index=1, now=_NOW, walk=_START, byline=byline, budget=exact
+        )
+        assert "... and" not in kept
+
+        dropped = queue_rows(
+            items, first_index=1, now=_NOW, walk=_START, byline=byline, budget=exact - 1
+        )
+        assert dropped.endswith("*... and 1 more*")
+
+    def test_the_gap_between_rows_counts_against_the_budget(
+        self, mock_author: MagicMock
+    ) -> None:
+        """Two-line rows are joined by a blank line and one-line rows by one
+        newline, so the same rows fit a tighter budget in one-line mode. Dropping
+        `len(gap)` from the running total would make the two modes agree."""
+        items = [_song(mock_author, n) for n in (1, 2)]
+        one = queue_row(items[0], 1, now=_NOW, walk=_START, byline=False)
+        two = queue_row(
+            items[1], 2, now=_NOW, walk=advance_walk(_START, items[0]), byline=False
+        )
+        budget = len(one) + 1 + len(two)
+
+        assert "... and" not in queue_rows(
+            items, first_index=1, now=_NOW, walk=_START, byline=False, budget=budget
+        )
+        # The same budget in two-line mode is one character short of its wider gap.
+        assert queue_rows(
+            items, first_index=1, now=_NOW, walk=_START, byline=True, budget=budget
+        ).endswith("*... and 1 more*")
 
     def test_one_oversized_row_still_shows(self, mock_author: MagicMock) -> None:
         text = queue_rows(
@@ -292,3 +340,35 @@ class TestTheDefaultBudgetHoldsTheDescriptionUnder4096:
         )
         assert len(unbounded) > EMBED_DESCRIPTION_LIMIT
         assert ROWS_BUDGET < EMBED_DESCRIPTION_LIMIT
+
+
+class TestFmtTotalDuration:
+    def test_seconds_only(self) -> None:
+        assert fmt_total_duration(45) == "45s"
+
+    def test_minutes_and_seconds(self) -> None:
+        assert fmt_total_duration(185) == "3m 5s"
+
+    def test_hours_minutes_seconds(self) -> None:
+        assert fmt_total_duration(3723) == "1h 2m 3s"
+
+    def test_zero(self) -> None:
+        assert fmt_total_duration(0) == "0s"
+
+    def test_exactly_one_hour(self) -> None:
+        assert fmt_total_duration(3600) == "1h"
+
+    def test_hours_no_minutes_with_seconds(self) -> None:
+        # Regression: 1h 0m 45s previously showed as "1h" (seconds dropped)
+        assert fmt_total_duration(3645) == "1h 45s"
+
+    def test_hours_and_minutes_no_seconds(self) -> None:
+        assert fmt_total_duration(3780) == "1h 3m"
+
+
+class TestRequesterMention:
+    def test_returns_mention_when_present(self, mock_author: MagicMock) -> None:
+        assert requester_mention(mock_author) == mock_author.mention
+
+    def test_returns_unknown_when_none(self) -> None:
+        assert requester_mention(None) == "Unknown"

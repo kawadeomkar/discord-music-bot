@@ -79,8 +79,7 @@ _TOKEN_EXPIRY_MARGIN_SECS = 60
 class SpotifyTrack:
     """One walked track as a listing shows it: its own name, apart from the search
     string it is queued as. The length and the link are what Spotify sent, so
-    either may be missing. Its own class because nothing else can hold it here:
-    the queue's search entry belongs to the parse layer and needs a requester."""
+    either may be missing."""
 
     name: str
     artists: list[str]

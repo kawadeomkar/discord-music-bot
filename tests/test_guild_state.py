@@ -477,6 +477,15 @@ _GOLDEN_YTSOURCE = (
 )
 # Written before the enqueue stamps existed: the reader defaults both to 0.
 _GOLDEN_YTSOURCE_PRE_STAMPS = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
+# Every optional key present. The ORDER is the contract: -remove and -clear LREM by
+# these exact bytes, so a reordered writer misses every entry already in Redis.
+_GOLDEN_YTSOURCE_FULL = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null,'
+    b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
+    b'"query_source":"","requester_id":424242424242424242,"title":"DNA.",'
+    b'"uploader":"Kendrick Lamar","duration":185,'
+    b'"webpage_url":"https://open.spotify.com/track/abc"}'
+)
 
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
@@ -671,6 +680,32 @@ class TestSearchQueueEntryWire:
     def test_writer_matches_golden_bytes(self) -> None:
         entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
         assert entry.to_redis() == _GOLDEN_YTSOURCE
+
+    def test_a_populated_writer_matches_golden_bytes(self) -> None:
+        """Pins the KEY ORDER, which the round-trip tests cannot see. LREM matches
+        an entry by its exact bytes, so reordering the writer leaves every already
+        queued track unremovable until the mirror is rebuilt."""
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:DNA. Kendrick Lamar",
+            process=True,
+            requester_id=424242424242424242,
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
+        assert entry.to_redis() == _GOLDEN_YTSOURCE_FULL
+
+    def test_a_falsy_display_value_is_written_not_skipped(self) -> None:
+        """The guard is `is not None`, not truthiness: a Spotify track can carry a
+        zero duration, and skipping the key would read back as unknown and render
+        `?:??` — and make the entry's bytes differ from a re-serialization."""
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:x", process=True, title="", duration=0
+        )
+        raw = entry.to_redis()
+        assert b'"title":""' in raw
+        assert b'"duration":0' in raw
 
     def test_the_requester_round_trips_through_the_lazy_resolve(self) -> None:
         source = YTSource(ytsearch="ytsearch:x", requester_id=424242424242424242)

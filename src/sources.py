@@ -131,7 +131,7 @@ class SpotifySource:
 
 
 # slots: one instance is retained per unresolved Spotify collection track (344 B
-# -> 120 B each). Keep the class free of __dict__ readers (asdict/vars) and off
+# -> 176 B each). Keep the class free of __dict__ readers (asdict/vars) and off
 # any pickle path; it crosses to Redis as SearchQueueEntry JSON.
 @dataclass(frozen=True, slots=True)
 class YTSource:

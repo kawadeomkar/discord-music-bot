@@ -96,6 +96,11 @@ _tracer = get_tracer(__name__)
 QueueItem = Union[QueueObject, YTSource]
 
 
+# TODO: ETAs render in one zone per guild, never per viewer: queue_embed()'s
+# "Est. playing at" and the NP "Estimated finish" read GuildConfig.timezone, which
+# -settings timezone sets. Owed: per-viewer rendering (<t:epoch:R>).
+
+
 # Collapses rapid -pause/-resume toggling into one trailing embed edit + Activity
 # refresh.
 _PAUSE_DEBOUNCE_SECS = 0.5
@@ -186,9 +191,6 @@ def _clock(secs: float) -> str:
     return fmt_duration(int(secs))
 
 
-# TODO: ETAs render in one zone per guild, never per viewer: queue_embed()'s
-# "Est. playing at" and the NP "Estimated finish" read GuildConfig.timezone, which
-# -settings timezone sets. Owed: per-viewer rendering (<t:epoch:R>).
 def _fmt_finish_time(duration_secs: int, tz: ZoneInfo) -> str:
     """Clock time `duration_secs` from now. No uncertainty prefix: a playing song's
     remaining duration is known."""
@@ -601,7 +603,7 @@ class MusicPlayer:
             else:
                 uncertain = True
         return datetime.datetime.now(tz=self.timezone), EtaWalk(
-            cumulative_secs, uncertain
+            cumulative_secs=cumulative_secs, uncertain=uncertain
         )
 
     def _eta_walk_to(self, index: int) -> tuple[datetime.datetime, EtaWalk]:

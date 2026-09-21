@@ -48,8 +48,6 @@ from src.musicplayer import (
     _reached_end,
     fmt_eta,
     _fmt_finish_time,
-    fmt_total_duration,
-    requester_mention,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
@@ -192,38 +190,6 @@ class TestOutboxNotifyWiring:
 
 
 # ── Formatter helpers ─────────────────────────────────────────────────────────
-
-
-class TestFmtTotalDuration:
-    def test_seconds_only(self) -> None:
-        assert fmt_total_duration(45) == "45s"
-
-    def test_minutes_and_seconds(self) -> None:
-        assert fmt_total_duration(185) == "3m 5s"
-
-    def test_hours_minutes_seconds(self) -> None:
-        assert fmt_total_duration(3723) == "1h 2m 3s"
-
-    def test_zero(self) -> None:
-        assert fmt_total_duration(0) == "0s"
-
-    def test_exactly_one_hour(self) -> None:
-        assert fmt_total_duration(3600) == "1h"
-
-    def test_hours_no_minutes_with_seconds(self) -> None:
-        # Regression: 1h 0m 45s previously showed as "1h" (seconds dropped)
-        assert fmt_total_duration(3645) == "1h 45s"
-
-    def test_hours_and_minutes_no_seconds(self) -> None:
-        assert fmt_total_duration(3780) == "1h 3m"
-
-
-class TestRequesterMention:
-    def test_returns_mention_when_present(self, mock_author: MagicMock) -> None:
-        assert requester_mention(mock_author) == mock_author.mention
-
-    def test_returns_unknown_when_none(self) -> None:
-        assert requester_mention(None) == "Unknown"
 
 
 class TestFmtFinishTime:
@@ -2822,13 +2788,26 @@ class TestQueuedRows:
     def test_the_slot_is_where_the_track_is_not_where_the_insert_expected(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """A front insert reports nothing ahead, but it lands behind a song the
-        loop has claimed, which -queue still lists first."""
+        """`ahead=0` promises the first slot, but the track landed behind an item
+        -queue still lists, so the row numbers from where the track IS."""
         claimed = QueueObject("https://yt.com/v=1", "Claimed", mock_author, duration=60)
         tracks = [_album_track(1, 100)]
         seed_queue(music_player.queue, claimed, *tracks)
 
         assert music_player.queued_rows(tracks, ahead=0).startswith("`2` ")
+
+    def test_the_slot_is_found_by_identity_not_by_equality(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A playlist holding the same track twice queues two EQUAL YTSources. An
+        equality lookup returns the first one's slot for both, so the second block
+        of rows would be numbered from the first block's position."""
+        first, second = _album_track(1, 100), _album_track(1, 100)
+        assert first == second and first is not second
+        seed_queue(music_player.queue, first, second)
+
+        assert music_player.queued_rows([first], ahead=0).startswith("`1` ")
+        assert music_player.queued_rows([second], ahead=0).startswith("`2` ")
 
     def test_a_collection_a_clear_already_took_renders_from_the_depth_it_saw(
         self, music_player: MusicPlayer

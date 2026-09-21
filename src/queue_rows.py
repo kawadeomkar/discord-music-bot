@@ -28,10 +28,10 @@ ROW_LIMIT = 10
 ROWS_BUDGET = 3400
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class EtaWalk:
-    """Accumulator for the queue's ETA walk; `now_pst` is invariant across a walk
-    and passed alongside. Frozen: advancing is `replace()` + rebind."""
+    """Accumulator for the queue's ETA walk; `now` is invariant across a walk and
+    passed alongside. Frozen: advancing is `replace()` + rebind."""
 
     cumulative_secs: int
     uncertain: bool
@@ -105,10 +105,9 @@ def advance_walk(walk: EtaWalk, item: QueueItem) -> EtaWalk:
 
 
 def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
-    """Total remaining playtime of queued items, and whether any duration was
-    unknown (the total is then a lower bound, flagged with "~"). Shared by
-    queue_embed(), the resume notices and the queued-playlist card so they can't
-    disagree."""
+    """Total remaining playtime of queued items, and whether the total is
+    approximate — set when a duration is unknown, and when one is Spotify's
+    estimate rather than the played track's. Either way it renders with a "~"."""
     total_secs = 0
     partial = False
     for item in items:
@@ -191,11 +190,14 @@ def queue_rows(
     used = 0
     for offset, item in enumerate(items[:limit]):
         row = queue_row(item, first_index + offset, now=now, walk=walk, byline=byline)
+        # The gap only exists between rows, so the first is charged for none: `used`
+        # is exactly what join() will return.
+        extra = len(row) if not rows else len(gap) + len(row)
         # The first row always shows: a listing of one row is never empty.
-        if rows and used + len(gap) + len(row) > budget:
+        if rows and used + extra > budget:
             break
         rows.append(row)
-        used += len(gap) + len(row)
+        used += extra
         walk = advance_walk(walk, item)
     more = len(items) - len(rows)
     if more > 0:
