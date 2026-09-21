@@ -473,6 +473,19 @@ pins:
         fi
     done
 
+    # The bgutil plugin and the sidecar that serves it are released in lockstep, and
+    # a major mismatch makes the server REFUSE to mint: "Update both the plugin and
+    # the HTTP server to the same version to proceed." Nothing failed when Dependabot
+    # bumped the pip half alone — the build stayed green and the bot lost its `web`
+    # fallback in production, silently, because the primary client needs no PO token.
+    want_pot="$(sed -n 's/^bgutil-ytdlp-pot-provider = "\(.*\)"$/\1/p' pyproject.toml)"
+    compose_pot="$(awk '/^  bgutil-pot-provider:/{f=1} f && /image: brainicism\/bgutil-ytdlp-pot-provider:/{sub(/.*:/, "", $2); print $2; exit}' docker-compose.yml)"
+    if [ -z "$want_pot" ] || [ "$want_pot" != "$compose_pot" ]; then
+        echo "PO-token pin drift: pyproject.toml=[$want_pot] docker-compose.yml=[$compose_pot]" >&2
+        echo "  Plugin and sidecar are released in lockstep; bump both in the same commit." >&2
+        fail=1
+    fi
+
     # `check`'s dependency list and the pre-push hooks are the same five recipes in the
     # same order, written twice. Drift is silent and runs one way: a step added to
     # `check` alone stops running on push while the gate still reports green.

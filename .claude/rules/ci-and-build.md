@@ -22,7 +22,7 @@ enforces the first group and nothing checks the second, so the unenforced list i
 what a maintainer reads before touching a version.
 
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces eight pairs, one name and one list — it is a dep of `check` and CI also runs it as
+   enforces nine pairs, one name and one list — it is a dep of `check` and CI also runs it as
    its own step, deliberately: Dependabot's `pip` and `pre-commit` ecosystems open
    SEPARATE PRs that each move one half, and those PRs are validated by CI and never
    by a local `check`.
@@ -40,6 +40,14 @@ what a maintainer reads before touching a version.
    `CLAUDE.md` and `docs/ARCHITECTURE.md`, which describe the client strategy for a
    specific version: Dependabot moves pyproject + `poetry.lock` without touching either,
    and main has carried a stale copy for exactly that reason.
+   The ninth is **`bgutil-ytdlp-pot-provider`** (pyproject) ↔ the
+   `brainicism/bgutil-ytdlp-pot-provider` image tag in `docker-compose.yml`, anchored to
+   the `bgutil-pot-provider` service. The plugin and the sidecar are released in
+   lockstep and a MAJOR mismatch makes the server refuse to mint at all — "Update both
+   the plugin and the HTTP server to the same version to proceed." It was unenforced
+   until Dependabot bumped the pip half alone (#280) and main shipped the pair split for
+   real: the build stayed green, and the `web` fallback lost its GVS token in production
+   while the primary client, which needs none, kept playing.
    The **name** is the `charts` extra: `[tool.poetry.extras]` defines it, and three
    sites select it (the `CHART_EXTRAS` ARG default and the test stage in `Dockerfile`,
    and `just install`). Each site is asserted separately rather than counted — the
@@ -52,13 +60,9 @@ what a maintainer reads before touching a version.
    to `check` alone simply stops running on push. The `env DOCKER=0` prefix is matched,
    not skipped, so a misspelled pin fails here rather than quietly containerizing a
    hook.
-   **Five pairs are NOT enforced — this list is what a maintainer checks by hand,
+   **Four pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
-   (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
-   `brainicism/bgutil-ytdlp-pot-provider` image tag in `docker-compose.yml`. The plugin
-   and the sidecar are released in lockstep; drift breaks PO-token minting, which
-   surfaces as YouTube playback failures, not as a red build.
-   (b) The published Prometheus port `9090`, in **four** places that move together: the
+   (a) The published Prometheus port `9090`, in **four** places that move together: the
    `PROMETHEUS_HOST_PORT` defaults inside the bot service's `DEBUG_PROMETHEUS_URL` and
    inside the otel-lgtm service's `ports:` entry (both `docker-compose.yml`), and the
    commented-out `DEBUG_PROMETHEUS_URL` and `PROMETHEUS_HOST_PORT` assignments in
@@ -66,14 +70,14 @@ what a maintainer reads before touching a version.
    literal — the container side of that same `ports:` entry — is Prometheus's own listen
    port inside `grafana/otel-lgtm` and must NOT move with them; both files also name the
    number in prose, which drifts just as silently.
-   (c) `otel/opentelemetry-collector-contrib` (the `otelcol-metrics` service) ↔ the
+   (b) `otel/opentelemetry-collector-contrib` (the `otelcol-metrics` service) ↔ the
    otelcol-contrib build inside `grafana/otel-lgtm` (the `otel-lgtm` service), both in
    `docker-compose.yml`. The comment above the collector's `image:` line states the rule
    — bump either image and check the other by hand. Like (a), drift is invisible to
    every build: the symptom lands on the metrics path, where a missing `docker_stats`
    series leaves `-debug`'s cpu/mem row reading `n/a (no metrics source)`, which is also
    exactly what "the `metrics` profile is not running" looks like.
-   (d) `MPLCONFIGDIR`, written in **three** places that must agree on a WRITABLE path:
+   (c) `MPLCONFIGDIR`, written in **three** places that must agree on a WRITABLE path:
    the Dockerfile's test stage (`/tmp/mplcache`, beside `RUFF_CACHE_DIR`), its runtime
    stage (`/home/app/.cache/matplotlib`, created and chowned in the same `RUN` as
    `useradd`), and `tests/conftest.py` at module scope. The three deliberately hold
@@ -83,7 +87,7 @@ what a maintainer reads before touching a version.
    a temp directory and warns once per process, so the symptom is a stderr line nobody
    reads. The conftest copy is the exception — the suite renders in-process, so rule
    11 turns that warning into a red build.
-   (e) `LIVENESS_INTERVAL_SECS`'s `maximum` (`_MAX_LIVENESS_SECS`, 60s, `config.py`) ↔
+   (d) `LIVENESS_INTERVAL_SECS`'s `maximum` (`_MAX_LIVENESS_SECS`, 60s, `config.py`) ↔
    the `HEALTHCHECK`'s 90s staleness window (`Dockerfile`). The cap exists so a touch
    cadence can never outlast the window; raise the window and the cap may follow. Lower
    it below 60s and lower the cap with it, or a cadence the cap still accepts outlasts
