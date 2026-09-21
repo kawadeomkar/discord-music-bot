@@ -123,13 +123,11 @@ class EmptyPlaylistError(PlaylistInputError):
 class ResolvedSpotifyPlaylist:
     """A Spotify playlist or album resolved to track titles, still needing
     per-title YouTube search resolution. The rest is what the enqueue embed
-    reports: lengths are Spotify's, not the YouTube matches', `artists` and
+    reports: `tracks` carries Spotify's own lengths and links, `artists` and
     `thumbnail` are an album's, and `short` is a walk Spotify ended early."""
 
     titles: list[str]
     name: Optional[str] = None
-    duration_secs: int = 0
-    duration_partial: bool = False
     unavailable: int = 0
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
@@ -285,8 +283,13 @@ async def _searches_for(
 ) -> list[YTSource]:
     """spotify_playlist_to_ytsearch, a chunk per event-loop turn. Positions count on
     from `analytics` across chunks, as they would in one call. `rows` is the walk's
-    display rows, one per title."""
-    if len(rows) != len(titles):
+    display rows, one per title; a set that does not pair up is dropped whole, because
+    a row read against the wrong title is worse than no row."""
+    if rows and len(rows) != len(titles):
+        log.warning(
+            f"spotify display rows do not pair with titles "
+            f"({len(rows)} rows, {len(titles)} titles); queueing without them"
+        )
         rows = ()
     tracks: list[YTSource] = []
     for start in range(0, len(titles), _SEARCH_BUILD_CHUNK):
@@ -450,8 +453,6 @@ async def queue_source(
         return ResolvedSpotifyPlaylist(
             playlist.titles,
             name=playlist.name,
-            duration_secs=playlist.duration_secs,
-            duration_partial=playlist.duration_partial,
             unavailable=playlist.unavailable,
             artists=playlist.artists,
             thumbnail=playlist.thumbnail,
@@ -549,9 +550,6 @@ async def enqueue_playlist(
         heading = [_playlist_heading(qobj.name, link)]
         if qobj.artists:
             heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
-        # Spotify's lengths, not the YouTube matches', so the total is approximate
-        # here as it is in -queue.
-        runtime = (qobj.duration_secs, True)
         # Built outside the lock: one YTSource per title, and the depth it
         # is minted against is almost always still the depth at the insert.
         provisional = _head_depth(mp, placement)
@@ -562,6 +560,9 @@ async def enqueue_playlist(
             requester_id=ctx.author.id,
             rows=qobj.tracks,
         )
+        # The same sum -queue shows for these tracks: Spotify's lengths, added as
+        # whole seconds, so the two totals cannot drift apart.
+        runtime = queue_runtime(tracks)
         log.info(f"spotify {collection_noun(source)} track count: {len(tracks)}")
         async with cog._plays.place(req) as verdict:
             if verdict.placed:

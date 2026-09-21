@@ -95,6 +95,9 @@ class TestQueueSource:
     ) -> None:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None  # fixture provides a mock client
+        row = SpotifyTrack(
+            name="Song A", artists=["A"], duration_secs=122, url="https://sp/a"
+        )
         music_bot.spotify.playlist = AsyncMock(
             return_value=SpotifyPlaylist(
                 name="Biteki",
@@ -102,6 +105,7 @@ class TestQueueSource:
                 duration_secs=122,
                 duration_partial=True,
                 unavailable=2,
+                tracks=[row],
             )
         )
         result = await play_pipeline.queue_source(
@@ -115,9 +119,8 @@ class TestQueueSource:
         assert result == ResolvedSpotifyPlaylist(
             titles=["Song A"],
             name="Biteki",
-            duration_secs=122,
-            duration_partial=True,
             unavailable=2,
+            tracks=[row],
         )
 
     async def test_spotify_track_calls_yt_source(
@@ -215,7 +218,13 @@ class TestEnqueuePlaylist:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         mp = _enqueue_mp(mock_ctx)
         resolved = ResolvedSpotifyPlaylist(
-            titles=["Song A"], name="Biteki", duration_secs=3723, duration_partial=True
+            titles=["Song A"],
+            name="Biteki",
+            tracks=[
+                SpotifyTrack(
+                    name="Song A", artists=["A"], duration_secs=3723, url="https://sp/a"
+                )
+            ],
         )
 
         await self._enqueue(music_bot, mock_ctx, mp, source, resolved)
@@ -2389,6 +2398,49 @@ class TestSearchesForAPlaylist:
         assert [t.ytsearch for t in tracks] == [f"ytsearch:T{n}" for n in range(5)]
         assert ticks - started >= 2
 
+    async def test_display_rows_stay_with_their_titles_across_chunks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rows are sliced per chunk while the titles are sliced separately, so
+        a chunk boundary is where the two can part company — and a row read against
+        the wrong title shows one track's length and link under another's name."""
+        monkeypatch.setattr(play_pipeline, "_SEARCH_BUILD_CHUNK", 2)
+        rows = [
+            SpotifyTrack(
+                name=f"T{n}",
+                artists=["A"],
+                duration_secs=100 + n,
+                url=f"https://sp/{n}",
+            )
+            for n in range(5)
+        ]
+        tracks = await play_pipeline._searches_for(
+            [f"T{n}" for n in range(5)],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=7,
+            rows=rows,
+        )
+        assert [t.title for t in tracks] == [f"T{n}" for n in range(5)]
+        assert [t.duration for t in tracks] == [100 + n for n in range(5)]
+        assert [t.webpage_url for t in tracks] == [f"https://sp/{n}" for n in range(5)]
+
+    async def test_rows_that_do_not_pair_with_the_titles_are_dropped_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Losing every row beats showing one track's length under another's name,
+        but it degrades the whole card to the pre-upgrade look, so it says so."""
+        tracks = await play_pipeline._searches_for(
+            [f"T{n}" for n in range(3)],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=7,
+            rows=[SpotifyTrack(name="T0", artists=["A"], duration_secs=1, url=None)],
+        )
+        assert [t.title for t in tracks] == [None, None, None]
+        assert "do not pair" in caplog.text
+        assert "1 rows, 3 titles" in caplog.text
+
 
 def _album_walk(**overrides: Any) -> SpotifyPlaylist:
     fields: dict[str, Any] = {
@@ -2400,7 +2452,19 @@ def _album_walk(**overrides: Any) -> SpotifyPlaylist:
         "artists": ["Daft Punk"],
         "thumbnail": "https://i.scdn.co/cover",
     }
-    return SpotifyPlaylist(**{**fields, **overrides})
+    fields.update(overrides)
+    # A walk returns one row per title, and SpotifyPlaylist refuses any other
+    # pairing, so a test that overrides the titles gets rows matching them.
+    fields.setdefault(
+        "tracks",
+        [
+            SpotifyTrack(
+                name=t, artists=["Daft Punk"], duration_secs=180, url=f"https://sp/{i}"
+            )
+            for i, t in enumerate(fields["titles"])
+        ],
+    )
+    return SpotifyPlaylist(**fields)
 
 
 class TestSpotifyAlbum:
@@ -2431,9 +2495,9 @@ class TestSpotifyAlbum:
         assert result == ResolvedSpotifyPlaylist(
             titles=["One More Time", "Aerodynamic"],
             name="Discovery",
-            duration_secs=531,
             artists=["Daft Punk"],
             thumbnail="https://i.scdn.co/cover",
+            tracks=_album_walk().tracks,
         )
 
     async def test_an_empty_album_queues_nothing_and_says_so(
@@ -2497,9 +2561,22 @@ class TestSpotifyAlbum:
             ResolvedSpotifyPlaylist(
                 titles=["One More Time", "Aerodynamic"],
                 name="Discovery",
-                duration_secs=531,
                 artists=["Daft Punk", "Romanthony"],
                 thumbnail="https://i.scdn.co/cover",
+                tracks=[
+                    SpotifyTrack(
+                        name="One More Time",
+                        artists=["Daft Punk"],
+                        duration_secs=320,
+                        url="https://sp/1",
+                    ),
+                    SpotifyTrack(
+                        name="Aerodynamic",
+                        artists=["Daft Punk"],
+                        duration_secs=211,
+                        url="https://sp/2",
+                    ),
+                ],
             ),
         )
 

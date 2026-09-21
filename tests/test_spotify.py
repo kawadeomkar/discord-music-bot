@@ -1327,10 +1327,16 @@ class TestSpotifyPlaylistPaging:
         assert (awaited := c.await_args) is not None
         params = awaited.kwargs["params"]
         assert params["limit"] == spotify_module._PLAYLIST_PAGE_SIZE
-        for field in ("next", "total", "name", "artists(name)", "duration_ms"):
+        # The whole nested group, not five separate `in` checks: every one of these
+        # keys has to sit INSIDE track(...), and a mask that hoists duration_ms or
+        # external_urls out of it satisfies the parts while Spotify answers with
+        # neither — every row then loses its length and its link.
+        assert (
+            "items(track(name,artists(name),duration_ms,external_urls(spotify)))"
+            in params["fields"]
+        )
+        for field in ("next", "total"):
             assert field in params["fields"]
-        # Under a mask an unnamed key is absent, and the row's link is one.
-        assert "external_urls(spotify)" in params["fields"]
 
     async def test_the_cursor_is_followed_without_the_first_pages_params(
         self, spotify: Spotify
@@ -1400,11 +1406,17 @@ class TestSpotifyPlaylistPaging:
     ) -> None:
         """A removed track (null) and one Spotify sends without a name are counted
         as walked, so a healthy playlist holding them is complete, and cached."""
-        page = _playlist_page(["Kept"], total=3, next_url=None)
+        page = _playlist_page(["Kept"], total=4, next_url=None)
         page["items"] += [{"track": None}, {"track": {"artists": []}}]
+        page["items"] += [{"track": {"artists": [{"name": "A"}], "name": "Kept Two"}}]
         with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
-            titles = (await spotify.playlist("pid_gaps")).titles
-        assert titles == ["Kept A"]
+            walked = await spotify.playlist("pid_gaps")
+        assert walked.titles == ["Kept A", "Kept Two A"]
+        # A skipped item must drop its ROW as well as its title: the two are read
+        # by index, so dropping one and keeping the other shifts every later row
+        # onto the wrong track and trips SpotifyPlaylist's own pairing check.
+        assert [t.name for t in walked.tracks] == ["Kept", "Kept Two"]
+        assert len(walked.tracks) == len(walked.titles)
         assert "walked" not in caplog.text
         assert await fake_redis.get("spotify:playlist:v4:pid_gaps") is not None
 

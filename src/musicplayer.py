@@ -1314,9 +1314,10 @@ class MusicPlayer:
                     f"Est. playing at {eta}",
                 ]
             )
-        # Sanitized and capped: a "]" in a masked link's label would close it early.
+        # Sanitized and capped: a "]" in a masked link's label would close it early,
+        # and an uploader is third-party text on the same line as one.
         title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
-        channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
+        channel = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
         duration = fmt_duration(item.duration) if item.duration is not None else "?:??"
         detail = [f"Channel: {channel}", f"Duration: `{duration}`"]
         if isinstance(item, QueueObject) and item.is_replay:

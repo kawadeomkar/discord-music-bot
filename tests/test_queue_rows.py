@@ -8,7 +8,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.queue_rows import (
+    ROW_BYLINE_MAX,
     ROW_LIMIT,
+    ROW_TITLE_MAX,
+    ROWS_BUDGET,
     EtaWalk,
     advance_walk,
     fmt_eta,
@@ -18,6 +21,7 @@ from src.queue_rows import (
     remaining_secs,
 )
 from src.sources import YTSource
+from src.util import EMBED_DESCRIPTION_LIMIT
 from src.youtube import QueueObject
 
 _NOW = datetime.datetime(2026, 9, 20, 21, 38, tzinfo=ZoneInfo("US/Pacific"))
@@ -251,3 +255,40 @@ class TestQueueRows:
             [_song(mock_author)], first_index=1, now=_NOW, walk=_START, budget=1
         )
         assert "Song 1" in text
+
+
+class TestTheDefaultBudgetHoldsTheDescriptionUnder4096:
+    """ROWS_BUDGET is the only thing between a listing of long rows and Discord's
+    4096-character description limit, which 400s the whole send rather than
+    truncating. Every other test here passes an explicit `budget=`, so without
+    this one the default is exercised by nothing and can be raised silently."""
+
+    @staticmethod
+    def _maximal(author: MagicMock, n: int) -> QueueObject:
+        """A row at both caps: yt-dlp bounds neither a title nor an uploader."""
+        return QueueObject(
+            "https://www.youtube.com/watch?v=" + "x" * 11,
+            "T" * (ROW_TITLE_MAX + 50),
+            author,
+            duration=215,
+            uploader="U" * (ROW_BYLINE_MAX + 50),
+        )
+
+    @pytest.mark.parametrize("byline", [True, False])
+    def test_ten_maximal_rows_fit_an_embed_description(
+        self, mock_author: MagicMock, byline: bool
+    ) -> None:
+        items = [self._maximal(mock_author, n) for n in range(ROW_LIMIT)]
+        text = queue_rows(items, first_index=1, now=_NOW, walk=_START, byline=byline)
+        assert len(text) <= EMBED_DESCRIPTION_LIMIT
+
+    def test_the_budget_is_what_holds_them(self, mock_author: MagicMock) -> None:
+        """Pins the mechanism, not just the outcome: with the budget lifted the
+        same ten rows overflow, so the constant is load-bearing and not incidental
+        to the ten-row limit."""
+        items = [self._maximal(mock_author, n) for n in range(ROW_LIMIT)]
+        unbounded = queue_rows(
+            items, first_index=1, now=_NOW, walk=_START, budget=10**6
+        )
+        assert len(unbounded) > EMBED_DESCRIPTION_LIMIT
+        assert ROWS_BUDGET < EMBED_DESCRIPTION_LIMIT

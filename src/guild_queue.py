@@ -110,11 +110,15 @@ def remove_matcher(needle: str) -> RemoveMatcher:
 
     def match(item: QueueItem) -> Optional[RemoveMode]:
         if not needle:
-            # An unresolved search has url=None, which an empty needle would match
-            # as "" and take out every Spotify collection track.
+            # An unresolved search may carry neither URL, which an empty needle would
+            # match as "" and take out every Spotify collection track.
             return None
+        # A search gains webpage_url once a Spotify walk has named its track, and that
+        # is the link -queue shows for it, so -remove accepts it too.
         resolved = (
-            item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
+            item.webpage_url
+            if isinstance(item, QueueObject)
+            else (item.url or item.webpage_url or "")
         )
         if resolved == needle:
             return RemoveMode.RESOLVED

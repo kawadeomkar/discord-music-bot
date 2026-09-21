@@ -47,6 +47,7 @@ from src.queue_progress import EnqueueProgress
 from src.spotify import SpotifyPlaylist
 from src.youtube import YTDL, QueueObject, YoutubePlaylist
 from tests.helpers import (
+    MOCK_QUEUED_ROWS,
     admit,
     command_callback,
     connected_vc,
@@ -5657,6 +5658,10 @@ class TestQueueProgressCard:
             if e is not None
         ]
         assert "Queued album — 2 songs" in titles, titles
+        # The rows the card lists, end to end: mock_mp stubs queued_rows, so
+        # without this the card's body was a MagicMock repr and nothing noticed.
+        sent = _sent_descriptions(mock_ctx)
+        assert any(MOCK_QUEUED_ROWS in d for d in sent), sent
 
     async def test_now_with_an_album_arms_the_card(
         self,
