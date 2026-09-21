@@ -1,11 +1,16 @@
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Final, Literal, Optional, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Final, Literal, Optional, Union
 from urllib.parse import parse_qs, urlsplit
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.util import get_logger, safe_label
+
+if TYPE_CHECKING:
+    # Annotation only: parsing stays free of the Spotify client.
+    from src.spotify import SpotifyTrack
 
 log = get_logger(__name__)
 
@@ -126,7 +131,7 @@ class SpotifySource:
 
 
 # slots: one instance is retained per unresolved Spotify collection track (344 B
-# -> 120 B each). Keep the class free of __dict__ readers (asdict/vars) and off
+# -> 176 B each). Keep the class free of __dict__ readers (asdict/vars) and off
 # any pickle path; it crosses to Redis as SearchQueueEntry JSON.
 @dataclass(frozen=True, slots=True)
 class YTSource:
@@ -164,6 +169,14 @@ class YTSource:
     # has to survive Redis. None on parse-time sources, which resolve inside the
     # command that built them, and on entries queued before the field existed.
     requester_id: Optional[int] = None
+    # What a listing shows while the search is unresolved, under the names a
+    # resolved song uses: the track's own title, its artists, its length in
+    # seconds, and the page the title links to. A Spotify track's; None on a
+    # typed search. The length is Spotify's, so an ETA built on it is an estimate.
+    title: Optional[str] = None
+    uploader: Optional[str] = None
+    duration: Optional[int] = None
+    webpage_url: Optional[str] = None
 
     @property
     def playlist_url(self) -> str:
@@ -210,14 +223,34 @@ def collection_noun(
 
 
 def spotify_playlist_to_ytsearch(
-    titles: list[str], *, analytics: Analytics, origin: str, requester_id: int
+    titles: list[str],
+    *,
+    analytics: Analytics,
+    origin: str,
+    requester_id: int,
+    tracks: Sequence[SpotifyTrack] = (),
 ) -> list[YTSource]:
     """Spotify album or playlist tracks as lazy YouTube searches, each resolved
     at dequeue. The Spotify token, the ask-time analytics (the head's; per-track
     positions derive from it), `origin` (the pasted collection link) and the
     requester are set here, the last point that knows where these came from.
     `requester_id` has no default: a track without one is attributed at dequeue to
-    whoever ran a command most recently."""
+    whoever ran a command most recently. `tracks` is `titles` as a listing shows
+    them, index for index; without it the searches carry no display fields."""
+    rows: Sequence[Optional[SpotifyTrack]] = (
+        tracks if len(tracks) == len(titles) else [None] * len(titles)
+    )
+    # One joined byline per distinct artist tuple: an album is usually one artist,
+    # and a fresh join per track is the only string this pass keeps for the life of
+    # the queue (measured ~800 KiB over 10,000 tracks).
+    bylines: dict[tuple[str, ...], Optional[str]] = {}
+
+    def byline(row: SpotifyTrack) -> Optional[str]:
+        key = tuple(row.artists)
+        if key not in bylines:
+            bylines[key] = ", ".join(key) or None
+        return bylines[key]
+
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
@@ -226,8 +259,12 @@ def spotify_playlist_to_ytsearch(
             analytics=replace(analytics, queue_position=analytics.queue_position + i),
             user_input=origin,
             requester_id=requester_id,
+            title=row.name if row else None,
+            uploader=byline(row) if row else None,
+            duration=row.duration_secs if row else None,
+            webpage_url=row.url if row else None,
         )
-        for i, title in enumerate(titles)
+        for i, (title, row) in enumerate(zip(titles, rows))
     ]
 
 

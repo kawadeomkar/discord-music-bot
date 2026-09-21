@@ -83,8 +83,8 @@ class MusicContext(commands.Context):
             own.append(single)
         song = mp.current_song  # the song the block below is built for
         block = mp.np_embed_block()
-        # ≤10 is Discord's per-message embed cap (worst case here is 4: the block, a
-        # playlist card and its unavailable-songs notice).
+        # ≤10 is Discord's per-message embed cap (worst case here is 5: the block's
+        # two, a collection card, its unavailable-songs notice and a short-walk one).
         attached = bool(block) and len(own) + len(block) <= 10
         embeds = block + own if attached else own
         if embeds:

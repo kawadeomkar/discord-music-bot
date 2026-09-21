@@ -55,7 +55,8 @@ QueueItem = Union[QueueObject, YTSource]
 _LREM_MAX_ENTRIES = 16
 
 # Entries serialized and RPUSHed per round trip by a bulk put. Serialization measured
-# ~7.6ms per thousand, which is how long each chunk holds the event loop.
+# ~1.5ms per thousand at ~400 bytes an entry, which is how long each chunk holds the
+# event loop; the RPUSH between chunks is what yields it.
 _PUT_CHUNK = 1000
 
 # Shallow queues rebuild instead: below ~80 survivors a rewrite is under 1ms.
@@ -110,11 +111,15 @@ def remove_matcher(needle: str) -> RemoveMatcher:
 
     def match(item: QueueItem) -> Optional[RemoveMode]:
         if not needle:
-            # An unresolved search has url=None, which an empty needle would match
-            # as "" and take out every Spotify collection track.
+            # An unresolved search may carry neither URL, which an empty needle would
+            # match as "" and take out every Spotify collection track.
             return None
+        # A search gains webpage_url once a Spotify walk has named its track, and that
+        # is the link -queue shows for it, so -remove accepts it too.
         resolved = (
-            item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
+            item.webpage_url
+            if isinstance(item, QueueObject)
+            else (item.url or item.webpage_url or "")
         )
         if resolved == needle:
             return RemoveMode.RESOLVED
@@ -146,10 +151,12 @@ def _to_entry(item: QueueItem) -> QueueEntry:
 
 
 def item_label(item: QueueItem) -> str:
-    """What to call a queued item in a reply. A YTSource is an unresolved search
-    with no `title`, so its term stands in, `ytsearch:` prefix off."""
+    """What to call a queued item in a reply. An unresolved search that carries no
+    title of its own is called by its term, `ytsearch:` prefix off."""
+    if item.title:
+        return item.title
     if isinstance(item, QueueObject):
-        return item.title or "?"
+        return "?"
     return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
@@ -518,6 +525,14 @@ class GuildQueue:
         """Snapshot of the queued items in display order."""
         return list(self._items)
 
+    def display_index(self, item: QueueItem) -> Optional[int]:
+        """The 1-based display position of `item`, by IDENTITY, or None when it is
+        no longer queued. Scans the deque rather than a copy of it."""
+        for index, queued in enumerate(self._items, 1):
+            if queued is item:
+                return index
+        return None
+
     def claimed_head(self) -> Optional[QueueItem]:
         """The item a consumer holds at the head, or None when nothing is claimed."""
         return self._items[0] if self._cursor else None
@@ -750,6 +765,10 @@ class GuildQueue:
                 user_input=entry.user_input,
                 query_source=entry.query_source,
                 requester_id=entry.requester_id,
+                title=entry.title,
+                uploader=entry.uploader,
+                duration=entry.duration,
+                webpage_url=entry.webpage_url,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:

@@ -22,6 +22,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
    - [Now Playing Host Model](#now-playing-host-model)
+   - [Queue rows](#queue-rows)
    - [Queue progress card](#queue-progress-card)
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
@@ -948,7 +949,7 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 4: a playlist card sent with its unavailable-songs notice).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 5: the two-embed block, a collection card, its unavailable-songs notice and a short-walk notice).
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `GuildSettings.np_refresh_secs()`: the larger of the server's `np-refresh` and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s), read before each sleep, so a change lands after the tick in progress. A server can slow its bar but never speed it past the bot's value, because the channel's edit bucket is shared with everything else the bot sends and edits there; the write is refused below the bot's value, and a stored value the bot has since overtaken runs at the bot's value and shows as `bot minimum` on the card. Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
@@ -973,6 +974,25 @@ tick. That is the footer reporting live values; debug mode is opt-in per guild a
 default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
+
+---
+
+### Queue rows
+
+`src/queue_rows.py` renders one queued item as a row of text, and owns the ETA walk that runs down a listing. It is pure: no player, no queue, no Discord call. A listing reads the same wherever it appears because there is one formatter, and it has two callers: `-queue` (`MusicPlayer.queue_embed`, two-line rows) and the queued album and playlist cards (`MusicPlayer.queued_rows`, one-line rows). The single-entry "Up next" and "Queued song" cards are `MusicPlayer._queue_entry_description`, a separate renderer over the same display fields — a row is one line of a list, a card is a labelled block — so a change here reaches the listings but not those cards:
+
+```
+`index` [**title**](link) · `length` · Est. playing at **9:41 PM PDT**
+channel · @requester                                   (with a byline)
+```
+
+`queue_rows` numbers rows from a `first_index`, chains the `EtaWalk` from the state its caller seeds (the playing song's remaining time, then every item ahead), and ends in `*... and N more*`. It is bounded twice: `ROW_LIMIT` rows, and `ROWS_BUDGET` characters, because ten rows at both caps pass an embed description's 4,096 on their own. Two-line rows are set apart by a blank line and one-line rows are not. An unknown length marks the walk uncertain, and every later time renders with a `~`.
+
+**An unresolved search renders the same row.** A Spotify track is queued as a `YTSource` search and only becomes a song when it is about to play, so the row cannot wait for yt-dlp. `YTSource` carries four display fields under the names a resolved song uses — `title`, `uploader` (the artists), `duration` and `webpage_url` (the Spotify track page) — and the formatter reads one set of attributes off either item. They persist on `SearchQueueEntry`, written only when present, so an entry queued before they existed keeps its bytes and renders as its search text and `resolving...`. The length is Spotify's and not the YouTube match's: `EtaWalk.advance_estimate` counts it and marks everything after it approximate, and `queue_runtime` adds it while keeping the total's `~`.
+
+**What the rows cost.** The four display fields are stored per queued track, so a `ytsource` entry on `guild:{id}:queue` grows to ~400 bytes (measured; serializing one `_PUT_CHUNK` of 1,000 is ~1.5ms). The cached walk under `spotify:playlist:v4:{id}` / `spotify:album_tracks:v2:{id}` carries a `tracks` array beside `titles`, one `[name, artists, duration_secs, url]` row per title — which is what the key versions were bumped for, and roughly triples that value. A 10,000-track collection therefore holds ~2 MB of cache plus ~4 MB of queue mirror, against the 256 MB the bundled Redis is given; both keys carry a TTL, so they stay eviction candidates under `volatile-lru` (see the eviction rules). On a cache HIT the rows are rebuilt `_CACHE_ROWS_CHUNK` at a time with a loop yield between chunks: the rebuild is ~6ms for 10,000 rows and a hit takes neither the walk slot nor the single flight, so without the yield every caller paid it on one tick.
+
+**A queued-collection card lists -queue's rows.** `queued_rows` runs after the put: it finds the first queued track in the display order by identity, walks the ETA to that slot and lists from there, so the card's numbers and times are the ones `-queue` shows for the same tracks. On the card every row would share one requester and mostly one artist, so it takes the one-line density, and its facts line drops "Est. playing at" because each row has its own. A YouTube playlist's tracks are resolved songs already, so its card gets links, lengths and times from the same call with no new data.
 
 ---
 
@@ -1151,7 +1171,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 |---|---|---|---|
 | `guild:{id}:state` | Hash | 20 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
-| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and `requester_id` when known). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
+| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and, each only when known, `requester_id` and the display fields `title`, `uploader`, `duration`, `webpage_url`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
 | `bot:{application_id}:config` | Hash | One field per `-settings bot` knob, named as its env var in lower case (`Knob.field`); absent runs the knob on its environment value. Written only by `BotSettings.write`/`write_reset`, applied at startup by `BotSettings.hydrate`, skipped while `BOT_SETTINGS_OVERRIDES=ignore`. One per application, so bots sharing a Redis cannot retune each other; `debug-default` is never stored | **none, ever** |
 | `guild:{id}:config` | Hash | 8 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off), `queue_progress_delay_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
@@ -1163,8 +1183,8 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
-| `spotify:album_tracks:v1:{id}` | String | The playlist object's shape, plus `artists` and `thumbnail`. Written only by a non-empty walk that counted exactly the album's `total` | 24 h |
+| `spotify:playlist:v4:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `tracks` (one `[name, artists, duration_secs, url]` display row per title, index-aligned with `titles`), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
+| `spotify:album_tracks:v2:{id}` | String | The playlist object's shape, `tracks` included, plus `artists` and `thumbnail`. Written only by a non-empty walk that counted exactly the album's `total` | 24 h |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1505,8 +1525,8 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:v3:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
-| `album(id)` | `spotify:album_tracks:v1:{id}` | 24 h | The same `SpotifyPlaylist` shape, plus the album's `artists` and cover `thumbnail`. Page 1 rides `GET /v1/albums/{id}`, so a one-page album is one request and takes no walk slot; later pages follow its `next` cursor inside one. Cached only when the walk counted exactly the album's `total` and kept at least one title — see [Spotify playlist paging](#spotify-playlist-paging) |
+| `playlist(id)` | `spotify:playlist:v4:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, a `SpotifyTrack` display row beside each (name, artists, length, track page), the playlist's name, total length, unavailable-item count |
+| `album(id)` | `spotify:album_tracks:v2:{id}` | 24 h | The same `SpotifyPlaylist` shape, plus the album's `artists` and cover `thumbnail`. Page 1 rides `GET /v1/albums/{id}`, so a one-page album is one request and takes no walk slot; later pages follow its `next` cursor inside one. Cached only when the walk counted exactly the album's `total` and kept at least one title — see [Spotify playlist paging](#spotify-playlist-paging) |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 

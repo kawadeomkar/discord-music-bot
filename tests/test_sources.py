@@ -25,6 +25,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
     timestamp_warning,
 )
+from src.spotify import SpotifyTrack
 
 
 class TestParseUrlYouTube:
@@ -597,6 +598,76 @@ class TestSpotifyPlaylistToYTSearch:
     def test_the_requester_has_no_default(self) -> None:
         with pytest.raises(TypeError, match="requester_id"):
             spotify_playlist_to_ytsearch(["a"], analytics=_ANALYTICS, origin=_ORIGIN)  # pyright: ignore[reportCallIssue]
+
+    def test_a_track_row_becomes_the_searchs_display_fields(self) -> None:
+        rows = [
+            SpotifyTrack(
+                name="LOYALTY.",
+                artists=["Kendrick Lamar", "Rihanna"],
+                duration_secs=227,
+                url="https://open.spotify.com/track/abc",
+            )
+        ]
+        (source,) = spotify_playlist_to_ytsearch(
+            ["LOYALTY. Kendrick Lamar Rihanna"],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=7,
+            tracks=rows,
+        )
+        assert source.ytsearch == "ytsearch:LOYALTY. Kendrick Lamar Rihanna"
+        assert (source.title, source.uploader, source.duration, source.webpage_url) == (
+            "LOYALTY.",
+            "Kendrick Lamar, Rihanna",
+            227,
+            "https://open.spotify.com/track/abc",
+        )
+
+    def test_one_artist_tuple_yields_one_shared_byline(self) -> None:
+        """An album is usually one artist, and the joined byline is the only string
+        this pass keeps for the life of the queue — a fresh join per track was
+        ~800 KiB over 10,000 of them."""
+        rows = [
+            SpotifyTrack(
+                name=f"T{i}", artists=["Daft Punk"], duration_secs=180, url=None
+            )
+            for i in range(50)
+        ]
+        built = spotify_playlist_to_ytsearch(
+            [f"T{i} Daft Punk" for i in range(50)],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=7,
+            tracks=rows,
+        )
+        assert {s.uploader for s in built} == {"Daft Punk"}
+        assert len({id(s.uploader) for s in built}) == 1
+
+    def test_a_different_artist_tuple_gets_its_own_byline(self) -> None:
+        rows = [
+            SpotifyTrack(name="A", artists=["X"], duration_secs=1, url=None),
+            SpotifyTrack(name="B", artists=["X", "Y"], duration_secs=1, url=None),
+            SpotifyTrack(name="C", artists=[], duration_secs=1, url=None),
+        ]
+        built = spotify_playlist_to_ytsearch(
+            ["A X", "B X Y", "C"],
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            requester_id=7,
+            tracks=rows,
+        )
+        assert [s.uploader for s in built] == ["X", "X, Y", None]
+
+    def test_without_rows_a_search_has_nothing_to_show(self) -> None:
+        (source,) = spotify_playlist_to_ytsearch(
+            ["a"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=7
+        )
+        assert (source.title, source.uploader, source.duration, source.webpage_url) == (
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class TestYTSourcePlaylistUrl:

@@ -11,7 +11,6 @@ because nothing outside this pipeline constructs them.
 import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
-from itertools import islice
 from typing import TYPE_CHECKING, Any, Optional, TypeGuard, Union, assert_never
 from collections.abc import Awaitable, Callable, Sequence
 
@@ -20,7 +19,7 @@ from discord.ext import commands
 
 from src.guild_queue import QueueItem
 from src.guild_state import Analytics
-from src.musicplayer import InterjectOutcome, MusicPlayer, queue_runtime
+from src.musicplayer import InterjectOutcome, MusicPlayer
 from src.play_placement import (
     Placement,
     PlayRequest,
@@ -40,19 +39,19 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
     timestamp_warning,
 )
-from src.spotify import SpotifyPlaylist
+from src.spotify import SpotifyPlaylist, SpotifyTrack
 from src.telemetry import get_tracer
 from src.queue_progress import enqueue_progress, is_collection
+from src.queue_rows import queue_runtime
 from src.util import (
     ECHO_MAX,
-    QUEUE_MESSAGE_ROWS_PLUS_ONE,
+    EMBED_DESCRIPTION_LIMIT,
     ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
     get_logger,
     notice_embed,
     pluralize,
-    queue_message,
     safe_label,
     send_embed,
     truncate_embed_title,
@@ -69,6 +68,9 @@ log = get_logger(__name__)
 # Searches built per event-loop turn for a Spotify playlist. Measured ~7ms a
 # thousand, which is how long each chunk holds the event loop.
 _SEARCH_BUILD_CHUNK = 1000
+
+# Blank lines and the "... and N more" tail the rows add around themselves.
+_DESCRIPTION_MARGIN = 64
 _tracer = get_tracer(__name__)
 
 
@@ -125,17 +127,16 @@ class EmptyPlaylistError(PlaylistInputError):
 class ResolvedSpotifyPlaylist:
     """A Spotify playlist or album resolved to track titles, still needing
     per-title YouTube search resolution. The rest is what the enqueue embed
-    reports: lengths are Spotify's, not the YouTube matches', `artists` and
+    reports: `tracks` carries Spotify's own lengths and links, `artists` and
     `thumbnail` are an album's, and `short` is a walk Spotify ended early."""
 
     titles: list[str]
     name: Optional[str] = None
-    duration_secs: int = 0
-    duration_partial: bool = False
     unavailable: int = 0
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
     short: bool = False
+    tracks: list[SpotifyTrack] = field(default_factory=list)
 
 
 @dataclass
@@ -277,10 +278,23 @@ def collection_note(
 
 
 async def _searches_for(
-    titles: Sequence[str], *, analytics: Analytics, origin: str, requester_id: int
+    titles: Sequence[str],
+    *,
+    analytics: Analytics,
+    origin: str,
+    requester_id: int,
+    rows: Sequence[SpotifyTrack] = (),
 ) -> list[YTSource]:
     """spotify_playlist_to_ytsearch, a chunk per event-loop turn. Positions count on
-    from `analytics` across chunks, as they would in one call."""
+    from `analytics` across chunks, as they would in one call. `rows` is the walk's
+    display rows, one per title; a set that does not pair up is dropped whole, because
+    a row read against the wrong title is worse than no row."""
+    if rows and len(rows) != len(titles):
+        log.warning(
+            f"spotify display rows do not pair with titles "
+            f"({len(rows)} rows, {len(titles)} titles); queueing without them"
+        )
+        rows = ()
     tracks: list[YTSource] = []
     for start in range(0, len(titles), _SEARCH_BUILD_CHUNK):
         if start:
@@ -292,6 +306,7 @@ async def _searches_for(
             ),
             origin=origin,
             requester_id=requester_id,
+            tracks=rows[start : start + _SEARCH_BUILD_CHUNK],
         )
     return tracks
 
@@ -442,12 +457,11 @@ async def queue_source(
         return ResolvedSpotifyPlaylist(
             playlist.titles,
             name=playlist.name,
-            duration_secs=playlist.duration_secs,
-            duration_partial=playlist.duration_partial,
             unavailable=playlist.unavailable,
             artists=playlist.artists,
             thumbnail=playlist.thumbnail,
             short=playlist.short,
+            tracks=playlist.tracks,
         )
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
@@ -536,21 +550,10 @@ async def enqueue_playlist(
     if isinstance(qobj, ResolvedSpotifyPlaylist):
         titles = qobj.titles
         count = len(titles)
-        # islice, not the whole list: queue_message renders ten, and escaping a
-        # 10,000-title playlist to show ten measured 53ms of event-loop time on
-        # the -play path. The count is what says the playlist was taken in full,
-        # which is the only place a user can see that it no longer stops at 100.
-        shown_titles = queue_message(
-            [
-                safe_label(t, ECHO_ROW_MAX)
-                for t in islice(titles, QUEUE_MESSAGE_ROWS_PLUS_ONE)
-            ]
-        )
         link = source.url if isinstance(source, SpotifySource) else None
         heading = [_playlist_heading(qobj.name, link)]
         if qobj.artists:
             heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
-        runtime = (qobj.duration_secs, qobj.duration_partial)
         # Built outside the lock: one YTSource per title, and the depth it
         # is minted against is almost always still the depth at the insert.
         provisional = _head_depth(mp, placement)
@@ -559,7 +562,11 @@ async def enqueue_playlist(
             analytics=replace(analytics, queue_position=provisional),
             origin=origin,
             requester_id=ctx.author.id,
+            rows=qobj.tracks,
         )
+        # The same sum -queue shows for these tracks: Spotify's lengths, added as
+        # whole seconds, so the two totals cannot drift apart.
+        runtime = queue_runtime(tracks)
         log.info(f"spotify {collection_noun(source)} track count: {len(tracks)}")
         async with cog._plays.place(req) as verdict:
             if verdict.placed:
@@ -585,12 +592,6 @@ async def enqueue_playlist(
                 f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
                 f"earlier {pluralize(qobj.skipped, 'song')}"
             )
-        shown_titles = queue_message(
-            [
-                safe_label(q.title, ECHO_ROW_MAX)
-                for q in islice(tracks, QUEUE_MESSAGE_ROWS_PLUS_ONE)
-            ]
-        )
         runtime = queue_runtime(tracks)
         # Minted before the lock: at 5,000 tracks the pass is milliseconds of
         # event-loop time every sibling -play would wait out (_rebase_positions).
@@ -610,10 +611,21 @@ async def enqueue_playlist(
     # waiting for. What follows is a Discord send and a stream warm.
     await release_hold()
     # After the put, like the single-song card, so the facts describe the slot taken.
+    # One read of the queue backs both numbers: "Songs ahead" and the first row's
+    # index disagreed when the loop dequeued between them.
+    first = mp.queued_slot(tracks, ahead=ahead)
     header = [f"Requested by: [{ctx.author.mention}]", *heading]
-    header.append(mp.playlist_facts(ahead=ahead, runtime=runtime))
+    # Every row carries its own start time, so the facts line does not.
+    header.append(mp.playlist_facts(ahead=first - 1, runtime=runtime, eta=False))
     body = [line for line in header if line]
-    description = "\n".join(body) + f"\n\n{shown_titles}"
+    # One bound over the whole description, not just the rows: the heading, the
+    # facts and a timestamp warning are each capped on their own, but their SUM
+    # is what Discord rejects.
+    around = "\n".join(body) + (f"\n\n{warning}" if warning else "")
+    room = EMBED_DESCRIPTION_LIMIT - len(around) - _DESCRIPTION_MARGIN
+    # The rows -queue will show for these tracks, read after the put.
+    rows = mp.queued_rows(tracks, first=first, budget=max(0, room))
+    description = "\n".join(body) + f"\n\n{rows}"
     if warning:
         description += f"\n\n{warning}"
     noun = collection_noun(source)
@@ -790,6 +802,7 @@ async def _resolve_interjection_source(
             analytics=analytics,
             origin=origin,
             requester_id=ctx.author.id,
+            rows=playlist.tracks,
         )
         # The head takes the full path — it has to be playable to interrupt
         # with. The rest stay lazy searches, resolved at dequeue.

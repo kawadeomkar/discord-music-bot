@@ -69,6 +69,7 @@ from src.spotify import (
     SpotifyPlaylistTooSlowError,
     SpotifyRateLimitError,
     SpotifyRequestError,
+    SpotifyRowMismatchError,
 )
 from src.youtube import ExtractionError
 from contextvars import Token
@@ -508,6 +509,7 @@ class MusicBot(commands.Cog):
                     SpotifyPlaylistTooSlowError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
+                    SpotifyRowMismatchError,
                     UnsupportedSpotifyLinkError,
                 ),
             ):

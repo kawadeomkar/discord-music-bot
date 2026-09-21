@@ -564,6 +564,32 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.44.0
+
+**A queued album or playlist is listed the way `-queue` lists songs.** The "Queued album"
+and "Queued playlist" replies used to print their own numbered list of search strings
+("DNA. Kendrick Lamar"). They now show `-queue`'s row for each track: its queue position,
+its name as a link, its length and when it is expected to start. `-queue` itself shows the
+same for album and Spotify-playlist tracks, which used to read `resolving...` with no
+length until just before they played; the queue's total now counts them.
+
+Two things to know. A Spotify track has no YouTube page until it is about to play, so its
+title links to the track on Spotify until then. And its length is Spotify's, not the
+YouTube match's, so start times behind it carry a `~`.
+
+Nothing to configure. Each album and Spotify playlist is read from Spotify once more after
+the upgrade, because the cached copies do not hold the new per-track details. Tracks
+already in a queue when you upgrade keep the old `resolving...` row until they play.
+Rolling back is only a redeploy.
+
+**It costs Redis memory.** Holding a name, artists, length and link for every queued track
+makes a saved queue entry about 400 bytes instead of about 270, and roughly triples the
+cached copy of a collection. A 10,000-track playlist that is both queued and cached now
+holds around 6 MB rather than around 3 MB. That matters only if you run enormous
+collections: the bundled Redis is capped at 256 MB, and when it fills it evicts the keys
+that carry a TTL — which includes saved queues, and an evicted queue is not restored after
+a restart. `-queue`, `-remove` and `-clear` are unaffected either way.
+
 ## Upgrading to 2.43.0
 
 **Spotify album links now queue.** `-play https://open.spotify.com/album/…` takes the

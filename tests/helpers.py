@@ -252,6 +252,9 @@ def paused_vc(ctx: Optional[MagicMock] = None) -> MagicMock:
     return in_authors_channel(vc, ctx)
 
 
+MOCK_QUEUED_ROWS = "`1` [**Row**](https://x) · `3:00` · Est. playing at **9:41 PM PDT**"
+
+
 def mock_mp(qsize: int = 0) -> MagicMock:
     """MusicPlayer stand-in for the -play cold path, with the playback-gate
     hooks awaitable: play() takes defer_playback() as an async context manager
@@ -276,6 +279,12 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     mp.queue_put_next = AsyncMock()
     # A str, not auto-vivified: the queued-playlist card joins it into its text.
     mp.playlist_facts = MagicMock(return_value="")
+    # The card's rows, for the same reason — and recognizable, so a command-level
+    # test can assert the card carries them rather than a Mock's repr.
+    mp.queued_rows = MagicMock(return_value=MOCK_QUEUED_ROWS)
+    # An int, not auto-vivified: the card derives "Songs ahead" from it. Mirrors
+    # the real lookup's fallback, which is the depth the insert saw.
+    mp.queued_slot = MagicMock(side_effect=lambda _tracks, *, ahead: ahead + 1)
     mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in

@@ -1870,6 +1870,29 @@ class TestRestoreEntries:
         # In-memory only: the entries were already on the Redis list.
         assert await fake_redis.exists(store.queue_key()) == 0
 
+    async def test_a_restored_search_keeps_what_the_listing_shows(
+        self, gq: GuildQueue
+    ) -> None:
+        """Dropped here, a restart turns every queued album track back into
+        "resolving..." with no length."""
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:DNA. Kendrick Lamar",
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
+        assert await gq.restore_entries([entry]) == 1
+
+        (item,) = gq.display_items()
+        assert isinstance(item, YTSource)
+        assert (item.title, item.uploader, item.duration, item.webpage_url) == (
+            "DNA.",
+            "Kendrick Lamar",
+            185,
+            "https://open.spotify.com/track/abc",
+        )
+
     async def test_departed_member_falls_back_to_owner(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
@@ -2489,7 +2512,7 @@ class TestRequeueFrontSwap:
         assert outcome.removed == [second]
         assert calls == ["rebuild_queue"]
         stored = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert [parse_queue_entry(b).webpage_url for b in stored] == [  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        assert [parse_queue_entry(b).webpage_url for b in stored] == [  # pyright: ignore[reportOptionalMemberAccess]
             item.webpage_url for item in [other, *pads]
         ]
 
@@ -3277,6 +3300,10 @@ class TestItemLabelNamesEveryItemType:
     def test_an_unresolved_search_uses_its_search_text(self) -> None:
         item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
         assert item_label(item) == "Artist - Song"
+
+    def test_an_unresolved_track_that_carries_a_title_uses_it(self) -> None:
+        item = YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", title="DNA.")
+        assert item_label(item) == "DNA."
 
     def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
         item = YTSource(url="https://yt.com/v=2", process=True)

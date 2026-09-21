@@ -101,7 +101,11 @@ the token's life) and track/album/playlist lookups. Spotify content resolves to 
 searches** (`"<name> <artist1> <artist2>"`); album and playlist tracks enqueue as lazy
 `SearchQueueEntry`s resolved per-song at dequeue, each carrying the requester's ID
 (`spotify_playlist_to_ytsearch` requires it): the resolve runs long after the command,
-when `_last_author` is whoever typed most recently. An album (`Spotify.album`) returns
+when `_last_author` is whoever typed most recently. Both walks keep a `SpotifyTrack`
+beside every title (name, artists, Spotify's length, the track's page), index for index,
+and `spotify_playlist_to_ytsearch` sets them as the search's display fields: that is
+what `-queue` and the queued card list until the track resolves (`src/queue_rows.py`).
+An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
 the playlist's path through `queue_source`, the card and every placement; page 1 rides
 `GET /v1/albums/{id}` unslotted, pages 2+ take a walk slot (below), a 403 maps to

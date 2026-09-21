@@ -27,7 +27,7 @@ from src.guild_state import (
     GuildConfig,
 )
 from src.redis_client import BotConfigStore, GuildRedisStore
-from src.musicplayer import _fmt_total_duration
+from src.musicplayer import fmt_total_duration
 from src.settings import (
     SETTINGS,
     TIMEZONE_REDIRECTS,
@@ -409,7 +409,7 @@ class TestDurationGrammar:
     def test_the_bots_own_clock_and_totals_parse_back(self, secs: int) -> None:
         spec = _local(SettingKind.DURATION)
         assert parse_value(spec, fmt_duration(secs)) == Parsed(float(secs))
-        assert parse_value(spec, _fmt_total_duration(secs)) == Parsed(float(secs))
+        assert parse_value(spec, fmt_total_duration(secs)) == Parsed(float(secs))
 
     @pytest.mark.parametrize("secs", [0.05, 0.1, 0.25, 0.5, 3, 60, 120, 600])
     def test_fmt_seconds_parses_back(self, secs: float) -> None:
