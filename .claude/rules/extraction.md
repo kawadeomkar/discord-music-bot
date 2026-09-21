@@ -97,18 +97,28 @@ cache-bypassing token grant + fetch of a known track, 10s cap) and only a genuin
 failures are inconclusive and leave it ENABLED. `_require_spotify()` at every dispatch
 raises `SpotifyDisabledError` with a status-specific user-facing message. Client caches
 the bearer token in Redis (TTL = expires_in − 30s, skipped if that margin would exceed
-the token's life) and track/playlist lookups. Spotify content resolves to **YouTube
-searches** (`"<name> <artist1> <artist2>"`); playlist tracks enqueue as lazy
+the token's life) and track/album/playlist lookups. Spotify content resolves to **YouTube
+searches** (`"<name> <artist1> <artist2>"`); album and playlist tracks enqueue as lazy
 `SearchQueueEntry`s resolved per-song at dequeue, each carrying the requester's ID
 (`spotify_playlist_to_ytsearch` requires it): the resolve runs long after the command,
-when `_last_author` is whoever typed most recently.
+when `_last_author` is whoever typed most recently. An album (`Spotify.album`) returns
+the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
+the playlist's path through `queue_source`, the card and every placement; page 1 rides
+`GET /v1/albums/{id}` unslotted, pages 2+ take a walk slot (below), a 403 maps to
+`SpotifyPlaylistForbiddenError` as the playlist's does, and it is cached only when the
+walk counted exactly the album's `total` and kept a title.
+Either walk that ends before Spotify's own count sets `SpotifyPlaylist.short`, which the
+queued card and the `--now` path turn into a notice. `parse_url` drops a share link's
+`/intl-xx/` segment, and a Spotify link of a type the bot does not queue, with no id, or
+with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
+`ValueError`, which `parse_input` would turn into a YouTube search for the link.
 
 ## Concurrency primitives
 
 | Primitive | Protects |
 |---|---|
 | `youtube.prefetch_warm_slot()` (semaphore, process-wide) | how many enqueue-time stream warms may hold a worker. A search resolves flat and leaves the stream to `prefetch_stream`, which `queue_put` spawns per song and nobody awaits — so those never pass through `resolves` and would otherwise be bounded only by `PLAY_INFLIGHT_MAX`. Half the pool, and NOT per guild: the harm is a warm queued ahead of another guild's in-band resolve. The loop's own one-ahead prefetch takes `_stream_source` instead and never waits here |
-| `_playlist_slot()` (semaphore, src/spotify.py, process-wide) | how many Spotify playlist walks run at once (2) — Spotify's rate limiter is per application, and a walk is up to 100 requests. The wait is bounded by `PLAY_RESOLVE_WAIT_SECS` (`SpotifyBusyError`), and the semaphore is rebuilt when the running loop changes |
+| `_playlist_slot()` (semaphore, src/spotify.py, process-wide) | how many Spotify playlist walks, and album walks past their first page, run at once (2) — Spotify's rate limiter is per application, and a walk is up to 100 requests. An album re-reads its cache once it holds the slot, which is its single flight. The wait is bounded by `PLAY_RESOLVE_WAIT_SECS` (`SpotifyBusyError`), and the semaphore is rebuilt when the running loop changes |
 | `_INFLIGHT_PLAYLISTS` / `_PLAYLIST_SUBSCRIBERS` (src/spotify.py, process-wide) | one walk per playlist, awaited through `asyncio.shield` by every caller, each of whose cards receives the walk's page reports; the job writes the cache itself, so a cancelled caller costs nothing |
 | `_PROGRESS_SUBSCRIBERS` (src/youtube.py, process-wide) | the cards watching a YouTube playlist extraction. Mutated on the event loop, READ on the yt-dlp pool's progress drain thread (`_publish_progress` copies the list before iterating), so a report can never touch the loop |
 | `Spotify._auth_lock` | token refresh double-fire |

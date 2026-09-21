@@ -64,6 +64,30 @@ from tests.helpers import (
     stub_yt_playlist,
 )
 
+_ALBUM_LINK = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+
+
+def _album_walk(titles: list[str]) -> SpotifyPlaylist:
+    return SpotifyPlaylist(
+        name="Discovery",
+        titles=titles,
+        duration_secs=0,
+        duration_partial=False,
+        unavailable=0,
+        artists=["Daft Punk"],
+        thumbnail="https://i.scdn.co/cover",
+    )
+
+
+def _sent_descriptions(mock_ctx: MagicMock) -> list[str]:
+    """Every embed description the command sent, one message or several."""
+    sent: list[str] = []
+    for call in mock_ctx.send.call_args_list:
+        embeds = [call.kwargs.get("embed"), *(call.kwargs.get("embeds") or [])]
+        sent += [e.description or "" for e in embeds if e is not None]
+    return sent
+
+
 # Captured before any test replaces the module attribute: the tests that want the
 # REAL insert (the depth is minted there) restore it by name, and the seam every
 # other test stubs is `play_pipeline.enqueue_single`.
@@ -1981,6 +2005,92 @@ class TestNowFlag:
 
         assert order == ["settle", "place"]
         live_mp.interject.assert_not_awaited()  # --next never interrupts
+
+    # ── An album takes every interjection branch a playlist does ──────────────
+
+    async def test_now_with_an_album_interrupts_and_calls_it_an_album(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(return_value=_album_walk(["Head", "Two"]))
+        music_bot.spotify.playlist = AsyncMock()
+        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        with patch(
+            "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {_ALBUM_LINK}"
+            )
+
+        music_bot.spotify.album.assert_awaited_once()
+        music_bot.spotify.playlist.assert_not_awaited()
+        live_mp.interject.assert_awaited_once()
+        sent = _sent_descriptions(mock_ctx)
+        assert any("from the album" in d for d in sent), sent
+        assert not any("from the playlist" in d for d in sent), sent
+
+    async def test_now_with_an_album_over_a_song_that_already_ended(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        live_mp.interject = AsyncMock(return_value=None)
+        live_mp.queue_put_next = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        mock_ctx.message.add_reaction = AsyncMock()
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(return_value=_album_walk(["Head", "Two"]))
+        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        with patch(
+            "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {_ALBUM_LINK}"
+            )
+
+        sent = _sent_descriptions(mock_ctx)
+        assert any(
+            "already ended" in d and "whole album back out" in d for d in sent
+        ), sent
+
+    async def test_an_album_over_a_paused_song_resumed_mid_walk_is_appended(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        live_vc.is_playing.return_value = False
+        live_vc.is_paused.return_value = True
+        mock_ctx.voice_client = live_vc
+        assert music_bot.spotify is not None  # fixture provides a mock client
+
+        async def _album(_aid: str, *, on_progress: Any = None) -> SpotifyPlaylist:
+            live_vc.is_paused.return_value = False  # a -resume lands mid-walk
+            live_vc.is_playing.return_value = True
+            return _album_walk(["Head", "Two", "Three"])
+
+        music_bot.spotify.album = AsyncMock(side_effect=_album)
+        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        with patch(
+            "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=_ALBUM_LINK)
+
+        live_mp.interject.assert_not_awaited()
+        note = live_mp.build_queued_song_embed.call_args.kwargs["note"]
+        assert "**3** songs from the album" in note, note
+        assert "whole album back out" in note, note
 
 
 class TestPlacementInsertsAndConfirmations:
@@ -5519,3 +5629,60 @@ class TestQueueProgressCard:
 
         assert card.entered == 1
         assert (card.handle.done, card.handle.total) == (100, 250)
+
+    async def test_an_album_arms_the_card_and_confirms_an_album(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """is_collection and the pipeline's own check each list the collection
+        types; an album missing from either gets the wrong message or none."""
+        self._warm(music_bot, mock_ctx)
+        assert music_bot.spotify is not None  # fixture provides a mock client
+
+        async def _album(_aid: str, *, on_progress: Any = None) -> SpotifyPlaylist:
+            if on_progress is not None:
+                on_progress(7, 12)
+            return _album_walk(["One", "Two"])
+
+        music_bot.spotify.album = AsyncMock(side_effect=_album)
+        card = _CardSpy()
+        notice = await self._play(music_bot, mock_ctx, _ALBUM_LINK, card)
+
+        assert card.entered == 1 and card.exited == 1
+        assert (card.handle.done, card.handle.total) == (7, 12)
+        notice.assert_not_called()
+        titles = [
+            e.title
+            for call in mock_ctx.send.call_args_list
+            for e in [call.kwargs.get("embed"), *(call.kwargs.get("embeds") or [])]
+            if e is not None
+        ]
+        assert "Queued album — 2 songs" in titles, titles
+
+    async def test_now_with_an_album_arms_the_card(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(return_value=_album_walk(["One", "Two"]))
+        card = _CardSpy()
+        with (
+            patch("src.play_pipeline.enqueue_progress", new=card),
+            patch(
+                "src.play_pipeline.YTDL.yt_source",
+                new=AsyncMock(return_value=song(1, mock_ctx)),
+            ),
+            patch(
+                "src.play_pipeline.YTDL.prefetch_stream",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {_ALBUM_LINK}"
+            )
+
+        assert card.entered == 1

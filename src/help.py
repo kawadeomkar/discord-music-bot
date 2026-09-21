@@ -59,8 +59,8 @@ SOURCES = (
     "link's `&index=` starts the queue at that position. A video link carrying "
     "`&list=` queues that whole list — a Mix (`list=RD…`) is hundreds of songs; "
     "delete the `&list=` part to queue only the video.\n"
-    "**Spotify** — track and playlist links. Each title is matched to its "
-    "YouTube audio, so a playlist may take a moment to queue.\n"
+    "**Spotify** — track, album and playlist links. Each title is matched to "
+    "its YouTube audio, so an album or playlist may take a moment to queue.\n"
     "**SoundCloud** — track links."
 )
 

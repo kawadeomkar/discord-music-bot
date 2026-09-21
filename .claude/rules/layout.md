@@ -55,7 +55,7 @@ src/
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source;
 │                     # is_mix (a YouTube Mix, which yt-dlp walks window by window)
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached); the playlist
-│                     # pager, its walk slot and single flight
+│                     # pager, its walk slot and single flight, and the album walk
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
 ├── dashboard.py      # optimistic-send + live-edit driver shared by -ping and -debug;
 │                     # LiveMessage (send/edit-on-change/floor) is also the card's

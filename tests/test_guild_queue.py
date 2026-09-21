@@ -1878,6 +1878,37 @@ class TestRestoreEntries:
         assert count == 1
         assert queue_object(gq.display_items()[0]).requester is mock_guild.owner
 
+    async def test_a_departed_member_still_resolves_through_the_user_cache(
+        self, mock_guild: MagicMock, store: GuildRedisStore
+    ) -> None:
+        """MusicPlayer._resolve_requester reads the user cache for the lazy searches,
+        so without this leg one restored snapshot archives the same person's songs
+        and searches under two requesters."""
+        departed = MagicMock()
+        departed.id = 4242
+        mock_guild.get_member = MagicMock(return_value=None)
+        gq = GuildQueue(
+            mock_guild,
+            store,
+            user_lookup=lambda uid: departed if uid == 4242 else None,
+        )
+
+        assert await gq.restore_entries([self._entry(1, 4242)]) == 1
+
+        assert queue_object(gq.display_items()[0]).requester is departed
+
+    async def test_the_user_cache_leg_still_falls_back_when_it_misses(
+        self, mock_guild: MagicMock, store: GuildRedisStore
+    ) -> None:
+        """A second chance, not a replacement: an id neither cache knows lands on
+        the fallback rather than dropping the song."""
+        mock_guild.get_member = MagicMock(return_value=None)
+        gq = GuildQueue(mock_guild, store, user_lookup=lambda _uid: None)
+
+        assert await gq.restore_entries([self._entry(1, 4242)]) == 1
+
+        assert queue_object(gq.display_items()[0]).requester is mock_guild.owner
+
     async def test_unresolvable_requester_drops_entry(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:

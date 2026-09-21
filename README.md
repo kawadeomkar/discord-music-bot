@@ -16,7 +16,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 ## Features
 
 - **Multi-source playback** — YouTube URLs and playlists, plain-text YouTube search,
-  Spotify tracks and playlists (expanded to YouTube searches), SoundCloud links, and
+  Spotify tracks, albums and playlists (expanded to YouTube searches), SoundCloud links, and
   any other site yt-dlp supports (TikTok, Vimeo, Bandcamp, Twitch clips, …)
 - **Near-zero inter-song latency** — a three-phase yt-dlp pipeline resolves metadata
   instantly at enqueue time, prefetches stream URLs in the background while the current
@@ -31,7 +31,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
 - **Per-guild isolation** — every server gets its own player, queue, history, and volume
-- **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
+- **Queue management** — shuffle, clear, remove by link (one album or playlist link takes out every track it queued), per-song ETA estimates,
   persistent play history
 - **Opt-in play-history archive** — off by default, and a default deployment keeps
   nothing long-term: the newest 50 plays per guild live in Redis and no Postgres is
@@ -78,7 +78,7 @@ details, aliases, and examples.
 | `-analytics [--days N]` | `an` | A six-panel chart of this server's listening — plays per day by source, when it listens, listening time, how much of each song gets played, song lengths and queue wait — plus top listeners, artists and songs. `--days` is one of 7, 30, 90, 365; the window covers COMPLETE UTC days, so today is not included — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
-| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one playlist link takes back out every track it queued |
+| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one album or playlist link takes back out every track it queued |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
 
 ### Utility
@@ -101,6 +101,7 @@ https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
 https://www.youtube.com/watch?v=ID&list=LIST_ID&index=4  # playlist from #4 on
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
+https://open.spotify.com/album/ALBUM_ID
 https://soundcloud.com/artist/track
 https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported site
 never gonna give you up                          # plain text searches YouTube
@@ -562,6 +563,29 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.43.0
+
+**Spotify album links now queue.** `-play https://open.spotify.com/album/…` takes the
+whole album, the way a playlist link already did: under `--now` and `--next` too, with
+the same live card while a long one is read, and one `-remove <the link>` takes it back
+out. The confirmation names the album, its artists and its cover. An album is read once
+and kept for 24 hours; Spotify is asked again after that.
+
+Three smaller changes to what a pasted Spotify link does:
+
+- **A share link from a non-English client works.** Spotify's own share sheet produces
+  `open.spotify.com/intl-de/album/…`; the locale segment used to make the link fail.
+- **A link the bot cannot queue says so.** An `/artist/` or `/show/` link, or one with no
+  id, used to answer with a Python exception. It now names the three kinds it takes.
+- **A link pasted as `<link>`** (how Discord sends one whose preview you suppressed) is
+  read as the link inside.
+
+If Spotify stops sending an album or playlist before its own count of it, the
+confirmation is now preceded by a line saying some songs may be missing, instead of
+reporting the partial count as the whole. Nothing to configure, and no data moves.
+Rolling back is only a redeploy; the album cache entries an older build never reads
+expire on their own.
 
 ## Upgrading to 2.40.0
 

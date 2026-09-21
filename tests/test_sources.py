@@ -13,6 +13,7 @@ from src.sources import (
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
+    UnsupportedSpotifyLinkError,
     URLSource,
     YTSource,
     YTType,
@@ -212,10 +213,171 @@ class TestParseUrlSpotify:
         assert result.type == SpotifyType.TRACK
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
 
+    def test_spotify_album(self) -> None:
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_url(url)
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+        assert result.stype == URLSource.SPOTIFY
+        assert result.process is True
+
+    def test_spotify_album_without_open_subdomain(self) -> None:
+        url = "https://spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_url(url)
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def test_spotify_album_with_si_param(self) -> None:
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl?si=abc123"
+        result = parse_url(url)
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
+    @pytest.mark.parametrize(
+        ("locale", "kind", "expected_type"),
+        [
+            ("intl-de", "album", SpotifyType.ALBUM),
+            ("intl-pt", "track", SpotifyType.TRACK),
+            ("intl-ja", "playlist", SpotifyType.PLAYLIST),
+        ],
+    )
+    def test_intl_locale_prefix_is_dropped(
+        self, locale: str, kind: str, expected_type: SpotifyType
+    ) -> None:
+        """Spotify's own share sheet emits /intl-xx/ links for every
+        non-English client — rejecting them rejects the URL half the world
+        copies, with copy telling the user to paste what they just pasted."""
+        url = f"https://open.spotify.com/{locale}/{kind}/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_url(url)
+        assert isinstance(result, SpotifySource)
+        assert result.type is expected_type
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def test_intl_prefixed_unsupported_type_still_raises(self) -> None:
+        """The locale strip must expose the real type, not blindly accept."""
+        url = "https://open.spotify.com/intl-fr/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url)
+        assert "'artist'" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # A bare /album: the len(path) < 2 leg.
+            "https://open.spotify.com/album",
+            # A trailing slash: len(path) == 2 with path[1] == "", so only the
+            # `not path[1]` half of the guard catches it. Untested, that half
+            # could be dropped with the suite green — and a SpotifySource with
+            # an empty id resolves to a 404 the user cannot act on.
+            "https://open.spotify.com/album/",
+            "https://open.spotify.com/intl-de/track/",
+        ],
+    )
+    def test_spotify_link_without_id_raises_cleanly(self, url: str) -> None:
+        with pytest.raises(UnsupportedSpotifyLinkError, match="has no id"):
+            parse_url(url)
+
     def test_unknown_spotify_type_raises(self) -> None:
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
-        with pytest.raises(Exception, match="Unknown Spotify track type"):
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
             parse_url(url)
+        # The message names the supported types so the user can act on it —
+        # as a sentence ("or"), not a bare comma join.
+        assert "'artist'" in str(exc_info.value)
+        assert "track, playlist or album" in str(exc_info.value)
+
+    def test_user_message_is_the_message(self) -> None:
+        """_command_error renders `user_message` for allowlisted classes; the
+        property existing is what keeps the class-name prefix out of the
+        embed."""
+        url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url)
+        assert exc_info.value.user_message == str(exc_info.value)
+
+    def test_unknown_spotify_type_is_not_a_value_error(self) -> None:
+        """Regression guard: parse_input catches ValueError and falls back to a
+        YouTube search. If this error ever becomes a ValueError, an /artist/
+        link silently turns into `ytsearch:https://open.spotify.com/...`."""
+        url = "https://open.spotify.com/show/4rOoJ6Egrf8K2IrywzwOMk"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url)
+        assert not isinstance(exc_info.value, ValueError)
+
+    def test_unknown_spotify_type_suppresses_exception_chain(self) -> None:
+        """`from None`: the enum-lookup ValueError is an implementation detail;
+        chaining it doubles the traceback in every error log."""
+        url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+    @pytest.mark.parametrize(
+        "segment",
+        ["**x**||y||`z`", "\u202e" * 1970, "\\" * 1970, "[x](y)"],
+        ids=["markdown", "bidi-run", "backslash-run", "brackets"],
+    )
+    def test_the_echoed_type_cannot_style_or_overflow_the_embed(
+        self, segment: str
+    ) -> None:
+        """The message is an embed description: Discord renders markdown there and
+        400s the send past 4,096 characters, which leaves the user with no reply."""
+        with pytest.raises(UnsupportedSpotifyLinkError) as raised:
+            parse_url(f"https://open.spotify.com/{segment}/1")
+
+        message = raised.value.user_message
+        assert len(message) < 300
+        for mark in ("**", "||", "`", "[", "]"):
+            assert mark not in message.replace("\\" + mark[0], "")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://open.spotify.com/",
+            "https://open.spotify.com/intl-de",
+            "https://open.spotify.com/intl-de/",
+        ],
+    )
+    def test_a_link_with_no_type_is_not_quoted_as_an_empty_one(self, url: str) -> None:
+        with pytest.raises(UnsupportedSpotifyLinkError) as raised:
+            parse_url(url)
+
+        assert "''" not in raised.value.user_message
+        assert "track, playlist or album" in raised.value.user_message
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://open.spotify.com/album/ID#frag",
+            "https://open.spotify.com/album/ID&x=1",
+            "https://open.spotify.com/album/../../v1/me",
+            "https://open.spotify.com/album/ID>",
+        ],
+    )
+    def test_an_id_that_is_not_base62_is_refused(self, url: str) -> None:
+        """The id goes into the API path, the cache key and the card's link."""
+        with pytest.raises(UnsupportedSpotifyLinkError, match="doesn't look right"):
+            parse_url(url)
+
+    def test_a_link_with_its_embed_suppressed_parses_like_the_bare_one(self) -> None:
+        source = parse_input("<https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl>")
+        assert isinstance(source, SpotifySource)
+        assert source.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def test_the_canonical_url_drops_the_locale_and_the_share_parameters(self) -> None:
+        source = parse_url(
+            "https://open.spotify.com/intl-de/album/6WgSCcRfaXuBVfM2TpV0Kl?si=abc"
+        )
+        assert isinstance(source, SpotifySource)
+        assert source.url == "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def test_parse_input_does_not_search_youtube_for_an_unsupported_link(self) -> None:
+        with pytest.raises(UnsupportedSpotifyLinkError):
+            parse_input("https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d")
 
 
 class TestParseUrlSoundcloud:
@@ -689,6 +851,21 @@ class TestQuotedArgumentsSurviveConsumeRest:
     def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
         assert unquote_argument('""') == '""'
         assert unquote_argument('"') == '"'
+
+    def test_discords_embed_suppression_wrapper_comes_off_a_link(self) -> None:
+        """`<link>` is how Discord sends a link whose embed the user suppressed,
+        and the `>` otherwise rides into the path."""
+        source = parse_input("<https://www.youtube.com/watch?v=dQw4w9WgXcQ>")
+        assert isinstance(source, YTSource)
+        assert source.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_angle_brackets_around_words_are_the_users_own(self) -> None:
+        assert unquote_argument("<3 this song>") == "<3 this song>"
+        assert unquote_argument("<>") == "<>"
+
+    def test_unwrapping_is_safe_twice(self) -> None:
+        once = unquote_argument("<https://youtu.be/x>")
+        assert unquote_argument(once) == once == "https://youtu.be/x"
 
 
 class TestTimestampWarning:

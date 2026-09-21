@@ -60,6 +60,7 @@ from src.history_archive import (
     ArchiveReader,
 )
 from src.musicplayer import MusicPlayer
+from src.sources import UnsupportedSpotifyLinkError
 from src.spotify import (
     Spotify,
     SpotifyAuthError,
@@ -98,7 +99,8 @@ _tracer = get_tracer(__name__)
 
 class SpotifyDisabledError(Exception):
     """A Spotify link was played while Spotify is unusable. Carries the
-    SpotifyStatus; the message is user-facing (rendered by _command_error)."""
+    SpotifyStatus; the message is user-facing, and `user_message` is the name
+    _command_error renders without the class-name prefix."""
 
     def __init__(self, status: SpotifyStatus) -> None:
         self.status = status
@@ -116,6 +118,10 @@ class SpotifyDisabledError(Exception):
                 "Try a YouTube or SoundCloud link, or just search by name."
             )
         super().__init__(message)
+
+    @property
+    def user_message(self) -> str:
+        return str(self)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -495,11 +501,14 @@ class MusicBot(commands.Cog):
                 (
                     ExtractionError,
                     PlaylistInputError,
+                    SpotifyAuthError,
                     SpotifyBusyError,
+                    SpotifyDisabledError,
                     SpotifyPlaylistForbiddenError,
                     SpotifyPlaylistTooSlowError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
+                    UnsupportedSpotifyLinkError,
                 ),
             ):
                 # The user-safe line: yt-dlp's raw message carries bug-report
@@ -547,8 +556,8 @@ class MusicBot(commands.Cog):
         usage="[--now|--next] <url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track or playlist link, a SoundCloud link, or plain "
-            "words to search YouTube with.\n\n"
+            "playlist, a Spotify track, album or playlist link, a SoundCloud link, or "
+            "plain words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
             "Otherwise the song is appended to the queue with an estimated start time. "
             "A `?t=` / `?ts=` timestamp starts it at that offset, and a playlist link's "
@@ -559,7 +568,7 @@ class MusicBot(commands.Cog):
             "over. Interrupt again and the parked songs unwind most recent first.\n\n"
             "`--next` queues it at the front instead, without interrupting anything."
             "\n\n"
-            "Both take a whole playlist in full. With `--now` that means the "
+            "Both take a whole playlist or album in full. With `--now` that means the "
             "interrupted song does not return until the last track — `-remove` with "
             "the same link takes the whole thing back out."
         ),
@@ -571,7 +580,8 @@ class MusicBot(commands.Cog):
                 "-p --next https://youtu.be/dQw4w9WgXcQ",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
-                "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
+                "-play https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
@@ -615,9 +625,9 @@ class MusicBot(commands.Cog):
             "The same request as `-play --now`, kept as its own command. Takes the "
             "same input as `-play`. If nothing is playing there is nothing to "
             "interrupt, so this behaves exactly like `-play`.\n\n"
-            "A playlist can't be interjected — only its **first track** is played, "
-            "since queueing the whole thing would delay the interrupted song "
-            "indefinitely. Use `-play` for the full playlist."
+            "A playlist or album is taken in full: its first track interrupts, the "
+            "rest queue behind it, and the interrupted song returns after the last "
+            "of them. `-remove` with the same link takes the whole thing back out."
         ),
         extras={
             "category": "Playback",
@@ -661,7 +671,7 @@ class MusicBot(commands.Cog):
             "current song ends. Nothing is interrupted — unlike `-playnow`, whatever "
             "is playing finishes first.\n\n"
             "The same request as `-play --next`, kept as its own command. Takes the "
-            "same input as `-play`, and takes a whole playlist in full.\n\n"
+            "same input as `-play`, and takes a whole playlist or album in full.\n\n"
             "Send it twice and the second one lands behind the first: each takes the "
             "front of the queue as it arrives, so they play in the order you asked."
         ),
@@ -902,7 +912,8 @@ class MusicBot(commands.Cog):
             "queue positions that were dropped, followed by the updated queue.\n\n"
             "Three things match: the YouTube link shown in the **Now Playing** "
             "card, the search text you queued with, and the link you queued with "
-            "— so removing a playlist link takes back out every track it added. "
+            "— so removing an album or playlist link takes back out every track it "
+            "added. "
             "Run it with no argument for a reminder.\n\n"
             "Links are matched as typed, so a `youtu.be` short link will not "
             "match a song queued from a full `youtube.com` one.\n\n"
@@ -915,7 +926,7 @@ class MusicBot(commands.Cog):
             "examples": [
                 "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 "-remove never gonna give you up",
-                "-remove https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                "-remove https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
             ],
             "note": (
                 "A search term removes what that exact search queued, not "

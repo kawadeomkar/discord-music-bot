@@ -759,6 +759,8 @@ class TestParseQueueEntryCorrupt:
         [
             b"not json at all",
             b'{"type":"qobj","title":"missing url and requester"}',
+            # A search may omit its requester; a resolved song may not.
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"missing requester"}',
             b"",
         ],
     )

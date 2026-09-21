@@ -10,9 +10,9 @@ because nothing outside this pipeline constructs them.
 
 import asyncio
 import contextlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import islice
-from typing import TYPE_CHECKING, Any, Optional, Union, assert_never
+from typing import TYPE_CHECKING, Any, Optional, TypeGuard, Union, assert_never
 from collections.abc import Awaitable, Callable, Sequence
 
 import discord
@@ -33,15 +33,19 @@ from src.sources import (
     SpotifyType,
     YTSource,
     YTType,
+    CollectionNoun,
+    collection_noun,
     parse_input,
     query_source_of,
     spotify_playlist_to_ytsearch,
     timestamp_warning,
 )
+from src.spotify import SpotifyPlaylist
 from src.telemetry import get_tracer
 from src.queue_progress import enqueue_progress, is_collection
 from src.util import (
     ECHO_MAX,
+    QUEUE_MESSAGE_ROWS_PLUS_ONE,
     ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
@@ -61,12 +65,6 @@ if TYPE_CHECKING:
     from src.musicbot import MusicBot
 
 log = get_logger(__name__)
-
-# One MORE than queue_message renders. It appends its "..." only while
-# `len(lines) < len(songs)`, so handing it exactly ten leaves a 5,000-track
-# playlist looking like a ten-track one — the eleventh is never rendered and
-# exists only to be counted.
-_ECHO_PLUS_ONE = 11
 
 # Searches built per event-loop turn for a Spotify playlist. Measured ~7ms a
 # thousand, which is how long each chunk holds the event loop.
@@ -109,29 +107,35 @@ class PlaylistIndexError(PlaylistInputError):
 
 
 class EmptyPlaylistError(PlaylistInputError):
-    """A playlist that resolved to nothing queueable. Vague about the cause:
+    """A collection that resolved to nothing queueable. Vague about the cause:
     yt-dlp drops unavailable entries before this code sees them, so "empty" and
-    "every video is private" are indistinguishable here."""
+    "every video is private" are indistinguishable here. An album's tracks are
+    Spotify's, so its copy names no video."""
 
-    def __init__(self) -> None:
+    def __init__(self, noun: CollectionNoun = "playlist") -> None:
+        tracks = "track on it" if noun == "album" else "video in it"
         super().__init__(
-            "playlist resolved to no tracks",
-            "That playlist has no songs I can queue — it may be empty, or every "
-            "video in it may be private or unavailable.",
+            f"{noun} resolved to no tracks",
+            f"That {noun} has no songs I can queue — it may be empty, or every "
+            f"{tracks} may be private or unavailable.",
         )
 
 
 @dataclass
 class ResolvedSpotifyPlaylist:
-    """A Spotify playlist resolved to track titles, still needing per-title
-    YouTube search resolution. The rest is what the enqueue embed reports:
-    lengths are Spotify's, not the YouTube matches'."""
+    """A Spotify playlist or album resolved to track titles, still needing
+    per-title YouTube search resolution. The rest is what the enqueue embed
+    reports: lengths are Spotify's, not the YouTube matches', `artists` and
+    `thumbnail` are an album's, and `short` is a walk Spotify ended early."""
 
     titles: list[str]
     name: Optional[str] = None
     duration_secs: int = 0
     duration_partial: bool = False
     unavailable: int = 0
+    artists: list[str] = field(default_factory=list)
+    thumbnail: Optional[str] = None
+    short: bool = False
 
 
 @dataclass
@@ -213,8 +217,45 @@ def with_queue_position(item: QueueItem, position: int) -> QueueItem:
     return replace(item, analytics=analytics)
 
 
+def _is_spotify_collection(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> TypeGuard[SpotifySource]:
+    return isinstance(source, SpotifySource) and source.type in (
+        SpotifyType.PLAYLIST,
+        SpotifyType.ALBUM,
+    )
+
+
+async def _spotify_collection(
+    source: SpotifySource, *, on_progress: Optional[ProgressFn], cog: MusicBot
+) -> SpotifyPlaylist:
+    """Walk a Spotify playlist or album. Raises on an empty one: the enqueue would
+    otherwise confirm it queued with 👍 over nothing queued."""
+    spotify = cog._require_spotify()
+    walk = spotify.album if source.type is SpotifyType.ALBUM else spotify.playlist
+    collection = await walk(source.id, on_progress=on_progress)
+    if not collection.titles:
+        raise EmptyPlaylistError(collection_noun(source))
+    return collection
+
+
+def short_walk_notice(noun: CollectionNoun) -> discord.Embed:
+    """Said when Spotify ended a walk before its own count of the collection: the
+    confirmation's song count is what was queued, not what the link holds."""
+    return notice_embed(
+        f"Spotify stopped sending this {noun} early, so some of its songs may be "
+        "missing from the queue.",
+        discord.Color.orange(),
+    )
+
+
 def collection_note(
-    url: str, queued: int, *, returns: str = "", head_playing: bool
+    url: str,
+    queued: int,
+    *,
+    returns: str = "",
+    head_playing: bool,
+    noun: CollectionNoun,
 ) -> str:
     """What a `-play` that queued a whole collection tells the user: how many
     tracks landed, when the interrupted song returns, and the `-remove` undo.
@@ -223,14 +264,14 @@ def collection_note(
     undo = (
         "the queued ones back out; the one playing needs `-skip`."
         if head_playing
-        else "the whole playlist back out."
+        else f"the whole {noun} back out."
     )
     # -remove compares links literally, so the command has to be copyable as-is.
     command = verbatim_code(f"-remove {url}", ECHO_MAX)
     if command is None:
         command = "`-remove` followed by the link you pasted"
     return (
-        f"\n\nQueued **{queued}** {pluralize(queued, 'song')} from the playlist."
+        f"\n\nQueued **{queued}** {pluralize(queued, 'song')} from the {noun}."
         f"{returns}\nNot what you wanted? {command} takes {undo}"
     )
 
@@ -394,23 +435,19 @@ async def queue_source(
     this call: it is taken at the extraction itself, so a cache hit and the pure
     HTTP of a Spotify playlist do not queue behind two in-flight lookups. See
     docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
-    if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
+    if _is_spotify_collection(source):
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
-        playlist = await cog._require_spotify().playlist(
-            source.id, on_progress=on_progress
-        )
-        titles = playlist.titles
-        if not titles:
-            # Otherwise the enqueue below confirms "Queued playlist" with 👍
-            # over nothing queued, which reads exactly like success.
-            raise EmptyPlaylistError()
+        playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
         return ResolvedSpotifyPlaylist(
-            titles,
+            playlist.titles,
             name=playlist.name,
             duration_secs=playlist.duration_secs,
             duration_partial=playlist.duration_partial,
             unavailable=playlist.unavailable,
+            artists=playlist.artists,
+            thumbnail=playlist.thumbnail,
+            short=playlist.short,
         )
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
@@ -480,7 +517,7 @@ async def enqueue_playlist(
     Spotify playlists arrive as titles needing YouTube search, YouTube playlists
     pre-resolved. Positions are minted at the insert: `analytics` carries the
     ask time and its depth is replaced by the one the head takes."""
-    # A playlist front-inserts in full, in order, under either flag. NEXT goes
+    # A collection front-inserts in full, in order, under either flag. NEXT goes
     # through queue_put_next, for the claim the loop's prefetch holds.
     enqueue = {
         Placement.TAIL: mp.queue_put,
@@ -504,14 +541,15 @@ async def enqueue_playlist(
         # the -play path. The count is what says the playlist was taken in full,
         # which is the only place a user can see that it no longer stops at 100.
         shown_titles = queue_message(
-            [safe_label(t, ECHO_ROW_MAX) for t in islice(titles, _ECHO_PLUS_ONE)]
+            [
+                safe_label(t, ECHO_ROW_MAX)
+                for t in islice(titles, QUEUE_MESSAGE_ROWS_PLUS_ONE)
+            ]
         )
-        link = (
-            f"https://open.spotify.com/playlist/{source.id}"
-            if isinstance(source, SpotifySource)
-            else None
-        )
+        link = source.url if isinstance(source, SpotifySource) else None
         heading = [_playlist_heading(qobj.name, link)]
+        if qobj.artists:
+            heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
         runtime = (qobj.duration_secs, qobj.duration_partial)
         # Built outside the lock: one YTSource per title, and the depth it
         # is minted against is almost always still the depth at the insert.
@@ -522,7 +560,7 @@ async def enqueue_playlist(
             origin=origin,
             requester_id=ctx.author.id,
         )
-        log.info(f"spotify playlist track count: {len(tracks)}")
+        log.info(f"spotify {collection_noun(source)} track count: {len(tracks)}")
         async with cog._plays.place(req) as verdict:
             if verdict.placed:
                 ahead = _songs_ahead(mp, placement)
@@ -548,7 +586,10 @@ async def enqueue_playlist(
                 f"earlier {pluralize(qobj.skipped, 'song')}"
             )
         shown_titles = queue_message(
-            [safe_label(q.title, ECHO_ROW_MAX) for q in islice(tracks, _ECHO_PLUS_ONE)]
+            [
+                safe_label(q.title, ECHO_ROW_MAX)
+                for q in islice(tracks, QUEUE_MESSAGE_ROWS_PLUS_ONE)
+            ]
         )
         runtime = queue_runtime(tracks)
         # Minted before the lock: at 5,000 tracks the pass is milliseconds of
@@ -575,19 +616,25 @@ async def enqueue_playlist(
     description = "\n".join(body) + f"\n\n{shown_titles}"
     if warning:
         description += f"\n\n{warning}"
+    noun = collection_noun(source)
     embeds = [
         build_embed(
-            f"Queued playlist — {count} {pluralize(count, 'song')}{next_suffix}",
+            f"Queued {noun} — {count} {pluralize(count, 'song')}{next_suffix}",
             description,
             discord.Color.blue(),
+            thumbnail=(
+                qobj.thumbnail if isinstance(qobj, ResolvedSpotifyPlaylist) else None
+            ),
         )
     ]
+    if isinstance(qobj, ResolvedSpotifyPlaylist) and qobj.short:
+        embeds.insert(0, short_walk_notice(noun))
     if qobj.unavailable:
         n = qobj.unavailable
         embeds.insert(
             0,
             notice_embed(
-                f"Skipped **{n}** unavailable {pluralize(n, 'song')} from this playlist.",
+                f"Skipped **{n}** unavailable {pluralize(n, 'song')} from this {noun}.",
                 discord.Color.red(),
             ),
         )
@@ -643,9 +690,11 @@ async def enqueue_single(
     else:
         # A note is the only word the user gets about tracks queued behind
         # this one, so an empty queue does not suppress the field.
+        # display_size(): a song the loop has claimed and is still resolving is
+        # neither pending nor playing, and this one queues behind it all the same.
         should_show_queued = (
             bool(note)
-            or mp.queue.qsize() > 0
+            or mp.queue.display_size() > 0
             or (isinstance(vc, discord.VoiceClient) and vc.is_playing())
         )
         if should_show_queued:
@@ -732,15 +781,15 @@ async def _resolve_interjection_source(
     analytics = Analytics(
         queued_at=ctx.message.created_at.timestamp(), queue_position=0
     )
-    if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-        playlist = await cog._require_spotify().playlist(
-            source.id, on_progress=on_progress
-        )
-        titles = playlist.titles
-        if not titles:
-            raise EmptyPlaylistError()
+    if _is_spotify_collection(source):
+        playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
+        if playlist.short:
+            await ctx.send(embed=short_walk_notice(collection_noun(source)))
         yts = await _searches_for(
-            titles, analytics=analytics, origin=origin, requester_id=ctx.author.id
+            playlist.titles,
+            analytics=analytics,
+            origin=origin,
+            requester_id=ctx.author.id,
         )
         # The head takes the full path — it has to be playable to interrupt
         # with. The rest stay lazy searches, resolved at dequeue.
@@ -905,7 +954,12 @@ async def interject_flow(
             # later. The interjection's 0 is replaced at the insert.
             qobj.interjected = False
             note = (
-                collection_note(url, len(follow_on) + 1, head_playing=False)
+                collection_note(
+                    url,
+                    len(follow_on) + 1,
+                    head_playing=False,
+                    noun=collection_noun(source),
+                )
                 if follow_on
                 else ""
             )
@@ -926,7 +980,12 @@ async def interject_flow(
             if follow_on:
                 # Nothing was interrupted, so the head is QUEUED rather than
                 # playing: it counts, and -remove reaches it.
-                note += collection_note(url, len(follow_on) + 1, head_playing=False)
+                note += collection_note(
+                    url,
+                    len(follow_on) + 1,
+                    head_playing=False,
+                    noun=collection_noun(source),
+                )
             await asyncio.gather(
                 ctx.send(embed=playing_next_embed(ctx, qobj, note=note)),
                 ctx.message.add_reaction("⏯️"),
@@ -958,7 +1017,7 @@ async def interject_flow(
                 f"`{outcome.resume_position_str}`."
             )
         if follow_on:
-            # The interrupted song waits behind the whole playlist, so the reply says
+            # The interrupted song waits behind the whole collection, so the reply says
             # so and names the undo (`-remove <the link>` matches user_input).
             desc += collection_note(
                 url,
@@ -969,6 +1028,7 @@ async def interject_flow(
                     else ""
                 ),
                 head_playing=True,
+                noun=collection_noun(source),
             )
         await asyncio.gather(
             send_embed(

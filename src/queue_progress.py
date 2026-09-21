@@ -31,6 +31,8 @@ from src.sources import (
     SpotifyType,
     YTSource,
     YTType,
+    CollectionNoun,
+    collection_noun,
     is_mix,
     timestamp_warning,
 )
@@ -50,9 +52,10 @@ log = get_logger(__name__)
 
 Source = Union[SpotifySource, YTSource, SoundcloudSource]
 
-_TITLE = "Working on that playlist…"
+# `{noun}` is CardDetails.noun: a Spotify album is not a playlist.
+_TITLE = "Working on that {noun}…"
 # Past the ceiling. Still true, and deliberately not "failed": nothing has.
-_STALLED_TITLE = "Still working on that playlist…"
+_STALLED_TITLE = "Still working on that {noun}…"
 
 # The elapsed line moves in 5s steps. Per second is 0.5 edits/s against a 1.0/s
 # per-channel budget the Now Playing bar already spends a third of.
@@ -106,6 +109,7 @@ class CardDetails:
     inside queue_source and does not exist while this is on screen."""
 
     requester: str
+    noun: CollectionNoun = "playlist"
     playlist_label: str = ""
     warning: str = ""
     placement_note: str = ""
@@ -155,7 +159,9 @@ def render_progress_card(
     if details.warning:
         lines.append(f"\n{details.warning}")
     embed = discord.Embed(
-        title=_STALLED_TITLE if progress.phase is EnqueuePhase.STALLED else _TITLE,
+        title=(
+            _STALLED_TITLE if progress.phase is EnqueuePhase.STALLED else _TITLE
+        ).format(noun=details.noun),
         description="\n".join(lines),
         color=discord.Color.blurple(),
     )
@@ -177,7 +183,7 @@ def is_collection(source: Source) -> bool:
     slow_resolve_notice owns the rest: two messages for one -play is worse than
     either alone."""
     if isinstance(source, SpotifySource):
-        return source.type is SpotifyType.PLAYLIST
+        return source.type in (SpotifyType.PLAYLIST, SpotifyType.ALBUM)
     if isinstance(source, YTSource):
         return source.type is YTType.PLAYLIST
     return False
@@ -225,6 +231,7 @@ async def enqueue_progress(
     ceiling = card_ceiling(delay, tick, config.queue_progress_max_secs())
     details = CardDetails(
         requester=ctx.author.mention,
+        noun=collection_noun(source),
         playlist_label=_playlist_label(source),
         warning=timestamp_warning(source) or "",
         placement_note=placement_note,

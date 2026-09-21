@@ -12,6 +12,7 @@ from src.sources import QUERY_SOURCE_SEARCH
 from src.util import (
     ECHO_ROW_MAX,
     EMBED_FIELD_LIMIT,
+    QUEUE_MESSAGE_ROWS_PLUS_ONE,
     notice_embed,
     pluralize,
     queue_message,
@@ -126,8 +127,8 @@ async def run(
                     queue_message(
                         [
                             echo(_removed_label(i), ECHO_ROW_MAX)
-                            # Sliced before the echo: queue_message keeps 10.
-                            for i in outcome.removed[:10]
+                            # Sliced before the echo; see the constant.
+                            for i in outcome.removed[:QUEUE_MESSAGE_ROWS_PLUS_ONE]
                         ]
                     )
                 ),

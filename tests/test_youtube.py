@@ -35,6 +35,7 @@ from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
+    NpHostRef,
     QueueObject,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
@@ -255,6 +256,25 @@ class TestYTDLPositionSecs:
         assert song.position_secs == 90.0
 
 
+def _carried_queueobject_fields() -> set[str]:
+    """QueueObject fields that must reach the playing YTDL, by name. Derived from
+    the dataclass, so a field added tomorrow is covered by both guards below
+    without either being edited. Anything not meant to cross is named here."""
+    import dataclasses
+
+    not_carried = {
+        # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
+        "webpage_url",
+        "title",
+        "duration",
+        "uploader",
+        "thumbnail",
+        # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
+        "ts",
+    }
+    return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+
+
 class TestYtStreamCarriesTheQueueObjectsFields:
     """`YTDL.yt_stream` is where a queue entry becomes a playing song and one of the
     three sites a new field is silently dropped at. `user_input` is what `-remove`
@@ -284,24 +304,11 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
     def test_no_queueobject_field_is_silently_left_behind(self) -> None:
         """Reflective, so a field added to QueueObject tomorrow fails HERE rather
-        than at playback — the hand-written list below it enumerates six fields and
-        cannot notice a seventh. Anything genuinely not meant to cross gets named
-        in the allow-list, with the reason."""
-        import dataclasses
+        than at playback. Anything genuinely not meant to cross gets named in the
+        allow-list, with the reason."""
         import inspect
 
-        # Fields that legitimately do not cross into YTDL.
-        not_carried = {
-            # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
-            "webpage_url",
-            "title",
-            "duration",
-            "uploader",
-            "thumbnail",
-            # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
-            "ts",
-        }
-        carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+        carried = _carried_queueobject_fields()
         params = set(inspect.signature(YTDL.__init__).parameters)
         missing = sorted(carried - params)
         assert not missing, (
@@ -312,8 +319,12 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
     async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
         """A field added to QueueObject and forgotten here dies at playback, where
-        every read of it happens. Asserted together so an omission fails rather
-        than needing to be noticed."""
+        every read of it happens. The guard above reads YTDL.__init__'s signature,
+        which is not the leg a field goes missing on, so this compares values across
+        the hop — and asserts each was given a non-default value, or a field the
+        constructor forgets arrives at its default and compares equal to itself."""
+        import dataclasses
+
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
@@ -326,20 +337,38 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             persisted=False,
             played_at=12.5,
             is_replay=True,
+            analytics=Analytics(queued_at=99.5, queue_position=7),
+            np_message_id=555,
+            np_channel_id=666,
+            np_dedicated=True,
+            np_host_ref=NpHostRef(
+                message=MagicMock(spec=discord.Message), own_embeds=[], dedicated=True
+            ),
+        )
+        carried = _carried_queueobject_fields()
+        defaults = {
+            f.name: f.default
+            for f in dataclasses.fields(QueueObject)
+            if f.default is not dataclasses.MISSING
+        }
+        undistinguished = sorted(
+            name
+            for name in carried
+            if name in defaults and getattr(qobj, name) == defaults[name]
+        )
+        assert not undistinguished, (
+            f"left at its default, so this test cannot see it dropped: "
+            f"{undistinguished}. Give it a non-default value above."
         )
 
         song = await self._played(qobj)
 
-        assert (
-            song.user_input,
-            song.query_source,
-            song.interjected,
-            song.is_resume,
-            song.start_paused,
-            song.persisted,
-            song.played_at,
-            song.is_replay,
-        ) == ("typed", "search", True, True, True, False, 12.5, True)
+        mismatched = {
+            name: (getattr(qobj, name), getattr(song, name, "<<absent>>"))
+            for name in sorted(carried)
+            if getattr(song, name, "<<absent>>") != getattr(qobj, name)
+        }
+        assert not mismatched, f"dropped between QueueObject and YTDL: {mismatched}"
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a

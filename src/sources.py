@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Final, Optional, Union
+from typing import Final, Literal, Optional, Union
 from urllib.parse import parse_qs, urlsplit
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
@@ -39,6 +39,10 @@ def parse_timestamp(raw: str) -> Optional[int]:
 # The unparseable `t=` is quoted inside a sentence, and a pasted URL fragment
 # can be arbitrarily long.
 _TIMESTAMP_ECHO_MAX = 40
+# Likewise the path segment an unsupported Spotify link names as its type.
+_SPOTIFY_KIND_ECHO_MAX = 40
+# Spotify ids are base62.
+_SPOTIFY_ID_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 def timestamp_warning(
@@ -92,6 +96,7 @@ def normalize_query_host(host: str) -> str:
 class SpotifyType(Enum):
     TRACK = "track"
     PLAYLIST = "playlist"
+    ALBUM = "album"
 
 
 def is_mix(list_id: str) -> bool:
@@ -113,8 +118,14 @@ class SpotifySource:
     process: bool = True
     stype: URLSource = URLSource.SPOTIFY
 
+    @property
+    def url(self) -> str:
+        """The canonical open.spotify.com link, without the locale or the share
+        parameters the pasted one may carry."""
+        return f"https://open.spotify.com/{self.type.value}/{self.id}"
 
-# slots: one instance is retained per unresolved Spotify-playlist track (344 B
+
+# slots: one instance is retained per unresolved Spotify collection track (344 B
 # -> 120 B each). Keep the class free of __dict__ readers (asdict/vars) and off
 # any pickle path; it crosses to Redis as SearchQueueEntry JSON.
 @dataclass(frozen=True, slots=True)
@@ -184,11 +195,25 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
+# What the replies call a collection. A Literal, so a reply that takes one cannot
+# be handed a guess, and one with no default cannot forget it.
+CollectionNoun = Literal["playlist", "album"]
+
+
+def collection_noun(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> CollectionNoun:
+    """What the replies call a collection: a Spotify album is the one that is not
+    a playlist."""
+    is_album = isinstance(source, SpotifySource) and source.type is SpotifyType.ALBUM
+    return "album" if is_album else "playlist"
+
+
 def spotify_playlist_to_ytsearch(
     titles: list[str], *, analytics: Analytics, origin: str, requester_id: int
 ) -> list[YTSource]:
-    """Spotify playlist tracks as lazy YouTube searches, each resolved at
-    dequeue. The Spotify token, the ask-time analytics (the head's; per-track
+    """Spotify album or playlist tracks as lazy YouTube searches, each resolved
+    at dequeue. The Spotify token, the ask-time analytics (the head's; per-track
     positions derive from it), `origin` (the pasted collection link) and the
     requester are set here, the last point that knows where these came from.
     `requester_id` has no default: a track without one is attributed at dequeue to
@@ -222,8 +247,19 @@ def _last(args: dict[str, list[str]], key: str) -> Optional[str]:
     return values[-1] if values else None
 
 
+class UnsupportedSpotifyLinkError(Exception):
+    """A Spotify URL this bot cannot queue: a type it does not take (/artist/,
+    /show/) or a type with no id. Not a ValueError, which parse_input reads as
+    "not a URL" and turns into a YouTube search for the link itself."""
+
+    @property
+    def user_message(self) -> str:
+        return str(self)
+
+
 def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
+    """Parse a URL into a source dataclass. Raises ValueError if no domain matches,
+    and UnsupportedSpotifyLinkError for a Spotify link that cannot be queued.
     domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path."""
     # `-` must be in the class: without it "my-site.com" is read as the host
     # "site.com", which lands in the archive's query_source.
@@ -283,10 +319,33 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
         )
     if domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
+        # Non-English clients share /intl-de/album/…; the locale routes nothing.
+        if path[0].startswith("intl-"):
+            path = path[1:]
+        kind = path[0] if path else ""
         try:
-            spotify_type = SpotifyType(path[0])
+            spotify_type = SpotifyType(kind)
         except ValueError:
-            raise Exception(f"Unknown Spotify track type: {path}")
+            values = [t.value for t in SpotifyType]
+            supported = ", ".join(values[:-1]) + f" or {values[-1]}"
+            # The segment is the user's own text on its way into an embed.
+            shown = safe_label(kind, _SPOTIFY_KIND_ECHO_MAX)
+            # `from None`: the enum lookup's ValueError is not the user's error.
+            raise UnsupportedSpotifyLinkError(
+                f"Spotify '{shown}' links aren't supported — try a {supported} link."
+                if shown
+                else f"That Spotify link doesn't point at a {supported}."
+            ) from None
+        if len(path) < 2 or not path[1]:
+            raise UnsupportedSpotifyLinkError(
+                f"That Spotify {kind} link has no id — copy the full link."
+            )
+        if not _SPOTIFY_ID_RE.fullmatch(path[1]):
+            # The id goes into the API path, the cache key and the card's link.
+            raise UnsupportedSpotifyLinkError(
+                f"That Spotify {kind} link's id doesn't look right — copy the link "
+                "again from Spotify."
+            )
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(spotify_type, path[1], process=True)
     if domain in ("soundcloud.com",):
@@ -312,10 +371,13 @@ def unquote_argument(text: str) -> str:
     trailing one into the path, and a quoted search stores `"some song"` as the
     origin `-remove some song` cannot match. Only a whole argument wrapped at
     both ends, never down to nothing; runs twice (here and at the command), so
-    it must be safe twice."""
-    for quote in ('"', "'"):
-        if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
+    it must be safe twice. `<link>` is the same case: Discord's own wrapper for a
+    link whose embed is suppressed, which -remove already strips from its needle."""
+    for opener, closer in (('"', '"'), ("'", "'")):
+        if len(text) > 2 and text.startswith(opener) and text.endswith(closer):
             return text[1:-1]
+    if len(text) > 2 and text[0] == "<" and text[-1] == ">" and " " not in text:
+        return text[1:-1]
     return text
 
 
