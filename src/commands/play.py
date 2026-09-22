@@ -14,9 +14,6 @@ from opentelemetry import trace
 from src.guild_state import Analytics
 from src.musicplayer import MusicPlayer
 from src.play_placement import (
-    NEXT_FLAG,
-    NOW_FLAG,
-    TIMESTAMP_FLAG,
     PlaceStalled,
     ResolveWaitExpired,
     resolve_mode_for,
@@ -25,6 +22,7 @@ from src.play_placement import (
     PlayArgs,
     PlayMode,
     PlayRequest,
+    play_usage,
     split_play_args,
 )
 from src.musicplayer import RESTORE_WAIT_SECS
@@ -159,9 +157,7 @@ async def _run_placed(
         if not url:
             await ctx.send(
                 embed=notice_embed(
-                    f"Missing argument: `url`. Usage: `{ctx.prefix}play "
-                    f"[{NOW_FLAG}|{NEXT_FLAG}] [{TIMESTAMP_FLAG} <time>] "
-                    f"<url|search>`",
+                    f"Missing argument: `url`. Usage: `{ctx.prefix}{play_usage()}`",
                     discord.Color.red(),
                 )
             )

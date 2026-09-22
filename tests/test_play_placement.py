@@ -25,6 +25,9 @@ from src.play_placement import (
     NEXT_FLAG,
     NOW_FLAG,
     TIMESTAMP_FLAG,
+    _OPTIONS,
+    _PLAY_OPTIONS,
+    play_usage,
     PlaceStalled,
     PlayArgs,
     _GuildPlays,
@@ -1112,3 +1115,111 @@ class TestSlowResolveNotice:
             dropped.set()
             await asyncio.sleep(0.1)
         mock_ctx.channel.send.assert_not_awaited()
+
+
+class TestTheOptionRegistry:
+    """Every branch of split_play_args reads `_PLAY_OPTIONS`, so an option added
+    there is parsed, refused, suggested and documented without editing the parser.
+    These pin that, rather than the three options that happen to be registered."""
+
+    def test_every_spelling_reaches_its_option(self) -> None:
+        for option in _PLAY_OPTIONS:
+            for spelling in option.spellings:
+                assert _OPTIONS[spelling] is option
+
+    def test_every_option_is_recognised_by_every_spelling(self) -> None:
+        """The table is the only place a spelling is declared, so a spelling it
+        carries must parse rather than fall through to the search."""
+        for option in _PLAY_OPTIONS:
+            for spelling in option.spellings:
+                text = f"{spelling} 1:32 song" if option.read else f"{spelling} song"
+                args = split_play_args(text)
+                assert args.error is None, (spelling, args.error)
+                assert args.query == "song"
+
+    def test_an_option_either_stands_for_a_value_or_reads_one(self) -> None:
+        """`read` is what decides whether the next token is consumed, so an entry
+        carrying both would silently eat a word of the search."""
+        for option in _PLAY_OPTIONS:
+            assert (option.constant is None) != (option.read is None), option.name
+
+    def test_only_a_value_taking_option_has_a_placeholder(self) -> None:
+        for option in _PLAY_OPTIONS:
+            assert bool(option.placeholder) is (option.read is not None), option.name
+
+    @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
+    def test_every_option_refuses_its_own_repeat(self, option: Any) -> None:
+        text = (
+            f"{option.name} 1:32 {option.name} 1:32 s"
+            if option.read
+            else (f"{option.name} {option.name} s")
+        )
+        args = split_play_args(text)
+        assert args.error is not None and "twice" in args.error
+        assert option.name in args.error
+
+    @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
+    def test_a_near_miss_of_every_option_is_suggested(self, option: Any) -> None:
+        """One dash short, or the em dash iOS substitutes — each names the long
+        form, built from the registry rather than a second list."""
+        for spelling in option.spellings:
+            stem = spelling.lstrip("-")
+            assert split_play_args(f"—{stem} x").dash_typo == option.name
+
+    @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
+    def test_a_valueless_option_refuses_a_value_and_the_reverse(
+        self, option: Any
+    ) -> None:
+        """`--now=x` was searched for as text before the registry; both shapes are
+        now answered by one rule that names the option it is about."""
+        args = split_play_args(f"{option.name}=x song")
+        assert args.error is not None and option.name in args.error
+        if option.read is None:
+            assert "doesn't take a value" in args.error
+        else:
+            # It takes one, so `=x` is read as the value and refused on its own
+            # terms rather than for carrying one at all.
+            assert "doesn't take a value" not in args.error
+
+    def test_options_over_one_field_are_mutually_exclusive(self) -> None:
+        """Two options naming the same field are alternatives; the message lists
+        that field's options in registry order, so it reads the same whichever was
+        typed first."""
+        first = split_play_args(f"{NOW_FLAG} {NEXT_FLAG} s").error
+        second = split_play_args(f"{NEXT_FLAG} {NOW_FLAG} s").error
+        assert first is not None and first == second
+        assert NOW_FLAG in first and NEXT_FLAG in first
+
+    def test_options_over_different_fields_combine(self) -> None:
+        """Only a shared field makes two options exclusive, so every cross-field
+        pair has to survive in both orders."""
+        for a in _PLAY_OPTIONS:
+            for b in _PLAY_OPTIONS:
+                if a.field == b.field:
+                    continue
+                spelled = [f"{o.name} 1:32" if o.read else o.name for o in (a, b)]
+                args = split_play_args(f"{' '.join(spelled)} song")
+                assert args.error is None, (a.name, b.name, args.error)
+                assert args.query == "song"
+
+    def test_the_usage_line_names_every_option(self) -> None:
+        """`-play`'s missing-argument notice renders from the registry, so a new
+        option documents itself there."""
+        usage = play_usage()
+        for option in _PLAY_OPTIONS:
+            assert option.name in usage
+            assert (option.placeholder in usage) if option.placeholder else True
+        assert usage.startswith("play ") and usage.endswith("<url|search>")
+
+    def test_alternatives_share_one_bracket(self) -> None:
+        """`[--now|--next]` rather than two brackets: they are one choice."""
+        assert f"[{NOW_FLAG}|{NEXT_FLAG}]" in play_usage()
+        assert f"[{TIMESTAMP_FLAG} <time>]" in play_usage()
+
+    def test_the_usage_hint_on_a_refusal_is_the_options_own(self) -> None:
+        """A `--now` mistake used to be answered with a `--timestamp` example."""
+        placement = split_play_args(f"{NOW_FLAG}=x song").error
+        assert placement is not None
+        assert NOW_FLAG in placement and TIMESTAMP_FLAG not in placement
+        timed = split_play_args(TIMESTAMP_FLAG).error
+        assert timed is not None and "1:32" in timed

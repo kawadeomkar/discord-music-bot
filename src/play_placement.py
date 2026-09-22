@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Final, Optional, Union
+from typing import Any, Final, Literal, Optional, Union
 from collections.abc import AsyncGenerator, Callable, Coroutine
 
 import discord
@@ -69,12 +69,6 @@ class PlayMode(Enum):
     NEXT = "next"
 
 
-_FLAG_MODES: Final[dict[str, PlayMode]] = {
-    NOW_FLAG: PlayMode.NOW,
-    NEXT_FLAG: PlayMode.NEXT,
-}
-
-
 class Placement(Enum):
     """Where an enqueue puts its songs, and which confirmation says so. COLD_FRONT
     and NEXT both front-insert, but only a disconnected bot waking a persisted
@@ -106,28 +100,115 @@ def resolve_mode_for(placement: Placement) -> ResolveMode:
     return ResolveMode.FLAT_OK
 
 
-# The start-offset flag's spellings. `-ts` is the short form, one dash like the
-# command prefix; `--ts` is what someone aiming between the two writes.
-_TIMESTAMP_FLAGS: Final[frozenset[str]] = frozenset({TIMESTAMP_FLAG, "--ts", "-ts"})
+# The PlayArgs field an option sets. Two options naming the same one are
+# alternatives — `--now` and `--next` both decide the placement — which is what
+# makes them mutually exclusive without a rule that names either.
+type PlayOptionField = Literal["mode", "start_offset"]
 
-# Stem (a flag without its dashes) -> the spelling a near-miss is answered with.
-# Built from the flags themselves, so a rename cannot leave a stale did-you-mean.
-_FLAG_STEMS: Final[dict[str, str]] = {
-    flag.lstrip("-"): canonical
-    for flag, canonical in (
-        *((flag, flag) for flag in _FLAG_MODES),
-        *((flag, TIMESTAMP_FLAG) for flag in _TIMESTAMP_FLAGS),
-    )
-}
+# What an option's value parser returns: the value, or the sentence saying why
+# the text is not one.
+type OptionValue = PlayMode | int
+type ValueReader = Callable[[str], tuple[Optional[OptionValue], Optional[str]]]
 
-# Longest stem first, so `timestamp` is not consumed as `t` + trailing text.
-_NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
-    f"[{DASHES}]{{1,2}}({'|'.join(sorted(_FLAG_STEMS, key=len, reverse=True))})"
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _PlayOption:
+    """One option `-play` takes. `name` is the spelling every message and
+    did-you-mean uses; `spellings` is what a user may type, `-ts` included.
+
+    An option either stands for a `constant` or carries a value `read` parses,
+    never both: `read` is what decides whether the next token is consumed.
+    kw_only, because `name` and `placeholder` are adjacent strings that both
+    reach a user."""
+
+    name: str
+    spellings: tuple[str, ...]
+    field: PlayOptionField
+    # How a usage line renders the value, or "" for an option that takes none.
+    placeholder: str = ""
+    # A value the usage hint shows in place of the placeholder.
+    sample: str = ""
+    constant: Optional[OptionValue] = None
+    read: Optional[ValueReader] = None
+
+    @property
+    def usage(self) -> str:
+        """How to write this option, for the messages that have to show it.
+        Spelled without a command name: -play, -playnow and -playnext all render
+        these, and the alias the user typed is not in scope here."""
+        return (
+            f"Usage: `{' '.join(filter(None, (self.name, self.sample)))} <url|search>`."
+        )
+
+
+def _read_start_offset(value: str) -> tuple[Optional[OptionValue], Optional[str]]:
+    """`value` as seconds, or the sentence saying why it is not a time. safe_label
+    for the reason timestamp_warning uses it: the echo sits in a code span a
+    backtick would close, and the cap keeps a 2,000-char argument out of the
+    embed."""
+    offset = parse_start_offset(value)
+    shown = safe_label(value, TIMESTAMP_ECHO_MAX)
+    if offset is None:
+        return None, (
+            f"⚠️ Couldn't read the timestamp `{shown}`. `{TIMESTAMP_FLAG}` "
+            f"takes {START_OFFSET_FORMATS}."
+        )
+    if offset >= MAX_START_OFFSET_SECS:
+        return None, (
+            f"⚠️ `{shown}` is longer than a day — `{TIMESTAMP_FLAG}` starts a "
+            f"song, not a broadcast."
+        )
+    return offset, None
+
+
+_PLAY_OPTIONS: Final[tuple[_PlayOption, ...]] = (
+    _PlayOption(
+        name=NOW_FLAG, spellings=(NOW_FLAG,), field="mode", constant=PlayMode.NOW
+    ),
+    _PlayOption(
+        name=NEXT_FLAG, spellings=(NEXT_FLAG,), field="mode", constant=PlayMode.NEXT
+    ),
+    # `-ts` is the short form, one dash like the command prefix; `--ts` is what
+    # someone aiming between the two writes.
+    _PlayOption(
+        name=TIMESTAMP_FLAG,
+        spellings=(TIMESTAMP_FLAG, "--ts", "-ts"),
+        field="start_offset",
+        placeholder="<time>",
+        sample="1:32",
+        read=_read_start_offset,
+    ),
 )
 
-# Spelled without a command name: -play, -playnow and -playnext all render these,
-# and the alias the user typed is not in scope here.
-_FLAG_USAGE: Final = f"Usage: `{TIMESTAMP_FLAG} 1:32 <url|search>`."
+# Every spelling, and every stem a near-miss can name, resolved to its option.
+# Both are built from the registry, so an option added or renamed there cannot
+# leave a spelling unmatched or a stale did-you-mean behind.
+_OPTIONS: Final[dict[str, _PlayOption]] = {
+    spelling: option for option in _PLAY_OPTIONS for spelling in option.spellings
+}
+_OPTION_STEMS: Final[dict[str, _PlayOption]] = {
+    spelling.lstrip("-"): option for spelling, option in _OPTIONS.items()
+}
+
+# Longest stem first, so `timestamp` is not consumed as `ts` + trailing text.
+_NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
+    f"[{DASHES}]{{1,2}}({'|'.join(sorted(_OPTION_STEMS, key=len, reverse=True))})"
+)
+
+
+def play_usage(*, command: str = "play") -> str:
+    """`-play`'s options as a usage line, rendered from the registry so a new one
+    documents itself. Alternatives over one field are joined with `|`."""
+    groups: dict[PlayOptionField, list[_PlayOption]] = {}
+    for option in _PLAY_OPTIONS:
+        groups.setdefault(option.field, []).append(option)
+    parts = []
+    for options in groups.values():
+        spelled = "|".join(
+            f"{option.name} {option.placeholder}".strip() for option in options
+        )
+        parts.append(f"[{spelled}]")
+    return f"{command} {' '.join(parts)} <url|search>"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -153,23 +234,37 @@ def _refused(argument: str, error: str) -> PlayArgs:
     return PlayArgs(mode=PlayMode.NORMAL, query=argument.strip(), error=error)
 
 
+def _already_set(prior: _PlayOption, option: _PlayOption) -> str:
+    """A leading option restating a decision the run already made. The same option
+    twice is a repeat; two over one field are alternatives, and the sentence lists
+    that field's options in registry order, so the rule reads the same whichever
+    one was typed first."""
+    if prior is option:
+        return f"⚠️ `{option.name}` was given twice."
+    names = [f"`{o.name}`" for o in _PLAY_OPTIONS if o.field == option.field]
+    return f"⚠️ Only one of {', '.join(names[:-1])} or {names[-1]} at a time."
+
+
 def split_play_args(argument: str) -> PlayArgs:
-    """Split the leading options off `-play`'s argument: at most one placement
-    flag (`--now`/`--next`) and at most one `--timestamp <time>`, in either order.
+    """Split the leading options off `-play`'s argument — at most one per field of
+    `_PLAY_OPTIONS`, in any order.
 
     Only the leading run counts, so an option further along stays part of the
-    search and of the origin `-remove` matches on. Inside the run a repeat, a
-    `--now`/`--next` conflict, a missing time and a time that does not parse each
-    set `error`. A leading token one dash off a flag (`-now`, an autocorrected
+    search and of the origin `-remove` matches on. Inside the run a repeat, two
+    options over one field, a missing value and a value that does not parse each
+    set `error`. A leading token one dash off an option (`-now`, an autocorrected
     `—next`) sets `dash_typo`; the exact match runs first, since a real `--now`
     also fits the near-miss pattern. A bare `now`/`next` is a search (`-p next to
     me`). See docs/ARCHITECTURE.md#the-play-flag-grammar.
 
-    Hand-parsed rather than a FlagConverter, whose grammar matches flags anywhere
-    in the line and would lift a `--ts` out of a search term.
+    Every branch below reads the registry, so an option added there is parsed,
+    refused, suggested and documented without editing this function.
+
+    Hand-parsed rather than a FlagConverter, whose grammar matches options
+    anywhere in the line and would lift a `--ts` out of a search term.
     """
-    mode = PlayMode.NORMAL
-    start_offset: Optional[int] = None
+    values: dict[PlayOptionField, Optional[OptionValue]] = {}
+    chosen: dict[PlayOptionField, _PlayOption] = {}
     # No strip on the tail at any step: `rest` never has one, and split() eats
     # the separator run while leaving the whitespace inside the query alone.
     rest = argument.strip()
@@ -177,65 +272,55 @@ def split_play_args(argument: str) -> PlayArgs:
         parts = rest.split(maxsplit=1)
         head = parts[0].lower()
         tail = parts[1] if len(parts) > 1 else ""
-        flag_mode = _FLAG_MODES.get(head)
-        if flag_mode is not None:
-            if mode is flag_mode:
-                return _refused(argument, f"⚠️ `{head}` was given twice.")
-            if mode is not PlayMode.NORMAL:
+        # `--ts=1:32` is one token, so the name is what precedes the first `=`.
+        name, sep, inline = head.partition("=")
+        option = _OPTIONS.get(name)
+        if option is None:
+            typo = _NEAR_FLAG_RE.fullmatch(head)
+            if typo is None:
+                break
+            # The whole argument, unconsumed: nothing is queued, so what the run
+            # had taken so far says nothing the did-you-mean needs.
+            return PlayArgs(
+                mode=PlayMode.NORMAL,
+                query=argument.strip(),
+                dash_typo=_OPTION_STEMS[typo.group(1)].name,
+            )
+        prior = chosen.get(option.field)
+        if prior is not None:
+            return _refused(argument, _already_set(prior, option))
+        if option.read is None:
+            if sep:
                 return _refused(
                     argument,
-                    f"⚠️ Only one of `{NOW_FLAG}` and `{NEXT_FLAG}` at a time.",
+                    f"⚠️ `{option.name}` doesn't take a value. {option.usage}",
                 )
-            mode, rest = flag_mode, tail
-            continue
-        # `--ts=1:32` is one token; `--ts= 1:32` is the value in the next one.
-        name, sep, inline = head.partition("=")
-        if name in _TIMESTAMP_FLAGS:
-            if start_offset is not None:
-                return _refused(argument, f"⚠️ `{TIMESTAMP_FLAG}` was given twice.")
+            values[option.field], rest = option.constant, tail
+        else:
             if sep and inline:
                 value, rest = inline, tail
             else:
                 value_parts = tail.split(maxsplit=1)
                 value = value_parts[0] if value_parts else ""
                 rest = value_parts[1] if len(value_parts) > 1 else ""
-            start_offset, refusal = _read_start_offset(value)
+            if not value:
+                return _refused(
+                    argument,
+                    f"⚠️ `{option.name}` needs a "
+                    f"{option.placeholder.strip('<>')} after it. {option.usage}",
+                )
+            parsed, refusal = option.read(value)
             if refusal is not None:
                 return _refused(argument, refusal)
-            continue
-        typo = _NEAR_FLAG_RE.fullmatch(head)
-        if typo is not None:
-            # The whole argument, unconsumed: nothing is queued, so what the run
-            # had taken so far says nothing the did-you-mean needs.
-            return PlayArgs(
-                mode=PlayMode.NORMAL,
-                query=argument.strip(),
-                dash_typo=_FLAG_STEMS[typo.group(1)],
-            )
-        break
-    return PlayArgs(mode=mode, query=rest, start_offset=start_offset)
-
-
-def _read_start_offset(value: str) -> tuple[Optional[int], Optional[str]]:
-    """`value` as seconds, or the sentence saying why it is not a time. safe_label
-    for the reason timestamp_warning uses it: the echo sits in a code span a
-    backtick would close, and the cap keeps a 2,000-char argument out of the
-    embed."""
-    if not value:
-        return None, f"⚠️ `{TIMESTAMP_FLAG}` needs a time after it. {_FLAG_USAGE}"
-    offset = parse_start_offset(value)
-    shown = safe_label(value, TIMESTAMP_ECHO_MAX)
-    if offset is None:
-        return None, (
-            f"⚠️ Couldn't read the timestamp `{shown}`. `{TIMESTAMP_FLAG}` "
-            f"takes {START_OFFSET_FORMATS}."
-        )
-    if offset >= MAX_START_OFFSET_SECS:
-        return None, (
-            f"⚠️ `{shown}` is longer than a day — `{TIMESTAMP_FLAG}` starts a "
-            f"song, not a broadcast."
-        )
-    return offset, None
+            values[option.field] = parsed
+        chosen[option.field] = option
+    mode = values.get("mode")
+    offset = values.get("start_offset")
+    return PlayArgs(
+        mode=mode if isinstance(mode, PlayMode) else PlayMode.NORMAL,
+        query=rest,
+        start_offset=offset if isinstance(offset, int) else None,
+    )
 
 
 # ── The voice gate ────────────────────────────────────────────────────────────
