@@ -18,19 +18,19 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **Multi-source playback** — YouTube URLs and playlists, plain-text YouTube search,
   Spotify tracks, albums and playlists (expanded to YouTube searches), SoundCloud links, and
   any other site yt-dlp supports (TikTok, Vimeo, Bandcamp, Twitch clips, …)
-- **Near-zero inter-song latency** — a three-phase yt-dlp pipeline resolves metadata
-  instantly at enqueue time, prefetches stream URLs in the background while the current
-  song plays, and caches them in Redis
-- **Live Now Playing card** — an embed with a live-updating progress bar that stays
-  pinned to the bottom of the channel, re-attaching itself beneath every bot response
+- **Prefetched playback** — a three-phase yt-dlp pipeline resolves metadata at enqueue
+  time, prefetches stream URLs in the background while the current song plays, and
+  caches them in Redis
+- **Live Now Playing card** — an embed with a live-updating progress bar that stays at
+  the bottom of the channel, re-attaching beneath every bot response
 - **`-play --now` interjection** — interrupt the current song with another one; the
-  interrupted song resumes afterward from the exact position it left off
+  interrupted song resumes afterward from the position it left off
 - **`-play --next` queue jump** — put a song (or a whole playlist) at the front of the
   queue without interrupting what is playing
 - **Crash recovery** — queue, current song (with playback position), volume, and
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
-- **Per-guild isolation** — every server gets its own player, queue, history, and volume
+- **Per-guild isolation** — every server has its own player, queue, history, and volume
 - **Queue management** — shuffle, clear, remove by link (one album or playlist link takes out every track it queued), per-song ETA estimates,
   persistent play history
 - **Opt-in play-history archive** — off by default, and a default deployment keeps
@@ -39,13 +39,13 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   Postgres, apply the schema, and record every play permanently
   ([details](#operating-the-play-history-archive))
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
-- **Rich `-help`** — a custom man-page-style help command with aliases, examples,
-  and per-command notes
-- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback client a
-  working fallback client when the primary client is throttled or blocked
+- **`-help` manual** — a man-page-style help command with aliases, examples, and
+  per-command notes
+- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback
+  client usable when the primary client is throttled or blocked
 - **Observability** — OpenTelemetry tracing and structured logging (structlog), with a
   bundled Grafana LGTM stack in Docker Compose
-- **Sharding-ready** — built on `AutoShardedBot`; FFmpeg streaming auto-reconnects on
+- **Sharding-ready** — built on `AutoShardedBot`; FFmpeg streaming reconnects on
   network drops
 
 ## Commands
@@ -115,7 +115,7 @@ YouTube's player hands you for a song you reached through a Mix carries
 
 A link wrapped the way Discord lets you wrap one still plays: `<link>` to hide its
 preview, a spoiler, a masked `[text](link)`, or a sentence's full stop on the end.
-Spotify album, artist and podcast links are refused with a message saying so.
+Spotify artist and podcast links are refused with a message saying so.
 
 YouTube, Spotify, and SoundCloud get first-class handling (timestamps, playlist
 expansion, Spotify→YouTube matching). Any other link is handed straight to
@@ -569,7 +569,7 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
-## Upgrading to 2.44.2
+## Upgrading to 2.45.0
 
 **Some links now play that failed, and a few route differently.** Nothing to configure and
 no data touched; rolling back is only a redeploy.

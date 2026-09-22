@@ -3353,6 +3353,12 @@ class TestSourceCacheKey:
         key = _source_cache_key("ytsearch:https://youtu.be/aBcDeFgHiJk Live")
         assert key == "ytdl:source:ytsearch:https://youtu.be/abcdefghijk live"
 
+    def test_a_link_shaped_search_still_folds(self) -> None:
+        """A slash alone does not make a link, so this stays one entry."""
+        assert _source_cache_key("AC/DC Back in Black") == _source_cache_key(
+            "ac/dc back in black"
+        )
+
 
 class TestSourceCacheRevalidation:
     """A hit older than _YT_SOURCE_FRESH_SECS is served as-is and refreshed behind

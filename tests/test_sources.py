@@ -1378,6 +1378,8 @@ class TestIsLink:
             f"HTTPS://YOUTU.BE/{_VIDEO}",
             f"spotify:track:{_TRACK}",
             "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy",
+            "www.youtube.com/watch?v=aBcDeF",
+            f"open.spotify.com/track/{_TRACK}",
         ],
     )
     def test_links(self, text: str) -> None:
@@ -1393,6 +1395,10 @@ class TestIsLink:
             f"https://youtu.be/{_VIDEO} live",
             "spotify:wrapped",
             "https://" + "a." * (LINK_MAX_CHARS // 2) + "com/",
+            # A slash in a title is not a path: both of these are real searches.
+            "AC/DC Back in Black",
+            "24/7 lofi radio",
+            "",
         ],
     )
     def test_not_links(self, text: str) -> None:
