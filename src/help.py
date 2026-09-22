@@ -59,9 +59,11 @@ SOURCES = (
     "link's `&index=` starts the queue at that position. A video link carrying "
     "`&list=` queues that whole list — a Mix (`list=RD…`) is hundreds of songs; "
     "delete the `&list=` part to queue only the video.\n"
-    "**Spotify** — track, album and playlist links. Each title is matched to "
-    "its YouTube audio, so an album or playlist may take a moment to queue.\n"
-    "**SoundCloud** — track links."
+    "**Spotify** — track, album and playlist links, or their `spotify:` URIs. "
+    "Each title is matched to its YouTube audio, so an album or playlist may "
+    "take a moment to queue. Artist and podcast links can't be played.\n"
+    "**SoundCloud** — track links.\n"
+    "A link can be wrapped in `<…>` to hide its preview."
 )
 
 _ALONE_TIMEOUT = server_spec(ConfigField.ALONE_TIMEOUT)

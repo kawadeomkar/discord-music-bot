@@ -558,8 +558,8 @@ class MusicBot(commands.Cog):
         usage="[--now|--next] <url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track, album or playlist link, a SoundCloud link, or "
-            "plain words to search YouTube with.\n\n"
+            "playlist, a Spotify track, album or playlist link or `spotify:` URI, "
+            "a SoundCloud link, or plain words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
             "Otherwise the song is appended to the queue with an estimated start time. "
             "A `?t=` / `?ts=` timestamp starts it at that offset, and a playlist link's "
