@@ -6083,3 +6083,53 @@ class TestAnInterjectedOffsetIsSettledBeforeTheInterrupt:
         assert resolve is not None and resolve.kwargs["start_offset"] == 92
         live_mp.interject.assert_awaited_once()
         music_bot._command_error.assert_not_awaited()
+
+
+class TestUnsupportedSpotifyLink:
+    """A Spotify link the bot cannot queue is refused by parse_input, which runs
+    before the cold path joins and before an interjection stops anything."""
+
+    _ARTIST = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+
+    async def test_a_cold_play_never_joins(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        music_bot.get_mp = MagicMock(return_value=mock_mp())
+        play_pipeline.queue_source = AsyncMock()
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            patch.object(music_bot._plays, "cold_join") as cold_join,
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._ARTIST)
+
+        cold_join.assert_not_called()
+        play_pipeline.queue_source.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Failed to queue song" in (embed.title or "")
+        assert embed.description == (
+            "Spotify 'artist' links aren't supported — try a track, playlist or "
+            "album link."
+        )
+
+    async def test_play_now_never_interrupts_the_song(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = mock_mp()
+        mp.current_song = MagicMock()
+        mp.interject = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.voice_client = playing_vc(mock_ctx)
+        play_pipeline.queue_source = AsyncMock()
+
+        with no_typing("src.commands.play.background_typing"):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {self._ARTIST}"
+            )
+
+        mp.interject.assert_not_awaited()
+        play_pipeline.queue_source.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Failed to play song now" in (embed.title or "")
+        assert "aren't supported" in (embed.description or "")

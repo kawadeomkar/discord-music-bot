@@ -253,7 +253,7 @@ graph TD
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
 | `youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
-| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track, playlist or album), or `SoundcloudSource`; a Spotify link of any other type, or with no id, raises `UnsupportedSpotifyLinkError`. |
+| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track, playlist or album), or `SoundcloudSource`; a Spotify link of any other type, or with no id, raises `UnsupportedSpotifyLinkError`. `is_link` is the one link-or-text verdict every other caller asks. |
 | `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `album`, `artists`, `albums` methods with per-type Redis cache TTLs. |
 | `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Its config methods: `read_config` (None when the read failed, so it stays apart from a guild that never chose), the dedicated `set_volume`/`migrate_volume` (both refuse a volume outside `CONFIG_DOMAIN`), `set_debug_mode` and `set_timezone`, the generic `update_config` (refuses those three fields and an empty config), `reset_config_fields` and `reset_volume` (both copies, one MULTI); each setter stamps `writer_app_id` when passed `writer=`. Every config reader, `get_playback_snapshot` and the batch readers included, reads a key that is not a hash as unset rather than as a failed read: no later read can change it, so a failure would be retried, and reported unreadable, for good. `BotConfigStore` is the same shape for `bot:{application_id}:config` — `read_config`, `update_config`, `reset_config_fields` — on `@_bot_op`, `_guild_op`'s sibling. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `iter_guild_configs` (pipelined, chunked, one dict per batch, which `GuildSettings.hydrate` merges before reading the next — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose"; one guild's error reply omits that guild alone, with one WARNING per batch rather than per guild), `read_config_writers` (the stamps, on the same contract), `scan_guild_config_ids` (a bounded `SCAN`, None on any failure) and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
@@ -649,25 +649,62 @@ disconnected client.
 ```mermaid
 flowchart TD
     Input["Raw input string"]
-    IsYT{"youtube.com\nor youtu.be?"}
+    Unwrap["unquote, then strip Discord's wrappers\nand trailing punctuation"]
+    IsURI{"spotify:kind:id URI?"}
+    IsLink{"one token, at most 2,048 chars,\nhttp(s) or dotted host, then /?"}
+    Host{"host, lowercased"}
     IsPL{"playlist\n(list= param)?"}
-    IsSP{"open.spotify.com\nor spotify.com?"}
-    IsSC{"soundcloud.com?"}
+    SPKind{"track or playlist,\nwith an id?"}
 
-    Input --> IsYT
-    IsYT -->|Yes| IsPL
+    Input --> Unwrap --> IsURI
+    IsURI -->|Yes| SPKind
+    IsURI -->|No| IsLink
+    IsLink -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    IsLink -->|Yes| Host
+    Host -->|"youtube.com, youtu.be"| IsPL
     IsPL -->|Yes| YTPL["YTSource(type=PLAYLIST, list_id=...)"]
     IsPL -->|"No (?t= honored)"| YTS["YTSource(url, ts?, process=False)"]
-
-    IsYT -->|No| IsSP
-    IsSP -->|track| SPS_T["SpotifySource(TRACK, id)"]
-    IsSP -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
-    IsSP -->|album| SPS_A["SpotifySource(ALBUM, id)"]
-    IsSP -->|"other type, or no id"| SPX["UnsupportedSpotifyLinkError"]
-    IsSP -->|No| IsSC
-    IsSC -->|Yes| SC["SoundcloudSource(url)"]
-    IsSC -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    Host -->|"open. / play. / spotify.com"| SPKind
+    SPKind -->|track| SPS_T["SpotifySource(TRACK, id)"]
+    SPKind -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
+    SPKind -->|album| SPS_A["SpotifySource(ALBUM, id)"]
+    SPKind -->|No| Refuse["UnsupportedSpotifyLinkError"]
+    Host -->|soundcloud.com| SC["SoundcloudSource(url)"]
+    Host -->|any other| OTHER["YTSource(url, stype=OTHER), for yt-dlp"]
 ```
+
+**The link test runs in linear time.** `re` holds the GIL for a whole match, so one slow
+match stalls discord.py's audio thread, and with it every guild. `_LINK_RE` is anchored
+(`re.match` tries one start position), and every quantified run in it stops at a literal
+its own class cannot match, so a failing match is linear too. A token longer than
+`LINK_MAX_CHARS` (2,048) is searched without being tested. The unanchored `re.search` this
+replaced measured 30 ms on a 2,048-character token with no `/` and 140 ms at 4,000, which
+one Nitro message can hold; the anchored test measures under 0.2 ms, and
+`TestLinkParsingIsLinear` bounds it at 5 ms. Wrappers come off with `str` methods for the
+same reason.
+
+What counts as a link:
+
+- **Scheme and host.** `http`, `https`, or no scheme at all, then a dotted host followed by
+  `/`. That keeps `will.i.am`, `Dr.Dre` and `98/99` searches. A token whose link does not
+  start it (`listen:https://…`, `ftp://…`, `user@host`) is a search.
+- **Wrappers.** `<link>` (Discord's embed suppression), `||link||`, `[text](link)`, a code
+  span and parentheses come off, up to three deep, along with a sentence's trailing
+  `.,!?;:`. The unwrap runs before the argument is split into words, because a masked
+  link's text can hold spaces.
+- **Case.** The host is lowercased before it is compared, and in the link handed to
+  yt-dlp too, since its extractors match hosts case-sensitively. The path keeps its case.
+- **Spotify.** The `intl-<locale>/` and `embed/` segments, `play.spotify.com`, the legacy
+  `/user/<name>/playlist/<id>` path and `spotify:` URIs all name a track or playlist. Any
+  other Spotify link raises `UnsupportedSpotifyLinkError`, whose `user_message` the command
+  renders. It is deliberately not a `ValueError`, which `parse_input` answers with a
+  search, and it is raised before `-play` joins voice or interrupts a song.
+- **Share links.** `youtube.com/attribution_link?u=<path>` is routed as the watch path it
+  carries, decoded once and only as a path on youtube.com.
+
+**One verdict.** `is_link` answers for `_source_cache_key`, whose key keeps a link's case
+because YouTube ids are case-sensitive, and for `-remove`'s fold. Neither can call a token
+a link that `-play` searched for, or the reverse.
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
@@ -2115,9 +2152,9 @@ as a backstop for any request that passes none: with no session timeout aiohttp 
 its 300 s default.
 
 **`DummyCookieJar` is load-bearing.** A default `CookieJar` would be process-wide and
-attacker-writable: `parse_url` hands any dotted domain to yt-dlp, whose generic
-extractor returns the input URL for the probe to fetch, so one `-play` reaches this
-session with a host the user chose. aiohttp applies no public-suffix check, so a
+attacker-writable: `parse_url` hands any http(s) host it does not special-case to
+yt-dlp, whose generic extractor returns the input URL for the probe to fetch, so one
+`-play` reaches this session with a host the user chose. aiohttp applies no public-suffix check, so a
 `Domain=com` cookie set by that host is replayed to `googlevideo.com` — and enough
 cookie bytes turns every probe into an HTTP 400, which maps to `DEAD`, deletes the
 cache entry and burns the one re-extraction, for every guild, until restart. Nothing

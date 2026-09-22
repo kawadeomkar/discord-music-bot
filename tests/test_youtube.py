@@ -44,7 +44,6 @@ from src.youtube import (
     _YT_PLAYLIST_TTL,
     _YT_SOURCE_FRESH_SECS,
     _YT_SOURCE_TTL,
-    _looks_like_url,
     _source_cache_key,
     _source_entry_is_stale,
     _YTDL_FLAT_SEARCH_OPTS,
@@ -3342,56 +3341,23 @@ class TestSourceCacheKey:
         assert key == "ytdl:source:https://yt.com/v=Ab"
 
     def test_a_scheme_less_link_keeps_its_case(self) -> None:
-        """A share sheet copies the host without `https://`, and parse_url leaves
-        that form in YTSource.url, which is what reaches this key."""
-        assert _source_cache_key("youtu.be/aBcDeF").endswith("youtu.be/aBcDeF")
+        """What users paste. parse_url reads it as a link, so its key must too, or
+        two ids differing only in case share an entry."""
+        upper = _source_cache_key("youtu.be/aBcDeFgHiJk")
+        assert upper == "ytdl:source:youtu.be/aBcDeFgHiJk"
+        assert upper != _source_cache_key("youtu.be/AbCdEfGhIjK")
 
-    def test_two_scheme_less_ids_differing_only_in_case_key_apart(self) -> None:
-        """The collision this predicate exists to stop: one entry for both, and the
-        second play served the first's song for the whole TTL."""
-        assert _source_cache_key("youtu.be/aBcDeFgHiJk") != _source_cache_key(
-            "youtu.be/AbCdEfGhIjK"
-        )
+    def test_a_search_holding_a_link_is_still_a_search(self) -> None:
+        """Words around a link are a search, which parse_input folds like any
+        other."""
+        key = _source_cache_key("ytsearch:https://youtu.be/aBcDeFgHiJk Live")
+        assert key == "ytdl:source:ytsearch:https://youtu.be/abcdefghijk live"
 
     def test_a_link_shaped_search_still_folds(self) -> None:
         """A slash alone does not make a link, so this stays one entry."""
         assert _source_cache_key("AC/DC Back in Black") == _source_cache_key(
             "ac/dc back in black"
         )
-
-
-class TestLooksLikeUrl:
-    """The one link-or-text verdict. The cache key branches on it (a link's is not
-    folded, and video ids are case-sensitive) and so does the revalidation."""
-
-    @pytest.mark.parametrize(
-        "token",
-        [
-            "https://www.youtube.com/watch?v=aBcDeF",
-            "youtu.be/aBcDeF",
-            "www.youtube.com/watch?v=aBcDeF",
-            "open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
-        ],
-    )
-    def test_a_link_is_one(self, token: str) -> None:
-        assert _looks_like_url(token)
-
-    @pytest.mark.parametrize(
-        "token",
-        [
-            "Destiny 2 OST",
-            "98/99",
-            "AC/DC Back in Black",
-            "24/7 lofi radio",
-            "will.i.am",
-            "ytsearch:Destiny 2",
-            "",
-        ],
-    )
-    def test_a_search_term_is_not(self, token: str) -> None:
-        """A dotless host is a search with a slash in it, a bare dotted token is an
-        artist, and a space rules a link out however the token starts."""
-        assert not _looks_like_url(token)
 
 
 class TestSourceCacheRevalidation:
@@ -3482,12 +3448,14 @@ class TestSourceCacheRevalidation:
         assert not youtube._SOURCE_REVALIDATIONS
         mock_extract.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "link", ["https://www.youtube.com/watch?v=oldOne", "youtu.be/oldOne12345"]
+    )
     async def test_a_stale_link_refreshes_nothing(
-        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, link: str
     ) -> None:
         """What ages is the ranking a SEARCH resolved through. A link's mapping is
         the link, and refreshing one would cost a full extraction to learn that."""
-        link = "https://www.youtube.com/watch?v=oldOne"
         await fake_redis.set(
             f"ytdl:source:{link}",
             orjson.dumps(

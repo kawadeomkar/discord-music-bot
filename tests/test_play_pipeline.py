@@ -350,12 +350,37 @@ class TestStartOffsetRefusals:
     def test_a_search_is_allowed(self) -> None:
         assert start_offset_refusal(parse_input("never gonna give you up")) is None
 
+    def test_a_youtu_be_link_carrying_a_list_names_its_video(self) -> None:
+        """youtu.be puts the video in the path, where `v=` never appears, so its
+        `video_id` comes from there — the offset can name the queued head exactly
+        as it does on a watch link."""
+        source = parse_url("https://youtu.be/dQw4w9WgXcQ?list=PL1")
+        assert isinstance(source, YTSource) and source.video_id == "dQw4w9WgXcQ"
+        assert start_offset_refusal(source) is None
+
+    @pytest.mark.parametrize(
+        "uri,refused",
+        [
+            ("spotify:track:4uLU6hMCjMI75M1A2tKUQC", False),
+            ("spotify:album:6WgSCcRfaXuBVfM2TpV0Kl", True),
+            ("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", True),
+        ],
+    )
+    def test_a_spotify_uri_is_judged_like_its_link(
+        self, uri: str, refused: bool
+    ) -> None:
+        """A `spotify:` URI reaches the same SpotifySource as the open.spotify.com
+        link, so one offset rule covers both spellings."""
+        assert (start_offset_refusal(parse_url(uri)) is not None) is refused
+
     def test_the_two_refusals_read_the_same_input_set(self) -> None:
         """They sit in two modules and run at two points in the flow; a source one
         refuses and the other resolves would drop the offset in silence."""
         for link in (
             "https://youtube.com/playlist?list=PL1",
             "https://youtube.com/watch?v=v&list=PL1",
+            "https://youtu.be/dQw4w9WgXcQ?list=PL1",
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
             "https://youtu.be/x",
         ):
             source = parse_url(link)

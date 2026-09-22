@@ -27,7 +27,6 @@ entries via SongQueueEntry.from_crashed_state).
 import asyncio
 import contextlib
 import random
-import re
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Iterator, Sequence
 from itertools import islice
@@ -39,7 +38,7 @@ import discord
 
 from src.guild_state import Analytics, QueueEntry, SearchQueueEntry, SongQueueEntry
 from src.redis_client import GuildRedisStore
-from src.sources import YTSource
+from src.sources import YTSource, is_link, unwrap
 from src.util import get_logger
 from src.youtube import QueueObject
 
@@ -80,15 +79,16 @@ class RemoveMode(StrEnum):
 RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
 
 
-# A scheme, or a bare dotted host that parse_url also accepts (`youtu.be/X`).
-_LOOKS_LIKE_A_LINK = re.compile(r"^(?:\w+://|[\w-]+(?:\.[\w-]+)+/)")
-
-
 def _normalize(s: str) -> str:
     """Collapse whitespace and casefold anything that is not a link. Links keep
-    their case: a casefolded Spotify base62 id would match a different playlist."""
-    s = " ".join(s.split()).strip("<>")
-    return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
+    their case: a casefolded Spotify base62 id would match a different playlist.
+    A link is unwrapped first, because -play takes one wrapped in Discord's markup
+    and the wrapper is still on the origin this matches against."""
+    s = " ".join(s.split())
+    link = unwrap(s)
+    if is_link(link):
+        return link
+    return s.strip("<>").casefold()
 
 
 def matches_origin(needle: str, origin: str) -> bool:

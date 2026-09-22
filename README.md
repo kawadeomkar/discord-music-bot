@@ -102,6 +102,7 @@ https://www.youtube.com/watch?v=ID&list=LIST_ID&index=4  # playlist from #4 on
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
 https://open.spotify.com/album/ALBUM_ID
+spotify:track:TRACK_ID                           # a Spotify URI works too
 https://soundcloud.com/artist/track
 https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported site
 never gonna give you up                          # plain text searches YouTube
@@ -111,6 +112,10 @@ A video link carrying `&list=` queues that whole list, not just the video. The l
 YouTube's player hands you for a song you reached through a Mix carries
 `&list=RD…`, and a Mix is hundreds of songs, each queued once. Delete the
 `&list=…` part to queue only the video, or `-remove` the link to take the Mix back out.
+
+A link wrapped the way Discord lets you wrap one still plays: `<link>` to hide its
+preview, a spoiler, a masked `[text](link)`, or a sentence's full stop on the end.
+Spotify artist and podcast links are refused with a message saying so.
 
 YouTube, Spotify, and SoundCloud get first-class handling (timestamps, playlist
 expansion, Spotify→YouTube matching). Any other link is handed straight to
@@ -564,6 +569,34 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.45.0
+
+**Some links now play that failed, and a few route differently.** Nothing to configure and
+no data touched; rolling back is only a redeploy.
+
+- **Now plays:** a link in `<…>`, `||…||`, a masked `[text](link)`, a code span or
+  parentheses, or with a full stop or comma on the end. Spotify URIs (`spotify:track:…`),
+  localized and embed Spotify links (`/intl-de/track/…`, `/embed/track/…`),
+  `play.spotify.com`, and the old `/user/<name>/playlist/…` path. A YouTube share link
+  (`attribution_link?u=…`) plays what it points at.
+- **Routes like the lowercase link:** a link with any uppercase in its host
+  (`WWW.YOUTUBE.COM/…`, `YOUTU.BE/…`). A `watch?v=…&list=…` spelled that way now queues
+  the playlist, like its lowercase twin, instead of one song.
+- **Starts at its timestamp:** `youtu.be/<video>?list=…&t=30`, when the video is the
+  playlist's first queued track.
+- **Refused with a message:** Spotify artist, show and episode links, and any other
+  Spotify link that names nothing playable. These used to fail with an internal error.
+- **Now a search:** a token whose link does not start it, such as `ftp://…`,
+  `//host/…`, `user@host/…` or `listen:https://…`. yt-dlp failed all of these before.
+
+In the archive, `query_source` moves for two of these: `YOUTU.BE/…` records
+`youtube.com`, and `play.spotify.com` records `spotify.com`. A scheme-less link
+(`youtu.be/…`) gets its own source-cache entry on its first play after the upgrade,
+since its key no longer folds case.
+
+A single long word in `-play` used to stall audio in every guild for up to a few hundred
+milliseconds; the link test now runs in linear time.
+
 ## Upgrading to 2.44.0
 
 **A queued album or playlist is listed the way `-queue` lists songs.** The "Queued album"
@@ -637,7 +670,6 @@ check, so a value above the container HEALTHCHECK's 90s staleness window made a 
 bot report unhealthy between touches, and `0` turned the touch loop into a spin. Either
 now stops the bot at startup, naming the variable, instead of starting. If yours is unset
 or inside that range, nothing changes. Rolling back is only a redeploy.
-
 ## Upgrading to 2.37.0
 
 **A Spotify playlist over 100 tracks now queues in full.** Only the first page was ever

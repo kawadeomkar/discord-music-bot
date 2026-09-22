@@ -253,7 +253,6 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 | `.claude/rules/ci-and-build.md` | the CI job graph, the image build and deploy, and every duplicated version pin — enforced and unenforced |
 | `.claude/rules/testing.md` | the test layout, the yt-dlp and Discord seams, fakeredis's divergences, the `pg` and `redis` tiers |
 | `.claude/rules/commands.md` | command registration, the one-module-per-command rule and the help copy each command carries |
-
 ### Observability
 
 structlog JSON to stdout always; OTLP gRPC traces and logs when `OTEL_SDK_DISABLED`

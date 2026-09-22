@@ -1,11 +1,16 @@
 """Tests for src/sources.py — URL parsing and source type detection."""
 
 import re
+import time
+from collections.abc import Callable
+from typing import NamedTuple, Optional
 
 import pytest
 
 from src.guild_state import Analytics
 from src.sources import (
+    LINK_MAX_CHARS,
+    is_link,
     unquote_argument,
     MAX_START_OFFSET_SECS,
     QUERY_SOURCE_SEARCH,
@@ -31,6 +36,7 @@ from src.sources import (
     timestamp_warning,
 )
 from src.spotify import SpotifyTrack
+from src.youtube import _source_cache_key
 
 
 class TestParseUrlYouTube:
@@ -358,7 +364,6 @@ class TestParseUrlSpotify:
     @pytest.mark.parametrize(
         "url",
         [
-            "https://open.spotify.com/album/ID#frag",
             "https://open.spotify.com/album/ID&x=1",
             "https://open.spotify.com/album/../../v1/me",
             "https://open.spotify.com/album/ID>",
@@ -368,6 +373,16 @@ class TestParseUrlSpotify:
         """The id goes into the API path, the cache key and the card's link."""
         with pytest.raises(UnsupportedSpotifyLinkError, match="doesn't look right"):
             parse_url(url)
+
+    def test_a_fragment_is_split_off_rather_than_refused(self) -> None:
+        """`#frag` is not part of the id and never reaches it, so the link plays
+        instead of being turned away for an id that only looked wrong."""
+        source = parse_url("https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl#x")
+        assert isinstance(source, SpotifySource)
+        assert (source.type, source.id) == (
+            SpotifyType.ALBUM,
+            "6WgSCcRfaXuBVfM2TpV0Kl",
+        )
 
     def test_a_link_with_its_embed_suppressed_parses_like_the_bare_one(self) -> None:
         source = parse_input("<https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl>")
@@ -384,6 +399,71 @@ class TestParseUrlSpotify:
     def test_parse_input_does_not_search_youtube_for_an_unsupported_link(self) -> None:
         with pytest.raises(UnsupportedSpotifyLinkError):
             parse_input("https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "track/4cOdK2wGLETKBW3PvgPWqT",
+            "intl-de/track/4cOdK2wGLETKBW3PvgPWqT",
+            "intl-pt-br/track/4cOdK2wGLETKBW3PvgPWqT",
+            "embed/track/4cOdK2wGLETKBW3PvgPWqT",
+            "intl-ja/embed/track/4cOdK2wGLETKBW3PvgPWqT/",
+        ],
+    )
+    def test_locale_and_embed_segments_name_the_same_track(self, path: str) -> None:
+        """Localized clients prefix `intl-<locale>`, and the embed player `embed/`.
+        Real locales answer 200 on that path, so it is what users paste."""
+        result = parse_url(f"https://open.spotify.com/{path}")
+        assert result == SpotifySource(SpotifyType.TRACK, "4cOdK2wGLETKBW3PvgPWqT")
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            "https://play.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+            "https://open.spotify.com/user/spotify/playlist/37i9dQZF1DXcBWIGoYBM5M",
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+            "spotify:user:spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+        ],
+    )
+    def test_legacy_hosts_paths_and_uris_name_the_same_playlist(
+        self, link: str
+    ) -> None:
+        result = parse_input(link)
+        assert result == SpotifySource(SpotifyType.PLAYLIST, "37i9dQZF1DXcBWIGoYBM5M")
+
+    def test_a_uri_that_is_not_a_spotify_item_stays_a_search(self) -> None:
+        """Only the exact URI shape is Spotify's; anything else spelled with the
+        prefix is words."""
+        assert parse_input("spotify:wrapped").stype is URLSource.SEARCH
+
+
+class TestSpotifyRefusal:
+    """A Spotify link the bot cannot queue fails the command with a sentence, in
+    parse_input, before any join or interruption (tests/commands/test_play.py)."""
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            "https://open.spotify.com/user/someone",
+            "https://open.spotify.com/",
+            "https://open.spotify.com/socialsession/abc?feature=campfire_invite",
+        ],
+    )
+    def test_anything_else_on_the_host_is_refused(self, link: str) -> None:
+        """A profile or a Jam invite. A ValueError here would search YouTube for
+        the link's text."""
+        with pytest.raises(
+            UnsupportedSpotifyLinkError, match="aren't supported|doesn't point at"
+        ):
+            parse_input(link)
+
+    def test_a_track_link_cut_off_before_its_id_says_so(self) -> None:
+        with pytest.raises(UnsupportedSpotifyLinkError, match="has no id"):
+            parse_input("https://open.spotify.com/track/")
+
+    def test_it_is_not_a_value_error(self) -> None:
+        """parse_input's search fallback catches ValueError."""
+        assert not issubclass(UnsupportedSpotifyLinkError, ValueError)
 
 
 class TestParseUrlSoundcloud:
@@ -835,18 +915,15 @@ class TestParseStartOffset:
         assert parse_timestamp("1:32") is None
 
 
-class TestDomainRegex:
+class TestLinkHost:
     def test_plus_and_pipe_are_not_hostname_characters(self) -> None:
-        """The old character class `[\\w+|\\.]+` treated `+` and `|` as literals,
-        so this parsed as a real host instead of falling back to search."""
         result = parse_input("you+tube|com/watch")
         assert isinstance(result, YTSource)
         assert result.ytsearch == "ytsearch:you+tube|com/watch"
 
     def test_hyphenated_hosts_are_not_truncated(self) -> None:
-        """`-` has to be in the class: re.search otherwise starts matching after
-        the hyphen, so "my-site.com" parses as the host "site.com" and the
-        archive records a query_source for a domain nobody linked."""
+        """`-` has to be in the host's class, or "my-site.com" is not a link and
+        the archive loses the host the user linked."""
         result = parse_url("https://my-site.com/watch?v=x")
         assert query_source_of(result) == "my-site.com"
 
@@ -863,9 +940,9 @@ class TestNormalizeQueryHost:
             ("xn--80ak6aa92e.com", "xn--80ak6aa92e.com"),
             ("192.168.1.10", "192.168.1.10"),
             # `_` is in `\w`, so bad_host.com really does reach the normalizer —
-            # it filters, it does not merely format. `|` and `+` no longer can:
-            # parse_url's domain group is `[\w.]+` and they fall through to
-            # search (TestDomainRegex). Kept as direct coverage of the filter.
+            # it filters, it does not merely format. `|` and `+` cannot: the
+            # link test sends them to search (TestLinkHost). Kept as direct
+            # coverage of the filter.
             ("bad_host.com", ""),
             ("bad|host.com", ""),
             ("bad+host.com", ""),
@@ -941,14 +1018,13 @@ class TestQuerySource:
         )
         assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
 
-    def test_uppercase_www_youtube_still_reports_youtube(self) -> None:
-        """parse_url's `www\\.` group is case-sensitive, so this misses the
-        YouTube branch and lands on the generic one — the normalizer still names
-        the service correctly."""
-        url = "https://WWW.youtube.com/watch?v=dQw4w9WgXcQ"
-        result = parse_url(url)
+    def test_an_uppercase_host_routes_like_the_lowercase_one(self) -> None:
+        """Hosts are case-insensitive, and yt-dlp's extractors are not: the link
+        handed on has its host lowercased and keeps its path's case."""
+        result = parse_url("https://WWW.YouTube.com/watch?v=dQw4w9WgXcQ")
         assert isinstance(result, YTSource)
-        assert result.stype == URLSource.OTHER
+        assert result.stype is URLSource.YOUTUBE
+        assert result.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         assert query_source_of(result) == QUERY_SOURCE_YOUTUBE
 
     def test_unstamped_ytsource_is_unknown(self) -> None:
@@ -1063,3 +1139,414 @@ class TestStartOffsetFormats:
 
     def test_the_bound_is_longer_than_any_song(self) -> None:
         assert MAX_START_OFFSET_SECS == 24 * 3600
+
+
+_VIDEO = "dQw4w9WgXcQ"
+_LIST = "PLwP_SiAcdui0KVebT0mU9Apz359a4ubsC"
+_TRACK = "4uLU6hMCjMI75M1A2tKUQC"
+_PLAYLIST = "37i9dQZF1DXcBWIGoYBM5M"
+
+
+class Route(NamedTuple):
+    """Where parse_input sends one input: the branch, the source's kind, what is
+    handed on (a link, a `ytsearch:` term, or a Spotify id), the archive's
+    query_source, and the ytdl:source key its resolve reads."""
+
+    branch: URLSource
+    kind: str
+    target: str
+    query_source: str
+    cache_key: Optional[str]
+
+
+def _route(text: str) -> Route:
+    source = parse_input(text)
+    if isinstance(source, SpotifySource):
+        return Route(
+            source.stype, source.type.value, source.id, QUERY_SOURCE_SPOTIFY, None
+        )
+    if isinstance(source, SoundcloudSource):
+        return Route(
+            source.stype,
+            "track",
+            source.url,
+            QUERY_SOURCE_SOUNDCLOUD,
+            _source_cache_key(source.url),
+        )
+    target = source.ytsearch or source.url or ""
+    return Route(
+        source.stype,
+        source.type.value,
+        target,
+        source.query_source,
+        _source_cache_key(target),
+    )
+
+
+def _youtube(link: str, kind: str = "track") -> Route:
+    return Route(
+        URLSource.YOUTUBE, kind, link, QUERY_SOURCE_YOUTUBE, f"ytdl:source:{link}"
+    )
+
+
+def _other(link: str, host: str) -> Route:
+    return Route(URLSource.OTHER, "track", link, host, f"ytdl:source:{link}")
+
+
+def _search(text: str) -> Route:
+    return Route(
+        URLSource.SEARCH,
+        "track",
+        f"ytsearch:{text}",
+        QUERY_SOURCE_SEARCH,
+        f"ytdl:source:ytsearch:{text.lower()}",
+    )
+
+
+def _spotify(kind: SpotifyType, spotify_id: str) -> Route:
+    return Route(URLSource.SPOTIFY, kind.value, spotify_id, QUERY_SOURCE_SPOTIFY, None)
+
+
+class TestRoutingUnchanged:
+    """Inputs the linear parser routes exactly as the unanchored `re.search` it
+    replaced did: branch, what is handed on, query_source and cache key.
+    query_source is archived, so a row moving here shifts -analytics' buckets."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            (
+                f"https://www.youtube.com/watch?v={_VIDEO}",
+                _youtube(f"https://www.youtube.com/watch?v={_VIDEO}"),
+            ),
+            (
+                f"http://youtube.com/watch?v={_VIDEO}&t=30",
+                _youtube(f"http://youtube.com/watch?v={_VIDEO}&t=30"),
+            ),
+            (
+                f"https://youtu.be/{_VIDEO}?si=abc",
+                _youtube(f"https://youtu.be/{_VIDEO}?si=abc"),
+            ),
+            (
+                f"https://www.youtube.com/playlist?list={_LIST}",
+                _youtube(f"https://www.youtube.com/playlist?list={_LIST}", "playlist"),
+            ),
+            (
+                f"https://www.youtube.com/watch?v={_VIDEO}&list={_LIST}&index=4",
+                _youtube(
+                    f"https://www.youtube.com/watch?v={_VIDEO}&list={_LIST}&index=4",
+                    "playlist",
+                ),
+            ),
+            (
+                f"https://www.youtube.com/shorts/{_VIDEO}",
+                _youtube(f"https://www.youtube.com/shorts/{_VIDEO}"),
+            ),
+            # Hosts that are not special-cased queue one song, list= or not.
+            (
+                f"https://m.youtube.com/watch?v={_VIDEO}",
+                _other(f"https://m.youtube.com/watch?v={_VIDEO}", "m.youtube.com"),
+            ),
+            (
+                f"https://music.youtube.com/watch?v={_VIDEO}&list=RDAMVM{_VIDEO}",
+                _other(
+                    f"https://music.youtube.com/watch?v={_VIDEO}&list=RDAMVM{_VIDEO}",
+                    "music.youtube.com",
+                ),
+            ),
+            (
+                f"https://www.youtube-nocookie.com/embed/{_VIDEO}",
+                _other(
+                    f"https://www.youtube-nocookie.com/embed/{_VIDEO}",
+                    "youtube-nocookie.com",
+                ),
+            ),
+            (
+                f"https://open.spotify.com/track/{_TRACK}?si=1",
+                _spotify(SpotifyType.TRACK, _TRACK),
+            ),
+            (
+                f"https://spotify.com/playlist/{_PLAYLIST}",
+                _spotify(SpotifyType.PLAYLIST, _PLAYLIST),
+            ),
+            (
+                "https://soundcloud.com/artist/track?si=x",
+                Route(
+                    URLSource.SOUNDCLOUD,
+                    "track",
+                    "https://soundcloud.com/artist/track?si=x",
+                    QUERY_SOURCE_SOUNDCLOUD,
+                    "ytdl:source:https://soundcloud.com/artist/track?si=x",
+                ),
+            ),
+            (
+                "https://m.soundcloud.com/artist/track",
+                _other("https://m.soundcloud.com/artist/track", "m.soundcloud.com"),
+            ),
+            (
+                "https://on.soundcloud.com/AbCdE",
+                _other("https://on.soundcloud.com/AbCdE", "on.soundcloud.com"),
+            ),
+            (
+                "https://spotify.link/AbCdEfGhIjK",
+                _other("https://spotify.link/AbCdEfGhIjK", "spotify.link"),
+            ),
+            (
+                "https://vimeo.com/76979871",
+                _other("https://vimeo.com/76979871", "vimeo.com"),
+            ),
+            (
+                "https://my-site.com/a/b",
+                _other("https://my-site.com/a/b", "my-site.com"),
+            ),
+            (
+                "https://artist.bandcamp.com/track/x",
+                _other("https://artist.bandcamp.com/track/x", "artist.bandcamp.com"),
+            ),
+            # A dotted name followed by `/` is a link, however unlikely.
+            ("hello.world/", _other("hello.world/", "hello.world")),
+            ("hello_world", _search("hello_world")),
+            ("98/99", _search("98/99")),
+            ("will.i.am", _search("will.i.am")),
+            ("Dr.Dre", _search("Dr.Dre")),
+            ("M.I.A.", _search("M.I.A.")),
+            ("AC/DC", _search("AC/DC")),
+            ("never gonna give you up", _search("never gonna give you up")),
+            # No `/` after the host, or a port before it: not a link.
+            ("https://youtube.com", _search("https://youtube.com")),
+            ("https://example.com:8080/x", _search("https://example.com:8080/x")),
+        ],
+    )
+    def test_route(self, text: str, expected: Route) -> None:
+        assert _route(text) == expected
+
+
+class TestRoutingChanged:
+    """Every input the linear parser routes differently from the search it
+    replaced. The README's upgrade note for this release lists the same rows."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            # Any uppercase in the host: once OTHER, one song, a folded key.
+            (
+                f"https://WWW.YOUTUBE.COM/watch?v={_VIDEO}&list={_LIST}",
+                _youtube(
+                    f"https://www.youtube.com/watch?v={_VIDEO}&list={_LIST}", "playlist"
+                ),
+            ),
+            (f"YOUTU.BE/{_VIDEO}", _youtube(f"youtu.be/{_VIDEO}")),
+            (
+                "https://SoundCloud.com/artist/track",
+                Route(
+                    URLSource.SOUNDCLOUD,
+                    "track",
+                    "https://soundcloud.com/artist/track",
+                    QUERY_SOURCE_SOUNDCLOUD,
+                    "ytdl:source:https://soundcloud.com/artist/track",
+                ),
+            ),
+            # A scheme-less link: once case-folded into its cache key.
+            (
+                f"youtube.com/watch?v={_VIDEO}",
+                _youtube(f"youtube.com/watch?v={_VIDEO}"),
+            ),
+            # Discord's wrappers: once handed to yt-dlp with the markup on.
+            (f"<https://youtu.be/{_VIDEO}>", _youtube(f"https://youtu.be/{_VIDEO}")),
+            (f"||https://youtu.be/{_VIDEO}||", _youtube(f"https://youtu.be/{_VIDEO}")),
+            (f"`https://youtu.be/{_VIDEO}`", _youtube(f"https://youtu.be/{_VIDEO}")),
+            (f"(https://youtu.be/{_VIDEO})", _youtube(f"https://youtu.be/{_VIDEO}")),
+            (f"https://youtu.be/{_VIDEO}.", _youtube(f"https://youtu.be/{_VIDEO}")),
+            # A masked link's text holds spaces: once a search for the markdown.
+            (
+                f"[the song](<https://youtu.be/{_VIDEO}>)",
+                _youtube(f"https://youtu.be/{_VIDEO}"),
+            ),
+            # Spotify shapes: once a search for the URI, a bare Exception, or OTHER.
+            (f"spotify:track:{_TRACK}", _spotify(SpotifyType.TRACK, _TRACK)),
+            (
+                f"https://open.spotify.com/intl-de/track/{_TRACK}",
+                _spotify(SpotifyType.TRACK, _TRACK),
+            ),
+            (
+                f"https://play.spotify.com/track/{_TRACK}",
+                _spotify(SpotifyType.TRACK, _TRACK),
+            ),
+            # A share link: once one song, now the watch link it carries.
+            (
+                f"https://www.youtube.com/attribution_link?u=%2Fwatch%3Fv%3D{_VIDEO}%26list%3D{_LIST}",
+                _youtube(
+                    f"https://www.youtube.com/watch?v={_VIDEO}&list={_LIST}", "playlist"
+                ),
+            ),
+            # A link that does not start the token: once handed to yt-dlp, which
+            # fails every one of these.
+            ("ftp://example.com/x", _search("ftp://example.com/x")),
+            (
+                f"//youtube.com/watch?v={_VIDEO}",
+                _search(f"//youtube.com/watch?v={_VIDEO}"),
+            ),
+            ("https://user@example.com/x", _search("https://user@example.com/x")),
+            (
+                f"listen:https://youtu.be/{_VIDEO}",
+                _search(f"listen:https://youtu.be/{_VIDEO}"),
+            ),
+            # A search holding a link: once kept its case in the cache key.
+            (
+                f"https://youtu.be/{_VIDEO} live",
+                _search(f"https://youtu.be/{_VIDEO} live"),
+            ),
+        ],
+    )
+    def test_route(self, text: str, expected: Route) -> None:
+        assert _route(text) == expected
+
+    def test_youtu_be_names_the_video_a_playlist_timestamp_belongs_to(self) -> None:
+        """`v=` never appears on youtu.be, so without the path its `t=` could
+        never be applied to the playlist's first track."""
+        result = parse_input(f"youtu.be/{_VIDEO}?list={_LIST}&t=30")
+        assert isinstance(result, YTSource)
+        assert (result.video_id, result.ts) == (_VIDEO, 30)
+
+
+class TestAttributionLink:
+    def test_the_inner_link_is_decoded_once(self) -> None:
+        """An inner share link is routed as the youtube.com link it is, and never
+        decoded again: nesting cannot buy another pass."""
+        inner = "%2Fattribution_link%3Fu%3D%252Fwatch%253Fv%253DdQw4w9WgXcQ%2526list%253DPLx"
+        result = parse_input(f"https://www.youtube.com/attribution_link?u={inner}")
+        assert isinstance(result, YTSource)
+        assert result.type is YTType.TRACK
+        assert result.url == (
+            "https://www.youtube.com/attribution_link?u=%2Fwatch%3Fv%3DdQw4w9WgXcQ%26list%3DPLx"
+        )
+
+    def test_an_absolute_inner_link_is_not_followed(self) -> None:
+        """Only a path on youtube.com: a `u` naming another host stays the share
+        link it arrived as."""
+        link = (
+            "https://www.youtube.com/attribution_link?u=https%3A%2F%2Fexample.com%2Fx"
+        )
+        assert _route(link) == _youtube(link)
+
+    def test_a_protocol_relative_inner_link_is_not_followed(self) -> None:
+        """`//host/x` starts with `/` but names a HOST, not the path this share
+        link stands for, so it stays the link it arrived as."""
+        link = "https://www.youtube.com/attribution_link?u=%2F%2Fexample.com%2Fx"
+        assert _route(link) == _youtube(link)
+
+
+class TestDiscordWrappers:
+    @pytest.mark.parametrize(
+        "wrapped",
+        [
+            f"<https://youtu.be/{_VIDEO}>",
+            f"||<https://youtu.be/{_VIDEO}>||",
+            f"[a song with spaces](https://youtu.be/{_VIDEO})",
+            f"<https://youtu.be/{_VIDEO}>.",
+            f"https://youtu.be/{_VIDEO}!",
+            f'"<https://youtu.be/{_VIDEO}>"',
+        ],
+    )
+    def test_the_link_inside_is_what_is_handed_on(self, wrapped: str) -> None:
+        result = parse_input(wrapped)
+        assert isinstance(result, YTSource)
+        assert result.url == f"https://youtu.be/{_VIDEO}"
+
+    @pytest.mark.parametrize(
+        "text", ["<never gonna give you up>", "beethoven!", "[remix](lyrics)"]
+    )
+    def test_wrapped_words_are_searched_as_typed(self, text: str) -> None:
+        assert parse_input(text) == YTSource(
+            ytsearch=f"ytsearch:{text}",
+            process=True,
+            stype=URLSource.SEARCH,
+            query_source=QUERY_SOURCE_SEARCH,
+        )
+
+
+class TestIsLink:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            f"https://youtu.be/{_VIDEO}",
+            f"youtu.be/{_VIDEO}",
+            f"HTTPS://YOUTU.BE/{_VIDEO}",
+            f"spotify:track:{_TRACK}",
+            "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy",
+            "www.youtube.com/watch?v=aBcDeF",
+            f"open.spotify.com/track/{_TRACK}",
+        ],
+    )
+    def test_links(self, text: str) -> None:
+        assert is_link(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "hello_world",
+            "will.i.am",
+            "98/99",
+            "ytsearch:never gonna give you up",
+            f"https://youtu.be/{_VIDEO} live",
+            "spotify:wrapped",
+            "https://" + "a." * (LINK_MAX_CHARS // 2) + "com/",
+            # A slash in a title is not a path: both of these are real searches.
+            "AC/DC Back in Black",
+            "24/7 lofi radio",
+            "",
+        ],
+    )
+    def test_not_links(self, text: str) -> None:
+        assert not is_link(text)
+
+
+def _fastest_of_three(fn: Callable[[str], object], token: str) -> float:
+    """Seconds for the fastest of three calls, so a scheduler stall on a loaded
+    runner does not read as the parser's cost."""
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        try:
+            fn(token)
+        except ValueError:
+            pass
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+class TestLinkParsingIsLinear:
+    """`re` holds the GIL for a whole match, so a slow one stalls discord.py's
+    audio thread in every guild. An unanchored search over a long token with no
+    `/` measured 30ms at 2,048 characters and 140ms at 4,000; the anchored test
+    measures under 0.2ms. Tokens at the link cap reach the regex; the longer ones
+    must not."""
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "a" * LINK_MAX_CHARS,
+            "www." * (LINK_MAX_CHARS // 4),
+            "a." * (LINK_MAX_CHARS // 2),
+            "-" * LINK_MAX_CHARS,
+            "https://" + "a." * ((LINK_MAX_CHARS - 8) // 2),
+            "a" * 3990,
+            "www." * 997,
+            "a." * 1995,
+            "-" * 3990,
+            "spotify:user:" + "a" * 3977,
+            "<" * 1995 + ">" * 1995,
+        ],
+        ids=lambda token: f"{token[:8]}…x{len(token)}",
+    )
+    @pytest.mark.parametrize(
+        "fn", [parse_input, parse_url, is_link], ids=lambda fn: fn.__name__
+    )
+    def test_an_adversarial_token_parses_in_under_5ms(
+        self, token: str, fn: Callable[[str], object]
+    ) -> None:
+        assert _fastest_of_three(fn, token) < 0.005
+
+    def test_a_token_past_the_cap_is_searched(self) -> None:
+        link = f"https://www.youtube.com/watch?v={_VIDEO}&x={'a' * LINK_MAX_CHARS}"
+        assert parse_input(link).stype is URLSource.SEARCH

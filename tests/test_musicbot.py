@@ -94,6 +94,22 @@ class TestCommandErrorRendering:
         assert detail == err.user_message
         assert "SpotifyPlaylistTooSlowError" not in detail
 
+    async def test_an_unsupported_spotify_link_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.sources import UnsupportedSpotifyLinkError
+
+        err = UnsupportedSpotifyLinkError("album")
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        assert call.args[2] == err.user_message
+        assert "UnsupportedSpotifyLinkError" not in call.args[2]
+
     async def test_a_stalled_spotify_page_renders_the_other_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

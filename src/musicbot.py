@@ -558,13 +558,13 @@ class MusicBot(commands.Cog):
         usage="[--now|--next] <url|search>",
         help=(
             "Queues a song and starts playback. Takes a YouTube, Spotify or "
-            "SoundCloud link — track, playlist or album — or plain words to "
-            "search YouTube with.\n\n"
-            "Not connected? It joins your channel first; otherwise the song is appended "
+            "SoundCloud link \u2014 track, playlist or album, or a `spotify:` URI \u2014 "
+            "or plain words to search YouTube with.\n\n"
+            "Not connected? It joins your channel first; otherwise it's appended "
             "with an estimated start time. A link's `?t=` starts it at that "
             "offset, and a playlist link's `&index=` from that position rather than "
             "the first track.\n\n"
-            "Options, before the song, in any order:\n\n"
+            "Options, before the song, any order:\n\n"
             "`--now` plays it immediately. The interrupted song returns from where it "
             "left off, paused if it was paused, unless it was nearly over. Interrupt "
             "again and the parked songs unwind most recent first.\n\n"
@@ -574,7 +574,7 @@ class MusicBot(commands.Cog):
             "\n\n"
             "`--timestamp 1:32` (or `-ts`) starts the song partway in, whatever the "
             "link, and beats its `?t=`. Also takes `2:04:30`, `90`, `90s`, "
-            "`2h30m15s`. Past the end of the song, nothing is queued."
+            "`2h30m15s`. Past the end, nothing is queued."
         ),
         extras={
             "category": "Playback",
