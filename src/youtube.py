@@ -633,7 +633,13 @@ def _looks_like_url(query: str) -> bool:
     predicate, because two places branch on it and they must agree: the cache key
     (a link's is not case-folded) and the revalidation (a link's mapping cannot
     drift)."""
-    return "://" in query.strip()
+    token = query.strip()
+    if "://" in token:
+        return True
+    # A share sheet copies "youtu.be/aBcD" with no scheme, and folding that keys
+    # two case-sensitive video ids to one entry.
+    host, slash, _ = token.partition("/")
+    return bool(slash) and "." in host and " " not in token
 
 
 def _source_cache_key(search: str) -> str:
