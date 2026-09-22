@@ -230,32 +230,26 @@ def past_end_refusal(
     None or 0 rules nothing out (livestreams report both), so an offset that
     cannot be checked stands and ffmpeg judges it.
 
-    A collection is measured against the track the offset actually landed on —
-    _apply_playlist_timestamp's `v=` head — and not at all when it landed on
+    A collection is measured against the track the offset landed on — the `v=`
+    head _apply_playlist_timestamp stamped — and not at all when it landed on
     none, so the interjection and the ordinary placement answer one link alike."""
     if start_offset is None:
         return None
-    head = _offset_head(qobj, start_offset)
-    if head is None or not head.duration or start_offset < head.duration:
+    if isinstance(qobj, QueueObject):
+        head = qobj
+    elif isinstance(qobj, ResolvedYoutubePlaylist) and qobj.tracks:
+        head = qobj.tracks[0]
+        if head.ts != start_offset:
+            return None
+    else:
+        return None
+    if not head.duration or start_offset < head.duration:
         return None
     return (
         f"⚠️ `{fmt_duration(start_offset)}` is past the end of "
         f"**{safe_label(head.title, ECHO_ROW_MAX)}** "
         f"(`{fmt_duration(head.duration)}`) — nothing was queued."
     )
-
-
-def _offset_head(
-    qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
-    start_offset: int,
-) -> Optional[QueueObject]:
-    """The track a `--timestamp` was applied to, or None if it reached none."""
-    if isinstance(qobj, QueueObject):
-        return qobj
-    if isinstance(qobj, ResolvedYoutubePlaylist) and qobj.tracks:
-        head = qobj.tracks[0]
-        return head if head.ts == start_offset else None
-    return None
 
 
 def plays_after_note(
@@ -1076,7 +1070,10 @@ async def interject_flow(
                 mp,
                 req,
                 note=note,
-                warning=timestamp_warning(source, overridden=start_offset is not None),
+                # None when the flag set the offset — see the -play call site.
+                warning=(
+                    None if start_offset is not None else timestamp_warning(source)
+                ),
                 follow_on=follow_on,
                 cog=cog,
             )

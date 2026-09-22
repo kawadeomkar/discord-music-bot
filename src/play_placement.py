@@ -118,27 +118,14 @@ class _PlayOption:
 
     An option either stands for a `constant` or carries a value `read` parses,
     never both: `read` is what decides whether the next token is consumed.
-    kw_only, because `name` and `placeholder` are adjacent strings that both
-    reach a user."""
+    kw_only, because `name` and the spellings are adjacent and one reaches a
+    user."""
 
     name: str
     spellings: tuple[str, ...]
     field: PlayOptionField
-    # How a usage line renders the value, or "" for an option that takes none.
-    placeholder: str = ""
-    # A value the usage hint shows in place of the placeholder.
-    sample: str = ""
     constant: Optional[OptionValue] = None
     read: Optional[ValueReader] = None
-
-    @property
-    def usage(self) -> str:
-        """How to write this option, for the messages that have to show it.
-        Spelled without a command name: -play, -playnow and -playnext all render
-        these, and the alias the user typed is not in scope here."""
-        return (
-            f"Usage: `{' '.join(filter(None, (self.name, self.sample)))} <url|search>`."
-        )
 
 
 def _read_start_offset(value: str) -> tuple[Optional[OptionValue], Optional[str]]:
@@ -146,6 +133,11 @@ def _read_start_offset(value: str) -> tuple[Optional[OptionValue], Optional[str]
     for the reason timestamp_warning uses it: the echo sits in a code span a
     backtick would close, and the cap keeps a 2,000-char argument out of the
     embed."""
+    if not value:
+        return None, (
+            f"⚠️ `{TIMESTAMP_FLAG}` needs a time after it, one of "
+            f"{START_OFFSET_FORMATS}."
+        )
     offset = parse_start_offset(value)
     shown = safe_label(value, TIMESTAMP_ECHO_MAX)
     if offset is None:
@@ -174,8 +166,6 @@ _PLAY_OPTIONS: Final[tuple[_PlayOption, ...]] = (
         name=TIMESTAMP_FLAG,
         spellings=(TIMESTAMP_FLAG, "--ts", "-ts"),
         field="start_offset",
-        placeholder="<time>",
-        sample="1:32",
         read=_read_start_offset,
     ),
 )
@@ -194,21 +184,6 @@ _OPTION_STEMS: Final[dict[str, _PlayOption]] = {
 _NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
     f"[{DASHES}]{{1,2}}({'|'.join(sorted(_OPTION_STEMS, key=len, reverse=True))})"
 )
-
-
-def play_usage(*, command: str = "play") -> str:
-    """`-play`'s options as a usage line, rendered from the registry so a new one
-    documents itself. Alternatives over one field are joined with `|`."""
-    groups: dict[PlayOptionField, list[_PlayOption]] = {}
-    for option in _PLAY_OPTIONS:
-        groups.setdefault(option.field, []).append(option)
-    parts = []
-    for options in groups.values():
-        spelled = "|".join(
-            f"{option.name} {option.placeholder}".strip() for option in options
-        )
-        parts.append(f"[{spelled}]")
-    return f"{command} {' '.join(parts)} <url|search>"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -242,7 +217,7 @@ def _already_set(prior: _PlayOption, option: _PlayOption) -> str:
     if prior is option:
         return f"⚠️ `{option.name}` was given twice."
     names = [f"`{o.name}`" for o in _PLAY_OPTIONS if o.field == option.field]
-    return f"⚠️ Only one of {', '.join(names[:-1])} or {names[-1]} at a time."
+    return f"⚠️ Only one of {' or '.join(names)} at a time."
 
 
 def split_play_args(argument: str) -> PlayArgs:
@@ -272,9 +247,7 @@ def split_play_args(argument: str) -> PlayArgs:
         parts = rest.split(maxsplit=1)
         head = parts[0].lower()
         tail = parts[1] if len(parts) > 1 else ""
-        # `--ts=1:32` is one token, so the name is what precedes the first `=`.
-        name, sep, inline = head.partition("=")
-        option = _OPTIONS.get(name)
+        option = _OPTIONS.get(head)
         if option is None:
             typo = _NEAR_FLAG_RE.fullmatch(head)
             if typo is None:
@@ -290,25 +263,12 @@ def split_play_args(argument: str) -> PlayArgs:
         if prior is not None:
             return _refused(argument, _already_set(prior, option))
         if option.read is None:
-            if sep:
-                return _refused(
-                    argument,
-                    f"⚠️ `{option.name}` doesn't take a value. {option.usage}",
-                )
             values[option.field], rest = option.constant, tail
         else:
-            if sep and inline:
-                value, rest = inline, tail
-            else:
-                value_parts = tail.split(maxsplit=1)
-                value = value_parts[0] if value_parts else ""
-                rest = value_parts[1] if len(value_parts) > 1 else ""
-            if not value:
-                return _refused(
-                    argument,
-                    f"⚠️ `{option.name}` needs a "
-                    f"{option.placeholder.strip('<>')} after it. {option.usage}",
-                )
+            # The reader owns the empty case too: only it knows what its value is.
+            value_parts = tail.split(maxsplit=1)
+            value = value_parts[0] if value_parts else ""
+            rest = value_parts[1] if len(value_parts) > 1 else ""
             parsed, refusal = option.read(value)
             if refusal is not None:
                 return _refused(argument, refusal)

@@ -18,10 +18,6 @@ log = get_logger(__name__)
 # older clients and re-pasted for years.
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 
-# `\d`, not str.isdigit(): isdigit() is True for `²` and `①`, which int()
-# rejects, and parse_timestamp promises never to raise.
-_DIGITS_RE: Final[re.Pattern[str]] = re.compile(r"\d+")
-
 # The clock a user reads off a player, accepted by parse_start_offset alone:
 # YouTube's `t=` never emits it, so widening parse_timestamp would change what a
 # pasted link means.
@@ -47,7 +43,9 @@ def parse_timestamp(raw: str) -> Optional[int]:
     raw = raw.strip().lower()
     if not raw:
         return None
-    if _DIGITS_RE.fullmatch(raw):
+    # isdecimal, not isdigit: isdigit is True for `²` and `①`, which int()
+    # rejects, and this promises never to raise.
+    if raw.isdecimal():
         return int(raw)
     match = _HMS_RE.fullmatch(raw)
     # An all-optional pattern also matches the empty string, so require a group.
@@ -85,18 +83,10 @@ _SPOTIFY_ID_RE = re.compile(r"[A-Za-z0-9]+")
 
 def timestamp_warning(
     source: Union[SpotifySource, YTSource, SoundcloudSource],
-    *,
-    overridden: bool = False,
 ) -> Optional[str]:
     """One line naming a `t=` value that did not parse, or None. Text rather
     than an embed: this module stays free of discord. Stated because something
-    the user wrote in their own URL changed where the song starts.
-
-    `overridden` is a `--timestamp` that set the offset itself: the dead `t=`
-    then changed nothing, and a link whose `t=` did not take is the likeliest
-    reason to reach for the flag at all."""
-    if overridden:
-        return None
+    the user wrote in their own URL changed where the song starts."""
     if not isinstance(source, YTSource) or source.bad_timestamp is None:
         return None
     # safe_label: rendered inside a code span, and a backtick would close it.

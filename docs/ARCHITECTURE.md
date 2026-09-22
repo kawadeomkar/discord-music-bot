@@ -1360,9 +1360,9 @@ shows), the `spellings` a user may type, the `PlayArgs` `field` it sets, and eit
 `constant` it stands for or a `read` that parses its value — never both, since `read` is
 what decides whether the next token is consumed.
 
-Everything else derives from that table: `_OPTIONS` maps every spelling, `_OPTION_STEMS`
-and `_NEAR_FLAG_RE` build the did-you-mean, and `play_usage()` renders the usage line the
-missing-argument notice shows. **`field` is what makes two options mutually exclusive** —
+Everything else derives from that table: `_OPTIONS` maps every spelling, and
+`_OPTION_STEMS` / `_NEAR_FLAG_RE` build the did-you-mean. **`field` is what makes two
+options mutually exclusive** —
 `--now` and `--next` both set `mode`, so the parser refuses the pair without a rule that
 names either, and the refusal lists that field's options in registry order so it reads
 the same whichever was typed first. Adding an option is one entry; the parser, the
@@ -1370,13 +1370,13 @@ refusals, the suggestions and the usage line all follow.
 
 Three outcomes, all of which queue nothing:
 
-- **`error`** — an option repeated, two options over one field, a value-taking option
-  with no value, a value that does not parse, a valueless option handed one (`--now=x`),
-  or a time at or past `MAX_START_OFFSET_SECS`. A finished sentence rather than an
-  exception: a typo is not worth a traceback and a trace id. Each hint is the option's
-  own `usage`, so a `--now` mistake is not answered with a `--timestamp` example. The
-  bound is what keeps an unbounded digit run out of `-ss`, out of the play epoch and out
-  of an embed description Discord would reject.
+- **`error`** — an option repeated, two options over one field, a value that does not
+  parse or is missing, or a time at or past `MAX_START_OFFSET_SECS`. A finished sentence
+  rather than an exception: a typo is not worth a traceback and a trace id. An option's
+  `read` owns every message about its value, the empty case included, since only it
+  knows what its value is. The bound is what keeps an unbounded digit run out of `-ss`,
+  out of the play epoch and out of an embed description Discord would reject. A value is
+  always the next token: there is no `--ts=1:32` form.
 - **`dash_typo`** — a leading token one dash off an option (`-now`, an autocorrected
   `—next`, a `–ts`), answered with the long form it names. The exact-match lookup runs
   first, since a real `--now` also fits the near-miss pattern, and `-ts` is a real

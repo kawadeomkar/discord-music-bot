@@ -1113,14 +1113,6 @@ class TestTimestampWarning:
         assert "`x`" not in warning
         assert "[y](z)" not in warning
 
-    def test_an_overriding_flag_suppresses_it(self) -> None:
-        """A `--timestamp` set the offset, so "starting from the beginning" is
-        flatly false — and a link whose `t=` did not take is the likeliest reason
-        to reach for the flag at all."""
-        source = parse_url("https://youtu.be/a?t=banana")
-        assert timestamp_warning(source) is not None
-        assert timestamp_warning(source, overridden=True) is None
-
 
 class TestStartOffsetFormats:
     def test_it_names_the_clock_form_the_flag_adds(self) -> None:

@@ -22,7 +22,6 @@ from src.play_placement import (
     PlayArgs,
     PlayMode,
     PlayRequest,
-    play_usage,
     split_play_args,
 )
 from src.musicplayer import RESTORE_WAIT_SECS
@@ -155,9 +154,13 @@ async def _run_placed(
             await ctx.send(embed=notice_embed(args.error, discord.Color.red()))
             return
         if not url:
+            # The command's own `usage=`, which is what -help renders, so the two
+            # cannot drift. Composed as cog_command_error composes its twin.
+            cmd = ctx.command
+            usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
             await ctx.send(
                 embed=notice_embed(
-                    f"Missing argument: `url`. Usage: `{ctx.prefix}{play_usage()}`",
+                    "Missing argument: `url`." + (f" Usage: {usage}" if usage else ""),
                     discord.Color.red(),
                 )
             )
@@ -393,8 +396,12 @@ async def _resolve_and_place(
                     mp,
                     req,
                     placement=placement,
-                    warning=timestamp_warning(
-                        source, overridden=args.start_offset is not None
+                    # None when the flag set the offset: the link's dead `t=`
+                    # changed nothing, so naming it would be false.
+                    warning=(
+                        None
+                        if args.start_offset is not None
+                        else timestamp_warning(source)
                     ),
                     release_hold=hold.aclose,
                     cog=cog,

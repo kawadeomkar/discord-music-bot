@@ -27,7 +27,6 @@ from src.play_placement import (
     TIMESTAMP_FLAG,
     _OPTIONS,
     _PLAY_OPTIONS,
-    play_usage,
     PlaceStalled,
     PlayArgs,
     _GuildPlays,
@@ -180,16 +179,9 @@ class TestTheTimestampFlag:
             "never gonna give you up",
         )
 
-    @pytest.mark.parametrize("sep", [" ", "="])
-    def test_the_value_may_be_joined_or_separate(self, sep: str) -> None:
-        args = split_play_args(f"--ts{sep}1:32 song")
+    def test_the_value_is_the_next_token(self) -> None:
+        args = split_play_args("--ts 1:32 song")
         assert (args.start_offset, args.query) == (92, "song")
-
-    def test_an_equals_with_the_time_in_the_next_token(self) -> None:
-        """`--ts= 1:32` is a space away from the joined form, and a time does
-        follow it."""
-        args = split_play_args("--ts= 1:32 song")
-        assert (args.start_offset, args.query, args.error) == (92, "song", None)
 
     @pytest.mark.parametrize(
         "argument,mode,offset,query",
@@ -1143,10 +1135,6 @@ class TestTheOptionRegistry:
         for option in _PLAY_OPTIONS:
             assert (option.constant is None) != (option.read is None), option.name
 
-    def test_only_a_value_taking_option_has_a_placeholder(self) -> None:
-        for option in _PLAY_OPTIONS:
-            assert bool(option.placeholder) is (option.read is not None), option.name
-
     @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
     def test_every_option_refuses_its_own_repeat(self, option: Any) -> None:
         text = (
@@ -1165,21 +1153,6 @@ class TestTheOptionRegistry:
         for spelling in option.spellings:
             stem = spelling.lstrip("-")
             assert split_play_args(f"—{stem} x").dash_typo == option.name
-
-    @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
-    def test_a_valueless_option_refuses_a_value_and_the_reverse(
-        self, option: Any
-    ) -> None:
-        """`--now=x` was searched for as text before the registry; both shapes are
-        now answered by one rule that names the option it is about."""
-        args = split_play_args(f"{option.name}=x song")
-        assert args.error is not None and option.name in args.error
-        if option.read is None:
-            assert "doesn't take a value" in args.error
-        else:
-            # It takes one, so `=x` is read as the value and refused on its own
-            # terms rather than for carrying one at all.
-            assert "doesn't take a value" not in args.error
 
     def test_options_over_one_field_are_mutually_exclusive(self) -> None:
         """Two options naming the same field are alternatives; the message lists
@@ -1202,24 +1175,9 @@ class TestTheOptionRegistry:
                 assert args.error is None, (a.name, b.name, args.error)
                 assert args.query == "song"
 
-    def test_the_usage_line_names_every_option(self) -> None:
-        """`-play`'s missing-argument notice renders from the registry, so a new
-        option documents itself there."""
-        usage = play_usage()
-        for option in _PLAY_OPTIONS:
-            assert option.name in usage
-            assert (option.placeholder in usage) if option.placeholder else True
-        assert usage.startswith("play ") and usage.endswith("<url|search>")
-
-    def test_alternatives_share_one_bracket(self) -> None:
-        """`[--now|--next]` rather than two brackets: they are one choice."""
-        assert f"[{NOW_FLAG}|{NEXT_FLAG}]" in play_usage()
-        assert f"[{TIMESTAMP_FLAG} <time>]" in play_usage()
-
-    def test_the_usage_hint_on_a_refusal_is_the_options_own(self) -> None:
-        """A `--now` mistake used to be answered with a `--timestamp` example."""
-        placement = split_play_args(f"{NOW_FLAG}=x song").error
-        assert placement is not None
-        assert NOW_FLAG in placement and TIMESTAMP_FLAG not in placement
-        timed = split_play_args(TIMESTAMP_FLAG).error
-        assert timed is not None and "1:32" in timed
+    def test_a_missing_value_names_the_shapes_it_takes(self) -> None:
+        """The reader owns the empty case, so the hint is the one list of shapes
+        rather than a usage line rendered somewhere else."""
+        error = split_play_args(TIMESTAMP_FLAG).error
+        assert error is not None
+        assert TIMESTAMP_FLAG in error and START_OFFSET_FORMATS in error

@@ -36,8 +36,8 @@ play():
   ├─ split_play_args: strips a LEADING RUN of options off the argument, one per
   │        _PLAY_OPTIONS field (--now/--next share `mode`, so they exclude each
   │        other; --timestamp <time> sets its own), in any order. The parser names
-  │        no option — the registry drives parsing, refusals, the did-you-mean and
-  │        play_usage(). A near-miss like -now becomes a hint, not a search for
+  │        no option — the registry drives parsing, refusals and the
+  │        did-you-mean. A near-miss like -now becomes a hint, not a search for
   │        "now <url>"; a repeat, a conflict or an unreadable value queues nothing
   ├─ PlayRegistry.register: admit to the guild's in-flight set (PLAY_INFLIGHT_MAX,
   │        default 16, declined past it), snapshot the queue generation. Requests
