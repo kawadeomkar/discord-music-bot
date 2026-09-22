@@ -1339,6 +1339,12 @@ class TestAttributionLink:
         )
         assert _route(link) == _youtube(link)
 
+    def test_a_protocol_relative_inner_link_is_not_followed(self) -> None:
+        """`//host/x` starts with `/` but names a HOST, not the path this share
+        link stands for, so it stays the link it arrived as."""
+        link = "https://www.youtube.com/attribution_link?u=%2F%2Fexample.com%2Fx"
+        assert _route(link) == _youtube(link)
+
 
 class TestDiscordWrappers:
     @pytest.mark.parametrize(

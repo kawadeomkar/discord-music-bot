@@ -324,7 +324,7 @@ _WRAPPER_PAIRS: Final = ("<>", "``", "()")
 _UNWRAP_PASSES: Final = 3
 
 
-def _unwrap(token: str) -> str:
+def unwrap(token: str) -> str:
     """The link inside the markup a message wraps one in: the pairs above,
     `||link||` (a spoiler) and `[text](link)` (a masked link). String methods
     only, so the cost stays linear in the token."""
@@ -369,7 +369,7 @@ def _parse_link(
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     if len(token) > LINK_MAX_CHARS:
         raise ValueError("Too long to be a link")
-    link = _unwrap(token)
+    link = unwrap(token)
     if _is_spotify_uri(link):
         uri = _SPOTIFY_URI_RE.fullmatch(link)
         if uri is None:
@@ -393,8 +393,14 @@ def _parse_link(
             and parts.path == "/attribution_link"
         ):
             # A share link carrying the path it redirects to, decoded once.
+            # `//` is excluded: that is protocol-relative, naming a host rather
+            # than the path this link stands for.
             inner = _last(args, "u")
-            if inner is not None and inner.startswith("/"):
+            if (
+                inner is not None
+                and inner.startswith("/")
+                and not inner.startswith("//")
+            ):
                 return _parse_link(
                     f"https://www.youtube.com{inner}", decode_nested=False
                 )
@@ -526,7 +532,7 @@ def parse_input(user_input: str) -> Union[SpotifySource, YTSource, SoundcloudSou
     YouTube search. Reads only what the caller passes, so a stripped flag is
     gone."""
     text = unquote_argument(" ".join(user_input.split()))
-    link = _unwrap(text)
+    link = unwrap(text)
     if len(link.split(None, 1)) == 1:
         try:
             return parse_url(link)
