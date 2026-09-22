@@ -47,12 +47,20 @@ class TestRemainingSecs:
     def test_unknown_duration_is_none(self, mock_author: MagicMock) -> None:
         assert remaining_secs(_song(mock_author, duration=None)) is None
 
-    def test_non_resume_ts_does_not_shrink_duration(
+    def test_any_start_offset_counts_only_what_plays(
         self, mock_author: MagicMock
     ) -> None:
-        # A ?t= start offset is a playback preference, not a shorter song —
-        # only resume entries are known to play just their tail.
-        assert remaining_secs(_song(mock_author, ts=150, duration=210)) == 210
+        """Every `ts` becomes an ffmpeg `-ss`, whether a resume, a link's `?t=` or
+        a `--timestamp` set it, so the ETA of everything behind must not count the
+        skipped head."""
+        assert remaining_secs(_song(mock_author, ts=150, duration=210)) == 60
+
+    def test_an_offset_past_the_end_counts_nothing(
+        self, mock_author: MagicMock
+    ) -> None:
+        """Only `?t=` can reach this — `--timestamp` is refused past the end — and
+        a negative remainder would drag every later ETA backwards."""
+        assert remaining_secs(_song(mock_author, ts=900, duration=210)) == 0
 
 
 class TestTheWalk:

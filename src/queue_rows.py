@@ -94,11 +94,13 @@ def requester_mention(
 
 
 def remaining_secs(item: QueueObject) -> Optional[int]:
-    """A queued item's expected playtime: full duration, minus the resume offset
-    for a resume entry, which plays only its tail."""
+    """A queued item's expected playtime: its duration less any start offset.
+    Every `ts` becomes an ffmpeg `-ss`, so a resume tail and a `--timestamp` song
+    alike play only from there, and counting the full duration would push the ETA
+    of everything behind them out by the offset."""
     if item.duration is None:
         return None
-    if item.is_resume and item.ts:
+    if item.ts:
         return max(0, item.duration - item.ts)
     return item.duration
 
@@ -151,7 +153,7 @@ def queue_row(
         if item.is_resume and item.ts:
             note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
         elif item.ts:
-            note = f"  ·  starts at `{item.ts}s`"
+            note = f"  ·  starts at `{fmt_duration(item.ts)}`"
         else:
             note = ""
         who = requester_mention(item.requester)
