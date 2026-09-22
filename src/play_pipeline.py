@@ -24,6 +24,7 @@ from src.play_placement import (
     Placement,
     PlayRequest,
     ResolveMode,
+    TIMESTAMP_FLAG,
     slow_resolve_notice,
 )
 from src.sources import (
@@ -49,6 +50,7 @@ from src.util import (
     ProgressFn,
     ECHO_ROW_MAX,
     build_embed,
+    fmt_duration,
     get_logger,
     notice_embed,
     pluralize,
@@ -177,16 +179,83 @@ def _apply_playlist_index(
     return kept, dropped
 
 
-def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> None:
-    """Start the first queued track at the link's `t=` offset, only when that
-    track is the `v=` video the link names — without a matching `index=` the
-    queue starts at track 1, usually a different song."""
-    if not source.ts or not source.video_id or not tracks:
+def _apply_playlist_timestamp(
+    tracks: list[QueueObject], source: YTSource, ts: Optional[int]
+) -> None:
+    """Start the first queued track at `ts` — the link's own `t=`, or the
+    `--timestamp` that overrode it — only when that track is the `v=` video the
+    link names: without a matching `index=` the queue starts at track 1, usually
+    a different song."""
+    if not ts or not source.video_id or not tracks:
         return
     # Substring, not equality: yt_playlist takes the entry's own `url` when it
     # has one, so the shape is not guaranteed.
     if source.video_id in tracks[0].webpage_url:
-        tracks[0].ts = source.ts
+        tracks[0].ts = ts
+
+
+def effective_start_offset(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+    start_offset: Optional[int],
+) -> Optional[int]:
+    """Where a resolve starts the song: the `--timestamp` flag, else the link's
+    own `t=`. The flag wins — it is the more explicit of the two, and a link
+    whose `t=` did not take is the likeliest reason to reach for it."""
+    if start_offset is not None:
+        return start_offset
+    return None if isinstance(source, SpotifySource) else source.ts
+
+
+def start_offset_refusal(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> Optional[str]:
+    """Why a `--timestamp` cannot start this input, or None. One offset over N
+    songs names none of them, so a collection is refused — except a watch link
+    carrying `&list=`, which names its `v=` video and is taken exactly like the
+    `t=` on the same link. Answered off the PARSED source, so the refusal lands
+    before the join and before any extraction."""
+    if not is_collection(source) or (isinstance(source, YTSource) and source.video_id):
+        return None
+    return (
+        f"⚠️ `{TIMESTAMP_FLAG}` starts one song, and that link queues a "
+        f"{collection_noun(source)}. Play the song on its own to start it partway in."
+    )
+
+
+def past_end_refusal(
+    qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
+    start_offset: Optional[int],
+) -> Optional[str]:
+    """Why `start_offset` cannot start the resolved song, or None. A duration of
+    None or 0 rules nothing out (livestreams report both), so an offset that
+    cannot be checked stands and ffmpeg judges it.
+
+    A collection is measured against the track the offset actually landed on —
+    _apply_playlist_timestamp's `v=` head — and not at all when it landed on
+    none, so the interjection and the ordinary placement answer one link alike."""
+    if start_offset is None:
+        return None
+    head = _offset_head(qobj, start_offset)
+    if head is None or not head.duration or start_offset < head.duration:
+        return None
+    return (
+        f"⚠️ `{fmt_duration(start_offset)}` is past the end of "
+        f"**{safe_label(head.title, ECHO_ROW_MAX)}** "
+        f"(`{fmt_duration(head.duration)}`) — nothing was queued."
+    )
+
+
+def _offset_head(
+    qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
+    start_offset: int,
+) -> Optional[QueueObject]:
+    """The track a `--timestamp` was applied to, or None if it reached none."""
+    if isinstance(qobj, QueueObject):
+        return qobj
+    if isinstance(qobj, ResolvedYoutubePlaylist) and qobj.tracks:
+        head = qobj.tracks[0]
+        return head if head.ts == start_offset else None
+    return None
 
 
 def plays_after_note(
@@ -429,6 +498,7 @@ async def queue_source(
     mode: ResolveMode,
     on_progress: Optional[ProgressFn] = None,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+    start_offset: Optional[int] = None,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
     """Resolve a parsed source into something enqueueable. `analytics` is the
@@ -449,7 +519,10 @@ async def queue_source(
     `pool_slot` is the guild's resolve bound, handed down rather than held around
     this call: it is taken at the extraction itself, so a cache hit and the pure
     HTTP of a Spotify playlist do not queue behind two in-flight lookups. See
-    docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken."""
+    docs/ARCHITECTURE.md#where-the-resolve-bound-is-taken.
+
+    `start_offset` is `--timestamp`, applied here so a link's `t=` and the flag
+    reach the song by one route."""
     if _is_spotify_collection(source):
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
@@ -477,20 +550,21 @@ async def queue_source(
             pool_slot=pool_slot,
         )
         tracks, skipped = _apply_playlist_index(playlist.tracks, source.index)
-        _apply_playlist_timestamp(tracks, source)
+        _apply_playlist_timestamp(
+            tracks, source, effective_start_offset(source, start_offset)
+        )
         return ResolvedYoutubePlaylist(
             tracks,
             skipped=skipped,
             title=playlist.title,
             unavailable=playlist.unavailable,
         )
-    ts: Optional[int] = None
+    ts = effective_start_offset(source, start_offset)
     search: str
     if isinstance(source, SpotifySource):
         search = await cog._require_spotify().track(source.id)
     elif isinstance(source, YTSource):
         search = source.ytsearch or source.url or ""
-        ts = source.ts
     elif isinstance(source, SoundcloudSource):
         search = source.url
     else:
@@ -781,6 +855,7 @@ async def _resolve_interjection_source(
     origin: str,
     on_progress: Optional[ProgressFn] = None,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+    start_offset: Optional[int] = None,
     cog: MusicBot,
 ) -> tuple[QueueObject, list[QueueItem]]:
     """Resolve an interjection's input into (head, everything behind it). The
@@ -830,7 +905,9 @@ async def _resolve_interjection_source(
         # Indexed here too: `--now` on a link copied mid-playlist starts at the
         # track the user was looking at, not the playlist's first.
         tracks, skipped = _apply_playlist_index(playlist.tracks, source.index)
-        _apply_playlist_timestamp(tracks, source)
+        _apply_playlist_timestamp(
+            tracks, source, effective_start_offset(source, start_offset)
+        )
         if skipped:
             await ctx.send(
                 embed=notice_embed(
@@ -849,6 +926,7 @@ async def _resolve_interjection_source(
         origin=origin,
         mode=ResolveMode.FULL,
         pool_slot=pool_slot,
+        start_offset=start_offset,
         cog=cog,
     )
     assert isinstance(qobj, QueueObject)
@@ -865,6 +943,7 @@ async def interject_flow(
     *,
     resume_paused: bool = True,
     require_paused: bool = False,
+    start_offset: Optional[int] = None,
     cog: MusicBot,
 ) -> None:
     """Resolve `url` to one song, interrupt what is playing, and report.
@@ -874,8 +953,16 @@ async def interject_flow(
     back playing). require_paused re-reads the pause state after resolution:
     `-play` interjects only because the song is paused, so a `-resume` landing
     during the 1–4s extraction removes the reason and the track is appended.
+
+    Every refusal `start_offset` can draw is settled before interject(), so a
+    rejected offset leaves the current song playing.
     """
     source = parse_input(url)
+    if start_offset is not None:
+        refusal = start_offset_refusal(source)
+        if refusal is not None:
+            await ctx.send(embed=notice_embed(refusal, discord.Color.red()))
+            return
     # The second entry point for both, covering `-playnow <playlist>` and plain
     # `-play` over a paused song. A plain `async with`: no gate hold here, so the
     # LIFO constraint on the other entry point does not apply. It spans the whole
@@ -912,8 +999,15 @@ async def interject_flow(
             origin=url,
             on_progress=progress.update if progress else None,
             pool_slot=cog._plays.resolve_slot(req),
+            start_offset=start_offset,
             cog=cog,
         )
+        # Before the prefetch, which every remaining source reaches with a
+        # duration already set: a refusal must not pay an extraction it discards.
+        refusal = past_end_refusal(qobj, start_offset)
+        if refusal is not None:
+            await ctx.send(embed=notice_embed(refusal, discord.Color.red()))
+            return
         # The head only: `interjected` is attribution, which song cut the line.
         qobj.interjected = True
 
@@ -982,7 +1076,7 @@ async def interject_flow(
                 mp,
                 req,
                 note=note,
-                warning=timestamp_warning(source),
+                warning=timestamp_warning(source, overridden=start_offset is not None),
                 follow_on=follow_on,
                 cog=cog,
             )

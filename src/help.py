@@ -61,7 +61,9 @@ SOURCES = (
     "delete the `&list=` part to queue only the video.\n"
     "**Spotify** — track, album and playlist links. Each title is matched to "
     "its YouTube audio, so an album or playlist may take a moment to queue.\n"
-    "**SoundCloud** — track links."
+    "**SoundCloud** — track links.\n"
+    "Any one song, from any of these, can start partway in: "
+    "`-play --timestamp 1:32 <song>`."
 )
 
 _ALONE_TIMEOUT = server_spec(ConfigField.ALONE_TIMEOUT)

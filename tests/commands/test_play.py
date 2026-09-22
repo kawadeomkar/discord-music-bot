@@ -5691,3 +5691,395 @@ class TestQueueProgressCard:
             )
 
         assert card.entered == 1
+
+
+class TestTheTimestampFlag:
+    """`-play --timestamp` end to end: what reaches the queue, what is refused, and
+    where each refusal lands relative to the join."""
+
+    @staticmethod
+    def _vc(
+        *, playing: bool = False, paused: bool = False, ctx: Optional[MagicMock] = None
+    ) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = playing
+        vc.is_paused.return_value = paused
+        vc.is_connected.return_value = True
+        return in_authors_channel(vc, ctx)
+
+    def _wire(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        *,
+        live: bool = True,
+        duration: Optional[int] = 210,
+    ) -> MagicMock:
+        mp = mock_mp()
+        mp.current_song = MagicMock() if live else None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        qobj = QueueObject(
+            "https://yt.com/v=1", "Test Song", mock_ctx.author, duration=duration
+        )
+        play_pipeline.queue_source = AsyncMock(return_value=qobj)
+        play_pipeline.enqueue_single = AsyncMock()
+        play_pipeline.interject_flow = AsyncMock()
+        play_cmd.abandon_cold_start = AsyncMock()
+        music_bot._command_error = AsyncMock()
+        seams = MagicMock()
+        seams.mp = mp
+        seams.qobj = qobj
+        seams.queue_source = play_pipeline.queue_source
+        seams.enqueue_single = play_pipeline.enqueue_single
+        seams.interject = play_pipeline.interject_flow
+        seams.command_error = music_bot._command_error
+        seams.abandon = play_cmd.abandon_cold_start
+        return seams
+
+    async def _play(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, url: str, *, cmd: Any = None
+    ) -> None:
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+        ):
+            await command_callback(cmd or MusicBot.play)(music_bot, mock_ctx, url=url)
+
+    async def test_the_offset_reaches_the_resolve(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, "--timestamp 1:32 never gonna give")
+
+        seams.command_error.assert_not_awaited()
+        assert seams.queue_source.await_args.kwargs["start_offset"] == 92
+        seams.enqueue_single.assert_awaited_once()
+
+    async def test_the_origin_is_the_song_alone(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The flag is stripped before `origin` is stamped: a leaked flag persists a
+        user_input `-remove never gonna give` cannot match."""
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, '-ts 1:32 "never gonna give"')
+
+        assert seams.queue_source.await_args.kwargs["origin"] == "never gonna give"
+
+    async def test_a_malformed_flag_answers_and_queues_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, "--ts banana never gonna give")
+
+        seams.queue_source.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert "banana" in mock_ctx.send.call_args.kwargs["embed"].description
+
+    async def test_a_playlist_link_is_refused_before_the_join(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Disconnected, so a refusal reaching the resolve would already have pulled
+        the bot into a channel it then has to be torn out of."""
+        seams = self._wire(music_bot, mock_ctx, live=False)
+        mock_ctx.voice_client = None
+
+        with patch("asyncio.create_task") as create_task:
+            await self._play(
+                music_bot,
+                mock_ctx,
+                "-ts 1:32 https://youtube.com/playlist?list=PL1",
+            )
+
+        create_task.assert_not_called()
+        seams.queue_source.assert_not_awaited()
+        seams.abandon.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert (
+            "queues a playlist" in mock_ctx.send.call_args.kwargs["embed"].description
+        )
+
+    async def test_a_watch_link_carrying_a_list_is_not_refused(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The shape YouTube's share button emits while a playlist is queued: the
+        `t=` on this link already starts its queued head, so the flag does too."""
+        seams = self._wire(music_bot, mock_ctx)
+        seams.queue_source.return_value = ResolvedYoutubePlaylist(
+            [QueueObject("https://yt.com/v=v4", "S4", mock_ctx.author, duration=210)]
+        )
+        play_pipeline.enqueue_playlist = AsyncMock()
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(
+            music_bot,
+            mock_ctx,
+            "-ts 1:32 https://youtube.com/watch?v=v4&list=PL1&index=4",
+        )
+
+        seams.command_error.assert_not_awaited()
+        assert seams.queue_source.await_args.kwargs["start_offset"] == 92
+        play_pipeline.enqueue_playlist.assert_awaited_once()
+
+    async def test_a_time_past_the_end_queues_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx, duration=210)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, "-ts 5:00 never gonna give")
+
+        seams.enqueue_single.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert "past the end" in mock_ctx.send.call_args.kwargs["embed"].description
+
+    async def test_a_cold_start_refusal_tears_the_join_back_down(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The refusal needs the resolved duration, so it lands after the join —
+        which must come down, and before the notice, like every other cold bail."""
+        seams = self._wire(music_bot, mock_ctx, live=False, duration=210)
+        mock_ctx.voice_client = None
+        order: list[str] = []
+        seams.abandon.side_effect = lambda *a, **k: order.append("abandon")
+        mock_ctx.send.side_effect = lambda *a, **k: order.append("notice")
+
+        loop = asyncio.get_event_loop()
+        join = loop.create_future()
+        join.set_result(None)
+
+        def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
+            coro.close()
+            mock_ctx.voice_client = connected_vc(mock_ctx)
+            return join
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await self._play(music_bot, mock_ctx, "-ts 5:00 never gonna give")
+
+        seams.enqueue_single.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert order == ["abandon", "notice"]
+
+    async def test_an_unknown_duration_lets_the_offset_stand(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Livestreams report no duration, and an offset that cannot be checked is
+        left to ffmpeg rather than refused on a guess."""
+        seams = self._wire(music_bot, mock_ctx, duration=None)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, "-ts 5:00 some 24/7 radio")
+
+        seams.enqueue_single.assert_awaited_once()
+
+    async def test_it_suppresses_the_dead_timestamp_warning(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The flag set the offset, so "starting from the beginning" would be flatly
+        false beside a card reading `Starts at 1:32`."""
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(
+            music_bot, mock_ctx, "-ts 1:32 https://youtu.be/dQw4w9WgXcQ?t=banana"
+        )
+
+        assert seams.enqueue_single.await_args.kwargs["warning"] is None
+
+    async def test_without_the_flag_the_warning_still_ships(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, "https://youtu.be/dQw4w9WgXcQ?t=banana")
+
+        assert "banana" in seams.enqueue_single.await_args.kwargs["warning"]
+
+    @pytest.mark.parametrize(
+        "argument,mode",
+        [
+            ("--now -ts 1:32 song", PlayMode.NOW),
+            ("-ts 1:32 --now song", PlayMode.NOW),
+        ],
+    )
+    async def test_it_rides_along_with_now(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, argument: str, mode: PlayMode
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, argument)
+
+        seams.interject.assert_awaited_once()
+        assert seams.interject.await_args.kwargs["start_offset"] == 92
+
+    async def test_playnow_carries_the_offset_through_its_own_spelling(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """`-playnow` forces the placement on the PARSED argument; re-rendering the
+        query alone would drop the offset on the floor."""
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(
+            music_bot, mock_ctx, "-ts 1:32 never gonna give", cmd=MusicBot.playnow
+        )
+
+        seams.interject.assert_awaited_once()
+        assert seams.interject.await_args.kwargs["start_offset"] == 92
+
+    async def test_playnext_carries_the_offset_and_keeps_its_placement(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(
+            music_bot, mock_ctx, "-ts 1:32 never gonna give", cmd=MusicBot.playnext
+        )
+
+        seams.interject.assert_not_awaited()
+        assert seams.queue_source.await_args.kwargs["start_offset"] == 92
+        assert seams.enqueue_single.await_args.kwargs["placement"] is Placement.NEXT
+
+    async def test_playnow_answers_a_malformed_flag(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Its own body, its own early return: without one the empty query becomes
+        an empty YouTube search."""
+        seams = self._wire(music_bot, mock_ctx)
+        mock_ctx.voice_client = self._vc(playing=True, ctx=mock_ctx)
+
+        await self._play(music_bot, mock_ctx, "--ts banana song", cmd=MusicBot.playnow)
+
+        seams.interject.assert_not_awaited()
+        seams.queue_source.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert "banana" in mock_ctx.send.call_args.kwargs["embed"].description
+
+
+class TestAnInterjectedOffsetIsSettledBeforeTheInterrupt:
+    """`--now` stops what is playing, so every refusal the offset can draw has to
+    land before interject() — a rejected offset must leave the song alone."""
+
+    @pytest.fixture
+    def live_mp(self) -> MagicMock:
+        from src.musicplayer import InterjectOutcome
+
+        mp = mock_mp()
+        mp.current_song = MagicMock()
+        mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Original Song",
+                resume_position=151,
+                was_paused=False,
+                returns_paused=False,
+            )
+        )
+        return mp
+
+    @pytest.fixture
+    def live_vc(self, mock_ctx: MagicMock) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        return in_authors_channel(vc, mock_ctx)
+
+    async def _run(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        url: str,
+        *,
+        prefetch: AsyncMock,
+    ) -> None:
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+            patch.object(YTDL, "prefetch_stream", new=prefetch),
+        ):
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
+
+    async def test_a_time_past_the_end_leaves_the_song_playing(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        music_bot._command_error = AsyncMock()
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject(
+                "https://yt.com/v=x", "Urgent", mock_ctx.author, duration=60
+            )
+        )
+        prefetch = AsyncMock(return_value=True)
+
+        await self._run(music_bot, mock_ctx, "-ts 99:00 test", prefetch=prefetch)
+
+        live_mp.interject.assert_not_awaited()
+        live_vc.stop.assert_not_called()
+        music_bot._command_error.assert_not_awaited()
+        # And it did not pay an extraction it then discarded.
+        prefetch.assert_not_awaited()
+        assert "past the end" in mock_ctx.send.await_args.kwargs["embed"].description
+
+    async def test_a_collection_is_refused_before_anything_resolves(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        music_bot._command_error = AsyncMock()
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock()
+
+        await self._run(
+            music_bot,
+            mock_ctx,
+            "-ts 1:32 https://youtube.com/playlist?list=PL1",
+            prefetch=AsyncMock(return_value=True),
+        )
+
+        live_mp.interject.assert_not_awaited()
+        play_pipeline.queue_source.assert_not_awaited()
+        music_bot._command_error.assert_not_awaited()
+        assert (
+            "queues a playlist" in mock_ctx.send.await_args.kwargs["embed"].description
+        )
+
+    async def test_an_accepted_offset_interjects_and_carries(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """The refusals must not refuse the ordinary case."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        music_bot._command_error = AsyncMock()
+        mock_ctx.voice_client = live_vc
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject(
+                "https://yt.com/v=x", "Urgent", mock_ctx.author, duration=210
+            )
+        )
+
+        await self._run(
+            music_bot, mock_ctx, "-ts 1:32 test", prefetch=AsyncMock(return_value=True)
+        )
+
+        resolve = play_pipeline.queue_source.await_args
+        assert resolve is not None and resolve.kwargs["start_offset"] == 92
+        live_mp.interject.assert_awaited_once()
+        music_bot._command_error.assert_not_awaited()

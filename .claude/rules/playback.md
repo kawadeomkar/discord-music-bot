@@ -33,8 +33,10 @@ three separate phases so queueing is instant and songs start with near-zero late
   │ validate_commands: author must be in a usable voice channel
   ▼
 play():
-  ├─ split_play_args: strips a LEADING --now / --next off the argument (PlayMode);
-  │        a near-miss like -now becomes a hint, not a search for "now <url>"
+  ├─ split_play_args: strips a LEADING RUN of options off the argument — one
+  │        --now / --next (PlayMode) and one --timestamp <time>, in either order;
+  │        a near-miss like -now becomes a hint, not a search for "now <url>", and
+  │        a repeat, a conflict or an unreadable time answers and queues nothing
   ├─ PlayRegistry.register: admit to the guild's in-flight set (PLAY_INFLIGHT_MAX,
   │        default 16, declined past it), snapshot the queue generation. Requests
   │        resolve CONCURRENTLY; only the insert is serialized — see .place()
@@ -44,6 +46,10 @@ play():
   │      • --next                    → NOT here: it never interrupts, paused or not
   ├─ parse_input (sources.py): single word → parse_url (youtube/spotify/soundcloud/
   │        any dotted domain → URLSource.OTHER, handed raw to yt-dlp); else ytsearch
+  ├─ --timestamp given? start_offset_refusal reads the PARSED source, so a
+  │        collection naming no track is answered before the join. Applied in
+  │        queue_source (beating the link's own t=), then past_end_refusal on the
+  │        resolved duration — after the join, so the cold start is torn back down
   ├─ placement (Placement enum — the insert position, decided separately from
   │        cold_start, which also drives the analytics shortcut and the join dance):
   │      • disconnected              → COLD_FRONT
@@ -272,7 +278,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
   casefolds — folding a link would let one Spotify playlist's base62 id match another's.
 
-### `-play --now` / `--next` placement, interjection and resume entries
+### `-play --now` / `--next` / `--timestamp` placement, interjection and resume entries
 
 `MusicPlayer.interject(qobj, vc, resume_paused)` implements "play this now, then put the
 interrupted song back where it was":

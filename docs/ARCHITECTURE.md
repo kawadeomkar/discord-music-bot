@@ -342,8 +342,9 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | YouTube watch URL | `https://youtube.com/watch?v=...` | `YTSource(process=False)` → `yt_source` (unified full extraction — the `process` field is parse metadata only). A link never resolves flat: its cost is the watch page, which nothing skips without failing YouTube's bot check |
 | YouTube short URL | `https://youtu.be/...` | `YTSource(process=False)` |
 | YouTube URL with timestamp | `?t=120` | `YTSource(ts=120)` → seeks via FFmpeg `-ss` |
+| `--timestamp` / `-ts` flag | `-p -ts 1:32 <url\|search>` | A leading option, taken off by `split_play_args` before `parse_input` sees it, so the origin `-remove` matches on is the song alone. `parse_start_offset` accepts the clock form (`1:32`, `2:04:30`) on top of everything `t=` takes — a second parser, so widening the flag cannot change what a pasted `?t=` means. Applied in `queue_source`, and the only start offset a search, a Spotify track or a SoundCloud link can carry. Beats the link's own `t=` (`effective_start_offset`), is refused at or past the resolved song's duration, and is refused for a collection that names no track (`start_offset_refusal`) |
 | YouTube playlist URL | `.../playlist?list=...`, or any `watch?v=…&list=…` | `YTSource(type=PLAYLIST, list_id=...)` → `YTDL.yt_playlist` (flat extraction) → N `QueueObject`s. `_YTDL_PLAYLIST_OPTS` uses `extract_flat="in_playlist"`, not `True`: a watch URL resolves to a `url_result` pointing at the playlist, and `True` stops at it with no entries |
-| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
+| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link — or a `--timestamp` beside it — applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
 | YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` → `yt_source(flat=True)` for an ordinary placement: one search POST for identity, the stream URL extracted later by the enqueue prefetch |
 | Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
 | Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist()` → N `YTSource` search items |
@@ -643,7 +644,7 @@ disconnected client.
 
 ### Source Resolution
 
-`parse_input` / `parse_url` in `sources.py` classify the raw input string:
+`parse_input` / `parse_url` in `sources.py` classify the raw input string. It arrives with the leading options already removed by `split_play_args` and reads nothing but what it is handed, which is what makes stripping a flag work at all.
 
 ```mermaid
 flowchart TD
@@ -1301,9 +1302,36 @@ the channel is told about it are one behaviour.
 
 The argument is parsed twice — once by `play_takes_the_queue` in `before_invoke` to
 decide the voice gate, once by `play()` for the body — and they agree only because both
-call `split_play_args`. A third flag that changes what "takes the queue" means has to be
+call `split_play_args`. A flag that changes what "takes the queue" means has to be
 reflected in both readings, not just the parser; at that point the gate should hand the
-parsed value forward instead.
+parsed value forward instead. `--timestamp` does not: it changes where a song starts,
+never where it lands.
+
+#### The play flag grammar
+
+`split_play_args` consumes a LEADING RUN of options and stops at the first token that is
+not one: at most one placement flag (`--now`/`--next`) and at most one `--timestamp
+<time>`, in either order. Everything from the stopping token on is the query, verbatim —
+which is also the origin `-remove` matches on, so an option lifted out of mid-line would
+leave a value the user never typed. `-playnow` and `-playnext` parse their argument
+through the same grammar and then force the placement, so a flag spelled there anyway is
+not searched for as text and a `--timestamp` beside it still lands.
+
+Three outcomes, all of which queue nothing:
+
+- **`error`** — a repeated option, a `--now`/`--next` conflict, a `--timestamp` with no
+  time, a time that does not parse, or one at or past `MAX_START_OFFSET_SECS`. A finished
+  sentence rather than an exception: a typo is not worth a traceback and a trace id. The
+  bound is what keeps an unbounded digit run out of `-ss`, out of the play epoch and out
+  of an embed description Discord would reject.
+- **`dash_typo`** — a leading token one dash off a flag (`-now`, an autocorrected
+  `—next`, a `–ts`), answered with the long form it names. The exact-match lookup runs
+  first, since a real `--now` also fits the near-miss pattern, and `-ts` is a real
+  spelling that never reaches it.
+- **an empty `query`** — reported by the command as a missing argument.
+
+Hand-parsed rather than a `FlagConverter`, whose grammar matches flags anywhere in the
+line and would lift a `--ts` out of a search term.
 
 1. **The player is not retired.** `MusicBot.cleanup()` stamps `MusicPlayer.mark_retired()`
    through `PlayRegistry.retire_player`, which takes the place lock so the stamp cannot
