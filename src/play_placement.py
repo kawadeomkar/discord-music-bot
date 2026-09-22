@@ -22,6 +22,12 @@ from opentelemetry import trace
 
 from src import config
 from src.musicplayer import MusicPlayer
+from src.sources import (
+    MAX_START_OFFSET_SECS,
+    START_OFFSET_FORMATS,
+    TIMESTAMP_ECHO_MAX,
+    parse_start_offset,
+)
 from src.util import (
     DASHES,
     ECHO_ROW_MAX,
@@ -51,6 +57,7 @@ PLACE_TIMEOUT_SECS = 7.0
 
 NOW_FLAG: Final[str] = "--now"
 NEXT_FLAG: Final[str] = "--next"
+TIMESTAMP_FLAG: Final[str] = "--timestamp"
 
 
 class PlayMode(Enum):
@@ -99,48 +106,136 @@ def resolve_mode_for(placement: Placement) -> ResolveMode:
     return ResolveMode.FLAT_OK
 
 
-# Built from _FLAG_MODES' keys, so a renamed flag cannot leave a stale near-miss.
-# The group is the flag minus its dashes; split_play_args re-attaches them.
+# The start-offset flag's spellings. `-ts` is the short form, one dash like the
+# command prefix; `--ts` is what someone aiming between the two writes.
+_TIMESTAMP_FLAGS: Final[frozenset[str]] = frozenset({TIMESTAMP_FLAG, "--ts", "-ts"})
+
+# Stem (a flag without its dashes) -> the spelling a near-miss is answered with.
+# Built from the flags themselves, so a rename cannot leave a stale did-you-mean.
+_FLAG_STEMS: Final[dict[str, str]] = {
+    flag.lstrip("-"): canonical
+    for flag, canonical in (
+        *((flag, flag) for flag in _FLAG_MODES),
+        *((flag, TIMESTAMP_FLAG) for flag in _TIMESTAMP_FLAGS),
+    )
+}
+
+# Longest stem first, so `timestamp` is not consumed as `t` + trailing text.
 _NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
-    f"[{DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
+    f"[{DASHES}]{{1,2}}({'|'.join(sorted(_FLAG_STEMS, key=len, reverse=True))})"
 )
+
+# Spelled without a command name: -play, -playnow and -playnext all render these,
+# and the alias the user typed is not in scope here.
+_FLAG_USAGE: Final = f"Usage: `{TIMESTAMP_FLAG} 1:32 <url|search>`."
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlayArgs:
-    """`-play`'s argument, split into the placement flag and the query. kw_only:
-    `query` and `dash_typo` are adjacent strings and one is echoed into an embed.
-    `dash_typo` names the flag a misspelt leading token meant; it only accompanies
-    PlayMode.NORMAL."""
+    """`-play`'s argument, split into its leading options and the query. kw_only:
+    `query`, `dash_typo` and `error` are adjacent strings and two are echoed into
+    an embed.
+
+    `dash_typo` names the flag a misspelt leading token meant, and `error` is a
+    finished sentence for a malformed option — a typo, not a fault worth a
+    traceback and a trace id. Either one means nothing is queued, and both come
+    with PlayMode.NORMAL."""
 
     mode: PlayMode
     query: str
+    start_offset: Optional[int] = None
     dash_typo: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _refused(argument: str, error: str) -> PlayArgs:
+    """A malformed option: the sentence to answer with, and nothing to queue."""
+    return PlayArgs(mode=PlayMode.NORMAL, query=argument.strip(), error=error)
 
 
 def split_play_args(argument: str) -> PlayArgs:
-    """Split a leading `--now`/`--next` off `-play`'s argument. Only the FIRST token
-    counts, so a flag further along stays part of the search and of the origin
-    `-remove` matches on; one flag, never a run. A leading token one dash off a
-    flag (`-now`, an autocorrected `—next`) sets `dash_typo`; the exact match runs
-    first, since a real `--now` also fits the near-miss pattern. A bare `now`/`next`
-    is a search (`-p next to me`)."""
-    stripped = argument.strip()
-    parts = stripped.split(maxsplit=1)
-    if not parts:
-        return PlayArgs(mode=PlayMode.NORMAL, query="")
-    head = parts[0].lower()
-    # No strip on the tail: `stripped` had none, and split() eats the separator run.
-    rest = parts[1] if len(parts) > 1 else ""
-    mode = _FLAG_MODES.get(head)
-    if mode is not None:
-        return PlayArgs(mode=mode, query=rest)
-    typo = _NEAR_FLAG_RE.fullmatch(head)
-    if typo is not None:
-        return PlayArgs(
-            mode=PlayMode.NORMAL, query=stripped, dash_typo=f"--{typo.group(1)}"
+    """Split the leading options off `-play`'s argument: at most one placement
+    flag (`--now`/`--next`) and at most one `--timestamp <time>`, in either order.
+
+    Only the leading run counts, so an option further along stays part of the
+    search and of the origin `-remove` matches on. Inside the run a repeat, a
+    `--now`/`--next` conflict, a missing time and a time that does not parse each
+    set `error`. A leading token one dash off a flag (`-now`, an autocorrected
+    `—next`) sets `dash_typo`; the exact match runs first, since a real `--now`
+    also fits the near-miss pattern. A bare `now`/`next` is a search (`-p next to
+    me`). See docs/ARCHITECTURE.md#the-play-flag-grammar.
+
+    Hand-parsed rather than a FlagConverter, whose grammar matches flags anywhere
+    in the line and would lift a `--ts` out of a search term.
+    """
+    mode = PlayMode.NORMAL
+    start_offset: Optional[int] = None
+    # No strip on the tail at any step: `rest` never has one, and split() eats
+    # the separator run while leaving the whitespace inside the query alone.
+    rest = argument.strip()
+    while rest:
+        parts = rest.split(maxsplit=1)
+        head = parts[0].lower()
+        tail = parts[1] if len(parts) > 1 else ""
+        flag_mode = _FLAG_MODES.get(head)
+        if flag_mode is not None:
+            if mode is flag_mode:
+                return _refused(argument, f"⚠️ `{head}` was given twice.")
+            if mode is not PlayMode.NORMAL:
+                return _refused(
+                    argument,
+                    f"⚠️ Only one of `{NOW_FLAG}` and `{NEXT_FLAG}` at a time.",
+                )
+            mode, rest = flag_mode, tail
+            continue
+        # `--ts=1:32` is one token; `--ts= 1:32` is the value in the next one.
+        name, sep, inline = head.partition("=")
+        if name in _TIMESTAMP_FLAGS:
+            if start_offset is not None:
+                return _refused(argument, f"⚠️ `{TIMESTAMP_FLAG}` was given twice.")
+            if sep and inline:
+                value, rest = inline, tail
+            else:
+                value_parts = tail.split(maxsplit=1)
+                value = value_parts[0] if value_parts else ""
+                rest = value_parts[1] if len(value_parts) > 1 else ""
+            start_offset, refusal = _read_start_offset(value)
+            if refusal is not None:
+                return _refused(argument, refusal)
+            continue
+        typo = _NEAR_FLAG_RE.fullmatch(head)
+        if typo is not None:
+            # The whole argument, unconsumed: nothing is queued, so what the run
+            # had taken so far says nothing the did-you-mean needs.
+            return PlayArgs(
+                mode=PlayMode.NORMAL,
+                query=argument.strip(),
+                dash_typo=_FLAG_STEMS[typo.group(1)],
+            )
+        break
+    return PlayArgs(mode=mode, query=rest, start_offset=start_offset)
+
+
+def _read_start_offset(value: str) -> tuple[Optional[int], Optional[str]]:
+    """`value` as seconds, or the sentence saying why it is not a time. safe_label
+    for the reason timestamp_warning uses it: the echo sits in a code span a
+    backtick would close, and the cap keeps a 2,000-char argument out of the
+    embed."""
+    if not value:
+        return None, f"⚠️ `{TIMESTAMP_FLAG}` needs a time after it. {_FLAG_USAGE}"
+    offset = parse_start_offset(value)
+    shown = safe_label(value, TIMESTAMP_ECHO_MAX)
+    if offset is None:
+        return None, (
+            f"⚠️ Couldn't read the timestamp `{shown}`. `{TIMESTAMP_FLAG}` "
+            f"takes {START_OFFSET_FORMATS}."
         )
-    return PlayArgs(mode=PlayMode.NORMAL, query=stripped)
+    if offset >= MAX_START_OFFSET_SECS:
+        return None, (
+            f"⚠️ `{shown}` is longer than a day — `{TIMESTAMP_FLAG}` starts a "
+            f"song, not a broadcast."
+        )
+    return offset, None
 
 
 # ── The voice gate ────────────────────────────────────────────────────────────
