@@ -574,7 +574,7 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
-## Upgrading to 2.47.2
+## Upgrading to 2.48.0
 
 **`-play` takes a start offset, and three things it already did read differently.**
 Nothing to configure and no data touched; rolling back is only a redeploy.
@@ -593,6 +593,10 @@ Nothing to configure and no data touched; rolling back is only a redeploy.
 - **A start offset renders as a clock.** `starts at 1:30` in the queue and the Now
   Playing card, and `Starting song at 1:30` when it begins, where all three read
   `90s` / `90 seconds` before.
+- **For operators:** a `-play` span now carries `play.start_offset` when the flag set
+  one (absent otherwise, so a filter for offset plays does not match every `-play`), and
+  `play.refused` naming why a request queued nothing. A refusal sends an embed and logs
+  nothing, so without that attribute it left no record it had run.
 - **A repeated or conflicting option on `-play` is now answered, not searched for.**
   `-play --now --next <song>` and `-play --now --now <song>` used to search YouTube for
   the leftover flag as part of the text; they now reply and queue nothing. An option
