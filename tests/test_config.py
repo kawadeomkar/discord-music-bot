@@ -830,6 +830,30 @@ class TestComposeMetricsProfile:
         assert "--profile archive --profile metrics down" in justfile
 
 
+class TestComposeCapsEveryLog:
+    """A crash-looping container writes to the same disk that is usually why it is
+    crashing, so an uncapped json-file log wedges the host it reports from. The cap
+    is an anchor rather than eight copies: a ninth service picks it up only by
+    saying so, which is what this pins."""
+
+    def test_every_service_takes_the_logging_anchor(self) -> None:
+        section = re.search(
+            r"^services:\n(.*?)(?=^\S|\Z)", _compose_directives(), re.S | re.M
+        )
+        assert section is not None
+        names = re.findall(r"^  (\S+):$", section.group(1), re.M)
+        assert names, "no services found"
+        missing = [n for n in names if "<<: *logging" not in _service_block(n)]
+        assert not missing, missing
+
+    def test_the_anchor_caps_total_size(self) -> None:
+        """10m x 3 files. Raising either without the other moves the real ceiling
+        somewhere the comment above no longer describes."""
+        directives = _compose_directives()
+        assert 'max-size: "10m"' in directives
+        assert 'max-file: "3"' in directives
+
+
 class TestComposeBakesTheCommit:
     """`-debug` reports the commit it is running by reading the GIT_SHA ENV baked
     into the image — the OCI label the Dockerfile also stamps is invisible from
