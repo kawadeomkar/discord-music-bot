@@ -76,6 +76,12 @@ class TestAppInitDefaults:
         # a stale True would skip teardown entirely.
         assert MusicBotApp()._teardown_started is False
 
+    def test_the_shard_ready_wait_is_shortened(self) -> None:
+        """discord.py's _delay_ready loop exits only by timing out, so this value
+        is charged to every start. Dropping the default 2.0 is the whole saving;
+        a revert would silently add 1.5s back to each restart."""
+        assert MusicBotApp()._connection.guild_ready_timeout == 0.5
+
 
 class TestSetupHook:
     @pytest.fixture(autouse=True)

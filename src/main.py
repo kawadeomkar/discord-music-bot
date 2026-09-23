@@ -155,6 +155,13 @@ class MusicBotApp(commands.AutoShardedBot):
             description="Plays YouTube, Spotify and SoundCloud audio in voice channels.",
             strip_after_prefix=True,
             help_command=MusicHelpCommand(),
+            # discord.py waits this long for ANOTHER GUILD_CREATE before declaring
+            # the shard ready, and its loop exits only by timing out — so the full
+            # value is charged to every start. The whole GUILD_CREATE stream
+            # measured 0.266s here, leaving 1.9x headroom at 0.5 (default 2.0).
+            # A dial, not a threshold: raise it if a guild is missing from
+            # bot.guilds at on_ready.
+            guild_ready_timeout=0.5,
         )
         self._redis_pool = None
         self.redis = None
