@@ -1,5 +1,6 @@
 """Tests for src/sources.py — URL parsing and source type detection."""
 
+import re
 import time
 from collections.abc import Callable
 from typing import NamedTuple, Optional
@@ -11,7 +12,9 @@ from src.sources import (
     LINK_MAX_CHARS,
     is_link,
     unquote_argument,
+    MAX_START_OFFSET_SECS,
     QUERY_SOURCE_SEARCH,
+    START_OFFSET_FORMATS,
     TIMESTAMP_FORMATS,
     QUERY_SOURCE_SOUNDCLOUD,
     QUERY_SOURCE_SPOTIFY,
@@ -25,6 +28,7 @@ from src.sources import (
     YTType,
     normalize_query_host,
     parse_input,
+    parse_start_offset,
     parse_timestamp,
     parse_url,
     query_source_of,
@@ -851,6 +855,65 @@ class TestParseTimestamp:
         — the "at least one group" guard is what stops that being 0 seconds."""
         assert parse_timestamp("") is None
 
+    @pytest.mark.parametrize("raw", ["²", "①", "₁", "¹²"])
+    def test_a_digit_int_rejects_is_not_a_timestamp(self, raw: str) -> None:
+        """str.isdigit() is True for these and int() rejects them. This promises
+        never to raise, and the flag parser calls it as a front door — outside any
+        handler that would turn a ValueError into an answer."""
+        assert parse_timestamp(raw) is None
+
+    def test_a_non_ascii_decimal_digit_still_parses(self) -> None:
+        """`\\d` is the Nd category, which int() takes: narrowing to ASCII would
+        make the bare-seconds form reject what the clock form accepts."""
+        assert parse_timestamp("١٢") == 12
+
+
+class TestParseStartOffset:
+    """`--timestamp`'s grammar: the clock a user reads off a player, on top of
+    everything `t=` takes."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("1:32", 92),
+            ("0:07", 7),
+            ("2:04:30", 7470),
+            ("1:00:00", 3600),
+            ("120:00", 7200),  # two-part: 120 minutes, its only reading
+            ("0:00", 0),
+            ("  1:32  ", 92),
+            # Everything parse_timestamp takes comes through unchanged.
+            ("90", 90),
+            ("90s", 90),
+            ("1m30s", 90),
+            ("2h30m15s", 9015),
+        ],
+    )
+    def test_valid_forms(self, raw: str, expected: int) -> None:
+        assert parse_start_offset(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw", ["1:75", "1:60", "2:70:00", "1:99:00", "1:2", "1:", ":30", "", "abc"]
+    )
+    def test_invalid_forms_return_none(self, raw: str) -> None:
+        """Seconds at or past 60, and the minutes of a three-part clock, are a
+        typo: reading `1:75` as 135 would seek somewhere the user did not name."""
+        assert parse_start_offset(raw) is None
+
+    def test_a_three_part_clock_bounds_its_minutes_and_a_two_part_does_not(
+        self,
+    ) -> None:
+        """`120:00` is 120 minutes; `1:120:00` is a typo, since the minutes there
+        sit between an hours field and a seconds field."""
+        assert parse_start_offset("120:00") == 7200
+        assert parse_start_offset("1:120:00") is None
+
+    def test_the_clock_form_stays_out_of_parse_timestamp(self) -> None:
+        """Two parsers, not one widened: YouTube's `t=` never emits a clock, so a
+        pasted `?t=1:32` must keep meaning what it means today."""
+        assert parse_start_offset("1:32") == 92
+        assert parse_timestamp("1:32") is None
+
 
 class TestLinkHost:
     def test_plus_and_pipe_are_not_hostname_characters(self) -> None:
@@ -1049,6 +1112,25 @@ class TestTimestampWarning:
         assert warning is not None
         assert "`x`" not in warning
         assert "[y](z)" not in warning
+
+
+class TestStartOffsetFormats:
+    def test_it_names_the_clock_form_the_flag_adds(self) -> None:
+        """The two lists live beside the parser that accepts them; this one is
+        wider by exactly the clock form."""
+        assert "1:32" in START_OFFSET_FORMATS
+        assert "1:32" not in TIMESTAMP_FORMATS
+        for shape in ("90", "90s", "2h30m15s"):
+            assert shape in START_OFFSET_FORMATS
+
+    def test_every_named_shape_parses(self) -> None:
+        """A format list that quotes a shape the parser rejects sends the user
+        round in a circle."""
+        for shape in re.findall(r"`([^`]+)`", START_OFFSET_FORMATS):
+            assert parse_start_offset(shape) is not None, shape
+
+    def test_the_bound_is_longer_than_any_song(self) -> None:
+        assert MAX_START_OFFSET_SECS == 24 * 3600
 
 
 _VIDEO = "dQw4w9WgXcQ"

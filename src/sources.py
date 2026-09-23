@@ -18,9 +18,21 @@ log = get_logger(__name__)
 # older clients and re-pasted for years.
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 
+# The clock a user reads off a player, accepted by parse_start_offset alone:
+# YouTube's `t=` never emits it, so widening parse_timestamp would change what a
+# pasted link means.
+_CLOCK_RE: Final[re.Pattern[str]] = re.compile(r"(?:(\d+):)?(\d+):(\d{2})")
+
+# Longer than any song, and the bound on what reaches ffmpeg's `-ss` and the
+# embeds that render an offset back.
+MAX_START_OFFSET_SECS: Final = 24 * 3600
+
 # Quoted back to the user when their timestamp does not parse; beside the regex
 # so the accepted shapes have one definition.
 TIMESTAMP_FORMATS: Final = "`90`, `90s`, `1m30s`, `2h30m15s`"
+
+# The same list for `--timestamp`, which takes the clock form on top.
+START_OFFSET_FORMATS: Final = "`1:32`, `2:04:30`, `90`, `90s`, `2h30m15s`"
 
 
 def parse_timestamp(raw: str) -> Optional[int]:
@@ -31,7 +43,9 @@ def parse_timestamp(raw: str) -> Optional[int]:
     raw = raw.strip().lower()
     if not raw:
         return None
-    if raw.isdigit():
+    # isdecimal, not isdigit: isdigit is True for `²` and `①`, which int()
+    # rejects, and this promises never to raise.
+    if raw.isdecimal():
         return int(raw)
     match = _HMS_RE.fullmatch(raw)
     # An all-optional pattern also matches the empty string, so require a group.
@@ -41,9 +55,26 @@ def parse_timestamp(raw: str) -> Optional[int]:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def parse_start_offset(raw: str) -> Optional[int]:
+    """Seconds from a `--timestamp` value, or None if it isn't one. The clock
+    form first, then everything `t=` takes. Seconds must be under 60, and so
+    must the minutes of a three-part clock: `1:75` is a typo, and reading it as
+    135 would seek somewhere the user did not name. A two-part `120:00` is 120
+    minutes, which is its only reading."""
+    raw = raw.strip().lower()
+    clock = _CLOCK_RE.fullmatch(raw)
+    if clock is None:
+        return parse_timestamp(raw)
+    hours, minutes, seconds = clock.groups()
+    if int(seconds) >= 60 or (hours is not None and int(minutes) >= 60):
+        return None
+    return int(hours or 0) * 3600 + int(minutes) * 60 + int(seconds)
+
+
 # The unparseable `t=` is quoted inside a sentence, and a pasted URL fragment
-# can be arbitrarily long.
-_TIMESTAMP_ECHO_MAX = 40
+# can be arbitrarily long. Public: the `--timestamp` flag echoes its own value
+# back the same way.
+TIMESTAMP_ECHO_MAX: Final = 40
 # Likewise the path segment an unsupported Spotify link names as its type.
 _SPOTIFY_KIND_ECHO_MAX = 40
 # Spotify ids are base62.
@@ -59,7 +90,7 @@ def timestamp_warning(
     if not isinstance(source, YTSource) or source.bad_timestamp is None:
         return None
     # safe_label: rendered inside a code span, and a backtick would close it.
-    shown = safe_label(source.bad_timestamp, _TIMESTAMP_ECHO_MAX)
+    shown = safe_label(source.bad_timestamp, TIMESTAMP_ECHO_MAX)
     return (
         f"⚠️ Couldn't read the timestamp `{shown}` in that link — starting from "
         f"the beginning. YouTube's `t=` takes {TIMESTAMP_FORMATS}."
@@ -202,7 +233,8 @@ class YTSource:
 @dataclass(frozen=True)
 class SoundcloudSource:
     # TODO: SoundCloud timestamp links are ignored, so the track always starts at 0:00.
-    # parse_url() reads `t`/`ts` for youtube.com only, so `ts` is never populated.
+    # parse_url() reads `t`/`ts` for youtube.com only, so `ts` is never populated;
+    # `-play --timestamp` is how a SoundCloud track gets a start offset today.
     url: str
     ts: Optional[int] = None
     process: bool = False

@@ -32,6 +32,9 @@ from src.play_pipeline import (
     ResolvedYoutubePlaylist,
     _rebase_positions,
     collection_note,
+    effective_start_offset,
+    past_end_refusal,
+    start_offset_refusal,
 )
 from src.redis_client import GuildRedisStore
 from src.util import ECHO_MAX, ECHO_ROW_MAX, EMBED_DESCRIPTION_LIMIT
@@ -189,6 +192,267 @@ def _enqueue_mp(mock_ctx: MagicMock) -> MagicMock:
     mp.enqueue_depth = MagicMock(return_value=0)
     mock_ctx.message.add_reaction = AsyncMock()
     return mp
+
+
+class TestTheStartOffsetReachesTheSong:
+    """`--timestamp` is applied inside queue_source, so a link's `t=` and the flag
+    reach a song by one route."""
+
+    @staticmethod
+    def _yt(**kwargs: Any) -> Any:
+        return YTSource(url="https://youtu.be/x", process=False, **kwargs)
+
+    def test_the_flag_beats_the_links_own_timestamp(self) -> None:
+        """A link whose `t=` did not take is the likeliest reason to reach for the
+        flag, so the flag cannot lose to it."""
+        assert effective_start_offset(self._yt(ts=43), 92) == 92
+        assert effective_start_offset(self._yt(ts=43), None) == 43
+        assert effective_start_offset(self._yt(), None) is None
+
+    def test_a_zero_offset_is_the_flag_and_not_its_absence(self) -> None:
+        """0 is falsy; reading it by truthiness would silently restore the link's
+        own `t=` for `-p -ts 0 <link with ?t=43>`."""
+        assert effective_start_offset(self._yt(ts=43), 0) == 0
+
+    def test_a_spotify_source_carries_no_timestamp_of_its_own(self) -> None:
+        """SpotifySource has no `ts` field at all, so the narrowing is what keeps
+        this from raising."""
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid")
+        assert effective_start_offset(source, None) is None
+        assert effective_start_offset(source, 92) == 92
+
+    async def test_a_search_is_resolved_at_the_offset(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A search is the input with no `t=` to carry one, which is the whole
+        reason the flag exists."""
+        source = parse_input("never gonna give you up")
+        with patch.object(YTDL, "yt_source", new=AsyncMock()) as yt_source:
+            await play_pipeline.queue_source(
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                start_offset=92,
+                cog=music_bot,
+            )
+        assert yt_source.await_args is not None
+        assert yt_source.await_args.kwargs["ts"] == 92
+
+    async def test_a_soundcloud_link_is_resolved_at_the_offset(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """parse_url never populates SoundcloudSource.ts, so the flag is the only
+        start offset a SoundCloud track can get."""
+        with patch.object(YTDL, "yt_source", new=AsyncMock()) as yt_source:
+            await play_pipeline.queue_source(
+                mock_ctx,
+                SoundcloudSource(url="https://soundcloud.com/a/b"),
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                start_offset=92,
+                cog=music_bot,
+            )
+        assert yt_source.await_args is not None
+        assert yt_source.await_args.kwargs["ts"] == 92
+
+    async def test_a_watch_link_with_a_list_starts_its_queued_head(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The shape YouTube's share button emits while a playlist is queued. The
+        `t=` on this exact link already starts track 4 at its offset, so the flag
+        does the same rather than disagreeing with it."""
+        source = parse_url("https://youtube.com/watch?v=vid4&list=PL1&index=4")
+        tracks = [
+            queue_object(
+                QueueObject(f"https://yt.com/v=vid{n}", f"S{n}", mock_ctx.author)
+            )
+            for n in range(1, 6)
+        ]
+        with patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)):
+            result = await play_pipeline.queue_source(
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                start_offset=92,
+                cog=music_bot,
+            )
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        # index=4 dropped the three ahead of it, so the head IS the `v=` video.
+        assert [t.webpage_url for t in result.tracks] == [
+            "https://yt.com/v=vid4",
+            "https://yt.com/v=vid5",
+        ]
+        assert [t.ts for t in result.tracks] == [92, None]
+
+    async def test_it_does_not_land_on_a_head_the_link_does_not_name(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Without a matching `index=` the queue starts at track 1, usually a
+        different song — the same guard the link's own `t=` passes through."""
+        source = parse_url("https://youtube.com/watch?v=vid4&list=PL1")
+        tracks = [
+            queue_object(
+                QueueObject(f"https://yt.com/v=vid{n}", f"S{n}", mock_ctx.author)
+            )
+            for n in range(1, 6)
+        ]
+        with patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)):
+            result = await play_pipeline.queue_source(
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                start_offset=92,
+                cog=music_bot,
+            )
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert [t.ts for t in result.tracks] == [None] * 5
+
+
+class TestStartOffsetRefusals:
+    """The two refusals, at the two points they can be answered: the input shape
+    before the join, and the resolved duration after it."""
+
+    def test_a_collection_is_refused_off_the_parsed_source(self) -> None:
+        """Answered before the join and before any extraction: one offset over N
+        songs names none of them."""
+        for link in (
+            "https://youtube.com/playlist?list=PL1",
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+            "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
+        ):
+            assert start_offset_refusal(parse_url(link)) is not None
+
+    def test_it_calls_an_album_an_album(self) -> None:
+        refusal = start_offset_refusal(
+            parse_url("https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl")
+        )
+        assert refusal is not None and "album" in refusal
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://youtube.com/watch?v=vid4&list=PL1&index=4",
+            "https://soundcloud.com/a/b",
+            "https://open.spotify.com/track/1",
+        ],
+    )
+    def test_one_song_and_a_named_video_are_allowed(self, link: str) -> None:
+        assert start_offset_refusal(parse_url(link)) is None
+
+    def test_a_search_is_allowed(self) -> None:
+        assert start_offset_refusal(parse_input("never gonna give you up")) is None
+
+    def test_a_youtu_be_link_carrying_a_list_names_its_video(self) -> None:
+        """youtu.be puts the video in the path, where `v=` never appears, so its
+        `video_id` comes from there — the offset can name the queued head exactly
+        as it does on a watch link."""
+        source = parse_url("https://youtu.be/dQw4w9WgXcQ?list=PL1")
+        assert isinstance(source, YTSource) and source.video_id == "dQw4w9WgXcQ"
+        assert start_offset_refusal(source) is None
+
+    @pytest.mark.parametrize(
+        "uri,refused",
+        [
+            ("spotify:track:4uLU6hMCjMI75M1A2tKUQC", False),
+            ("spotify:album:6WgSCcRfaXuBVfM2TpV0Kl", True),
+            ("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M", True),
+        ],
+    )
+    def test_a_spotify_uri_is_judged_like_its_link(
+        self, uri: str, refused: bool
+    ) -> None:
+        """A `spotify:` URI reaches the same SpotifySource as the open.spotify.com
+        link, so one offset rule covers both spellings."""
+        assert (start_offset_refusal(parse_url(uri)) is not None) is refused
+
+    def test_the_two_refusals_read_the_same_input_set(self) -> None:
+        """They sit in two modules and run at two points in the flow; a source one
+        refuses and the other resolves would drop the offset in silence."""
+        for link in (
+            "https://youtube.com/playlist?list=PL1",
+            "https://youtube.com/watch?v=v&list=PL1",
+            "https://youtu.be/dQw4w9WgXcQ?list=PL1",
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+            "https://youtu.be/x",
+        ):
+            source = parse_url(link)
+            refused = start_offset_refusal(source) is not None
+            assert refused is (
+                play_pipeline.is_collection(source)
+                and not (isinstance(source, YTSource) and bool(source.video_id))
+            )
+
+    def test_an_offset_at_or_past_the_end_is_refused(self, mock_ctx: MagicMock) -> None:
+        qobj = QueueObject(
+            "https://yt.com/v=1", "Test Song", mock_ctx.author, duration=210
+        )
+        assert past_end_refusal(qobj, 210) is not None
+        assert past_end_refusal(qobj, 900) is not None
+        assert past_end_refusal(qobj, 209) is None
+
+    def test_an_unknown_or_zero_duration_rules_nothing_out(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Livestreams report both, and an offset that cannot be checked stands —
+        ffmpeg judges it."""
+        for duration in (None, 0):
+            qobj = QueueObject(
+                "https://yt.com/v=1", "Live", mock_ctx.author, duration=duration
+            )
+            assert past_end_refusal(qobj, 9000) is None
+
+    def test_no_flag_means_no_refusal(self, mock_ctx: MagicMock) -> None:
+        """A link's own `?t=` past the end keeps starting at 0:00 as it always
+        has; only the explicit flag is answered."""
+        qobj = QueueObject(
+            "https://yt.com/v=1", "T", mock_ctx.author, duration=60, ts=900
+        )
+        assert past_end_refusal(qobj, None) is None
+
+    def test_a_collection_the_offset_never_reached_is_not_measured(self) -> None:
+        assert past_end_refusal(ResolvedSpotifyPlaylist(titles=["A"]), 9000) is None
+        assert past_end_refusal(ResolvedYoutubePlaylist([]), 9000) is None
+
+    def test_a_playlist_head_the_offset_landed_on_is_measured(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A `watch?v=…&list=…` link starts its queued head, so the ordinary
+        placement has to answer it the way the interjection does — there the head
+        arrives as a bare QueueObject and would be checked either way."""
+        head = QueueObject(
+            "https://yt.com/v=v4", "S4", mock_ctx.author, duration=210, ts=9000
+        )
+        playlist = ResolvedYoutubePlaylist([head])
+        assert past_end_refusal(playlist, 9000) is not None
+        assert past_end_refusal(ResolvedYoutubePlaylist([head]), 60) is None
+
+    def test_it_names_both_clocks(self, mock_ctx: MagicMock) -> None:
+        qobj = QueueObject(
+            "https://yt.com/v=1", "Test Song", mock_ctx.author, duration=210
+        )
+        refusal = past_end_refusal(qobj, 7470)
+        assert refusal is not None
+        assert "2:04:30" in refusal and "3:30" in refusal
+        assert "Test Song" in refusal
+
+    def test_the_title_cannot_forge_a_link_in_the_refusal(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The title is yt-dlp's text on its way into an embed description."""
+        qobj = QueueObject(
+            "https://yt.com/v=1", "[a](http://evil)`x`", mock_ctx.author, duration=60
+        )
+        refusal = past_end_refusal(qobj, 900)
+        assert refusal is not None
+        assert "[a](http://evil)" not in refusal and "`x`" not in refusal
 
 
 class TestEnqueuePlaylist:

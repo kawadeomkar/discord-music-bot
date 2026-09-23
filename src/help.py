@@ -63,7 +63,8 @@ SOURCES = (
     "Each title is matched to its YouTube audio, so an album or playlist may "
     "take a moment to queue. Artist and podcast links can't be played.\n"
     "**SoundCloud** — track links.\n"
-    "A link can be wrapped in `<…>` to hide its preview."
+    "A link can be wrapped in `<…>` to hide its preview. Any one song, from any "
+    "of these, can start partway in: `-play --timestamp 1:32 <song>`."
 )
 
 _ALONE_TIMEOUT = server_spec(ConfigField.ALONE_TIMEOUT)

@@ -7250,7 +7250,7 @@ class TestQueueEntryCard:
         )
         seed_queue(music_player.queue, item)
 
-        assert "Starts at `83s`" in self._next_up_body(music_player)
+        assert "Starts at `1:23`" in self._next_up_body(music_player)
 
     def test_placeholders_for_unknown_duration_and_uploader(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -11639,8 +11639,8 @@ class TestAnnounceResume:
 
 
 class TestStartOffsetAnnounce:
-    """The "Starting song at Xs" notice for a `?t=` link. Sent by YTDL.yt_stream at
-    construction until this branch, which announced under the wrong song."""
+    """The "Starting song at 1:30" notice for a start offset, whether a link's
+    `?t=` or a `--timestamp` set it."""
 
     async def test_wording(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
@@ -11648,7 +11648,7 @@ class TestStartOffsetAnnounce:
         live_song.start_offset = 90
         await music_player._announce_start_offset(live_song)
         embed = mock_channel.send.call_args.kwargs["embed"]
-        assert "Starting song at 90 seconds" in embed.description
+        assert "Starting song at 1:30" in embed.description
 
     async def test_send_failure_swallowed(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
@@ -11719,13 +11719,15 @@ class TestResumeEntryDisplay:
         embed = music_player.queue_embed()
         assert "⏮ resumes at `2:30`" in described(embed)
 
-    async def test_plain_ts_note_unchanged(
+    async def test_a_plain_start_offset_renders_as_a_clock(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=30, duration=210)
+        """The same format as its is_resume twin two lines up, and as the bar,
+        the presence and every other duration."""
+        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=90, duration=210)
         await music_player.queue.put([item])
         embed = music_player.queue_embed()
-        assert "starts at `30s`" in described(embed)
+        assert "starts at `1:30`" in described(embed)
 
 
 class TestEstimatedFinishUsesRemaining:

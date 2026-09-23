@@ -557,22 +557,24 @@ class MusicBot(commands.Cog):
         brief="queue a song and start playing",
         usage="[--now|--next] <url|search>",
         help=(
-            "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track, album or playlist link or `spotify:` URI, "
-            "a SoundCloud link, or plain words to search YouTube with.\n\n"
-            "If the bot is not connected yet it joins your voice channel first. "
-            "Otherwise the song is appended to the queue with an estimated start time. "
-            "A `?t=` / `?ts=` timestamp starts it at that offset, and a playlist link's "
-            "`&index=` starts from that position instead of from the first track.\n\n"
-            "One option, as the first word:\n\n"
-            "`--now` plays it immediately. The interrupted song returns from the exact "
-            "position it left off at, paused if it was paused, unless it was nearly "
-            "over. Interrupt again and the parked songs unwind most recent first.\n\n"
-            "`--next` queues it at the front instead, without interrupting anything."
+            "Queues a song and starts playback. Takes a YouTube, Spotify or "
+            "SoundCloud link \u2014 track, playlist or album, or a `spotify:` URI \u2014 "
+            "or plain words to search YouTube with.\n\n"
+            "Not connected? It joins your channel first; otherwise it's appended "
+            "with an estimated start time. A link's `?t=` starts it at that "
+            "offset, and a playlist link's `&index=` from that position rather than "
+            "the first track.\n\n"
+            "Options, before the song, any order:\n\n"
+            "`--now` plays it immediately. The interrupted song returns from where it "
+            "left off, paused if it was paused, unless it was nearly over. Interrupt "
+            "again and the parked songs unwind most recent first.\n\n"
+            "`--next` queues it at the front instead, interrupting nothing. Both take "
+            "a playlist or album in full, so with `--now` the interrupted song returns "
+            "after the last track; `-remove <the link>` undoes it all."
             "\n\n"
-            "Both take a whole playlist or album in full. With `--now` that means the "
-            "interrupted song does not return until the last track — `-remove` with "
-            "the same link takes the whole thing back out."
+            "`--timestamp 1:32` (or `-ts`) starts the song partway in, whatever the "
+            "link, and beats its `?t=`. Also takes `2:04:30`, `90`, `90s`, "
+            "`2h30m15s`. Past the end, nothing is queued."
         ),
         extras={
             "category": "Playback",
@@ -580,6 +582,8 @@ class MusicBot(commands.Cog):
                 "-play never gonna give you up",
                 "-p --now never gonna give you up",
                 "-p --next https://youtu.be/dQw4w9WgXcQ",
+                "-play --timestamp 1:32 never gonna give you up",
+                "-p --now -ts 43 https://youtu.be/dQw4w9WgXcQ",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
                 "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
@@ -625,8 +629,9 @@ class MusicBot(commands.Cog):
             "interrupted song is not lost — it comes back from the exact position "
             "it left off at, and if it was paused it returns paused.\n\n"
             "The same request as `-play --now`, kept as its own command. Takes the "
-            "same input as `-play`. If nothing is playing there is nothing to "
-            "interrupt, so this behaves exactly like `-play`.\n\n"
+            "same input as `-play`, `--timestamp` included. If nothing is playing "
+            "there is nothing to interrupt, so this behaves exactly like `-play`."
+            "\n\n"
             "A playlist or album is taken in full: its first track interrupts, the "
             "rest queue behind it, and the interrupted song returns after the last "
             "of them. `-remove` with the same link takes the whole thing back out."
@@ -635,6 +640,7 @@ class MusicBot(commands.Cog):
             "category": "Playback",
             "examples": [
                 "-playnow never gonna give you up",
+                "-pn -ts 1:32 never gonna give you up",
                 "-pn https://youtu.be/dQw4w9WgXcQ",
             ],
             "note": (
@@ -673,7 +679,8 @@ class MusicBot(commands.Cog):
             "current song ends. Nothing is interrupted — unlike `-playnow`, whatever "
             "is playing finishes first.\n\n"
             "The same request as `-play --next`, kept as its own command. Takes the "
-            "same input as `-play`, and takes a whole playlist or album in full.\n\n"
+            "same input as `-play`, `--timestamp` included, and takes a whole "
+            "playlist or album in full.\n\n"
             "Send it twice and the second one lands behind the first: each takes the "
             "front of the queue as it arrives, so they play in the order you asked."
         ),
@@ -681,6 +688,7 @@ class MusicBot(commands.Cog):
             "category": "Playback",
             "examples": [
                 "-playnext never gonna give you up",
+                "-pnx -ts 1:32 never gonna give you up",
                 "-pnx https://youtu.be/dQw4w9WgXcQ",
             ],
             "note": (

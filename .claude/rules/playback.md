@@ -33,8 +33,12 @@ three separate phases so queueing is instant and songs start with near-zero late
   │ validate_commands: author must be in a usable voice channel
   ▼
 play():
-  ├─ split_play_args: strips a LEADING --now / --next off the argument (PlayMode);
-  │        a near-miss like -now becomes a hint, not a search for "now <url>"
+  ├─ split_play_args: strips a LEADING RUN of options off the argument, one per
+  │        _PLAY_OPTIONS field (--now/--next share `mode`, so they exclude each
+  │        other; --timestamp <time> sets its own), in any order. The parser names
+  │        no option — the registry drives parsing, refusals and the
+  │        did-you-mean. A near-miss like -now becomes a hint, not a search for
+  │        "now <url>"; a repeat, a conflict or an unreadable value queues nothing
   ├─ PlayRegistry.register: admit to the guild's in-flight set (PLAY_INFLIGHT_MAX,
   │        default 16, declined past it), snapshot the queue generation. Requests
   │        resolve CONCURRENTLY; only the insert is serialized — see .place()
@@ -47,6 +51,10 @@ play():
   │        host → URLSource.OTHER for yt-dlp; a Spotify link that names nothing
   │        playable raises UnsupportedSpotifyLinkError before any join); else ytsearch.
   │        is_link is the one link-or-text verdict. docs/ARCHITECTURE.md#source-resolution
+  ├─ --timestamp given? start_offset_refusal reads the PARSED source, so a
+  │        collection naming no track is answered before the join. Applied in
+  │        queue_source (beating the link's own t=), then past_end_refusal on the
+  │        resolved duration — after the join, so the cold start is torn back down
   ├─ placement (Placement enum — the insert position, decided separately from
   │        cold_start, which also drives the analytics shortcut and the join dance):
   │      • disconnected              → COLD_FRONT
@@ -275,7 +283,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
   casefolds — folding a link would let one Spotify playlist's base62 id match another's.
 
-### `-play --now` / `--next` placement, interjection and resume entries
+### `-play --now` / `--next` / `--timestamp` placement, interjection and resume entries
 
 `MusicPlayer.interject(qobj, vc, resume_paused)` implements "play this now, then put the
 interrupted song back where it was":

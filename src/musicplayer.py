@@ -1325,7 +1325,7 @@ class MusicPlayer:
         elif item.is_resume and item.ts:
             detail.append(f"⏮ Resumes at `{fmt_duration(item.ts)}`")
         elif item.ts:
-            detail.append(f"Starts at `{item.ts}s`")
+            detail.append(f"Starts at `{fmt_duration(item.ts)}`")
         return "\n".join(
             [
                 f"Requested by: [{requester_mention(item.requester)}]",
@@ -1929,7 +1929,7 @@ class MusicPlayer:
         try:
             await self._channel.send(
                 embed=self._notice(
-                    f"Starting song at {song.start_offset} seconds",
+                    f"Starting song at {fmt_duration(song.start_offset)}",
                     discord.Color.blue(),
                 )
             )

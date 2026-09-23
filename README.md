@@ -27,6 +27,9 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   interrupted song resumes afterward from the position it left off
 - **`-play --next` queue jump** — put a song (or a whole playlist) at the front of the
   queue without interrupting what is playing
+- **`-play --timestamp` start offset** — start any song partway in, whatever the link:
+  a search, a Spotify track and a SoundCloud link can all take one, and it beats a `?t=`
+  on the link it is given
 - **Crash recovery** — queue, current song (with playback position), volume, and
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
@@ -57,9 +60,9 @@ details, aliases, and examples.
 
 | Command | Aliases | Description |
 |---|---|---|
-| `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything. A playlist that takes more than a couple of seconds to read shows a live card with its progress, which disappears when the songs land |
-| `-playnow <url\|search>` | `pn` | The same request as `-play --now`, kept as its own command |
-| `-playnext <url\|search>` | `pnx` | The same request as `-play --next`, kept as its own command |
+| `-play [--now\|--next] [--timestamp <time>] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything. `--timestamp` (or `-ts`) starts the song partway in — `1:32`, `2:04:30`, `90`, `90s`, `2h30m15s` — and beats a `?t=` on the link; a time past the end of the song queues nothing and says so. The options go before the song, in any order. A playlist that takes more than a couple of seconds to read shows a live card with its progress, which disappears when the songs land |
+| `-playnow <url\|search>` | `pn` | The same request as `-play --now`, kept as its own command; takes `--timestamp` too |
+| `-playnext <url\|search>` | `pnx` | The same request as `-play --next`, kept as its own command; takes `--timestamp` too |
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
@@ -107,6 +110,8 @@ https://soundcloud.com/artist/track
 https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported site
 never gonna give you up                          # plain text searches YouTube
 ```
+
+Any one of these can start partway in: `-play --timestamp 1:32 <input>`.
 
 A video link carrying `&list=` queues that whole list, not just the video. The link
 YouTube's player hands you for a song you reached through a Mix carries
@@ -568,6 +573,34 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Upgrading to 2.48.0
+
+**`-play` takes a start offset, and three things it already did read differently.**
+Nothing to configure and no data touched; rolling back is only a redeploy.
+
+- **New:** `-play --timestamp 1:32 <song>` (or `-ts`) starts any song partway in —
+  a search, a Spotify track and a SoundCloud link included, none of which could carry
+  a start offset before. It takes `1:32`, `2:04:30`, `90`, `90s` or `2h30m15s`, goes
+  among the leading options in any order, and works on `-playnow` and `-playnext` too.
+  It beats a `?t=` on the same link. A time at or past the end of the song queues
+  nothing and says so; a link that queues a playlist is refused, unless it names a
+  `v=` video, where it starts that track exactly as a `&t=` on it already did.
+- **Queue ETAs shrink for a song with a start offset.** A `?t=` song used to be billed
+  its full length, so every song behind it was estimated that much too late. It is now
+  billed what actually plays. Nothing about playback changes — only the estimates, and
+  only for a queue holding such a song.
+- **A start offset renders as a clock.** `starts at 1:30` in the queue and the Now
+  Playing card, and `Starting song at 1:30` when it begins, where all three read
+  `90s` / `90 seconds` before.
+- **For operators:** a `-play` span now carries `play.start_offset` when the flag set
+  one (absent otherwise, so a filter for offset plays does not match every `-play`), and
+  `play.refused` naming why a request queued nothing. A refusal sends an embed and logs
+  nothing, so without that attribute it left no record it had run.
+- **A repeated or conflicting option on `-play` is now answered, not searched for.**
+  `-play --now --next <song>` and `-play --now --now <song>` used to search YouTube for
+  the leftover flag as part of the text; they now reply and queue nothing. An option
+  after the song is unaffected — `-play <song> --now` is still a search for all of it.
 
 ## Upgrading to 2.45.0
 

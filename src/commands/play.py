@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Union
 
 import discord
@@ -13,8 +14,6 @@ from opentelemetry import trace
 from src.guild_state import Analytics
 from src.musicplayer import MusicPlayer
 from src.play_placement import (
-    NEXT_FLAG,
-    NOW_FLAG,
     PlaceStalled,
     ResolveWaitExpired,
     resolve_mode_for,
@@ -50,6 +49,8 @@ from src import play_pipeline
 from src.play_pipeline import (
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
+    past_end_refusal,
+    start_offset_refusal,
 )
 
 log = get_logger(__name__)
@@ -70,13 +71,22 @@ if TYPE_CHECKING:
     from src.musicbot import MusicBot
 
 
-async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
-    """`-play` — split the placement flag off, then resolve, join if needed, queue.
+async def run(
+    ctx: commands.Context,
+    url: str,
+    *,
+    cog: MusicBot,
+    force_mode: Optional[PlayMode] = None,
+) -> None:
+    """`-play` — split the leading options off, then resolve, join if needed, queue.
     Takes the cog: the cold path runs -join through discord.py and tears the player
-    down when that join produces no usable client."""
+    down when that join produces no usable client. `force_mode` is the placement a
+    dedicated spelling pins, overriding whatever the argument asked for."""
     # Consume-rest, so a multi-word search arrives whole — it is what -remove
     # matches on. The strip covers callers that bypass discord.py's parser.
     args = split_play_args(url.strip())
+    if force_mode is not None:
+        args = replace(args, mode=force_mode)
     # The player is bound here, not after the resolve: every failure path hands
     # this exact one to abandon_cold_start. The query is unquoted to match what
     # _run_placed stores as the entry's origin, which is what -remove matches on.
@@ -104,21 +114,31 @@ async def run(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
 async def run_now(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
     """`-playnow` — the same request as `-play --now`, kept as its own command.
 
-    The placement is re-parsed and forced rather than prepended: a user who spells
-    a flag here anyway (`-playnow --next x`) would otherwise have it searched for
-    as part of the query. One entry point behind both spellings, so the placement
-    grammar, the admission and the confirmation cannot fork.
+    The argument goes through the same grammar and the placement is then forced,
+    so a flag a user spells here anyway (`-playnow --next x`) is not searched for
+    as text and a `--timestamp` beside it still lands. One entry point behind both
+    spellings, so the grammar, the admission and the confirmation cannot fork.
     """
-    await run(ctx, f"{NOW_FLAG} {split_play_args(url.strip()).query}", cog=cog)
+    await run(ctx, url, cog=cog, force_mode=PlayMode.NOW)
 
 
 async def run_next(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
     """`-playnext` — the same request as `-play --next`, kept as its own command.
 
-    The `--now` sibling's reasoning, one flag over: the placement is re-parsed and
-    forced so a flag the user spells here anyway is not searched for as text.
+    The `--now` sibling's reasoning, one flag over: the argument is parsed and the
+    placement forced, so neither a misspelt placement nor a `--timestamp` is lost.
     """
-    await run(ctx, f"{NEXT_FLAG} {split_play_args(url.strip()).query}", cog=cog)
+    await run(ctx, url, cog=cog, force_mode=PlayMode.NEXT)
+
+
+async def _refuse(
+    ctx: commands.Context, text: str, reason: str, *, color: discord.Color
+) -> None:
+    """Answer a request that queues nothing, and record WHY on the span. Without
+    the stamp a refused -play leaves no trace at all — it logs nothing, and the
+    embed is the only evidence it ever ran."""
+    trace.get_current_span().set_attribute("play.refused", reason)
+    await ctx.send(embed=notice_embed(text, color))
 
 
 async def _run_placed(
@@ -126,27 +146,39 @@ async def _run_placed(
 ) -> None:
     """The body behind -play, taking the argument already split and the request
     the registry admitted."""
-    trace.get_current_span().set_attribute("play.mode", args.mode.value)
+    span = trace.get_current_span()
+    span.set_attribute("play.mode", args.mode.value)
+    # A `--timestamp` changes where the song starts and what the archive records,
+    # and leaves `play.mode` at "normal" — so without this the span cannot tell an
+    # offset play from an ordinary one, and neither can anyone reading a trace.
+    if args.start_offset is not None:
+        span.set_attribute("play.start_offset", args.start_offset)
     # ONE rebind, so every `origin=url` below is the query with the flag off: a
     # leaked flag persists a user_input -remove cannot match. read_rest hands the
     # quotes through, so a quoted origin would need a literal match.
     url = unquote_argument(args.query)
     async with background_typing(ctx):
         if args.dash_typo is not None:
-            await ctx.send(
-                embed=notice_embed(
-                    f"Did you mean `{args.dash_typo}`? Options take two dashes.",
-                    discord.Color.orange(),
-                )
+            await _refuse(
+                ctx,
+                f"Did you mean `{args.dash_typo}`? Options take two dashes.",
+                "dash_typo",
+                color=discord.Color.orange(),
             )
             return
+        if args.error is not None:
+            await _refuse(ctx, args.error, "bad_option", color=discord.Color.red())
+            return
         if not url:
-            await ctx.send(
-                embed=notice_embed(
-                    f"Missing argument: `url`. Usage: `{ctx.prefix}play "
-                    f"[{NOW_FLAG}|{NEXT_FLAG}] <url|search>`",
-                    discord.Color.red(),
-                )
+            # The command's own `usage=`, which is what -help renders, so the two
+            # cannot drift. Composed as cog_command_error composes its twin.
+            cmd = ctx.command
+            usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
+            await _refuse(
+                ctx,
+                "Missing argument: `url`." + (f" Usage: {usage}" if usage else ""),
+                "no_query",
+                color=discord.Color.red(),
             )
             return
 
@@ -167,7 +199,7 @@ async def _run_placed(
         # can change.
         if live_vc is not None:
             if args.mode is PlayMode.NOW:
-                return await _interject(ctx, url, mp, live_vc, req, cog=cog)
+                return await _interject(ctx, url, mp, live_vc, req, cog=cog, args=args)
             if live_vc.is_paused() and args.mode is not PlayMode.NEXT:
                 # Paused -> interject: appending would bury the request behind
                 # a paused song. The interrupted song returns PLAYING. `--next`
@@ -179,11 +211,21 @@ async def _run_placed(
                     live_vc,
                     req,
                     cog=cog,
+                    args=args,
                     resume_paused=False,
                     require_paused=True,
                 )
 
         source = parse_input(url)
+        # Before the join below, not after the resolve: a refusal that has already
+        # pulled the bot into a channel has to tear that back down.
+        if args.start_offset is not None:
+            refusal = start_offset_refusal(source)
+            if refusal is not None:
+                await _refuse(
+                    ctx, refusal, "offset_collection", color=discord.Color.red()
+                )
+                return
 
         notice = await _resolve_and_place(ctx, args, req, mp, source, url, cog=cog)
         if notice is not None:
@@ -279,6 +321,7 @@ async def _resolve_and_place(
                     mode=resolve_mode_for(placement),
                     on_progress=progress.update if progress else None,
                     pool_slot=cog._plays.resolve_slot(req),
+                    start_offset=args.start_offset,
                     cog=cog,
                 )
                 # Stamped before the join wait below, so play.resolve_secs times
@@ -330,6 +373,7 @@ async def _resolve_and_place(
                 mode=resolve_mode_for(placement),
                 on_progress=progress.update if progress else None,
                 pool_slot=cog._plays.resolve_slot(req),
+                start_offset=args.start_offset,
                 cog=cog,
             )
             # The cold branch stamps its own above, before the join wait.
@@ -354,6 +398,15 @@ async def _resolve_and_place(
                 discord.Color.orange(),
             )
 
+        # The same order as the restore bail above: the cold start comes down
+        # first, so the refusal is the last thing the channel sees.
+        refusal = past_end_refusal(qobj, args.start_offset)
+        if refusal is not None:
+            trace.get_current_span().set_attribute("play.refused", "offset_past_end")
+            if cold_start:
+                await abandon_cold_start(cog, ctx, mp)
+            return notice_embed(refusal, discord.Color.red())
+
         try:
             if isinstance(qobj, QueueObject):
                 await play_pipeline.enqueue_single(
@@ -362,7 +415,13 @@ async def _resolve_and_place(
                     mp,
                     req,
                     placement=placement,
-                    warning=timestamp_warning(source),
+                    # None when the flag set the offset: the link's dead `t=`
+                    # changed nothing, so naming it would be false.
+                    warning=(
+                        None
+                        if args.start_offset is not None
+                        else timestamp_warning(source)
+                    ),
                     release_hold=hold.aclose,
                     cog=cog,
                 )
@@ -462,6 +521,7 @@ async def _interject(
     req: PlayRequest,
     *,
     cog: MusicBot,
+    args: PlayArgs,
     resume_paused: bool = True,
     require_paused: bool = False,
 ) -> None:
@@ -477,6 +537,7 @@ async def _interject(
             req,
             resume_paused=resume_paused,
             require_paused=require_paused,
+            start_offset=args.start_offset,
             cog=cog,
         )
     except PlaceStalled, ResolveWaitExpired:

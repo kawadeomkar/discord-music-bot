@@ -244,7 +244,7 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 
 | Rule file | Covers |
 |---|---|
-| `.claude/rules/playback.md` | the life of `-play` and the loop's bookkeeping, the per-guild object graph, `GuildQueue`, `--now`/`--next` and resume entries, the Now Playing host; the queue, placement and playback primitives |
+| `.claude/rules/playback.md` | the life of `-play` and the loop's bookkeeping, the per-guild object graph, `GuildQueue`, `--now`/`--next`/`--timestamp` and resume entries, the Now Playing host; the queue, placement and playback primitives |
 | `.claude/rules/state-and-recovery.md` | the Redis schema, the history backfill, crash recovery; the restore, archive and outbox primitives |
 | `.claude/rules/extraction.md` | the yt-dlp pool, client strategy and stream healing, Spotify; the extraction and playlist primitives |
 | `.claude/rules/config.md` | every environment variable, its default and its bounds; the settings primitives |
@@ -252,7 +252,7 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 | `.claude/rules/layout.md` | the annotated module map: what each file holds and where a change belongs |
 | `.claude/rules/ci-and-build.md` | the CI job graph, the image build and deploy, and every duplicated version pin — enforced and unenforced |
 | `.claude/rules/testing.md` | the test layout, the yt-dlp and Discord seams, fakeredis's divergences, the `pg` and `redis` tiers |
-| `.claude/rules/commands.md` | command registration, the one-module-per-command rule and the help copy each command carries |
+| `.claude/rules/commands.md` | command registration, the one-module-per-command rule, which argument mechanism a command takes (and why not argparse), and the help copy each command carries |
 ### Observability
 
 structlog JSON to stdout always; OTLP gRPC traces and logs when `OTEL_SDK_DISABLED`
@@ -343,7 +343,7 @@ Every environment variable, its default and its bounds: `.claude/rules/config.md
 | Where | Marker | Summary |
 |---|---|---|
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
-| sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
+| sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) — `-play --timestamp` is how such a track gets a start offset |
 | youtube.py `yt_source` / `_first_video_entry` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results (the marker moved to `_first_video_entry` with the loop it describes) |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | play_pipeline.py `enqueue_playlist` | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
@@ -351,7 +351,7 @@ Every environment variable, its default and its bounds: `.claude/rules/config.md
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
 | commands/jump.py `run` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
-| guild_state.py `from_crashed_state` | FIXME | A crash-recovered song is a resume in everything but the flag. A song that WAS a `-play --now` tail now round-trips `is_resume` correctly (`from_song` carries it), but a song merely interrupted mid-play comes back with `ts` set and `is_resume` false, so it announces "Starting song at N seconds" rather than resuming. Synthesizing the flag from `ts > 0` would also move the queue display and the interjection wording, so it wants its own change |
+| guild_state.py `from_crashed_state` | FIXME | A crash-recovered song is a resume in everything but the flag. A song that WAS a `-play --now` tail now round-trips `is_resume` correctly (`from_song` carries it), but a song merely interrupted mid-play comes back with `ts` set and `is_resume` false, so it announces "Starting song at 2:17" rather than resuming. Synthesizing the flag from `ts > 0` would also move the queue display and the interjection wording, so it wants its own change |
 
 ## Recipes for common changes
 
