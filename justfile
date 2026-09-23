@@ -40,7 +40,10 @@ set positional-arguments
 set lazy
 
 IMAGE := "discord-music-bot"
-DOCKER := env('DOCKER', '0')
+# Defaults to 1: recipes run inside the test image so a contributor needs only Docker
+# and just. Pass DOCKER=0 to run natively against the local venv (faster, needs the
+# Python toolchain). See the header note below for which recipes honour this.
+DOCKER := env('DOCKER', '1')
 REPO := justfile_directory()
 
 # Call the venv's binaries directly rather than `poetry run`: poetry re-resolves the
@@ -55,15 +58,24 @@ REPO := justfile_directory()
 # from any subdirectory.
 VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } else { REPO / ".venv/bin" }
 
-# ── Where the tools run: local venv (default) or the test image (DOCKER=1) ────
+# ── Where the tools run: the test image (default) or a local venv (DOCKER=0) ──
 #
-#   just check            native, fast — needs Python, Poetry and the venv
-#   DOCKER=1 just check   same checks inside the image — needs only Docker and just
+#   just check            inside the test image — needs only Docker and just
+#   DOCKER=0 just check   same checks native, fast — needs Python, Poetry and the venv
 #
-# DOCKER=1 exists so the project can be handed to someone with no Python toolchain.
-# The checks are the same commands either way; only the interpreter they run under
-# differs. Note the override must PRECEDE the recipe (`DOCKER=1 just check`, not
-# `just check DOCKER=1` — that is a "recipe not found" error).
+# Docker is the DEFAULT so the project can be handed to someone with no Python
+# toolchain: the checks run with only Docker and just installed. Pass DOCKER=0 to run
+# natively against the local venv instead. The checks are the same commands either
+# way; only the interpreter they run under differs. Note the override must PRECEDE the
+# recipe (`DOCKER=0 just check`, not `just check DOCKER=0` — that is a "recipe not
+# found" error).
+#
+# test-pg and test-redis do not honour the switch: see PYTEST_NATIVE.
+#
+# Automated callers that must mirror CI pin DOCKER=0 so they stay native like CI
+# itself: ci.yml's lint/test jobs, build_common.sh's deploy gate, and all five pre-push
+# hooks. Flip the default here and those pins are what keep them from silently moving
+# into Docker.
 #
 # Mount src/ and tests/ as SUBDIRECTORIES, never the repo root. The image keeps its
 # virtualenv at /app/.venv and puts it on PATH, so mounting over /app would shadow the
@@ -116,12 +128,17 @@ RUFF := if DOCKER == "1" { DOCKER_RUN_USER + ' ruff' } else { quote(VENV_BIN / '
 PYRIGHT := if DOCKER == "1" { DOCKER_RUN_USER + ' pyright --pythonpath /app/.venv/bin/python' } else { quote(VENV_BIN / 'pyright') + ' --pythonpath ' + quote(VENV_BIN / 'python') }
 PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { quote(VENV_BIN / 'pytest') }
 
+# The integration tiers run the venv's pytest under either DOCKER value. A tier test
+# starts a container through the Docker socket, or dials the server CI publishes on
+# the runner's localhost; the test image reaches neither.
+PYTEST_NATIVE := quote(VENV_BIN / 'pytest')
+
 [private]
 default:
     @{{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
     @echo ""
-    @echo "Prefix DOCKER=1 to run fmt/lint/types/test inside the test image instead"
-    @echo "of a local venv — requires only Docker and just, no Python or Poetry."
+    @echo "fmt/lint/types/test run inside the test image by DEFAULT (needs only Docker"
+    @echo "and just, no Python or Poetry). Prefix DOCKER=0 to run against a local venv."
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
@@ -161,6 +178,11 @@ test-image-rebuild:
 [private]
 _venv:
     @test -x {{ quote(VENV_BIN / 'pre-commit') }} || { echo "No usable venv at {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }
+
+# The tiers' counterpart to _tools, which under DOCKER=1 checks the image and not the venv.
+[private]
+_venv_pytest:
+    @test -x {{ PYTEST_NATIVE }} || { echo "pytest not found in {{ VENV_BIN }}/ — test-pg and test-redis run against the venv under either DOCKER value: run 'just install' first." >&2; exit 1; }
 
 # Make sure the ONE tool this check calls actually exists, on whichever path is selected.
 #
@@ -214,31 +236,46 @@ _tools TOOL:
 fmt: (_tools 'ruff')
     #!/usr/bin/env bash
     set -uo pipefail
-    {{ RUFF }} check --fix src/ tests/ || lint_rc=$?
-    {{ RUFF }} format src/ tests/
+    {{ RUFF }} check --fix src/ tests/ scripts/ || lint_rc=$?
+    {{ RUFF }} format src/ tests/ scripts/
     exit "${lint_rc:-0}"
 
 # Check formatting only, no rewrites (~0.04s)
 [group('check')]
 fmt-check: (_tools 'ruff')
-    {{ RUFF }} format --check src/ tests/
+    {{ RUFF }} format --check src/ tests/ scripts/
 
 # Check lint rules only, no rewrites (~0.05s)
 [group('check')]
 lint: (_tools 'ruff')
-    {{ RUFF }} check src/ tests/
+    {{ RUFF }} check src/ tests/ scripts/
 
 # Type-check src/ AND tests/ with pyright (~6s)
 [group('check')]
 types: (_tools 'pyright')
     {{ PYRIGHT }}
 
-# Run the test suite (~13s); coverage gates the no-args run, subset runs skip it
+# Run the test suite; the whole-suite run is parallel and gated, a subset is neither
 #
 # fail_under is a PROJECT floor, so it answers a whole-suite run or nothing: one file
 # measures ~26% of src/ and fails a green run. No args is the whole suite; test-report
 # sets COVERAGE_GATE because its args are reporting flags, not a selection. The tiers
 # reach the same conclusion by passing --no-cov outright.
+#
+# -n auto on the SAME branch, and that is the point: the gate is the only way the whole
+# suite runs, so parallel-safety is enforced by construction rather than by a second
+# recipe someone remembers to run. A test that shares state across workers fails the
+# pre-push hook and CI, not a convenience command that was allowed to rot. `auto` is
+# xdist's own count — psutil's physical if that extra is installed, os.cpu_count()
+# otherwise; measured, everything at or above the physical count is one plateau, so
+# which of the two it resolves to does not matter. See test-report for the measurements.
+#
+# A subset stays SERIAL, and that carries more than the startup cost it was chosen for:
+# every flag xdist is known to break is itself an argument, so it lands on this branch
+# and works. `-s` is silently swallowed under -n (execnet does not forward worker
+# stdout), `--pdb` disables distribution, `--lf`/`--ff` re-run everything, and
+# `--sw`/`--maxfail` stop late. All of them behave normally here. `just test tests/` is
+# the escape hatch: the whole suite, serially, to reproduce a parallel-only failure.
 #
 # Shebang + "$@" rather than a plain line + {{ ARGS }}, because {{ ARGS }} flattens to
 # one space-joined string: `just test -k "spotify or youtube"` reached pytest as
@@ -246,13 +283,13 @@ types: (_tools 'pyright')
 # body costs on macOS is noise against a 13s suite. See `set positional-arguments`.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
-[doc('Run the test suite (~13s); coverage gates the no-args run, subset runs skip it')]
+[doc('Run the test suite; the whole-suite run is parallel and gated, a subset is neither')]
 [group('check')]
 test *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
     if [ $# -eq 0 ] || [ "${COVERAGE_GATE:-0}" = "1" ]; then
-        {{ PYTEST }} --tb=short -q "$@"
+        {{ PYTEST }} --tb=short -q -n auto "$@"
     else
         {{ PYTEST }} --tb=short -q --no-cov "$@"
     fi
@@ -268,12 +305,21 @@ test *ARGS: (_tools 'pytest')
 # --no-cov, and not as a shortcut: this tier drives SQL against a real server
 # rather than exercising src/ branches, so measuring it under the 80% gate would
 # fail the run on a coverage number that means nothing for what it tests.
+#
+# -p no:xdist is a GUARD, not a preference, and it prevents a failure rather than
+# waste. An xdist worker is its own process running its own session, so with
+# testcontainers `just test-pg -n 4` starts FOUR Postgres containers; worse, with
+# POSTGRES_TEST_URL set — the CI path, where no container starts at all — every
+# worker shares one server while raw_pg_dsn's database counter restarts at t1 in
+# each, so they collide: measured, -n 2 fails with a DuplicateDatabaseError per
+# test. Disabling the plugin makes -n an unrecognized argument (exit 4) instead.
+# The tiers are 99 and 49 tests behind a container start; nothing to parallelize.
 [doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
 [group('check')]
-test-pg *ARGS: (_tools 'pytest')
+test-pg *ARGS: _venv_pytest
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_PG_TESTS=1 {{ PYTEST }} -m pg --no-cov --tb=short -q "$@"
+    RUN_PG_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m pg --no-cov --tb=short -q "$@"
 
 # Opt-in real-Redis tier (testcontainers; needs Docker)
 #
@@ -286,10 +332,10 @@ test-pg *ARGS: (_tools 'pytest')
 # rather than a description. Its sibling test-pg carries both attributes.
 [doc('Run the real-Redis integration tier (needs Docker, or REDIS_TEST_URL)')]
 [group('check')]
-test-redis *ARGS: (_tools 'pytest')
+test-redis *ARGS: _venv_pytest
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_REDIS_TESTS=1 {{ PYTEST }} -m redis --no-cov --tb=short -q "$@"
+    RUN_REDIS_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
 
 # Check this file's own formatting (~0.01s)
 [group('check')]
@@ -427,6 +473,48 @@ pins:
         fi
     done
 
+    # The bgutil plugin and the sidecar that serves it are released in lockstep, and
+    # a major mismatch makes the server REFUSE to mint: "Update both the plugin and
+    # the HTTP server to the same version to proceed." Nothing failed when Dependabot
+    # bumped the pip half alone — the build stayed green and the bot lost its `web`
+    # fallback in production, silently, because the primary client needs no PO token.
+    want_pot="$(sed -n 's/^bgutil-ytdlp-pot-provider = "\(.*\)"$/\1/p' pyproject.toml)"
+    compose_pot="$(awk '/^  bgutil-pot-provider:/{f=1} f && /image: brainicism\/bgutil-ytdlp-pot-provider:/{sub(/.*:/, "", $2); print $2; exit}' docker-compose.yml)"
+    if [ -z "$want_pot" ] || [ "$want_pot" != "$compose_pot" ]; then
+        echo "PO-token pin drift: pyproject.toml=[$want_pot] docker-compose.yml=[$compose_pot]" >&2
+        echo "  Plugin and sidecar are released in lockstep; bump both in the same commit." >&2
+        fail=1
+    fi
+
+    # `check`'s dependency list and the pre-push hooks are the same five recipes in the
+    # same order, written twice. Drift is silent and runs one way: a step added to
+    # `check` alone stops running on push while the gate still reports green.
+    #
+    # The optional `env DOCKER=0 ` prefix is the hooks' native pin. Matched rather than
+    # ignored: an entry that misspells it is a hook running in a container the gate did
+    # not ask for, so it must fail here.
+    check_deps="$(sed -n 's/^check: //p' justfile)"
+    hook_deps="$(awk '
+        function flush() {
+            if (entry ~ /^(env DOCKER=0 )?just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
+                sub(/^(env DOCKER=0 )?just /, "", entry)
+                out = out (out == "" ? "" : " ") entry
+            }
+            entry = ""; stages = ""
+        }
+        /^ *- id:/ { flush(); next }
+        /^ *entry:/ { entry = $0; sub(/^ *entry: */, "", entry); next }
+        /^ *stages:/ { stages = $0; next }
+        END { flush(); print out }
+    ' .pre-commit-config.yaml)"
+    if [ -z "$check_deps" ] || [ "$check_deps" != "$hook_deps" ]; then
+        echo "pre-push gate drift: the hooks do not mirror \`check\`'s dependencies" >&2
+        echo "  justfile  check: [$check_deps]" >&2
+        echo "  pre-push hooks: [$hook_deps]" >&2
+        echo "  A step named in only one of them runs in only one of them." >&2
+        fail=1
+    fi
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing
@@ -442,11 +530,112 @@ pins:
 # imports. Dropping it was intentional, not an oversight; this note exists because
 # the diff that dropped it did not say so.
 #
+# The two slow checks, and the only pair worth overlapping: pyright runs inside
+# pytest's wall clock. Fusing exactly these leaves the other four as separately named
+# pre-push hooks — pre-commit renders one status line per hook and runs hooks
+# sequentially, so every extra line costs the concurrency it breaks.
+HEAVY := "types test"
+
+# Run pyright and pytest concurrently, reporting both outcomes
+#
+# No fail-fast: both tasks always run and both are always reported, so one red check
+# never hides what the other would have said.
+#
+# Each task's output is captured and replayed grouped. Sharing one stdout interleaves
+# them, landing a concurrent tool's diagnostics inside pytest's progress output. Only
+# the status lines go out live, one printf each so they stay line-atomic.
+#
+# The `_tools` guards are sequential dependencies so they resolve before the fan-out.
+# Child `just` processes cannot de-duplicate them, and under DOCKER=1 that leaves two
+# children racing `test-image-rebuild` on the same tag.
+[doc('Run pyright and pytest concurrently, reporting both outcomes')]
+[group('check')]
+check-heavy: (_tools 'pyright') (_tools 'pytest')
+    #!/usr/bin/env bash
+    # No `-e`: a failing task must not abort the recipe before the rest are reaped.
+    set -uo pipefail
+
+    JUST=({{ quote(just_executable()) }} --justfile {{ quote(justfile()) }})
+    read -ra names <<< "{{ HEAVY }}"
+
+    # A terminal gets the status lines live and a recap after the diagnostics. Under
+    # pre-commit stdout is a pipe replayed whole when the hook exits, so the streamed
+    # lines are already the recap. tty gates the colour for the same reason.
+    if [ -t 1 ]; then tty=1; else tty=0; fi
+    if [ "$tty" = 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        red=$'\033[31m'; green=$'\033[32m'; bold=$'\033[1m'; off=$'\033[0m'
+    else
+        red=''; green=''; bold=''; off=''
+    fi
+
+    log_dir="$(mktemp -d)"
+    trap 'rm -rf "$log_dir"' EXIT
+
+    # Flush left: pre-commit prints a hook's captured output as out.strip(), which eats
+    # the leading whitespace of the first line only, shifting it out of line with the rest.
+    status_line() {  # name rc secs
+        if [ "$2" = 0 ]; then
+            printf '%s✓%s %-14s %4ss\n' "$green" "$off" "$1" "$3"
+        else
+            printf '%s✗%s %-14s %4ss  (exit %s)\n' "$red" "$off" "$1" "$3" "$2"
+        fi
+    }
+
+    for n in "${names[@]}"; do
+        {
+            start=$SECONDS
+            "${JUST[@]}" "$n" > "$log_dir/$n.out" 2>&1
+            rc=$?
+            secs=$((SECONDS - start))
+            printf '%s\n' "$rc" > "$log_dir/$n.rc"
+            printf '%s\n' "$secs" > "$log_dir/$n.t"
+            status_line "$n" "$rc" "$secs"
+        } &
+    done
+    wait
+
+    # Failing output, grouped and in HEAVY order rather than completion order, so a
+    # given failure lands in the same place regardless of how the run interleaved.
+    fail=0
+    for n in "${names[@]}"; do
+        rc="$(cat "$log_dir/$n.rc")"
+        [ "$rc" = 0 ] && continue
+        fail=1
+        printf '\n%s%s── %s failed (exit %s) %s%s\n' "$bold" "$red" "$n" "$rc" "──" "$off"
+        cat "$log_dir/$n.out"
+    done
+
+    # Recap only on a failing terminal run: the live lines have scrolled past the
+    # diagnostics by then. Off a terminal they are still directly above.
+    if [ "$fail" != 0 ] && [ "$tty" = 1 ]; then
+        printf '\n'
+        for n in "${names[@]}"; do
+            status_line "$n" "$(cat "$log_dir/$n.rc")" "$(cat "$log_dir/$n.t")"
+        done
+    fi
+    exit "$fail"
+
+# A plain dependency list: the one definition of the gate, readable by `just --dump
+# --dump-format json`, and named hook-for-hook by the pre-push config. `check-heavy` is
+# the only entry hiding recipes, and `just --list` still shows them.
+#
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc("What CI's lint and test jobs run — run this before pushing")]
 [group('check')]
-check: fmt-justfile pins fmt-check lint types test
+check: fmt-justfile pins fmt-check lint check-heavy
 
+# Measurements behind `test`'s -n auto, back-to-back, full suite, 6-core/12-thread
+# macOS. Parallel wins at every worker count, including the small ones CI runs on:
+#
+#     serial, coverage on    97.5s      -n 4, coverage on    35.1s
+#     -n 2,   coverage on    52.4s      -n 8, coverage on    46.4s
+#
+# The worker count is a PLATEAU, not a tuned optimum: swept 2x each, -n 4 is 33.9s and
+# 6/8/10/12 are 28.8/28.9/28.7/29.2 — indistinguishable. Below the physical core count
+# costs ~20%; above it costs nothing. --dist worksteal was measured and rejected (29.8s
+# median against load's 27.7s): it rebalances long tails and there is none, the slowest
+# single test being 1.90s against a 5.17s per-worker slice.
+#
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
 # a second definition of the gate — only reporting flags differ, and they never affect
@@ -476,7 +665,8 @@ test-report *ARGS:
 
 # Mirrors CI's container-test job. Its value is proving the IMAGE runs (a runtime stage
 # missing a dependency is invisible to `just test`), which is why it is not part of
-# `check`.
+# `check`. The image also pins MOCK_SPEC_CACHE_DISABLE=1, so this is the reference run
+# against stock unittest.mock — see docs/ARCHITECTURE.md#the-mock-spec-cache.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Build the test image and run the suite inside it')]
@@ -583,11 +773,23 @@ services:
         docker compose up -d redis
     fi
 
+# Answers "what would the bot actually play for this?" with the real stream opts —
+# selected format, the ladder it chose from, and the fallback candidates the retry
+# would walk. Run it at every yt-dlp bump: the repo's claims about format selection
+# are empirical, and both YouTube and yt-dlp move under them.
+# Host venv only: it makes a live network call, so there is nothing DOCKER=1 would
+# buy, and depending on `_tools` would trigger a test-image rebuild before running
+# the local interpreter anyway.
+[doc('Print the format yt-dlp selects and the fallback ladder for a URL')]
+[group('dev')]
+ytdl-formats URL:
+    {{ quote(VENV_BIN / 'python') }} -m scripts.ytdl_formats {{ quote(URL) }}
+
 # Escape hatch for compose commands this file does not wrap, with the archive
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
 # A raw `docker compose` still works — it just never deploys the archive tier.
 [doc('Run `docker compose` with the archive profile derived from HISTORY_ARCHIVE_ENABLED')]
-[group('deploy')]
+[group('ops')]
 compose *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -679,9 +881,10 @@ db-backfill-docker *ARGS:
     resolve_external_postgres_env
     docker compose run --rm ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-backfill "$@"
 
-# The one Redis-side operator recipe. It exists because XLEN alone cannot tell
-# apart four states that call for four different responses, and working that out
-# by hand during an incident is the wrong time to learn the commands:
+# One of two Redis-side operator recipes (the other is bot-settings). It exists
+# because XLEN alone cannot tell apart four states that call for four different
+# responses, and working that out by hand during an incident is the wrong time to
+# learn the commands:
 #
 #   undelivered        backlog the drainer has not read yet
 #   in flight          delivered, insert not committed — normal, unless it is old
@@ -755,6 +958,45 @@ outbox IDLE_MS='60000':
     echo
     echo "head (oldest 3):"
     r XRANGE "$key" - + COUNT 3 | sed 's/^/  /'
+
+# The operator's stored -settings bot overrides, one bot:{application_id}:config hash
+# per application: a dev and a prod bot sharing this Redis each have their own. A
+# stored override beats the environment, so this is the way out of a harmful one
+# without Discord (BOT_SETTINGS_OVERRIDES=ignore is the other). The application id
+# is an argument, never derived: the listing and every startup log line print it.
+# Scope: the compose Redis only, as with `just outbox`.
+[doc('Stored bot settings: list every bot:*:config, or reset <application_id>')]
+[group('database')]
+bot-settings *ARGS:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    r() { docker compose exec -T redis redis-cli "$@" | tr -d '\r'; }
+    pattern=bot:*:config
+    case "${1:-}" in
+        "")
+            found=0
+            for k in $(r --scan --pattern "$pattern"); do
+                found=1
+                echo "$k"
+                r HGETALL "$k" | paste - - | sed 's/^/  /'
+            done
+            [ "$found" -eq 1 ] || echo "no stored bot settings ($pattern)"
+            ;;
+        reset)
+            id="${2:-}"
+            if [[ ! "$id" =~ ^[0-9]{17,20}$ ]] || [ "$#" -ne 2 ]; then
+                echo "usage: just bot-settings reset <application_id>  (17-20 digits)" >&2
+                exit 2
+            fi
+            key="bot:${id}:config"
+            echo "deleted $(r DEL "$key") key: $key"
+            echo "A running bot keeps its overrides in memory until it restarts: just restart."
+            ;;
+        *)
+            echo "usage: just bot-settings [reset <application_id>]" >&2
+            exit 2
+            ;;
+    esac
 
 # Rows Postgres refused, parked by record_rejection. Expected to print NOTHING:
 # every entry reaching the drainer is insertable by construction, so a row here
@@ -852,8 +1094,8 @@ db-restore FILE DB='':
 # a gate you cannot skip is a gate you route around.
 
 # Build the runtime image as :latest and :<git-sha> — no test gate
-[group('build')]
-image:
+[group('ops')]
+build:
     #!/usr/bin/env bash
     set -euo pipefail
     source ./build_common.sh
@@ -873,7 +1115,7 @@ image:
     CHART_EXTRAS= build_runtime_image "{{ IMAGE }}:latest-slim" "{{ IMAGE }}:$tag-slim"
 
 # Deploy an already-built image; pass a git sha to roll back
-[group('deploy')]
+[group('ops')]
 up TAG='':
     # Quoted: unquoted, `just up '*'` globbed against the repo root and `just up "a b"`
     # passed two arguments. Both ended at the deploy guard's refusal, but naming a tag
@@ -881,8 +1123,28 @@ up TAG='':
     # rather than none, which is why deploy_docker.sh tests `-n "${1:-}"` and not `$#`.
     ./deploy_docker.sh "{{ TAG }}"
 
+# Pull the current branch, build the image, and (re)deploy the containers — the "catch up
+# to origin and refresh my stack" shortcut, and the first-run "clone and start the
+# containers" path (compose creates them when none exist, rebuilds/recreates only the bot
+# container when they do).
+#
+# Delegates to scripts/deploy.sh rather than chaining `build`/`up` here, on purpose: that
+# script is the no-`just` entry point a regular user runs (`./scripts/deploy.sh` with only
+# Docker installed), and routing the recipe through it keeps the two a SINGLE code path
+# that cannot drift. The step-by-step rationale (best-effort --ff-only pull, tag matching,
+# why no gate) lives in that script now.
+#
+# NO test gate — for the gated build → check → deploy use ./build_docker.sh; to gate by
+# hand first, run `just check` (or `just ci`) and then this.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Pull the current branch, build the image, and (re)deploy the containers (no gate)')]
+[group('ops')]
+deploy:
+    ./scripts/deploy.sh
+
 # Stop the compose stack (volumes are kept)
-[group('deploy')]
+[group('ops')]
 down:
     # --profile archive is load-bearing, not decoration. `docker compose down`
     # with the profile INACTIVE removes only un-profiled containers and leaves
@@ -897,23 +1159,23 @@ down:
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text
-# said "recreate", which sent `image && restart` down a path that silently kept running
+# said "recreate", which sent `build && restart` down a path that silently kept running
 # the old code. Use `just up` to deploy.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Restart the running bot in place — does NOT pick up a new image (use `just up`)')]
-[group('deploy')]
+[group('ops')]
 restart:
     docker compose restart discord-music-bot
 
 # Follow the bot's logs
-[group('deploy')]
+[group('ops')]
 logs *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     docker compose logs -f discord-music-bot "$@"
 
 # Show compose service status
-[group('deploy')]
+[group('ops')]
 ps:
     docker compose ps

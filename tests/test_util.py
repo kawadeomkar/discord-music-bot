@@ -4,19 +4,103 @@ utilities."""
 import asyncio
 import contextlib
 import logging
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import discord
 import pytest
+from opentelemetry import trace as trace_api
 
+from src import util
+from tests.helpers import settle
 from src.util import (
+    verbatim_code,
+    BAR_WIDTH,
+    FOOTER_LIMIT,
+    OWNER_LOOKUP_RETRY_SECS,
+    current_traceparent,
+    traceparent_context,
+    _TYPING_HOLDS,
+    _TYPING_TASKS,
     _typing_keepalive,
     background_typing,
+    cancel_task,
+    codeblock_fields,
     fmt_duration,
+    fmt_seconds,
     get_logger,
+    is_operator,
+    join_footer,
+    owner_lookup_backing_off,
     pluralize,
+    progress_bar,
+    progress_line,
     queue_message,
 )
+
+
+class TestSharedTyping:
+    """One keepalive per channel, however many commands are waiting."""
+
+    async def test_concurrent_holders_share_one_keepalive(self) -> None:
+        ctx = MagicMock()
+        ctx.channel.id = 7
+        started = 0
+
+        @contextlib.asynccontextmanager
+        async def _typing() -> AsyncIterator[None]:
+            nonlocal started
+            started += 1
+            yield
+
+        ctx.typing = _typing
+        async with background_typing(ctx):
+            async with background_typing(ctx):
+                await asyncio.sleep(0)
+                assert started == 1  # not one POST per command
+            await asyncio.sleep(0)
+            # Still held: the first command returning must not blink the
+            # indicator off while the second is still resolving.
+            assert 7 in _TYPING_TASKS
+        assert _TYPING_TASKS.get(7) is None
+        assert 7 not in _TYPING_HOLDS  # and the refcount does not leak
+
+
+class TestCancelTask:
+    """Whose CancelledError it may swallow."""
+
+    async def test_the_awaited_tasks_cancellation_is_swallowed(self) -> None:
+        task = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        await cancel_task(task)  # no raise: this is the cancellation it asked for
+
+        assert task.cancelled()
+
+    async def test_the_callers_own_cancellation_is_not(self) -> None:
+        """A prefetch pinned in the yt-dlp executor does not stop when asked, so
+        the caller's own deadline fires while this await sits. Swallowed here,
+        asyncio.timeout sees no exception to convert and never raises — the caller
+        runs on past a bound it was told it had."""
+
+        async def _pinned() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(5)  # the worker still holds it
+
+        task = asyncio.create_task(_pinned())
+        await asyncio.sleep(0)
+
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await cancel_task(task)
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
 
 class TestQueueMessage:
@@ -67,6 +151,29 @@ class TestQueueMessage:
         result = queue_message(songs)
         assert "song15" not in result
         assert "song20" not in result
+
+    def test_ten_long_titles_stay_inside_the_field_cap(self) -> None:
+        # Ten 100-char titles composed to 1040 — past Discord's 1024 field cap,
+        # which 400s the WHOLE send. For -remove that arrives after the songs are
+        # gone from memory and Redis, so the user is told a destructive command
+        # failed when it succeeded, with nothing to undo it.
+        result = queue_message(["t" * 100 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.endswith("...")
+
+    def test_a_length_overflow_still_names_what_it_can(self) -> None:
+        # Dropped for length, not for count: some entries still render, and the
+        # trailing mark says the list was cut.
+        result = queue_message(["x" * 200 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.startswith("1: ")
+        assert result.endswith("...")
+
+    def test_one_oversized_title_is_truncated_not_dropped(self) -> None:
+        # An empty field would say nothing at all about what was taken.
+        result = queue_message(["y" * 5000])
+        assert 0 < len(result) <= 1024
+        assert result.startswith("1: ")
 
 
 class TestGetLogger:
@@ -173,6 +280,171 @@ class TestFmtDuration:
 
     def test_minute_rollover_pads_seconds(self) -> None:
         assert fmt_duration(61) == "1:01"
+
+
+class TestFmtSeconds:
+    """The seconds renderer the -settings registry uses: it must read back as the
+    same float, so nothing a card prints is refused when typed back."""
+
+    @pytest.mark.parametrize(
+        ("secs", "text"),
+        [
+            (3, "3s"),
+            (3.0, "3s"),
+            (0.5, "0.5s"),
+            (0.25, "0.25s"),
+            (0.05, "0.05s"),
+            (120, "120s"),
+        ],
+    )
+    def test_renders_the_shortest_form(self, secs: float, text: str) -> None:
+        assert fmt_seconds(secs) == text
+
+    @pytest.mark.parametrize("secs", [0.05, 0.1, 0.25, 0.5, 3, 60, 120, 600])
+    def test_reads_back_as_the_same_float(self, secs: float) -> None:
+        assert float(fmt_seconds(secs).removesuffix("s")) == secs
+
+
+class TestCodeblockFields:
+    def test_short_block_is_one_field(self) -> None:
+        fields = codeblock_fields("Config", ["a", "b"])
+        assert fields == [("Config", "```\na\nb\n```")]
+
+    def test_long_block_splits_rather_than_truncating(self) -> None:
+        """Discord's field cap is 1024. A config listing clipped in place would
+        read as a complete one, which is worse than showing none."""
+        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
+        fields = codeblock_fields("Config", lines)
+        assert len(fields) > 1
+        assert all(len(value) <= 1024 for _, value in fields)
+        assert fields[1][0] == "Config (cont.)"
+        rendered = "".join(value for _, value in fields)
+        for line in lines:
+            assert line in rendered
+
+
+class TestIsOperator:
+    """The operator check -debug, -ping and -settings share. It never raises, and a
+    lookup that raised is not repeated for OWNER_LOOKUP_RETRY_SECS."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        # util's own reference only: the event loop reads time.monotonic too.
+        now = [1000.0]
+        monkeypatch.setattr("src.util.time", SimpleNamespace(monotonic=lambda: now[0]))
+        return now
+
+    async def test_it_answers_what_is_owner_answers(self) -> None:
+        ctx = MagicMock()
+        ctx.bot.is_owner = AsyncMock(return_value=True)
+        assert await is_operator(ctx) is True
+        ctx.bot.is_owner = AsyncMock(return_value=False)
+        assert await is_operator(ctx) is False
+        assert owner_lookup_backing_off() is False
+
+    async def test_a_raising_lookup_denies_without_asking_again_for_a_minute(
+        self, clock: list[float]
+    ) -> None:
+        """is_owner() RAISES when application_info() fails. Each attempt is a REST
+        call discord.py retries for ~25s, so a Discord outage must not cost one per
+        command."""
+        ctx = MagicMock()
+        ctx.bot.is_owner = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=503), "boom")
+        )
+        assert await is_operator(ctx) is False
+        assert owner_lookup_backing_off() is True
+
+        clock[0] += OWNER_LOOKUP_RETRY_SECS - 1
+        assert await is_operator(ctx) is False
+        ctx.bot.is_owner.assert_awaited_once()
+
+        clock[0] += 1
+        ctx.bot.is_owner = AsyncMock(return_value=True)
+        assert owner_lookup_backing_off() is False
+        assert await is_operator(ctx) is True
+        ctx.bot.is_owner.assert_awaited_once()
+
+    async def test_cancellation_is_not_a_failed_lookup(
+        self, clock: list[float]
+    ) -> None:
+        ctx = MagicMock()
+        ctx.bot.is_owner = AsyncMock(side_effect=asyncio.CancelledError)
+        with pytest.raises(asyncio.CancelledError):
+            await is_operator(ctx)
+        assert owner_lookup_backing_off() is False
+
+
+class TestTraceparentRoundTrip:
+    """How a span context crosses the stream cache and comes back as a link."""
+
+    @staticmethod
+    def _span(trace_id: int) -> trace_api.NonRecordingSpan:
+        return trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=trace_id,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+
+    def test_it_round_trips_a_span(self) -> None:
+        trace_id = 0x4BF92F3577B34DA6A3CE929D0E0E4736
+        with trace_api.use_span(self._span(trace_id), end_on_exit=False):
+            carried = current_traceparent()
+        assert carried.startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        ctx = traceparent_context(carried)
+        assert ctx is not None and ctx.trace_id == trace_id
+        # is_remote marks it as arriving from elsewhere, which a link's context is.
+        assert ctx.is_remote
+
+    def test_no_span_carries_nothing(self) -> None:
+        """Reachable: prewarm, a cache write outside any command, the whole suite."""
+        assert current_traceparent() == ""
+
+    def test_an_absent_or_broken_value_is_no_link(self) -> None:
+        """A pre-feature cache entry has no traceparent, and a truncated one must
+        not raise on the playback path — both are simply "nothing to link"."""
+        assert traceparent_context("") is None
+        assert traceparent_context("not-a-traceparent") is None
+        assert traceparent_context("00-" + "0" * 32 + "-" + "0" * 16 + "-01") is None
+
+
+class TestJoinFooter:
+    """The one definition of how an embed's own footer and debug mode's suffix share
+    a footer. Three seams write one (both decoration seams and the two dashboards),
+    and a seam that joined them differently would put the mark somewhere else."""
+
+    def test_the_suffix_takes_its_own_line(self) -> None:
+        assert join_footer("environment: test", "\U0001f41e shard 0") == (
+            "environment: test\n\U0001f41e shard 0"
+        )
+
+    def test_a_lone_suffix_is_the_whole_footer(self) -> None:
+        assert join_footer("", "\U0001f41e shard 0") == "\U0001f41e shard 0"
+
+    def test_a_lone_base_is_returned_unjoined(self) -> None:
+        assert join_footer("environment: test", "") == "environment: test"
+
+    def test_two_empty_sides_stay_empty(self) -> None:
+        assert join_footer("", "") == ""
+
+    def test_the_clip_falls_on_the_base(self) -> None:
+        """Clipping the join instead would take the break and the head of the suffix,
+        putting both footers back on one line."""
+        suffix = "\U0001f41e shard 0"
+        text = join_footer("B" * FOOTER_LIMIT, suffix)
+        assert len(text) == FOOTER_LIMIT
+        assert text.endswith(f"\n{suffix}")
+        assert text.startswith("BB")
+
+    def test_a_suffix_with_no_room_left_drops_the_base(self) -> None:
+        """truncate() to a limit of zero returns an ellipsis on a nearly whole string,
+        so clamping the width alone would return a footer over the limit."""
+        text = join_footer("B" * 400, "S" * FOOTER_LIMIT)
+        assert len(text) == FOOTER_LIMIT
+        assert "B" not in text
 
 
 class TestBackgroundTyping:
@@ -368,3 +640,190 @@ class TestTypingKeepaliveCancellation:
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
         assert keepalive.cancelled()
+
+
+class TestJoinTask:
+    """The signal-and-await join. cancel_task has a class for the same contract;
+    this one shipped with both of its exception arms unexecuted."""
+
+    async def test_a_task_that_raises_is_logged_and_swallowed(self) -> None:
+        """A background task's failure must not become the joiner's, which is
+        already unwinding — often inside a finally, often with a real error
+        already propagating."""
+
+        async def _boom() -> None:
+            raise RuntimeError("background boom")
+
+        task = asyncio.create_task(_boom())
+        with patch.object(util.log, "warning") as warned:
+            await util.join_task(task)
+        assert "background boom" in str(warned.call_args)
+
+    async def test_a_task_cancelled_from_elsewhere_is_not_the_joiners_problem(
+        self,
+    ) -> None:
+        """Someone else cancelled the joined task. The joiner was not cancelled,
+        so it carries on: swallowing here is the point of the helper."""
+
+        async def _park() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_park())
+        await asyncio.sleep(0)
+        task.cancel()
+        await util.join_task(task)
+        assert task.cancelled()
+
+    async def test_the_joiners_own_cancellation_is_re_raised(self) -> None:
+        """The other arm, and the one that matters: a joiner that swallows its own
+        cancellation returns normally from a cancelled task, which stalls the
+        shutdown gather that cancelled it."""
+        started = asyncio.Event()
+
+        async def _park() -> None:
+            await asyncio.sleep(3600)
+
+        async def _joiner() -> None:
+            task = asyncio.create_task(_park())
+            started.set()
+            await util.join_task(task)
+
+        joining = asyncio.create_task(_joiner())
+        async with asyncio.timeout(2):
+            await started.wait()
+        await settle()
+        joining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joining
+        assert joining.cancelled()
+
+    async def test_the_joined_task_is_shielded_from_the_joiners_cancellation(
+        self,
+    ) -> None:
+        """Task.cancel() cancels whatever the task is waiting ON, and `await task`
+        makes the joined task the _fut_waiter — so an unshielded join cancels the
+        very task it promises not to cancel, mid-cleanup."""
+        started = asyncio.Event()
+        joined: list[asyncio.Task[None]] = []
+
+        async def _work() -> None:
+            await asyncio.sleep(0.05)
+
+        async def _joiner() -> None:
+            task = asyncio.create_task(_work())
+            joined.append(task)
+            started.set()
+            await util.join_task(task)
+
+        joining = asyncio.create_task(_joiner())
+        async with asyncio.timeout(2):
+            await started.wait()
+        await settle()
+        joining.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await joining
+        # Finished rather than cancelled: a flag set in a finally runs on either
+        # ending, so only the task's own outcome tells the two apart.
+        async with asyncio.timeout(2):
+            await asyncio.wait(joined)
+        assert not joined[0].cancelled()
+
+
+class TestProgressBar:
+    @pytest.mark.parametrize(
+        "ratio,expected",
+        [
+            (0.0, "🔘" + "⬜" * 9),
+            (0.5, "🟦" * 5 + "🔘" + "⬜" * 4),
+            (11 / 12, "🟦" * 9 + "🔘"),
+            (1.0, "🟦" * 9 + "🔘"),
+        ],
+    )
+    def test_head_reserves_the_last_cell(self, ratio: float, expected: str) -> None:
+        assert progress_bar(ratio) == expected
+
+    @pytest.mark.parametrize("width,expected", [(0, ""), (1, "🔘"), (3, "🟦🟦🔘")])
+    def test_narrow_widths(self, width: int, expected: str) -> None:
+        """width=0 renders rather than raising, and a width of one is the head."""
+        assert progress_bar(1.0, width=width) == expected
+
+    @pytest.mark.parametrize("ratio", [-0.5, 1.5, 12.0])
+    def test_a_ratio_outside_zero_to_one_is_clamped(self, ratio: float) -> None:
+        """A replayed progress stream reports past its own total, and the
+        renderer must not run off the end of the bar."""
+        bar = progress_bar(ratio)
+        assert len(bar) == BAR_WIDTH
+        assert bar in ("🔘" + "⬜" * 9, "🟦" * 9 + "🔘")
+
+    def test_the_default_width_is_the_shared_constant(self) -> None:
+        assert len(progress_bar(0.5)) == BAR_WIDTH
+
+
+def _clock(secs: float) -> str:
+    return fmt_duration(int(secs))
+
+
+def _cells(line: str) -> str:
+    """The glyph run between the two backticked labels."""
+    return line.split("`")[2].strip()
+
+
+class TestProgressLine:
+    """The Now Playing bar's shape, shared by the NP card (clock labels) and the
+    queue-progress card (song counts)."""
+
+    def test_empty_string_without_a_positive_total(self) -> None:
+        assert progress_line(0.0, 0, label=_clock) == ""
+        assert progress_line(10.0, -1, label=_clock) == ""
+
+    def test_labels_both_ends_around_the_bar(self) -> None:
+        assert progress_line(65.0, 200, label=_clock) == (
+            "`1:05` " + progress_bar(65 / 200) + " `3:20`"
+        )
+
+    def test_head_at_start_when_the_position_is_zero(self) -> None:
+        line = progress_line(0.0, 200, label=_clock)
+        assert line.startswith("`0:00`")
+        assert _cells(line) == "🔘" + "⬜" * 9
+
+    def test_head_at_end_when_the_position_equals_the_total(self) -> None:
+        assert _cells(progress_line(200.0, 200, label=_clock)) == "🟦" * 9 + "🔘"
+
+    def test_head_roughly_midpoint_at_half(self) -> None:
+        assert _cells(progress_line(100.0, 200, label=_clock)) == (
+            "🟦" * 5 + "🔘" + "⬜" * 4
+        )
+
+    def test_a_position_past_the_total_is_clamped_bar_and_label(self) -> None:
+        """Imprecise duration metadata plus a -ss start offset can push the raw
+        position past the reported duration; the left label must never read past
+        the right one (e.g. `4:05 … 4:02`)."""
+        line = progress_line(250.0, 200, label=_clock)
+        assert line.startswith("`3:20`")
+        assert "`4:10`" not in line
+        assert _cells(line) == "🟦" * 9 + "🔘"
+
+    def test_a_negative_position_is_clamped_bar_and_label(self) -> None:
+        line = progress_line(-5.0, 200, label=_clock)
+        assert line.startswith("`0:00`")
+        assert _cells(line).startswith("🔘")
+
+    def test_width_is_customizable_and_defaults_to_the_shared_constant(self) -> None:
+        assert len(_cells(progress_line(0.0, 200, label=_clock, width=5))) == 5
+        assert len(_cells(progress_line(0.0, 200, label=_clock))) == BAR_WIDTH
+
+    def test_a_count_label_formats_both_ends(self) -> None:
+        """The queue-progress card's label: nothing clock-shaped leaks in."""
+        assert progress_line(335, 1671, label=lambda n: str(int(n))) == (
+            "`335` " + progress_bar(335 / 1671) + " `1671`"
+        )
+
+
+class TestVerbatimCode:
+    def test_the_text_is_not_escaped(self) -> None:
+        """Discord shows a code span literally, so an escape is copied with it."""
+        assert verbatim_code("a_b*c", 20) == "`a_b*c`"
+
+    @pytest.mark.parametrize("text", ["a`b", "a\nb", "a\x00b", "x" * 21])
+    def test_what_a_span_cannot_hold_is_refused(self, text: str) -> None:
+        assert verbatim_code(text, 20) is None

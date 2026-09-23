@@ -1,6 +1,9 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import copy
+import pathlib
+import contextlib
 import logging
 import redis.asyncio as aioredis
 import pickle
@@ -16,27 +19,51 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import discord
 import orjson
+from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from yarl import URL
 import pytest
 from redis.asyncio import Redis
-from yarl import URL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
+from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
 from src.guild_state import Analytics
+from src import youtube
+from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
+    NpHostRef,
     QueueObject,
+    _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
+    _cache_stream,
+    _OGG_HEADER_PACKETS,
+    _STREAM_CANDIDATES,
     _UNUSED_INFO_COLLECTIONS,
+    _YT_PLAYLIST_TTL,
+    _YT_SOURCE_FRESH_SECS,
+    _YT_SOURCE_TTL,
+    _source_cache_key,
+    _source_entry_is_stale,
+    _YTDL_FLAT_SEARCH_OPTS,
+    _mine_audio_candidates,
+    select_search_entry,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
+    _playlist_tracks,
     _record_serving_format,
     _run_extract,
     ExtractRequest,
+    _extract_once,
+    _inflight_key,
+    _queue_object_from_flat_entry,
     _slim_info,
     _EXTRACTOR_ARGS,
     _probe_stream_url,
@@ -47,10 +74,12 @@ from src.youtube import (
     _stream_url_ttl,
     _ytdlp_extract,
     _YtdlpLogger,
+    warm_worker,
     YTDLVideoInfo,
     YTDLVideoMetadata,
+    YoutubePlaylist,
 )
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, settle
 
 # Ask-time analytics for direct yt_source/yt_playlist calls — the command paths
 # mint this at dispatch; both params are REQUIRED so a call site cannot forget.
@@ -77,6 +106,14 @@ def playable_urls(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     probe = AsyncMock(return_value=StreamProbe.PLAYABLE)
     monkeypatch.setattr("src.youtube._probe_stream_url", probe)
     return probe
+
+
+async def _settle_stream_warms() -> None:
+    """Drain the stream-cache warms yt_source starts and does not await. The reply
+    is what stops waiting for them; every reader of that cache still joins."""
+    await asyncio.gather(
+        *tuple(youtube._INFLIGHT_STREAM_WARMS.values()), return_exceptions=True
+    )
 
 
 def _fake_ytdl_data(**overrides: Any) -> YTDLVideoInfo:
@@ -154,7 +191,11 @@ class TestYTDLElapsedSecs:
     """Elapsed-time tracking by counting YTDL.read() calls — deterministic, no
     time-mocking. Patches the parent FFmpegOpusAudio.read() (what super().read()
     resolves to) rather than the real _packet_iter, which noop_ffmpeg_init
-    never sets up."""
+    never sets up.
+
+    Every count here is offset by _OGG_HEADER_PACKETS: the first two packets of any
+    Ogg Opus stream are OpusHead and OpusTags, which discord.py yields like audio and
+    YTDL deliberately does not count."""
 
     def test_zero_before_any_read(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
@@ -165,7 +206,8 @@ class TestYTDLElapsedSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            song.read()
+            for _ in range(_OGG_HEADER_PACKETS + 1):
+                song.read()
         assert song.elapsed_secs == pytest.approx(0.02)
 
     def test_accumulates_across_multiple_reads(
@@ -173,7 +215,7 @@ class TestYTDLElapsedSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.elapsed_secs == pytest.approx(0.10)
 
@@ -205,7 +247,7 @@ class TestYTDLPositionSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.position_secs == song.elapsed_secs == pytest.approx(0.10)
 
@@ -213,7 +255,7 @@ class TestYTDLPositionSecs:
         song = ytdl_instance()
         song.start_offset = 90
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.position_secs == pytest.approx(90.10)
 
@@ -225,12 +267,30 @@ class TestYTDLPositionSecs:
         assert song.position_secs == 90.0
 
 
+def _carried_queueobject_fields() -> set[str]:
+    """QueueObject fields that must reach the playing YTDL, by name. Derived from
+    the dataclass, so a field added tomorrow is covered by both guards below
+    without either being edited. Anything not meant to cross is named here."""
+    import dataclasses
+
+    not_carried = {
+        # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
+        "webpage_url",
+        "title",
+        "duration",
+        "uploader",
+        "thumbnail",
+        # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
+        "ts",
+    }
+    return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+
+
 class TestYtStreamCarriesTheQueueObjectsFields:
-    """`YTDL.yt_stream` is the hop where a queue entry becomes a playing song, and
-    CLAUDE.md's queue-entry-field recipe names it as one of the three sites a new
-    field is silently dropped at. `user_input` reached it late: it is what
-    `-remove` matches on, and a -playnow resume tail is rebuilt from the YTDL, so
-    losing it here leaves the parked track un-removable by origin."""
+    """`YTDL.yt_stream` is where a queue entry becomes a playing song and one of the
+    three sites a new field is silently dropped at. `user_input` is what `-remove`
+    matches on, and a resume tail is rebuilt from the YTDL, so losing it here
+    leaves the parked track un-removable by origin."""
 
     @staticmethod
     async def _played(qobj: QueueObject) -> YTDL:
@@ -255,26 +315,11 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
     def test_no_queueobject_field_is_silently_left_behind(self) -> None:
         """Reflective, so a field added to QueueObject tomorrow fails HERE rather
-        than at playback — the hand-written list below it enumerates six fields and
-        cannot notice a seventh. Anything genuinely not meant to cross gets named
-        in the allow-list, with the reason."""
-        import dataclasses
+        than at playback. Anything genuinely not meant to cross gets named in the
+        allow-list, with the reason."""
         import inspect
 
-        # Fields that legitimately do not cross into YTDL.
-        not_carried = {
-            # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
-            "webpage_url",
-            "title",
-            "duration",
-            "uploader",
-            "thumbnail",
-            # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
-            "ts",
-            # Runtime-only NP handle; a live Message cannot be carried on a source.
-            "np_host_ref",
-        }
-        carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+        carried = _carried_queueobject_fields()
         params = set(inspect.signature(YTDL.__init__).parameters)
         missing = sorted(carried - params)
         assert not missing, (
@@ -285,8 +330,12 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
     async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
         """A field added to QueueObject and forgotten here dies at playback, where
-        every read of it happens. Asserted together so an omission fails rather
-        than needing to be noticed."""
+        every read of it happens. The guard above reads YTDL.__init__'s signature,
+        which is not the leg a field goes missing on, so this compares values across
+        the hop — and asserts each was given a non-default value, or a field the
+        constructor forgets arrives at its default and compares equal to itself."""
+        import dataclasses
+
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
@@ -298,29 +347,48 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             start_paused=True,
             persisted=False,
             played_at=12.5,
+            is_replay=True,
+            analytics=Analytics(queued_at=99.5, queue_position=7),
+            np_message_id=555,
+            np_channel_id=666,
+            np_dedicated=True,
+            np_host_ref=NpHostRef(
+                message=MagicMock(spec=discord.Message), own_embeds=[], dedicated=True
+            ),
+            stream_attempts=2,
+            failed_format_ids=frozenset({"251"}),
+        )
+        carried = _carried_queueobject_fields()
+        defaults = {
+            f.name: f.default
+            for f in dataclasses.fields(QueueObject)
+            if f.default is not dataclasses.MISSING
+        }
+        undistinguished = sorted(
+            name
+            for name in carried
+            if name in defaults and getattr(qobj, name) == defaults[name]
+        )
+        assert not undistinguished, (
+            f"left at its default, so this test cannot see it dropped: "
+            f"{undistinguished}. Give it a non-default value above."
         )
 
         song = await self._played(qobj)
 
-        assert (
-            song.user_input,
-            song.query_source,
-            song.interjected,
-            song.is_resume,
-            song.start_paused,
-            song.persisted,
-            song.played_at,
-        ) == ("typed", "search", True, True, True, False, 12.5)
+        mismatched = {
+            name: (getattr(qobj, name), getattr(song, name, "<<absent>>"))
+            for name in sorted(carried)
+            if getattr(song, name, "<<absent>>") != getattr(qobj, name)
+        }
+        assert not mismatched, f"dropped between QueueObject and YTDL: {mismatched}"
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
-        """`_neutralize_prefetch` reads `persisted` back off the playing song to
-        rebuild a QueueObject, so a YTDL without it raises AttributeError on every
-        `-playnow` over a COMPLETED prefetch — failing the command and stranding
-        the claim, which the next commit then settles onto the wrong song.
-
-        False is the value that matters: it marks the crash-recovered head, whose
-        entry is NOT on the Redis list, and a rebuild defaulting to True writes
-        that head into the mirror, where its dequeue never LPOPs."""
+        """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a
+        QueueObject, so a YTDL without it raises on every `-play --now` over a
+        COMPLETED prefetch and strands the claim. False is the value that matters:
+        the crash-recovered head is NOT on the Redis list, and a rebuild defaulting
+        to True writes it into the mirror, where its dequeue never LPOPs."""
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
@@ -608,13 +676,12 @@ class TestYTSource:
         failure) is re-raised untouched as the classified ExtractionError — only a
         genuine UnsupportedError is remapped to the friendly message. _command_error
         renders the ExtractionError via its user_message."""
-        from src.youtube import ExtractionError
 
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.side_effect = DownloadError(
                 "ERROR: unable to download webpage"
             )
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 await YTDL.yt_source(
                     mock_ctx.author,
                     "ytsearch:test",
@@ -848,13 +915,14 @@ class TestYTPlaylistAnalytics:
         with patch(
             "src.youtube._ytdlp_extract", return_value=self._entries("a", "b", "c")
         ):
-            tracks = await YTDL.yt_playlist(
+            playlist = await YTDL.yt_playlist(
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=Analytics(queued_at=1752529000.5, queue_position=2),
                 user_input="https://yt.com/playlist?list=PL1",
             )
+        tracks = playlist.tracks
         assert [t.analytics.queue_position for t in tracks] == [2, 3, 4]
         assert all(t.analytics.queued_at == 1752529000.5 for t in tracks)
         assert all(t.query_source == "youtube.com" for t in tracks)
@@ -870,15 +938,393 @@ class TestYTPlaylistAnalytics:
             # A deleted video, and one missing its ID — both skipped.
             return_value=self._entries("a", None, "b", "", "c"),
         ):
-            tracks = await YTDL.yt_playlist(
+            playlist = await YTDL.yt_playlist(
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
                 user_input="https://yt.com/playlist?list=PL1",
             )
+        tracks = playlist.tracks
         assert [t.title for t in tracks] == ["Ta", "Tb", "Tc"]
+        assert playlist.unavailable == 2
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
+
+
+class TestExtractSingleflight:
+    """One extraction per distinct query at a time, process-wide."""
+
+    async def test_a_full_pool_slot_does_not_split_one_key_into_two_jobs(self) -> None:
+        """The slot is taken inside the job for this reason. Awaited before the
+        registry write, every caller for one key reads an empty registry while it
+        queues and starts a job of its own — losing the single flight in a paste
+        burst, which is the only time it is worth anything."""
+        slot = asyncio.Semaphore(1)
+        started = 0
+        release = asyncio.Event()
+
+        async def _extract(_request: Any) -> Any:
+            nonlocal started
+            started += 1
+            await release.wait()
+            return {"webpage_url": "https://yt.com/v=one", "url": "u"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            async with slot:  # the guild's only slot, held elsewhere
+                callers = [
+                    asyncio.ensure_future(
+                        _extract_once(
+                            "ytdl:source:same|full", MagicMock(), pool_slot=slot
+                        )
+                    )
+                    for _ in range(3)
+                ]
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                assert started == 0  # all three queued behind the held slot
+            release.set()
+            results = await asyncio.gather(*callers)
+
+        assert started == 1
+        assert all(r == results[0] for r in results)
+
+    async def test_a_joiner_takes_no_slot_of_its_own(self) -> None:
+        """The leader holds the worker. Charging its joiners lets one popular link
+        exhaust a guild's budget with jobs that are not running."""
+        slot = asyncio.Semaphore(1)
+        release = asyncio.Event()
+
+        async def _extract(_request: Any) -> Any:
+            await release.wait()
+            return {"webpage_url": "https://yt.com/v=two", "url": "u"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            leader = asyncio.ensure_future(
+                _extract_once("ytdl:source:shared|full", MagicMock(), pool_slot=slot)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            joiner = asyncio.ensure_future(
+                _extract_once("ytdl:source:shared|full", MagicMock(), pool_slot=slot)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert slot.locked()  # the leader's job, and only it
+            release.set()
+            assert await leader == await joiner
+
+    async def test_the_leaders_cancellation_does_not_reach_a_joiner(self) -> None:
+        """The key carries no guild, so the leader and a joiner are routinely
+        different guilds. Guild A's -clear cancels its prefetch; published, that
+        cancellation reaches guild B's playback loop, whose `except Exception`
+        cannot catch CancelledError and whose loop() re-raises it — guild B sits in
+        voice with a full queue and no player until a restart."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            leader = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            joiner = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            leader.cancel()
+            await asyncio.sleep(0)
+            gate.set()
+            result = await joiner
+
+        assert leader.cancelled()
+        assert not joiner.cancelled()
+        assert result == {"title": "shared"}
+
+    # A joiner that re-reads a job that already failed never suspends, so a
+    # regression spins the loop, which only pytest-timeout can interrupt.
+    @pytest.mark.timeout(10)
+    async def test_a_leaders_exhausted_slot_does_not_fail_its_joiners(
+        self,
+    ) -> None:
+        """The key carries no guild, so the leader's guild budget is routinely not
+        the joiner's. A joiner holds no worker and may hold no slot at all — the
+        playback loop's own in-band resolve passes None — so inheriting the
+        leader's refusal is one guild's paste burst killing another guild's song
+        while every worker sits idle."""
+        from src.youtube import _extract_once
+
+        blocked = asyncio.Event()
+        # Held until the joiners are parked on the leader's job: failing sooner,
+        # the first joiner finds an empty registry and simply leads.
+        expire = asyncio.Event()
+        calls: list[int] = []
+
+        class _FullSlot:
+            async def __aenter__(self) -> None:
+                blocked.set()
+                await expire.wait()
+                raise ResolveWaitExpired(120.0)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        async def _extract(_request: Any) -> dict[str, Any]:
+            calls.append(1)
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_extract):
+            leader = asyncio.create_task(
+                _extract_once("k", MagicMock(), pool_slot=_FullSlot())
+            )
+            async with asyncio.timeout(2):
+                await blocked.wait()
+            # Three, not one: with a single joiner, re-electing every joiner in
+            # turn and re-electing one are the same count.
+            joiners = [
+                asyncio.create_task(_extract_once("k", MagicMock())) for _ in range(3)
+            ]
+            await settle()
+            expire.set()
+            with pytest.raises(ResolveWaitExpired):
+                await leader
+            async with asyncio.timeout(2):
+                results = await asyncio.gather(*joiners)
+            assert results == [{"title": "shared"}] * 3
+
+        # The leader never reached yt-dlp, so the one re-elected joiner is the only
+        # extraction that ran, and the other two joined it.
+        assert calls == [1]
+
+    async def test_an_abandoned_job_still_answers_the_callers_that_stayed(
+        self,
+    ) -> None:
+        """The extraction is a task rather than an inline await, so the leader
+        walking away does not take the work with it — every joiner is still served
+        by the one job, which is the collapse this exists to provide."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            leader = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            joiners = [
+                asyncio.create_task(_extract_once("k", MagicMock())) for _ in range(3)
+            ]
+            await asyncio.sleep(0)
+            leader.cancel()
+            await asyncio.sleep(0)
+            gate.set()
+            results = await asyncio.gather(*joiners)
+
+        assert calls == 1
+        assert results == [{"title": "shared"}] * 3
+
+    async def test_a_joiner_sees_the_leaders_failure_as_that_failure(self) -> None:
+        """A failure answers the joiner's query too — as the error it was, not as a
+        None the caller would render as "Could not find song"."""
+        from src.youtube import ExtractionError, _extract_once
+
+        gate = asyncio.Event()
+
+        async def _boom(_request: Any) -> dict[str, Any]:
+            await gate.wait()
+            raise ExtractionError("nope")
+
+        with patch("src.youtube._run_extract", new=_boom):
+            leader = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            joiner = asyncio.create_task(_extract_once("k", MagicMock()))
+            await asyncio.sleep(0)
+            gate.set()
+            with pytest.raises(youtube.ExtractionError):
+                await joiner
+            with pytest.raises(youtube.ExtractionError):
+                await leader
+
+    async def test_identical_concurrent_queries_extract_once(self) -> None:
+        """Requests resolve concurrently now, so N users pasting the same trending
+        link is N identical jobs against a FIFO pool of four workers, all racing to
+        write the same cache entry."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            request = MagicMock()
+            waiters = [
+                asyncio.create_task(_extract_once("k", request)) for _ in range(4)
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            results = await asyncio.gather(*waiters)
+
+        assert calls == 1
+        assert all(r == {"title": "shared"} for r in results)
+
+    async def test_a_failure_is_not_replayed_by_the_next_caller(self) -> None:
+        """The waiters share the winner's exception — retrying it N times is the
+        pile-up this exists to prevent — but the entry goes before the result is
+        published, so the call AFTER extracts again."""
+        from src.youtube import ExtractionError, _extract_once
+
+        calls = 0
+
+        async def _boom(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            raise ExtractionError("nope")
+
+        with patch("src.youtube._run_extract", new=_boom):
+            for _ in range(2):
+                with pytest.raises(youtube.ExtractionError):
+                    await _extract_once("k", MagicMock())
+
+        assert calls == 2
+
+    async def test_a_completed_extraction_is_not_replayed_by_the_next_caller(
+        self,
+    ) -> None:
+        """The success half of the same rule: the entry goes before the result is
+        published, so a caller arriving afterwards extracts fresh. That is what makes
+        the playback loop's re-extraction after a DEAD probe a NEW job — rejoining
+        would hand it back the URL that just failed."""
+        from src.youtube import _extract_once
+
+        calls = 0
+
+        async def _once(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {"title": "fresh"}
+
+        with patch("src.youtube._run_extract", new=_once):
+            for _ in range(2):
+                await _extract_once("k", MagicMock())
+
+        assert calls == 2
+
+    async def test_different_profiles_of_one_query_do_not_share_a_job(self) -> None:
+        """The profile is part of the key because the results are not
+        interchangeable: a flat entry's `url` is the watch page, a processed one's is
+        the googlevideo CDN URL. Sharing one job between them would persist a CDN URL
+        as a song's identity — into ytdl:source, the queue, and play_history."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            waiters = [
+                asyncio.create_task(
+                    _extract_once(_inflight_key("ytdl:source:q", profile), MagicMock())
+                )
+                for profile in ("full", "flat", "stream")
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            await asyncio.gather(*waiters)
+
+        assert calls == 3
+
+    async def test_one_profile_of_one_query_still_collapses(self) -> None:
+        """The keying change must not cost the collapse it exists to provide."""
+        from src.youtube import _extract_once
+
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return {"title": "shared"}
+
+        with patch("src.youtube._run_extract", new=_slow):
+            waiters = [
+                asyncio.create_task(
+                    _extract_once(_inflight_key("ytdl:source:q", "full"), MagicMock())
+                )
+                for _ in range(4)
+            ]
+            await asyncio.sleep(0)
+            gate.set()
+            await asyncio.gather(*waiters)
+
+        assert calls == 1
+
+
+class TestSearchEntrySelection:
+    """Which of a search's entries gets played. The old rule — first non-playlist
+    entry — accepted a result yt-dlp had selected no format for, which then failed at
+    stream time looking unrelated to the search."""
+
+    async def _pick(self, mock_ctx: MagicMock, entries: list[Any]) -> QueueObject:
+        with patch(
+            "src.youtube._ytdlp_extract",
+            return_value={"_type": "playlist", "entries": entries},
+        ):
+            return await YTDL.yt_source(
+                mock_ctx.author,
+                "some song",
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input="some song",
+            )
+
+    async def test_an_entry_without_a_stream_url_is_passed_over(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        formatless = {"webpage_url": "https://yt.com/v=noformat", "title": "No Format"}
+        playable = _fake_ytdl_data(webpage_url="https://yt.com/v=ok", title="Playable")
+
+        result = await self._pick(mock_ctx, [formatless, playable])
+
+        assert result.title == "Playable"
+
+    async def test_playlists_and_null_entries_are_still_skipped(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        playable = _fake_ytdl_data(webpage_url="https://yt.com/v=ok", title="Playable")
+
+        result = await self._pick(
+            mock_ctx, [None, {"_type": "playlist", "url": "https://x"}, playable]
+        )
+
+        assert result.title == "Playable"
+
+    async def test_the_first_entry_still_wins_when_none_carries_a_url(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The fallback is the old rule, so an entry shape this code does not
+        recognise plays as before rather than failing outright."""
+        first = {"webpage_url": "https://yt.com/v=first", "title": "First"}
+        second = {"webpage_url": "https://yt.com/v=second", "title": "Second"}
+
+        result = await self._pick(mock_ctx, [first, second])
+
+        assert result.title == "First"
 
 
 class TestYTSourceUnifiedExtraction:
@@ -907,6 +1353,31 @@ class TestYTSourceUnifiedExtraction:
         assert req.opts is _YTDL_STREAM_SEARCH_OPTS
         assert req.process is True
 
+    async def test_the_inflight_key_names_the_request_profile(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """yt_source single-flights under the cache key PLUS its profile. Keyed by the
+        cache key alone, a flat caller of the same query would join this job and read
+        `url` — the CDN stream URL on a processed result — as the watch page."""
+        from src.youtube import _INFLIGHT_EXTRACTS
+
+        seen: list[str] = []
+
+        async def _record(_request: Any) -> Any:
+            seen.extend(_INFLIGHT_EXTRACTS)
+            return _fake_ytdl_data()
+
+        with patch("src.youtube._run_extract", new=_record):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "some song",
+                query_source="ytsearch",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert seen == ["ytdl:source:some song|full"]
+
     async def test_fresh_extraction_writes_both_caches(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
     ) -> None:
@@ -924,13 +1395,74 @@ class TestYTSourceUnifiedExtraction:
                 user_input=None,
             )
 
+        # The source entry is written on the reply path; the stream entry lands
+        # behind it, which is the point of not awaiting the probe.
         source_entry = await fake_redis.get("ytdl:source:unified search")
+        assert await fake_redis.get("ytdl:stream:https://yt.com/v=uni1") is None
+        await _settle_stream_warms()
         stream_entry = await fake_redis.get("ytdl:stream:https://yt.com/v=uni1")
         assert source_entry is not None
         assert stream_entry is not None
         cached = orjson.loads(stream_entry)
         assert cached["url"] == fake_data["url"]
         assert cached["title"] == "Test Song"
+
+    @pytest.mark.parametrize("flat", [False, True], ids=["full", "flat"])
+    async def test_a_search_with_no_video_is_refused_and_not_cached(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, flat: bool
+    ) -> None:
+        """A search whose extraction holds no video hands back its wrapper, whose
+        webpage_url is the `ytsearch:` string. Cached as a song, every play of it
+        fails for 24h and blames YouTube's stream (seen live)."""
+        wrapper = {
+            "_type": "playlist",
+            "webpage_url": "ytsearch:Fantasy Snow Strippers",
+            "title": "Fantasy Snow Strippers",
+            "entries": [],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=wrapper):
+            with pytest.raises(youtube.ExtractionError) as excinfo:
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "ytsearch:Fantasy Snow Strippers",
+                    redis=fake_redis,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                    flat=flat,
+                )
+
+        assert "playable" in excinfo.value.user_message
+        assert await fake_redis.keys("ytdl:source:*") == []
+        await _settle_stream_warms()
+        assert await fake_redis.keys("ytdl:stream:*") == []
+
+    def test_a_wrapper_with_no_video_has_no_first_entry(self) -> None:
+        """Every caller reads None as "nothing usable"; the wrapper itself would be
+        a song whose page URL is the search string."""
+        wrapper: Any = {
+            "webpage_url": "ytsearch:x",
+            "entries": [None, {"_type": "playlist"}],
+        }
+        assert youtube._first_video_entry(wrapper) is None
+        video: Any = {"webpage_url": "https://www.youtube.com/watch?v=a"}
+        assert youtube._first_video_entry(video) is video
+
+    async def test_an_entry_without_a_page_url_is_refused(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        fake_data = _fake_ytdl_data(webpage_url="ytsearch:odd")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            with pytest.raises(youtube.ExtractionError):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "odd",
+                    redis=fake_redis,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+        assert await fake_redis.keys("ytdl:source:*") == []
 
     async def test_stream_cache_hit_for_prefetch_after_yt_source(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -971,6 +1503,7 @@ class TestYTSourceUnifiedExtraction:
 
         assert isinstance(result, QueueObject)
         assert result.webpage_url == "https://yt.com/v=uni3"
+        await _settle_stream_warms()
         assert await fake_redis.get("ytdl:source:dead probe search") is not None
         assert await fake_redis.get("ytdl:stream:https://yt.com/v=uni3") is None
 
@@ -1084,6 +1617,7 @@ class TestYTStream:
             executable: str,
             before_options: str,
             options: str,
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -1096,9 +1630,14 @@ class TestYTStream:
 
         assert "volume=0.5" in captured_options["options"]
 
-    async def test_yt_stream_appends_seek_when_ts_set(
+    async def test_yt_stream_seeks_on_both_sides_when_ts_is_set(
         self, mock_ctx: MagicMock
     ) -> None:
+        """Two-pass seek: `-ss N` before -i for the range request, `-ss 0` after it to
+        drop the pre-roll the input seek lands in. Input-side alone measured 5-10s
+        early (webm cluster granularity) — which position_secs would then overstate
+        on every surface. The volume filter must NOT follow the seek to the input
+        side: ffmpeg silently ignores -filter:a placed ahead of the input."""
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -1115,17 +1654,54 @@ class TestYTStream:
             executable: str,
             before_options: str,
             options: str,
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
+            captured_options["before_options"] = before_options
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
         ):
-            await YTDL.yt_stream(qobj, channel)
+            await YTDL.yt_stream(qobj, channel, volume=0.5)
 
-        assert "-ss 90" in captured_options["options"]
+        assert "-ss 90" in captured_options["before_options"]
+        assert "-ss 0" in captured_options["options"]
+        assert "-ss 90" not in captured_options["options"]
+        assert "volume=0.5" in captured_options["options"]
+        assert "volume" not in captured_options["before_options"]
+
+    async def test_a_zero_timestamp_is_not_a_seek(self, mock_ctx: MagicMock) -> None:
+        """`?t=0` is a real input (sources.py int()s it), and "start at the start" is
+        what no seek already does. Taking the seek path for it shipped a two-pass -ss
+        that costs an Opus pre-skip packet for nothing, and made "no seek" and "seek
+        to zero" two different code paths."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=0
+        )
+        captured: dict[str, str] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            before_options: str,
+            options: str,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["before_options"] = before_options
+            captured["options"] = options
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(qobj, AsyncMock(spec=discord.TextChannel))
+
+        assert "-ss" not in captured["before_options"]
+        assert "-ss" not in captured["options"]
 
     async def test_yt_stream_carries_ts_as_start_offset(
         self, mock_ctx: MagicMock
@@ -1609,6 +2185,34 @@ class TestRevokedStreamUrl:
         with patch("src.youtube._get_probe_session", return_value=session):
             assert await _probe_stream_url("https://cdn/x") is expected
 
+    async def test_a_signed_hls_path_is_probed_without_being_requoted(self) -> None:
+        """yarl requotes a plain URL string, decoding the %3D/%3B that an HLS
+        manifest carries INSIDE its signed path (`sgoap/gir%3Dyes%3Bitag%3D140`).
+        Google signs the encoded form, so the requoted URL 403s and the probe called
+        every live stream and every HLS rung of the format ladder DEAD — while ffmpeg
+        played the same URL. Verified live: requoted 403, encoded 200."""
+        url = (
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/"
+            "sgoap/gir%3Dyes%3Bitag%3D140/xpc/EgVo2aDSNQ%3D%3D/index.m3u8"
+        )
+        response = MagicMock()
+        response.status = 200
+        session = MagicMock()
+        session.get.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+        with patch("src.youtube._get_probe_session", return_value=session):
+            assert await _probe_stream_url(url) is StreamProbe.PLAYABLE
+
+        (sent,) = session.get.call_args.args
+        # A plain str is what aiohttp requotes: it builds URL(str) itself, and only a
+        # URL handed in already-encoded survives that step intact.
+        assert isinstance(sent, URL)
+        assert str(sent) == url
+        assert str(URL(str(sent))) != url, (
+            "yarl no longer requotes this shape — the fix may be obsolete, but do not "
+            "delete it without re-measuring against a live manifest URL"
+        )
+
     async def test_a_probe_bug_is_logged_at_error_not_swallowed_as_a_verdict(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -1792,6 +2396,341 @@ class TestRevokedStreamUrl:
         assert await _probe_stream_url("") is StreamProbe.DEAD
 
 
+class TestCandidateLadderWalk:
+    """A revoked URL used to cost a 3-5s re-extraction that re-selected the same
+    format — curing a stale URL but not a format YouTube stopped serving. The ladder
+    walks sideways first: next format, ~100ms probe, same extraction."""
+
+    def _laddered(self, webpage_url: str, *format_ids: str) -> YTDLVideoInfo:
+        """Stream data whose ladder is the given formats, best first: the head is the
+        selected format at the top level, and only the ALTERNATIVES are stored under
+        audio_candidates — the shape _cache_stream persists."""
+        ladder = [_fmt(fid, "opus", 129.0, 48000) for fid in format_ids]
+        return _fake_ytdl_data(
+            webpage_url=webpage_url,
+            audio_candidates=ladder[1:],
+            **{k: ladder[0][k] for k in _CANDIDATE_FIELDS},
+        )
+
+    async def _cache(self, fake_redis: aioredis.Redis, data: YTDLVideoInfo) -> None:
+        await fake_redis.set(
+            f"ytdl:stream:{data['webpage_url']}", orjson.dumps(data), ex=1800
+        )
+
+    async def _play(
+        self, fake_redis: aioredis.Redis, webpage_url: str, author: Any, **kwargs: Any
+    ) -> YTDL:
+        qobj = QueueObject(webpage_url, "Laddered Song", author)
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            return await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis, **kwargs
+            )
+
+    async def test_a_dead_head_falls_sideways_without_re_extracting(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The headline behavior: the second rung plays, and yt-dlp is never called."""
+        url = "https://yt.com/v=sideways"
+        await self._cache(fake_redis, self._laddered(url, "251", "140", "249"))
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        mock_extract.assert_not_called()
+        assert song.data.get("format_id") == "140"
+        assert song.url == song.data["url"]
+
+    async def test_a_promotion_leaves_the_shared_extraction_result_alone(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """_extract_once hands every joiner of one extraction the same dict, and the
+        stream warm reads it while this resolve walks. A promotion written onto it
+        would have the warm cache one format's URL under another's shape."""
+        url = "https://yt.com/v=shared"
+        shared = self._laddered(url, "251", "140")
+        before = copy.deepcopy(shared)
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        with patch("src.youtube._extract_once", new=AsyncMock(return_value=shared)):
+            resolved = await YTDL._resolve_playable_stream(
+                QueueObject(url, "Shared", mock_ctx.author), fake_redis
+            )
+
+        assert resolved.get("format_id") == "140"
+        assert shared == before
+
+    async def test_a_deprioritized_promotion_still_rewrites_the_ladder(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The retry path's cache coherence, and it is the COMMON path rather than an
+        edge case: _retry_failed_stream invalidates the entry first, so every retry
+        resolves fresh, walks with the failed format deprioritized, and re-caches.
+
+        The reorder means the winner can land at index 0 while still differing from
+        the format the entry was built around — so a rewrite gated on a non-zero
+        index would persist `format_id: 140` over a ladder still headed by 251, and
+        the next play would probe the blacklisted rung first, discard what the retry
+        learned, and warn about the wrong format until the TTL lapsed.
+        """
+        url = "https://yt.com/v=retryladder"
+        playable_urls.side_effect = [
+            StreamProbe.PLAYABLE
+        ]  # 140, walked first, is healthy
+
+        qobj = QueueObject(
+            url,
+            "Laddered Song",
+            mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
+        )
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                return_value=self._laddered(url, "251", "140", "249"),
+            ),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "140"
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None, "the promotion must have re-cached the entry"
+        cached = orjson.loads(cast(bytes, raw))
+        assert cached["format_id"] == "140"
+        # Asserted through the reconstruction, which is the only thing a later play
+        # walks: rung 0 must be the URL this probe validated. Storing the head
+        # separately is what USED to let the two disagree.
+        ladder = YTDL._candidate_ladder(cast(YTDLVideoInfo, cached))
+        ids = [c.get("format_id") for c in ladder]
+        assert ids[0] == "140"
+        # 251 is not dropped — it is demoted, since the usual cause is a URL revoked
+        # between probe and first read, which a fresh extraction cures.
+        assert "251" in ids
+
+    async def test_the_winner_is_promoted_wholesale(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Not just the URL: the whole format shape, so _record_serving_format and
+        YTDL's abr/asr/acodec describe what is actually playing."""
+        url = "https://yt.com/v=promote"
+        data = self._laddered(url, "251", "140")
+        cast(dict[str, Any], data)["audio_candidates"][0].update(
+            acodec="mp4a.40.2", abr=130.0, asr=44100
+        )
+        await self._cache(fake_redis, data)
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.acodec == "mp4a.40.2"
+        assert song.asr == 44100
+
+    async def test_a_promotion_rewrites_the_cache_entry(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Without the rewrite, the next play re-probes the same dead URL every time
+        until the TTL lapses — re-diagnosing a failure already known."""
+        url = "https://yt.com/v=rewrite"
+        await self._cache(fake_redis, self._laddered(url, "251", "140", "249"))
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        await self._play(fake_redis, url, mock_ctx.author)
+
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None
+        cached = orjson.loads(raw)
+        assert cached["format_id"] == "140"
+        # The winner is the top-level format now, so what is STORED is what follows
+        # it — and the rung that failed is DEMOTED rather than deleted: deleting it
+        # left two promotions pinning a single worst rung for the rest of the TTL with
+        # nothing to fall back to, and a rung can fail for reasons that pass (one CDN
+        # host 503ing) and deserve a later retry.
+        assert [c["format_id"] for c in cached["audio_candidates"]] == ["249", "251"]
+
+    async def test_a_promotion_clears_the_dead_formats_metadata(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The promotion REPLACES the format shape rather than merging over it.
+        _candidate_shape omits keys a format does not carry, so a merge left the dead
+        format's abr/asr in place and the Now Playing footer advertised a bitrate the
+        stream was not using."""
+        url = "https://yt.com/v=stale"
+        data = self._laddered(url, "251", "140")
+        alternative = cast(dict[str, Any], data)["audio_candidates"][0]
+        del alternative["abr"]
+        del alternative["asr"]
+        await self._cache(fake_redis, data)
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.data.get("format_id") == "140"
+        assert song.abr is None
+        assert song.asr is None
+
+    async def test_a_promotion_does_not_extend_the_entrys_life(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A promotion re-caches URLs from an extraction that may be nearly 30 minutes
+        old. _STREAM_URL_MAX_TTL is measured from now, so an unbounded rewrite would
+        hand them another full window — and two promotions ~90 minutes from one
+        extraction — widening exactly the "probe says 200, ffmpeg 403s" gap the probe
+        exists to close."""
+        url = "https://yt.com/v=ttlcap"
+        key = f"ytdl:stream:{url}"
+        await fake_redis.set(
+            key, orjson.dumps(self._laddered(url, "251", "140")), ex=100
+        )
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        await self._play(fake_redis, url, mock_ctx.author)
+
+        ttl = await fake_redis.ttl(key)
+        assert 0 < ttl <= 100, f"the entry's life was extended to {ttl}s"
+
+    async def test_a_healthy_head_rewrites_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The common path stays one probe and zero writes."""
+        url = "https://yt.com/v=healthy"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        with patch("src.youtube.cache_set") as mock_set:
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        mock_set.assert_not_called()
+        assert playable_urls.await_count == 1
+        assert song.data.get("format_id") == "251"
+
+    async def test_a_whole_dead_ladder_falls_back_to_re_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Sideways first, in place second: only when every rung is dead does the
+        entry get dropped and re-extracted."""
+        url = "https://yt.com/v=all_dead"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        fresh = self._laddered(url, "251")
+        cast(dict[str, Any], fresh)["title"] = "Fresh Song"
+        playable_urls.side_effect = [
+            StreamProbe.DEAD,
+            StreamProbe.DEAD,
+            StreamProbe.PLAYABLE,
+        ]
+
+        with patch("src.youtube._ytdlp_extract", return_value=fresh) as mock_extract:
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        mock_extract.assert_called_once()
+        assert song.title == "Fresh Song"
+
+    async def test_a_fresh_extraction_walks_its_own_ladder(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A cache miss gets the same treatment, and caches the rung that survived."""
+        url = "https://yt.com/v=fresh_ladder"
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
+
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=self._laddered(url, "251", "140")
+        ):
+            song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.data.get("format_id") == "140"
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None
+        assert orjson.loads(raw)["format_id"] == "140"
+
+    async def test_a_failed_format_is_tried_last_not_skipped(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A format that just 403'd mid-play is suspect, so the retry walks the
+        others first — but it is deprioritized, never removed: a single-format
+        video would otherwise have nothing left to try."""
+        url = "https://yt.com/v=retry"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        qobj = QueueObject(
+            url, "Retrying Song", mock_ctx.author, failed_format_ids=frozenset({"251"})
+        )
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "140"
+
+    async def test_the_only_format_is_still_tried_after_it_failed(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Filtering instead of reordering would make the retry a guaranteed
+        failure here — and "revoked between the probe and ffmpeg's first read", the
+        common case, is cured by a fresh URL for the same format."""
+        url = "https://yt.com/v=single"
+        await self._cache(fake_redis, self._laddered(url, "251"))
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        qobj = QueueObject(
+            url, "Single Format", mock_ctx.author, failed_format_ids=frozenset({"251"})
+        )
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "251"
+
+    async def test_entries_cached_before_the_ladder_existed_still_play(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Wire-compat: a pre-upgrade entry carries one URL and no candidates, which
+        must read as a one-rung ladder rather than an empty one."""
+        url = "https://yt.com/v=legacy"
+        legacy = _fake_ytdl_data(webpage_url=url, title="Legacy Song")
+        await self._cache(fake_redis, legacy)
+        playable_urls.return_value = StreamProbe.PLAYABLE
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.title == "Legacy Song"
+        assert song.url == legacy["url"]
+
+    async def test_an_unconfirmed_rung_ends_the_walk(
+        self, playable_urls: AsyncMock
+    ) -> None:
+        """The ladder and the tri-state probe meet here. Every rung shares one host and
+        one `expire`, so a probe that could not complete for the head will not complete
+        for the rest: walking on would spend STREAM_PROBE_TIMEOUT per rung to learn
+        nothing, then report a song dead that ffmpeg was never asked to play."""
+        data = self._laddered("https://yt.com/v=blocked", "251", "140", "249")
+        playable_urls.return_value = StreamProbe.UNCONFIRMED
+
+        verdict, index = await YTDL._probe_candidate_ladder(data)
+
+        assert verdict is StreamProbe.UNCONFIRMED
+        assert index == 0
+        assert playable_urls.await_count == 1
+
+    async def test_an_unconfirmed_walk_does_not_serve_a_rung_proven_dead(
+        self, playable_urls: AsyncMock
+    ) -> None:
+        """Stopping is not the same as standing still: the rungs already refused stay
+        refused, so the walk promotes the rung it stopped ON. Returning the head
+        instead would hand the caller a URL this very walk watched YouTube revoke."""
+        data = self._laddered("https://yt.com/v=mixed", "251", "140", "249")
+        playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.UNCONFIRMED]
+
+        verdict, index = await YTDL._probe_candidate_ladder(data)
+
+        assert verdict is StreamProbe.UNCONFIRMED
+        assert index == 1
+        assert data.get("format_id") == "140"
+
+
 class TestStreamCache:
     async def test_cache_hit_skips_executor(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -1914,7 +2853,119 @@ class TestRecordServingFormat:
         assert {"format_id", "protocol", "vcodec"} <= _STREAM_CACHE_FIELDS
 
 
+class TestStreamExtractionSingleflight:
+    """prefetch_stream and the playback loop's resolve build the same request for the
+    same song. Today the unified play-path extraction pre-warms the stream cache so
+    they rarely both run; a flat-resolved song has no such warm, and then the enqueue
+    prefetch and the loop race on one video."""
+
+    async def test_prefetch_and_loop_resolve_share_one_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(_request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _fake_ytdl_data(webpage_url="https://yt.com/v=race")
+
+        qobj = QueueObject("https://yt.com/v=race", "Raced Song", mock_ctx.author)
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(YTDL.prefetch_stream(qobj, redis=fake_redis)),
+                asyncio.create_task(YTDL._resolve_playable_stream(qobj, fake_redis)),
+            ]
+            # Both must clear their cache read (several fakeredis awaits) and reach
+            # the extraction before the gate opens, or the second one is a cache hit
+            # and the test passes for the wrong reason.
+            await asyncio.sleep(0.05)
+            assert calls == 1
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        assert calls == 1
+
+    async def test_a_second_song_is_still_its_own_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The key is per song: single-flighting collapses duplicates of one video,
+        never two different ones."""
+        gate = asyncio.Event()
+        calls = 0
+
+        async def _slow(request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return _fake_ytdl_data(webpage_url=request.url)
+
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(
+                    YTDL.prefetch_stream(
+                        QueueObject(f"https://yt.com/v=s{i}", "Song", mock_ctx.author),
+                        redis=fake_redis,
+                    )
+                )
+                for i in range(2)
+            ]
+            await asyncio.sleep(0.05)
+            gate.set()
+            await asyncio.gather(*tasks)
+
+        assert calls == 2
+
+
 class TestPrefetchStream:
+    """Its bool is a gate, not a hint: _interject_flow stops what is already
+    playing, so a head this could not extract must not get that far. Anything
+    unprovable answers True — the bot plays without Redis."""
+
+    async def test_a_failed_extraction_reports_not_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        qobj = QueueObject("https://yt.com/v=pfg1", "Boom", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", side_effect=ExtractionError("nope")):
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
+
+    async def test_an_empty_extraction_reports_not_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=pfg2", "Nothing", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", return_value=None):
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
+
+    async def test_a_warmed_song_reports_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=pfg3", "Fine", mock_ctx.author)
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=pfg3", title="Fine")
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
+
+    async def test_no_redis_reports_warmed(self, mock_ctx: MagicMock) -> None:
+        """Nothing to warm and nothing provable — not a "not playable" answer."""
+        qobj = QueueObject("https://yt.com/v=pfg4", "No Redis", mock_ctx.author)
+        assert await YTDL.prefetch_stream(qobj, redis=None) is True
+
+    async def test_an_already_cached_song_reports_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=pfg5", "Cached", mock_ctx.author)
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=pfg5",
+            orjson.dumps(
+                _fake_ytdl_data(webpage_url="https://yt.com/v=pfg5", title="Cached")
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract") as extract:
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
+        extract.assert_not_called()
+
     async def test_populates_cache_on_miss(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
@@ -1995,7 +3046,194 @@ class TestPrefetchStream:
         assert cached is None
 
 
-class TestYTStreamPlaynowFlags:
+class TestOpusPassthrough:
+    """Discord speaks Opus and ~90% of what YouTube serves here already IS Opus, so
+    the encoder was spending a full lossy generation to arrive at the same thing.
+    `codec="copy"` remuxes instead. discord.py resolves `codec` to 'copy' only for
+    ('opus', 'libopus', 'copy') and to 'libopus' for everything else, INCLUDING None
+    — so the gate is a plain codec string, and None is today's behavior."""
+
+    async def _ffmpeg_args(self, **data_overrides: Any) -> tuple[Optional[str], str]:
+        """The codec AND the output options yt_stream hands FFmpegOpusAudio.
+
+        Both, together, because they encode one invariant across two code paths:
+        ffmpeg REFUSES `-c:a copy` alongside any filtergraph. Capturing only the
+        codec is what let a mutation that always appends the volume filter survive
+        the whole suite.
+        """
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            options: Optional[str] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["options"] = options or ""
+
+        volume = data_overrides.pop("volume", 1.0)
+        # A remuxable YouTube serve, spelled out: opus, stereo, and one of the itags
+        # known to be 20ms-framed. Every clause of the gate is defeatable per test.
+        data: dict[str, Any] = {
+            "acodec": "opus",
+            "audio_channels": 2,
+            "format_id": "251",
+        }
+        data.update(data_overrides)
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data(**data)),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject("https://yt.com/v=x", "Song", MagicMock()),
+                AsyncMock(spec=discord.TextChannel),
+                volume=volume,
+            )
+        return captured["codec"], captured["options"]
+
+    async def _codec(self, **data_overrides: Any) -> Optional[str]:
+        """The codec yt_stream hands FFmpegOpusAudio for this serve."""
+        codec, _ = await self._ffmpeg_args(**data_overrides)
+        return codec
+
+    async def test_an_opus_serve_is_remuxed(self) -> None:
+        assert await self._codec() == "copy"
+
+    async def test_an_aac_serve_is_still_encoded(self) -> None:
+        """The muxed fallback rungs (itag 18, HLS 91-96) carry AAC."""
+        assert await self._codec(acodec="mp4a.40.2", format_id="18") is None
+
+    async def test_a_volume_filter_forces_the_encoder(self) -> None:
+        """A filter has to touch samples, so it cannot ride the copy path."""
+        assert await self._codec(volume=0.5) is None
+
+    async def test_any_filter_forces_the_encoder_not_just_volume(self) -> None:
+        """The invariant is "a filtergraph exists", not "volume is non-unity".
+
+        Volume is only today's filter source. This stands in a future one (the
+        per-guild loudness setting is the next) by making _audio_filters emit a
+        filter yt_stream knows nothing about: the copy path must still refuse, or
+        ffmpeg exits 234 with zero bytes and the player reports a refused stream.
+        """
+        with patch("src.youtube._audio_filters", return_value=["dynaudnorm"]):
+            codec, options = await self._ffmpeg_args()
+        assert codec is None
+        assert "-filter:a dynaudnorm" in options
+
+    async def test_filters_are_joined_into_one_chain(self) -> None:
+        """One -filter:a, comma-separated — a second flag would silently replace
+        the first rather than adding to it."""
+        with patch("src.youtube._audio_filters", return_value=["volume=0.5", "anull"]):
+            _, options = await self._ffmpeg_args()
+        assert options.count("-filter:a") == 1
+        assert "-filter:a volume=0.5,anull" in options
+
+    async def test_a_missing_codec_is_not_assumed_to_be_opus(self) -> None:
+        """Pre-upgrade cache entries and extractors that report nothing must fall to
+        the encoder, not be guessed into a remux that ffmpeg would then refuse."""
+        assert await self._codec(acodec=None) is None
+
+    async def test_a_surround_serve_is_never_remuxed(self) -> None:
+        """`-c:a copy` copies OpusHead too, so a 5.1 stream reaches Discord as
+        6-channel multistream and clients decode only the front pair — centre-channel
+        vocals silently vanish. yt-dlp sorts `channels` ABOVE `acodec`, so bestaudio
+        really does select itag 338 on videos that carry it; `-ac 2` used to downmix.
+        """
+        assert await self._codec(audio_channels=6, format_id="338") is None
+
+    async def test_an_unknown_channel_count_is_not_assumed_to_be_stereo(self) -> None:
+        """Not every extractor populates audio_channels, and the safe reading of
+        absent is "re-encode" — the encoder path is correct for every input."""
+        assert await self._codec(audio_channels=None) is None
+
+    async def test_a_mono_serve_is_remuxed(self) -> None:
+        """Mono stays mono rather than being upmixed by `-ac 2`, which is the honest
+        rendering of the source and decodes correctly at the client."""
+        assert await self._codec(audio_channels=1) == "copy"
+
+    async def test_an_opus_format_outside_the_allowlist_is_encoded(self) -> None:
+        """Packet duration is the reason. `read()` counts packets and every position
+        surface is frames x 20ms, but Opus may legally be 60ms-framed — which plays
+        at 3x speed and reads a third of its true position. yt-dlp reports no frame
+        duration, so anything but YouTube's known-20ms itags takes the encoder.
+        SoundCloud's http_opus is exactly this case.
+        """
+        assert await self._codec(format_id="http_opus_0_0") is None
+
+    async def test_the_volume_filter_and_the_copy_codec_are_mutually_exclusive(
+        self,
+    ) -> None:
+        """The invariant, asserted directly rather than inferred from two separate
+        tests: ffmpeg exits 234 with zero bytes on `-c:a copy` plus `-filter:a`, and
+        the player would blame YouTube and burn the whole retry budget for it.
+        """
+        for volume in (1.0, 0.5, 2.0):
+            codec, options = await self._ffmpeg_args(volume=volume)
+            assert codec != "copy" or "-filter:a" not in options, (
+                f"volume={volume} produced codec={codec!r} options={options!r}"
+            )
+
+
+class TestYTStreamCarriedFields:
+    """A playing song becomes a QueueObject again — a neutralized prefetch, an
+    interjection's resume tail, a stream retry — so anything QueueObject carries and
+    YTDL does not is silently dropped at that rebuild. `user_input` and `persisted`
+    have each been lost this way before."""
+
+    async def _stream(self, qobj: QueueObject) -> YTDL:
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            return await YTDL.yt_stream(qobj, AsyncMock(spec=discord.TextChannel))
+
+    async def test_user_input_survives(self, mock_ctx: MagicMock) -> None:
+        """The only surviving record of the collection link -remove matches on: a
+        search entry's ytsearch is a title this code generated."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                user_input="https://open.spotify.com/album/abc",
+            )
+        )
+        assert song.user_input == "https://open.spotify.com/album/abc"
+
+    async def test_persisted_survives(self, mock_ctx: MagicMock) -> None:
+        """A crash-recovered song was never RPUSHed to the Redis list. Rebuilt as
+        persisted=True, its next dequeue LPOPs an entry that belongs to an unrelated
+        still-queued song — deleting it, with no error."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                persisted=False,
+            )
+        )
+        assert song.persisted is False
+
+    async def test_retry_state_survives(self, mock_ctx: MagicMock) -> None:
+        """The loop reads both off the PLAYING song to decide whether to retry."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                stream_attempts=2,
+                failed_format_ids=frozenset({"251"}),
+            )
+        )
+        assert song.stream_attempts == 2
+        assert song.failed_format_ids == frozenset({"251"})
+
+
+class TestYTStreamInterjectionFlags:
     async def test_flags_carried_onto_ytdl(self, mock_ctx: MagicMock) -> None:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
@@ -2048,9 +3286,10 @@ class TestYTStreamPlaynowFlags:
             executable: str,
             before_options: Optional[str],
             options: Optional[str],
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
-            captured_options["options"] = options
+            captured_options["before_options"] = before_options
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
@@ -2059,7 +3298,7 @@ class TestYTStreamPlaynowFlags:
             await YTDL.yt_stream(qobj, channel)
 
         channel.send.assert_not_awaited()
-        assert "-ss 151" in captured_options["options"]
+        assert "-ss 151" in captured_options["before_options"]
 
 
 class TestPotProviderCompatibility:
@@ -2092,6 +3331,13 @@ class TestPotProviderCompatibility:
         clients = _EXTRACTOR_ARGS["youtube"]["player_client"]
         assert clients[0] == "default"
         assert not [c for c in clients if not c.startswith("-") and c != "default"]
+
+    def test_tab_extractions_skip_the_homepage_fetch(self) -> None:
+        """Without this every search and playlist extraction opens by downloading the
+        878 KB youtube.com homepage — 0.35s of a 1.00s flat search — for a ytcfg only
+        cookie-authenticated playlists read. The key is `youtubetab`, which
+        youtube:search and youtube:tab both read; under `youtube` it does nothing."""
+        assert _EXTRACTOR_ARGS["youtubetab"]["skip"] == ["webpage"]
 
 
 class TestProcessBoundaryContract:
@@ -2128,6 +3374,11 @@ class TestProcessBoundaryContract:
         far side, and only a real module-level lookup round-trips to the same object."""
         assert pickle.loads(pickle.dumps(_ytdlp_extract)) is _ytdlp_extract
 
+    def test_warm_worker_is_picklable_by_reference(self) -> None:
+        """prewarm() submits it to every worker, so it is pickled by qualified name
+        and must stay a module-level function."""
+        assert pickle.loads(pickle.dumps(warm_worker)) is warm_worker
+
     def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
         """ProcessPoolExecutor pickles `initializer` to every worker, so a closure or
         bound method here breaks pool construction rather than one extraction. The
@@ -2159,6 +3410,7 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
         "abr": 128,
         "asr": 44100,
         "acodec": "opus",
+        "audio_channels": 2,
         "format_id": "251",
         "protocol": "https",
         "vcodec": "none",
@@ -2175,6 +3427,1482 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
     }
     base.update(overrides)
     return base
+
+
+def _audio_ladder() -> list[dict[str, Any]]:
+    """A YouTube format list shaped the way a real one is: sorted worst→best, and
+    carrying every kind of entry a naive audio filter would wrongly admit —
+    storyboards (audio-less but `vcodec: none`), a DRC variant, a dubbed track, and
+    the video-only rungs."""
+    return [
+        {"format_id": "sb0", "url": "https://sb", "vcodec": "none", "acodec": "none"},
+        _fmt("139", "mp4a.40.5", 49.0, 22050),
+        _fmt("249", "opus", 46.0, 48000),
+        _fmt("251-drc", "opus", 129.0, 48000),
+        _fmt("251-1", "opus", 129.0, 48000, language="es"),
+        _fmt("140", "mp4a.40.2", 130.0, 44100),
+        _fmt("251", "opus", 129.0, 48000, language="en"),
+        {"format_id": "137", "url": "https://137", "vcodec": "avc1", "acodec": "none"},
+    ]
+
+
+def _fmt(
+    format_id: str, acodec: str, abr: float, asr: int, **extra: Any
+) -> dict[str, Any]:
+    """One audio-only format, with the expire param _stream_url_ttl needs to consider
+    the URL cacheable."""
+    return {
+        "format_id": format_id,
+        "url": f"https://r2.googlevideo.com/{format_id}?expire={int(time.time()) + 7200}",
+        "vcodec": "none",
+        "acodec": acodec,
+        "abr": abr,
+        "asr": asr,
+        "protocol": "https",
+        "audio_channels": 2,
+        **extra,
+    }
+
+
+class TestAudioCandidateMining:
+    """The fallback ladder is mined in the worker because _slim_info drops `formats` —
+    after that the alternative URLs exist nowhere, which is why one dead URL used to
+    cost the whole song."""
+
+    def _mine(self, **overrides: Any) -> list[dict[str, Any]]:
+        fields: dict[str, Any] = {
+            "formats": _audio_ladder(),
+            "format_id": "251",
+            "language": "en",
+            **overrides,
+        }
+        return cast(
+            list[dict[str, Any]], _mine_audio_candidates(_realistic_raw_info(**fields))
+        )
+
+    def test_keeps_the_top_rungs_best_first(self) -> None:
+        """yt-dlp sorts worst→best, so the ladder is walked in reverse. What is KEPT
+        is the alternatives behind the selection — 251 is the selection here, and it
+        is not stored because _candidate_ladder synthesizes it from the top level."""
+        assert [c["format_id"] for c in self._mine()] == ["140", "249"]
+
+    def test_the_selected_format_is_never_stored_twice(self) -> None:
+        """Rung 0 is the selected format, and it already exists at the top level of
+        the dict this list rides on. Storing it again duplicated a ~1.1 KB signed URL
+        byte for byte — and made "rung 0 is the selection" an invariant to maintain
+        rather than one that cannot be violated."""
+        assert "251" not in [c["format_id"] for c in self._mine()]
+
+    def test_the_selection_is_dropped_wherever_the_sort_put_it(self) -> None:
+        """The selected format is excluded even when it is not the best-sorted one,
+        so it cannot reappear as its own fallback."""
+        assert [c["format_id"] for c in self._mine(format_id="140")] == ["251", "249"]
+
+    def test_storyboards_and_drc_and_dubs_are_excluded(self) -> None:
+        """Storyboards carry `vcodec: none` too (the acodec test is what removes
+        them); a `-drc` variant or a foreign-language dub would silently change what
+        the song sounds like."""
+        ids = [c["format_id"] for c in self._mine()]
+        assert "sb0" not in ids and "137" not in ids
+        assert "251-drc" not in ids and "251-1" not in ids
+
+    def test_a_storyboard_is_excluded_by_the_filter_and_not_by_the_cap(self) -> None:
+        """Deliberately fewer real audio formats than _STREAM_CANDIDATES, so the slice
+        cannot be what drops the storyboard — only the acodec test can.
+
+        yt-dlp writes the STRING "none" here, not None, so narrowing that check to an
+        identity test against None removes the only branch that ever fires in
+        production. A storyboard promoted as audio would probe 200 (it is a real
+        JPEG mosaic) and be served to the voice channel as the song.
+        """
+        candidates = self._mine(
+            formats=[
+                {
+                    "format_id": "sb0",
+                    "url": "https://sb0",
+                    "vcodec": "none",
+                    "acodec": "none",
+                },
+                {
+                    "format_id": "sb1",
+                    "url": "https://sb1",
+                    "vcodec": "none",
+                    "acodec": "none",
+                },
+                _fmt("249", "opus", 46.0, 48000),
+                _fmt("251", "opus", 129.0, 48000),
+            ],
+            language=None,
+        )
+        # 251 is the selection, so 249 is the only alternative — and the storyboards
+        # can only have been removed by the acodec test, not by the cap.
+        assert [c["format_id"] for c in candidates] == ["249"]
+        assert len(candidates) < _STREAM_CANDIDATES - 1
+
+    def test_language_less_formats_survive_a_language_selection(self) -> None:
+        """Absent language means "the only track", not "a different one"."""
+        assert "140" in [c["format_id"] for c in self._mine()]
+
+    def test_muxed_selection_gets_no_alternatives(self) -> None:
+        """The muxed rung already means the audio-only path is degraded; walking
+        sideways across muxed formats is not a recovery worth having. It still plays,
+        via the rung 0 _candidate_ladder synthesizes from the top level."""
+        assert self._mine(format_id="18", vcodec="avc1.42001E") == []
+
+    def test_no_format_list_mines_nothing(self) -> None:
+        """extract_flat playlist entries carry no formats and no stream URL."""
+        assert _mine_audio_candidates({"url": "https://x", "title": "t"}) == []
+        assert _mine_audio_candidates({"formats": _audio_ladder()}) == []
+
+    def test_candidates_are_capped(self) -> None:
+        assert len(self._mine()) <= _STREAM_CANDIDATES
+
+    def test_a_field_the_format_lacks_stays_absent(self) -> None:
+        """Absent must not become None. A candidate promotes wholesale via
+        data.update(), so a fabricated `asr: None` would overwrite the real
+        top-level value with nothing — contradicting YTDLVideoInfo's non-optional
+        types and making the NP footer advertise a sample rate the stream lacks.
+
+        Asserting on the KEYS, because an all-None candidate satisfies a
+        set-equality check against _CANDIDATE_FIELDS just as well as a full one.
+        """
+        sparse = _fmt("249", "opus", 46.0, 48000)
+        del sparse["asr"]
+        del sparse["abr"]
+        candidates = self._mine(
+            formats=[sparse, _fmt("251", "opus", 129.0, 48000)],
+            format_id="251",
+            language=None,
+        )
+
+        assert "asr" not in candidates[0]
+        assert "abr" not in candidates[0]
+        assert candidates[0]["format_id"] == "249"
+
+    def test_only_the_candidate_fields_are_carried(self) -> None:
+        """A candidate promotes wholesale onto the info-dict, so a stray key here
+        would overwrite a top-level field with a per-format one. Every candidate field
+        is also a cached field, or a promotion would not survive the round trip."""
+        assert set(self._mine()[0]) == set(_CANDIDATE_FIELDS)
+        assert set(_CANDIDATE_FIELDS) <= set(_STREAM_CACHE_FIELDS)
+
+
+class TestSearchEntryPicker:
+    """One rule, two callers: yt_source picks the entry to play and `just
+    ytdl-formats` reports on it. Two copies would drift, and the diagnostic built to
+    answer "what would the bot play?" would then answer for a different song."""
+
+    def test_an_entry_with_a_stream_url_wins(self) -> None:
+        entries = [
+            {"_type": "url", "id": "a"},
+            {"_type": "video", "id": "b", "url": "https://b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries))
+        assert chosen is not None and chosen.get("id") == "b"
+
+    def test_the_first_non_playlist_entry_is_the_fallback(self) -> None:
+        """No entry carries a URL — an unrecognised shape still plays rather than
+        failing outright, which is why this is not `next(..., None)`."""
+        entries = [
+            {"_type": "playlist", "id": "p"},
+            {"_type": "video", "id": "a"},
+            {"_type": "video", "id": "b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries))
+        assert chosen is not None and chosen.get("id") == "a"
+
+    def test_nothing_playable_is_none_not_an_index_error(self) -> None:
+        """An all-playlist result used to IndexError inside the diagnostic."""
+        assert select_search_entry(cast(Any, [{"_type": "playlist"}, None])) is None
+
+
+class TestFlatEntryMapper:
+    """_queue_object_from_flat_entry turns one search entry into a queue card, or
+    declines. A None sends the query down the full path, so every refusal costs one
+    wasted flat call and nothing else — which is why the bar for accepting is high."""
+
+    @staticmethod
+    def _entry(**overrides: Any) -> Any:
+        entry: dict[str, Any] = {
+            "id": "djV11Xbc914",
+            "title": "a-ha - Take On Me",
+            "url": "https://www.youtube.com/watch?v=djV11Xbc914",
+            "duration": 244,
+            "uploader": "a-ha",
+            "thumbnail": "https://i.ytimg.com/vi/x/hq720.jpg",
+        }
+        entry.update(overrides)
+        return entry
+
+    def _map(self, mock_ctx: MagicMock, **overrides: Any) -> Optional[QueueObject]:
+        return _queue_object_from_flat_entry(
+            self._entry(**overrides),
+            mock_ctx.author,
+            query_source="search",
+            analytics=_ANALYTICS,
+            user_input="take on me",
+        )
+
+    def test_maps_a_plain_result(self, mock_ctx: MagicMock) -> None:
+        qobj = self._map(mock_ctx)
+        assert qobj is not None
+        assert qobj.title == "a-ha - Take On Me"
+        assert qobj.duration == 244
+        assert qobj.uploader == "a-ha"
+        assert qobj.thumbnail == "https://i.ytimg.com/vi/x/hq720.jpg"
+        assert qobj.user_input == "take on me"
+        assert qobj.query_source == "search"
+        assert qobj.analytics is _ANALYTICS
+
+    def test_webpage_url_is_derived_from_the_id_not_read_from_url(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The flat and full paths must agree on this string by construction: it is
+        the stream-cache key, what -remove matches, and part of play_history's dedup
+        tuple. `url` is whatever the renderer supplied."""
+        qobj = self._map(mock_ctx, url="https://youtu.be/djV11Xbc914?si=abc")
+        assert qobj is not None
+        assert qobj.webpage_url == "https://www.youtube.com/watch?v=djV11Xbc914"
+
+    def test_ts_is_a_parameter_never_read_off_the_entry(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A playback offset belongs to the request, not to the video."""
+        qobj = _queue_object_from_flat_entry(
+            self._entry(),
+            mock_ctx.author,
+            query_source="search",
+            analytics=_ANALYTICS,
+            user_input=None,
+            ts=42,
+        )
+        assert qobj is not None and qobj.ts == 42
+
+    def test_uploader_falls_back_to_channel(self, mock_ctx: MagicMock) -> None:
+        qobj = self._map(mock_ctx, uploader=None, channel="a-ha - Topic")
+        assert qobj is not None and qobj.uploader == "a-ha - Topic"
+
+    def test_no_id_declines(self, mock_ctx: MagicMock) -> None:
+        assert self._map(mock_ctx, id=None) is None
+
+    def test_a_live_entry_declines(self, mock_ctx: MagicMock) -> None:
+        """Live is refused on live_status alone, not on the missing duration that
+        usually accompanies it: a renderer that reports both would otherwise queue a
+        stream whose "length" is whatever it has run for so far."""
+        assert self._map(mock_ctx, live_status="is_live") is None
+        assert self._map(mock_ctx, duration=None, live_status="is_live") is None
+
+    def test_an_upcoming_entry_declines(self, mock_ctx: MagicMock) -> None:
+        """A premiere has a duration and nothing to stream yet."""
+        assert self._map(mock_ctx, live_status="is_upcoming") is None
+
+    def test_a_duration_less_entry_declines(self, mock_ctx: MagicMock) -> None:
+        """Every ytdl:source entry the flat path writes must have a duration, the
+        same contract the full path's cache writes keep."""
+        assert self._map(mock_ctx, duration=None) is None
+
+    def test_a_processed_entry_declines_and_warns(
+        self, mock_ctx: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A processed entry reaching the flat mapper means the single-flight key
+        stopped separating profiles, and its `url` is a CDN address. Refusing is the
+        cheap failure; persisting it would put a googlevideo URL in play_history."""
+        with caplog.at_level(logging.WARNING):
+            assert self._map(mock_ctx, format_id="251") is None
+        assert "processed entry" in caplog.text
+
+
+class TestFlatYtSource:
+    """yt_source(flat=True): the search half of the play path, answered from one
+    search POST with no watch page and no stream URL."""
+
+    async def test_extracts_flat_and_writes_only_the_source_cache(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        flat = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "abc123",
+                    "title": "Flat Song",
+                    "url": "https://www.youtube.com/watch?v=abc123",
+                    "duration": 200,
+                    "uploader": "Chan",
+                    "thumbnail": "https://img/hq720.jpg",
+                }
+            ],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=flat) as mock_extract:
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:flat song",
+                redis=fake_redis,
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input=None,
+                flat=True,
+            )
+
+        mock_extract.assert_called_once()
+        req = mock_extract.call_args[0][0]
+        assert req.opts is _YTDL_FLAT_SEARCH_OPTS
+        assert req.process is True
+        assert qobj.webpage_url == "https://www.youtube.com/watch?v=abc123"
+        # Derived from `id`, not read from the entry's own `url` — which the fixture
+        # sets to a CDN address, the shape a processed entry carries.
+        assert "googlevideo" not in qobj.webpage_url
+        cached = await fake_redis.get("ytdl:source:ytsearch:flat song")
+        assert cached is not None
+        entry = orjson.loads(cached)
+        assert entry.pop("cached_at") == pytest.approx(time.time(), abs=60)
+        assert entry == {
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "title": "Flat Song",
+            "duration": 200,
+            "uploader": "Chan",
+            "thumbnail": "https://img/hq720.jpg",
+        }
+        # No stream URL exists yet — the song's prefetch is what extracts it.
+        assert await fake_redis.keys("ytdl:stream:*") == []
+
+    def test_the_flat_opts_carry_a_default_search(self) -> None:
+        """A Spotify track reaches yt_source as a bare title — `Take On Me a-ha`, no
+        `ytsearch:` prefix, because this code generated it rather than a user typing
+        it. Without default_search yt-dlp reads that as a URL and refuses it."""
+        assert _YTDL_FLAT_SEARCH_OPTS["default_search"] == "auto"
+        assert _YTDL_FLAT_SEARCH_OPTS["extract_flat"] == "in_playlist"
+
+    async def test_a_warm_source_cache_still_short_circuits(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The cache read comes first in either mode: a query anyone ran in the last
+        hour costs no yt-dlp call at all, which is faster than any flat extraction."""
+        await fake_redis.set(
+            "ytdl:source:ytsearch:warm",
+            orjson.dumps({"webpage_url": "https://yt.com/v=w", "title": "Warm"}),
+            ex=3600,
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:warm",
+                redis=fake_redis,
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input=None,
+                flat=True,
+            )
+        mock_extract.assert_not_called()
+        assert qobj.title == "Warm"
+
+    async def test_an_unmappable_entry_falls_back_to_the_full_path(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A live first result behaves exactly as it does with flat=False: two pool
+        calls, the second one the full extraction, and the same QueueObject."""
+        live = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "lofi",
+                    "title": "lofi radio",
+                    "duration": None,
+                    "live_status": "is_live",
+                }
+            ],
+        }
+        full = _fake_ytdl_data(webpage_url="https://yt.com/v=lofi", title="lofi radio")
+        with patch(
+            "src.youtube._ytdlp_extract", side_effect=[live, full]
+        ) as mock_extract:
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:lofi radio",
+                redis=fake_redis,
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input=None,
+                flat=True,
+            )
+
+        assert mock_extract.call_count == 2
+        assert mock_extract.call_args_list[0][0][0].opts is _YTDL_FLAT_SEARCH_OPTS
+        assert mock_extract.call_args_list[1][0][0].opts is _YTDL_STREAM_SEARCH_OPTS
+        assert qobj.webpage_url == "https://yt.com/v=lofi"
+        # The full path warms the stream cache, as it does for every link — behind
+        # the reply, so the assertion settles the warm first.
+        await _settle_stream_warms()
+        assert await fake_redis.keys("ytdl:stream:*") != []
+
+    async def test_a_flat_and_a_full_resolve_of_one_query_do_not_share_a_job(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The single-flight key carries the profile, so concurrent callers wanting
+        different shapes each get their own extraction with their own opts."""
+        gate = asyncio.Event()
+        seen: list[Any] = []
+
+        async def _slow(request: Any) -> Any:
+            seen.append(request.opts)
+            await gate.wait()
+            if request.opts is _YTDL_FLAT_SEARCH_OPTS:
+                return {
+                    "_type": "playlist",
+                    "entries": [{"id": "shared", "title": "Shared", "duration": 10}],
+                }
+            return _fake_ytdl_data(webpage_url="https://yt.com/v=shared")
+
+        kwargs: dict[str, Any] = dict(
+            query_source="search", analytics=_ANALYTICS, user_input=None
+        )
+        with patch("src.youtube._run_extract", new=_slow):
+            tasks = [
+                asyncio.create_task(
+                    YTDL.yt_source(
+                        mock_ctx.author,
+                        "ytsearch:shared",
+                        redis=fake_redis,
+                        flat=flat,
+                        **kwargs,
+                    )
+                )
+                for flat in (True, False)
+            ]
+            await asyncio.sleep(0.05)
+            gate.set()
+            flat_qobj, full_qobj = await asyncio.gather(*tasks)
+
+        assert set(map(id, seen)) == {
+            id(_YTDL_FLAT_SEARCH_OPTS),
+            id(_YTDL_STREAM_SEARCH_OPTS),
+        }
+        # Each caller got its own shape. Sharing one job would hand the full caller a
+        # flat dict (no webpage_url) or the flat caller a CDN url as identity.
+        assert flat_qobj.webpage_url == "https://www.youtube.com/watch?v=shared"
+        assert full_qobj.webpage_url == "https://yt.com/v=shared"
+
+    async def test_an_unsupported_url_fails_identically_on_the_flat_path(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Both profiles route through one except clause, so the message a user sees
+        for a site yt-dlp will not take cannot drift between them."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError("ERROR: Unsupported URL", unsupported=True)
+        with patch("src.youtube._ytdlp_extract", side_effect=err):
+            with pytest.raises(Exception, match="isn't from a site I can play"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "https://nope.example/x",
+                    redis=fake_redis,
+                    query_source="nope.example",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                    flat=True,
+                )
+
+    async def test_a_flat_resolved_song_still_streams(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The property that survives to playback: a QueueObject the flat path built
+        carries no stream URL, and yt_stream extracts one with the stream opts."""
+        flat = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "play1",
+                    "title": "Playable",
+                    "duration": 100,
+                    "uploader": "Chan",
+                }
+            ],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=flat):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:playable",
+                redis=fake_redis,
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input=None,
+                flat=True,
+            )
+
+        stream = _fake_ytdl_data(
+            webpage_url="https://www.youtube.com/watch?v=play1", title="Playable"
+        )
+        channel = AsyncMock(spec=discord.TextChannel)
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=stream) as mock_extract,
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            song = await YTDL.yt_stream(qobj, channel, redis=fake_redis)
+
+        assert mock_extract.call_args[0][0].opts is _YTDL_STREAM_OPTS
+        assert song.title == "Playable"
+
+
+class TestTheStreamWarmIsSharedNotAwaited:
+    """yt_source starts the stream-cache warm from the extraction it already paid for
+    and returns without waiting for the probe behind it. Everything that reads that
+    cache joins the same job, so the reply gets faster and nothing extracts twice."""
+
+    async def test_yt_source_returns_before_the_probe_finishes(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The probe is a network round trip bounded only by its timeout, and the
+        reply needs identity, not a probed URL."""
+        release = asyncio.Event()
+
+        async def _stalled_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _stalled_probe
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=slowprobe")
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "slow probe search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        assert qobj.webpage_url == "https://yt.com/v=slowprobe"
+        warm = youtube._INFLIGHT_STREAM_WARMS["ytdl:stream:https://yt.com/v=slowprobe"]
+        assert not warm.done()
+        release.set()
+        await _settle_stream_warms()
+        assert await fake_redis.get("ytdl:stream:https://yt.com/v=slowprobe")
+
+    async def test_the_prefetch_joins_the_warm_instead_of_extracting_again(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The regression this guards: with the warm unawaited, an enqueue-time
+        prefetch that read the cache directly would miss and pay a second full
+        extraction of the URL the warm is about to write."""
+        release = asyncio.Event()
+
+        async def _stalled_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _stalled_probe
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=joined")
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "joined search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            prefetch = asyncio.ensure_future(
+                YTDL.prefetch_stream(qobj, redis=fake_redis)
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not prefetch.done()  # parked on the warm, not extracting
+            release.set()
+            assert await prefetch is True
+        mock_extract.assert_not_called()
+
+    async def test_the_warm_records_onto_a_span_that_is_still_open(
+        self, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """yt_source does not await the warm, so the resolve's span has ended by
+        the time the probe answers, and an ended span drops the serving format and
+        the probe verdict (103 warnings in one day of production logs)."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        release = asyncio.Event()
+
+        async def _slow_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _slow_probe
+        data = cast(Any, _fake_ytdl_data(webpage_url="https://yt.com/v=spanned"))
+        with patch.object(youtube, "_tracer", tracer):
+            with tracer.start_as_current_span("ytdl.yt_source"):
+                warm = youtube._start_stream_warm(
+                    fake_redis, "ytdl:stream:https://yt.com/v=spanned", data
+                )
+            release.set()
+            assert await warm is True
+
+        spans = {span.name: span for span in exporter.get_finished_spans()}
+        assert "ytdl.stream_probe" not in (spans["ytdl.yt_source"].attributes or {})
+        warm_span = spans["ytdl.stream_warm"]
+        assert (warm_span.attributes or {})["ytdl.stream_probe"] == "playable"
+        resolve_context = spans["ytdl.yt_source"].context
+        assert warm_span.parent is not None and resolve_context is not None
+        assert warm_span.parent.span_id == resolve_context.span_id
+
+    async def test_a_cancelled_joiner_leaves_the_warm_running(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Every bulk queue mutation cancels a prefetch, and the warm is shared."""
+        release = asyncio.Event()
+
+        async def _stalled_probe(_url: str) -> StreamProbe:
+            await release.wait()
+            return StreamProbe.PLAYABLE
+
+        playable_urls.side_effect = _stalled_probe
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=cancelled")
+        cache_key = "ytdl:stream:https://yt.com/v=cancelled"
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author,
+                "cancelled search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
+
+        prefetch = asyncio.ensure_future(YTDL.prefetch_stream(qobj, redis=fake_redis))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        prefetch.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await prefetch
+
+        assert not youtube._INFLIGHT_STREAM_WARMS[cache_key].cancelled()
+        release.set()
+        await _settle_stream_warms()
+        assert await fake_redis.get(cache_key)
+
+    async def test_two_warms_of_one_url_are_one_job(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=once")
+        first = youtube._start_stream_warm(fake_redis, "ytdl:stream:once", data)
+        second = youtube._start_stream_warm(fake_redis, "ytdl:stream:once", data)
+        assert first is second
+        await _settle_stream_warms()
+
+
+class TestProbeReuse:
+    """A URL confirmed playable seconds ago is not re-probed at play time."""
+
+    def test_only_a_stamped_entry_inside_the_window_reuses_the_verdict(self) -> None:
+        assert not youtube._probe_is_recent(_fake_ytdl_data())
+        assert youtube._probe_is_recent(_fake_ytdl_data(probed_at=time.time()))
+        assert not youtube._probe_is_recent(
+            _fake_ytdl_data(probed_at=time.time() - youtube._PROBE_REUSE_SECS - 1)
+        )
+
+    async def test_an_unconfirmed_entry_is_never_stamped(
+        self, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Only a PLAYABLE verdict earns the skip — an unconfirmed URL was never
+        confirmed by anything."""
+        playable_urls.return_value = StreamProbe.UNCONFIRMED
+        data = _fake_ytdl_data(webpage_url="https://yt.com/v=unconf")
+        await youtube._probe_and_cache(fake_redis, "ytdl:stream:unconf", data)
+        cached = orjson.loads(await fake_redis.get("ytdl:stream:unconf") or b"{}")
+        assert "probed_at" not in cached
+
+    async def test_a_recent_cache_hit_skips_the_play_time_probe(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=recent", "Recent", mock_ctx.author)
+        cached = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=recent", probed_at=time.time()
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=recent", orjson.dumps(cached)
+        )
+        resolved = await YTDL._resolve_playable_stream(qobj, fake_redis)
+        assert resolved["webpage_url"] == "https://yt.com/v=recent"
+        playable_urls.assert_not_awaited()
+
+    async def test_a_format_that_failed_a_play_is_not_served_from_a_recent_verdict(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A retry invalidates its entry, but a warm can rewrite it before the retry
+        resolves. The stamp says the URL answered a probe; the play says the format
+        produced no audio, and the play is what the retry is acting on."""
+        qobj = QueueObject(
+            "https://yt.com/v=burned",
+            "Burned",
+            mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
+        )
+        cached = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=burned",
+            format_id="251",
+            probed_at=time.time(),
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=burned", orjson.dumps(cached)
+        )
+        await YTDL._resolve_playable_stream(qobj, fake_redis)
+        playable_urls.assert_awaited()
+
+    async def test_a_stale_stamp_is_probed_as_before(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        qobj = QueueObject("https://yt.com/v=old", "Old", mock_ctx.author)
+        cached = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=old",
+            probed_at=time.time() - youtube._PROBE_REUSE_SECS - 1,
+        )
+        await fake_redis.set("ytdl:stream:https://yt.com/v=old", orjson.dumps(cached))
+        await YTDL._resolve_playable_stream(qobj, fake_redis)
+        playable_urls.assert_awaited_once()
+
+
+class TestSourceCacheKey:
+    """A query's ytdl:source key. Case folding is what makes "Destiny" and "destiny "
+    one entry; a URL is what it must never be applied to."""
+
+    def test_a_search_folds_case_and_whitespace(self) -> None:
+        assert _source_cache_key("  Destiny ") == _source_cache_key("destiny")
+
+    def test_a_url_keeps_its_case(self) -> None:
+        """YouTube video ids are case-sensitive. Folded, `?v=aBcDeF` and `?v=AbCdEf`
+        share one entry and the second play is served the first's song for the whole
+        TTL — which is now a day."""
+        upper = _source_cache_key("https://www.youtube.com/watch?v=aBcDeF")
+        lower = _source_cache_key("https://www.youtube.com/watch?v=AbCdEf")
+        assert upper != lower
+        assert upper.endswith("v=aBcDeF")
+
+    def test_a_url_is_still_stripped(self) -> None:
+        key = _source_cache_key("  https://yt.com/v=Ab  ")
+        assert key == "ytdl:source:https://yt.com/v=Ab"
+
+    def test_a_scheme_less_link_keeps_its_case(self) -> None:
+        """What users paste. parse_url reads it as a link, so its key must too, or
+        two ids differing only in case share an entry."""
+        upper = _source_cache_key("youtu.be/aBcDeFgHiJk")
+        assert upper == "ytdl:source:youtu.be/aBcDeFgHiJk"
+        assert upper != _source_cache_key("youtu.be/AbCdEfGhIjK")
+
+    def test_a_search_holding_a_link_is_still_a_search(self) -> None:
+        """Words around a link are a search, which parse_input folds like any
+        other."""
+        key = _source_cache_key("ytsearch:https://youtu.be/aBcDeFgHiJk Live")
+        assert key == "ytdl:source:ytsearch:https://youtu.be/abcdefghijk live"
+
+    def test_a_link_shaped_search_still_folds(self) -> None:
+        """A slash alone does not make a link, so this stays one entry."""
+        assert _source_cache_key("AC/DC Back in Black") == _source_cache_key(
+            "ac/dc back in black"
+        )
+
+
+class TestSourceCacheRevalidation:
+    """A hit older than _YT_SOURCE_FRESH_SECS is served as-is and refreshed behind
+    the reply, so a repeat play inside the day is one Redis GET."""
+
+    @staticmethod
+    def _entry(**over: Any) -> dict[str, Any]:
+        return {
+            "webpage_url": "https://www.youtube.com/watch?v=old",
+            "title": "Stale Song",
+            "duration": 120,
+            "uploader": "Chan",
+            "thumbnail": None,
+        } | over
+
+    @staticmethod
+    async def _stored(redis: aioredis.Redis, key: str) -> Any:
+        raw = await redis.get(key)
+        assert raw is not None
+        return orjson.loads(raw)
+
+    async def _hit(self, ctx: MagicMock, redis: aioredis.Redis, query: str) -> Any:
+        return await YTDL.yt_source(
+            ctx.author,
+            query,
+            redis=redis,
+            query_source="search",
+            analytics=_ANALYTICS,
+            user_input=None,
+        )
+
+    def test_an_entry_with_no_stamp_reads_as_fresh(self) -> None:
+        """Written by a build that stamped nothing — and carrying that build's one-hour
+        TTL, so it expires before staleness could matter. Read as stale, the first
+        minutes after a deploy would revalidate the whole cache."""
+        assert not _source_entry_is_stale(self._entry())
+        assert not _source_entry_is_stale("not a dict")
+
+    def test_a_fresh_stamp_reads_as_fresh_and_an_old_one_as_stale(self) -> None:
+        assert not _source_entry_is_stale(self._entry(cached_at=time.time()))
+        assert _source_entry_is_stale(
+            self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+        )
+
+    async def test_a_stale_search_hit_serves_the_entry_and_refreshes_it(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.set(
+            "ytdl:source:stale search",
+            orjson.dumps(
+                self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+            ),
+        )
+        flat = {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "new1",
+                    "title": "Fresh Song",
+                    "duration": 200,
+                    "uploader": "Chan",
+                }
+            ],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=flat) as mock_extract:
+            qobj = await self._hit(mock_ctx, fake_redis, "stale search")
+            # The reply is served from the entry that was there, not the refresh.
+            assert qobj.title == "Stale Song"
+            assert mock_extract.call_count == 0
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
+
+        rewritten = await self._stored(fake_redis, "ytdl:source:stale search")
+        assert rewritten["title"] == "Fresh Song"
+        assert rewritten["webpage_url"] == "https://www.youtube.com/watch?v=new1"
+        assert rewritten["cached_at"] == pytest.approx(time.time(), abs=60)
+        assert await fake_redis.ttl("ytdl:source:stale search") == _YT_SOURCE_TTL
+
+    async def test_a_fresh_hit_refreshes_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.set(
+            "ytdl:source:fresh search",
+            orjson.dumps(self._entry(cached_at=time.time())),
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await self._hit(mock_ctx, fake_redis, "fresh search")
+        assert not youtube._SOURCE_REVALIDATIONS
+        mock_extract.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "link", ["https://www.youtube.com/watch?v=oldOne", "youtu.be/oldOne12345"]
+    )
+    async def test_a_stale_link_refreshes_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, link: str
+    ) -> None:
+        """What ages is the ranking a SEARCH resolved through. A link's mapping is
+        the link, and refreshing one would cost a full extraction to learn that."""
+        await fake_redis.set(
+            f"ytdl:source:{link}",
+            orjson.dumps(
+                self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await self._hit(mock_ctx, fake_redis, link)
+        assert not youtube._SOURCE_REVALIDATIONS
+        mock_extract.assert_not_called()
+
+    async def test_a_refresh_that_resolves_nothing_leaves_the_entry_alone(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A live result or one without a duration: the stale entry still plays, so
+        it outlives the attempt rather than being dropped."""
+        stale = self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+        await fake_redis.set("ytdl:source:live search", orjson.dumps(stale))
+        live = {
+            "_type": "playlist",
+            "entries": [{"id": "l1", "title": "Live", "live_status": "is_live"}],
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=live):
+            await self._hit(mock_ctx, fake_redis, "live search")
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
+
+        assert await self._stored(fake_redis, "ytdl:source:live search") == stale
+
+    async def test_a_failed_refresh_does_not_escape_the_task(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The reply has already gone out from the entry this failed to refresh."""
+        await fake_redis.set(
+            "ytdl:source:boom search",
+            orjson.dumps(
+                self._entry(cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1)
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract", side_effect=RuntimeError("nope")):
+            await self._hit(mock_ctx, fake_redis, "boom search")
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
+
+
+class TestWarmWorker:
+    """What prewarm() hands each worker. The pool owns lifecycle only, so the warm-up
+    is supplied by this module, like every other callable it submits."""
+
+    def test_builds_one_youtubedl_from_a_copy_of_the_stream_opts(self) -> None:
+        """The first YoutubeDL a process builds discovers plugins and probes for a JS
+        runtime — 166-339 ms every later construction skips. The copy is the rule
+        _ytdlp_extract already follows: YoutubeDL writes into the params it is given,
+        and the opts profiles are shared module state."""
+        with patch("src.youtube.youtube_dl") as mock_ytdl:
+            warm_worker()
+
+        mock_ytdl.YoutubeDL.assert_called_once()
+        (params,) = mock_ytdl.YoutubeDL.call_args.args
+        assert params == _YTDL_STREAM_OPTS
+        assert params is not _YTDL_STREAM_OPTS
+
+
+class TestYtPlaylistEntries:
+    """What a flat playlist entry puts on its queue card. The entries yt-dlp returns
+    carry duration and uploader outright and a thumbnails collection _slim_info drops,
+    so these run the real slimming rather than a hand-written entry."""
+
+    @staticmethod
+    def _raw_entry(video_id: str, **overrides: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "id": video_id,
+            "title": f"Song {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": 244,
+            "uploader": "a-ha",
+            "channel": "a-ha - Topic",
+            "thumbnails": [
+                {"url": "https://i.ytimg.com/vi/x/default.jpg"},
+                {"url": "https://i.ytimg.com/vi/x/hq720.jpg"},
+            ],
+        }
+        entry.update(overrides)
+        return entry
+
+    async def _playlist(
+        self, mock_ctx: MagicMock, entries: list[Any]
+    ) -> list[QueueObject]:
+        async def _extract(_request: Any) -> Any:
+            return _slim_info({"_type": "playlist", "entries": entries})
+
+        with patch("src.youtube._run_extract", new=_extract):
+            playlist = await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input="https://www.youtube.com/playlist?list=PL1",
+            )
+        return playlist.tracks
+
+    async def test_a_short_gets_the_same_url_a_pasted_link_would(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """_extract_video sets a Short's `url` to /shorts/{id}. Read from there, one
+        video has two identities: a second ytdl:stream key, a -remove that misses it,
+        and a play_history row the dedup index reads as a different song."""
+        (qobj,) = await self._playlist(
+            mock_ctx,
+            [self._raw_entry("sh0rt", url="https://www.youtube.com/shorts/sh0rt")],
+        )
+        assert qobj.webpage_url == "https://www.youtube.com/watch?v=sh0rt"
+
+    async def test_a_track_carries_duration_uploader_and_thumbnail(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        (qobj,) = await self._playlist(mock_ctx, [self._raw_entry("abc")])
+        assert qobj.duration == 244
+        assert qobj.uploader == "a-ha"
+        assert qobj.thumbnail == "https://i.ytimg.com/vi/x/hq720.jpg"
+
+    async def test_uploader_falls_back_to_channel(self, mock_ctx: MagicMock) -> None:
+        """yt-dlp also parses lockupViewModel results, which carry fewer fields than
+        the videoRenderer ones."""
+        (qobj,) = await self._playlist(
+            mock_ctx, [self._raw_entry("lockup", uploader=None)]
+        )
+        assert qobj.uploader == "a-ha - Topic"
+
+    async def test_a_live_entry_still_queues_without_a_duration(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """duration is None on a live entry. The card renders an unknown length; the
+        playlist must not lose the track over it."""
+        (qobj,) = await self._playlist(
+            mock_ctx,
+            [self._raw_entry("live", duration=None, live_status="is_live")],
+        )
+        assert qobj.duration is None
+        assert qobj.title == "Song live"
+
+
+class TestCacheWritability:
+    def test_an_unwritable_cache_directory_is_named_at_startup(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A volume created root-owned stays root-owned for uid 10001: seen live,
+        with yt-dlp's own PermissionError the only trace, once per store."""
+        sigfuncs = tmp_path / "yt-dlp" / "youtube-sigfuncs"
+        sigfuncs.mkdir(parents=True)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            youtube.os, "access", lambda path, _mode: path != str(sigfuncs)
+        )
+
+        with caplog.at_level(logging.WARNING):
+            youtube.warn_if_cache_unwritable()
+
+        assert "not writable" in caplog.text
+        assert "youtube-sigfuncs" in caplog.text
+
+    def test_a_writable_or_absent_cache_says_nothing(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        with caplog.at_level(logging.WARNING):
+            youtube.warn_if_cache_unwritable()
+            (tmp_path / "yt-dlp").mkdir()
+            youtube.warn_if_cache_unwritable()
+        assert "not writable" not in caplog.text
+
+
+class TestMixRepeats:
+    """yt-dlp walks a Mix one window at a time and can yield a video it already
+    yielded: one walk returned 1,671 entries for 492 videos. A Mix keeps each video
+    once; a playlist keeps what its owner put there."""
+
+    @staticmethod
+    def _entries(*ids: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": video_id,
+                "title": f"Song {video_id}",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": 100,
+            }
+            for video_id in ids
+        ]
+
+    @staticmethod
+    def _urls(queued: list[QueueObject]) -> list[str]:
+        return [q.webpage_url.rsplit("=", 1)[1] for q in queued]
+
+    async def _fetch(
+        self,
+        ctx: MagicMock,
+        list_id: str,
+        ids: tuple[str, ...],
+        redis: Optional[aioredis.Redis] = None,
+    ) -> list[QueueObject]:
+        url = f"https://www.youtube.com/watch?v={ids[0]}&list={list_id}"
+        data = {"_type": "playlist", "id": list_id, "entries": self._entries(*ids)}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            playlist = await YTDL.yt_playlist(
+                url,
+                ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=url,
+                redis=redis,
+            )
+        return playlist.tracks
+
+    @pytest.mark.parametrize("list_id", ["RDa", "RDAMVMa"])
+    async def test_a_mix_keeps_each_video_once_in_first_seen_order(
+        self, mock_ctx: MagicMock, list_id: str
+    ) -> None:
+        """RDAMVM is the same Mix reached through YouTube Music."""
+        queued = await self._fetch(mock_ctx, list_id, ("a", "b", "c", "a", "b", "d"))
+        assert self._urls(queued) == ["a", "b", "c", "d"]
+        # Positions come from the kept tracks, so a dropped repeat leaves no gap.
+        assert [q.analytics.queue_position for q in queued] == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("list_id", ["PLmine", "RDCLAK5uy_kmPRjHDECIcuVwnKsx2Ng"])
+    async def test_a_playlist_keeps_a_video_its_owner_added_twice(
+        self, mock_ctx: MagicMock, list_id: str
+    ) -> None:
+        """A curated RDCLAK5uy_ list shares the Mix prefix and is a playlist: the tab
+        extractor walks it with a header count and never repeats itself."""
+        queued = await self._fetch(mock_ctx, list_id, ("a", "b", "a"))
+        assert self._urls(queued) == ["a", "b", "a"]
+
+    async def test_the_cache_holds_the_mix_without_its_repeats(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Deduplicated before the write, so a paste inside the window does not
+        bring the repeats back."""
+        await self._fetch(mock_ctx, "RDa", ("a", "b", "a"), fake_redis)
+        with patch("src.youtube._ytdlp_extract") as extract:
+            url = "https://www.youtube.com/watch?v=a&list=RDa"
+            again = await YTDL.yt_playlist(
+                url,
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=url,
+                redis=fake_redis,
+            )
+        extract.assert_not_called()
+        assert self._urls(again.tracks) == ["a", "b"]
+
+    def test_the_repeat_count_rides_the_span(self) -> None:
+        """The walk's own size and what was queued disagree for a repeating Mix,
+        and the trace is where that has to be visible. A real span, never a patched
+        get_current_span: that function is OpenTelemetry's global, and the log line
+        beside the attribute reads it too."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        url = "https://www.youtube.com/watch?v=a&list=RDa"
+        with tracer.start_as_current_span("unique"):
+            _playlist_tracks(
+                cast(Any, {"id": "RDa", "entries": self._entries("a", "b")}), url
+            )
+        with tracer.start_as_current_span("repeats"):
+            tracks, unavailable = _playlist_tracks(
+                cast(Any, {"id": "RDa", "entries": self._entries("a", "a", "b", "a")}),
+                url,
+            )
+        with tracer.start_as_current_span("kept"):
+            kept, kept_unavailable = _playlist_tracks(
+                cast(Any, {"id": "PLx", "entries": self._entries("a", "a")}), url
+            )
+        unique, repeats, owned = exporter.get_finished_spans()
+        assert len(tracks) == 2
+        # A dropped repeat is not an unavailable video.
+        assert unavailable == 0
+        assert "ytdl.playlist_repeats" not in (unique.attributes or {})
+        assert (repeats.attributes or {})["ytdl.playlist_repeats"] == 2
+        assert (repeats.attributes or {})["ytdl.playlist_repeats_dropped"] is True
+        # A playlist's repeats are counted and kept.
+        assert len(kept) == 2
+        assert kept_unavailable == 0
+        assert (owned.attributes or {})["ytdl.playlist_repeats"] == 1
+        assert (owned.attributes or {})["ytdl.playlist_repeats_dropped"] is False
+
+
+class TestUnavailableEntries:
+    """A private or deleted video in a flat playlist arrives as its id alone — no
+    title, no duration — and would otherwise queue under its id and fail at its
+    turn. It is dropped and counted, so the confirmation can say how many went."""
+
+    _URL = "https://www.youtube.com/playlist?list=PLx"
+
+    @staticmethod
+    def _entry(video_id: str, **overrides: Any) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "id": video_id,
+            "title": f"Song {video_id}",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": 100,
+        }
+        entry.update(overrides)
+        return entry
+
+    def _tracks(self, *entries: Any, list_id: str = "PLx") -> tuple[list[str], int]:
+        tracks, unavailable = _playlist_tracks(
+            cast(Any, {"id": list_id, "entries": list(entries)}), self._URL
+        )
+        return [t.webpage_url.rsplit("=", 1)[1] for t in tracks], unavailable
+
+    def test_an_id_only_entry_is_dropped_and_counted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            ids, unavailable = self._tracks(
+                self._entry("a"),
+                {"id": "jYC5BcL7YtQ", "title": None, "duration": None},
+                self._entry("b"),
+            )
+        assert ids == ["a", "b"]
+        assert unavailable == 1
+        assert "jYC5BcL7YtQ" in caplog.text
+
+    def test_a_null_and_an_id_less_entry_are_counted(self) -> None:
+        ids, unavailable = self._tracks(
+            None, self._entry("a"), {"title": "no id", "duration": 100}
+        )
+        assert ids == ["a"]
+        assert unavailable == 2
+
+    def test_a_live_entry_is_kept(self) -> None:
+        """A title and no duration: live, not unavailable."""
+        ids, unavailable = self._tracks(
+            self._entry("live", duration=None, live_status="is_live")
+        )
+        assert ids == ["live"]
+        assert unavailable == 0
+
+    def test_an_entry_with_a_duration_and_no_title_is_named_by_its_id(self) -> None:
+        tracks, unavailable = _playlist_tracks(
+            cast(Any, {"id": "PLx", "entries": [self._entry("untitled", title=None)]}),
+            self._URL,
+        )
+        assert [(t.title, t.duration) for t in tracks] == [("untitled", 100)]
+        assert unavailable == 0
+
+    def test_a_mix_counts_an_unavailable_video_it_repeats_once(self) -> None:
+        """The repeat is the walk's, not a second unavailable video."""
+        gone = {"id": "gone"}
+        ids, unavailable = self._tracks(
+            self._entry("a"), gone, self._entry("a"), gone, list_id="RDa"
+        )
+        assert ids == ["a"]
+        assert unavailable == 1
+
+    def test_the_unavailable_count_rides_the_span(self) -> None:
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer("test")
+        with tracer.start_as_current_span("clean"):
+            self._tracks(self._entry("a"))
+        with tracer.start_as_current_span("dropped"):
+            self._tracks(None, {"id": "gone"}, self._entry("a"))
+        clean, dropped = exporter.get_finished_spans()
+        assert "ytdl.playlist_unavailable" not in (clean.attributes or {})
+        assert (dropped.attributes or {})["ytdl.playlist_unavailable"] == 2
+
+
+class TestPlaylistCache:
+    """The most expensive resolve in the system, cached and single-flighted. The
+    entry list is stored; the requester, analytics and user_input are per request."""
+
+    @staticmethod
+    def _entries(*ids: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": video_id,
+                "title": f"Song {video_id}",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "duration": 100,
+                "uploader": "Chan",
+            }
+            for video_id in ids
+        ]
+
+    async def _resolve(
+        self,
+        ctx: MagicMock,
+        redis: aioredis.Redis,
+        url: str,
+        *,
+        analytics: Analytics = _ANALYTICS,
+    ) -> YoutubePlaylist:
+        return await YTDL.yt_playlist(
+            url,
+            ctx.author,
+            query_source="youtube.com",
+            analytics=analytics,
+            user_input=url,
+            redis=redis,
+        )
+
+    async def _fetch(
+        self,
+        ctx: MagicMock,
+        redis: aioredis.Redis,
+        url: str,
+        *,
+        analytics: Analytics = _ANALYTICS,
+    ) -> list[QueueObject]:
+        return (await self._resolve(ctx, redis, url, analytics=analytics)).tracks
+
+    async def test_a_second_paste_inside_the_window_is_one_redis_get(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLcache"
+        data = {"_type": "playlist", "entries": self._entries("a1", "a2")}
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            first = await self._fetch(mock_ctx, fake_redis, url)
+            second = await self._fetch(mock_ctx, fake_redis, url)
+
+        assert mock_extract.call_count == 1
+        assert [q.webpage_url for q in first] == [q.webpage_url for q in second]
+        assert [q.title for q in second] == ["Song a1", "Song a2"]
+        assert await fake_redis.ttl("ytdl:playlist:v3:PLcache") == _YT_PLAYLIST_TTL
+
+    async def test_every_entry_point_to_one_collection_shares_the_entry(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Keyed on the pasted URL, a watch link copied mid-playlist and the
+        playlist page itself fragment the cache into an entry each."""
+        data = {"_type": "playlist", "entries": self._entries("b1")}
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            await self._fetch(
+                mock_ctx, fake_redis, "https://www.youtube.com/playlist?list=PLsame"
+            )
+            await self._fetch(
+                mock_ctx,
+                fake_redis,
+                "https://www.youtube.com/watch?v=b1&list=PLsame&index=4",
+            )
+            await self._fetch(
+                mock_ctx, fake_redis, "https://www.youtube.com/playlist?list=PLsame&t=9"
+            )
+
+        assert mock_extract.call_count == 1
+        assert await fake_redis.keys("ytdl:playlist:*") == [b"ytdl:playlist:v3:PLsame"]
+
+    def test_a_url_with_no_list_id_keys_on_itself(self) -> None:
+        assert youtube._playlist_cache_key("https://sc.com/set/x") == (
+            "ytdl:playlist:v3:https://sc.com/set/x"
+        )
+
+    async def test_two_users_pasting_one_collection_run_one_extraction(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLrace"
+        release = asyncio.Event()
+        calls = 0
+
+        async def _slow_extract(_request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return {"_type": "playlist", "entries": self._entries("c1")}
+
+        with patch("src.youtube._run_extract", new=_slow_extract):
+            both = asyncio.gather(
+                self._fetch(mock_ctx, fake_redis, url),
+                self._fetch(mock_ctx, fake_redis, url),
+            )
+            for _ in range(3):
+                await asyncio.sleep(0)
+            release.set()
+            first, second = await both
+
+        assert calls == 1
+        assert len(first) == len(second) == 1
+
+    async def test_the_cache_cannot_resurrect_a_skipped_entry(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A null entry, an id-less one, and a private video's id-only one are all
+        dropped before the write, so the hit sees what the miss did — and reports
+        the same count of them."""
+        url = "https://www.youtube.com/playlist?list=PLskip"
+        entries: list[Any] = [
+            None,
+            *self._entries("d1"),
+            {"title": "no id here"},
+            {"id": "private"},
+            *self._entries("d2"),
+        ]
+        data = {"_type": "playlist", "entries": entries}
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            miss = await self._resolve(mock_ctx, fake_redis, url)
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        assert mock_extract.call_count == 1
+        assert [q.webpage_url for q in miss.tracks] == [
+            q.webpage_url for q in hit.tracks
+        ]
+        assert len(hit.tracks) == 2
+        assert miss.unavailable == hit.unavailable == 3
+        # Positions count kept tracks, so the drops leave no gaps.
+        assert [q.analytics.queue_position for q in hit.tracks] == [0, 1]
+
+    async def test_a_hit_returns_the_title_the_miss_extracted(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Read from the top-level info-dict through _slim_info, which slims the
+        worker's result and must leave the playlist's title on it."""
+        url = "https://www.youtube.com/playlist?list=PLEFC01F5D8255CE9B"
+        title = "David Bowie: From The Beginning"
+        data = _slim_info(
+            {"_type": "playlist", "title": title, "entries": self._entries("f1")}
+        )
+        with patch("src.youtube._ytdlp_extract", return_value=data) as mock_extract:
+            miss = await self._resolve(mock_ctx, fake_redis, url)
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        assert mock_extract.call_count == 1
+        assert miss.title == hit.title == title
+        assert (miss.unavailable, hit.unavailable) == (0, 0)
+        stored = orjson.loads(
+            cast(bytes, await fake_redis.get("ytdl:playlist:v3:PLEFC01F5D8255CE9B"))
+        )
+        assert stored["title"] == title
+        assert stored["unavailable"] == 0
+        assert [e["webpage_url"] for e in stored["entries"]] == [
+            "https://www.youtube.com/watch?v=f1"
+        ]
+
+    @pytest.mark.parametrize("extracted", [{}, {"title": ""}], ids=["absent", "empty"])
+    async def test_an_untitled_playlist_has_no_title(
+        self,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+        extracted: dict[str, Any],
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLnotitle"
+        data = {"_type": "playlist", **extracted, "entries": self._entries("g1")}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            miss = await self._resolve(mock_ctx, fake_redis, url)
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        assert miss.title is hit.title is None
+
+    async def test_a_hit_missing_the_playlist_fields_still_parses(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLbare"
+        entry = {"webpage_url": "https://www.youtube.com/watch?v=h1", "title": "H1"}
+        await fake_redis.set(
+            "ytdl:playlist:v3:PLbare", orjson.dumps({"entries": [entry]})
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            hit = await self._resolve(mock_ctx, fake_redis, url)
+
+        mock_extract.assert_not_called()
+        assert (hit.title, hit.unavailable) == (None, 0)
+        assert [q.title for q in hit.tracks] == ["H1"]
+
+    async def test_an_empty_playlist_is_not_cached(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """A private or unavailable playlist extracts to no entries too, and a
+        quarter hour is a long time to answer a retry with the same nothing."""
+        url = "https://www.youtube.com/playlist?list=PLempty"
+        with patch(
+            "src.youtube._ytdlp_extract", return_value={"_type": "playlist"}
+        ) as mock_extract:
+            assert await self._fetch(mock_ctx, fake_redis, url) == []
+            assert await self._fetch(mock_ctx, fake_redis, url) == []
+
+        assert mock_extract.call_count == 2
+        assert await fake_redis.keys("ytdl:playlist:*") == []
+
+    async def test_a_hit_carries_this_request_s_requester_and_positions(
+        self, mock_ctx: MagicMock, mock_author: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The entries are shared; who asked and where the tracks land are not."""
+        url = "https://www.youtube.com/playlist?list=PLwho"
+        data = {"_type": "playlist", "entries": self._entries("e1", "e2")}
+        with patch("src.youtube._ytdlp_extract", return_value=data):
+            await self._fetch(mock_ctx, fake_redis, url)
+            second = await YTDL.yt_playlist(
+                url,
+                mock_author,
+                query_source="youtube.com",
+                analytics=replace(_ANALYTICS, queue_position=7),
+                user_input="the second paste",
+                redis=fake_redis,
+            )
+
+        assert [q.requester for q in second.tracks] == [mock_author, mock_author]
+        assert [q.analytics.queue_position for q in second.tracks] == [7, 8]
+        assert {q.user_input for q in second.tracks} == {"the second paste"}
 
 
 class TestSlimInfoReturnContract:
@@ -2201,6 +4929,50 @@ class TestSlimInfoReturnContract:
         restored = pickle.loads(pickle.dumps(slim))
         assert restored["url"] == slim["url"]
         assert restored["webpage_url"] == slim["webpage_url"]
+
+    async def test_the_cache_entry_records_the_extraction_that_wrote_it(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Whatever span reaches _cache_stream IS the extraction that minted the URL,
+        so the entry carries its traceparent — the enqueue-time warm, the one-ahead
+        prefetch, or an in-band resolve. That stamp is the only record of where a URL
+        came from once it is serving from cache."""
+        from src.util import traceparent_context
+
+        expire = int(time.time()) + 3600
+        data = cast(
+            Any,
+            {"url": f"https://cdn/v?expire={expire}", "webpage_url": "https://yt/v=1"},
+        )
+        span = trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+            )
+        )
+        with trace_api.use_span(span, end_on_exit=False):
+            assert await _cache_stream(fake_redis, "ytdl:stream:x", data)
+
+        cached = orjson.loads(cast(Any, await fake_redis.get("ytdl:stream:x")))
+        ctx = traceparent_context(cached["traceparent"])
+        assert ctx is not None
+        assert ctx.trace_id == 0x4BF92F3577B34DA6A3CE929D0E0E4736
+
+    async def test_an_untraced_write_leaves_the_entry_unstamped(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """A cache write outside any span — and every entry written before this
+        field existed. The reader treats an absent key as "nothing to link"."""
+        expire = int(time.time()) + 3600
+        data = cast(
+            Any,
+            {"url": f"https://cdn/v?expire={expire}", "webpage_url": "https://yt/v=2"},
+        )
+        assert await _cache_stream(fake_redis, "ytdl:stream:y", data)
+        cached = orjson.loads(cast(Any, await fake_redis.get("ytdl:stream:y")))
+        assert "traceparent" not in cached
 
     def test_slimmed_info_keeps_every_field_callers_read(self) -> None:
         """No consumed field is lost to slimming. _STREAM_CACHE_FIELDS is the exhaustive
@@ -2236,6 +5008,101 @@ class TestSlimInfoReturnContract:
                 assert field not in entry
         pickle.loads(pickle.dumps(slim))  # the whole wrapper still round-trips
 
+    def test_slimming_keeps_the_largest_thumbnail_url(self) -> None:
+        """thumbnails[] leaves with the other oversized collections, but the one URL
+        callers render must not go with it. yt-dlp orders that list ascending by size,
+        so the last entry is the one to keep."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info(thumbnail=None)))
+        assert slim["thumbnail"] == "https://img/2.jpg"
+        assert "thumbnails" not in slim
+
+    def test_a_thumbnail_the_extractor_set_itself_wins(self) -> None:
+        """A processed info-dict already names one; the collection is the fallback."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        assert slim["thumbnail"] == "https://img.yt.com/test.jpg"
+
+    def test_no_thumbnails_collection_leaves_the_thumbnail_unset(self) -> None:
+        """Unset stays unset — an invented value would be cached and rendered as a
+        real one."""
+        raw = _realistic_raw_info(thumbnail=None)
+        del raw["thumbnails"]
+        slim = cast(dict[str, Any], _slim_info(raw))
+        assert slim["thumbnail"] is None
+
+    def test_a_thumbnails_entry_without_a_url_is_ignored(self) -> None:
+        """The last element is not guaranteed to be a usable dict. Reading `url` off
+        one that has none raises inside the worker, which fails the whole extraction
+        rather than losing one field."""
+        slim = cast(
+            dict[str, Any],
+            _slim_info(
+                _realistic_raw_info(thumbnail=None, thumbnails=[{"height": 720}])
+            ),
+        )
+        assert slim["thumbnail"] is None
+
+    def test_an_empty_thumbnails_collection_is_survivable(self) -> None:
+        """yt-dlp emits `thumbnails: []` for a video that has none. Reading the last
+        element of it would raise inside the worker, which fails the whole extraction
+        rather than one field."""
+        slim = cast(
+            dict[str, Any],
+            _slim_info(_realistic_raw_info(thumbnail=None, thumbnails=[])),
+        )
+        assert slim["thumbnail"] is None
+
+    def test_each_entry_keeps_its_own_largest_thumbnail(self) -> None:
+        """Playlist and search entries carry their own collection, dropped per entry —
+        so the lift has to run at both levels, not just the top."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [_realistic_raw_info(thumbnail=None), None],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        assert slim["entries"][0]["thumbnail"] == "https://img/2.jpg"
+        assert "thumbnails" not in slim["entries"][0]
+
+    def test_slimming_mines_the_audio_ladder_before_dropping_formats(self) -> None:
+        """The ONE integration point of the whole retry ladder.
+
+        `formats` is dropped in the same pass, so if the ladder is not attached here
+        it exists nowhere afterwards and every fallback URL is gone for good. Nothing
+        else in the suite covers it — the mining tests hand-build `audio_candidates`
+        into a fixture, and every extraction test patches out _slim_info's caller — so
+        without this the entire feature can be deleted with the suite still green.
+        """
+        raw = _realistic_raw_info(
+            formats=_audio_ladder(), format_id="251", language="en"
+        )
+        slim = cast(dict[str, Any], _slim_info(raw))
+        assert [c["format_id"] for c in slim["audio_candidates"]] == ["140", "249"]
+        assert slim["format_id"] == "251"  # rung 0, carried at the top level
+        assert "formats" not in slim
+        # Cheap enough to ship, and picklable — it crosses the boundary every time.
+        pickle.loads(pickle.dumps(slim))
+
+    def test_each_search_entry_is_mined_too(self) -> None:
+        """yt_source narrows to an entry, so an unmined one reaches playback with no
+        ladder and silently falls back to single-URL behaviour."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [
+                _realistic_raw_info(
+                    formats=_audio_ladder(), format_id="251", language="en"
+                )
+            ],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        entry = slim["entries"][0]
+        assert [c["format_id"] for c in entry["audio_candidates"]] == ["140", "249"]
+        assert "formats" not in entry
+
+    def test_an_entry_with_no_formats_gets_no_ladder_key(self) -> None:
+        """extract_flat playlist entries carry no `formats`, and must not gain an
+        empty key — _candidate_ladder's legacy path is what serves them."""
+        slim = cast(dict[str, Any], _slim_info({"url": "https://x", "title": "t"}))
+        assert "audio_candidates" not in slim
+
     def test_slim_info_passes_none_through(self) -> None:
         """A failed extract_info returns None; callers branch on `data is None`, so
         slimming must not turn it into anything else."""
@@ -2266,14 +5133,14 @@ class TestExtractionErrorClassification:
             )
 
     def test_downloaderror_is_reclassified_with_its_fields_mined(self) -> None:
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         real_error = self._real_downloaderror()
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = real_error
 
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
 
         err = caught.value
@@ -2330,7 +5197,7 @@ class TestExtractionErrorClassification:
         inner error so the flag survives the (otherwise unpicklable) boundary."""
         import sys
 
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         try:
             raise UnsupportedError("https://example.com/not-media")
@@ -2340,19 +5207,19 @@ class TestExtractionErrorClassification:
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = wrapped
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is True
 
     def test_non_unsupported_error_is_not_flagged_unsupported(self) -> None:
         """A garden-variety DownloadError (network failure, video unavailable) must
         classify with unsupported=False — only genuine UnsupportedError sets it."""
-        from src.youtube import ExtractionError, _ytdlp_extract
+        from src.youtube import _ytdlp_extract
 
         fake_ydl = MagicMock()
         fake_ydl.extract_info.side_effect = self._real_downloaderror()
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
-            with pytest.raises(ExtractionError) as caught:
+            with pytest.raises(youtube.ExtractionError) as caught:
                 _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is False
 
@@ -2600,18 +5467,39 @@ class TestProbeSessionSharing:
         await youtube.close_probe_session()
         assert await _probe_stream_url("https://cdn/x") is StreamProbe.UNCONFIRMED
 
-    async def test_probe_session_carries_the_configured_timeout(self) -> None:
-        """STREAM_PROBE_TIMEOUT_SECS is baked into the session once, at first use,
-        rather than passed per call — so nothing else exercises the constructor and
-        a dropped timeout would leave every probe on aiohttp's 5-minute default,
+    async def test_probe_session_carries_a_backstop_timeout(self) -> None:
+        """Nothing else exercises the constructor, and a session with no timeout
+        would leave any request that passes none on aiohttp's 5-minute default,
         stalling a song start behind a CDN that never answers."""
         import src.youtube as youtube
+        from src import config
 
         session = youtube._get_probe_session()
         try:
-            assert session.timeout.total == youtube._STREAM_PROBE_TIMEOUT
+            assert session.timeout.total == config.STREAM_PROBE_TIMEOUT_MAX_SECS
         finally:
             await youtube.close_probe_session()
+
+    async def test_each_probe_passes_the_current_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Per request, so a bot-setting change reaches the next probe without
+        rebuilding the process-wide session."""
+        import src.youtube as youtube
+        from src import config
+
+        response = MagicMock(status=200)
+        session = MagicMock()
+        session.get = MagicMock()
+        session.get.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.get.return_value.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(youtube, "_get_probe_session", lambda: session)
+
+        assert await _probe_stream_url("https://cdn/x") is StreamProbe.PLAYABLE
+        config.stream_probe_timeout_secs.set_override(0.7)
+        assert await _probe_stream_url("https://cdn/x") is StreamProbe.PLAYABLE
+        totals = [c.kwargs["timeout"].total for c in session.get.call_args_list]
+        assert totals == [config.stream_probe_timeout_secs.baseline, 0.7]
 
     async def test_probe_connector_is_unbounded(self) -> None:
         """One connector serves every guild now. aiohttp's default limit of 100
@@ -2651,3 +5539,598 @@ class TestProbeSessionSharing:
             assert dict(replayed) == {}
         finally:
             await youtube.close_probe_session()
+
+
+class TestPrefetchWarmSlot:
+    """The bound on enqueue-time stream warms."""
+
+    async def test_a_burst_of_warms_cannot_hold_every_worker(self) -> None:
+        """One warm spawns per enqueued song, so a paste burst is N of them against
+        a four-worker pool. The bound is what keeps a worker free for the in-band
+        resolve another guild's playback loop is parked on."""
+        from src.youtube import prefetch_warm_slot, ytdlp_pool
+
+        slots = max(1, ytdlp_pool.max_workers // 2)
+        assert slots < ytdlp_pool.max_workers, "a bound that holds the pool is no bound"
+
+        sem = prefetch_warm_slot()
+        for _ in range(slots):
+            await sem.acquire()
+        blocked = asyncio.create_task(sem.acquire())
+        await asyncio.sleep(0)
+        try:
+            assert not blocked.done()
+        finally:
+            blocked.cancel()
+            for _ in range(slots):
+                sem.release()
+
+    async def test_one_slot_serves_every_caller_on_the_loop(self) -> None:
+        """A per-call semaphore would bound nothing."""
+        from src.youtube import prefetch_warm_slot
+
+        assert prefetch_warm_slot() is prefetch_warm_slot()
+
+
+class TestTheProbeSessionDoesNotRequoteRedirects:
+    """aiohttp parses Location as URL(loc, encoded=not requote_redirect_url), so the
+    default undoes the pre-encoding on the redirect leg — and an HLS manifest signs
+    parameters inside its own path, which googlevideo then 403s."""
+
+    async def test_the_session_is_built_with_requoting_off(self) -> None:
+        import src.youtube as yt
+
+        yt._probe_session = None
+        captured: dict[str, Any] = {}
+
+        class _Session:
+            closed = False
+
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        with patch("aiohttp.ClientSession", new=_Session):
+            yt._get_probe_session()
+
+        yt._probe_session = None
+        assert captured["requote_redirect_url"] is False
+
+
+class TestTheFlatMapperDeclinesWhatItCannotDescribe:
+    """Every decline falls through to the full path, which answers the query
+    properly — a bad QueueObject is cached for an hour and never repaired."""
+
+    def _entry(self, **over: Any) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "id": "abc123",
+            "title": "A Song",
+            "duration": 240,
+            "uploader": "Chan",
+        }
+        base.update(over)
+        return base
+
+    def _map(self, entry: dict[str, Any], author: MagicMock) -> Any:
+        from src.youtube import _queue_object_from_flat_entry
+
+        return _queue_object_from_flat_entry(
+            cast(Any, entry),
+            author,
+            query_source="search",
+            analytics=_ANALYTICS,
+            user_input=None,
+        )
+
+    def test_a_titleless_entry_declines(self, mock_author: MagicMock) -> None:
+        """Falling back to the id caches a raw video id as the song's title — card,
+        queue entry and play_history — and _enrich_queueobject deliberately does not
+        back-fill titles, so nothing ever corrects it."""
+        assert self._map(self._entry(title=None), mock_author) is None
+        assert self._map(self._entry(title=""), mock_author) is None
+
+    def test_a_zero_duration_declines(self, mock_author: MagicMock) -> None:
+        """`is None` accepted 0, which renders a 0:00 card and stands for an hour."""
+        assert self._map(self._entry(duration=0), mock_author) is None
+
+    def test_a_collection_entry_declines(self, mock_author: MagicMock) -> None:
+        """Every flat entry is `_type: "url"`, playlists and channels included, so
+        the extractor key is the only thing separating a video from a collection
+        whose id would be spliced into a watch URL."""
+        assert (
+            self._map(
+                self._entry(id="PLabc123", ie_key="YoutubeTab", duration=9000),
+                mock_author,
+            )
+            is None
+        )
+
+    def test_an_ordinary_video_still_maps(self, mock_author: MagicMock) -> None:
+        """The guards must not refuse the case they exist to let through — with or
+        without an ie_key, which not every entry shape carries."""
+        for entry in (self._entry(), self._entry(ie_key="Youtube")):
+            qobj = self._map(entry, mock_author)
+            assert qobj is not None
+            assert qobj.webpage_url == "https://www.youtube.com/watch?v=abc123"
+            assert qobj.title == "A Song"
+
+
+class TestTheProbeTargetIsEncodedOnlyWhenItIsAlreadyValid:
+    """encoded=True stops yarl decoding the %3D/%3B an HLS manifest signs inside its
+    path — and validates nothing, so a URL that genuinely needs quoting would go
+    into the request line raw and earn a 400 for a stream ffmpeg would have played."""
+
+    def test_a_signed_hls_path_is_left_alone(self) -> None:
+        from src.youtube import _probe_target
+
+        url = "https://r2.googlevideo.com/videoplayback/sgoap/gir%3Dyes%3Bitag%3D140/f.m3u8"
+        assert str(_probe_target(url)) == url
+
+    def test_a_url_needing_quotes_is_quoted(self) -> None:
+        from src.youtube import _probe_target
+
+        assert " " not in str(_probe_target("https://host.example/a b/c"))
+        assert str(_probe_target("https://host.example/\u00fcni")).isascii()
+
+
+class _FakeProgressQueue:
+    """Stands in for the worker's multiprocessing.Queue."""
+
+    def __init__(self, error: Optional[Exception] = None) -> None:
+        self.puts: list[Any] = []
+        self._error = error
+
+    def put_nowait(self, item: Any) -> None:
+        if self._error is not None:
+            raise self._error
+        self.puts.append(item)
+
+
+@pytest.fixture
+def worker_queue(monkeypatch: pytest.MonkeyPatch) -> _FakeProgressQueue:
+    queue = _FakeProgressQueue()
+    monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", queue)
+    return queue
+
+
+class TestCountEntry:
+    """yt-dlp's match_filter, as a progress hook.
+
+    The failure to pin hardest: a return value that is not None makes yt-dlp SKIP
+    that entry — falsy values included, because _match_entry tests `is not None`
+    (YoutubeDL.py:1664). Measured on a 4-entry playlist: `return ""` kept 0 of 4
+    while the command still reported success. Every assertion here is `is None`;
+    `assert not ret` passes while every song is silently gone.
+    """
+
+    @pytest.mark.parametrize(
+        "info",
+        [
+            {},
+            {"_type": "url", "url": "https://yt.com/v=1", "playlist_index": 1},
+            {"id": "abc", "title": "T", "playlist_index": 40},
+            {"playlist_count": 1671, "playlist": "Mix"},
+            {"playlist_index": None},
+        ],
+        ids=["empty", "flat-entry", "counted-entry", "playlist-infodict", "no-index"],
+    )
+    def test_it_returns_none_for_every_entry_shape(
+        self, info: dict[str, Any], worker_queue: _FakeProgressQueue
+    ) -> None:
+        assert youtube._count_entry("rid", info, incomplete=True) is None
+
+    def test_the_playlist_infodict_carries_the_header_count(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """YoutubeDL.py:2088, once, before any entry. It is the only way the count
+        _tab.py:793 read off page 1 reaches the parent before the walk ends — the
+        pool future does not return until every continuation has been fetched."""
+        youtube._count_entry("rid", {"playlist_count": 1671}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, 1671)]
+
+    def test_a_collection_with_no_header_count_reports_none(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """Mixes, radio lists and channel tabs have no count at all, so `total is
+        None` is a supported steady state rather than a transient one."""
+        youtube._count_entry("rid", {"playlist": "Mix"}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, None)]
+
+    def test_only_every_nth_entry_is_reported(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """The bar has ten cells, so at 1,671 tracks one cell is 167 entries and
+        nothing on screen can tell 25 from 1 — while the queue's _wlock is shared
+        across workers and one write per entry is 1,671 of them."""
+        for index in range(1, 76):
+            youtube._count_entry("rid", {"playlist_index": index}, incomplete=True)
+
+        assert worker_queue.puts == [
+            ("rid", 25, None),
+            ("rid", 50, None),
+            ("rid", 75, None),
+        ]
+
+    def test_the_index_is_the_progress_value_not_a_call_count(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        """_match_entry is reachable from three sites for one playlist, and only
+        :2161 carries an index. Reading the index rather than counting calls is
+        what keeps a naive counter from reporting 3,343/1,671."""
+        youtube._count_entry("rid", {"playlist_index": 100}, incomplete=True)
+        youtube._count_entry("rid", {"playlist_index": 100}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 100, None), ("rid", 100, None)]
+
+    def test_a_zero_entry_playlist_counts_zero(
+        self, worker_queue: _FakeProgressQueue
+    ) -> None:
+        youtube._count_entry("rid", {"playlist_count": 0}, incomplete=True)
+
+        assert worker_queue.puts == [("rid", 0, 0)]
+
+    def test_a_queue_that_raises_still_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """yt-dlp does not wrap match_filter, so a queue.Full or a closed queue
+        would escape extract_info as a RemoteCallError and tell the user the
+        playlist could not be fetched — by a progress bug."""
+        monkeypatch.setattr(
+            ytdlp_pool_module, "_PROGRESS_Q", _FakeProgressQueue(RuntimeError("full"))
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert (
+                youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True)
+                is None
+            )
+
+        assert "progress queue put failed" in caplog.text
+        assert "RuntimeError('full')" in caplog.text
+
+    def test_a_wedged_queue_warns_once_not_once_per_entry(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A queue whose write lock died with a worker fails every later put of
+        the walk — ~220 puts for one large playlist."""
+        wedged = _FakeProgressQueue(RuntimeError("full"))
+        monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", wedged)
+
+        with caplog.at_level(logging.WARNING):
+            for index in (25, 50, 75):
+                youtube._count_entry("rid", {"playlist_index": index}, incomplete=True)
+            monkeypatch.setattr(
+                ytdlp_pool_module, "_PROGRESS_Q", _FakeProgressQueue(RuntimeError("x"))
+            )
+            youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True)
+
+        # One for the wedged queue, one for the next generation's.
+        assert caplog.text.count("progress queue put failed") == 2
+
+    def test_without_a_queue_it_is_inert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The suite's autouse fixture supplies its own executor_factory, so
+        _worker_init never runs and the global is never set."""
+        monkeypatch.setattr(ytdlp_pool_module, "_PROGRESS_Q", None)
+
+        assert (
+            youtube._count_entry("rid", {"playlist_index": 25}, incomplete=True) is None
+        )
+
+
+class TestPlaylistOpts:
+    def test_without_a_card_the_shared_constant_is_handed_through_untouched(
+        self,
+    ) -> None:
+        """No card watching, no behaviour change: the extraction is byte-for-byte
+        what it has always been."""
+        assert youtube._playlist_opts(None) is youtube._YTDL_PLAYLIST_OPTS
+
+    def test_with_a_card_it_is_a_copy_carrying_the_streaming_hook(self) -> None:
+        opts = youtube._playlist_opts("rid")
+
+        assert opts is not youtube._YTDL_PLAYLIST_OPTS
+        assert opts["lazy_playlist"] is True
+        assert callable(opts["match_filter"])
+        # The constant is a module-level shared dict: mutating it would leak one
+        # guild's callback into another guild's extraction.
+        assert "match_filter" not in youtube._YTDL_PLAYLIST_OPTS
+        assert "lazy_playlist" not in youtube._YTDL_PLAYLIST_OPTS
+
+    def test_lazy_playlist_is_required_not_optional(self) -> None:
+        """Without it YoutubeDL.py:2100 materialises the generator — every
+        continuation page fetched — before the per-entry loop runs, so the hook
+        fires in one burst after the network is over and the bar jumps 0 to 100%
+        in a single frame. It also removes the second, indexless call site."""
+        assert youtube._playlist_opts("rid").get("lazy_playlist") is True
+
+    def test_none_of_the_flags_that_fight_lazy_are_set(self) -> None:
+        """playlistreverse/playlistrandom warn under lazy, and 'playlist-index' in
+        compat_opts changes indexing. Re-check this if the opts profile grows."""
+        opts = youtube._playlist_opts("rid")
+        assert not opts.get("playlistreverse")
+        assert not opts.get("playlistrandom")
+        assert "playlist-index" not in (opts.get("compat_opts") or ())
+
+    def test_the_callback_survives_pickling(self) -> None:
+        """Nothing in the suite pickles — the autouse fixture runs extraction on a
+        thread pool — so an unpicklable callable (a lambda, a closure, a bound
+        method) would pass `just check` and break only inside a container."""
+        restored = pickle.loads(
+            pickle.dumps(youtube._playlist_opts("rid")["match_filter"])
+        )
+
+        assert restored.func is youtube._count_entry
+        assert restored.args == ("rid",)
+
+
+class TestProgressSubscription:
+    """Progress is keyed on the EXTRACTION, not the requester: _extract_once
+    single-flights on the URL, so the second caller of one playlist issues no
+    request of its own and would otherwise watch a frozen card beside a moving
+    one — identical inputs, opposite experience."""
+
+    def test_every_card_on_one_extraction_gets_the_report(self) -> None:
+        first: list[Any] = []
+        second: list[Any] = []
+
+        with (
+            youtube._progress_subscription("key", lambda d, t: first.append((d, t))),
+            youtube._progress_subscription("key", lambda d, t: second.append((d, t))),
+        ):
+            youtube._publish_progress(("key", 25, 1671))
+
+        assert first == [(25, 1671)] == second
+
+    def test_leaving_unsubscribes_and_the_registry_empties(self) -> None:
+        seen: list[Any] = []
+        with youtube._progress_subscription("key", lambda d, t: seen.append(d)):
+            pass
+
+        youtube._publish_progress(("key", 25, None))
+
+        assert seen == []
+        assert "key" not in youtube._PROGRESS_SUBSCRIBERS
+
+    def test_one_failing_subscriber_does_not_stop_the_others(self) -> None:
+        seen: list[Any] = []
+
+        def _boom(done: int, total: Optional[int]) -> None:
+            raise RuntimeError("card is gone")
+
+        with (
+            youtube._progress_subscription("key", _boom),
+            youtube._progress_subscription("key", lambda d, t: seen.append(d)),
+        ):
+            youtube._publish_progress(("key", 7, None))
+
+        assert seen == [7]
+
+    def test_a_malformed_message_is_dropped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            youtube._publish_progress("not a tuple")
+            youtube._publish_progress(("key", 1))
+
+        assert caplog.text.count("malformed progress message") == 2
+
+    def test_a_message_for_nobody_is_dropped(self) -> None:
+        youtube._publish_progress(("nobody", 1, None))
+
+
+class TestYtPlaylistProgress:
+    async def test_the_worker_key_and_the_subscription_key_are_the_same(
+        self, mock_author: MagicMock
+    ) -> None:
+        """The whole phase-3 chain in one assertion. The key the opts hand the
+        worker through match_filter and the key the card subscribes under are
+        minted separately, so a mismatch is silent: extraction succeeds, the
+        playlist queues, and the bar never moves."""
+        seen: list[tuple[int, Optional[int]]] = []
+
+        async def _extract(request: Any) -> dict[str, Any]:
+            # What the worker would carry: _count_entry is armed with the key.
+            request_id = request.opts["match_filter"].args[0]
+            youtube._publish_progress((request_id, 7, 100))
+            return {"entries": []}
+
+        with patch.object(youtube, "_run_extract", new=_extract):
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PLkeymatch",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PLkeymatch",
+                on_progress=lambda done, total: seen.append((done, total)),
+            )
+
+        assert seen == [(7, 100)]
+
+    def test_count_entry_through_a_real_youtubedl(self) -> None:
+        """The two load-bearing facts live only in comments citing yt-dlp line
+        numbers, and both are silent when wrong: a non-None return drops entries,
+        and the per-entry site fires only for an entry check_filter() calls
+        is_single_video. Driven through the real YoutubeDL, offline."""
+        from yt_dlp import YoutubeDL
+
+        published: list[tuple[str, int, Optional[int]]] = []
+
+        class _Q:
+            def put_nowait(self, message: Any) -> None:
+                published.append(message)
+
+        entries = [
+            {
+                "_type": "url",
+                # ie_key selects the extractor check_filter asks, and the URL is
+                # what it parses. An eleven-char id, or _VALID_URL rejects it.
+                "ie_key": "Youtube",
+                "id": "abcdefghijk",
+                "url": "https://www.youtube.com/watch?v=abcdefghijk",
+                "title": f"T{n}",
+            }
+            for n in range(60)
+        ]
+        playlist: Any = {
+            "_type": "playlist",
+            "id": "PLreal",
+            "title": "Real",
+            "entries": entries,
+            "playlist_count": 60,
+            "extractor": "youtube:tab",
+            "extractor_key": "YoutubeTab",
+            "webpage_url": "https://www.youtube.com/playlist?list=PLreal",
+        }
+
+        with patch.object(
+            ytdlp_pool_module, "worker_progress_queue", return_value=_Q()
+        ):
+            # Any at the yt-dlp boundary, like every other call into it here.
+            opts: Any = {
+                **youtube._playlist_opts("rid"),
+                "quiet": True,
+                "extract_flat": True,
+            }
+            with YoutubeDL(opts) as ydl:
+                result: Any = ydl.process_ie_result(playlist, download=False)
+
+        # Nothing was dropped: a non-None return would silently eat entries, and
+        # a non-None at the PLAYLIST-level call eats the whole playlist.
+        assert len(result["entries"]) == 60
+        # The header count arrives first, indexless, before any entry.
+        assert published[0] == ("rid", 0, 60)
+        # Then every _PROGRESS_EVERY-th index, in walk order.
+        assert [d for _, d, _ in published[1:]] == [25, 50]
+
+    def test_the_per_entry_hook_needs_a_video_shaped_id(self) -> None:
+        """is_single_video parses the id against _VALID_URL, so an entry shape
+        yt-dlp stops recognising zeroes the bar with extraction still green. This
+        is the failure mode; the test above is the working one."""
+        from yt_dlp import YoutubeDL
+
+        published: list[Any] = []
+
+        class _Q:
+            def put_nowait(self, message: Any) -> None:
+                published.append(message)
+
+        entries = [
+            {
+                "_type": "url",
+                "ie_key": "Youtube",
+                "id": "short",
+                "url": "https://x/y",
+                "title": f"T{n}",
+            }
+            for n in range(60)
+        ]
+        playlist: Any = {
+            "_type": "playlist",
+            "id": "PLshort",
+            "entries": entries,
+            "extractor": "youtube:tab",
+            "extractor_key": "YoutubeTab",
+            "webpage_url": "https://www.youtube.com/playlist?list=PLshort",
+        }
+        with patch.object(
+            ytdlp_pool_module, "worker_progress_queue", return_value=_Q()
+        ):
+            # Any at the yt-dlp boundary, like every other call into it here.
+            opts: Any = {
+                **youtube._playlist_opts("rid"),
+                "quiet": True,
+                "extract_flat": True,
+            }
+            with YoutubeDL(opts) as ydl:
+                result: Any = ydl.process_ie_result(playlist, download=False)
+
+        assert len(result["entries"]) == 60  # still all queued
+        assert [d for _, d, _ in published[1:]] == []  # and no per-entry report
+
+    async def test_a_subscriber_leaving_mid_publish_does_not_break_the_rest(
+        self,
+    ) -> None:
+        """_publish_progress runs on the drain thread and the subscriber list is
+        mutated from the event loop, so it iterates a copy."""
+        seen: list[int] = []
+        first_report: list[Any] = []
+
+        def _leaver(done: int, _total: Optional[int]) -> None:
+            youtube._PROGRESS_SUBSCRIBERS["k"].remove(first_report[0])
+
+        def _stayer(done: int, _total: Optional[int]) -> None:
+            seen.append(done)
+
+        first_report.append(_leaver)
+        with youtube._progress_subscription("k", _leaver):
+            with youtube._progress_subscription("k", _stayer):
+                youtube._publish_progress(("k", 3, 9))
+        assert seen == [3]
+
+    def test_a_malformed_request_id_is_refused(self) -> None:
+        """The guard has to cover the LOOKUP, not just the unpack: an unhashable
+        id raises TypeError out of dict.get, on the drain thread, where it kills
+        progress for the life of the executor."""
+        youtube._publish_progress(([], 1, 2))
+        youtube._publish_progress(("only-two", 1))
+
+    def test_the_module_pool_is_built_with_a_progress_sink(self) -> None:
+        """Asserted against the source, because the autouse seam swaps the pool
+        for a thread-backed one before any test sees it. Without the sink the
+        worker's queue is drained into nothing and every bar is indeterminate."""
+        import ast
+
+        tree = ast.parse(pathlib.Path(youtube.__file__).read_text())
+        calls = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "ytdlp_pool" for t in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+        ]
+        assert calls, "module-level ytdlp_pool assignment not found"
+        assert any(kw.arg == "progress_sink" for kw in calls[0].keywords)
+
+    async def test_no_card_means_the_extraction_is_unchanged(
+        self, mock_author: MagicMock
+    ) -> None:
+        with patch.object(
+            youtube, "_extract_once", new=AsyncMock(return_value={"entries": []})
+        ) as extract:
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PL1",
+            )
+
+        opts = extract.call_args.args[1].opts
+        assert opts is youtube._YTDL_PLAYLIST_OPTS
+
+    async def test_a_card_arms_the_hook_and_subscribes_to_it(
+        self, mock_author: MagicMock
+    ) -> None:
+        seen: list[Any] = []
+
+        async def _extract(key: str, request: Any, **_: Any) -> dict[str, Any]:
+            # The worker's messages, replayed from where the drain thread would.
+            youtube._publish_progress((key, 0, 1671))
+            youtube._publish_progress((key, 25, None))
+            return {"entries": []}
+
+        with patch.object(youtube, "_extract_once", new=_extract):
+            await YTDL.yt_playlist(
+                "https://www.youtube.com/playlist?list=PL1",
+                mock_author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=0.0, queue_position=0),
+                user_input="https://www.youtube.com/playlist?list=PL1",
+                on_progress=lambda d, t: seen.append((d, t)),
+            )
+
+        assert seen == [(0, 1671), (25, None)]
+        assert youtube._PROGRESS_SUBSCRIBERS == {}

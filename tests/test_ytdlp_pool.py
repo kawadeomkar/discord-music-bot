@@ -6,9 +6,11 @@ no worker process: the class owns lifecycle, not extraction, and its logic is ab
 exception — it spawns for real; see its docstring."""
 
 import asyncio
+import multiprocessing
 import os
 import pickle
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import (
     BrokenExecutor,
@@ -18,17 +20,24 @@ from concurrent.futures import (
 )
 from concurrent.futures.process import BrokenProcessPool
 from logging.handlers import QueueListener
-from unittest.mock import MagicMock, patch
+from queue import Empty
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from src.ytdlp_pool import (
+    _PROGRESS_JOIN_SECS,
+    _PROGRESS_QUEUE_MAX,
     PoolClosedError,
     RemoteCallError,
     YtdlpPool,
+    _call_with_context,
     _picklable_call,
+    _MAX_TASKS_PER_CHILD,
+    _pool_context,
     _warmup_noop,
     _worker_init,
+    worker_progress_queue,
 )
 
 
@@ -116,6 +125,16 @@ def _log_warning_in_worker(message: str) -> int:
     return os.getpid()
 
 
+def _emit_progress_in_worker(payload: tuple[str, int, int]) -> int:
+    """Runs in a real worker: put one message on the progress queue the way
+    youtube._count_entry does, so the parent's drain thread can prove it arrives.
+    """
+    queue = worker_progress_queue()
+    assert queue is not None, "the initializer never handed the worker a queue"
+    queue.put_nowait(payload)
+    return os.getpid()
+
+
 def _thread_pool_factory(max_workers: int = 2) -> Callable[[], Executor]:
     """A factory the pool can call to get an in-process executor."""
     return lambda: ThreadPoolExecutor(
@@ -154,12 +173,62 @@ class TestLazyCreation:
             ctor.assert_called_once_with(
                 max_workers=3,
                 initializer=_worker_init,
-                initargs=(pool._log_queue,),
+                initargs=(pool._log_queue, None),
+                max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+                mp_context=ANY,
+            )
+            # The context is passed EXPLICITLY, and it is the platform's own default.
+            # Omit it and CPython silently forces spawn wherever a task budget is set,
+            # which on Linux replaces 3.14's forkserver default and measured 23-30x
+            # slower worker startup — invisible on macOS, where spawn is the default
+            # anyway, so only an assertion on the passed value can catch it.
+            assert (
+                ctor.call_args.kwargs["mp_context"].get_start_method()
+                == multiprocessing.get_start_method()
             )
             # the real spawn path starts a listener to drain that queue into the parent
             assert pool._log_listener is not None
+            # No progress_sink, so no second queue and no drain thread: the chart
+            # pool and every test pool build exactly what they did before.
+            assert pool._progress_queue is None
+            assert pool._progress_thread is None
         finally:
             pool.shutdown(wait=False)
+
+    def test_a_pool_that_opts_out_is_given_no_task_budget(self) -> None:
+        """The chart pool's one worker pays matplotlib's import and a warm render on
+        every replacement, so it is built without a budget. The context still goes
+        in: it is the platform's own default either way."""
+        pool = YtdlpPool(max_workers=1, name="chart render", recycle_workers=False)
+        with patch("src.ytdlp_pool.ProcessPoolExecutor") as ctor:
+            pool._acquire()
+        try:
+            assert ctor.call_args.kwargs["max_tasks_per_child"] is None
+        finally:
+            pool.shutdown(wait=False)
+
+    def test_the_chart_pool_opts_out(self) -> None:
+        """Reloaded, because conftest swaps the module's pool for a thread-backed
+        one: what is asserted is the pool the module itself builds."""
+        import importlib
+
+        from src import chart_pool
+
+        swapped = chart_pool.chart_pool
+        try:
+            built = importlib.reload(chart_pool).chart_pool
+            assert built._recycle_workers is False
+        finally:
+            setattr(chart_pool, "chart_pool", swapped)
+
+    def test_the_pool_context_never_uses_fork(self) -> None:
+        """`fork` is rejected outright by max_tasks_per_child, and forking a
+        multi-threaded asyncio process is unsafe regardless — so a host whose default
+        is fork falls to forkserver rather than failing to build a pool at all."""
+        with patch(
+            "src.ytdlp_pool.multiprocessing.get_start_method", return_value="fork"
+        ):
+            assert _pool_context().get_start_method() in ("forkserver", "spawn")
 
     def test_generation_increments_per_executor_built(self) -> None:
         """Rebuild bumps the counter so logs from either side of a break are
@@ -234,7 +303,29 @@ class TestPrewarm:
 
         assert executor.submit.call_count == 3
         for call in executor.submit.call_args_list:
-            assert call.args[0] is _warmup_noop
+            # Through the picklable-error net, like every run() submission: a warm
+            # that raises a yt-dlp error would otherwise fail to unpickle in the
+            # parent's result thread and brick the pool.
+            assert call.args[0] is _call_with_context
+            assert call.args[2] is _warmup_noop
+
+    def test_prewarm_submits_the_warm_up_the_caller_supplies(self) -> None:
+        """Lifecycle is all this module owns — what a worker warms is the caller's,
+        like every run() callable. src.youtube passes a YoutubeDL construction."""
+        from concurrent.futures import ProcessPoolExecutor
+
+        def warm() -> None:
+            return None
+
+        executor = MagicMock(spec=ProcessPoolExecutor)
+        pool = YtdlpPool(max_workers=2, executor_factory=lambda: executor)
+
+        pool.prewarm(warm)
+
+        assert executor.submit.call_count == 2
+        for call in executor.submit.call_args_list:
+            assert call.args[0] is _call_with_context
+            assert call.args[2] is warm
 
     def test_prewarm_after_shutdown_raises(self) -> None:
         """The closed gate covers every entry point, not just run()."""
@@ -656,8 +747,26 @@ class TestRealWorkerProcess:
     a callable crossing a real boundary with a late submit refused; an
     ExtractionError surviving pickling with its fields and cause, which the seam can
     never exercise since it never pickles an exception; a worker log record reaching
-    a parent handler with worker_id and trace_id. Argument picklability stays with
-    TestProcessBoundaryContract."""
+    a parent handler with worker_id and trace_id; and worker recycling, which is a
+    property of the real executor and invisible to the seam. Argument picklability
+    stays with TestProcessBoundaryContract."""
+
+    async def test_a_worker_is_recycled_after_its_task_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """max_tasks_per_child is what turns "a worker grew until the OS killed it"
+        into routine turnover, and only a real executor honours it — the thread-pool
+        seam ignores the argument entirely. Budget of 1 so the test costs one extra
+        spawn rather than 64."""
+        monkeypatch.setattr("src.ytdlp_pool._MAX_TASKS_PER_CHILD", 1)
+        pool = YtdlpPool(max_workers=1)
+        try:
+            first, _ = await pool.run(_double_in_worker, 1)
+            second, _ = await pool.run(_double_in_worker, 2)
+        finally:
+            await pool.aclose()
+
+        assert first != second, "the worker served both tasks — it was never recycled"
 
     async def test_a_real_worker_process_runs_the_submitted_callable(self) -> None:
         pool = YtdlpPool(max_workers=1)
@@ -699,6 +808,24 @@ class TestRealWorkerProcess:
         # the real worker traceback came back attached, stringified by the stdlib
         assert err.__cause__ is not None
         assert "DownloadError" in str(err.__cause__)
+
+    async def test_a_worker_progress_message_reaches_the_parent(self) -> None:
+        """The one end-to-end assertion for the progress transport: the queue is
+        handed to a real worker through initargs, written from inside it, and read
+        by the parent's drain thread. The thread-pool seam never runs the
+        initializer, so nothing else can see this."""
+        received: list[object] = []
+        pool = YtdlpPool(max_workers=1, progress_sink=received.append)
+        try:
+            worker_pid = await pool.run(_emit_progress_in_worker, ("rid", 25, 1671))
+            assert worker_pid != os.getpid(), "ran in-process — no worker was spawned"
+            async with asyncio.timeout(15):
+                while not received:
+                    await asyncio.sleep(0.02)
+        finally:
+            await pool.aclose()
+
+        assert received == [("rid", 25, 1671)]
 
     async def test_the_returned_info_dict_survives_the_real_boundary_only_slimmed(
         self,
@@ -782,13 +909,14 @@ class TestRealWorkerProcess:
 
 class TestDefaults:
     def test_worker_count_defaults_from_the_environment(self) -> None:
-        """YTDLP_POOL_WORKERS is read once at import; the constructor default carries
-        it, so a pool built with no arguments is the env-configured one."""
-        import src.ytdlp_pool as module
+        """YTDLP_POOL_WORKERS is read once, by config at import; the constructor
+        default carries it, so a pool built with no arguments is the env-configured
+        one."""
+        from src import config
 
         pool = YtdlpPool()
 
-        assert pool._max_workers == module._DEFAULT_WORKERS
+        assert pool._max_workers == config.YTDLP_POOL_WORKERS
 
     def test_explicit_worker_count_overrides_the_default(self) -> None:
         assert YtdlpPool(max_workers=7)._max_workers == 7
@@ -853,7 +981,11 @@ class TestPrewarmCallable:
         with patch.object(pool, "_acquire", return_value=executor):
             pool.prewarm()
         assert executor.submit.call_count == 2
-        assert executor.submit.call_args[0][0] is _warmup_noop
+        # Submitted through _call_with_context, so the warm callable is its third
+        # argument: a yt-dlp exception raised in the worker has to be flattened on
+        # the way back or it fails to unpickle and bricks the pool.
+        assert executor.submit.call_args[0][0] is _call_with_context
+        assert executor.submit.call_args[0][2] is _warmup_noop
 
     def test_a_supplied_callable_is_submitted_once_per_worker(self) -> None:
         def _warm() -> None: ...
@@ -862,7 +994,7 @@ class TestPrewarmCallable:
         executor = MagicMock(spec=ProcessPoolExecutor)
         with patch.object(pool, "_acquire", return_value=executor):
             pool.prewarm(_warm)
-        assert [c[0][0] for c in executor.submit.call_args_list] == [_warm] * 3
+        assert [c[0][2] for c in executor.submit.call_args_list] == [_warm] * 3
 
     def test_a_thread_pool_seam_submits_nothing(self) -> None:
         """The test seam is thread-backed, so there is no process to warm — and
@@ -875,3 +1007,248 @@ class TestPrewarmCallable:
             pool.prewarm(lambda: None)
         submit.assert_not_called()
         pool.shutdown(wait=False)
+
+
+class TestProgressTransport:
+    """The second worker queue: created with the pool, drained on a thread, and
+    stopped after the workers are gone. Only the LIFECYCLE lives here — what a
+    message means is src/youtube.py's."""
+
+    def test_no_sink_builds_no_queue_and_no_thread(self) -> None:
+        """The chart pool, and every pool built without a card to feed, pays
+        nothing for this."""
+        pool = YtdlpPool(executor_factory=_thread_pool_factory())
+        try:
+            pool._acquire()
+            assert pool._progress_queue is None
+            assert pool._progress_thread is None
+        finally:
+            pool.shutdown(wait=False)
+
+    def test_a_sink_gets_what_the_drain_reads(self) -> None:
+        received: list[object] = []
+        pool = YtdlpPool(max_workers=1, progress_sink=received.append)
+        try:
+            with patch("src.ytdlp_pool.ProcessPoolExecutor", return_value=MagicMock()):
+                pool._acquire()
+            queue = pool._progress_queue
+            assert queue is not None
+            queue.put(("rid", 25, 1671))
+            deadline = time.monotonic() + 5.0
+            while not received and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            pool.shutdown(wait=False)
+
+        assert received == [("rid", 25, 1671)]
+
+    def test_a_sink_that_raises_does_not_kill_the_drain(self) -> None:
+        seen: list[object] = []
+
+        def _sink(message: object) -> None:
+            seen.append(message)
+            if len(seen) == 1:
+                raise RuntimeError("subscriber blew up")
+
+        pool = YtdlpPool(max_workers=1, progress_sink=_sink)
+        try:
+            with patch("src.ytdlp_pool.ProcessPoolExecutor", return_value=MagicMock()):
+                pool._acquire()
+            queue = pool._progress_queue
+            assert queue is not None
+            queue.put(("a", 1, None))
+            queue.put(("b", 2, None))
+            deadline = time.monotonic() + 5.0
+            while len(seen) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            pool.shutdown(wait=False)
+
+        assert seen == [("a", 1, None), ("b", 2, None)]
+
+    def test_a_break_heal_hands_the_new_workers_a_new_queue(self) -> None:
+        """A worker SIGKILLed between Queue._feed's wacquire() and wrelease() holds
+        the write lock forever: _sem never drains and every put_nowait past
+        _PROGRESS_QUEUE_MAX raises Full, silently, for the life of the process.
+        Reusing the queue across a heal is exactly when that has happened. The
+        parent drains the queue the new workers were handed, not the old one."""
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        try:
+            with patch(
+                "src.ytdlp_pool.ProcessPoolExecutor", return_value=MagicMock()
+            ) as executor:
+                first = pool._acquire()
+                queue, thread = pool._progress_queue, pool._progress_thread
+                pool._replace(first)
+                pool._acquire()
+
+            assert queue is not None and thread is not None
+            assert pool._progress_queue is not queue
+            assert executor.call_args.kwargs["initargs"][1] is pool._progress_queue
+            assert pool._progress_thread is not None
+            assert pool._progress_thread.is_alive()
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+        finally:
+            pool.shutdown(wait=False)
+
+    def test_a_heal_does_not_wait_on_the_old_drain(self) -> None:
+        """_acquire builds the executor under the pool lock, on the event loop. A
+        drain stuck in its sink must not hold a heal for _PROGRESS_JOIN_SECS."""
+        entered, release = threading.Event(), threading.Event()
+
+        def _stuck(_message: object) -> None:
+            entered.set()
+            release.wait(timeout=10.0)
+
+        pool = YtdlpPool(max_workers=1, progress_sink=_stuck)
+        try:
+            with patch("src.ytdlp_pool.ProcessPoolExecutor", return_value=MagicMock()):
+                first = pool._acquire()
+                assert pool._progress_queue is not None
+                pool._progress_queue.put(("rid", 1, None))
+                assert entered.wait(timeout=5.0)
+                pool._replace(first)
+                started = time.monotonic()
+                pool._acquire()
+                assert time.monotonic() - started < _PROGRESS_JOIN_SECS / 2
+        finally:
+            release.set()
+            pool.shutdown(wait=False)
+
+    def test_the_drain_stops_on_a_flag_rather_than_a_sentinel_message(self) -> None:
+        """After terminate_workers() the queue's _wlock is a POSIX semaphore a
+        worker SIGTERMed mid-write never released, so telling the drain to stop by
+        writing to the queue could block the parent there forever."""
+        queue = MagicMock()
+        queue.get.side_effect = Empty
+        stop = threading.Event()
+        pool = YtdlpPool(progress_sink=lambda _m: None)
+        thread = threading.Thread(
+            target=pool._drain_progress, args=(queue, stop), daemon=True
+        )
+        thread.start()
+
+        stop.set()
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        queue.put.assert_not_called()
+        queue.put_nowait.assert_not_called()
+
+    def test_shutdown_stops_the_drain_thread(self) -> None:
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        with patch("src.ytdlp_pool.ProcessPoolExecutor", return_value=MagicMock()):
+            pool._acquire()
+        thread = pool._progress_thread
+        assert thread is not None and thread.is_alive()
+
+        pool.shutdown(wait=False)
+
+        thread.join(timeout=5.0)
+        # The flag is what stops it, and nothing else can: close() releases the
+        # parent's own handle and does not interrupt a blocked get, so a drain
+        # told to stop only by its queue dying would outlive the pool. Measured —
+        # this is not a backstop arrangement, it is the only mechanism.
+        assert pool._progress_stop.is_set()
+        assert not thread.is_alive()
+        assert pool._progress_queue is None
+
+    async def test_aclose_stops_the_drain_thread(self) -> None:
+        """The production close path. shutdown() is the test seam's; a drain left
+        running by aclose() outlives the pool for the life of the process."""
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        with patch("src.ytdlp_pool.ProcessPoolExecutor", return_value=MagicMock()):
+            pool._acquire()
+        thread = pool._progress_thread
+        assert thread is not None and thread.is_alive()
+
+        await pool.aclose(timeout=1.0)
+
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        assert pool._progress_queue is None
+
+    def test_the_worker_initializer_binds_the_queue_and_drops_its_join(self) -> None:
+        """cancel_join_thread, because at worker exit Queue._finalize_join JOINS
+        the feeder thread — blocked in send_bytes once the parent stops reading —
+        so the worker cannot exit and shutdown burns its full 10s timeout."""
+        queue = MagicMock()
+        try:
+            _worker_init(None, queue)
+
+            assert worker_progress_queue() is queue
+            queue.cancel_join_thread.assert_called_once()
+        finally:
+            _worker_init(None, None)
+
+    def test_no_queue_leaves_the_worker_global_unset(self) -> None:
+        _worker_init(None, None)
+        assert worker_progress_queue() is None
+
+    def test_the_progress_queue_is_bounded(self) -> None:
+        """maxsize=0 is a SEM_VALUE_MAX semaphore, so put_nowait would never
+        raise and a stalled drain would grow the queue without limit. The bound
+        is what makes a dropped message the failure instead of memory."""
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        pool._start_progress_drain()
+        try:
+            assert pool._progress_queue is not None
+            assert pool._progress_queue._maxsize == _PROGRESS_QUEUE_MAX
+        finally:
+            pool._stop_progress_drain()
+
+    def test_a_restarted_drain_stops_the_one_before_it(self) -> None:
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        pool._start_progress_drain()
+        first_queue, first_thread = pool._progress_queue, pool._progress_thread
+        try:
+            pool._start_progress_drain()
+            assert pool._progress_queue is not first_queue
+            assert pool._progress_thread is not first_thread
+            assert first_thread is not None
+            first_thread.join(timeout=5.0)
+            assert not first_thread.is_alive()
+            assert pool._progress_thread is not None
+            assert pool._progress_thread.is_alive()
+        finally:
+            pool._stop_progress_drain()
+
+    def test_a_drain_that_dies_unexpectedly_says_so(self) -> None:
+        """This is the one failure that leaves no line anywhere: the thread
+        returns, progress ends for the life of the executor, and every card after
+        it shows an elapsed line instead of a bar with nothing to explain why."""
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        stop = threading.Event()
+
+        class _Broken:
+            def get(self, timeout: float) -> object:
+                raise OSError("handle is gone")
+
+        with patch("src.ytdlp_pool.log") as logger:
+            pool._drain_progress(_Broken(), stop)
+        assert logger.warning.called
+
+    def test_a_drain_stopped_on_purpose_is_silent(self) -> None:
+        """A closed queue at shutdown is the expected ending and says nothing —
+        otherwise every restart logs a warning nobody should read."""
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        stop = threading.Event()
+
+        class _Closing:
+            def get(self, timeout: float) -> object:
+                stop.set()
+                raise OSError("closed at shutdown")
+
+        with patch("src.ytdlp_pool.log") as logger:
+            pool._drain_progress(_Closing(), stop)
+        assert not logger.warning.called
+
+    def test_stopping_twice_is_inert(self) -> None:
+        """A heal calls it before rebuilding, so it runs on an already-stopped
+        transport as a matter of course."""
+        pool = YtdlpPool(max_workers=1, progress_sink=lambda _m: None)
+        pool._start_progress_drain()
+        pool._stop_progress_drain()
+        pool._stop_progress_drain()
+        assert pool._progress_queue is None

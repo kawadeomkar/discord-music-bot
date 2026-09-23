@@ -1,6 +1,6 @@
 # Architecture
 
-_Last full audit: 2026-07-14, verified line-by-line against `src/` on branch `task/help-command-2` (adds the `-help`/`--help` man-page help surface and the `-playnow` interjection subsystem)._
+_Last full audit: 2026-07-14, verified line-by-line against `src/` on branch `task/help-command-2`._
 
 _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topology, modules and shutdown were re-verified against `src/`. The Postgres archive is **opt-in** (`HISTORY_ARCHIVE_ENABLED`, default off) and is **not** on the `-history` read path; see [History read path](#history-read-path) and [History archive tier](#history-archive-tier)._
 
@@ -16,12 +16,14 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Startup and Initialization](#startup-and-initialization)
    - [Voice Channel Join](#voice-channel-join)
    - [-play Command Pipeline](#-play-command-pipeline)
-   - [-playnow Interjection](#-playnow-interjection)
+   - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
    - [Now Playing Host Model](#now-playing-host-model)
+   - [Queue rows](#queue-rows)
+   - [Queue progress card](#queue-progress-card)
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
    - [Crash Recovery](#crash-recovery)
@@ -40,12 +42,16 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
 15. [Subsystem Invariants](#subsystem-invariants)
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
+    - [Spotify playlist paging](#spotify-playlist-paging)
+    - [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)
+    - [Stream-retry ladder](#stream-retry-ladder)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
     - [Now Playing host invariants](#now-playing-host-invariants)
     - [Debug footer seams](#debug-footer-seams)
     - [Analytics rendering](#analytics-rendering)
+    - [Settings resolution](#settings-resolution)
 16. [Design Decisions](#design-decisions)
 
 ---
@@ -91,7 +97,7 @@ graph TD
 | Discord client | `discord.py` 2.7.1 | Gateway, voice, commands framework |
 | Audio extraction | `yt-dlp` 2026.8.18.122307.dev0 (pinned to a **nightly**; `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so yt-dlp's fallback client stays available |
 | PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so the fallback client's formats are served at all |
-| Codec | FFmpeg (system, installed in the runtime image) | Decode + re-encode to Opus for Discord |
+| Codec | FFmpeg (system, installed in the runtime image) | Remux Opus straight through (`-c:a copy`) when the serve already is 20 ms stereo Opus and volume is 1.0; decode + re-encode to Opus otherwise |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
 | Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
 | Serialization | `orjson` | Fast JSON serialization for Redis payloads |
@@ -122,7 +128,7 @@ Five containers are defined in [docker-compose.yml](../docker-compose.yml):
 
 Redis is configured with:
 - `appendonly yes` + `appendfsync everysec` — data survives container restarts with at most 1 second of loss
-- `maxmemory 256mb` + `maxmemory-policy volatile-lru` — **only TTL-carrying keys are eviction candidates**. Caches (`ytdl:*`, `spotify:*`) and the `guild:{id}:{state,queue,now_playing}` keys carry TTLs and are reconstructible or re-creatable. **Three kinds of key deliberately carry none** and must never become candidates: `history:outbox` (plays not yet durable in Postgres), `guild:{id}:history` (the capped, PERSISTed window `-history` reads) and `guild:{id}:config` (a guild's durable choices — evicting one silently reverts a setting the guild made). Never switch to `allkeys-*` — see [Redis memory bounds](#redis-memory-bounds)
+- `maxmemory 256mb` + `maxmemory-policy volatile-lru` — **only TTL-carrying keys are eviction candidates**. Caches (`ytdl:*`, `spotify:*`) and the `guild:{id}:{state,queue,now_playing}` keys carry TTLs and are reconstructible or re-creatable. **Four kinds of key deliberately carry none** and must never become candidates: `history:outbox` (plays not yet durable in Postgres), `guild:{id}:history` (the capped, PERSISTed window `-history` reads), `guild:{id}:config` (a guild's durable choices — evicting one silently reverts a setting the guild made) and `bot:{application_id}:config` (the operator's bot-wide overrides). Never switch to `allkeys-*` — see [Redis memory bounds](#redis-memory-bounds)
 
 ```mermaid
 graph LR
@@ -176,6 +182,9 @@ graph TD
     redis_client["src/redis_client.py\nGuildRedisStore + cache helpers"]
     telemetry["src/telemetry.py\nOTel + structlog setup"]
     config["src/config.py\nENVIRONMENT + tunables"]
+    settings_mod["src/settings.py\n-settings registry + grammar"]
+    settings_cmd["src/commands/settings.py\n-settings body"]
+    settings_card["src/settings_card.py\n-settings embeds"]
     help_cmd["src/help.py\nMusicHelpCommand"]
     dashboard["src/dashboard.py\noptimistic-send + live-edit driver"]
     ping["src/ping.py\n-ping probes + rendering"]
@@ -224,35 +233,44 @@ graph TD
     chart_pool --> ytdlp_pool
     main --> chart_pool
     spotify --> redis_client
+    settings_mod --> config
+    settings_mod --> guild_state
+    musicbot --> settings_cmd
+    settings_cmd --> settings_mod
+    settings_cmd --> settings_card
+    settings_card --> settings_mod
 ```
 
 | Module | Responsibility |
 |---|---|
 | `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when **`HISTORY_ARCHIVE_ENABLED` is true** (`PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`) — the flag is the consent gate, never URL presence: enabled without `POSTGRES_URL` **raises**, and disabled ignores a set one with an INFO, leaving bit-identical pre-Postgres behavior, and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
-| `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-playnow`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, the per-guild alone-disconnect timers, and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect) and crash recovery via `on_ready`. |
-| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, and `-playnow` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
+| `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-play --now`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, `debug_settings`, `guild_settings` (the settings cache and only writer of `guild:{id}:config`), and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect), crash recovery via `on_ready` (`_recover_after_ready`: the settings hydrate pass, then one restore per guild), and `on_guild_join`/`on_guild_remove` (hydrate / `GuildSettings.forget`). |
+| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, `--now` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`), and the public hooks `-replay` drives from `commands/replay.py` (`still_live()`, `stop_if_live()`, `ensure_prefetch()`, `hand_over_to_replay()`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
 | `guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns **one deque plus a cursor into it** (`_items[:_cursor]` claimed, `_items[_cursor:]` pending) and the Redis mirror, along with the bulk-mutation mutex, the generation counter, and the `_wake` Event whose sole writer is `_sync_wake()`. Every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. This replaced an `asyncio.Queue` plus a parallel display `deque` whose agreement had to be maintained by hand — see [Queue invariant](#queue-invariant). |
 | `guild_history.py` | `GuildHistory` — played-song history domain class. Two legs, both bounded at `HISTORY_CACHE_LIMIT` (50): the PERSISTed `guild:{id}:history` Redis list and an in-memory deque of the same window. `recent()` merges those two and **never reads Postgres** — see [History read path](#history-read-path). Writes additionally XADD the outbox while the archive is enabled. |
-| `guild_state.py` | Schema module: **every byte persisted to Redis is defined here**. Field-name constants (`StateField`, `NowPlayingField`, `QueueEntryField`, `ConfigField`) + frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`, `HistoryEntry`, `GuildConfig`) with `from_redis`/`to_redis` converters. `GuildConfig` is the durable-settings object behind `guild:{id}:config`, and every one of its fields is `Optional` on purpose: absent means "follow the host default", which an explicit `False`/`0.0` does not (`tzinfo()` resolves the stored IANA name at read time, falling back to `DEFAULT_TIMEZONE` rather than raising on a render path). Pure data — no domain logic, no project runtime imports. Wire formats are pinned by golden-fixture tests. |
+| `guild_state.py` | Schema module: **every byte persisted to Redis is defined here**. Field-name constants (`StateField`, `NowPlayingField`, `QueueEntryField`, `ConfigField`, with `ConfigFieldName` as its `Literal` type) + frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`, `HistoryEntry`, `GuildConfig`) with `from_redis`/`to_redis` converters. `GuildConfig` is the durable-settings object behind `guild:{id}:config`, and every one of its fields is `Optional` on purpose: absent means "follow the host default", which an explicit `False`/`0.0` does not (`tzinfo()` resolves the stored IANA name at read time, falling back to `DEFAULT_TIMEZONE` rather than raising on a render path). `CONFIG_DOMAIN` maps each numeric config field to a `ConfigDomain` (`lo`, `hi`, and whether `OFF_SECS` means off), and `GuildConfig.__post_init__` reads a value outside it as unset, with a WARNING, wherever a `GuildConfig` is built; the legacy `:state` volume parses through the same domain. `CONFIG_WRITER_FIELD` (`writer_app_id`) is a wire field beside the settings, not one of them: the application that last wrote the hash. `parse_number_fields` reads `bot:{application_id}:config`: the caller names the float and the count fields (`BotConfigStore` takes them from `config.KNOBS`, which this module cannot import), it only parses (a count is an exact `int()`), and the bounds stay with the `-settings` registry. `DEFAULT_IDLE_TIMEOUT_SECS`/`DEFAULT_ALONE_TIMEOUT_SECS` sit beside `DEFAULT_TIMEZONE`, because the `-settings` registry, the playback loop and the watchdog all read them and this is the one module that imports nothing from `src`. Pure data — no domain logic, no project runtime imports. Wire formats are pinned by golden-fixture tests. |
 | `db_migrate.py` | The SQL migration runner (`python -m src.db_migrate`, also `just db-migrate`). Forward-only `NNNN_description.sql` files in `migrations/`, ordered numerically, recorded in the `schema_migrations` ledger, each applied in its own transaction under `pg_advisory_xact_lock` (so a migration must be idempotent-safe on retry). Holds `EXPECTED_SCHEMA_VERSION`; the app verifies that version and never applies DDL itself. Every deploy runs it before recreating the bot and aborts on failure; a database ahead of the build exits 0 with a note, matching the archive's own tolerance, so rollbacks deploy. `POSTGRES_MIGRATE_URL` lets migrations run as a higher-privilege role. |
 | `history_archive.py` | Postgres archive + drainer: `HistoryArchive` protocol (writes), `ArchiveReader` protocol (the read surface MusicBot holds: `-ping`'s liveness probe and `-leaderboard`'s aggregate), `PostgresHistoryArchive` (lazy asyncpg pool, `HistoryEntry`↔row mapping, schema-version check, `leaderboard()`), `HistoryOutboxDrainer` (one supervised task per process: replay this consumer's pending IDs → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL` by ID; at-least-once, deduped by `play_history_dedup`). The outbox is a **stream with a `drainers` consumer group**, so two live drainers are safe by construction. Present only when `HISTORY_ARCHIVE_ENABLED` is true. |
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
 | `youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
-| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`. |
-| `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
-| `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `read_guild_configs` (pipelined, chunked — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose") and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
+| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track, playlist or album), or `SoundcloudSource`; a Spotify link of any other type, or with no id, raises `UnsupportedSpotifyLinkError`. `is_link` is the one link-or-text verdict every other caller asks. |
+| `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `album`, `artists`, `albums` methods with per-type Redis cache TTLs. |
+| `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Its config methods: `read_config` (None when the read failed, so it stays apart from a guild that never chose), the dedicated `set_volume`/`migrate_volume` (both refuse a volume outside `CONFIG_DOMAIN`), `set_debug_mode` and `set_timezone`, the generic `update_config` (refuses those three fields and an empty config), `reset_config_fields` and `reset_volume` (both copies, one MULTI); each setter stamps `writer_app_id` when passed `writer=`. Every config reader, `get_playback_snapshot` and the batch readers included, reads a key that is not a hash as unset rather than as a failed read: no later read can change it, so a failure would be retried, and reported unreadable, for good. `BotConfigStore` is the same shape for `bot:{application_id}:config` — `read_config`, `update_config`, `reset_config_fields` — on `@_bot_op`, `_guild_op`'s sibling. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `iter_guild_configs` (pipelined, chunked, one dict per batch, which `GuildSettings.hydrate` merges before reading the next — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose"; one guild's error reply omits that guild alone, with one WARNING per batch rather than per guild), `read_config_writers` (the stamps, on the same contract), `scan_guild_config_ids` (a bounded `SCAN`, None on any failure) and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
 | `analytics_card.py` | `-analytics`'s window allowlist (`{7, 30, 90, 365}` — see [Analytics rendering](#analytics-rendering)), `AnalyticsFlags`, both Redis cache codecs (the orjson aggregate and the PNG's aggregate-digest key), and the embed renderer. Pure, like `leaderboard.py`, and named `_card` because `guild_state.Analytics` already exists. **Every human-authored string the command shows is rendered here**, never in the image. |
 | `analytics_render.py` | The six-panel figure. Imports matplotlib **inside** `build_figure`, never at module scope, and constructs nothing at module scope at all — a spawned worker re-imports it. `_ascii_safe()` raises on anything the bundled font cannot draw. Imports nothing from `src/` except `guild_state`. |
 | `chart_pool.py` | The chart pool's only home: one lazily-spawned `YtdlpPool(max_workers=1, name="chart render")`, plus `chart_available()` (a `find_spec` lookup, so it never pays matplotlib's import). Exists so there IS a stable name for `main.py` to close, `debug.py` to read and `conftest.py` to patch; imports only `ytdlp_pool`. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
-| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0), the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0), and `ANALYTICS_RENDER_DEADLINE_SECS` (20.0) — read through `_float_env`, which refuses non-finite values separately from its floor because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. Plus the call-time accessors: `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
+| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, default `development`; `main()` may infer `production`/the branch slug from git before telemetry starts), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0, floor 1.0), `STREAM_PROBE_TIMEOUT_SECS` (2.0, floor 0.1), `LIVENESS_INTERVAL_SECS` (15.0, between 1 and 60), the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0), and `ANALYTICS_RENDER_DEADLINE_SECS` (20.0) — read through `_float_env`, which names each floor in a `_MIN_*` constant beside its knob and refuses non-finite values separately from that floor (and from an optional maximum) because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. `YTDLP_POOL_WORKERS` (4, floor 1) and the other integer knobs go through `_int_env`. Each `-settings bot` knob is declared once, as a `Knob` handle named as its variable in lower case (`ping_tick_secs = _secs("PING_TICK_SECS", …)`): calling it returns the override, else the environment value, and it carries `env`, `field`, `kind`, `floor`, `baseline`, `override()`, `set_override()` and `clear_override()`; `KNOBS` holds them all by field ([Settings resolution](#settings-resolution)). Plus the call-time accessors: `bot_settings_overrides_ignored()` (`BOT_SETTINGS_OVERRIDES`: `apply` or `ignore`, garbage raises), `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
+| `settings.py` | The `-settings` machinery. Pure: `SETTINGS`, one `SettingSpec` per setting chat may show or change (scope, kind, label, bounds, and the `config` knob a bot setting overrides), and the functions every surface shares — `parse_value` (each kind's grammar matched in full with `re.ASCII`, then the bounds), `format_value` (one rendering per kind, each parsing back), `in_bounds`/`check_write`, `find`, and `parse_settings_args`, which reads one line of chat into a `SettingsRequest` or a `Refusal` whose text never quotes the input. A server setting's bounds are its field's `CONFIG_DOMAIN`; a bot setting's chat minimum sits above the floor `config.env_floor` recorded. Timezones are accepted only as `Area/City`, `UTC` or `GMT`, with a redirect table for the rest, built on first use because it walks the tz database. `config.py` reads the environment; this module decides what chat may set. `GuildSettings` (on the cog) caches every server's `guild:{id}:config` and is the only writer of it ([Settings resolution](#settings-resolution)). `BotSettings` (on `MusicBotApp`) applies the operator's stored overrides from `bot:{application_id}:config` to `config`'s accessors, holds the session-only `debug-default`, and honours `BOT_SETTINGS_OVERRIDES=ignore` ([Settings resolution](#settings-resolution)). |
+| `settings_card.py` | `-settings`' embeds, pure like `analytics_card.py`: the server card (three prose lines per setting, grouped as the registry groups them: `**label** · value · source`, its one-clause summary, and the command that changes it with the range that command accepts now, `` `-settings leave-when-idle <value>` · 5:00–30:00 ``; prose because code blocks wrap badly on a phone, and a group past Discord's 1,024-character field continues in a `(cont.)` field), the operator-only bot card (the same three lines per bot setting, its command naming the key, `` `-settings bot heartbeat <value>` · 2s–30s ``, with the operator's source labels, `5s · bot owner; env 3s`), one setting's detail, and every change and refusal reply. Values render through the registry's `format_value`, so a value copied off a card parses back. The bot card is never a second embed on `-settings`: a response in the player's home channel becomes the Now Playing host, whose embeds ride every progress tick. |
+| `commands/settings.py` | `-settings`' body: parse the one-line request (`parse_settings_args`, with the message tail so a line break after the command word still counts), stay silent on a refused bullet-shaped message, check who may do it, then read through `GuildSettings.load` (bounded) and write through `GuildSettings.write`/`reset`. A reply's "(was …)" is the write's own `WriteResult.previous`, never a read taken before the lock. Every send passes `AllowedMentions.none()`. |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
 | `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver `-ping` and `-debug` share. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row, a block of rendered lines) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. Both callers reply through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
 | `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
-| `debug.py` | `-debug`: the snapshot's collectors and rendering, plus `--enable`/`--disable` argument parsing. **Observation-only by rule** — nothing here changes playback, caching, queueing or persistence, which is what keeps "test with debug on, ship with debug off" a valid methodology. Every collector degrades to a labeled `unknown`/`n/a` rather than raising (`_safe_block`): a debug tool that crashes is worse than no debug tool. The host blocks are gated on bot ownership at **collection**, not at render, so a non-owner's `-debug` launches no probe at all — the public surface is versions plus this server's own player/voice state. The `Config` block renders a deny-by-default allowlist: `SECRET` variables show `set`/`unset` and never a value, `URL` variables lose userinfo, credential-bearing query params and the host itself. `musicbot.py` owns the command registration and the per-guild override cache. |
-| `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`. |
+| `debug.py` | `-debug`: the snapshot's collectors and rendering, plus `--enable`/`--disable` argument parsing. **Observation-only by rule** — nothing here changes playback, caching, queueing or persistence, which is what keeps "test with debug on, ship with debug off" a valid methodology. Every collector degrades to a labeled `unknown`/`n/a` rather than raising (`_safe_block`): a debug tool that crashes is worse than no debug tool. The host blocks are gated on bot ownership at **collection**, not at render, so a non-owner's `-debug` launches no probe at all — the public surface is versions plus this server's own player/voice state and the settings it has changed. The `Config` block renders a deny-by-default allowlist: `SECRET` variables show `set`/`unset` and never a value, `URL` variables lose userinfo, credential-bearing query params and the host itself. `musicbot.py` owns the command registration. `DebugSettings` holds each guild's debug-mode choice as a projection of `debug_mode` that `GuildSettings` writes (`apply_choices`, `drop`) — it has no writer of its own — and the operator's session `debug-default` (`set_default_override`). |
+| `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `fmt_duration`/`fmt_seconds` (the clock, and the shortest seconds text that parses back to the same float), `DASHES` (every dash a keyboard substitutes for `-`), `codeblock_fields` (lines split across 1024-char code-block fields), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`, `is_operator` (the owner check `-debug` and `-ping` share: fails closed, never raises, and a lookup that raised answers False for 60s without asking again; `owner_lookup_backing_off` says when). |
 
 **Key types:**
 
@@ -261,14 +279,15 @@ graph TD
 | `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song) |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
 | `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — an unresolved YouTube item |
-| `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`), `id` |
+| `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; `QueueItem = Union[QueueObject, YTSource]` is the live-item type |
-| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the `-playnow` fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the ask-time analytics `queued_at` / `queue_position` (flat on the wire; grouped as `Analytics` in memory), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the collection link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither |
+| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the interjection fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the ask-time analytics `queued_at` / `queue_position` (flat on the wire; grouped as `Analytics` in memory), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the playlist link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither. A `SearchQueueEntry` also carries `requester_id`, written only when known: the track resolves at dequeue, when `_last_author` is whoever ran a command most recently, so `MusicPlayer._resolve_requester` looks the stored ID up (member, else user cache) and falls back to `_last_author` only for an entry queued before the field existed |
 | `Analytics` | `guild_state.py` | The pure-analytics values a live queue object carries — `queued_at` / `queue_position`, zero reads outside serialize/carry. Frozen, so carry sites can alias one instance. **In-memory only**: every wire shape and Postgres column stays flat, exploded and rebuilt at this module's serialization boundary. Its membership *is* the pure-analytics class, and the admission rule (nothing may branch on or render a member) lives on its docstring — `query_source`, `played_at` and the `np_*` trio all look eligible and are not |
 | `GuildStateData` / `NowPlayingData` / `GuildPlaybackSnapshot` | `guild_state.py` | Typed snapshots of the state hash, now-playing hash, and the full restore read |
 | `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`, `message_id`, `channel_id`, `queued_at`, `queue_position`, `query_source`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
 | `GuildRedisStore` | `redis_client.py` | Per-guild Redis operations namespace |
+| `BotConfigStore` | `redis_client.py` | Redis operations on `bot:{application_id}:config` |
 
 ---
 
@@ -280,65 +299,75 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 
 | Command | Aliases | Arguments | Description |
 |---|---|---|---|
-| `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/playlist, or SoundCloud URL. Joins voice first if not connected. |
-| `-playnow` | `pn` | `url` | Interject a song **immediately**, parking the current one to resume from its exact position afterward. Falls back to `-play` when nothing is live. Playlists interject only their first track. See [-playnow Interjection](#-playnow-interjection). |
+| `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/album/playlist, or SoundCloud URL. Joins voice first if not connected. |
+| `-play --now` | — | `url` | Interject a song **immediately**, parking the current one to resume from its exact position afterward. Behaves as a plain `-play` when nothing is live. A playlist comes in full: its head interrupts and the rest queue behind it, so the parked song returns only after the last track. See [-play --now Interjection](#-play---now-interjection). |
+| `-play --next` | — | `url` | Front-insert without interrupting: the song plays when the current one ends. A playlist front-inserts in full, in order. Identical to a plain `-play` when nothing is queued, since a front insert into an empty queue *is* an append. Goes through `MusicPlayer.queue_put_next`, which neutralizes the loop's prefetch first — a bare `put_front` lands behind the prefetch's open claim and the song plays second. |
 | `-skip` | `sk` | — | Stop the current song and advance to the next. |
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
-| `-resume` | `r` | — | Resume paused playback; re-hosts the Now Playing block so the pause confirmation becomes plain history. |
+| `-resume` | `r` | — | Resume paused playback; the paused card leaves the block, and a response hosting it is re-hosted so the bar sits at the channel bottom. |
+| `-replay` | `rp`, `restart` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`commands/replay.py`'s `replay_current()` → `ReplayOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `MIN_REPLAY_POSITION_SECS`. See [-replay](#-replay). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
-| `-remove` | `rm` | `<link or search text>` | Remove **all** queued songs matching, by the resolved yt-dlp URL **or** by what the user originally typed — a search term or a source link, so one playlist link takes back out every track it added. Reports the removed positions and names which of the two matched. Consume-rest, so a multi-word search works. Without an argument, prints usage. |
+| `-remove` | `rm` | `<link or search text>` | Remove **all** queued songs matching, by the resolved yt-dlp URL **or** by what the user originally typed — a search term or a source link, so one album or playlist link takes back out every track it added. Reports the removed positions and names which of the two matched. Consume-rest, so a multi-word search works. Without an argument, prints usage. |
 | `-now` | `np`, `rn`, `nowplaying` | — | Display the now-playing embed, rebuilt live for the current song. |
 | `-queue` | `q` | — | Display the next 10 songs with per-song ETA. |
 | `-history` | `h` | `[--limit N]` | Display the last N played songs (default 10, max 50). Served from the capped Redis list alone, in both archive modes — see [History read path](#history-read-path). |
 | `-leaderboard` | `lb`, `top` | `[--days N]` | Top 10 listeners and top 10 songs for this server, ranked by total listening time; `--days` scopes both boards to a rolling window. Aggregated from the Postgres archive (the first production reader of it) behind a 60 s Redis cache; replies with a notice when the archive is disabled. |
 | `-analytics` | `an` | `[--days N]` | Six-panel chart of this server's listening (plays per day by source, weekday x hour heatmap, listening time, per-play completion by source, song-length mix, queue-wait percentiles) plus top listeners/artists/songs. Postgres-only, like `-leaderboard`, and gated on the archive the same way. `--days` is an **allowlist** of 7/30/90/365 — a free-form range would defeat its own cache; the window is N COMPLETE UTC days, so today is excluded and the answer is immutable until midnight, which is when the Redis cache expires. Rendered in a worker process; every render failure degrades to the embed-only card. One in flight per guild, and one run per guild per 30 s — the two cover different axes, so neither substitutes for the other. See [Analytics rendering](#analytics-rendering). |
-| `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to Redis. |
+| `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (usually takes effect two songs later — see the prefetch note below). Persisted to Redis. `-settings volume` shows and changes the same saved level, and accepts the same voice gate. |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | — | Live-editing service-health dashboard: probes Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, and reports the bot / yt-dlp / FFmpeg versions. One in flight per guild. |
-| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing/runtime footer to every embed the bot sends in that guild, the live Now Playing card included) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
+| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state, with a `settings` row naming each setting changed here (`leave-when-idle 10:00 (1 changed)`); build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing/runtime footer to every embed the bot sends in that guild, the live Now Playing card included) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`, or the operator's `-settings bot debug-default` until restart. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
+| `-settings` | `config`, `cfg`, `prefs` | `[bot] [<setting> [<value> \| reset]]` | This server's settings (volume, timezone, when to leave voice, the Now Playing bar, the lookup notice and playlist card, the debug footer): the card, one setting in detail, a change or a reset. Anyone can view; a change needs **Manage Server**, or for `volume` `-volume`'s voice gate, or the bot's operator. `-settings bot` shows and changes the bot-wide settings, for the operator alone, and a server write of a key that is also bot-wide (`np-refresh`, `slow-notice`, `queue-progress-delay`) names the bot form to the operator. Key first, one line, every word used: `-settings debug on for the staging bot` is refused rather than read as `debug on`. Writes go through `GuildSettings` under its per-guild lock, each Redis call bounded at 2 s, so there is no `max_concurrency`. |
 | `-jump` | `j` | — | Stub; replies "currently in development". |
 | `-help` | `commands` | `[command]` | Man-page-styled embed help: the full command list, or detailed help for one command (`-help play`). Aliases resolve too (`-help np`). Rendered by `MusicHelpCommand` (`help.py`). |
 
 **Permission model:**
 
-Every command that touches playback is gated by `@commands.before_invoke(validate_commands)`. The read-only ones are not: `-ping` and `-leaderboard` answer without the author being in voice (and `-help` is a `HelpCommand`, not a cog command at all). `cog_before_invoke` runs first for all of them: it binds structlog contextvars (`guild_id`, `user_id`, `command`), opens a `command.{name}` OTel span (closed in `cog_after_invoke`), creates the guild's `MusicPlayer` if needed, and refreshes the persisted `(voice_channel_id, text_channel_id)` pair when the command channel changed. A command carrying `extras={"observation_only": True}` — today only `-debug` — returns after the span and the contextvars and skips both the `get_mp()` and the channel-persistence steps: a command that reports on a guild's player must not manufacture one to look at, and creating it would also start a restore and a 300 s gate timeout on an idle guild. `validate_commands` then checks:
+Every command that touches playback is gated by `@commands.before_invoke(validate_commands)`. The read-only ones are not: `-ping` and `-leaderboard` answer without the author being in voice (and `-help` is a `HelpCommand`, not a cog command at all). `cog_before_invoke` runs first for all of them: it binds structlog contextvars (`guild_id`, `user_id`, `command`), opens a `command.{name}` OTel span (closed in `cog_after_invoke`), creates the guild's `MusicPlayer` if needed, and refreshes the persisted `(voice_channel_id, text_channel_id)` pair when the command channel changed. A command carrying `extras={"skips_player_setup": True}` — today `-debug`, `-analytics` and `-settings` — returns after the span and the contextvars and skips both the `get_mp()` and the channel-persistence steps: a command that reports on a guild's player must not manufacture one to look at, creating it would also start a restore and a 300 s gate timeout on an idle guild, and `get_mp()` would re-home an existing player's Now Playing card to the channel `-settings` was typed in. `validate_commands` then checks:
 1. The author is a `discord.Member` (not a `discord.User`)
 2. The author is in a voice channel
 3. For non-`play` commands: the bot is in the same voice channel as the author
 
-`-help` (and the `--help` flag on any command) is exempt from the voice-channel gate: the help command carries no `before_invoke(validate_commands)`, and `--help` short-circuits in `invoke()` ahead of it — so help is always reachable, even from outside a voice channel. `-playnow` **is** gated like `-play` (it may join voice first).
+`-help` (and the `--help` flag on any command) is exempt from the voice-channel gate: the help command carries no `before_invoke(validate_commands)`, and `--help` short-circuits in `invoke()` ahead of it — so help is always reachable, even from outside a voice channel. `-play --now` and `-play --next` are gated MORE strictly than a plain `-play`: the same-channel exemption is lifted for both, since one stops what another channel is hearing and the other decides what it hears next. Appending is what the exemption was for, and neither appends.
+
+**Who counts as the bot's operator** is discord.py's `Bot.is_owner`, asked through `util.is_operator`. discord.py calls `application_info()` once: the application's owner, or, for a team-owned application, every member whose role is Admin or Developer. A successful lookup is cached until restart, so a developer removed from the team keeps the operator's reach until then. A lookup that raises caches nothing, and discord.py retries its 5xx for up to ~25 s, so `is_operator` remembers the failure for 60 s (`OWNER_LOOKUP_RETRY_SECS`) and answers False without asking. It fails closed and never raises: an unreachable owner is not an owner.
+
+`-settings` carries no `validate_commands` and checks inside its body, cheapest first. A server setting needs `manage_guild`; `volume` also accepts `check_voice_permissions(author, voice_client, "volume")`, the gate `-volume` runs, so a listener who could `-volume 50` can `-settings volume 50` (and a member in any voice channel while the bot is in none); then `is_operator`. A bot-wide setting is the operator's alone, and nothing bot-wide — card, detail, typo suggestion or range — is rendered for anyone else. In a DM anyone else is told settings are per server; the operator gets the bot card for `-settings` or a `bot` request, and is asked to name `bot` for anything else. The prefix is a bare `-` with `strip_after_prefix`, so a markdown list item such as `- settings page is broken` dispatches: a message with whitespace after the `-` whose parse is refused as too much, a bad shape, an unknown name or a reset without a setting gets no reply at all, only a DEBUG line and `settings.refused=bullet_shape` on the span.
 
 **Supported `-play` inputs:**
 
 | Input format | Example | Resolution path |
 |---|---|---|
-| YouTube watch URL | `https://youtube.com/watch?v=...` | `YTSource(process=False)` → `yt_source` (unified full extraction — the `process` field is parse metadata only) |
+| YouTube watch URL | `https://youtube.com/watch?v=...` | `YTSource(process=False)` → `yt_source` (unified full extraction — the `process` field is parse metadata only). A link never resolves flat: its cost is the watch page, which nothing skips without failing YouTube's bot check |
 | YouTube short URL | `https://youtu.be/...` | `YTSource(process=False)` |
 | YouTube URL with timestamp | `?t=120` | `YTSource(ts=120)` → seeks via FFmpeg `-ss` |
+| `--timestamp` / `-ts` flag | `-p -ts 1:32 <url\|search>` | A leading option, taken off by `split_play_args` before `parse_input` sees it, so the origin `-remove` matches on is the song alone. `parse_start_offset` accepts the clock form (`1:32`, `2:04:30`) on top of everything `t=` takes — a second parser, so widening the flag cannot change what a pasted `?t=` means. Applied in `queue_source`, and the only start offset a search, a Spotify track or a SoundCloud link can carry. Beats the link's own `t=` (`effective_start_offset`), is refused at or past the resolved song's duration, and is refused for a collection that names no track (`start_offset_refusal`) |
 | YouTube playlist URL | `.../playlist?list=...`, or any `watch?v=…&list=…` | `YTSource(type=PLAYLIST, list_id=...)` → `YTDL.yt_playlist` (flat extraction) → N `QueueObject`s. `_YTDL_PLAYLIST_OPTS` uses `extract_flat="in_playlist"`, not `True`: a watch URL resolves to a `url_result` pointing at the playlist, and `True` stops at it with no entries |
-| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `-playnow` interjects that track instead of the first. A `t=` on the same link applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
-| YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` |
+| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link — or a `--timestamp` beside it — applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
+| YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` → `yt_source(flat=True)` for an ordinary placement: one search POST for identity, the stream URL extracted later by the enqueue prefetch |
 | Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
 | Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist()` → N `YTSource` search items |
+| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(ALBUM)` → `Spotify.album()` → N `YTSource` search items |
+| Any other Spotify link | `https://open.spotify.com/artist/...`, a type with no id, an id that is not base62 | `UnsupportedSpotifyLinkError` — never a `ValueError`, which `parse_input` would turn into a YouTube search for the link. A leading `/intl-xx/` locale segment is dropped first |
 | SoundCloud URL | `https://soundcloud.com/...` | `SoundcloudSource` → yt-dlp directly |
 
 ---
 
 ## Configuration
 
-**Environment variables:**
+**Environment variables.** The operator can override the knobs [Settings resolution](#settings-resolution) lists with `-settings bot`, at runtime and within a chat range; a stored override wins over the variable until it is reset.
 
 | Variable | Required | Description |
 |---|---|---|
 | `DISCORD_TOKEN` | Yes | Bot token from Discord Developer Portal |
-| `SPOTIFY_CLIENT_ID` | Yes | Spotify app client ID |
-| `SPOTIFY_CLIENT_SECRET` | Yes | Spotify app client secret |
+| `SPOTIFY_CLIENT_ID` | No | Spotify app client ID. Set both or neither: without them Spotify links are refused and everything else works |
+| `SPOTIFY_CLIENT_SECRET` | No | Spotify app client secret |
 | `REDIS_URL` | No | Redis connection URL (defaults to `redis://localhost:6379`) |
-| `POSTGRES_URL` | No | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). Unset → the entire Postgres tier is off (no outbox writes, no drainer, pre-Postgres read behavior) |
+| `POSTGRES_URL` | While the archive is enabled | Durable-tier DSN (e.g. `postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot`). `HISTORY_ARCHIVE_ENABLED` decides whether the Postgres tier runs, never this variable: enabled, startup refuses without it; disabled (the default), it is ignored |
 | `ENVIRONMENT` | No | Deployment environment label; default `development`, and `main()` infers `production` / the branch slug from git when unset and a repo is present. Stamped on the OTel resource. |
-| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`; sized against Discord's ~5 edits/5 s per-channel bucket) |
+| `NOW_PLAYING_UPDATE_INTERVAL_SECS` | No | Progress-bar edit cadence (default `3.0`, floor `1.0`; sized against Discord's ~5 edits/5 s per-channel bucket). A server's `np-refresh` can only slow it |
 | `ANALYTICS_RENDER_DEADLINE_SECS` | No | How long `-analytics` waits for its chart before sending the card without one (default `20.0`). Sized for the cold path, measured in the deployed image at 5.9 s — `import src.main` 3.6 s under forkserver plus matplotlib 2.4 s, against a ~1.0 s render. Bounds the CALLER only: a `ProcessPoolExecutor` cannot cancel a running call |
 | `OTEL_SERVICE_NAME` | No | OTel service name (default `discord-music-bot`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP gRPC endpoint (default `http://localhost:4317`) |
@@ -353,26 +382,31 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | `intents` | `discord.Intents.all()` | All intents enabled |
 | Bot class | `AutoShardedBot` | Multi-shard within one process; Discord requires sharding at 2500 guilds |
 | Context class | `MusicContext` | Installed via `get_context` override — the NP-block attach point |
+| Unknown commands | `on_command_error` | Swallows `CommandNotFound`. The prefix is a bare `-` with `strip_after_prefix`, so a markdown bullet in an ordinary message dispatches as a command; without this each one logs at ERROR. It is also what makes a removed command (`-pn`) answer with nothing rather than an error |
 
-**yt-dlp option profiles** (`youtube.py`) — three profiles share `_YTDL_BASE_OPTS` (`quiet`, `no_warnings`, `noplaylist`, `nocheckcertificate`, `source_address 0.0.0.0`, `socket_timeout 30`, `extractor_args: player_client ["default", "-tv_simply"]`):
+**yt-dlp option profiles** (`youtube.py`) — four profiles share `_YTDL_BASE_OPTS` (`quiet`, `no_warnings`, `noplaylist`, `nocheckcertificate`, `source_address 0.0.0.0`, `socket_timeout 30`, `extractor_args: player_client ["default", "-tv_simply"]` and `youtubetab: skip ["webpage"]`, which drops the 878 KB homepage every search and playlist extraction used to open with):
 
 | Profile | Used by | Deltas from base |
 |---|---|---|
 | `_YTDL_STREAM_OPTS` | `yt_stream` / `prefetch_stream` | `format: bestaudio/best[height<=360]/best`, `check_formats: False` (skips HEAD probes), `retries: 10` |
 | `_YTDL_STREAM_SEARCH_OPTS` | `yt_source` (unified single extraction) | stream opts + `default_search: auto` — one call yields identity **and** stream URL, populating both caches |
 | `_YTDL_PLAYLIST_OPTS` | `yt_playlist` | `noplaylist: False`, `extract_flat: True` — enumerates entries without per-video extraction |
+| `_YTDL_FLAT_SEARCH_OPTS` | `yt_source(flat=True)` | playlist opts + `default_search: auto` — one search POST, no watch page and no player call, so identity only. `process` stays `True`: with `process=False` yt-dlp never iterates the search generator, so no search happens at all |
 
 `rm_cachedir` is deliberately **absent**: yt-dlp's JS-player cache is kept across calls so the signature-decryption JS is only re-fetched when YouTube publishes a new player version. A fresh `YoutubeDL` instance is constructed per extraction call (`_ytdlp_extract`), and it is handed a **shallow copy** of the opts profile — `YoutubeDL.__init__` keeps the params dict by reference and writes into it (`js_runtimes`, `http_headers`, ...), so passing the module-level dicts directly would make them shared mutable state across repeated extractions within a worker process.
 
 **Extraction pool** (`ytdlp_pool.py`, instantiated in `youtube.py`):
 
 ```python
-ytdlp_pool = YtdlpPool()   # max_workers from YTDLP_POOL_WORKERS, default 4
+ytdlp_pool = YtdlpPool(progress_sink=lambda message: _publish_progress(message))
+#                      max_workers from YTDLP_POOL_WORKERS, default 4
 ```
 
 Extraction runs in **worker processes**, not threads: JSON parsing, signature decryption and format selection are GIL-bound Python, so threads would contend for the GIL and steal time from the event loop serving voice heartbeats.
 
-`YtdlpPool` owns the lifecycle and nothing else — the callable is passed per call (`ytdlp_pool.run(_ytdlp_extract, ...)`), which is what keeps it free of yt-dlp knowledge and keeps `patch("src.youtube._ytdlp_extract")` working in tests. Lifecycle: created lazily (so importing the module never spawns children), prewarmed from `setup_hook`, rebuilt once if a worker dies (`BrokenProcessPool`), and closed from `close()` via `aclose()`, which bounds the join at 10 s. A submit after close raises `PoolClosedError` rather than silently spawning a pool nothing would join.
+The sink is the opt-in half: a pool built with one carries a second queue and a thread draining it, so a worker can report progress while `extract_info` is still running (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). Built without one, neither exists.
+
+`YtdlpPool` owns the lifecycle and nothing else — the callable is passed per call (`ytdlp_pool.run(_ytdlp_extract, ...)`), which is what keeps it free of yt-dlp knowledge and keeps `patch("src.youtube._ytdlp_extract")` working in tests. Lifecycle: created lazily (so importing the module never spawns children), prewarmed from `setup_hook`, recycled every `_MAX_TASKS_PER_CHILD` (16) extractions so a worker's resident set never grows into an OOM kill (the chart pool passes `recycle_workers=False`: its one worker would pay matplotlib's import again on every replacement), rebuilt once if a worker dies (`BrokenProcessPool`), and closed from `close()` via `aclose()`, which bounds the join at 10 s. The start method is passed explicitly (`_pool_context`) because setting a task budget otherwise makes CPython force `spawn`, silently replacing 3.14's forkserver default on Linux. A submit after close raises `PoolClosedError` rather than silently spawning a pool nothing would join.
 
 Each worker holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default worker count is deliberately conservative.
 
@@ -396,15 +430,18 @@ sequenceDiagram
     Main->>Main: assert DISCORD_TOKEN / SPOTIFY_* present
     Main->>Bot: bot.run(token) → connect WebSocket
     Discord-->>Bot: setup_hook (before READY)
+    Bot->>Bot: read HISTORY_ARCHIVE_ENABLED, then BOT_SETTINGS_OVERRIDES (garbage aborts)
     Bot->>Redis: create_redis_pool() + get_redis()
+    Bot->>Bot: bot_settings = BotSettings(...)
     Bot->>Bot: HISTORY_ARCHIVE_ENABLED? → archive →<br/>HistoryOutboxDrainer.start() (lazy — no PG connection yet)
     Bot->>Bot: load_extension("src.musicbot")
+    Bot-)Redis: BotSettings.hydrate_until_read() — spawned, not awaited (bot:{application_id}:config)
     Discord-->>Bot: on_ready (all guilds cached)
     Bot->>Bot: presence = "Playing music"
     Bot->>Bot: MusicBot.on_ready → create_task(_restore_guild) × N guilds
 ```
 
-`setup_hook` runs after the WebSocket connection is established but before READY is dispatched — Redis is guaranteed available before any command is processed. `setup_telemetry()` runs first in `main()` because it configures structlog before the first `get_logger()` call resolves.
+`setup_hook` runs after the WebSocket connection is established but before READY is dispatched — Redis is guaranteed available before any command is processed. It reads `HISTORY_ARCHIVE_ENABLED` and then `BOT_SETTINGS_OVERRIDES` before anything else, because both parsers raise on garbage and nothing later would report it as loudly. The bot-settings hydration it spawns never holds startup; see [Settings resolution](#settings-resolution). `setup_telemetry()` runs first in `main()` because it configures structlog before the first `get_logger()` call resolves.
 
 ---
 
@@ -450,8 +487,8 @@ sequenceDiagram
     Bot->>Sources: parse_input(url)
     Sources-->>Bot: YTSource | SpotifySource | SoundcloudSource
 
-    alt Spotify playlist
-        Bot->>SP: spotify.playlist(id) → List[str] titles
+    alt Spotify album / playlist
+        Bot->>SP: spotify.album(id) / spotify.playlist(id) → SpotifyPlaylist, its titles
         Bot->>Sources: spotify_playlist_to_ytsearch(titles) → List[YTSource]
         Bot->>MP: queue_put(items, prefetch=False)
     else YouTube playlist
@@ -460,12 +497,12 @@ sequenceDiagram
     else Single track (YouTube / Spotify track / SoundCloud)
         Bot->>SP: spotify.track(id)  [if Spotify track]
         Bot->>YTDL: yt_source(requester, search, ts, redis)
-        Note over YTDL: checks ytdl:source cache first (1h TTL);<br/>on miss, one unified extraction<br/>writes BOTH ytdl:source and ytdl:stream
+        Note over YTDL: checks ytdl:source cache first (24h TTL, refreshed past 1h);<br/>on miss, a search resolves FLAT (ytdl:source only)<br/>and a link takes the unified extraction (both caches)
         YTDL-->>Redis: cache_set("ytdl:stream:<url>", data, ≤1800s)
         YTDL-->>Bot: QueueObject(webpage_url, title, ...)
         Bot->>MP: queue_put([qobj])
         MP->>PF: create_task(YTDL.prefetch_stream(qobj, redis))
-        Note over PF: cache-hit no-op for unified-path songs;<br/>full extraction only for sparse items<br/>(playlist entries, requeues)
+        Note over PF: cache-hit no-op for unified-path songs;<br/>the extraction itself for flat-resolved searches,<br/>playlist entries and requeues
     end
 
     MP->>Redis: RPUSH typed queue entries (SongQueueEntry / SearchQueueEntry)
@@ -476,22 +513,24 @@ Playlists (both kinds) enqueue with `prefetch=False` so a 100-track playlist doe
 
 ---
 
-### -playnow Interjection
+### -play --now Interjection
 
-`-playnow` (`pn`) plays a song **immediately**, parking the current one to resume from its exact position afterward. Full design: [PLAYNOW_PROPOSAL.md](PLAYNOW_PROPOSAL.md).
+`-play --now` plays a song **immediately**, parking the current one to resume from its exact position afterward. A playlist arrives whole: the head interrupts, `follow_on` sits between it and the resume entry, and the parked song therefore returns after the LAST track — on a long link, in practice never. That is a deliberate call rather than an oversight; the confirmation states it and names `-remove <the same link>`, which takes every track back out because `remove_matcher` matches on the `user_input` each one carries.
+
+`-play --next` is the third placement: front-insert, interrupt nothing. It routes through `MusicPlayer.queue_put_next`, which calls `_neutralize_prefetch()` before `put_front` — `loop()` spawns `_prefetch_next_song()` every iteration and its `get_nowait()` holds a claim for the rest of the current song, so a bare `put_front` inserts at `_cursor`, BEHIND that claim, and the song plays second. Nothing may go ahead of the claim (I6 makes the claimed items a prefix because Redis retires them by `LPOP`), so handing it back is the only correct move. It deliberately does not re-spawn the prefetch: `_prefetch_task` is a single slot under a claim-then-null protocol with `loop()`, and a re-spawn racing the loop's own would orphan one task holding a claim nothing settles, drifting `_cursor` permanently.
 
 ```mermaid
 flowchart TD
-    Start(["-playnow url"])
+    Start(["-play --now url"])
     Live{"a song live?\n(current_song + vc playing/paused)"}
     Fallback["fall back to -play\n(joins if needed; playlists enqueue in full)"]
-    Resolve["parse_input + _resolve_playnow_source\n(playlist → first track only)\nqobj.interjected = True"]
-    Warm["await YTDL.prefetch_stream(qobj)\nwarm stream cache BEFORE interrupting\n(avoids dead air; back-fills embed metadata)"]
-    Interject["mp.interject(qobj, vc)"]
+    Resolve["parse_input + _resolve_interjection_source\n→ (head, follow_on)\nhead.interjected = True"]
+    Warm["await YTDL.prefetch_stream(head)\nwarm stream cache BEFORE interrupting\n(head only: N warms mint URLs that expire)"]
+    Interject["mp.interject(head, vc, follow_on=…)"]
     Ended{"song ended\nmid-resolve?"}
-    FrontOnly["queue.put_front([qobj])\n(interjected reset)\n'Playing next' notice"]
+    FrontOnly["mp.queue_put_next([head, *follow_on])\n(interjected reset)\n'Playing next' notice"]
     Resume["build resume SongQueueEntry\n(is_resume=True, ts=position_secs,\nstart_paused=was_paused)\ninherits played_at + query_source"]
-    PutFront["queue.put_front([qobj, resume?])\n_skip_history_for = stopped song\nvc.stop() → loop picks up qobj"]
+    PutFront["queue.put_front([head, *follow_on, resume?])\n_skip_history_for = stopped song\nvc.stop() → loop picks up head"]
 
     Start --> Live
     Live -->|No| Fallback
@@ -504,42 +543,174 @@ flowchart TD
 Key properties:
 
 - **Resume fidelity**: the parked song's position comes from `position_secs` (the frame counter), stored as `ts` on an `is_resume` `SongQueueEntry`. When the loop dequeues that entry it seeks via FFmpeg `-ss ts` and, if `start_paused`, comes back paused — the interruption is invisible to playback position.
-- **Warm before interrupt**: `prefetch_stream` is **awaited** (not fire-and-forget like `queue_put`'s warm-up) so the current song keeps playing through a possible yt-dlp miss rather than cutting to silence before the playnow song is ready.
+- **Warm before interrupt**: `prefetch_stream` is **awaited** (not fire-and-forget like `queue_put`'s warm-up) so the current song keeps playing through a possible yt-dlp miss rather than cutting to silence before the interjected song is ready.
 - **Nearly-finished guard**: a song with almost no time left gets no resume entry (`resume_position is None`) — it just ends.
-- **Stacking**: interjecting on top of another `-playnow` song parks it like any other, in front of the tails already waiting, so the queue unwinds LIFO and every parked song returns. Depth is unbounded and recorded on the span as `interject.depth` (the run of consecutive `is_resume` entries starting after the claimed prefix — `_cursor + 1`, not display index 1, because `put_front` inserts behind a dequeued-but-uncommitted item — i.e. parked *plays*, via `GuildQueue.resume_tail_depth`). `ts` is absolute at every level, so a tail of a tail resumes at the position actually reached rather than at its own fragment's start.
+- **Stacking**: interjecting on top of an already-interjected song parks it like any other, in front of the tails already waiting, so the queue unwinds LIFO and every parked song returns. Depth is unbounded and recorded on the span as `interject.depth` (the run of consecutive `is_resume` entries starting after the claimed prefix — `_cursor + 1`, not display index 1, because `put_front` inserts behind a dequeued-but-uncommitted item — i.e. parked *plays*, via `GuildQueue.resume_tail_depth`). `ts` is absolute at every level, so a tail of a tail resumes at the position actually reached rather than at its own fragment's start.
 - **History once**: `_skip_history_for` holds the parked song's identity so the stop-transition's history step skips it — it is recorded exactly once, when its resume tail finishes. It holds the song object (not a bare flag) because the song can end naturally during `interject()`'s awaits. The same marker is what lets a *teardown* record safely: `cog.cleanup` claims the mid-play song through `MusicPlayer.claim_current_song_for_history()`, which declines when the marker already names it (a parked tail will record the play on `-resume`) and otherwise takes the marker so the loop cannot record it twice.
 - **Crash-safe**: resume entries are ordinary persisted `SongQueueEntry`s (LPUSHed to the front of the Redis list), so a crash mid-interjection recovers the parked song from the queue like any other.
 
 ---
 
+### -replay
+
+`-replay` (`rp`, `restart`) plays the live song again from `0:00`. The body is
+`src/commands/replay.py`, as every command body is; the cog keeps the declaration,
+the decorators and the `except` that renders the failure embed. The replay flow lives
+there too — `replay_current()`, its verdict and `ReplayResult` — and drives the player
+only through its public methods. The player keeps what its loop reads: the retire
+marker and the trace link, both set by `hand_over_to_replay()`. It reuses
+`--now`'s skeleton — neutralize the prefetch, front-insert, stop the live song,
+let the loop's ordinary dequeue do the rest — and differs in four decided ways.
+
+- **The interrupted play keeps its own history entry.** `--now` suppresses the
+  parked fragment's entry via `_skip_history_for` because its resume tail spans the
+  whole play. A replay starts at `0:00` and spans none of what was already heard, so
+  suppressing here would lose that listening with no row, no log line and no reject.
+  Two plays, two rows; `played_at` is stamped fresh on the replay, so the
+  `(guild_id, played_at, webpage_url)` dedup index does not collide.
+- **The replay is the caller's ask.** `requester` and the ask-time `analytics` both
+  name whoever ran `-replay`, not the original requester, or `-leaderboard` credits
+  a play to someone who did not ask for it. `query_source` and `user_input` stay with
+  the song: they classify how the song was *found*, which a replay does not change.
+- **A paused song comes back playing**, on `-play`'s precedent ("`-play` means
+  play") and `-skip`'s: the ask is for the song to sound.
+  Nothing sets `start_paused`, so the flag keeps its single `--now` producer.
+- **The interrupted song's NP card is retired, not finalized.** A replay is the same
+  song, so a bar frozen at the interrupt position would stand directly above the
+  replay's own card naming it again. `_retire_np_for` carries the song's identity to
+  the loop's iteration end, the way `_skip_history_for` does.
+
+**Liveness.** `MusicPlayer.still_live()` is the single test both `replay_current()`
+and `interject()` use before acting on a song, and every term is a window a command
+can wake up in:
+
+| Term | Window it closes |
+|---|---|
+| `current_song is song` | the obvious one |
+| `not play_next.is_set()` | the audio thread sets `play_next` two task cancels before the loop clears `current_song`; acting there replays a finished song and stops the next one |
+| `not _stopped_deliberately` | `note_deliberate_stop()` precedes every stop we make (`-skip`, `--now`, `-replay`), and until the loop's next `vc.play()` `current_song` names a song already over — the stopped one, or the next one before it starts. Acting there front-inserts against it: a `--now` landing after a `-replay`'s stop would park a resume tail ahead of the replay, and a `-replay` after a `-skip` replays what was skipped. The loop clears the flag at that `vc.play()` |
+| loop task not done | a torn-down player (`-stop`, the alone watchdog, a voice kick): the voice client is gone, so the stop would land on a disconnected one |
+
+It is checked twice per command — at dispatch and again after the prefetch is neutralized
+— because the neutralize destroys the next song's resolved source and a song already
+gone needs neither.
+
+**Bounding the resolve.** The replay is resolved through the loop's own
+`_prefetch_next_song()`, so the extraction, probe and FFmpeg spawn are paid while the
+interrupted song is still playing rather than in the silence after the stop. The wait
+is `asyncio.wait({task}, timeout=...)`: it does not cancel the task when the bound
+expires, and does not re-raise when a teardown cancels it — `cleanup()` cancels
+exactly this task, and a direct `await` would put that `CancelledError` into a command
+body whose `except Exception` cannot catch it.
+
+**The stop is a gate, as it is for `--now`.** A copy that cannot play must not stop
+what is playing, so the song is stopped only when the copy is certain to be next:
+the task in the slot is still the replay's, it has finished, and the claimed head is
+the very `QueueObject` the replay inserted (`_replay_result`). Identity, not a URL
+match, is what separates the cases that must not stop, because each of them leaves
+something at the head:
+
+| `ReplayResult` | What happened | The song |
+|---|---|---|
+| `REPLAYING` | the copy resolved and is held at the head | stopped; the copy plays now |
+| `ENDED_FIRST` | the song ended before the verdict | already over; the copy plays next |
+| `STILL_LOADING` | the resolve outlived `_REPLAY_RESOLVE_TIMEOUT`, still holding the copy | plays on; the copy follows it |
+| `STOPPED_ELSEWHERE` | a `-skip` or `--now` stopped the song first (`_stopped_deliberately`) | stopped by that command; the copy is still queued |
+| `TORN_DOWN` | the player was torn down (`-stop`, a kick, the alone watchdog) | gone; the copy waits in the saved queue for `-resume` |
+| `INTERRUPTED` | another command cancelled the resolve. The verdict runs as the cancel lands, before that command has changed the queue, so it cannot say where the copy ends up | plays on, or is stopped by that command |
+| `QUEUED_LATER` | a `-shuffle` or `--next` landed after the resolve finished and put something ahead of the copy, which is still queued — by identity, or as a rebuilt copy carrying `is_replay` | plays on; the copy plays when the queue reaches it |
+| `FAILED` | the resolve returned no song and retired the copy | plays on |
+| `DROPPED` | a `-clear` or `-remove` took the copy out of the queue | plays on |
+
+**A replay is two traces, and they say so.** One song is one trace, so the interrupted play and its replay are separate traces with the same attribute keys. The interrupted iteration records `song.ended_by=replay`; `player.replay` links to it (`link.kind=replayed_song`); the replayed iteration records `song.is_replay` and links back to it (`link.kind=replay_of`), carried on `MusicPlayer._replay_of` from the stop to the replay's start. `bot.replay` records `replay.outcome` on every exit, the refusals that never reach the player included.
+
+**A `--now` during the replay's resolve inserts no resume tail.** It neutralizes the resolve, which hands the copy back to the head, and `interject()` finds a `-replay` copy of the live song next (`guild_queue.is_replay_of`): the copy already plays the song again after the interjection, so a tail at the interrupt position ahead of it would play the song a third time. The interrupted fragment records its own history row, as with `-skip`, and `--now`'s reply says the song plays again from `0:00` after it. A marker held for the length of `replay_current` could not stand in for this check: the replay's verdict runs as soon as the neutralize cancels its resolve, before `--now` has inserted anything.
+
+Expiring the bound stops nothing: a resolve past it can still fail, and a stop into
+it would cut the song off for a copy that never plays.
+
+**Writing the slot.** The front insert awaits an LPUSH, and the song can end inside
+it: the loop reads and nulls the slot, claims the copy, and at the copy's start
+spawns its own prefetch. So liveness is checked once more after the insert, with no
+await between that check and the slot write, and the write goes through
+`ensure_prefetch()` — as the loop's and `-shuffle`'s do — which never starts a task
+over one already in the slot. Two tasks in the slot is two claims the loop settles
+one of: the next song is skipped, or the replay lost, and `_cursor` drifts for good.
+
+**Residual race.** A teardown completing *inside* that resolve leaves the replay on
+the queue, so a later `-resume` plays it. The stop is guarded, so nothing is sent to a
+disconnected client.
+
+---
+
 ### Source Resolution
 
-`parse_input` / `parse_url` in `sources.py` classify the raw input string:
+`parse_input` / `parse_url` in `sources.py` classify the raw input string. It arrives with the leading options already removed by `split_play_args` and reads nothing but what it is handed, which is what makes stripping a flag work at all.
 
 ```mermaid
 flowchart TD
     Input["Raw input string"]
-    IsYT{"youtube.com\nor youtu.be?"}
+    Unwrap["unquote, then strip Discord's wrappers\nand trailing punctuation"]
+    IsURI{"spotify:kind:id URI?"}
+    IsLink{"one token, at most 2,048 chars,\nhttp(s) or dotted host, then /?"}
+    Host{"host, lowercased"}
     IsPL{"playlist\n(list= param)?"}
-    IsSP{"open.spotify.com\nor spotify.com?"}
-    IsSC{"soundcloud.com?"}
+    SPKind{"track or playlist,\nwith an id?"}
 
-    Input --> IsYT
-    IsYT -->|Yes| IsPL
+    Input --> Unwrap --> IsURI
+    IsURI -->|Yes| SPKind
+    IsURI -->|No| IsLink
+    IsLink -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    IsLink -->|Yes| Host
+    Host -->|"youtube.com, youtu.be"| IsPL
     IsPL -->|Yes| YTPL["YTSource(type=PLAYLIST, list_id=...)"]
     IsPL -->|"No (?t= honored)"| YTS["YTSource(url, ts?, process=False)"]
-
-    IsYT -->|No| IsSP
-    IsSP -->|track| SPS_T["SpotifySource(TRACK, id)"]
-    IsSP -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
-    IsSP -->|No| IsSC
-    IsSC -->|Yes| SC["SoundcloudSource(url)"]
-    IsSC -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    Host -->|"open. / play. / spotify.com"| SPKind
+    SPKind -->|track| SPS_T["SpotifySource(TRACK, id)"]
+    SPKind -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
+    SPKind -->|album| SPS_A["SpotifySource(ALBUM, id)"]
+    SPKind -->|No| Refuse["UnsupportedSpotifyLinkError"]
+    Host -->|soundcloud.com| SC["SoundcloudSource(url)"]
+    Host -->|any other| OTHER["YTSource(url, stype=OTHER), for yt-dlp"]
 ```
+
+**The link test runs in linear time.** `re` holds the GIL for a whole match, so one slow
+match stalls discord.py's audio thread, and with it every guild. `_LINK_RE` is anchored
+(`re.match` tries one start position), and every quantified run in it stops at a literal
+its own class cannot match, so a failing match is linear too. A token longer than
+`LINK_MAX_CHARS` (2,048) is searched without being tested. The unanchored `re.search` this
+replaced measured 30 ms on a 2,048-character token with no `/` and 140 ms at 4,000, which
+one Nitro message can hold; the anchored test measures under 0.2 ms, and
+`TestLinkParsingIsLinear` bounds it at 5 ms. Wrappers come off with `str` methods for the
+same reason.
+
+What counts as a link:
+
+- **Scheme and host.** `http`, `https`, or no scheme at all, then a dotted host followed by
+  `/`. That keeps `will.i.am`, `Dr.Dre` and `98/99` searches. A token whose link does not
+  start it (`listen:https://…`, `ftp://…`, `user@host`) is a search.
+- **Wrappers.** `<link>` (Discord's embed suppression), `||link||`, `[text](link)`, a code
+  span and parentheses come off, up to three deep, along with a sentence's trailing
+  `.,!?;:`. The unwrap runs before the argument is split into words, because a masked
+  link's text can hold spaces.
+- **Case.** The host is lowercased before it is compared, and in the link handed to
+  yt-dlp too, since its extractors match hosts case-sensitively. The path keeps its case.
+- **Spotify.** The `intl-<locale>/` and `embed/` segments, `play.spotify.com`, the legacy
+  `/user/<name>/playlist/<id>` path and `spotify:` URIs all name a track or playlist. Any
+  other Spotify link raises `UnsupportedSpotifyLinkError`, whose `user_message` the command
+  renders. It is deliberately not a `ValueError`, which `parse_input` answers with a
+  search, and it is raised before `-play` joins voice or interrupts a song.
+- **Share links.** `youtube.com/attribution_link?u=<path>` is routed as the watch path it
+  carries, decoded once and only as a path on youtube.com.
+
+**One verdict.** `is_link` answers for `_source_cache_key`, whose key keeps a link's case
+because YouTube ids are case-sensitive, and for `-remove`'s fold. Neither can call a token
+a link that `-play` searched for, or the reverse.
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
-- **Playlist**: `Spotify.playlist(id)` → `List[str]` titles → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Album**: `Spotify.album(id)` → the same `SpotifyPlaylist`, plus its artists and cover → the playlist's path from there
 
 ---
 
@@ -550,11 +721,11 @@ Every song passes through up to three phases:
 ```mermaid
 flowchart LR
     subgraph Phase1["Phase 1 — Enqueue (unified single extraction)"]
-        P1["yt_source(search)\nytdl:source cache (1h) or ONE\nyt-dlp full extraction (process=True)\npopulating ytdl:source + ytdl:stream\nReturns: QueueObject"]
+        P1["yt_source(search)\nytdl:source cache (24h), else a FLAT\nsearch (identity only) or, for a link,\nONE full extraction (both caches)\nReturns: QueueObject"]
     end
 
     subgraph Phase1b["Phase 1b — Eager Prefetch (background)"]
-        P1b["prefetch_stream(QueueObject)\ncache-hit no-op after Phase 1;\nfull extraction only for bare\nQueueObjects (playlists, requeues)\n+ enriches QueueObject metadata"]
+        P1b["prefetch_stream(QueueObject)\ncache-hit no-op after a full Phase 1;\nthe extraction itself after a flat one,\nand for playlists and requeues\n+ enriches QueueObject metadata"]
     end
 
     subgraph Phase2["Phase 2 — Play (low latency)"]
@@ -566,9 +737,14 @@ flowchart LR
     Phase1b -->|"Redis cache populated"| Phase2
 ```
 
-**Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 1 h) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss, **one** full extraction with `_YTDL_STREAM_SEARCH_OPTS` and hardcoded `process=True` (searches *and* direct URLs — unprocessed extraction would do no format selection and leave nothing to cache) yields identity plus a selected stream URL, and `_probe_and_cache` writes the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity. Returns a `QueueObject`.
+**Phase 1** (`YTDL.yt_source`): Checks the `ytdl:source:{normalized query}` Redis cache (TTL 24 h, see [Source-cache freshness](#source-cache-freshness)) before running yt-dlp — repeat plays of the same input skip the 3–4 s lookup. On a miss it takes one of two paths, chosen by the caller through `ResolveMode` (see [Resolve mode](#resolve-mode)):
 
-**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). For songs Phase 1 just resolved it is a cache-hit no-op (one Redis GET); it runs a full extraction only for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
+- **Flat** (`flat=True`, `_YTDL_FLAT_SEARCH_OPTS`) for a search or a Spotify track under an ordinary placement: one search POST yields id, title, duration, uploader and thumbnail — enough for the card and the queue entry — and **no stream URL**, so only `ytdl:source` is written. Measured at 0.65 s against the full path's 2.46 s. An entry the mapper cannot describe as a plain song (live, upcoming, or duration-less) returns `None` and the query falls through to the full path, which produces exactly what it produced before the flat path existed — at the cost of both rounds. `ytsearch:` returns a single entry, so the full path re-fetches the same declined video: `-play lofi hip hop radio`, whose top hit is a live stream, pays ~0.65 s + ~2.46 s and two pool jobs where it used to pay one.
+- **Full** (`_YTDL_STREAM_SEARCH_OPTS`, hardcoded `process=True` — unprocessed extraction would do no format selection and leave nothing to cache) for every link, every interjection head, every **cold start** (its song plays immediately, so the stream extraction is on the path to audio either way and a flat resolve would only move the failure past the join), and every lazy entry resolving at dequeue: identity plus a selected stream URL, with `_probe_and_cache` writing the `ytdl:stream` entry alongside the `ytdl:source` one. A failed probe skips only the stream write — the song still enqueues on identity.
+
+Returns a `QueueObject`.
+
+**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). After a full Phase 1 it is a cache-hit no-op (one Redis GET); after a flat one it **is** the stream extraction, single-flighted with the playback loop's own resolve of the same song, and it runs a full extraction for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`, joined through `_start_stream_warm` so a warm yt_source already started is shared rather than repeated — see [Warming the stream cache](#warming-the-stream-cache)), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
 
 **Phase 2** (`YTDL.yt_stream`): Called just before playback. Cache hit → construct `YTDL` with no yt-dlp call; miss → extract and cache.
 
@@ -576,22 +752,138 @@ flowchart LR
 - YouTube CDN URLs have a 6-hour expiry window and are IP-bound (the `ip` field is inside the HMAC-signed `sparams`) — they cannot be reused from a different host
 - Cache TTL formula: `min(expire − now − 1800s, _STREAM_URL_MAX_TTL=1800s)`; not written if the result is under 60 s. YouTube revokes URLs well before their advertised `expire`, so the 1800 s cap — not `expire` — is what bounds a fresh extraction's TTL in practice
 - Cache lifetime follows the probe verdict. `_probe_stream_url` returns `StreamProbe.PLAYABLE` / `DEAD` / `UNCONFIRMED`; only `PLAYABLE` earns the full ceiling, `DEAD` is never cached, and `UNCONFIRMED` (the probe itself never completed — timeout, DNS, connection refused; also HTTP 429 and 5xx, which say "not right now" exactly as a timeout does) gets `_UNCONFIRMED_STREAM_TTL` = 120 s. That third state is deliberately neither of the others: treated as `DEAD` it would fail songs whenever the probe is blocked, and treated as `PLAYABLE` it writes an unverified URL into a 30-minute entry — not hypothetical, an ISP-embedded CDN edge that accepted no connections made one song unplayable for the entry's whole TTL. It is still cached, because the probe's failure modes are process-wide rather than per-URL: declining the write would stop *anything* repopulating the cache, putting every song through the yt-dlp-then-prefetch extraction twice. 120 s keeps the cache working through a blip while capping a wrong entry at minutes
-- An unconfirmed **cached** URL is dropped and re-extracted for a freshly signed one, subject to three brakes. It is **not** re-extracted onto a different edge: measured over six identical re-extractions each of two videos, the CDN host (`rrN---sn-…`) and the selected format (251) came back byte-identical every time, and only the signature and `expire` changed — the `sn-` component is the ISP-local Google Global Cache node and is structurally sticky to the host's network. So the drop cures an early revocation, never an unreachable edge, which is also why `_MAX_STREAM_EXTRACTIONS` is **1**: a url minted a second ago that already probes dead is being refused for a reason an identical call cannot vary (GVS enforcement, PO token, format, IP), and yt-dlp has already retried the player API three times internally via `extractor_retries`. The drop is **free** — never charged against that budget, so a resolve that discards one entry still has its extraction in hand. It is **suppressed** once `probe_path_looks_broken()` (`_UNCONFIRMED_STREAK_LIMIT` consecutive unconfirmed verdicts) says the probe rather than the URL is the broken component, since deleting every entry then is self-inflicted load. And the **background prefetch declines it** (`allow_reextract=False`): `_cancel_prefetch()` awaits that task, an executor job cannot be interrupted, so a re-extraction there would sit in front of every `-clear`/`-shuffle`/`-remove`
+- An unconfirmed **cached** URL is dropped and re-extracted for a freshly signed one, subject to three brakes. It is **not** re-extracted onto a different edge: measured over six identical re-extractions each of two videos, the CDN host (`rrN---sn-…`) and the selected format (251) came back byte-identical every time, and only the signature and `expire` changed — the `sn-` component is the ISP-local Google Global Cache node and is structurally sticky to the host's network. So the drop cures an early revocation, never an unreachable edge, which is also why `_MAX_STREAM_EXTRACTIONS` is **1**: a url minted a second ago that already probes dead is being refused for a reason an identical call cannot vary (GVS enforcement, PO token, format, IP), and yt-dlp has already retried the player API three times internally via `extractor_retries`. The drop is **free** — never charged against that budget, so a resolve that discards one entry still has its extraction in hand. It is **suppressed** once `probe_path_looks_broken()` (`_UNCONFIRMED_STREAK_LIMIT` consecutive unconfirmed verdicts) says the probe rather than the URL is the broken component, since deleting every entry then is self-inflicted load. And the **background prefetch declines it** (`allow_reextract=False`): `-clear`, `-shuffle` and `-remove` await that task's cancel, an executor job cannot be interrupted, so a re-extraction there would sit in front of every `-clear`/`-shuffle`/`-remove`
+
+---
+
+### Resolve mode
+
+`ResolveMode` (`src/play_placement.py`) is how a caller says whether a resolve may stop at search metadata. `resolve_mode_for(placement)` maps `TAIL` and `NEXT` to `FLAT_OK` and `COLD_FRONT` to `FULL`; `_resolve_interjection_source` passes `FULL` explicitly, and `MusicPlayer._resolve_source` takes `yt_source`'s `flat=False` default. The function enumerates `Placement` rather than defaulting, so a member added later cannot inherit `FLAT_OK` in silence — a test asserts the mapping member by member.
+
+**A cold start is `FULL` for the same reason an interjection is.** Its song plays immediately, so the stream extraction is on the path to audio either way and flat buys only a faster card; what it costs is the failure boundary. Resolved flat, an unplayable song enqueues, the join lands, the card is sent, and the bot is parked in a channel with an empty queue until the server's idle timeout (5:00 by default).
+
+**Flat for cold starts was weighed and declined, on the failure boundary rather than the clock.** The clock argues for it: a cold search would acknowledge from the flat POST at ~0.65 s instead of ~2.46 s, and time-to-audio is measured materially unchanged (0.65 s + 1.86 s against 2.46 s — see [yt-dlp three-phase pipeline](#yt-dlp-three-phase-pipeline)), so the trade on latency alone is nearly two seconds of acknowledgement for about fifty milliseconds of audio. What it costs is where a failure lands. Two cases separate: a search that resolves to *nothing* raises either way and `_abandon_cold_start` runs unchanged, but a head whose **stream** extraction fails later is the new exposure — under FULL the bot never joins and the user is told the song was not queued, under flat the bot has already joined, already sent the card, and answers with `_handle_dead_stream`'s notice before idling out of a channel it entered for one song. Re-creating the boundary means holding the playback gate across the spawned stream extraction and tearing down on failure, which puts a new await inside the cold-start teardown path — the most delicate sequencing in the repo — to buy back a boundary the current code gets for free. Reopen it with that cost in view, not with the latency number alone.
+
+**`FLAT_OK` is on the time-to-audio path in exactly one case, and it is measured, not assumed.** A `TAIL` onto a connected but idle, empty-queue bot has nothing playing behind it, so its flat POST is additive rather than hidden behind a song. The measurement is in [yt-dlp three-phase pipeline](#yt-dlp-three-phase-pipeline): 0.65 s + 1.86 s against the unified path's 2.46 s — the card lands ~1.8 s sooner and the music starts ~0.05 s later. Every other `TAIL` and every `NEXT` is placed behind something already playing, where the prefetch's stream extraction finishes long before the slot is reached and flat is free outright. So the idle case buys nearly two seconds of acknowledgement for a difference in audio that is inside the noise of a CDN round trip, and it needs no fourth `Placement` to carve out.
+
+**It is a parameter rather than an inference, because the input cannot answer it.** Both the command path and interjection resolve through `MusicBot.queue_source`, so "a search may go flat" would have to carry the exception "unless it is an interjection head" — and `--now <words>` is a search by every test the input itself can offer. `interject()` stops the current song, so its head must be playable before anything is stopped.
+
+**Only a search has a cheap mode.** `YoutubeIE._real_extract` fetches the watch page and the player API whatever `process` and `extract_flat` say, so a link's floor is the full extraction; the search's extra work — search client config, results page, playlist bookkeeping — is exactly what `extract_flat` skips. Skipping the watch page (`youtube:player_skip=webpage`) is what YouTube's bot check catches, measured failing on 3 of 4 videos, because the watch page is where visitor data comes from.
+
+**`process` stays `True` on the flat path.** With `process=False` yt-dlp returns `entries` as an unconsumed `itertools.islice` and never iterates it — no search is performed at all — and `sanitize_info` reduces the islice to its `repr()`, so what crosses the process boundary is a 40-character string. `extract_flat: "in_playlist"` with `process=True` is the configuration `yt_playlist` has always run.
+
+**The flat path may write `ytdl:source`** because `_queue_object_from_flat_entry` refuses any entry without a duration, so every entry it writes carries the same five fields the full path writes. The one difference measured between the two is the duration itself: the search renderer's `lengthSeconds` can disagree with the processed value by a second (322 against 321 on one of three live queries), which the enqueue card, the queue listing and the ETA inherit — `play_history` does not: `HistoryEntry.from_song` reads `YTDL.duration_secs`, set from the stream extraction. It derives `webpage_url` from the entry's `id` rather than reading `url`: that string is the `ytdl:stream` cache key, what `-remove` matches, and part of `play_history`'s dedup tuple, so the two paths have to agree on it by construction.
+
+---
+
+### Where the resolve bound is taken
+
+`PLAY_RESOLVE_CONCURRENCY` (`_GuildPlays.resolves`) bounds how many of a guild's admitted `-play`s may hold one of the shared pool's workers. It is acquired inside `_extract_once`, around the job it starts — **not** around the caller's whole resolve.
+
+That distinction is the difference between the bound doing its job and the bound being the problem. A resolve is not all pool work: a repeat `-play` is a `ytdl:source` GET, a re-pasted collection is a `ytdl:playlist` GET, and a Spotify playlist is Spotify HTTP plus Redis and never touches yt-dlp at all. Held around the whole resolve, every one of those queued behind two in-flight extractions in the same guild — the exact request class that should be instant. Held at the extraction, they proceed while the two long lookups run.
+
+A caller that **joins** an in-flight job takes no slot either: the leader is the one holding a worker, and charging its joiners would let one popular link exhaust a guild's budget with jobs that are not running.
+
+**The slot is acquired inside the job, not before the registry write.** Nothing may be awaited between `_extract_once`'s read of `_INFLIGHT_EXTRACTS` and its write, or the single flight is lost exactly when it is worth most: with the semaphore full, every caller for one key reads an empty registry while it queues, and each starts a job of its own. `_gated_extract` holds the slot for as long as the extraction runs, so a queued job is still a registered one and its key still deduplicates.
+
+The slot is passed down as `pool_slot` — through `queue_source`, `yt_source` and `yt_playlist` — rather than read from a registry, because `src/youtube.py` knows nothing about guilds. A resolve reached outside a command (a lazy `SearchQueueEntry` at dequeue, a prefetch, a test) passes `None` and is bounded by `prefetch_warm_slot()` or by nothing, as before.
+
+---
+
+### A resolve that has to wait
+
+`PLAY_RESOLVE_CONCURRENCY` decides how many of a guild's `-play`s may hold a worker; this is what happens to the ones that may not. `ResolveSlot` wraps that semaphore and puts a deadline on the **acquire alone** — `PLAY_RESOLVE_WAIT_SECS`, default 120s.
+
+**The extraction inside is deliberately unbounded.** The slot exists to queue expensive work: a 5,547-track playlist legitimately runs 99s, and a deadline covering the job would cancel exactly the resolve the bound was sized for. What is bounded is the stretch before it, which produces no output at all and so cannot be told apart from a bot that stopped answering.
+
+The default is generous on purpose. Every second of that wait can be another guild member's legitimate resolve finishing, and the cost of expiring early is a refusal the user did not need to get — so the deadline is sized to catch a pool that is genuinely wedged, not a pool that is merely busy.
+
+On expiry `ResolveSlot.__aenter__` raises `ResolveWaitExpired`, and **releases nothing**: `__aexit__` does not run for an `__aenter__` that raised, so a release there would hand out a permit the guild never held and uncap the bound. The wrapper is stateless per entry for the same reason one request's resolve can enter it more than once — the count lives in the semaphore, and each `async with` owns only its own acquire.
+
+**The command renders it, not the resolve.** `-play`'s cold path already handles failures around `queue_source` by unwinding a join, and reporting a full pool as a failed join would name the wrong subsystem. The refusal is honest about what did not happen: the request queued for a slot and gave up before any extraction began, so nothing was searched and nothing was queued. Unlike a stalled place (`PlaceStalled`), "try again" here cannot duplicate a song.
+
+`pool_slot` is typed as `AbstractAsyncContextManager` rather than `asyncio.Semaphore` throughout `src/youtube.py`, so the slot can carry the deadline without that module learning anything about guilds. A resolve reached outside a command still passes `None`.
+
+**One guild's exhausted budget is never another's.** `ResolveWaitExpired` is a `util.PoolSlotUnavailable`, the contract between whoever owns a slot and the extraction that holds one: the bound belongs to the CALLER that supplied the slot, never to the shared job that caller happened to start. `_extract_once` single-flights on the URL and the key carries no guild, so publishing a leader's expired wait to its joiners would fail another guild's song — including the playback loop's own in-band resolve, which supplies no slot at all. A joiner that sees it re-elects instead, and retires the failed job at that point rather than leaving it to the job's done callback: that runs through `call_soon`, and a caller joining an already-failed job never suspends, so it would read the same job straight back and spin.
+
+#### Saying so while it waits
+
+`slow_resolve_notice` posts once a request outlives its server's `slow-notice` — `PLAY_SLOW_NOTICE_SECS` (default 6s, above the 1–4s a warm resolve takes) unless the server set its own, 4–60s or `off` — and deletes the message when the request settles: `place()` returns, or the request is dropped (see [Queue progress card](#queue-progress-card)). Both `-play` entry points read that value synchronously from `GuildSettings` as they enter the notice and pass it as the required `delay=`; `off` is `None`, which arms no poster task. It wraps the whole resolve rather than the slot queue alone — a full pool and a slow extraction are the same silence to the user.
+
+No queue position is quoted, because there is no line to be Nth in: requests resolve concurrently and serialize only at the insert.
+
+It sends through `ctx.channel.send`, the same exception `-ping` and `-debug` take — `MusicContext.send` would prepend the Now Playing block and adopt the message as its host, so deleting the notice would drag the live progress bar onto it. Bypassing it also skips debug-mode decoration, so the footer arrives pre-rendered as `debug_suffix`, like the dashboards'. On the cold path it is entered **before** the gate hold so it unwinds **after** it: retracting the notice awaits a Discord call, and an await between the teardown decision and the hold release is exactly what that path may not have.
+
+**Single tracks only, and one per channel.** A collection shows the [queue progress card](#queue-progress-card) instead — two messages for one `-play` is worse than either — and both entry points take the same `if`, the interjection route included. Because `PLAY_INFLIGHT_MAX` is 16 and `PLAY_RESOLVE_CONCURRENCY` guarantees the tail of a pasted burst crosses the delay, `util.channel_claim` gives a channel to one notice at a time. The claim is exclusive and keyed by KIND (a channel showing a card can still show a notice for a different request), and it is taken at the SEND, so a request that settles inside its own delay never denies the slot to a slow sibling. A request that loses the claim asks again every `_NOTICE_RETRY_SECS` until it settles, so its notice posts once the other is taken back; each notice names its query and its requester, so the one on screen is never mistaken for someone else's. The span records `play.slow_notice` (`shown`, `claimed_elsewhere`, `send_failed`).
+
+**The task that posts it is the task that retracts it**, in its own `finally`. A caller cancelled while the send is in flight never learns the message handle, so a delete anywhere else would leave the notice standing with nothing that knows its id. The caller only signals and joins, through `util.join_task`, which re-raises a cancellation aimed at the caller and shields the joined task: `await task` makes the joined task the canceller's `_fut_waiter`, so an unshielded join would cancel the very task it is waiting out, mid-cleanup.
+
+---
+
+### The playlist cache
+
+`yt_playlist` is the most expensive resolve the bot performs — the documented worst case is 99 s for a 5,547-track list, all of it on the reply path — and it used to call `_run_extract` directly: no cache, and no single-flight, so two users pasting one collection ran two of them against a four-worker pool.
+
+It now goes through `_extract_once` under the `"playlist"` profile and caches the result in `ytdl:playlist:v3:{list id}` for `_YT_PLAYLIST_TTL` (15 minutes). `yt_playlist` returns a `YoutubePlaylist`: the tracks, the playlist's `title` (from the extraction's top-level info-dict, which carries it with and without `lazy_playlist`; `None` when absent) and `unavailable`, the count of entries dropped as unplayable.
+
+**Fifteen minutes, not the source cache's day.** A playlist is editable, and its entry count and order are what the callers' `&index=` handling and every "Queued playlist — N songs" line are built from. What the window has to cover is the two cases that actually hurt: the same collection pasted twice in a burst, and a re-paste soon after.
+
+**The key is the `list=` id.** One collection reaches the bot as `/playlist?list=X`, as a watch link carrying `&index=4`, and with a `&t=` on the end. Keyed on the pasted URL those are three entries and three extractions. A URL with no `list=` falls back to itself.
+
+**Entries, not `QueueObject`s.** The requester, the `user_input` `-remove` matches on, and the per-track `queue_position` are all per request — only the five identity fields are shared, stored through the same `_identity_to_wire` the source cache uses. The value is `{"title", "unavailable", "entries": [...]}`, so a hit returns the title and count the miss wrote. Entries yt-dlp could not describe (a null entry, one with no `id`, and one with an `id` but neither a title nor a duration — how a private or deleted video arrives in a flat extraction) are dropped and counted in `_playlist_tracks` **before** the write, so a hit cannot resurrect what the miss refused, and positions still count kept tracks so the drops leave no gaps. A live entry has a title and no duration and is kept; an entry with a duration and no title is kept under its video id. The count rides the span as `ytdl.playlist_unavailable`.
+
+**An empty result is not cached.** A private or unavailable playlist extracts to no entries too, and a quarter of an hour is a long time to answer a retry with the same nothing.
+
+**A Mix is deduplicated; a playlist is not.** A Mix (`list=RD…`) has no playlist page — YouTube marks it `isInfinite` and answers `/playlist?list=RD…` with "This playlist type is unviewable" — so yt-dlp walks it one `next` request at a time, each naming the last video of the previous window. When a window comes back without that video, `_extract_inline_playlist` restarts from the window's top and yields entries it already yielded. One walk of a Mix returned 1,671 entries for 492 distinct videos. `_playlist_tracks` therefore keeps the first occurrence of each video in a Mix, before the cache write, and records the count as `ytdl.playlist_repeats`; a dropped repeat is not counted as unavailable, so a private video a Mix walks past twice counts once. A playlist keeps every entry and records the count alone (`ytdl.playlist_repeats_dropped` says which): YouTube lets its owner add a video twice, and dropping one there would change what they asked for. A curated `RDCLAK5uy_` list shares the Mix prefix but is a playlist — it has a page and a header count, and yt-dlp's tab extractor walks it without repeating — so `_is_mix` excludes it. The cache key is versioned with the value's shape (`v3`: a deduplicated entry list beside the title and unavailable count), so no build reads a value written for another.
+
+---
+
+### Warming the stream cache
+
+A full Phase 1 extraction yields a selected stream URL alongside the identity, and that URL is worth caching — but only once it has been **probed**, which is a network round trip bounded by `config.stream_probe_timeout_secs()` (2 s by default), passed per request. The reply needs the identity alone, so `yt_source` **starts** the probe-and-cache and returns without awaiting it (`_start_stream_warm`). Every link's `-play` gets its confirmation that much sooner.
+
+**The warm is registered, not fired blindly.** `_INFLIGHT_STREAM_WARMS` holds the job under its cache key, and every reader of that cache goes through `_stream_cache_get`, which joins a warm in flight rather than treating the miss as a miss. Without that join the enqueue-time `prefetch_stream` — spawned by `queue_put` moments later — would find nothing and pay a **second full extraction** of the URL the warm is about to write, and a cold start's playback loop would do the same on its way to audio. The join is shielded: the warm is shared, and a cancelled prefetch (every bulk queue mutation cancels one) must leave it running for whoever else is waiting.
+
+**It runs under a span of its own**, `ytdl.stream_warm`, a child of the resolve that started it. The resolve returns without awaiting it, so its span has ended by the time the probe answers, and an ended span drops every attribute written to it — the serving format and the probe verdict among them.
+
+**Nobody is obliged to await it**, so the done-callback retrieves any exception itself and logs it. An unretrieved one would surface at collection time in a task with no caller left to name. The callback also pops the key before any joiner resumes, so a later miss starts a fresh warm instead of joining a settled one — the same ordering `_extract_once` depends on.
+
+**`probed_at` closes the double-probe.** `_cache_stream` stamps the entry when the verdict was PLAYABLE, and `_resolve_playable_stream` reuses that verdict for `_PROBE_REUSE_SECS` (10 s) instead of re-probing a URL the resolve confirmed seconds ago against a signature good for half an hour. Only PLAYABLE stamps: an UNCONFIRMED entry was never confirmed by anything and is probed as before. Inside the window a revocation costs one ffmpeg spawn, which is what `produced_audio` already catches — the same exposure as a URL revoked between probe and first read.
+
+---
+
+### Source-cache freshness
+
+`ytdl:source` entries live for `_YT_SOURCE_TTL` (24 h) and are considered fresh for `_YT_SOURCE_FRESH_SECS` (1 h). Past that, a hit is **still served** — the reply is one Redis GET either way — and a refresh is spawned behind it. The entry is ~200 bytes, TTL'd and therefore eviction-safe under `volatile-lru`, so lengthening it trades storage for exactly the thing the play path is measured on: every repeat of a query inside a day becomes a single round trip instead of a 0.65–2.5 s resolve.
+
+**Only a search is revalidated.** What ages in a source entry is the query → video mapping YouTube's ranking decides; a link's mapping is the link. Refreshing a link would spend a full extraction (its floor — see [Resolve mode](#resolve-mode)) to relearn a `webpage_url` that cannot have changed, and the metadata it would correct is cosmetic. So `_revalidate_source` runs one flat POST, for searches only, and `yt_source` skips it for any query containing `://`.
+
+**The refresh may not raise, and may not drop the entry.** It runs in a task nobody awaits, spawned after the reply has already been served from the entry it is refreshing. A flat result the mapper declines — a live top hit, one without a duration, or no result at all — leaves the stale entry in place: it still names a playable video, which is more than the alternative. Concurrent refreshes of one query collapse in `_extract_once` under the `"flat"` profile, the same single-flight the miss path uses.
+
+**An entry with no `cached_at` reads as fresh, not stale.** It was written by the build before the stamp existed, and it carries that build's 1 h TTL, so it expires before staleness could matter. Read the other way, the first hour after a deploy would revalidate every entry in the cache once.
+
+**The key is case-folded except for a URL.** `"Destiny"` and `"destiny "` are one search and must share an entry. YouTube video ids are case-sensitive, so folding a link's key makes `?v=aBcDeF` and `?v=AbCdEf` collide — and the second play is served the first's song for a day rather than an hour, which is what makes this worth stating.
+
+---
+
+**`_extract_once` is keyed by `_inflight_key(cache_key, profile)`** — `"flat"`, `"full"` or `"stream"`. Keyed by the cache key alone, a flat and a full caller of one query would share a job whose `url` means different things to each: the watch page on a flat entry, the googlevideo CDN address on a processed one. The `"stream"` profile is shared by `prefetch_stream` and the playback loop's `_resolve_playable_stream`, which build identical requests; the key is popped before the result publishes, so the loop's re-extraction after a `DEAD` probe still gets a fresh job.
+
+**Every caller awaits the shared job through `asyncio.shield`, the leader included.** The key carries no guild, so the leader and its joiners are routinely different guilds: a `-play` cancelled by `-stop`, by the place bound, or by its own command timeout would otherwise propagate into the job every joiner is waiting on. The worst landing is the playback loop's `_resolve_playable_stream`, which joins on the `"stream"` profile — a `CancelledError` there is not caught by its `except Exception`, `loop()` re-raises it, and that guild has no player until a restart. Shielding the leader too is what makes the job outlive whichever caller started it; the `done_callback` that pops the key is registered before the first shield, so it runs before any awaiter resumes and a retry starts a fresh job rather than rejoining the one that just settled.
 
 ---
 
 ### Playback Loop
 
-`MusicPlayer.loop()` runs as a long-lived asyncio task. It first awaits `bot.wait_until_ready()` and `_restore_complete` (so crash-restore finishes populating the queue before the first dequeue). Each iteration is wrapped in a `player.loop.iteration` span and carries a `claim_outstanding` flag so the exception handler can release a claim no other path settled.
+`MusicPlayer.loop()` runs as a long-lived asyncio task. It first awaits `bot.wait_until_ready()` and `_restore_complete` (so crash-restore finishes populating the queue before the first dequeue). Each iteration is wrapped in a `player.loop.iteration` span — rooted, so a song is a trace — and carries a `claim_outstanding` flag so the exception handler can release a claim no other path settled.
 
 ```mermaid
 flowchart TD
     Start(["iteration start\nplay_next.clear()"])
     HavePF{"prefetched_song\navailable?"}
     UsePF["current_song = prefetched_song\n(its claim becomes ours)"]
-    GetQueue["queue_get() — 300s timeout"]
+    GetQueue["queue_get() — the server's idle timeout"]
     Timeout["TimeoutError → stop()"]
-    Resolve["_resolve_source()\nYTSource → QueueObject"]
+    Resolve["_resolve_source()\nYTSource → QueueObject\n(its own 300s bound)"]
     Stream["_stream_source() → YTDL"]
     Failed{"YTDL is None?"}
     FailPop["queue.finish_failed_dequeue()\nsend 'Failed…' via send_with_np"]
@@ -623,9 +915,10 @@ Key details:
 
 - **Atomic start transaction**: for a real queue item, `pop_queue_and_start_song` LPOPs the Redis queue and writes all current-song state fields plus the `now_playing` display snapshot in one `MULTI/EXEC` — there is no window where the song is neither on the queue list nor in the state hash. A crash-recovered song (`persisted=False`) was never on the Redis list, so only the state fields are written (an LPOP would drop an unrelated queued song).
 - **Backdated epoch**: `play_start_epoch` is stored as `play_start − song.start_offset`. The same offset is passed again as `start_offset`, seeding `last_position_secs` so a crash inside the first heartbeat interval still resumes a `?t=` song at its offset. The backdated epoch now feeds only the legacy fallback.
-- **`_prefetch_next_song`** dequeues via `queue.get_nowait()`, resolves + streams the next item while the current song plays. If cancelled (clear/shuffle/remove), it returns the item to the front via `queue.requeue_front()` — the claim goes back with it. If resolve/stream fails, it settles the claim and mirrors it via `queue.finish_failed_dequeue()`.
+- **`_prefetch_next_song`** dequeues via `queue.get_nowait()`, resolves + streams the next item while the current song plays. If cancelled (clear/shuffle/remove), it returns the item to the front via `queue.requeue_front()` — the claim goes back with it. If resolve/stream fails, it settles the claim and mirrors it via `queue.finish_failed_dequeue()`. The queue keeps the claimed entry, which for a lazy Spotify track is still a search, so the prefetch also records what it resolved to in `_prefetched_head`; while that entry is still the head, Up next, `-queue` and the ETA walks show the resolved song (`_displayed()`). Display only — the queue, its claim and its Redis mirror are untouched.
+- **Volume lands a song late, on purpose**: a source's level is baked into FFmpeg's `-filter:a` when it is built, and the prefetch builds the next song one song early, so a `-volume` written mid-song usually reaches the song AFTER next. Rebuilding the prefetched source at the new level was tried and removed: it kills an FFmpeg whose connection to the signed stream URL is already open and re-requests that URL a song later, bypassing `_resolve_playable_stream`'s probe-and-heal. YouTube revokes those URLs routinely, so the reopened request can 403 where the established connection would have played on — trading a level that lands late for a song that does not play at all. `-volume` and `-settings volume` both say so.
 - **Every claim is settled exactly once** — by `commit_dequeue()` (the song starts), `finish_failed_dequeue()` (failure), or `requeue_front()` (cancellation, which returns the claim with the item). The loop's exception handler releases a claim no other path settled, tracked by `claim_outstanding`; a claim left standing would keep its item counted as in flight forever and the next release would settle a different song.
-- **Resume entries**: an `is_resume` `SongQueueEntry` (from `-playnow`) replays through the same FFmpeg `-ss ts` seek path as a `?t=` song and honours `start_paused`. The parked song's history add is deferred via `_skip_history_for` so it is recorded once, at its resume tail — see [-playnow Interjection](#-playnow-interjection).
+- **Resume entries**: an `is_resume` `SongQueueEntry` (from an interjection) replays through the same FFmpeg `-ss ts` seek path as a `?t=` song and honours `start_paused`. The parked song's history add is deferred via `_skip_history_for` so it is recorded once, at its resume tail — see [-play --now Interjection](#-play---now-interjection).
 
 ---
 
@@ -650,9 +943,9 @@ Every mutation that touches the Redis mirror (put, clear, shuffle, remove, `fini
 
 **Settling a claim asks the claim, not the item.** `redis_pop_for(item, *, persisted=None)` defaults to deriving the answer from `item`, and `item=None` defaults to popping — right for every ordinary dequeue and wrong for exactly one caller. The playback loop's prefetched branch holds a claim whose item is a `YTDL`, which is not a `QueueItem` and cannot be passed; a prefetch really can hold an *unpersisted* claim (a cold-start `-play` front-inserts at cursor 0, ahead of the crash-recovered head, so the prefetch behind it takes that head). So the loop carries `claim_persisted` from the moment it takes the claim through to its outer error handler, and both settle paths — the start transaction's LPOP and `finish_failed_dequeue`'s — read that one flag rather than re-deriving it. Re-deriving is what LPOPed a real entry for a head that never had one, deleting the next queued song with no error and no log line.
 
-`put`/`put_front` return the list they enqueued, which the caller uses to spawn per-item prefetch. They no longer patch what passes through: queue objects arrive complete. `queue_position` is depth **at ask** — `MusicPlayer.enqueue_depth()` read once at command dispatch, alongside the `queued_at` taken from the command message — rather than depth at insert computed under this mutex. It is approximate against the insert by design: the playback loop dequeues continuously, so the two differ routinely with no user involvement, and the quantity the field proxies for is stored exactly beside it as `played_at − queued_at`. `enqueue_depth()` reads `display_size()`, never `qsize()`: a claimed song is gone from the pending count and still ahead of a new arrival, so `qsize()` would undercount by one exactly when a `-play` lands during another song's resolve. The two are now `len(_items)` and `len(_items) - _cursor` — one term apart over the same fields, which is why five tests pin them apart and each half of the swap fails a different subset.
+`put`/`put_front` return the list they enqueued, which the caller uses to spawn per-item prefetch. They no longer patch what passes through: queue objects arrive complete. `queue_position` is depth **at the insert** — `MusicPlayer.enqueue_depth()` (or `_front_insert_depth`, or 0 for a cold start) read under `-play`'s place lock, the slot the song actually takes — while `queued_at` is taken from the command message at dispatch. Two requests resolving together would read one depth at dispatch; at the insert they read consecutive ones. The quantity the field proxies for is stored exactly beside it as `played_at − queued_at`. `enqueue_depth()` reads `display_size()`, never `qsize()`: a claimed song is gone from the pending count and still ahead of a new arrival, so `qsize()` would undercount by one exactly when a `-play` lands during another song's resolve. The two are now `len(_items)` and `len(_items) - _cursor` — one term apart over the same fields, which is why five tests pin them apart and each half of the swap fails a different subset.
 
-`MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) settle the prefetch **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else. `queue_clear`/`queue_remove` call `_cancel_prefetch()`; `queue_shuffle` calls `_neutralize_prefetch()`, because `cancel_task()` no-ops on a *completed* prefetch, whose claim would otherwise pin its song to the front of the reorder and leave `shuffle()`'s too-few guard counting one below what `-queue` renders.
+`MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) settle the prefetch **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else. `queue_clear` calls `_cancel_prefetch()`; `queue_shuffle` and `queue_remove` call `_neutralize_prefetch()`, because `cancel_task()` no-ops on a *completed* prefetch, whose claim would otherwise pin its song to the front of the reorder and leave `shuffle()`'s too-few guard counting one below what `-queue` renders — and, for `-remove`, keep the next song unremovable for nearly the whole current song, since `remove()` never touches a claimed item. `queue_remove` settles only when the claimed head matches, as queued or in the form a completed prefetch requeues (a lazy search matches the link it resolved to only there), so an unrelated removal kills no FFmpeg process and repeats no resolve. Both re-fill the slot in a `finally`, and never on a `retired` player: a prefetch started there, whose resolve then failed, would LPOP the queue the teardown saved.
 
 - **Shuffle**: islices the pending tail under the mutex, `random.shuffle`, re-enqueues, rebuilds the mirror. Returns a `ShuffleOutcome` enum. The too-few guard counts `display_size()`, the number `-queue` and `-debug` render, so a refusal quoting 4 cannot land on a queue the user sees four songs in — only the pending tail is reordered, but a claimed head still counts toward the threshold.
 - **Clear**: empties the deque, resets the cursor, bumps the generation, returns the removed titles for the report embed. Those two are the whole invalidation signal — a prefetched song the loop holds is discarded because its commit finds nothing claimed. There is no cleared-flag; one existed and was read a whole song too late.
@@ -670,6 +963,8 @@ That bound is the point rather than a micro-optimisation: the LREMs run inside *
 
 The shortcut is guarded twice more, because LREM matches on **exact serialized bytes** and nothing else in the codebase promises them. It is skipped outright when a removed blob is byte-identical to a **claimed** item's — LREM takes the head-most equal element, which would be the entry awaiting its commit-time LPOP — and it falls back to the rebuild whenever `remove_queue_entries` returns fewer than it was asked for. That short count is what a queued object mutated after its entry was written looks like (a resume tail gaining `np_*` ids, an enriched duration, a substituted requester), and it is also what a swallowed Redis error or an evicted key returns. The rebuild cannot be wrong by construction: it restates the whole list from memory.
 
+**A swapped-in item is serialized as the entry it replaced.** `requeue_front()` may return a claim as a different object: the prefetch's `CancelledError` handler hands back a lazy search it had already resolved, and `_neutralize_prefetch` rebuilds a completed prefetch with the stream extraction's title, uploader, thumbnail and duration. Neither serializes like the entry on the list. `GuildQueue._listed` records the replaced entry against the new object (by `id()`, holding the object), a second swap carries the first record over, and the record goes when the item leaves the deque. `_mirror_entry()` is the one serializer for the byte-exact writes — the LREM, `_claimed_blobs()` and the rebuild — so a rebuild writes the listed entry back and the record stays true. Without it, removing a swapped head misses LREM and rebuilds the list, and a swapped head claimed again hides from `_claimed_blobs()`: with a byte-identical twin pending (one video listed twice in a playlist), the LREM takes the claimed copy's entry, the song start's LPOP then retires the next song's, and nothing marks the mirror dirty. A crash restores a swapped item in its listed form, which re-resolves or replays the same song.
+
 Counted per distinct serialization, never `LREM … 0`: two enqueues of one song usually differ on the wire (`queue_position`, `queued_at`), but when they do not, removing "all matching" would take out a copy still queued.
 
 **No residual window against a concurrent mutation**: the loop settles its claim through `commit_dequeue()`, the async context manager that holds the bulk mutex across the caller's own store dispatch, so the in-memory settle and the start transaction's server-side LPOP land under one hold. This closed the window a separate commit-then-dispatch used to leave open, where a bulk mutation scheduled in that event-loop tick raced the LPOP server-side. A caller with no Redis write to make passes an empty body.
@@ -682,7 +977,7 @@ The hold is bounded by `_START_WRITE_TIMEOUT` (5s, musicplayer.py). The pool set
 
 ### Now Playing Host Model
 
-While a song is live, the **Now Playing embed block** (`[now_playing, next_up?]`, built by `np_embed_block()`) lives in exactly one **host message** — the newest bot message in the player's channel — so the live progress bar is always at the bottom. Full design: [NOW_PLAYING_EMBED_ATTACH_PLAN.md](NOW_PLAYING_EMBED_ATTACH_PLAN.md).
+While a song is live, the **Now Playing embed block** (`[now_playing, paused?, next_up?]`, built by `np_embed_block()`) lives in exactly one **host message** — the newest bot message in the player's channel — so the live progress bar is always at the bottom. Full design: [NOW_PLAYING_EMBED_ATTACH_PLAN.md](NOW_PLAYING_EMBED_ATTACH_PLAN.md).
 
 Mechanics:
 
@@ -693,29 +988,90 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 3).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 6: the three-embed block, a collection card, its unavailable-songs notice and a short-walk notice).
 
-**Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
+**Progress bar**: `_progress_updater` edits the host's NP embed every `GuildSettings.np_refresh_secs()`: the larger of the server's `np-refresh` and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s), read before each sleep, so a change lands after the tick in progress. A server can slow its bar but never speed it past the bot's value, because the channel's edit bucket is shared with everything else the bot sends and edits there; the write is refused below the bot's value, and a stored value the bot has since overtaken runs at the bot's value and shows as `bot minimum` on the card. Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, paused card).
 
 **Identical re-renders are not pushed.** `_push_np_edit` compares the rendered payload
 (`[e.to_dict() for e in embeds]`) and the host id against the last pair it sent
-successfully, and returns without a PATCH when both match. The bar has ten segments, so a
-four-minute song's display changes ~10 times while the 3 s tick fires ~80: roughly seven
-in eight edits carried nothing new, one request each from a bucket shared across every
-concurrently-playing guild. Keying on the payload rather than on playback position covers
-pause state, next-up, volume and a swapped-in own embed without enumerating them — the
-same approach `dashboard.py` uses for `-ping` and `-debug`. The pair is recorded only
-after a successful edit, so a failure cannot suppress its own retry, and
-`_release_np_host` clears it because retirement can strip-edit the message by a path that
-never reaches `_push_np_edit`.
+successfully, and returns without a PATCH when both match. While a song with a known
+duration plays, the two never match: the bar prints the elapsed clock
+(`fmt_duration(int(elapsed_secs))`), which changes every second, so at any cadence of 1 s
+or more every tick is a real PATCH on the channel's bucket. That is why the cadence has a
+1 s floor and why a server's `np-refresh` can only slow it. What the guard skips is a card
+with nothing moving on it, such as a song with no duration, whose bar is empty. Keying on
+the payload rather than on playback position covers pause state, next-up, volume and a
+swapped-in own embed without enumerating them — the same approach `dashboard.py` uses for
+`-ping` and `-debug`. The pair is recorded only after a successful edit, so a failure
+cannot suppress its own retry, and `_release_np_host` clears it because retirement can
+strip-edit the message by a path that never reaches `_push_np_edit`.
 
-A guild with **debug mode** enabled saves nothing here: the footer carries the runtime
-snapshot, which `RuntimeSampler` resamples at
-`max(1.0, min(5.0, NOW_PLAYING_UPDATE_INTERVAL_SECS))` — the same 3 s cadence as the tick
-— so the payload differs every time. That is the footer reporting live values; debug mode
-is opt-in per guild and off by default.
+A guild with **debug mode** enabled changes the payload even then: the footer carries the
+runtime snapshot, which `RuntimeSampler` resamples every `sample_interval_secs()`: the
+bot's `now_playing_update_interval_secs()` floored at 1 s and capped at 5 s, re-read each
+tick. That is the footer reporting live values; debug mode is opt-in per guild and off by
+default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
+
+---
+
+### Queue rows
+
+`src/queue_rows.py` renders one queued item as a row of text, and owns the ETA walk that runs down a listing. It is pure: no player, no queue, no Discord call. A listing reads the same wherever it appears because there is one formatter, and it has two callers: `-queue` (`MusicPlayer.queue_embed`, two-line rows) and the queued album and playlist cards (`MusicPlayer.queued_rows`, one-line rows). The single-entry "Up next" and "Queued song" cards are `MusicPlayer._queue_entry_description`, a separate renderer over the same display fields — a row is one line of a list, a card is a labelled block — so a change here reaches the listings but not those cards:
+
+```
+`index` [**title**](link) · `length` · Est. playing at **9:41 PM PDT**
+channel · @requester                                   (with a byline)
+```
+
+`queue_rows` numbers rows from a `first_index`, chains the `EtaWalk` from the state its caller seeds (the playing song's remaining time, then every item ahead), and ends in `*... and N more*`. It is bounded twice: `ROW_LIMIT` rows, and `ROWS_BUDGET` characters, because ten rows at both caps pass an embed description's 4,096 on their own. Two-line rows are set apart by a blank line and one-line rows are not. An unknown length marks the walk uncertain, and every later time renders with a `~`.
+
+**An unresolved search renders the same row.** A Spotify track is queued as a `YTSource` search and only becomes a song when it is about to play, so the row cannot wait for yt-dlp. `YTSource` carries four display fields under the names a resolved song uses — `title`, `uploader` (the artists), `duration` and `webpage_url` (the Spotify track page) — and the formatter reads one set of attributes off either item. They persist on `SearchQueueEntry`, written only when present, so an entry queued before they existed keeps its bytes and renders as its search text and `resolving...`. The length is Spotify's and not the YouTube match's: `EtaWalk.advance_estimate` counts it and marks everything after it approximate, and `queue_runtime` adds it while keeping the total's `~`.
+
+**What the rows cost.** The four display fields are stored per queued track, so a `ytsource` entry on `guild:{id}:queue` grows to ~400 bytes (measured; serializing one `_PUT_CHUNK` of 1,000 is ~1.5ms). The cached walk under `spotify:playlist:v4:{id}` / `spotify:album_tracks:v2:{id}` carries a `tracks` array beside `titles`, one `[name, artists, duration_secs, url]` row per title — which is what the key versions were bumped for, and roughly triples that value. A 10,000-track collection therefore holds ~2 MB of cache plus ~4 MB of queue mirror, against the 256 MB the bundled Redis is given; both keys carry a TTL, so they stay eviction candidates under `volatile-lru` (see the eviction rules). On a cache HIT the rows are rebuilt `_CACHE_ROWS_CHUNK` at a time with a loop yield between chunks: the rebuild is ~6ms for 10,000 rows and a hit takes neither the walk slot nor the single flight, so without the yield every caller paid it on one tick.
+
+**A queued-collection card lists -queue's rows.** `queued_rows` runs after the put: it finds the first queued track in the display order by identity, walks the ETA to that slot and lists from there, so the card's numbers and times are the ones `-queue` shows for the same tracks. On the card every row would share one requester and mostly one artist, so it takes the one-line density, and its facts line drops "Est. playing at" because each row has its own. A YouTube playlist's tracks are resolved songs already, so its card gets links, lengths and times from the same call with no new data.
+
+---
+
+### Queue progress card
+
+A collection enqueue that outlives its server's `queue-progress-delay` (`QUEUE_PROGRESS_DELAY_SECS` unless the server set its own, 2–60 s) gets a live card in the channel saying how far it has got (`src/queue_progress.py`). It is deleted the moment the request settles: when `place()` returns, before the confirmation is sent, or when `-stop`, `-clear`, `-remove` or a teardown drops the request.
+
+**A drop is heard mid-resolve.** Those commands stamp `PlayRequest.dropped_by`, and `place()` reads the stamp only once the resolve returns — about 90 s after the stamp for a 5,547-track playlist. So the stamp also sets `PlayRequest.settled`, an `asyncio.Event` handed to the card and to the slow-resolve notice, and `retire_player` sets it for every unplaced request on the player it retires (a kick or the alone-watchdog calls no command). The message comes down at once; the resolve itself runs to completion and its result is discarded at `place()`, which is where the "dropped" reply is sent.
+
+**So is the end of the placement.** `place()` sets the same event on its way out, placed, refused or stalled, so neither message waits for the command to return. Everything after the put is the reply, and its sends and reactions are Discord round trips that can outlast the delay: on a cold start a playlist queued in 1.7 s and Discord held the confirmation's 👍 reaction for 2.0 s, which is long enough for a card waiting on the return to come up at 2.5 s, under a confirmation already posted. The interjection route still retracts after the interrupt, because `interject()` runs inside `place()`'s body.
+
+**The wait is in the resolve, not in the enqueue.** Measured on a YouTube Mix whose walk yielded 1,671 entries — 492 distinct videos, see [The playlist cache](#the-playlist-cache): 28.98 s of a 29.60 s command is `queue_source`, and the insert is 0.01 s. A bar counting songs added to the queue would sit at 0 for 29 seconds and then jump to 100 % in one frame, which is worse than no bar. So the card reports the resolve, and its numbers come from the source walking its own pages.
+
+**Two phases, because the others are unreachable.** `FETCHING`, and `STALLED` once the card passes its ceiling. A "queued" or "done" render would exist for less than a frame — the insert is 0.01 s and the card is deleted immediately after — and every failure path deletes the card before anything could render one.
+
+**Where the numbers come from.** A Spotify collection is easy: the pager reads `total` from page 1 and reports after every page, so its bar is determinate from the first tick. A YouTube collection has no such channel — `YTDL.yt_playlist` awaits one `extract_info` that returns after the whole continuation walk, so the track count and the tracks would arrive in the same tick, milliseconds before the card is deleted. It gets one built for it (see [Progress out of a yt-dlp worker](#progress-out-of-a-yt-dlp-worker)). A collection with no header count at all — a Mix (`RD…`, other than a curated `RDCLAK5uy_` list), a channel tab — still renders indeterminate: an elapsed line rounded to 5 s and no bar. That is a steady state, not a transient one.
+
+**`total` and `done` are allowed to disagree at the end.** For Spotify the numerator counts playlist ITEMS walked, and the list queued omits removed tracks and nameless episodes; a local file carries a name and is kept. For YouTube the denominator is the playlist header's count, while `_playlist_tracks` drops null, ID-less and id-only (private or deleted) entries after extraction, so a playlist with deleted videos finishes at 1668/1671 and never fills. The card is deleted 0.01 s later either way; what the user is told they queued comes from the confirmation, not from here.
+
+**The card is a SECOND message and never becomes the confirmation.** `play_pipeline._reply` sends the confirmation through `MusicContext.send`, which prepends the Now Playing block and adopts that message as the NP host. A card sent with `ctx.channel.send` — which it must be, or the progress updater rewrites it every 3 s — can never do that, so merging the two would stop every playlist enqueue from re-hosting the NP card at the channel bottom. The cost of not merging is that the existing host sits *above* the card, edited invisibly, for the card's whole life: one of the documented exceptions to the host model, listed under [Now Playing host invariants](#now-playing-host-invariants), bounded by the delete, and NOT by the ceiling below — that stops the card EDITING, it does not take it down, so a resolve that outlives it leaves the host buried until the enqueue finally settles.
+
+**Two entry points.** `commands/play.py::_resolve_and_place` covers `-play`, `-playnext` and the cold start; `play_pipeline.interject_flow` covers `-playnow <playlist>` and plain `-play <playlist>` over a paused song, which return one level above `_resolve_and_place` and would otherwise get nothing. Only the first has a playback gate hold, so only the first is subject to the ordering rule below.
+
+**Ordering, at the first entry point.** The card is entered on the outer `AsyncExitStack` **before** the gate hold, so LIFO unwinds it after: taking the card back awaits a Discord call, and on a cold start no await may sit between `abandon_cold_start`'s hold-count read and the hold's release, or two participants each read the other's hold and neither tears the player down.
+
+**The driver is stopped by a signal and awaited, never cancelled.** The send is deferred past the delay, so it is owned by a task — the command body is blocked inside `queue_source` and cannot wait it out. That task both sends and then edits, so there is a recurring window in which the message exists on Discord and the local handle does not; cancelling inside it orphans the card permanently, because the teardown reads `None` and deletes nothing while the POST lands anyway. So the task that sent the card deletes it in its own `finally`, and the teardown sets the settled signal and joins the task, bounded by `QUEUE_PROGRESS_JOIN_SECS`. The delete suppresses `HTTPException` — it runs while an `ExtractionError` may be propagating, and a 404 about a card the user deleted must not replace the real error.
+
+**Nothing edits under the place lock.** `PlayRegistry.place()`'s body is the put alone, bounded by `PLACE_TIMEOUT_SECS`; the card's state object takes a plain attribute store and the driver renders on its own cadence.
+
+**The edit budget is per channel.** Discord allows 5 edits / 5 s per channel and every `PATCH /channels/{cid}/messages/{mid}` there shares one bucket, which the NP progress bar already spends a third of at its 3 s cadence. A 429 never reaches `safe_edit` — `HTTPClient.request` logs it and sleeps the bucket internally — so the symptom is the NP bar silently freezing, invisible in our logs. Three things keep the card inside the budget:
+
+- `QUEUE_PROGRESS_TICK_SECS` defaults to **5.0 s** with its own floor of 2.0 s, not the dashboards' 0.05 s: `-ping` and `-debug` can share that floor because their deadlines cap the damage at ~8 edits, and this card has no such cap. `-settings bot queue-progress-tick` goes no lower than 3 s, so the card and the NP bar at their fastest chat cadences are 0.67 edits/s.
+- **One card per channel.** `PLAY_INFLIGHT_MAX` is 16 and requests resolve concurrently, so a pasted burst would otherwise arm sixteen edit loops on one bucket. `PLAY_RESOLVE_CONCURRENCY` cannot throttle them — it is taken inside `_extract_once`, below where the card is entered, so requests 3..16 park there and are *guaranteed* to cross the display threshold. The claim is taken when a card is about to be sent rather than at entry, so a cache hit that finished inside the delay never denies the slot to a slow sibling. A request that loses it asks again every tick, so its card appears once the other is taken back rather than never. The span records `play.progress_card` (`shown`, `claimed_elsewhere`, `stalled`, `send_failed`), and a stall also logs a WARNING with the counts it reached.
+- **The count is quantized to the bar's cells.** The bar is the Now Playing bar (`util.progress_line`), labelled `` `done` … `total` songs `` where the NP card puts clock times. A Spotify page landing every ~300 ms moves the raw count six times per tick, so `embeds_changed` would suppress nothing. The number rendered is the smallest count that fills the cells the bar draws, so the two never disagree and a whole enqueue costs at most `BAR_WIDTH` edits. This is also why a determinate card shows no elapsed line: the elapsed step moves every tick by construction, which would undo the quantization and put the card back to one edit per tick.
+
+**What the card does NOT fix is the composite.** Card + NP bar is 0.2/s + 0.333/s, comfortably inside the 1.0/s the bucket allows. Add a `-debug` at its 1 s tick and the channel is at **1.533/s — 7.67 edits per 5 s against 5**, for the dashboard's whole 8 s deadline. That overlap is already 33 % over budget on `main` without the card, so the card worsens an existing problem rather than creating one; the honest statement is that the per-feature budgets hold and the composite does not, and the thing that gives way is the NP bar, silently. Anyone adding a fifth edit loop to a channel should fix the composite rather than size against the remainder.
+
+**The card owns its own deadline.** Nothing else bounds the work it watches: `PLAY_RESOLVE_WAIT_SECS` bounds the wait for a resolve slot and deliberately not the extraction inside it, `PLACE_TIMEOUT_SECS` bounds 0.01 s of a 29 s command, and yt-dlp's own `socket_timeout` × `retries` lets a single page hold 300 s with no aggregate bound across 56 of them. Past its ceiling the card renders its terminal state once and stops editing; the exit stack still deletes it when the enqueue finally settles. The ceiling is `card_ceiling(delay, tick, max)`: `QUEUE_PROGRESS_MAX_SECS`, or the delay plus two ticks if that is longer. The card sends after its delay and checks the ceiling only after each tick, so a shorter ceiling stalls it at its first check without one ordinary edit. All three are bot settings, read once as the card is entered, and `-settings bot` moves them separately; its write bounds keep a chat change clear of the rule (a max of at least the longest delay a server can set plus two ticks, and a tick that fits twice between them), and the per-card rule covers what the environment sets and what a reset or a start's stored values leave, which apply without write bounds. Each write bound is rounded inward to a value the grammar can type, and one that leaves no room makes the card and the refusal say which setting has to move first.
+
+**The typing indicator keeps running under it.** `background_typing` is refcounted per channel, so suppressing it for a collection would drop it for every other `-play` in flight there.
 
 ---
 
@@ -732,19 +1088,19 @@ resume(vc): vc.resume() → store.on_resume(now)       → mark_resumed()
 - **The exact pause point**: `pause()` records the position itself because the ticker skips paused songs (frames are frozen, so it would rewrite one value for the whole pause). Both writes take the same `t`, so the legacy math below cannot count the gap between them as playback. Skipped when nothing is playing — `-pause` is reachable with no song.
 - **Redis epoch accounting** (crash-recovery correctness): `on_pause` writes `pause_start_epoch`; `on_resume` folds the pause interval into `total_pause_seconds` and clears `pause_start_epoch`. Recovery position is read from `last_position_secs`, recorded by the heartbeat while the song played — no clock is consulted, so downtime is never credited. The epoch accounting above feeds only `_legacy_wall_clock_position_at`, the fallback for a hash written before the heartbeat existed, and goes with it one release after this ships.
 - **`mark_paused`/`mark_resumed`** both fire `_fire_pause_state_updates()` — a debounced one-off NP-embed edit + presence refresh, so the bar and tooltip freeze/unfreeze promptly rather than waiting for the next 3 s tick.
-- `-pause` replies with a **confirmation embed** (`build_pause_confirmation_embed`) showing the frozen position; `-resume` calls `rehost_np_after_resume()` so a pause confirmation hosting the block becomes plain history rather than sitting beneath a live, advancing bar.
+- `-pause` replies with the **block itself**, re-pinned (`repin_now_playing()`): the paused card (`_build_paused_embed`) is the block's second embed, built from live client state, so it appears under the song it describes and is gone the moment `-resume` rebuilds the block — nothing deletes it. It shows the frozen position, who paused and when (a Discord timestamp, so each viewer reads their own clock), and points at `-resume`. `-resume` calls `rehost_np_after_resume()` so a response that was hosting the block does not keep a live, advancing bar beneath whatever it said. `-pause` with nothing to pause answers too, separating an already-paused song from no song at all.
 
 ---
 
 ### Auto-Disconnect
 
-Two independent triggers, both handled in `musicbot.py`:
+Two independent triggers, the playback loop's (`musicplayer.py`) and `VoiceWatchdog`'s (`recovery.py`):
 
-1. **Queue idle timeout**: `loop()`'s `queue_get()` times out after 300 s with nothing queued → `stop()` → cleanup + disconnect.
+1. **Queue idle timeout**: `loop()`'s `queue_get()` times out after the server's `idle-timeout` with nothing queued → `stop()` → cleanup + disconnect. The setting is 5:00 by default and at most 30:00, and is read from `GuildSettings`' cache once per wait. Its minimum is the fixed wait it replaced, because the timer does not consult `PlayRegistry`: a shorter one could end the session while a `-play` is still resolving. Once `queue_get()` hands over an entry, the timer is rescheduled to `_IN_BAND_RESOLVE_TIMEOUT_SECS` (300 s) for that entry's resolve, so a wedged resolve cannot hold a guild with songs queued silent for the length of a long wait.
 2. **Alone in channel** (`on_voice_state_update`):
    - Bot ejected (`before.channel` set, `after.channel` None) → full `cleanup()`.
    - Bot *moved* between channels → cancel any stale alone-timer from the old channel.
-   - Last human leaves the bot's channel → start a **10-second countdown** (`_alone_countdown`, tracked in `_alone_timers`): sends a notice via `send_with_np`, sleeps 10 s, re-checks channel membership, and cleans up if still alone. A human rejoining (or an explicit stop) cancels the timer. Mute/deafen events (channel unchanged) are ignored.
+   - Last human leaves the bot's channel → start a countdown of the server's **`alone-timeout`** (`VoiceWatchdog._countdown`, tracked in `_timers`): sends a notice via `send_with_np` quoting the wait through `fmt_duration`, sleeps it, re-checks channel membership, and cleans up if still alone. The setting is 0:10 by default and at most 2:00, read from `GuildSettings`' cache once, when the countdown starts, so the notice, the sleep and both log lines quote one number. The cap is there because nothing pauses while the bot waits alone: the song plays on, the loop records it to history, and the queue keeps advancing. A human rejoining (or an explicit stop) cancels the timer. Any other channel change that leaves the bot alone, another bot joining or leaving included, restarts it: the replacement is stored before the old countdown unwinds, and a countdown removes only its own entry, so a later rejoin still cancels the replacement. Mute/deafen events (channel unchanged) are ignored.
 
 `cleanup()` also cancels any pending alone-timer first, so the timer can't fire after cleanup and attempt a second teardown.
 
@@ -752,7 +1108,7 @@ Two independent triggers, both handled in `musicbot.py`:
 
 ### Crash Recovery
 
-On `on_ready` (cold start or session loss — **not** WebSocket resume, which fires `on_resumed`), `MusicBot` spawns a `_restore_guild` task per guild (skipped if the guild already has a player):
+On `on_ready` (cold start or session loss — **not** WebSocket resume, which fires `on_resumed`), `MusicBot._recover_after_ready` runs one settings hydrate pass, then spawns a `_restore_guild` task per guild (skipped if the guild already has a player). After the first `on_ready` of a process, once those tasks return, it runs the orphan config sweep ([Settings resolution](#settings-resolution)):
 
 ```mermaid
 sequenceDiagram
@@ -772,7 +1128,7 @@ sequenceDiagram
     MusicBot->>MP: MusicPlayer(...) + start() → loop() + _restore_state()
 
     MP->>Redis: get_playback_snapshot() — one round-trip for state +<br/>queue + now_playing + history
-    MP->>MP: restore volume (only if stored)
+    MP->>MP: GuildSettings.seed(snapshot.config) → restore volume/timezone<br/>(only accepted fields; a legacy volume migrates via a SEED write)
     MP->>MP: crashed song → SongQueueEntry.from_crashed_state()<br/>→ queue.restore_crashed() (persisted=False)
     MP->>Redis: clear current_song_url immediately (at-most-once)
     MP->>MP: queue.restore_entries(pending) + history.restore()
@@ -834,6 +1190,7 @@ sequenceDiagram
 | `store` | `Optional[GuildRedisStore]` | `None` if no Redis configured |
 | `_player` | `Optional[asyncio.Task]` | Long-lived `loop()` task |
 | `_prefetch_task` | `Optional[asyncio.Task]` | Active `_prefetch_next_song()` task |
+| `_prefetched_head` | `Optional[tuple[QueueItem, QueueObject]]` | The entry the prefetch claimed and what it resolved to, for the cards (matched by identity) |
 | `_restore_task` / `_restore_complete` | `Optional[asyncio.Task]` / `asyncio.Event` | One-shot `_restore_state()`; the event gates `loop()`'s first dequeue |
 | `_progress_task` | `Optional[asyncio.Task]` | Per-song progress-bar updater |
 | `_heartbeat_task` | `Optional[asyncio.Task]` | Per-song position recorder for crash recovery; started only when a store exists |
@@ -847,24 +1204,26 @@ sequenceDiagram
 
 **The schema is defined in one place: `src/guild_state.py`** — field constants + frozen value objects with `from_redis`/`to_redis` converters; no other module touches raw wire bytes. Wire formats are pinned by golden-fixture tests (rolling restarts mix writers, so serializer changes must keep old entries readable).
 
-All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle expiry), refreshed on writes, restore, and clean shutdown.
+All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle expiry), refreshed on writes, restore, and clean shutdown. Every song start re-arms the queue key after its LPOP, since a guild playing a long queue writes nothing else to it while the heartbeat keeps the state key alive; a lapsed list would leave recovery the playing song alone, and a later RPUSH onto the empty key would be LPOPed by the next start. The heartbeat task re-arms all three keys once per hour of playback, for a single song longer than `GUILD_TTL`.
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|
 | `guild:{id}:state` | Hash | 20 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
-| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
+| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and, each only when known, `requester_id` and the display fields `title`, `uploader`, `duration`, `webpage_url`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
-| `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` | **none, ever** |
+| `bot:{application_id}:config` | Hash | One field per `-settings bot` knob, named as its env var in lower case (`Knob.field`); absent runs the knob on its environment value. Written only by `BotSettings.write`/`write_reset`, applied at startup by `BotSettings.hydrate`, skipped while `BOT_SETTINGS_OVERRIDES=ignore`. One per application, so bots sharing a Redis cannot retune each other; `debug-default` is never stored | **none, ever** |
+| `guild:{id}:config` | Hash | 8 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off), `queue_progress_delay_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
 | `analytics:png:v{n}:{guild_id}:{days}:{digest}` | Bytes | the rendered chart, keyed by a digest of the aggregate it was drawn from so a stale entry MISSES rather than pairing an old chart with fresh numbers. Raw bytes, not orjson — that would base64 it for a 33% penalty | to the next UTC midnight |
 | `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
-| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
-| `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
+| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, 1.28 KB/rung measured, taking an entry from 4.66 KB to 8.49 KB of payload and 5.22 KB to 10.34 KB resident (it crosses jemalloc's 8192 size class) | `expire − now − 1800s`; not written if < 60 s |
+| `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist:v4:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `tracks` (one `[name, artists, duration_secs, url]` display row per title, index-aligned with `titles`), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
+| `spotify:album_tracks:v2:{id}` | String | The playlist object's shape, `tracks` included, plus `artists` and `thumbnail`. Written only by a non-empty walk that counted exactly the album's `total` | 24 h |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -872,7 +1231,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
-- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so a `-playnow`-interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`), `queued_at timestamptz` and `queue_position` (both read at **ask** time — when the user's command message was sent, and how many songs were ahead of it at that moment, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption. `queue_position` is approximate against the insert by design, since the loop dequeues while a command resolves), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
+- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`. They identify the host and do not promise it still exists: a dedicated card the bot retires is deleted after its id is recorded — at a `-replay`, a teardown, a stream that never opened, and a parked tail flushed by `-clear`/`-remove`. A reader that fetches the message must expect a 404), `queued_at timestamptz` (read at **ask** time — when the user's command message was sent) and `queue_position` (read at the **insert** — how many songs were ahead of it when it took its slot, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. Rows written before the insert-time mint carry the dispatch-time depth, which differs only when two requests resolved together. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption.), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
 - **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
@@ -915,7 +1274,7 @@ flowchart TD
         PROG["_progress_task — _progress_updater()"]
         HB["_heartbeat_task — _heartbeat_updater()"]
         DEB["_pause_debounce_task"]
-        ALONE["alone-timer — _alone_countdown()"]
+        ALONE["alone-timer — VoiceWatchdog._countdown()"]
     end
 
     subgraph BGTasks["Fire-and-forget tasks"]
@@ -949,10 +1308,291 @@ flowchart TD
 | `GuildQueue._mutex: asyncio.Lock` | `GuildQueue` (private) | Bulk queue mutations + the loop's dequeue commit (`commit_dequeue()` holds it across the start transaction's dispatch) |
 | `GuildQueue._wake: asyncio.Event` | `GuildQueue` (private) | The pending-item signal a parked `get()` waits on. Set iff `_cursor < len(_items)`; `_sync_wake()` is its ONLY writer, because a stale set leaves the wait loop with no suspension point and stalls the whole event loop (I3) |
 | `_np_edit_lock: asyncio.Lock` | `MusicPlayer` | Old-host edits vs retire (strip/delete is always the final write) |
+| per-guild write lock (refcounted, dropped when idle) | `GuildSettings` | Every write, reset and forget of `guild:{id}:config`, one store call at a time per guild. Reads take no lock: one sequence counter stamps each commit, and a read skips fields stamped after it began ([Settings resolution](#settings-resolution)) |
 | `Spotify._auth_lock: asyncio.Lock` | `Spotify` | Double-checked locking for token refresh |
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
 | `PostgresHistoryArchive._init_lock: asyncio.Lock` | `PostgresHistoryArchive` | Double-checked lazy pool creation + migration run (first successful `acquire()` wins) |
+| `_GuildPlays.lock: asyncio.Lock` | `PlayRegistry` (src/play_placement.py) | A `-play`'s insert alone — see [Play placement](#play-placement) |
+
+### Play placement
+
+`-play` runs in three phases, and only the middle one touches guild state:
+
+| Phase | Guild state | Lock |
+|---|---|---|
+| resolve — `queue_source`, yt-dlp, Spotify; the cold-start join beside it | none (caches keyed by query, one process-wide pool) | `_GuildPlays.resolves`, a per-guild bound on pool workers |
+| insert — `queue_put` / `queue_put_front` / `queue_put_next` / `interject` | the queue, the player | `_GuildPlays.lock`, inside `asyncio.timeout(PLACE_TIMEOUT_SECS)` |
+| reply | none | none |
+
+Requests resolve concurrently and land as each finishes; a `--now` sent behind a
+5,547-track collection interrupts when its own song resolves rather than after the
+collection's 99s extraction. Serializing the insert is what closes the three races a
+fully serialized body used to close — two interjections parking two resume tails for
+one song, two cold starts each joining, two front inserts landing out of order — and
+it does so at the insert, where each request re-validates rather than re-reads:
+
+The mechanism lives in `src/play_placement.py`: the flag grammar, the voice gate both
+readings share, and `PlayRegistry` — the per-guild in-flight set, its place lock, the
+cold-start singleflight and the pool semaphore. The cog keeps the commands and every
+reply. Its tests stay in `tests/test_musicbot.py`, because what places a song and what
+the channel is told about it are one behaviour.
+
+The argument is parsed twice — once by `play_takes_the_queue` in `before_invoke` to
+decide the voice gate, once by `play()` for the body — and they agree only because both
+call `split_play_args`. A flag that changes what "takes the queue" means has to be
+reflected in both readings, not just the parser; at that point the gate should hand the
+parsed value forward instead. `--timestamp` does not: it changes where a song starts,
+never where it lands.
+
+#### The play flag grammar
+
+`split_play_args` consumes a LEADING RUN of options and stops at the first token that is
+not one. Everything from the stopping token on is the query, verbatim — which is also the
+origin `-remove` matches on, so an option lifted out of mid-line would leave a value the
+user never typed. `-playnow` and `-playnext` parse their argument through the same
+grammar and then force the placement, so a flag spelled there anyway is not searched for
+as text and a `--timestamp` beside it still lands.
+
+**The options are a registry, not a chain of branches.** `_PLAY_OPTIONS` is the one
+place an option is declared; `split_play_args` reads it and names no option of its own.
+Each `_PlayOption` carries its canonical `name` (what every message and did-you-mean
+shows), the `spellings` a user may type, the `PlayArgs` `field` it sets, and either a
+`constant` it stands for or a `read` that parses its value — never both, since `read` is
+what decides whether the next token is consumed.
+
+Everything else derives from that table: `_OPTIONS` maps every spelling, and
+`_OPTION_STEMS` / `_NEAR_FLAG_RE` build the did-you-mean. **`field` is what makes two
+options mutually exclusive** —
+`--now` and `--next` both set `mode`, so the parser refuses the pair without a rule that
+names either, and the refusal lists that field's options in registry order so it reads
+the same whichever was typed first. Adding an option is one entry; the parser, the
+refusals, the suggestions and the usage line all follow.
+
+Three outcomes, all of which queue nothing:
+
+- **`error`** — an option repeated, two options over one field, a value that does not
+  parse or is missing, or a time at or past `MAX_START_OFFSET_SECS`. A finished sentence
+  rather than an exception: a typo is not worth a traceback and a trace id. An option's
+  `read` owns every message about its value, the empty case included, since only it
+  knows what its value is. The bound is what keeps an unbounded digit run out of `-ss`,
+  out of the play epoch and out of an embed description Discord would reject. A value is
+  always the next token: there is no `--ts=1:32` form.
+- **`dash_typo`** — a leading token one dash off an option (`-now`, an autocorrected
+  `—next`, a `–ts`), answered with the long form it names. The exact-match lookup runs
+  first, since a real `--now` also fits the near-miss pattern, and `-ts` is a real
+  spelling that never reaches it.
+- **an empty `query`** — reported by the command as a missing argument.
+
+Hand-parsed rather than a `FlagConverter`, whose grammar matches flags anywhere in the
+line and would lift a `--ts` out of a search term.
+
+1. **The player is not retired.** `MusicBot.cleanup()` stamps `MusicPlayer.mark_retired()`
+   through `PlayRegistry.retire_player`, which takes the place lock so the stamp cannot
+   land between a put's deque write and its mirror write, and stamps anyway once that
+   put's own bound expires. The synchronous history claim runs first, above every
+   await, so a song that starts while the fence waits cannot be claimed. A request that
+   bound that player at dispatch (`PlayRequest.mp`) and reaches the lock after
+   `-stop`, a kick or the alone-watchdog is refused and says so. Without the check the
+   put lands in the Redis mirror alone — the in-memory copy went with the player —
+   and the next restore resurrects it.
+2. **The queue's generation matches the snapshot.** `GuildQueue.clear()` bumps
+   `_generation` under the bulk mutex; a request registered before a `-clear` is refused
+   at the insert, the same way the playback loop's `try_commit_dequeue` refuses a
+   dequeue across a bump.
+3. **No command stamped it.** `-clear`, `-stop` and `-remove` name the requests they cut
+   off from the in-flight registry (`PlayRegistry.inflight`, read with no await after the
+   act), and each request reports itself. The stamp is a verdict of its own and not only
+   a label on the two above: a `-stop` that lands before a cold-start join has no player
+   to retire and no queue to bump, so without this check the channel is told the request
+   was dropped and it joins and plays anyway.
+4. **The author is still in voice.** `validate_commands` ran at dispatch; the resolve
+   can take 99s. `voice_refusal` re-runs the same check under the lock and the
+   refusal is sent after it.
+
+The verdict is one value (`PlaceResult`) rather than a verdict beside fields the
+caller has to remember to read, and a stall carries which half of the budget ran out
+on the exception it raises.
+
+**A request is placed once its checks pass, before the put, and the put is one call.**
+`PlayRequest.placed` is what `-stop`, `-clear` and `-remove` read to decide whether a
+request is still theirs to drop, and a command arriving while the put runs waits on the
+queue mutex behind it and acts on what the put inserted, so it must neither stamp the
+request nor report it stopped. A put that raises gives the request back. A collection's
+head and its `follow_on` go in a single `queue_put`, so a `-remove <the link>` waiting on
+the mutex takes all of it or none. `interject_flow`'s paused fallback, whose hold ends
+without inserting when a `-resume` landed during the resolve, clears `placed` before
+`enqueue_single` takes the lock again, so a command in between can still drop it.
+
+The body under the lock is the put, and the `queue_position` minted on it. Rendering
+is not: an "Est. playing at" walks the whole queue, and the hold is shared, so under it
+one long queue's walk is time every sibling `-play` spends waiting. The confirmation is
+built before the lock and sent after it is released, which also keeps a 429 on the
+channel off every other request. What that costs is exactness in an estimate — a
+sibling placing in between leaves the quoted time one song short, the same ±1
+`enqueue_depth()` already carries against a queue the loop keeps moving.
+
+`PLACE_TIMEOUT_SECS` exists because the pool sets no `socket_timeout`, so a Redis
+that accepts and then stalls has no bound of its own; it is outer to the lock, so a
+request parked behind a stalled sibling gives up on its own clock. It is 7s rather
+than 5s so that it outlives `_START_WRITE_TIMEOUT`, the 5s a song start may hold the
+queue mutex for against that same stall. Equal bounds expire together, and a placer
+waiting out a stalled start would report a stall of its own at the instant the mutex
+it wanted was about to free. The hold is one
+round trip long, so a guild bursting to `PLAY_INFLIGHT_MAX` serializes that many —
+~40ms at the 2.4ms p50 the start transaction measures, and past ~300ms a trip the
+sixteenth request spends its whole budget waiting. That is reported as a busy queue,
+which is what it is. What it must NOT do is disconnect: a cold start refused late —
+by the clock or by a verdict — tears its player down so a join that reached an empty
+channel does not sit there, and once the connection is up and the queue is not empty
+that reasoning is inverted, because the songs in it are a sibling's or a restore's
+(`MusicBot._cold_start_left_something_playable`).
+
+A put cancelled mid-flight may have appended in memory with the Redis write unknown,
+which is why the stall notice declines to say the song is absent and points at `-queue`
+rather than inviting a retry — a live process whose deque and mirror differ by one is
+not the state a crash leaves, and telling the user to send it again mints a duplicate.
+The queue records that divergence itself: `GuildQueue.mirror_dirty` is set when a
+mirror write does not finish, and while it stands the next enqueue REBUILDS the list
+instead of appending to it, the LREM shortcut is refused, and only a rebuild that
+landed clears it. Without that the list keeps its wrong shape, a later dequeue's LPOP
+retires an entry that is not the one it dequeued, and a `-clear` cut short leaves every
+entry it thought it dropped for the next restore to find.
+
+**`queue_position` is minted at the insert**, not at dispatch: two requests resolving
+together would read the same depth at dispatch, and the depth at the insert is the
+slot the song takes. `queued_at` stays the message snowflake.
+
+**Cold starts share one join.** The first request to find no voice client creates the
+guild's `-join` task (`_GuildPlays.join`); every request that finds none while it runs
+awaits the same task through `asyncio.shield` — `await task` would carry an awaiting
+task's cancellation into the join while another request still waits on it. A creator
+whose resolve fails with nobody else holding the gate cancels its join before tearing
+down, as a single cold start always did; with another participant holding, the join
+and the teardown decision are theirs. A join mid-cancellation settles a tick later,
+and `cold_join` skips it rather than hand it to a request arriving in that tick.
+Every participant front-inserts (`front` is decided at dispatch: "the bot was
+disconnected when I asked"), so all of them land ahead of the restored leftovers, the
+last to place at the head — the rule two `--next`s already follow. The gate opens
+when the last hold releases.
+
+**A failed join is reported by each waiter for itself.** `join()` runs on the context
+of the request that created the task and renders its own error there, so `cold_join`
+returns whether this request created it: the creator stays silent (it was just told)
+and every other request answers with `_join_failed_notice`, naming the song it lost.
+Without that split a request could wait out a 1–4s resolve and a failed handshake and
+receive nothing at all. The notice is RETURNED rather than sent, for the no-await rule
+below; the drop is stamped `play.dropped_by="join_failed"` and logged before the
+teardown, since `join()` swallowing its own error leaves the span no other record.
+
+`_abandon_cold_start` skips when another participant holds the gate, and the rule that
+makes that last-one-out rather than both-skip is that **nothing awaits between the
+decision and the hold's release**: the skipped request leaves its `AsyncExitStack`
+synchronously, so the second failure sees one hold and tears down. `_resolve_and_place`
+returns its notices rather than sending them for exactly this reason, and a test pins
+the rule against the source.
+
+**Two bounds, and they measure different things.** `PLAY_INFLIGHT_MAX` (default 16)
+bounds a guild's requests *admitted*: its unit is one coroutine, one open span and one
+typing keepalive, and past it a request is declined, raised from `play()` before
+`_play`'s own `except` so it reaches `cog_command_error`. `play.inflight` is recorded
+before the cap check, so a declined request carries the count it would have joined.
+
+`PLAY_RESOLVE_CONCURRENCY` (default 2, `_GuildPlays.resolves`) bounds how many of those
+are *extracting* — holding one of the process-wide yt-dlp pool's workers. The pool is
+FIFO and shared by every guild, so admission alone is no bound on it: sixteen distinct
+links is sixteen jobs, and with a default pool of four they occupy every worker for
+four waves. What queues behind them is not only other guilds' `-play`s but the playback
+loop's own in-band extractions — a lazy Spotify entry resolving at dequeue, a
+dead-stream re-extraction — which is dead air between songs in a guild that did
+nothing. Half the pool is the default so one guild can never hold all of it. Requests
+wait on the semaphore rather than being refused: within a guild the order is fair, and
+the bound is what keeps it fair between guilds. A collection is one extraction job, not
+one per track, so a `--now` sits behind at most a couple of them. The semaphore is sized
+when the guild's `_GuildPlays` is built, from `config.play_resolve_concurrency()`: a built
+semaphore cannot be resized safely (an extra `release()` uncaps it), so a bot-setting
+override reaches a guild once its in-flight requests have all retired and the next one
+builds it again. The in-flight cap and the wait's deadline are read per request.
+
+It bounds the *resolve*, which is only half of what a `-play` costs the pool. A search
+resolves flat and leaves the stream to `prefetch_stream`, spawned per enqueued song and
+awaited by nobody, so a burst's warms reach the pool outside this semaphore entirely.
+`youtube.prefetch_warm_slot()` is their bound — half the pool, process-wide rather than
+per guild, because the harm it prevents is a warm queued ahead of another guild's
+in-band resolve. The playback loop's own one-ahead prefetch goes through
+`_stream_source`, not this path, so it is never held behind a burst of warms.
+
+**Order in the channel is not order in the queue.** Confirmations are sent after the
+lock releases, so two requests that placed A then B can have their embeds arrive B then
+A — a slow edit or a 429 on one send is enough. Each ETA is correct as of its own
+insert; only the reading order drifts, and the `queue_position` each confirmation
+carries is what settles it.
+
+#### The contract a streamed collection places under
+
+Everything above assumes one request makes one atomic put. A resolve that yields tracks
+incrementally cannot: holding the lock for the length of the stream breaks the put-alone
+rule, and taking it per batch makes "the generation matched at my insert" a per-batch
+claim, so a `-clear` mid-stream leaves the batches already placed and drops the rest.
+
+**This is written ahead of the code, and nothing in this tree streams a collection.** A
+playlist or an album is walked whole and placed with one put
+([Spotify playlist paging](#spotify-playlist-paging)). The pieces named below —
+`_begin_collection_enqueue`, `_drain_collection_tail`, `put(..., expected_generation=)`,
+`bump_generation()` — were built once, against an older queue, on
+`task/spotify-collection-streaming`; that branch merged in 2.43.0 with its albums ported
+onto the walk-then-place design and its streaming layer set aside, and `442a8d00` is the
+last commit carrying it. The contract stands for whoever builds streaming again: it
+inherits one rather than inventing one at merge, where two mechanisms would both answer
+"may this put land?" and neither would answer "half of it did".
+
+1. **The lock covers the first batch. The compare-and-put carries the tail.** A
+   streaming request takes the place lock exactly once, for page 1, and gets one
+   ordinary `PlaceResult` — retired, generation, stamp and voice are decided there and
+   not again. Later batches never take it: each goes in through
+   `put(..., expected_generation=g)`, where `g` is the generation page 1 placed against
+   and the comparison happens inside the queue's own mutex hold. That is the stronger
+   primitive for the tail, not merely the cheaper one — the place lock's read-then-put
+   leaves a window the compare-and-put closes — and a guild-wide lock held across a 99s
+   drain would park every sibling `-play` behind one pasted link.
+
+   What follows from it: **the tail is invalidated by the generation counter alone**, so
+   everything that must stop a stream has to bump it. `clear()` already does;
+   `cleanup()` must, or a `-stop` retires the player while the drain keeps feeding a
+   queue nothing will play.
+
+2. **A partial placement reports a count, not a verdict.** `PlaceResult` stays
+   per-request — it is the answer to one question asked once, and making it per-batch
+   would give a request N verdicts and the channel N replies. The confirmation is sent
+   when page 1 lands, because that is when the music starts and the user has waited long
+   enough. The drain speaks again ONLY when it ended early: *"Queued 340 of 5,547 — the
+   rest was dropped when `-clear` ran."* A clean drain says nothing further, since the
+   page-1 confirmation already promised the collection. The span carries the placed
+   count either way, so an early end is visible even when the channel was told nothing.
+
+3. **The admission slot is held for the whole drain; the pool slot is not.** The request
+   stays in the in-flight registry until its last batch: it is one coroutine, one open
+   span and one typing keepalive, which is exactly what `PLAY_INFLIGHT_MAX` measures,
+   and it is also what lets `-remove` and `-clear` name a stream that is still running.
+   `PLAY_RESOLVE_CONCURRENCY` is the opposite case — it bounds what one guild holds of
+   a shared, process-wide pool, so the drain releases it after each page and re-acquires
+   it for the next. A `--now` arriving mid-drain then waits one page boundary rather
+   than a whole collection.
+
+Two questions this deliberately leaves to the branch, with the constraint each answer
+has to meet. **What the page-1 confirmation may claim**, given `playlist_count` is
+extractor-dependent and `None` on a channel page under a bounded call — whatever it
+says must stay true after a mid-stream `-clear`, which rules out a bare total. And
+**what `-remove <link>` means against a running stream**, which is the one input that
+names a collection in both states at once: tracks already queued, and more still
+coming.
+
+Per-guild in-memory state is shard-safe — a guild lives on exactly one shard — so none
+of this reaches for Redis coordination. The exclusion is a rolling deploy, where two
+instances briefly both field commands: each has its own `_plays`, so the lock, the
+singleflight and the in-flight registry are per process and the races above reopen
+across the pair for that window. It is the same exposure `lock:guild:{id}:recovery`
+exists for, and unlike recovery this side has no Redis lock behind it.
 
 ---
 
@@ -967,7 +1607,8 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:{id}` | 1 h (playlists are user-editable) | `List[str]` of track titles |
+| `playlist(id)` | `spotify:playlist:v4:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, a `SpotifyTrack` display row beside each (name, artists, length, track page), the playlist's name, total length, unavailable-item count |
+| `album(id)` | `spotify:album_tracks:v2:{id}` | 24 h | The same `SpotifyPlaylist` shape, plus the album's `artists` and cover `thumbnail`. Page 1 rides `GET /v1/albums/{id}`, so a one-page album is one request and takes no walk slot; later pages follow its `next` cursor inside one. Cached only when the walk counted exactly the album's `total` and kept at least one title — see [Spotify playlist paging](#spotify-playlist-paging) |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -987,7 +1628,9 @@ Configured in `src/telemetry.py`; `setup_telemetry()` is the first call in `main
 Span conventions worth knowing:
 - Every command invocation gets a `command.{name}` span opened in `cog_before_invoke` and closed in `cog_after_invoke` (error path ends it early).
 - `player.loop.iteration` spans deliberately stay open for the full song duration (3–5 min typically) — this is expected, not a leak.
-- The alone-countdown span covers only the post-sleep decision so it doesn't sit open for 10 s.
+- A song's span **links** to the extraction that minted its stream URL. `_cache_stream` stamps its own `traceparent` onto the `ytdl:stream:` entry, so the link reaches whichever of the three produced it: the enqueue-time warm (a child of the `-play` that queued the song, so this is also the link back to that command), the one-ahead prefetch in the previous song's trace, or nothing at all when the URL was extracted in band — that work is already in this trace, and a self-link is noise. A LINK, never a parent, for the reason the rooting exists.
+- `player.loop.iteration` is a ROOT span (`context=Context()`), so **one song is one trace**: its resolve, its stream extraction, the prefetch it launches for the next song, and every log line the loop emits while it plays. The loop task inherits the context of whatever created the player — a `-play` or `guild.restore` — so an inherited parent files every song a guild ever plays under that one command, in a trace that never ends. The id is what the Now Playing card and the playback-error notice both print.
+- The alone-countdown span covers only the post-sleep decision so it doesn't sit open for the countdown.
 - Error embeds include a `trace: {trace_id}` footer (`util.trace_footer`) for cross-referencing user reports with Tempo.
 - `shutdown_telemetry()` force-flushes on close, run in an executor because it can block up to 30 s.
 
@@ -999,7 +1642,7 @@ Span conventions worth knowing:
 ```mermaid
 flowchart LR
     YT["YouTube CDN\n(signed HTTPS stream)"]
-    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Output: Opus frames\n- Volume filter (if ≠ 1.0)\n- Seek offset (-ss N, if ts set)"]
+    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Seek: -ss N before -i, -ss 0 after\n- Output: Opus frames (remuxed when eligible)\n- Volume filter (encoder path only)"]
     Reader["discord.py reader thread\n(reads Opus frames from FFmpeg stdout\n→ YTDL.read() counts frames)"]
     VC["Discord Voice UDP\n(Opus + NaCl encryption)"]
     User["Discord Client\n(decodes Opus)"]
@@ -1011,14 +1654,33 @@ flowchart LR
 ```
 
 **FFmpeg flags:**
-- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop
-- `options`: `-vn` (audio only); extended with `-ss {ts}` for timestamp seeks and `-filter:a volume={v}` for non-unity volume
+- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
+- `options`: `-vn` (audio only); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
 
-**Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and pause confirmation.
+**Opus passthrough.** Discord speaks Opus and most of what YouTube serves already is Opus, so `YTDL` passes `codec="copy"` to `FFmpegOpusAudio` and the stream is remuxed rather than decoded and re-encoded — saving a full lossy generation and ~3.9 s of CPU per 213 s song. `_passthrough_codec` (src/youtube.py) is the gate, and every clause of it is load-bearing, because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k` discord.py always emits:
+
+| Clause | Why |
+|---|---|
+| no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Volume is the only source today. |
+| `audio_channels in (1, 2)` | a 5.1 serve copied verbatim reaches Discord as 6-channel multistream Opus and clients decode only the front pair, silently losing centre-channel vocals. yt-dlp ranks `channels` **above** `acodec` when sorting, so `bestaudio` does select itag 338 where it exists. Absent means re-encode. |
+| `format_id` in `{249, 250, 251}` | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly; SoundCloud's `http_opus` is exactly the case this excludes. |
+
+Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
+
+Three differences are accepted, and ffmpeg warns about none of them, since no encoder is instantiated to ignore them: a mono source stays mono rather than being upmixed; the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band forward error correction, so packet loss on the voice path produces dropouts libopus used to conceal. YouTube's files carry no FEC of their own, which makes that last one a real regression for lossy listeners and the reason to keep the gate narrow rather than widen it.
+
+**Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
 
 **Timestamp seek**: a `?t=N` URL parameter is carried on `QueueObject.ts` → FFmpeg `-ss N` → recorded as `YTDL.start_offset` so position surfaces and the backdated `play_start_epoch` agree.
+
+The seek is deliberately **two-pass**, and both halves were measured before shipping — each single-sided form is wrong in one direction:
+
+- **output side alone** (`-ss` after `-i`): accurate, but ffmpeg opens the stream at 0:00 and decodes its way to the offset, so a crash-recovered song 40 min in pulls 40 min of audio through the CDN before its first frame.
+- **input side alone** (`-ss` before `-i`): a real HTTP range request, but it lands on the nearest webm cluster **before** the target — measured 5–10 s early across offsets, on live googlevideo and on the same stream saved to disk, under both libopus and copy. `-accurate_seek` is already the default and does not fix it. Since `position_secs = start_offset + elapsed`, that error would land on every position surface and a `-playnow` resume would replay audio.
+
+Shipping form is `-ss N` before `-i` **plus** `-ss 0` after it: the range request is kept, and the output-side threshold drops the pre-roll it lands in (that pre-roll carries negative timestamps, which is what makes 0 the right threshold). Measured back to ±0.02 s at every offset.
 
 ---
 
@@ -1046,7 +1708,7 @@ stateDiagram-v2
 
     Playing --> WaitingForSong : stream error (None YTDL)\nskip to next
 
-    WaitingForSong --> [*] : 300s queue timeout\nor cleanup()
+    WaitingForSong --> [*] : idle timeout\nor cleanup()
     Playing --> [*] : cleanup() / alone timer / eject
 ```
 
@@ -1247,8 +1909,10 @@ socket read timeout. A slow tier must cost depth, never an error embed.
 
 ### Redis memory bounds
 
-Three kinds of key carry no TTL and are therefore never eviction candidates under
-`volatile-lru`: `guild:{id}:history`, `guild:{id}:config` and `history:outbox`. Once they fill
+Four kinds of key carry no TTL and are therefore never eviction candidates under
+`volatile-lru`: `guild:{id}:history`, `guild:{id}:config`, `bot:{application_id}:config`
+and `history:outbox`. The bot hash is one per application and bounded by the number of
+bot settings, so it cannot grow. Once they fill
 `maxmemory` with no TTL-bearing key left to evict, Redis rejects **every** write
 with OOM — state, queue and cache alike — and each store method swallows it and
 logs, so persistence degrades silently rather than crashing.
@@ -1256,9 +1920,11 @@ logs, so persistence degrades silently rather than crashing.
 Only the **outbox** can reach that state by growing. The history lists are bounded
 at `HISTORY_CACHE_LIMIT` per guild, so their total scales with guild count
 (~24 KB each, ~24 MB across a thousand), not with runtime. The config hashes are
-bounded by the number of settings that exist — three fields, ~160 bytes measured,
-per guild that has chosen one — so they scale with guild count even more weakly
-(~1.5 MB across ten thousand) and cannot grow on their own at all. The outbox is near-empty
+bounded by the number of settings that exist — eight fields and the `writer_app_id`
+stamp, 272–304 bytes with every field set (`MEMORY USAGE` on `redis:7-alpine` 7.4.11,
+listpack-encoded), per guild that has chosen one — so they scale with guild count even
+more weakly (~3 MB across ten thousand guilds that set everything) and cannot grow on
+their own at all. The outbox is near-empty
 whenever the drainer keeps up and grows for the whole duration of a Postgres
 outage, at ~625 bytes per play — so the bundled 256 MB budget holds roughly 429k
 un-archived plays. `HISTORY_OUTBOX_MAX` is the opt-in bound on it; it defaults to
@@ -1319,8 +1985,10 @@ every member of every guild — permanently, in Discord's retained history — t
 host runs the public default. The value is a public constant in a GPL repo; the leak
 is the confirmation, not the string. The `is_owner()` await must also be reached only
 when the advisory exists: `MusicBotApp` sets neither `owner_id` nor `owner_ids`, so
-discord.py falls through to `application_info()`, a REST GET that retries ~25 s on a
-5xx and then raises — ahead of the skeleton send the command promises is immediate.
+discord.py falls through to
+`application_info()`, a REST GET that retries ~25 s on a 5xx and then raises — ahead
+of the skeleton send the command promises is immediate. `util.is_operator` turns the
+raise into a denial and skips the call for 60 s after one fails.
 
 The default lives in six places with nothing linking them: `src/config.py`,
 `build_common.sh`'s preflight, three `docker-compose.yml` service interpolations, and
@@ -1429,6 +2097,143 @@ format requires a token, so it costs nothing while `visionos` is healthy; YouTub
 PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
 provisioned ahead of enforcement rather than after it.
 
+### Spotify playlist paging
+
+`playlist()` follows the API's `next` cursor to the end. That turns one request per playlist into up to a hundred, so three things bound what it can cost.
+
+**The walk is bounded twice.** `_PLAYLIST_PAGE_TIMEOUT_SECS` (20 s) covers one request, which is the thing that can hang — `_HTTP_TIMEOUT` does not reach a page spending three 429 retries at up to `_MAX_RETRY_AFTER_SECS` each. Neither bound is allowed to cut a 429 sleep short: the walk hands `http_call` the earlier of the two as a `deadline`, and a retry that would sleep past it raises `SpotifyRateLimitError` at once. Expired, either bound would raise `SpotifyPlaylistTooSlowError`, whose advice for a stalled page is to try again — the one thing a rate limit must never be answered with, since the retry re-sends every request that earned the 429. `_PLAYLIST_WALK_TIMEOUT_SECS` (120 s) covers the whole walk and is sized against the WORK: `_MAX_PLAYLIST_PAGES` is derived from Spotify's own 10,000-item ceiling, so the budget allows ~1.2 s a page where a healthy call is ~0.2 s. A single bound could not tell a stalled request from a large playlist, and only one of those is worth retrying — `SpotifyPlaylistTooSlowError.whole_walk` is which deadline expired.
+
+**The pages are issued sequentially, and that is a choice.** `total` is known after page 1, so pages 2..N could go out together. They do not: a walk already meets Spotify's per-application rate limiter a hundred times more often than a track lookup did, and the 120 s budget absorbs about one fully-retried page. Concurrency would spend exactly the thing that is scarce. If this ever needs to be faster, raise the budget before adding parallelism.
+
+**Two process-wide bounds, not per guild**, because the limiter is per application. `_playlist_slot()` (2, rebuilt per event loop) caps concurrent walks, and the wait for it is bounded by `PLAY_RESOLVE_WAIT_SECS` — the walk budget starts only once the slot is held, so without that bound a small playlist behind two 10,000-track walks waits minutes having sent nothing, and it answers `SpotifyBusyError` instead. `_INFLIGHT_PLAYLISTS` single-flights on the cache key, so N users pasting one link is one walk rather than N identical hundred-request ones. `PLAY_RESOLVE_CONCURRENCY` covers neither — it guards yt-dlp workers, and a Spotify walk holds none. The slot is taken INSIDE the single flight, around the requests alone, for the reason `_extract_once` takes its pool slot there: a joiner issues no request and must not queue for a slot it will not use.
+
+**The walk belongs to no caller.** Every caller awaiting it — the one that started it and every joiner — subscribes to `_PLAYLIST_SUBSCRIBERS` under the cache key for as long as it waits, and each page's report goes to all of them, so a second guild's card moves with the walk it joined. The cache write is the job's own, after the walk: a caller cancelled mid-walk (a `-stop`) neither takes the walk from the others, which await it through `asyncio.shield`, nor throws away a hundred requests nobody is left to cache.
+
+**A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
+
+**An album is the same walk with three differences.** `Spotify.album` returns the playlist's `SpotifyPlaylist` plus the album's artists and cover, and takes the playlist's path from `queue_source` on. Page 1 rides `GET /v1/albums/{id}`, which carries the identity and the first tracks page, so a one-page album is one request and takes no walk slot, exactly as a track link takes none. Pages 2+ follow the `next` cursor inside a `_playlist_slot()` slot: the walk budget restarts once the slot is held, and the cache is read again first, which is the album's single flight — N pastes of one album walk it once, without `_INFLIGHT_PLAYLISTS`. The page cap is the album's own size, `ceil(total / page-1 stride) + 2`, and a cursor naming the page it came from ends the walk; an album is cached only on `walked == total` with at least one title, because an album never changes and a repeating cursor overshoots any `>=`. A 403 maps to the same `SpotifyPlaylistForbiddenError`, worded for an album.
+
+**A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes. The shortfall reaches the channel too: both walks set `SpotifyPlaylist.short`, and the queued card and the `--now` path put a notice above what they send, since the card's count is what was queued and not what the link holds.
+
+**The name is a request of its own.** `v1/playlists/{id}/tracks` does not carry the playlist's name, so after the walk, still inside its slot, `_playlist_name` sends one `GET v1/playlists/{id}?fields=name`, bounded by `_PLAYLIST_PAGE_TIMEOUT_SECS`. Folding the name into page 1 — fetching `v1/playlists/{id}` with a nested `tracks(...)` mask — does not work: the `tracks.next` cursor Spotify returns then carries that request's `fields=name,tracks(...)`, and page 2 fetched from it comes back as `{}`, which this walk reads as a refused playlist. The name only decorates the confirmation, so any failure there returns `None` and never fails the walk. The walk's own mask adds `duration_ms`, which costs no extra request: the result sums the kept tracks' milliseconds and divides once, and marks the total `duration_partial` when a kept track carried none. `unavailable` counts items walked and not kept.
+
+### Progress out of a yt-dlp worker
+
+A YouTube playlist resolve is one `extract_info` call in a pool worker that returns once, after every continuation page has been fetched. The queue-progress card needs increments before then, so there is a second worker queue beside the log one.
+
+**`lazy_playlist: True` is what makes the hook a stream rather than a burst.** Without it `YoutubeDL.py:2100` runs `entries = resolved_entries = list(entries)` — every continuation page fetched — before the per-entry loop at `:2144` begins, so the loop is pure CPU and the hook fires in one ~50 ms burst after the 29 s of network is over. A bar driven from that sits at 0 for the whole fetch and then jumps to 100 % in one tick, which is the failure the card exists to avoid. Under `lazy` the loop iterates the live generator and drives the fetches itself. It also removes a second call site: `utils/_utils.py:2491` is gated on `not lazy_playlist`, so the callback goes from 2N+1 calls per playlist to N+1 (measured: 9 calls for 4 entries without it, 5 with).
+
+**The hook is `match_filter`, and it MUST return `None` on every path.** `_match_entry` tests `if reason is not None` (`YoutubeDL.py:1664`), so any other value — `""` and `0` included — silently drops that entry: measured on a 4-entry playlist, `return ""` kept 0 of 4 while the command still reported success, and `return 0` raises a bare `TypeError` at `:1666` that is not a `YoutubeDLError` and so is never classified. Worse, `match_filter` is also called once at `:2088` with the playlist infodict, where a non-`None` return makes `__process_playlist` return with the *entire playlist* gone. So `_count_entry` has exactly one unconditional `return None` and no conditional return paths, and its tests assert `is None` — `assert not ret` passes while every song is gone.
+
+**The index is the progress value.** Of the three sites `_match_entry` is reachable from, only `:2161` carries `playlist_index`, so reading it rather than counting calls is what stops a naive counter reporting 3,343/1,671. The `:2088` call has no index and carries `playlist_count`, which `_tab.py:793` read off page 1 — that is the first message and the only way the total reaches the parent before the walk ends.
+
+**Everything the callback does is wrapped, and the wrap logs.** yt-dlp does not wrap `match_filter`, so a `queue.Full`, a closed queue or a `BrokenPipeError` would escape `extract_info` as a `RemoteCallError` and tell the user the playlist could not be fetched. The opposite failure is silent: `YoutubeDL.py:1625-1628` catches a `TypeError` from the callback and substitutes `None` "for backward compatibility", so a signature mismatch or a bad argument vanishes into a card that never moves. Hence the warning.
+
+**Messages are absolute, never deltas.** The parent takes `max()`, so a dropped message self-corrects on the next one and a `BrokenProcessPool` heal — which re-runs the extraction from entry 0 — is idempotent rather than reporting 2×N. Entries are coalesced one message per 25 in the worker; the bar has ten cells, so at 1,671 tracks one cell is 167 entries.
+
+**The queue is bounded, drained on a thread, and stopped after the workers are gone.** `multiprocessing.Queue()` defaults to `maxsize=0`, which sizes its semaphore at `SEM_VALUE_MAX` (32,767): 30,000 `put_nowait` calls raised no `Full` at all, so the drop-on-full this design relies on would never happen and the worker would buffer without bound instead. The parent drains on a thread like the log `QueueListener` — `get_nowait` measured at 38.4 µs/op and a playlist's messages arrive in a burst, which on the event loop delays every other guild's Now Playing edit and the playback loop's song handoff. Two shutdown rules are load-bearing, both the reverse of the tempting order: the worker calls `cancel_join_thread()` (at worker exit `Queue._finalize_join` joins the feeder thread, which is blocked in `send_bytes` once the parent stops reading, so the worker cannot exit and shutdown burns its full 10 s timeout), and the drain stops **after** the join rather than before. Stopping is a flag the drain polls, not a sentinel message: after `terminate_workers()` the queue's `_wlock` is a POSIX semaphore a worker SIGTERMed mid-write never released.
+
+**Progress is keyed on the extraction, not the requester.** `_extract_once` single-flights on the URL, so the second caller of one playlist issues no `ExtractRequest` and would otherwise watch a frozen card beside a moving one. `_PROGRESS_SUBSCRIBERS` maps the inflight key to every callback watching it. A message from a superseded extraction of the same playlist can still arrive; counts are absolute and readers take `max()`, so the worst it does is run the bar slightly ahead.
+
+**`process=False` was considered and rejected.** It returns the extractor's raw `ie_result` (`YoutubeDL.py:1886-1890`), whose `entries` is a live generator the worker could iterate with no `match_filter` at all — and therefore none of the drop-an-entry failure mode above. The reason it loses is blast radius: the worker would have to reproduce what `__process_playlist` does (the `orderedSet` dedup at `:2093`, `playlist_items` selection, null handling, the per-entry normalisation that fills `thumbnail` and `duration`) and would return a differently shaped dict, so `_playlist_tracks`, the `ytdl:playlist:` cache format and the error classification would all need re-verifying against a shape no test in this repo can produce — the suite's autouse fixture runs extraction on a thread pool and never calls yt-dlp for real. `match_filter` changes nothing about what `extract_info` returns; its one new failure mode is a return value, which an unconditional `return None` and a test asserting `is None` close completely.
+
+**What the suite cannot see, and why.** `[tool.coverage.run]` is `branch = true` with `source = ["src"]` and no `concurrency = "multiprocessing"`, so lines executed in a worker earn zero coverage. The autouse `use_thread_ytdlp_pool` fixture supplies its own `executor_factory`, so `_worker_init` never runs and **nothing is pickled** — an unpicklable callback would pass `just check` and break only inside a container, which is why `_count_entry` is module-level with the request id bound by `functools.partial`, and why one test pickles that partial directly. "Extracted count == input count" needs yt-dlp's real `_match_entry` loop and has no offline form; the callable is covered directly for every entry shape, and one real round trip through the progress queue sits beside `tests/test_ytdlp_pool.py`'s spawned-worker tests.
+
+### Stream-retry ladder
+
+One extraction already contains every URL the bot could want, so the recovery rule is
+**retry sideways before retrying in place**: the next audio format under the same
+extraction, not the same format under a fresh one.
+
+The ladder is mined in the worker (`_mine_audio_candidates`), because `_slim_info`
+drops `formats` and after that the alternative URLs are gone from the process. It keeps
+the top `_STREAM_CANDIDATES` (3) audio-only formats, best first, with candidate 0 being
+the format yt-dlp itself selected — so "candidate 0" and "the URL the probe already
+validated" are the same thing, an identity `_probe_candidate_ladder` then maintains by
+rewriting the ladder on **every** promotion (see below). Three filters are load-bearing
+rather than cosmetic: storyboards also carry `vcodec: none` (the `acodec` test is what
+removes them, and yt-dlp writes the string `"none"` there, not `None`), and `-drc`
+variants and foreign-language dubs would make a fallback quietly change what the song
+*sounds* like. A muxed selection gets a one-rung ladder — itself — since that rung
+already means the audio-only path is degraded, and walking sideways across muxed
+formats is not a recovery worth having.
+
+The ladder rides the existing `ytdl:stream:{webpage_url}` entry (1.28 KB/rung
+measured, URL-dominated — which roughly doubles the entry, and slightly more than
+doubles its resident cost, since the result lands just past jemalloc's 8192 size
+class). That key is TTL'd and evictable, so it carries none of the
+non-evictable-key obligations in [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
+Entries written before the ladder existed parse as a one-rung ladder, so wire-compat
+needs no version field.
+
+At probe time `_probe_candidate_ladder` walks it and **promotes the winner wholesale** —
+URL plus format shape — so `_record_serving_format`, the source's `abr`/`asr`/`acodec`
+and every span attribute describe what is really playing rather than what was
+originally selected. Two consequences follow, and both are behavior rather than
+bookkeeping:
+
+- **A promotion rewrites the cache entry**, with the dead rungs ahead of the winner
+  pruned. Left alone, a cached ladder whose head is dead re-probes that same dead URL
+  on every play until the TTL lapses, re-diagnosing a failure it already knows. The
+  rewrite is unconditional rather than gated on a non-zero index: `deprioritize`
+  reorders the walk, so a winner can land at index 0 while still differing from the
+  entry's stored head — and a retry always re-caches (it invalidates first, so its
+  resolve is a fresh extraction), which would otherwise persist a ladder headed by the
+  very format that just failed and discard everything the retry learned.
+- **Re-extraction is the last resort, not the first.** A fallback probe costs ~100 ms
+  against a 3–5 s extraction that would re-select the *same* format anyway — which
+  cures a stale URL but does nothing against format-level enforcement (the yt-dlp#16150
+  shape, where the format dies again immediately under a fresh signature). Only when
+  every rung is dead is the entry dropped and re-extracted, then walked once more.
+
+The walk shares two things with the rest of the resolve. A freshly extracted info-dict
+is copied before it is walked: `_extract_once` hands every joiner the same dict, and a
+promotion rewrites the one it is given. And the `probed_at` shortcut (see
+[Warming the stream cache](#warming-the-stream-cache)) is not taken for a format in
+`failed_format_ids`, so a retry whose entry was re-warmed in the meantime still walks
+past the format that burned.
+
+Prefetch deliberately probes only the head: walking all three per song would tax every
+play for the rare failure.
+
+**The second failure window is playback time.** A URL revoked in the seconds between
+the probe and ffmpeg's first read reaches the loop as `stream_failed` — zero frames plus
+an ffmpeg error. That song now gets `_STREAM_PLAY_ATTEMPTS` (3) plays in total:
+`_retry_failed_stream` re-queues it at the front carrying the attempt it spent and the
+format that burned, and the fresh resolve deprioritizes that format. Deprioritizes, not
+skips — a single-format video would otherwise have nothing left to try, and the common
+cause here (revocation, not enforcement) is cured by a fresh URL for the same format.
+
+Three placements inside that iteration are load-bearing:
+
+- **The decision, and `_neutralize_prefetch()`, run where `stream_failed` is computed**,
+  not beside the requeue at the iteration tail. By the tail the loop has claimed
+  `_prefetch_task` into a local, so a neutralize there reads `None`, no-ops, and the
+  already-resolved next song plays *instead of* the retry — exactly the failure that
+  call exists to prevent. The requeue itself goes through `queue_put_next`, which hands
+  back any claim a command (`-shuffle`, `-remove`, `-replay`) opened in the slot
+  between the decision and the put.
+- **The history write is suppressed while a retry is pending.** A retried fragment never
+  records; the terminal attempt records exactly once. Without that, a stream-failed
+  resume tail writes twice — once on `heard_before`, once when the retry succeeds — and
+  Postgres' `(guild_id, played_at, webpage_url)` dedup index collapses the pair while
+  `guild:{id}:history`, the only list `-history` reads, keeps both.
+- **The retry carries no start stamp unless audio was actually heard.** `played_at`
+  means "audio started"; keeping the failed attempt's would also make `_flush_played`
+  write a 0-second play if `-clear` destroyed the retry first.
+
+`stream_attempts`/`failed_format_ids` are runtime-only — never on the Redis wire. A
+crash mid-retry resets the counter, which costs a restarted bot a few more attempts at a
+dead song and saves the whole `QueueEntryField`/parse-path surface. They are inherited
+by `_requeued_form` (a prefetched retry has not played, so its chain is live) and
+deliberately **reset** by `interject()`'s resume tail (that song is producing audio,
+which ends the chain, and a format blacklisted at 0:00 may be healthy again by the time
+a deeply-stacked tail resolves).
+
+Mid-song death stays out of scope: it produced audio and earned its history entry, and
+retrying it means resuming at the death position — a different feature this machinery
+makes cheap to add later.
+
 ### yt-dlp process boundary
 
 Four things cross into the worker processes, each with its own contract:
@@ -1440,6 +2245,9 @@ Four things cross into the worker processes, each with its own contract:
   `patch("src.youtube._ytdlp_extract")` in the suite.
 - **The result** — `_slim_info` is what makes it picklable at all; a raw
   `process=True` info dict carries live objects and commonly 100 KB–1 MB nobody reads.
+  It is also the last point at which the *whole* format ladder exists, which is why the
+  fallback audio URLs are mined into `audio_candidates` here rather than anywhere the
+  parent could do it (see [Stream-retry ladder](#stream-retry-ladder)).
 - **The exception** — flattened in the worker by `_classify_ytdlp_error`, where the
   structure still exists (yt-dlp's own exceptions carry live tracebacks and cannot
   cross). **Every field of the flattened error needs a default**: a required
@@ -1470,10 +2278,17 @@ throughput one, and do not restore the handshake claim a comment here once carri
 The residual real benefit is the connector's 10 s `ttl_dns_cache`, which helps inside
 one resolve and not across songs.
 
+**The timeout is per request.** Each probe passes
+`ClientTimeout(total=config.stream_probe_timeout_secs())`, which replaces the session's
+timeout wholesale, so a bot-setting change reaches the next probe without rebuilding the
+session. The session keeps `config.STREAM_PROBE_TIMEOUT_MAX_SECS` (5 s, the chat maximum)
+as a backstop for any request that passes none: with no session timeout aiohttp would wait
+its 300 s default.
+
 **`DummyCookieJar` is load-bearing.** A default `CookieJar` would be process-wide and
-attacker-writable: `parse_url` hands any dotted domain to yt-dlp, whose generic
-extractor returns the input URL for the probe to fetch, so one `-play` reaches this
-session with a host the user chose. aiohttp applies no public-suffix check, so a
+attacker-writable: `parse_url` hands any http(s) host it does not special-case to
+yt-dlp, whose generic extractor returns the input URL for the probe to fetch, so one
+`-play` reaches this session with a host the user chose. aiohttp applies no public-suffix check, so a
 `Domain=com` cookie set by that host is replayed to `googlevideo.com` — and enough
 cookie bytes turns every probe into an HTTP 400, which maps to `DEAD`, deletes the
 cache entry and burns the one re-extraction, for every guild, until restart. Nothing
@@ -1495,7 +2310,7 @@ The invariants the code cites by number:
 | **I6** | in-flight items are a **prefix**, because Redis retires them by LPOP |
 
 **`clear()` returns the claimed prefix too.** It feeds `MusicPlayer._flush_played`, so a parked
-`-playnow` tail earns its `play_history` row only because the return covers `_items` entire and
+interjection tail earns its `play_history` row only because the return covers `_items` entire and
 not just what was pending. Return the pending slice instead and that row goes with no error and
 no log line.
 
@@ -1516,6 +2331,19 @@ eats the new head.
 
 ### Now Playing host invariants
 
+**Four sends are exceptions to the host model**, for two distinct reasons. A message
+an edit LOOP owns must not be the host, or the progress updater rewrites it every 3s:
+that covers `-ping`, `-debug` and the queue-progress card, all three through
+`dashboard.LiveMessage`. A message we DELETE must not be the host either, or the
+retraction drags the live bar onto a message that is about to vanish: that covers
+`play_placement.slow_resolve_notice`. All four send with `ctx.channel.send` rather
+than `MusicContext.send`, so they neither carry an NP block nor retire the current
+host, which stays above them — edited invisibly — until the next ordinary `ctx.send`
+adopts a new one. They also miss debug-mode decoration, which is why all four are
+handed a pre-rendered `debug_suffix`. Add a fifth and it belongs
+in this list, in CLAUDE.md's host section, and on whichever of the two reasons it
+takes.
+
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the
 pointer swap is synchronous, retirement is fire-and-forget under `_np_edit_lock`.
 Overlapping sends can complete out of order — channel position is send-*start* order
@@ -1528,7 +2356,7 @@ that never produced audio has its block disposed of rather than finalized, since
 completed bar would be a false record.
 
 **Interrupted fragments clean up after themselves.** Releasing rather than retiring is
-right for a song that ended, but a `-playnow`-interrupted fragment leaves a bar frozen
+right for a song that ended, but an interrupted fragment leaves a bar frozen
 at its interrupt position — and a stack leaves one per interjection. So the resume tail
 inherits a pointer to that card (`np_message_id` / `np_channel_id` / `np_dedicated` on
 the wire, plus a runtime-only `np_host_ref`) and disposes of it when the tail starts,
@@ -1541,7 +2369,7 @@ strictly *after* its own card is up. Three constraints shape this:
   which `set_context` reassigns on every command and which therefore records where the
   last command ran rather than where any card was posted.
 - **Capture is late-bound**, at the interrupted fragment's iteration end. Anything read
-  inside `interject()` can name a message the `-playnow` confirmation's own adopt has
+  inside `interject()` can name a message the interjection confirmation's own adopt has
   already retired.
 
 The runtime ref is what allows full fidelity: a card hosted by a *command response* is
@@ -1561,22 +2389,42 @@ request (`debug_footer()`). The trace id is what makes it useful: it is already 
 join key for every log line and span, so pasting one out of Discord finds the exact
 request in Loki/Tempo.
 
-"Every embed" is sent from three places, so three seams apply it:
+"Every embed" is sent from four places, so four seams apply it — all through the one
+`DebugSettings.decorate()`, which owns the enabled check, the strip fallback and the
+shard and runtime figures; `debug_footer` supplies the environment itself. A seam
+passes only what it alone knows: the span to name, and elapsed-ms where a command
+timed something. Adding a segment reaches every embed at once:
 
 | Seam | Covers |
 |---|---|
-| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs |
+| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs; the only seam with elapsed-ms |
 | `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
-| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so neither seam above reaches them |
+| `restore_guild` (recovery.py) | the channels-deleted notice, which has no player to decorate it |
+| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so no decoration seam reaches them. Takes `DebugSettings.footer()` — the string form, which omits the environment and the trace because both cards print those themselves |
 
 Rules each seam encodes:
 
 - **The block decorates at build time, not at the attach site**, so every render —
   command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
   produces one, and the tick refreshes the metrics alongside the bar.
-- **The block carries no trace id.** It re-renders under the command span when a
-  response attaches it and under the playback span on the next tick, so a trace id
-  there would alternate on a single message. One-shot notices do carry theirs.
+- **The environment leads the suffix**, because it says which deployment everything
+  after it describes. `debug_footer` reads `config.ENVIRONMENT` itself rather than
+  taking it as an argument — it is a property of the process, so a caller able to
+  supply it is a caller able to name the wrong one — and reads it late, since `main()`
+  may infer it from the git branch long after the module is imported. The two
+  dashboards suppress it with `skip_environment`, the way they already suppress the
+  trace, because both cards open their own footer with `environment: <name>`.
+- **The block carries the PLAYING SONG's trace id**, captured once into
+  `MusicPlayer._playback_span` when that song starts and read by both block render
+  sites. Read from the ambient span instead it would alternate on a single message —
+  the command's when a response attaches the block, the loop's on the next tick.
+  It advances with the song rather than with the loop iteration, so a resolve that
+  failed leaves the previous song's tail naming its own trace. The song-end finalize
+  captures the span at spawn, beside `song`/`message`/`own_embeds` and for the same
+  reason: it awaits `_np_edit_lock`, which a debounced edit can hold across a PATCH,
+  so a span read at edit time can already name the song that replaced this one.
+  One-shot notices carry the ambient span's id, which is that same trace when the
+  player raised it.
 - **A host's cached own embeds are never re-decorated.** Their elapsed-ms records the
   request that sent them, so a command response that became the host before a toggle
   keeps the footer it was sent with until a new host replaces it.
@@ -1585,13 +2433,30 @@ Rules each seam encodes:
   differs, so a per-tick-varying footer would edit the board until its deadline.
 - **`-debug` gates the runtime segment on `operator`.** That card withholds its
   Runtime block from a non-owner and says so in the same embed.
-- **Decoration replaces rather than appends**, and removes a stale suffix when there
-  is nothing to show. `play_message` is built once per song, decorated in place, and
-  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle.
+- **Decoration replaces rather than appends.** `play_message` is built once per song,
+  decorated in place, and re-sent by `-now`, so it outlives both a re-send and a
+  mid-song toggle. The mark is the boundary it replaces from, wherever in the footer
+  it sits. Every decorated embed gets a suffix — the environment alone is always worth
+  showing — so removing one is `strip_debug_footers`' job, on the debug-off side.
+- **The suffix starts a line of its own** whenever the embed already carries a footer,
+  through `util.join_footer`, so every place that writes one joins identically. Inline it continues
+  that footer, and Discord wraps the run at the card's width — mid-segment, so the two
+  read as one paragraph. The break is written only when there is a base to separate
+  from, comes off with the suffix when a `--disable` strips it, and survives a
+  near-limit footer because the clip falls on the base.
+- **The suffix itself is two lines**: where the request ran (environment, elapsed-ms,
+  shard, and the sampler's cpu/mem/lag), then what it counted (tasks, pool workers,
+  and the trace id). `debug_footer` writes that break for the same reason the one
+  above exists — left to Discord the wrap lands mid-segment, and a 32-hex trace id
+  makes it certain on any card. Only the first line carries the mark, since
+  `_strip_debug_suffix` cuts from there and a second one would strand the counts.
+  A line absent leaves no break behind: a card with no snapshot and no span is one
+  line, and the dashboards' string form is one line plus its counts.
 
-`RuntimeSampler` feeds the runtime segments on the NP tick's cadence
-(`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is
-effectively debug-enabled.
+`RuntimeSampler` feeds the runtime segments on the bot's NP tick cadence
+(`sample_interval_secs()`, floored at 1 s and capped at 5 s, re-read each tick, so a
+`-settings bot np-refresh` change reaches it within one interval), running only while some
+guild is effectively debug-enabled.
 
 ### Analytics rendering
 
@@ -1870,11 +2735,226 @@ for "real IO across several services", and this command touches one, with a warm
 `MusicContext.send`, which would cost the NP block. `background_typing(ctx)` covers the
 one real gap — the ~2.0 s first invocation in a process.
 
+### Settings resolution
+
+`-settings` holds values at two scopes: bot-wide knobs, owned by the operator, and
+per-server settings. Each scope has one writer.
+
+**Bot settings: override, else environment, else code default.** Each settable knob
+(`config.KNOBS`) is one statement in `config.py`:
+`ping_tick_secs = _secs("PING_TICK_SECS", 1.0, minimum=…)`. `_secs` and `_count` parse the
+variable at import through `_float_env`/`_int_env` and return a `Knob[float]` or
+`Knob[int]`: a frozen handle holding the variable's name, its kind and the floor the parse
+enforced. Calling the handle (`config.ping_tick_secs()`) returns the knob's **override**,
+else its **baseline**, both read at call time. Everything else that names a knob — the
+registry's `SettingSpec(knob=…)`, the `-debug` rows, the hash field `Knob.field` — holds
+the handle or derives from it, so a new knob is that statement and its `SettingSpec`.
+
+The handle holds no value. Baselines and overrides live in two private maps keyed by
+variable, which a handle reads through the module's globals, so a handle built before a
+reload of `config` reads what the reload parsed. Production never reloads `config`; the
+test suite does, under a registry that holds handles. A handle's identity does not survive
+that reload, so nothing keys on the handle itself: `BotSettings` and `knob_spec` key on
+`Knob.env`.
+
+- **One writer.** A knob's `set_override` and `clear_override` are called in `src/` only
+  by `BotSettings` (`src/settings.py`). `set_override` checks the value's type — a `bool`
+  for either kind, a non-int for an int knob, raise `TypeError` — and nothing else:
+  bounds belong to the registry, and `BotSettings` checks `in_bounds` before it calls.
+  `override()` is a read-only view, open to any module; `baseline` is read only by the
+  registry and its cards, which show both values.
+- **Consumers call the knob when the value applies**, never its baseline and never
+  at import. When that is differs by consumer: a per-tick read (the heartbeat, the
+  runtime sampler) lands after the tick in progress, a per-invocation read (`-ping`,
+  `-debug`, `-analytics`, each `-play`'s admission and resolve wait, each stream probe) at
+  the next one (a playlist card reads its delay, tick and ceiling as it is entered), and a
+  value built into a long-lived object at its rebuild — a guild's
+  resolve semaphore, once its in-flight requests have all retired.
+- **`TestBotKnobsAreReadAtCallTime`** holds that rule over every `src/` module in one AST
+  pass, matching identifiers by name, so an aliased import is caught without tracking it.
+  **G1**: no read of a knob's baseline (`.baseline`, or `_BASELINES`) outside `config.py`,
+  `settings.py` and `settings_card.py`. Importing a handle by name is not one: it reads
+  when called. **G2**: no knob called when a module is imported or a
+  `def`/`class` statement runs — module and class bodies, decorators and parameter defaults;
+  function bodies, lazy annotations and a knob passed uncalled are fine. **G3**:
+  `set_override`/`clear_override` called only in `src/settings.py`. **G4**: no knob read in a
+  pool worker's entry function or any same-module function it calls by bare name, since a
+  worker re-imports modules with environment values only; the test asserts each entry still
+  exists. The same walker runs over a synthetic source holding every shape, and must report
+  exactly those lines. A knob reached through `config.KNOBS[...]` or a `SettingSpec.knob` is
+  invisible to G2 and G4, which match the accessor's name; every such read in `src/` sits
+  inside a function body.
+- **`-debug` shows what is in force.** The knobs' Config-block rows are derived from the
+  registry, in the order `-settings bot` lists them; each holds its handle and carries no
+  fallback. `render_config_value` renders it at render time through the
+  registry's `format_value`, with the `-settings bot` card's labels: `3s (default)`,
+  `3s (env)` (the parsed baseline, not the raw string), `5s (bot owner; env 3s)` or
+  `5s (bot owner; default 3s)`. An environment value outside the chat range is honoured
+  and renders `0.5s (env, outside chat range)`: a chat write can only move it back inside,
+  which is how a single-server install keeps `PLAY_RESOLVE_CONCURRENCY` at the full pool.
+  Every other row is env-only and renders its raw string, since its value cannot change
+  after import.
+- **`-debug`'s "This server" block lists the server settings changed here**, which everyone
+  can see, so it names server settings only, by the names the card prints (`card_name`):
+  `timezone Europe/London, leave-when-idle 10:00 (2 changed)`, with the card's `not saved`
+  and `bot minimum` labels. A setting still following
+  the bot is left out. It reads `GuildSettings.peek()`, so the snapshot never waits on Redis,
+  and it adds `stored values not read yet` until a read has covered every field: `-debug`
+  is how a Redis outage gets diagnosed, and "none changed" would be false during one.
+- **Two maps, `Literal` keys.** Each accessor's return type is its map's value type, with
+  no `cast`. The keys are `Literal` strings rather than an `Enum` because
+  `importlib.reload(config)` would mint new enum classes, and a registry built before
+  the reload would hold members that fail `isinstance` against them.
+- **Reload.** `importlib.reload(config)` rebinds both maps empty and re-parses every
+  baseline, so a reload drops overrides rather than leaving a captured value stale.
+  A cog reload does not reload `src.config`, so overrides survive
+  `reload_extension("src.musicbot")`.
+
+**Where overrides come from.** `bot:{application_id}:config` (`BotConfigStore`, a mapping
+by `Knob.field`): one hash per application, so a dev bot and a prod bot sharing a
+Redis cannot retune each other. `setup_hook` builds `MusicBotApp.bot_settings` after the
+Redis pool, and after `load_extension` spawns `BotSettings.hydrate_until_read()` without awaiting
+it. Until the read lands, every knob runs on its environment value.
+
+- The read runs under `CONFIG_IO_TIMEOUT_SECS` (2s). A failed or timed-out read logs one
+  WARNING, leaves `hydrated` False and is retried with the guild retry's backoff (1s to
+  60s) until one lands; `on_ready` starts it again only when none is running, which is
+  when the first ran before discord.py set `application_id`. While `unread`, the
+  `-settings bot` card and a bot setting's detail open with a warning, a bot write's reply
+  names nothing as the value it replaced, and `-debug`'s `BOT_SETTINGS_OVERRIDES` row
+  says the stored values are not read yet, since every knob shows its environment value.
+- A stored value outside the registry's current bounds is skipped with a WARNING, never
+  applied and never an abort: the key outlives builds, and a build can change bounds.
+- One INFO lists every override applied, and each override that shadows a **set**
+  environment variable draws a WARNING naming all three ways back: `-settings bot <key>
+  reset`, `just bot-settings reset <application_id>` and `BOT_SETTINGS_OVERRIDES=ignore`.
+- A knob that `apply` or `reset` changed while the read was in flight keeps that value,
+  and so does a knob whose last write or reset did not reach Redis: a read after a
+  failed one would otherwise put the older stored value back.
+
+**Bot writes.** `-settings bot <setting> <value>` and `-settings bot <setting> reset`,
+for the operator alone, go through `BotSettings.write`/`write_reset`: one at a time under
+its write lock, the store call first, under `CONFIG_IO_TIMEOUT_SECS`, then the override,
+so Redis and the process end on the same last write. An unconfirmed store call still
+applies, and the card marks the setting `not saved` until a later write lands. While
+`BOT_SETTINGS_OVERRIDES=ignore` is set, the command refuses before any store call. A server
+write of a key that is also a bot setting (`np-refresh`, `slow-notice`,
+`queue-progress-delay`) stays the server's,
+and the operator's reply names the bot form.
+- Hydration is skipped while `application_id` is None: discord.py sets it in `login()`,
+  before `setup_hook`, so only a bot that never logged in (a unit test) lacks one.
+
+**`debug-default` is session-only.** It is the debug mode a server that never chose
+follows. `BotSettings.apply` keeps it in memory and passes it to
+`DebugSettings.set_default_override`; `DebugSettings._default` stays the `DEBUG_MODE`
+parse, and `default` returns the override when one is set. `cog_load` hands a reloaded
+cog's new `DebugSettings` the value `BotSettings` holds, and a restart builds a new
+`BotSettings`, which starts from `DEBUG_MODE`. It is never written to the bot hash:
+debug mode publishes the whole process's load figures on every embed in every server
+that follows the default, and a stored `on` would keep doing so after the variable was
+deleted.
+
+**Ways back from a harmful stored override without chat.**
+
+- **`BOT_SETTINGS_OVERRIDES=ignore`.** `setup_hook` reads it immediately after
+  `HISTORY_ARCHIVE_ENABLED`, before the Redis pool, so a garbage value refuses startup
+  (`apply`, empty or unset apply what is stored). With `ignore`, hydration never reads
+  the key and logs one WARNING naming it, and `BotSettings.apply` and `reset` refuse
+  every stored setting; `debug-default` is never stored, so it stays settable. The key is
+  left in place: removing the variable and restarting brings its values back.
+- **`just bot-settings`** lists every `bot:*:config` hash on the compose Redis, and
+  `just bot-settings reset <application_id>` deletes one. The running bot keeps its
+  in-memory overrides until it restarts.
+
+**Server settings: stored choice, else registry default.** `guild:{id}:config`
+(`GuildConfig`) holds what a server chose; an absent field means "never chose". Every
+stored numeric value is inside `CONFIG_DOMAIN`, because `GuildConfig.__post_init__`
+reads anything else as unset wherever a `GuildConfig` is built, the legacy `:state`
+volume included. `MusicBot.guild_settings` (`GuildSettings`, `src/settings.py`) caches
+each guild's config and is the only writer of the key.
+
+- **Hot paths never await it.** They read synchronously (`peek`), because the Redis pool
+  has no `socket_timeout` and an awaited read against a stalled Redis would hang the
+  playback loop or a send. `TestHotPathsNeverAwaitSettings` fails an await on
+  `guild_settings` in the hot-path modules, allowing exactly one: restore's SEED write.
+- **Three readers fill the cache.** A restoring player seeds it from the snapshot it
+  already reads (`seed`); `on_ready` hydrates every guild before recovery
+  (`_recover_after_ready` awaits one `hydrate` pass, then spawns the restores, so the
+  pass's batches — one pool connection at a time — finish before the per-guild fan-out
+  reaches the pool's cap; each batch is merged before the next is read, so no stretch
+  between awaits grows with the guild count), with a retry that backs off from 1s to 60s for any guild a
+  failed or timed-out batch left out; and `load` reads one guild on demand,
+  single-flight, for a command. A read that fails caches nothing: an unread guild
+  keeps its current entry and falls back to defaults for what it does not know.
+- **A write on an uncached guild creates a partial entry** holding only that field. The
+  others read as unset, exactly as before the write, and `is_complete` stays False
+  until a read covers every field. Guilds that never chose share one `_EMPTY` entry.
+- **One writer, one order.** `write`, `reset` and `forget` take a per-guild lock
+  (refcounted, dropped when idle), make one store call under `CONFIG_IO_TIMEOUT_SECS`
+  (each field maps to exactly one store method, and a SET passes the bot's
+  `application_id` as the `writer_app_id` stamp), then commit synchronously: stamp,
+  cache, the unpersisted mark, the `debug_mode` projection into `DebugSettings`, and
+  the live player's `volume` or `timezone`. The store call comes before the stamp, so a
+  read resolves either before the commit, which overwrites it, or after, when the stamp
+  makes it skip the field. The live assignment is in the commit because restore's gate
+  reads the stamp. `TestGuildConfigHasOneWriter` fails any other caller of the store's
+  config writers. `persisted=False` means *not confirmed*: a pipeline sends before it
+  reads, so a timed-out write can still land, and the reply says it applies until the
+  bot restarts.
+- **The merge rule** (`seed`, `hydrate`, `load`): nothing for a guild forgotten since
+  the read began; otherwise every field not stamped since it began and not marked
+  unpersisted. An unsaved write keeps its value until a later write reaches Redis,
+  which is what its reply promised.
+- **Stamp pruning.** Stamps and forget marks are compared only with a `started` value
+  from an open `reading()` registration, so each is dropped once it is at or below the
+  lowest open one (or the counter, with none open): an absent stamp compares as never
+  set, which is already the answer for every such read. With no read in flight both
+  maps are empty.
+- **Restore ordering.** `_restore_state` first takes the volume and zone the cache holds,
+  so a player built after a write that did not reach Redis plays that write, as does a
+  player with no store or no readable snapshot. It then registers immediately before
+  its snapshot read and stays registered through the SEED write. `seed`'s accepted set gates the zone,
+  the volume and the legacy migration alike, and the migration re-checks the stamp
+  under the guild's lock, because a `volume reset` can commit while it waits.
+- **Forget.** `on_guild_remove` calls `forget`: a bounded `clear_config`, then the entry,
+  stamps and marks are dropped and the guild is marked forgotten, so a read that began
+  earlier merges nothing and a write queued behind it is refused rather than recreating a
+  no-TTL key.
+
+**The orphan sweep.** A guild removed while the bot is offline raises no
+`on_guild_remove`, and its key has no TTL. Once per process, after the first
+`on_ready`'s restores have all returned, `GuildSettings.sweep_orphans` forgets a key
+only when both hold:
+
+1. **Its guild is not in `bot.guilds`**, checked when the key is listed and again,
+   synchronously, just before its `forget`. At that point the cache is complete:
+   discord.py dispatches `on_ready` only after every shard in `shard_ids` received READY,
+   READY's guild list (unavailable guilds included, as stubs) is cached synchronously, an
+   outage's `GUILD_DELETE` keeps the guild cached, and a reconnect never clears the
+   cache — so a later `on_ready` could find no new orphan, and a stale extra guild errs
+   toward keeping its key.
+2. **Its `writer_app_id` is this application's id.** `guild:{id}:config` carries no
+   application id of its own, and a dev bot and a prod bot can share one Redis, so
+   membership alone would let a dev bot delete the config of every prod guild it is not
+   in. An unstamped key — written by an older build, or by a new build rolled out
+   elsewhere first — is never a candidate. The stamp names the last writer, not every
+   user: in a guild both applications serve, the key is shared like every other
+   `guild:{id}:*` key, so whichever wrote last removes it once it was removed from that
+   guild while offline, as `on_guild_remove` does for a removal seen live.
+
+It is skipped in a process given a subset of shards (`shard_ids` set: it sees a subset of
+guilds) and while `application_id` is None. The listing is a `SCAN` loop with every call
+bounded (a failure deletes nothing and logs one WARNING), the stamps are read in pipelined
+batches, and the deletes run one at a time through `forget` — at most 500 per start,
+stopping at the first unconfirmed DELETE or when the bot closes — ending in one INFO
+counting what was removed, skipped and left. A guild re-added between the re-check and
+its DELETE loses the stale config, the same outcome as a removal the bot saw live.
+
 ## Design Decisions
 
 ### yt-dlp three-phase pipeline
 
-The queue stores lightweight `QueueObject`s rather than fully resolved `YTDL` objects. Full stream extraction is deferred to just before playback so signed YouTube CDN URLs are as fresh as possible when FFmpeg starts. Phase 1's unified single extraction warms both the `ytdl:source` (1 h) and `ytdl:stream` caches in one yt-dlp call at enqueue time — halving YouTube request volume versus the previous search-then-prefetch double extraction — so Phase 2 is almost always a cache read; the Phase 1b eager prefetch covers the entries that skip the unified path (playlist items, requeues).
+The queue stores lightweight `QueueObject`s rather than fully resolved `YTDL` objects. Full stream extraction is deferred to just before playback so signed YouTube CDN URLs are as fresh as possible when FFmpeg starts. For a link, Phase 1's unified single extraction warms both the `ytdl:source` (24 h) and `ytdl:stream` caches in one yt-dlp call at enqueue time, so Phase 2 is a cache read; for a search it warms only `ytdl:source`, and the Phase 1b prefetch performs the stream extraction — as it already does for the entries that skip the unified path (playlist items, requeues). A cold search therefore costs **four** HTTP requests (the search POST; then the watch page, player API and manifest at prefetch) against the unified path's five, since `youtubetab:skip=webpage` removed the homepage fetch both paths used to open with. What doubles is the number of yt-dlp *calls*, not the traffic; time-to-audio on an empty queue is unchanged (0.65 s + 1.86 s against 2.46 s).
 
 ### Keeping `_prefetch_next_song`
 
@@ -1892,9 +2972,9 @@ Every persisted byte is defined in `guild_state.py` as frozen value objects with
 
 `current_song_url` is written when a song begins and deleted when it ends normally; a non-empty value at startup means a mid-song crash. Recovery re-enqueues the song in-memory only (`persisted=False` — it never touches the Redis list, and `redis_pop_for()` skips it) and clears the key immediately, so repeated crash-restart cycles cannot accumulate duplicates. The start transaction (`pop_queue_and_start_song`) makes the LPOP and the state write atomic, closing the historical at-most-once window for normal dequeues too.
 
-### `-playnow` interjection via front-inserted resume entries
+### `-play --now` interjection via front-inserted resume entries
 
-`-playnow` interrupts the current song and hands it back afterward without any new task, timer, or side channel: the parked song becomes an ordinary `is_resume` `SongQueueEntry` LPUSHed to the front of the queue (`put_front`), carrying its `position_secs` as `ts` and its paused state as `start_paused`. The loop replays it through the same `-ss`/seek path any `?t=` song uses, so resume fidelity and crash recovery come for free. The only extra state is `_skip_history_for` (so a parked song is logged to history once, at its resume tail, not twice). Interjections **stack**: a `-playnow` on top of a `-playnow` parks that song too, and the queue unwinds LIFO. One `_skip_history_for` slot is still enough at any depth — each interjection stops exactly one song, and that song's loop iteration consumes the marker before the next `-playnow` can finish resolving. Full design: [PLAYNOW_PROPOSAL.md](PLAYNOW_PROPOSAL.md).
+`-play --now` interrupts the current song and hands it back afterward without any new task, timer, or side channel: the parked song becomes an ordinary `is_resume` `SongQueueEntry` LPUSHed to the front of the queue (`put_front`), carrying its `position_secs` as `ts` and its paused state as `start_paused`. The loop replays it through the same `-ss`/seek path any `?t=` song uses, so resume fidelity and crash recovery come for free. The only extra state is `_skip_history_for` (so a parked song is logged to history once, at its resume tail, not twice). Interjections **stack**: an interjection on top of an interjection parks that song too, and the queue unwinds LIFO. One `_skip_history_for` slot is still enough at any depth — each interjection stops exactly one song, and that song's loop iteration consumes the marker before the next can finish resolving.
 
 ### Persisted `YTSource` entries
 
@@ -1930,8 +3010,20 @@ Discord requires sharding at 2500+ guilds. `AutoShardedBot` negotiates shards au
 
 ### `volatile-lru` eviction policy
 
-With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction candidates — all caches and all `guild:*` runtime keys, every one reconstructible (caches) or re-creatable (runtime state). Three kinds of key are deliberately TTL-less and must never be evicted: `history:outbox`, which holds played-song entries not yet drained to Postgres; `guild:{id}:history`, the capped window `-history` reads and the only source it has; and `guild:{id}:config`, which holds each guild's durable choices, where an eviction is a setting silently reverting with no log line. An `allkeys-*` policy would let memory pressure destroy not-yet-durable history or a guild's settings, which is why the compose file pins the policy with a do-not-change comment.
+With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction candidates — all caches and all `guild:*` runtime keys, every one reconstructible (caches) or re-creatable (runtime state). Four kinds of key are deliberately TTL-less and must never be evicted: `history:outbox`, which holds played-song entries not yet drained to Postgres; `guild:{id}:history`, the capped window `-history` reads and the only source it has; `guild:{id}:config`, which holds each guild's durable choices, where an eviction is a setting silently reverting with no log line; and `bot:{application_id}:config`, the operator's bot-wide overrides, where an eviction returns every overridden knob to its environment value at the next start. An `allkeys-*` policy would let memory pressure destroy not-yet-durable history or a guild's settings, which is why the compose file pins the policy with a do-not-change comment.
 
 ### Two-tier data architecture (Redis + Postgres)
 
-The durable/runtime boundary is drawn once: data a user would miss a week later lives in Postgres (`play_history` now; future stats/preferences); data that only matters to the running player stays in Redis, permanently — the runtime tier is *correctly placed*, not "not yet migrated". Writes cross the boundary through the `history:outbox` Redis **stream**, drained by one background task (replay pending → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL`), so the playback loop keeps Redis-only latency, Postgres downtime buffers instead of losing entries, and the dedup unique index makes at-least-once delivery and backfill idempotent by the same mechanism. **Reads follow the same rule**: `-history` shows the recent window and is served from the capped Redis list alone — see [History read path](#history-read-path) — while `-leaderboard` needs the permanent record and is the archive's one reader. The archive is opt-in and a default deployment collects nothing long-term.
+The durable/runtime boundary is drawn once: data a user would miss a week later lives in Postgres (`play_history`), except preferences, which live in the Redis config hashes (`guild:{id}:config`), non-evictable and written only by explicit commands; data that only matters to the running player stays in Redis, permanently — the runtime tier is *correctly placed*, not "not yet migrated". Writes cross the boundary through the `history:outbox` Redis **stream**, drained by one background task (replay pending → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL`), so the playback loop keeps Redis-only latency, Postgres downtime buffers instead of losing entries, and the dedup unique index makes at-least-once delivery and backfill idempotent by the same mechanism. **Reads follow the same rule**: `-history` shows the recent window and is served from the capped Redis list alone — see [History read path](#history-read-path) — while `-leaderboard` needs the permanent record and is the archive's one reader. The archive is opt-in and a default deployment collects nothing long-term.
+
+### The mock spec cache
+
+`tests/mock_spec_cache.py` memoizes `unittest.mock`'s spec introspection for the whole suite. A spec'd mock spends nearly all its time in `NonCallableMock._mock_add_spec`, which walks `dir(spec)` calling `inspect.getattr_static`, `inspect.unwrap` and `iscoroutinefunction` per attribute; the result depends only on `(spec, _spec_as_instance, _eat_self)`, so it is computed once per class and replayed. `MagicMixin.__init__` is patched alongside it to seed `_mock_methods` before the first `_mock_set_magics()`, so the magic methods a spec forbids are never installed and then deleted. `tests/conftest.py` installs both at import, before collection, so module-level mocks are covered too. Measured on the full suite, it saves about a sixth of the CPU time; that is the wall-clock saving of a serial run (`just test tests/`), while the gate's `-n auto` run saves only a few percent. A spec'd mock costs roughly an order of magnitude less than an unpatched one.
+
+**The operating rule is that a spec class must not be mutated once it has been used as a spec.** The cache answers from the snapshot it took the first time it saw the class, so a `patch.object` or `monkeypatch.setattr` on a spec class makes every later mock of it silently wrong — a child that comes back `AsyncMock` instead of `MagicMock`, or an attribute that raises where the real class allows it. Two mechanisms bound that. `check_for_drift()`, called by a session fixture, compares every entry against its class at the end of the run; it therefore catches a mutation still standing then and **not** one already reverted, which is a real limit and is asserted as one. `MOCK_SPEC_CACHE_STRICT=1` covers the reverted case by re-checking each entry where it is served, raising at that mock and naming the test holding the patch — the cost is the speedup, so it is a debugging mode. A drift line carries the class in the MRO that supplies the attribute and the test that filled the entry, because the session fixture raises during teardown of whichever test happened to run last.
+
+The container tier runs the suite with the cache **off** — `MOCK_SPEC_CACHE_DISABLE=1`, set in the Dockerfile's test stage so the justfile and `ci.yml`, which issue their own `docker run`, cannot drift apart on it. That makes `container-test` a reference run against stock `unittest.mock`: a divergence the guards above do not anticipate surfaces as two jobs disagreeing over the same tests. The cache's own tests skip themselves when it is off and so run in the venv tier alone, which is what keeps both the patched and the unpatched path covered on every push.
+
+A test that must replace an attribute on a spec class can stay payload-neutral by decorating the replacement with `functools.wraps(original)`: `_spec_asyncs` is derived after `inspect.unwrap`, so a wrapped stand-in leaves the entry true. `tests/conftest.py`'s `Spotify` session tracker and `tests/test_musicplayer.py`'s `MusicPlayer.loop` stub both rely on this.
+
+The module patches private CPython internals, so it guards the shapes it reads — both signatures, the exact set of `__dict__` keys `_mock_add_spec` writes, the defaults `mock_add_spec()` relies on, and that the payload is independent of `spec_set` — and declines to install rather than failing the suite when a guard trips or the interpreter is newer than `_VERIFIED_BELOW`. An unpatched run is slower and still correct. `MOCK_SPEC_CACHE_DISABLE=1` switches it off the same way. Because its blast radius is the whole suite, it is the one file outside `src/` that the coverage gate measures.

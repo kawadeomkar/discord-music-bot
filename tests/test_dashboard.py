@@ -14,7 +14,12 @@ import discord
 import pytest
 
 from src import dashboard
-from src.dashboard import embeds_changed, outcome_of, run_live_dashboard
+from src.dashboard import (
+    LiveMessage,
+    embeds_changed,
+    outcome_of,
+    run_live_dashboard,
+)
 
 
 @pytest.fixture
@@ -62,6 +67,27 @@ class TestSafeEdit:
         message = MagicMock(spec=discord.Message)
         message.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
         assert await dashboard.safe_edit(message, _embed("x")) is False
+
+    async def test_any_other_refusal_keeps_the_message_and_logs_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """False means "gone", and a caller that hears it drops its handle and
+        skips the delete: a transient 503 read that way strands the message in the
+        channel for good."""
+        monkeypatch.setattr(dashboard, "_EDIT_FAILURES_LOGGED", set())
+        message = MagicMock(spec=discord.Message)
+        message.id = 991
+        message.edit = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(status=503), "unavailable")
+        )
+
+        with monkeypatch.context() as m:
+            logger = MagicMock()
+            m.setattr(dashboard, "log", logger)
+            assert await dashboard.safe_edit(message, _embed("x")) is True
+            assert await dashboard.safe_edit(message, _embed("y")) is True
+
+        logger.warning.assert_called_once()
 
 
 class TestOutcomeOf:
@@ -635,3 +661,149 @@ class TestLateAndPartialFailures:
         for _ in range(5):
             await asyncio.sleep(0)
         assert not (asyncio.all_tasks() - before)
+
+
+class TestLiveMessage:
+    """The send/edit/floor mechanics on their own. These are ADDITIVE: every
+    run_live_dashboard test above still drives run_live_dashboard, because the
+    composition — the probe loop, _drain, the deadline re-check and the never-leak
+    finally — is what -ping and -debug cannot see and what those tests pin."""
+
+    async def test_finish_flushes_past_the_floor_and_tick_does_not(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The distinction the card's ceiling depends on. Its terminal "Still
+        working" render is the only thing telling a user the card has stopped
+        updating, so it must not be droppable by a floor that has not expired —
+        which is exactly what tick() does with a changed render."""
+        message = mock_ctx.channel.send.return_value
+        renders = iter(range(100))
+        live = LiveMessage(5.0)
+
+        def _render() -> list[discord.Embed]:
+            return [discord.Embed(description=str(next(renders)))]
+
+        await live.start(mock_ctx, _render)
+        assert await live.tick()
+        assert message.edit.await_count == 0  # inside the floor: dropped
+        await live.finish()
+        assert message.edit.await_count == 1  # past it regardless
+
+    async def test_the_floor_holds_after_every_edit_not_just_the_send(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """tick() advances last_edit_at, so a producer moving the render on every
+        tick still edits at most once per floor. Without that line the first edit
+        resets nothing and the floor only ever holds against the SEND — which is
+        one edit per tick for the whole run, on a per-channel budget."""
+        message = mock_ctx.channel.send.return_value
+        renders = iter(range(100))
+        live = LiveMessage(5.0)
+
+        def _render() -> list[discord.Embed]:
+            return [discord.Embed(description=str(next(renders)))]
+
+        await live.start(mock_ctx, _render)
+        # Floor is 5s and no time passes, so every one of these is suppressed.
+        for _ in range(5):
+            assert await live.tick()
+        assert message.edit.await_count == 0
+
+        # Past the floor exactly once: one edit, then the floor holds again.
+        live._last_edit_at -= 10.0
+        assert await live.tick()
+        assert message.edit.await_count == 1
+        for _ in range(5):
+            assert await live.tick()
+        assert message.edit.await_count == 1
+
+    async def test_the_first_render_goes_out_through_channel_send(
+        self, dash_ctx: MagicMock
+    ) -> None:
+        """ctx.channel.send, never ctx.send: MusicContext.send would adopt an
+        edit loop as the Now Playing host."""
+        live = LiveMessage(0.0)
+        await live.start(dash_ctx, lambda: _embed("a"))
+
+        dash_ctx.channel.send.assert_awaited_once()
+        dash_ctx.send.assert_not_called()
+
+    async def test_an_unchanged_render_is_not_edited(self, dash_ctx: MagicMock) -> None:
+        live = LiveMessage(0.0)
+        await live.start(dash_ctx, lambda: _embed("a"))
+
+        assert await live.tick() is True
+        assert await live.tick() is True
+
+        dash_ctx.channel.send.return_value.edit.assert_not_awaited()
+
+    async def test_a_moved_render_is_edited_once_the_floor_has_passed(
+        self, dash_ctx: MagicMock
+    ) -> None:
+        text = "a"
+        live = LiveMessage(0.0)
+        await live.start(dash_ctx, lambda: _embed(text))
+
+        text = "b"
+        assert await live.tick() is True
+
+        dash_ctx.channel.send.return_value.edit.assert_awaited_once()
+
+    async def test_the_floor_suppresses_an_early_edit_and_finish_flushes_it(
+        self, dash_ctx: MagicMock
+    ) -> None:
+        """Discord buckets edits per channel and this one is shared with the NP
+        progress bar, so a moved render waits — but what it would have shown is
+        not lost."""
+        text = "a"
+        live = LiveMessage(60.0)
+        await live.start(dash_ctx, lambda: _embed(text))
+        message = dash_ctx.channel.send.return_value
+
+        text = "b"
+        assert await live.tick() is True
+        message.edit.assert_not_awaited()
+
+        assert await live.finish() is message
+        message.edit.assert_awaited_once_with(embeds=_embed("b"))
+
+    async def test_finish_does_not_edit_when_nothing_moved(
+        self, dash_ctx: MagicMock
+    ) -> None:
+        live = LiveMessage(0.0)
+        await live.start(dash_ctx, lambda: _embed("a"))
+
+        assert await live.finish() is dash_ctx.channel.send.return_value
+        dash_ctx.channel.send.return_value.edit.assert_not_awaited()
+
+    async def test_a_deleted_message_stops_the_caller_and_latches(
+        self, dash_ctx: MagicMock
+    ) -> None:
+        """tick() reporting False is what lets the probe loop bail instead of
+        spending its whole deadline on 404 edits."""
+        text = "a"
+        live = LiveMessage(0.0)
+        await live.start(dash_ctx, lambda: _embed(text))
+        message = dash_ctx.channel.send.return_value
+        message.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
+
+        text = "b"
+        assert await live.tick() is False
+
+        text = "c"
+        assert await live.tick() is False
+        assert await live.finish() is None
+        message.edit.assert_awaited_once()
+
+    async def test_a_send_that_discord_refuses_is_the_callers_to_report(
+        self, dash_ctx: MagicMock
+    ) -> None:
+        """Unguarded on purpose: -ping and -debug render an error embed from it,
+        and the card suppresses it at its own call site."""
+        dash_ctx.channel.send = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(), "no")
+        )
+        live = LiveMessage(0.0)
+
+        with pytest.raises(discord.HTTPException):
+            await live.start(dash_ctx, lambda: _embed("a"))

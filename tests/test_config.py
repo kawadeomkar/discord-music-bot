@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
-from typing import Any
+from typing import Any, Optional, cast
 
 import pytest
 
@@ -30,6 +30,13 @@ from src.config import (
     spotify_enabled,
     using_default_postgres_password,
 )
+
+
+def _parsed(module: ModuleType, name: str) -> float:
+    """What `module` parsed from the environment for `name`: a settable knob's
+    baseline, else the module constant."""
+    knob = module.KNOBS.get(name.lower())
+    return getattr(module, name) if knob is None else knob.baseline
 
 
 class TestSpotifyEnabled:
@@ -400,6 +407,18 @@ class TestFloatEnv:
         with pytest.raises(ValueError, match="KNOB must be >= 0.05"):
             _float_env("KNOB", 1.0, minimum=0.05)
 
+    def test_a_default_under_a_derived_floor_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QUEUE_PROGRESS_MAX_SECS's floor is DELAY + TICK, so raising the tick
+        alone could sink the untouched 300s default beneath it and start a card
+        that is born stalled."""
+        monkeypatch.delenv("KNOB", raising=False)
+        with pytest.raises(
+            ValueError, match="KNOB must be >= 400.0; its default is 300.0"
+        ):
+            _float_env("KNOB", 300.0, minimum=400.0)
+
     @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
     def test_non_finite_is_refused(
         self, raw: str, monkeypatch: pytest.MonkeyPatch
@@ -418,6 +437,145 @@ class TestFloatEnv:
         monkeypatch.setenv("KNOB", raw)
         with pytest.raises(ValueError, match="KNOB must be a number"):
             _float_env("KNOB", 1.0, minimum=0.05)
+
+    def test_above_the_maximum_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", "60.5")
+        with pytest.raises(ValueError, match="KNOB must be <= 60.0"):
+            _float_env("KNOB", 1.0, minimum=1.0, maximum=60.0)
+
+    @pytest.mark.parametrize("raw", ["1.0", "60.0"])
+    def test_both_bounds_are_inclusive(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        assert _float_env("KNOB", 5.0, minimum=1.0, maximum=60.0) == float(raw)
+
+    def test_no_maximum_leaves_the_top_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Optional, so the existing minimum-only knobs keep accepting any finite
+        value above their floor."""
+        monkeypatch.setenv("KNOB", "1e9")
+        assert _float_env("KNOB", 1.0, minimum=0.05) == 1e9
+
+
+class TestPlayBounds:
+    """The two -play knobs, and the floor that keeps them meaningful."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload: fixture teardown runs ahead of monkeypatch's
+        own, so a reload here would re-read the very value under test and raise
+        out of teardown."""
+        import importlib
+
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    def test_defaults(self) -> None:
+        assert config.play_inflight_max.baseline == 16
+        assert config.play_resolve_concurrency.baseline == 2
+
+    @pytest.mark.parametrize("name", ["PLAY_INFLIGHT_MAX", "PLAY_RESOLVE_CONCURRENCY"])
+    def test_zero_is_refused_at_import(
+        self, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        """Floored at 1, and loudly. Zero admits nothing: every -play in every
+        guild declined, or every resolve waiting on a semaphore that never opens,
+        with no error to say why."""
+        import importlib
+
+        monkeypatch.setenv(name, "0")
+        with pytest.raises(ValueError, match=name):
+            importlib.reload(config)
+
+
+class TestEnvFloors:
+    """Knobs refused at import below their floor, so a value that would spin a
+    loop or leave a pool of zero never reaches one."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload, as TestPlayBounds does: teardown runs ahead of
+        monkeypatch's own, so a reload here would re-read the value under test."""
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    @staticmethod
+    def _reload(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        return importlib.reload(config)
+
+    @pytest.mark.parametrize(
+        ("name", "default"),
+        [
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", 3.0),
+            ("STREAM_PROBE_TIMEOUT_SECS", 2.0),
+            ("YTDLP_POOL_WORKERS", 4),
+        ],
+    )
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_is_the_default(
+        self,
+        name: str,
+        default: float,
+        raw: Optional[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, raw)
+        assert _parsed(self._reload(monkeypatch), name) == default
+
+    @pytest.mark.parametrize(
+        ("name", "raw", "message"),
+        [
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", "0.5", ">= 1.0"),
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", "0", ">= 1.0"),
+            ("STREAM_PROBE_TIMEOUT_SECS", "0.05", ">= 0.1"),
+            ("YTDLP_POOL_WORKERS", "0", ">= 1"),
+        ],
+    )
+    def test_outside_the_bounds_refuses_startup(
+        self, name: str, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(name, raw)
+        with pytest.raises(ValueError, match=f"{name} must be {re.escape(message)}"):
+            self._reload(monkeypatch)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "NOW_PLAYING_UPDATE_INTERVAL_SECS",
+            "STREAM_PROBE_TIMEOUT_SECS",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            ("nan", "a finite number"),
+            ("inf", "a finite number"),
+            ("3s", "a number"),
+        ],
+    )
+    def test_non_finite_or_garbage_names_the_variable(
+        self, name: str, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(name, raw)
+        with pytest.raises(ValueError, match=f"{name} must be {message}"):
+            self._reload(monkeypatch)
+
+    def test_a_fractional_worker_count_names_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("YTDLP_POOL_WORKERS", "2.5")
+        with pytest.raises(ValueError, match="YTDLP_POOL_WORKERS must be an integer"):
+            self._reload(monkeypatch)
 
 
 class TestArchiveTunables:
@@ -1148,3 +1306,225 @@ class TestDebugPrometheusUrl:
     def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
         assert debug_prometheus_url() == "http://localhost:9090"
+
+
+class TestBotKnobDeclarations:
+    """The names -settings may override, and what the registry asserts against."""
+
+    def test_every_baseline_is_of_its_knobs_kind(self) -> None:
+        for field, knob in config.KNOBS.items():
+            assert type(knob.baseline) is knob.kind, field
+
+    def test_the_count_knobs(self) -> None:
+        counts = {field for field, knob in config.KNOBS.items() if knob.kind is int}
+        assert counts == {"play_inflight_max", "play_resolve_concurrency"}
+
+    def test_baseline_is_read_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(config._BASELINES, "PING_TICK_SECS", 2.5)
+        assert config.ping_tick_secs.baseline == 2.5
+
+    @pytest.mark.parametrize(
+        ("knob", "floor"),
+        [
+            ("NOW_PLAYING_UPDATE_INTERVAL_SECS", 1.0),
+            ("HEARTBEAT_INTERVAL_SECS", 0.5),
+            ("STREAM_PROBE_TIMEOUT_SECS", 0.1),
+            ("PING_TICK_SECS", 0.05),
+            ("PLAY_INFLIGHT_MAX", 1),
+        ],
+    )
+    def test_floor_is_the_minimum_the_parse_enforced(
+        self, knob: str, floor: float
+    ) -> None:
+        assert config.KNOBS[knob.lower()].floor == floor
+
+
+class TestKnobHandle:
+    """A knob is a handle: the name, the kind and the floor. Its values are held by
+    the module, which is what lets a handle outlive a reload."""
+
+    def test_a_handle_names_its_variable_field_kind_and_floor(self) -> None:
+        knob = config.play_inflight_max
+        assert (knob.env, knob.field) == ("PLAY_INFLIGHT_MAX", "play_inflight_max")
+        assert knob.kind is int
+        assert knob.floor == 1
+        assert config.KNOBS[knob.field] is knob
+
+    def test_every_handle_is_the_module_global_named_as_its_field(self) -> None:
+        assert len(config.KNOBS) == 15
+        for field, knob in config.KNOBS.items():
+            assert getattr(config, field) is knob, field
+
+    def test_a_dependent_floor_reads_the_baselines_it_is_built_from(self) -> None:
+        assert config.queue_progress_max_secs.floor == (
+            config.queue_progress_delay_secs.baseline
+            + config.queue_progress_tick_secs.baseline
+        )
+
+    def test_a_handle_held_across_a_reload_reads_the_reloaded_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The -settings registry holds handles built at its own import, and this
+        suite reloads config under it."""
+        held = config.heartbeat_interval_secs
+        # Read first: a handle that kept what it read would pass a test that only
+        # reads afterwards.
+        assert (held.baseline, held()) == (3.0, 3.0)
+        monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4.0")
+        try:
+            importlib.reload(config)
+            assert held is not config.heartbeat_interval_secs
+            assert held.baseline == 4.0
+            config.heartbeat_interval_secs.set_override(9.0)
+            assert (held(), held.override()) == (9.0, 9.0)
+            held.clear_override()
+            assert config.heartbeat_interval_secs() == 4.0
+        finally:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS")
+            importlib.reload(config)
+
+
+class TestBotKnobOverrides:
+    """The override maps behind -settings bot. Tests set a knob through
+    set_override, which type-checks the value; conftest clears every override after
+    each test."""
+
+    @pytest.mark.parametrize("field", sorted(config.KNOBS))
+    def test_each_knob_returns_the_override_then_the_baseline(self, field: str) -> None:
+        knob = cast(config.Knob[float], config.KNOBS[field])
+        assert knob() == knob.baseline
+        value = knob.kind(knob.baseline + 1)
+        knob.set_override(value)
+        assert (knob(), knob.override()) == (value, value)
+        assert type(knob()) is knob.kind
+        knob.clear_override()
+        assert knob() == knob.baseline
+        assert knob.override() is None
+
+    def test_the_baseline_is_read_at_call_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(config._BASELINES, "PING_TICK_SECS", 2.5)
+        assert config.ping_tick_secs() == 2.5
+
+    def test_an_int_knob_refuses_a_float_and_a_bool(self) -> None:
+        with pytest.raises(TypeError):
+            config.play_inflight_max.set_override(2.5)  # pyright: ignore[reportArgumentType]
+        with pytest.raises(TypeError):
+            config.play_inflight_max.set_override(True)
+        assert config.play_inflight_max.override() is None
+
+    def test_a_float_knob_takes_an_int_as_a_float_and_refuses_a_bool(self) -> None:
+        config.ping_tick_secs.set_override(2)
+        assert type(config.ping_tick_secs()) is float
+        with pytest.raises(TypeError):
+            config.ping_tick_secs.set_override(True)
+
+    def test_no_bounds_are_checked(self) -> None:
+        """The registry owns the bounds; tests drive sub-floor values through here."""
+        config.ping_tick_secs.set_override(0.0)
+        assert config.ping_tick_secs() == 0.0
+
+    def test_an_int_knob_keeps_its_type(self) -> None:
+        config.play_resolve_concurrency.set_override(3)
+        assert type(config.play_resolve_concurrency()) is int
+        assert type(config.play_resolve_concurrency()) is int
+
+    def test_a_reload_drops_every_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both maps are rebound empty and the baselines re-parsed, so no captured
+        value goes stale. An accessor imported by name before the reload still
+        reads the reloaded module."""
+        import importlib
+
+        accessor = config.heartbeat_interval_secs
+        config.heartbeat_interval_secs.set_override(9.0)
+        monkeypatch.setenv("HEARTBEAT_INTERVAL_SECS", "4.0")
+        try:
+            importlib.reload(config)
+            assert config.heartbeat_interval_secs.override() is None
+            assert accessor() == 4.0
+        finally:
+            monkeypatch.delenv("HEARTBEAT_INTERVAL_SECS")
+            importlib.reload(config)
+
+
+class TestBotSettingsOverridesIgnored:
+    @pytest.mark.parametrize(
+        ("raw", "ignored"),
+        [(None, False), ("", False), ("apply", False), (" Ignore ", True)],
+    )
+    def test_the_accepted_values(
+        self, monkeypatch: pytest.MonkeyPatch, raw: Optional[str], ignored: bool
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("BOT_SETTINGS_OVERRIDES", raising=False)
+        else:
+            monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", raw)
+        assert config.bot_settings_overrides_ignored() is ignored
+
+    @pytest.mark.parametrize("raw", ["true", "ignored", "off"])
+    def test_anything_else_raises_naming_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        monkeypatch.setenv("BOT_SETTINGS_OVERRIDES", raw)
+        with pytest.raises(ValueError, match="BOT_SETTINGS_OVERRIDES"):
+            config.bot_settings_overrides_ignored()
+
+
+class TestLivenessInterval:
+    """The touch cadence is refused at import outside 1-60s, so a value that would
+    spin the loop or outlast the HEALTHCHECK's 90s staleness window never runs."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload, as TestPlayBounds does: teardown runs ahead of
+        monkeypatch's own, so a reload here would re-read the value under test."""
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    @staticmethod
+    def _reload(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        return importlib.reload(config)
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_is_the_default(
+        self, raw: Optional[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("LIVENESS_INTERVAL_SECS", raising=False)
+        else:
+            monkeypatch.setenv("LIVENESS_INTERVAL_SECS", raw)
+        assert self._reload(monkeypatch).LIVENESS_INTERVAL_SECS == 15.0
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [("0.5", ">= 1.0"), ("0", ">= 1.0"), ("61", "<= 60.0"), ("90", "<= 60.0")],
+    )
+    def test_outside_the_bounds_refuses_startup(
+        self, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LIVENESS_INTERVAL_SECS", raw)
+        with pytest.raises(
+            ValueError,
+            match=f"LIVENESS_INTERVAL_SECS must be {re.escape(message)}",
+        ):
+            self._reload(monkeypatch)
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [("nan", "a finite number"), ("inf", "a finite number"), ("3s", "a number")],
+    )
+    def test_non_finite_or_garbage_names_the_variable(
+        self, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LIVENESS_INTERVAL_SECS", raw)
+        with pytest.raises(
+            ValueError, match=f"LIVENESS_INTERVAL_SECS must be {message}"
+        ):
+            self._reload(monkeypatch)
