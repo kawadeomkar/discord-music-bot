@@ -57,7 +57,7 @@ matplotlib = { version = "^3.11", optional = true }
 #
 # `--only=` is unaffected by this flag — it selects groups explicitly — so the
 # Dockerfile stages and CI's composite action keep resolving exactly as before.
-tzdata = "^2026.3"
+tzdata = "^2026.4"
 
 # One extra, named by every install path that wants charts. The runtime image is
 # published in both shapes (`:<tag>` with, `:<tag>-slim` without); the test image and
