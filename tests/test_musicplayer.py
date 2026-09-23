@@ -24,7 +24,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_history import GuildHistory
-from src.guild_queue import GuildQueue, RemoveMode
+
+from src.guild_queue import GuildQueue, QueueItem, RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
@@ -40,6 +41,7 @@ from src.guild_state import (
 from src.redis_client import GuildRedisStore
 from src import config, musicplayer
 from src.commands import replay as replay_cmd
+from src.queue_rows import advance_walk, queue_row
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -47,10 +49,8 @@ from src.musicplayer import (
     _STREAM_FAILURE_CIRCUIT,
     _STREAM_PLAY_ATTEMPTS,
     _reached_end,
-    _fmt_eta,
+    fmt_eta,
     _fmt_finish_time,
-    _fmt_total_duration,
-    _requester_mention,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
@@ -248,38 +248,6 @@ class TestOutboxNotifyWiring:
 # ── Formatter helpers ─────────────────────────────────────────────────────────
 
 
-class TestFmtTotalDuration:
-    def test_seconds_only(self) -> None:
-        assert _fmt_total_duration(45) == "45s"
-
-    def test_minutes_and_seconds(self) -> None:
-        assert _fmt_total_duration(185) == "3m 5s"
-
-    def test_hours_minutes_seconds(self) -> None:
-        assert _fmt_total_duration(3723) == "1h 2m 3s"
-
-    def test_zero(self) -> None:
-        assert _fmt_total_duration(0) == "0s"
-
-    def test_exactly_one_hour(self) -> None:
-        assert _fmt_total_duration(3600) == "1h"
-
-    def test_hours_no_minutes_with_seconds(self) -> None:
-        # Regression: 1h 0m 45s previously showed as "1h" (seconds dropped)
-        assert _fmt_total_duration(3645) == "1h 45s"
-
-    def test_hours_and_minutes_no_seconds(self) -> None:
-        assert _fmt_total_duration(3780) == "1h 3m"
-
-
-class TestRequesterMention:
-    def test_returns_mention_when_present(self, mock_author: MagicMock) -> None:
-        assert _requester_mention(mock_author) == mock_author.mention
-
-    def test_returns_unknown_when_none(self) -> None:
-        assert _requester_mention(None) == "Unknown"
-
-
 class TestFmtFinishTime:
     def test_matches_clock_format(self) -> None:
         """PST or PDT: the suffix follows the zone's own abbreviation now, so half
@@ -294,7 +262,7 @@ class TestFmtFinishTime:
         assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
 
     def test_no_uncertainty_prefix(self) -> None:
-        # Unlike _fmt_eta(), a song's own remaining duration is never
+        # Unlike fmt_eta(), a song's own remaining duration is never
         # uncertain — no "~" prefix and no bold markdown wrapping.
         result = _fmt_finish_time(90, ZoneInfo(DEFAULT_TIMEZONE))
         assert not result.startswith("~")
@@ -1618,7 +1586,7 @@ class TestQueueRemoveWithAPrefetch:
         outcome = await music_player.queue_remove("https://yt.com/v=0")
 
         assert outcome.positions == [1]
-        assert [i.webpage_url for i in music_player.queue.display_items()] == [  # pyright: ignore[reportAttributeAccessIssue]
+        assert [i.webpage_url for i in music_player.queue.display_items()] == [
             f"https://yt.com/v={n}" for n in range(1, 8)
         ]
         await asyncio.gather(*list(music_player._background_tasks))
@@ -2056,6 +2024,44 @@ class TestResumeNoticeEmbed:
         """History alone is not a resumption — the queue is what gates the send."""
         music_player.history.restore([HistoryEntry(title="Old Song", played_at=1.0)])
         assert music_player.build_resume_notice_embed(started) is None
+
+    def test_a_hostile_title_cannot_forge_a_link_in_the_notice(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Discord renders markdown in descriptions and field values, so a length
+        cap alone lets a video titled as a masked link post one under the bot's
+        name. A crashed head wins "Left off on"; its history twin is tested below."""
+        hostile = "[FREE NITRO](https://evil.example)"
+        started = QueueObject("https://yt.com/v=s", hostile, mock_author)
+        crashed = QueueObject(
+            "https://yt.com/v=c", hostile, mock_author, persisted=False, ts=10
+        )
+        seed_queue(music_player.queue, crashed)
+
+        embed = music_player.build_resume_notice_embed(started)
+
+        assert embed is not None
+        assert "](https://evil.example)" not in described(embed)
+        left_off = next(f for f in embed.fields if f.name == "Left off on")
+        assert "](https://evil.example)" not in (left_off.value or "")
+
+    def test_a_hostile_history_title_cannot_forge_a_link_either(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The leg reached after a -stop, where the newest history entry stands in
+        for the interrupted song."""
+        hostile = "[FREE NITRO](https://evil.example)"
+        started = QueueObject("https://yt.com/v=s", "Fine Title", mock_author)
+        seed_queue(
+            music_player.queue, QueueObject("https://yt.com/v=q", "Q", mock_author)
+        )
+        music_player.history.restore([HistoryEntry(title=hostile, played_at=1.0)])
+
+        embed = music_player.build_resume_notice_embed(started)
+
+        assert embed is not None
+        last_played = next(f for f in embed.fields if f.name == "Last played")
+        assert "](https://evil.example)" not in (last_played.value or "")
 
     def test_highlight_color_is_orange(
         self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
@@ -2625,7 +2631,7 @@ class TestEtaWalkTo:
 
     def _eta_at(self, mp: MusicPlayer, index: int) -> str:
         now_pst, walk = mp._eta_walk_to(index)
-        return _fmt_eta(
+        return fmt_eta(
             now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
         )
 
@@ -2697,14 +2703,12 @@ class TestEtaWalkTo:
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60),
         )
         now_pst, walk = music_player._queue_eta_seed()
-        _, walk = music_player._format_queue_line(
-            music_player.queue._items[0], 1, now_pst, walk
-        )
-        expected_line, _ = music_player._format_queue_line(
+        walk = advance_walk(walk, music_player.queue._items[0])
+        expected_line = queue_row(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
             2,
-            now_pst,
-            walk,
+            now=now_pst,
+            walk=walk,
         )
         assert self._eta_at(music_player, 2) in expected_line
 
@@ -2748,7 +2752,7 @@ class TestPlaylistFacts:
         assert first == "Total Duration: **10m**  ·  Songs ahead: **2**"
         now_pst, walk = music_player._eta_walk_to(3)
         eta = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
-        assert second == f"Est. playing at {_fmt_eta(eta, walk.uncertain)}"
+        assert second == f"Est. playing at {fmt_eta(eta, walk.uncertain)}"
         assert not second.startswith("Est. playing at ~")
 
     def test_a_lazy_track_ahead_makes_the_start_time_approximate(
@@ -2768,6 +2772,124 @@ class TestPlaylistFacts:
         facts = music_player.playlist_facts(ahead=0, runtime=(600, False))
         assert "Songs ahead" not in facts
         assert "Est. playing at" in facts
+
+    def test_a_card_whose_rows_carry_the_times_asks_for_none(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        facts = music_player.playlist_facts(ahead=0, runtime=(600, True), eta=False)
+        assert facts == "Total Duration: **~10m**"
+
+
+def _album_track(n: int, secs: int) -> YTSource:
+    return YTSource(
+        ytsearch=f"ytsearch:Track {n} Artist",
+        requester_id=4242,
+        title=f"Track {n}",
+        uploader="Artist",
+        duration=secs,
+        webpage_url=f"https://open.spotify.com/track/{n}",
+    )
+
+
+def _card_rows(mp: MusicPlayer, tracks: Sequence[QueueItem], *, ahead: int) -> str:
+    """What enqueue_playlist builds: ONE slot read, then the rows from it. The
+    card's "Songs ahead" is derived from the same read."""
+    return mp.queued_rows(tracks, first=mp.queued_slot(tracks, ahead=ahead))
+
+
+class TestQueuedRows:
+    """The rows a queued-collection card lists: -queue's own, for the slots the
+    tracks took."""
+
+    def test_rows_are_numbered_by_the_slot_each_track_took(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        ahead = QueueObject("https://yt.com/v=1", "Ahead", mock_author, duration=60)
+        tracks = [_album_track(1, 100), _album_track(2, 200)]
+        seed_queue(music_player.queue, ahead, *tracks)
+
+        first, second = _card_rows(music_player, tracks, ahead=1).split("\n")
+
+        assert first.startswith("`2` [**Track 1**](https://open.spotify.com/track/1)")
+        assert second.startswith("`3` [**Track 2**]")
+        # One line each: on the card every row would repeat one requester.
+        assert "<@4242>" not in first
+
+    def test_the_times_continue_from_the_songs_ahead(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        ahead = QueueObject("https://yt.com/v=1", "Ahead", mock_author, duration=60)
+        tracks = [_album_track(1, 100), _album_track(2, 200)]
+        seed_queue(music_player.queue, ahead, *tracks)
+
+        first, second = _card_rows(music_player, tracks, ahead=1).split("\n")
+
+        now_pst, walk = music_player._eta_walk_to(2)
+        start = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        assert f"Est. playing at {fmt_eta(start, False)}" in first
+        # Behind a Spotify length, which is an estimate.
+        later = start + datetime.timedelta(seconds=100)
+        assert f"Est. playing at {fmt_eta(later, True)}" in second
+
+    def test_they_are_the_rows_queue_shows_for_the_same_tracks(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        tracks = [_album_track(1, 100), _album_track(2, 200)]
+        seed_queue(music_player.queue, *tracks)
+
+        card = _card_rows(music_player, tracks, ahead=0).split("\n")
+        queue = described(music_player.queue_embed())
+
+        for row in card:
+            assert row in queue
+
+    def test_the_slot_is_where_the_track_is_not_where_the_insert_expected(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """`ahead=0` promises the first slot, but the track landed behind an item
+        -queue still lists, so the row numbers from where the track IS."""
+        claimed = QueueObject("https://yt.com/v=1", "Claimed", mock_author, duration=60)
+        tracks = [_album_track(1, 100)]
+        seed_queue(music_player.queue, claimed, *tracks)
+
+        assert _card_rows(music_player, tracks, ahead=0).startswith("`2` ")
+
+    def test_the_slot_is_found_by_identity_not_by_equality(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A playlist holding the same track twice queues two EQUAL YTSources. An
+        equality lookup returns the first one's slot for both, so the second block
+        of rows would be numbered from the first block's position."""
+        first, second = _album_track(1, 100), _album_track(1, 100)
+        assert first == second and first is not second
+        seed_queue(music_player.queue, first, second)
+
+        assert _card_rows(music_player, [first], ahead=0).startswith("`1` ")
+        assert _card_rows(music_player, [second], ahead=0).startswith("`2` ")
+
+    def test_a_collection_a_clear_already_took_renders_from_the_depth_it_saw(
+        self, music_player: MusicPlayer
+    ) -> None:
+        rows = _card_rows(music_player, [_album_track(1, 100)], ahead=6)
+        assert rows.startswith("`7` ")
+
+    def test_past_ten_tracks_the_rest_are_counted(
+        self, music_player: MusicPlayer
+    ) -> None:
+        tracks = [_album_track(n, 60) for n in range(14)]
+        seed_queue(music_player.queue, *tracks)
+
+        rows = _card_rows(music_player, tracks, ahead=0).split("\n")
+
+        assert len(rows) == 11
+        assert rows[-1] == "*... and 4 more*"
+
+    def test_nothing_queued_is_no_rows(self, music_player: MusicPlayer) -> None:
+        assert _card_rows(music_player, [], ahead=0) == ""
 
 
 class TestBuildNowPlayingEmbed:
@@ -7119,7 +7241,7 @@ class TestPrefetchedHeadIsShownResolved:
 
 class TestQueueEntryCard:
     """The block's "Up next" and the -play confirmation are one renderer. The
-    -queue page keeps _format_queue_line: a row and a card are different jobs."""
+    -queue page keeps queue_rows.queue_row: a row and a card are different jobs."""
 
     @staticmethod
     def _next_up_body(mp: MusicPlayer) -> str:
@@ -7183,7 +7305,7 @@ class TestQueueEntryCard:
         )
         seed_queue(music_player.queue, item)
 
-        assert "Starts at `83s`" in self._next_up_body(music_player)
+        assert "Starts at `1:23`" in self._next_up_body(music_player)
 
     def test_placeholders_for_unknown_duration_and_uploader(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -7211,6 +7333,62 @@ class TestQueueEntryCard:
         assert "[x](http://evil)" not in body
         assert "](https://yt.com/v=1)" in body
         assert body.count("](") == 1
+
+    def test_an_unresolved_track_renders_the_fields_it_was_queued_with(
+        self, music_player: MusicPlayer
+    ) -> None:
+        seed_queue(
+            music_player.queue,
+            YTSource(
+                ytsearch="ytsearch:DNA. Kendrick Lamar",
+                process=True,
+                requester_id=4242,
+                title="DNA.",
+                uploader="Kendrick Lamar",
+                duration=185,
+                webpage_url="https://open.spotify.com/track/abc",
+            ),
+        )
+
+        lines = self._next_up_body(music_player).split("\n")
+        assert lines[0] == "Requested by: [<@4242>]"
+        assert lines[1] == "[**DNA.**](https://open.spotify.com/track/abc)"
+        assert lines[2] == "Artist: Kendrick Lamar  ·  Duration: `3:05`"
+        assert lines[3].startswith("Est. playing at ")
+
+    @pytest.mark.parametrize(
+        "missing,expected",
+        [
+            ("webpage_url", "**DNA.**"),
+            ("uploader", "Artist: Unknown  ·  Duration: `3:05`"),
+            ("duration", "Artist: Kendrick Lamar  ·  Duration: `?:??`"),
+            ("requester_id", "Requested by: [Unknown]"),
+        ],
+    )
+    def test_an_unresolved_track_falls_back_field_by_field(
+        self, music_player: MusicPlayer, missing: str, expected: str
+    ) -> None:
+        """Spotify answers without a duration for a local file, without a link for
+        one too, and the row is built from whatever the walk got. Each field falls
+        back on its own; the happy path above covers none of them."""
+        fields: dict[str, object] = {
+            "requester_id": 4242,
+            "title": "DNA.",
+            "uploader": "Kendrick Lamar",
+            "duration": 185,
+            "webpage_url": "https://open.spotify.com/track/abc",
+        }
+        fields[missing] = None
+        seed_queue(
+            music_player.queue,
+            YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", process=True, **fields),  # pyright: ignore[reportArgumentType]
+        )
+
+        body = self._next_up_body(music_player)
+        assert expected in body
+        # Whatever is missing, the entry is still named and still placed.
+        assert "DNA." in body and "Est. playing at " in body
+        assert "resolving..." not in body
 
     def test_unresolved_ytsource_renders_resolving(
         self, music_player: MusicPlayer
@@ -7240,7 +7418,7 @@ class TestQueueEntryCard:
         # Derived from the SEED, not from _eta_walk_to — an expectation computed
         # by the code under test moves with it and asserts nothing.
         now_pst, seed = music_player._queue_eta_seed()
-        expected = _fmt_eta(
+        expected = fmt_eta(
             now_pst + datetime.timedelta(seconds=seed.cumulative_secs + 1200),
             seed.uncertain,
         )
@@ -12244,8 +12422,8 @@ class TestAnnounceResume:
 
 
 class TestStartOffsetAnnounce:
-    """The "Starting song at Xs" notice for a `?t=` link. Sent by YTDL.yt_stream at
-    construction until this branch, which announced under the wrong song."""
+    """The "Starting song at 1:30" notice for a start offset, whether a link's
+    `?t=` or a `--timestamp` set it."""
 
     async def test_wording(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
@@ -12253,7 +12431,7 @@ class TestStartOffsetAnnounce:
         live_song.start_offset = 90
         await music_player._announce_start_offset(live_song)
         embed = mock_channel.send.call_args.kwargs["embed"]
-        assert "Starting song at 90 seconds" in embed.description
+        assert "Starting song at 1:30" in embed.description
 
     async def test_send_failure_swallowed(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
@@ -12308,36 +12486,6 @@ class TestStartOffsetAnnounce:
         assert "🐞" in (embed.footer.text or "")
 
 
-class TestRemainingSecs:
-    def test_normal_item_full_duration(self, queue_obj: QueueObject) -> None:
-        from src.musicplayer import _remaining_secs
-
-        assert _remaining_secs(queue_obj) == 210
-
-    def test_resume_entry_counts_only_tail(self, mock_author: MagicMock) -> None:
-        from src.musicplayer import _remaining_secs
-
-        item = QueueObject(
-            "https://yt.com/v=1", "T", mock_author, ts=150, duration=210, is_resume=True
-        )
-        assert _remaining_secs(item) == 60
-
-    def test_unknown_duration_is_none(self, queue_obj_no_meta: QueueObject) -> None:
-        from src.musicplayer import _remaining_secs
-
-        assert _remaining_secs(queue_obj_no_meta) is None
-
-    def test_non_resume_ts_does_not_shrink_duration(
-        self, mock_author: MagicMock
-    ) -> None:
-        # A ?t= start offset is a playback preference, not a shorter song —
-        # only resume entries are known to play just their tail.
-        from src.musicplayer import _remaining_secs
-
-        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=150, duration=210)
-        assert _remaining_secs(item) == 210
-
-
 class TestResumeEntryDisplay:
     async def test_queue_embed_shows_resume_note(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -12354,13 +12502,15 @@ class TestResumeEntryDisplay:
         embed = music_player.queue_embed()
         assert "⏮ resumes at `2:30`" in described(embed)
 
-    async def test_plain_ts_note_unchanged(
+    async def test_a_plain_start_offset_renders_as_a_clock(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=30, duration=210)
+        """The same format as its is_resume twin two lines up, and as the bar,
+        the presence and every other duration."""
+        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=90, duration=210)
         await music_player.queue.put([item])
         embed = music_player.queue_embed()
-        assert "starts at `30s`" in described(embed)
+        assert "starts at `1:30`" in described(embed)
 
 
 class TestEstimatedFinishUsesRemaining:
@@ -14242,41 +14392,6 @@ class TestGuildTimezoneOnRestore:
         music_player.timezone = ZoneInfo("Europe/London")
         rendered = _fmt_finish_time(90, music_player.timezone)
         assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
-
-
-class TestQueueLinesCannotForgeALink:
-    """`_format_queue_line` renders the title inside a masked link's LABEL, and
-    yt-dlp titles are uploader-chosen. An unbalanced `]` closes the label early
-    and re-points the link at whatever the title puts after it — under the bot's
-    name, in a message a member only had to get queued to trigger.
-
-    This was the inconsistency the -remove work introduced: its own Songs field
-    escaped, and the queue embed it sends 30ms later did not."""
-
-    def test_a_hostile_title_cannot_close_the_label(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        item = QueueObject(
-            "https://yt.com/v=1",
-            "Song](https://evil.example) [FREE NITRO",
-            mock_author,
-            duration=100,
-        )
-        now, walk = music_player._queue_eta_seed()
-        line, _ = music_player._format_queue_line(item, 1, now, walk)
-        assert "](https://evil.example)" not in line
-        assert "[FREE NITRO" not in line
-        # The real destination is still the one the queue holds.
-        assert "](https://yt.com/v=1)" in line
-
-    def test_an_unresolved_search_is_sanitized_too(
-        self, music_player: MusicPlayer
-    ) -> None:
-        """The resolving line renders user-typed text straight into a description."""
-        item = YTSource(ytsearch="ytsearch:[click](https://evil.example)", process=True)
-        now, walk = music_player._queue_eta_seed()
-        line, _ = music_player._format_queue_line(item, 1, now, walk)
-        assert "[" not in line and "](" not in line
 
 
 class TestRetiredFlag:

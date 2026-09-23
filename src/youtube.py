@@ -24,7 +24,7 @@ from opentelemetry.trace import StatusCode
 from src import config
 from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
-from src.sources import is_mix
+from src.sources import is_link, is_mix
 from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
@@ -760,21 +760,13 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
         )
 
 
-def _looks_like_url(query: str) -> bool:
-    """Whether a resolve input is a link rather than words to search with. One
-    predicate, because two places branch on it and they must agree: the cache key
-    (a link's is not case-folded) and the revalidation (a link's mapping cannot
-    drift)."""
-    return "://" in query.strip()
-
-
 def _source_cache_key(search: str) -> str:
     """The ytdl:source key for a query. Case-folded so "Destiny" and "destiny " reach
-    one entry — but never for a URL: YouTube video ids are case-sensitive, so `?v=aB`
-    and `?v=Ab` would share an entry and the second would be served the first's song
-    for the whole TTL."""
+    one entry — but never for a link, scheme-less or not, as parse_url reads one:
+    YouTube video ids are case-sensitive, so `?v=aB` and `?v=Ab` would share an entry
+    and the second would be served the first's song for the whole TTL."""
     query = search.strip()
-    return f"ytdl:source:{query if _looks_like_url(query) else query.lower()}"
+    return f"ytdl:source:{query if is_link(query) else query.lower()}"
 
 
 def _source_entry_is_stale(cached: Any) -> bool:
@@ -2127,7 +2119,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
                 stale = _source_entry_is_stale(cached)
                 trace.get_current_span().set_attribute("ytdl.source_stale", stale)
-                if stale and not _looks_like_url(search):
+                if stale and not is_link(search.strip()):
                     # Served now, refreshed behind the reply: what ages is the
                     # ranking a search resolved through, and a link's mapping is
                     # the link. Not awaited — this play uses the entry it has.

@@ -5,12 +5,13 @@ paths:
   - "src/play_placement.py"
   - "src/play_pipeline.py"
   - "src/queue_progress.py"
+  - "src/queue_rows.py"
   - "src/musicbot.py"
   - "src/main.py"
   - "src/util.py"
   - "src/commands/{clear,join,jump,now,pause,play,queue,remove,replay,resume,shuffle,skip,stop,volume}.py"
   - "src/commands/_common.py"
-  - "tests/test_{musicplayer,guild_queue,play_placement,play_pipeline,queue_progress,musicbot,main,util}.py"
+  - "tests/test_{musicplayer,guild_queue,play_placement,play_pipeline,queue_progress,queue_rows,musicbot,main,util}.py"
   - "tests/commands/test_{clear,join,now,pause,play,queue,remove,replay,resume,shuffle,skip,stop,volume}.py"
 ---
 
@@ -32,8 +33,12 @@ three separate phases so queueing is instant and songs start with near-zero late
   │ validate_commands: author must be in a usable voice channel
   ▼
 play():
-  ├─ split_play_args: strips a LEADING --now / --next off the argument (PlayMode);
-  │        a near-miss like -now becomes a hint, not a search for "now <url>"
+  ├─ split_play_args: strips a LEADING RUN of options off the argument, one per
+  │        _PLAY_OPTIONS field (--now/--next share `mode`, so they exclude each
+  │        other; --timestamp <time> sets its own), in any order. The parser names
+  │        no option — the registry drives parsing, refusals and the
+  │        did-you-mean. A near-miss like -now becomes a hint, not a search for
+  │        "now <url>"; a repeat, a conflict or an unreadable value queues nothing
   ├─ PlayRegistry.register: admit to the guild's in-flight set (PLAY_INFLIGHT_MAX,
   │        default 16, declined past it), snapshot the queue generation. Requests
   │        resolve CONCURRENTLY; only the insert is serialized — see .place()
@@ -41,8 +46,15 @@ play():
   │      • --now                     → interrupt, park a resume tail (resume_paused=True)
   │      • plain -play + PAUSED song → same flow, resume_paused=False ("-play means play")
   │      • --next                    → NOT here: it never interrupts, paused or not
-  ├─ parse_input (sources.py): single word → parse_url (youtube/spotify/soundcloud/
-  │        any dotted domain → URLSource.OTHER, handed raw to yt-dlp); else ytsearch
+  ├─ parse_input (sources.py): one token once Discord's wrappers are off → parse_url, a
+  │        linear, anchored link test (youtube/spotify/soundcloud; any other http(s)
+  │        host → URLSource.OTHER for yt-dlp; a Spotify link that names nothing
+  │        playable raises UnsupportedSpotifyLinkError before any join); else ytsearch.
+  │        is_link is the one link-or-text verdict. docs/ARCHITECTURE.md#source-resolution
+  ├─ --timestamp given? start_offset_refusal reads the PARSED source, so a
+  │        collection naming no track is answered before the join. Applied in
+  │        queue_source (beating the link's own t=), then past_end_refusal on the
+  │        resolved duration — after the join, so the cold start is torn back down
   ├─ placement (Placement enum — the insert position, decided separately from
   │        cold_start, which also drives the analytics shortcut and the join dance):
   │      • disconnected              → COLD_FRONT
@@ -81,7 +93,7 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   behind it is a network round trip. Everything that reads that cache joins the
   same job through `_stream_cache_get`, so nothing extracts the URL twice.
   See docs/ARCHITECTURE.md#resolve-mode and #warming-the-stream-cache.
-  Spotify track → title search; Spotify playlist → titles → YTSource ytsearch
+  Spotify track → title search; Spotify album/playlist → titles → YTSource ytsearch
   entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
   QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
   playlists, so a 10,000-track paste yields to the event loop between chunks).
@@ -283,7 +295,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
   casefolds — folding a link would let one Spotify playlist's base62 id match another's.
 
-### `-play --now` / `--next` placement, interjection and resume entries
+### `-play --now` / `--next` / `--timestamp` placement, interjection and resume entries
 
 `MusicPlayer.interject(qobj, vc, resume_paused)` implements "play this now, then put the
 interrupted song back where it was":
@@ -363,7 +375,8 @@ per-tick-varying footer would edit the board until its deadline (which is why th
 suffix omits elapsed-ms).
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
-10-embed cap; worst case here is 4, a playlist card under its unavailable-songs notice), then `_adopt_np_host_if_current` makes that message
+10-embed cap; worst case here is 5, a collection card under its unavailable-songs and
+short-walk notices), then `_adopt_np_host_if_current` makes that message
 the new host and retires the previous one (dedicated NP message → deleted; command
 response → strip-edited back to its own embeds). Attaching at send time makes response +
 block one atomic message, so the bar is never momentarily buried. Song end: host is
@@ -433,6 +446,14 @@ can spend the whole placement budget before the insert begins.
 
 ## Recipes
 
+**The listing row**: every LISTING of queue items goes through `src/queue_rows.py` —
+`queue_embed` and `queued_rows` (the queued album/playlist cards). The single-entry "Up
+next" and "Queued song" cards are a separate renderer reading the same fields, so a
+change to the row format is not automatically a change to them. A new surface that lists
+queue items calls `queue_rows`, never its own format; an unresolved search renders from
+`YTSource`'s display fields, so a new kind of lazy entry sets those rather than teaching
+the formatter a new type. See `docs/ARCHITECTURE.md#queue-rows`.
+
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
@@ -460,6 +481,18 @@ needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
 `_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song` / `from_crashed_state`**, or a
 crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
 back `None` on the one song that was playing).
+
+**Add a SEARCH-entry field** (a field on an unresolved `YTSource`, e.g. a listing's display
+fields) — a different checklist, and the step that differs is the one upgrades depend on:
+`YTSource` field with an `Optional` default → `SearchQueueEntry` field with the same
+default → `SearchQueueEntry.from_ytsource` → `to_redis`, written **only when the value is
+not None**, never as a flat table entry → `parse_queue_entry` with `.get` →
+`GuildQueue._rehydrate` → a golden-bytes test beside `_GOLDEN_YTSOURCE`. The when-known
+write is what keeps an entry queued by the previous build byte-identical, and LREM matches
+these entries by their exact bytes: write the key unconditionally and every `-remove` and
+`-clear` misses on every entry already in Redis, each one then rewriting the whole list
+under the bulk mutex. Nothing here goes near `YTDL`: a search has no playing-song form
+until it resolves, and resolution builds a fresh `QueueObject`.
 
 **Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
 the loop() bookkeeping comments first; every claim, release, and Redis

@@ -14,8 +14,9 @@ from discord.ext import commands
 import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_state import Analytics, HistoryEntry
-from src.musicbot import MusicBot
+from src.musicbot import MusicBot, SpotifyDisabledError
 from src.play_placement import check_voice_permissions, play_takes_the_queue
+from src.sources import UnsupportedSpotifyLinkError
 from src.spotify import SpotifyAuthError
 from tests.helpers import (
     described,
@@ -93,6 +94,22 @@ class TestCommandErrorRendering:
         assert detail == err.user_message
         assert "SpotifyPlaylistTooSlowError" not in detail
 
+    async def test_an_unsupported_spotify_link_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.sources import UnsupportedSpotifyLinkError
+
+        err = UnsupportedSpotifyLinkError("album")
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        assert call.args[2] == err.user_message
+        assert "UnsupportedSpotifyLinkError" not in call.args[2]
+
     async def test_a_stalled_spotify_page_renders_the_other_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -107,6 +124,30 @@ class TestCommandErrorRendering:
 
         assert (call := send_embed.await_args) is not None
         assert call.args[2] == err.user_message
+
+    @pytest.mark.parametrize(
+        "err",
+        [
+            UnsupportedSpotifyLinkError("Spotify 'artist' links aren't supported."),
+            SpotifyAuthError(401, "endpoint: https://api.spotify.com/v1/albums/x"),
+            SpotifyDisabledError(SpotifyStatus.DISABLED),
+        ],
+        ids=["unsupported-link", "rejected-credentials", "spotify-disabled"],
+    )
+    async def test_a_spotify_link_failure_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, err: Any
+    ) -> None:
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == err.user_message
+        assert type(err).__name__ not in detail
+        assert "api.spotify.com" not in detail
 
     async def test_a_plain_exception_still_renders_type_and_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock

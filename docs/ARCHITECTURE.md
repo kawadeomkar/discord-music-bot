@@ -22,6 +22,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
    - [Now Playing Host Model](#now-playing-host-model)
+   - [Queue rows](#queue-rows)
    - [Queue progress card](#queue-progress-card)
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
@@ -253,8 +254,8 @@ graph TD
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
 | `youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
-| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`. |
-| `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
+| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track, playlist or album), or `SoundcloudSource`; a Spotify link of any other type, or with no id, raises `UnsupportedSpotifyLinkError`. `is_link` is the one link-or-text verdict every other caller asks. |
+| `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `album`, `artists`, `albums` methods with per-type Redis cache TTLs. |
 | `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Its config methods: `read_config` (None when the read failed, so it stays apart from a guild that never chose), the dedicated `set_volume`/`migrate_volume` (both refuse a volume outside `CONFIG_DOMAIN`), `set_debug_mode` and `set_timezone`, the generic `update_config` (refuses those three fields and an empty config), `reset_config_fields` and `reset_volume` (both copies, one MULTI); each setter stamps `writer_app_id` when passed `writer=`. Every config reader, `get_playback_snapshot` and the batch readers included, reads a key that is not a hash as unset rather than as a failed read: no later read can change it, so a failure would be retried, and reported unreadable, for good. `BotConfigStore` is the same shape for `bot:{application_id}:config` — `read_config`, `update_config`, `reset_config_fields` — on `@_bot_op`, `_guild_op`'s sibling. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `iter_guild_configs` (pipelined, chunked, one dict per batch, which `GuildSettings.hydrate` merges before reading the next — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose"; one guild's error reply omits that guild alone, with one WARNING per batch rather than per guild), `read_config_writers` (the stamps, on the same contract), `scan_guild_config_ids` (a bounded `SCAN`, None on any failure) and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
 | `analytics_card.py` | `-analytics`'s window allowlist (`{7, 30, 90, 365}` — see [Analytics rendering](#analytics-rendering)), `AnalyticsFlags`, both Redis cache codecs (the orjson aggregate and the PNG's aggregate-digest key), and the embed renderer. Pure, like `leaderboard.py`, and named `_card` because `guild_state.Analytics` already exists. **Every human-authored string the command shows is rendered here**, never in the image. |
@@ -278,7 +279,7 @@ graph TD
 | `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song) |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
 | `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — an unresolved YouTube item |
-| `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`), `id` |
+| `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; `QueueItem = Union[QueueObject, YTSource]` is the live-item type |
 | `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the interjection fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the ask-time analytics `queued_at` / `queue_position` (flat on the wire; grouped as `Analytics` in memory), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the playlist link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither. A `SearchQueueEntry` also carries `requester_id`, written only when known: the track resolves at dequeue, when `_last_author` is whoever ran a command most recently, so `MusicPlayer._resolve_requester` looks the stored ID up (member, else user cache) and falls back to `_last_author` only for an entry queued before the field existed |
@@ -298,7 +299,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 
 | Command | Aliases | Arguments | Description |
 |---|---|---|---|
-| `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/playlist, or SoundCloud URL. Joins voice first if not connected. |
+| `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/album/playlist, or SoundCloud URL. Joins voice first if not connected. |
 | `-play --now` | — | `url` | Interject a song **immediately**, parking the current one to resume from its exact position afterward. Behaves as a plain `-play` when nothing is live. A playlist comes in full: its head interrupts and the rest queue behind it, so the parked song returns only after the last track. See [-play --now Interjection](#-play---now-interjection). |
 | `-play --next` | — | `url` | Front-insert without interrupting: the song plays when the current one ends. A playlist front-inserts in full, in order. Identical to a plain `-play` when nothing is queued, since a front insert into an empty queue *is* an append. Goes through `MusicPlayer.queue_put_next`, which neutralizes the loop's prefetch first — a bare `put_front` lands behind the prefetch's open claim and the song plays second. |
 | `-skip` | `sk` | — | Stop the current song and advance to the next. |
@@ -309,7 +310,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
-| `-remove` | `rm` | `<link or search text>` | Remove **all** queued songs matching, by the resolved yt-dlp URL **or** by what the user originally typed — a search term or a source link, so one playlist link takes back out every track it added. Reports the removed positions and names which of the two matched. Consume-rest, so a multi-word search works. Without an argument, prints usage. |
+| `-remove` | `rm` | `<link or search text>` | Remove **all** queued songs matching, by the resolved yt-dlp URL **or** by what the user originally typed — a search term or a source link, so one album or playlist link takes back out every track it added. Reports the removed positions and names which of the two matched. Consume-rest, so a multi-word search works. Without an argument, prints usage. |
 | `-now` | `np`, `rn`, `nowplaying` | — | Display the now-playing embed, rebuilt live for the current song. |
 | `-queue` | `q` | — | Display the next 10 songs with per-song ETA. |
 | `-history` | `h` | `[--limit N]` | Display the last N played songs (default 10, max 50). Served from the capped Redis list alone, in both archive modes — see [History read path](#history-read-path). |
@@ -342,11 +343,14 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | YouTube watch URL | `https://youtube.com/watch?v=...` | `YTSource(process=False)` → `yt_source` (unified full extraction — the `process` field is parse metadata only). A link never resolves flat: its cost is the watch page, which nothing skips without failing YouTube's bot check |
 | YouTube short URL | `https://youtu.be/...` | `YTSource(process=False)` |
 | YouTube URL with timestamp | `?t=120` | `YTSource(ts=120)` → seeks via FFmpeg `-ss` |
+| `--timestamp` / `-ts` flag | `-p -ts 1:32 <url\|search>` | A leading option, taken off by `split_play_args` before `parse_input` sees it, so the origin `-remove` matches on is the song alone. `parse_start_offset` accepts the clock form (`1:32`, `2:04:30`) on top of everything `t=` takes — a second parser, so widening the flag cannot change what a pasted `?t=` means. Applied in `queue_source`, and the only start offset a search, a Spotify track or a SoundCloud link can carry. Beats the link's own `t=` (`effective_start_offset`), is refused at or past the resolved song's duration, and is refused for a collection that names no track (`start_offset_refusal`) |
 | YouTube playlist URL | `.../playlist?list=...`, or any `watch?v=…&list=…` | `YTSource(type=PLAYLIST, list_id=...)` → `YTDL.yt_playlist` (flat extraction) → N `QueueObject`s. `_YTDL_PLAYLIST_OPTS` uses `extract_flat="in_playlist"`, not `True`: a watch URL resolves to a `url_result` pointing at the playlist, and `True` stops at it with no entries |
-| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
+| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link — or a `--timestamp` beside it — applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
 | YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` → `yt_source(flat=True)` for an ordinary placement: one search POST for identity, the stream URL extracted later by the enqueue prefetch |
 | Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
 | Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist()` → N `YTSource` search items |
+| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(ALBUM)` → `Spotify.album()` → N `YTSource` search items |
+| Any other Spotify link | `https://open.spotify.com/artist/...`, a type with no id, an id that is not base62 | `UnsupportedSpotifyLinkError` — never a `ValueError`, which `parse_input` would turn into a YouTube search for the link. A leading `/intl-xx/` locale segment is dropped first |
 | SoundCloud URL | `https://soundcloud.com/...` | `SoundcloudSource` → yt-dlp directly |
 
 ---
@@ -483,8 +487,8 @@ sequenceDiagram
     Bot->>Sources: parse_input(url)
     Sources-->>Bot: YTSource | SpotifySource | SoundcloudSource
 
-    alt Spotify playlist
-        Bot->>SP: spotify.playlist(id) → SpotifyPlaylist, its titles
+    alt Spotify album / playlist
+        Bot->>SP: spotify.album(id) / spotify.playlist(id) → SpotifyPlaylist, its titles
         Bot->>Sources: spotify_playlist_to_ytsearch(titles) → List[YTSource]
         Bot->>MP: queue_put(items, prefetch=False)
     else YouTube playlist
@@ -641,32 +645,72 @@ disconnected client.
 
 ### Source Resolution
 
-`parse_input` / `parse_url` in `sources.py` classify the raw input string:
+`parse_input` / `parse_url` in `sources.py` classify the raw input string. It arrives with the leading options already removed by `split_play_args` and reads nothing but what it is handed, which is what makes stripping a flag work at all.
 
 ```mermaid
 flowchart TD
     Input["Raw input string"]
-    IsYT{"youtube.com\nor youtu.be?"}
+    Unwrap["unquote, then strip Discord's wrappers\nand trailing punctuation"]
+    IsURI{"spotify:kind:id URI?"}
+    IsLink{"one token, at most 2,048 chars,\nhttp(s) or dotted host, then /?"}
+    Host{"host, lowercased"}
     IsPL{"playlist\n(list= param)?"}
-    IsSP{"open.spotify.com\nor spotify.com?"}
-    IsSC{"soundcloud.com?"}
+    SPKind{"track or playlist,\nwith an id?"}
 
-    Input --> IsYT
-    IsYT -->|Yes| IsPL
+    Input --> Unwrap --> IsURI
+    IsURI -->|Yes| SPKind
+    IsURI -->|No| IsLink
+    IsLink -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    IsLink -->|Yes| Host
+    Host -->|"youtube.com, youtu.be"| IsPL
     IsPL -->|Yes| YTPL["YTSource(type=PLAYLIST, list_id=...)"]
     IsPL -->|"No (?t= honored)"| YTS["YTSource(url, ts?, process=False)"]
-
-    IsYT -->|No| IsSP
-    IsSP -->|track| SPS_T["SpotifySource(TRACK, id)"]
-    IsSP -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
-    IsSP -->|No| IsSC
-    IsSC -->|Yes| SC["SoundcloudSource(url)"]
-    IsSC -->|No| YTS_S["YTSource(ytsearch='ytsearch:...', process=True)"]
+    Host -->|"open. / play. / spotify.com"| SPKind
+    SPKind -->|track| SPS_T["SpotifySource(TRACK, id)"]
+    SPKind -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
+    SPKind -->|album| SPS_A["SpotifySource(ALBUM, id)"]
+    SPKind -->|No| Refuse["UnsupportedSpotifyLinkError"]
+    Host -->|soundcloud.com| SC["SoundcloudSource(url)"]
+    Host -->|any other| OTHER["YTSource(url, stype=OTHER), for yt-dlp"]
 ```
+
+**The link test runs in linear time.** `re` holds the GIL for a whole match, so one slow
+match stalls discord.py's audio thread, and with it every guild. `_LINK_RE` is anchored
+(`re.match` tries one start position), and every quantified run in it stops at a literal
+its own class cannot match, so a failing match is linear too. A token longer than
+`LINK_MAX_CHARS` (2,048) is searched without being tested. The unanchored `re.search` this
+replaced measured 30 ms on a 2,048-character token with no `/` and 140 ms at 4,000, which
+one Nitro message can hold; the anchored test measures under 0.2 ms, and
+`TestLinkParsingIsLinear` bounds it at 5 ms. Wrappers come off with `str` methods for the
+same reason.
+
+What counts as a link:
+
+- **Scheme and host.** `http`, `https`, or no scheme at all, then a dotted host followed by
+  `/`. That keeps `will.i.am`, `Dr.Dre` and `98/99` searches. A token whose link does not
+  start it (`listen:https://…`, `ftp://…`, `user@host`) is a search.
+- **Wrappers.** `<link>` (Discord's embed suppression), `||link||`, `[text](link)`, a code
+  span and parentheses come off, up to three deep, along with a sentence's trailing
+  `.,!?;:`. The unwrap runs before the argument is split into words, because a masked
+  link's text can hold spaces.
+- **Case.** The host is lowercased before it is compared, and in the link handed to
+  yt-dlp too, since its extractors match hosts case-sensitively. The path keeps its case.
+- **Spotify.** The `intl-<locale>/` and `embed/` segments, `play.spotify.com`, the legacy
+  `/user/<name>/playlist/<id>` path and `spotify:` URIs all name a track or playlist. Any
+  other Spotify link raises `UnsupportedSpotifyLinkError`, whose `user_message` the command
+  renders. It is deliberately not a `ValueError`, which `parse_input` answers with a
+  search, and it is raised before `-play` joins voice or interrupts a song.
+- **Share links.** `youtube.com/attribution_link?u=<path>` is routed as the watch path it
+  carries, decoded once and only as a path on youtube.com.
+
+**One verdict.** `is_link` answers for `_source_cache_key`, whose key keeps a link's case
+because YouTube ids are case-sensitive, and for `-remove`'s fold. Neither can call a token
+a link that `-play` searched for, or the reverse.
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
 - **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Album**: `Spotify.album(id)` → the same `SpotifyPlaylist`, plus its artists and cover → the playlist's path from there
 
 ---
 
@@ -944,7 +988,7 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 4: a playlist card sent with its unavailable-songs notice).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 5: the two-embed block, a collection card, its unavailable-songs notice and a short-walk notice).
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `GuildSettings.np_refresh_secs()`: the larger of the server's `np-refresh` and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s), read before each sleep, so a change lands after the tick in progress. A server can slow its bar but never speed it past the bot's value, because the channel's edit bucket is shared with everything else the bot sends and edits there; the write is refused below the bot's value, and a stored value the bot has since overtaken runs at the bot's value and shows as `bot minimum` on the card. Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
@@ -969,6 +1013,25 @@ tick. That is the footer reporting live values; debug mode is opt-in per guild a
 default.
 
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
+
+---
+
+### Queue rows
+
+`src/queue_rows.py` renders one queued item as a row of text, and owns the ETA walk that runs down a listing. It is pure: no player, no queue, no Discord call. A listing reads the same wherever it appears because there is one formatter, and it has two callers: `-queue` (`MusicPlayer.queue_embed`, two-line rows) and the queued album and playlist cards (`MusicPlayer.queued_rows`, one-line rows). The single-entry "Up next" and "Queued song" cards are `MusicPlayer._queue_entry_description`, a separate renderer over the same display fields — a row is one line of a list, a card is a labelled block — so a change here reaches the listings but not those cards:
+
+```
+`index` [**title**](link) · `length` · Est. playing at **9:41 PM PDT**
+channel · @requester                                   (with a byline)
+```
+
+`queue_rows` numbers rows from a `first_index`, chains the `EtaWalk` from the state its caller seeds (the playing song's remaining time, then every item ahead), and ends in `*... and N more*`. It is bounded twice: `ROW_LIMIT` rows, and `ROWS_BUDGET` characters, because ten rows at both caps pass an embed description's 4,096 on their own. Two-line rows are set apart by a blank line and one-line rows are not. An unknown length marks the walk uncertain, and every later time renders with a `~`.
+
+**An unresolved search renders the same row.** A Spotify track is queued as a `YTSource` search and only becomes a song when it is about to play, so the row cannot wait for yt-dlp. `YTSource` carries four display fields under the names a resolved song uses — `title`, `uploader` (the artists), `duration` and `webpage_url` (the Spotify track page) — and the formatter reads one set of attributes off either item. They persist on `SearchQueueEntry`, written only when present, so an entry queued before they existed keeps its bytes and renders as its search text and `resolving...`. The length is Spotify's and not the YouTube match's: `EtaWalk.advance_estimate` counts it and marks everything after it approximate, and `queue_runtime` adds it while keeping the total's `~`.
+
+**What the rows cost.** The four display fields are stored per queued track, so a `ytsource` entry on `guild:{id}:queue` grows to ~400 bytes (measured; serializing one `_PUT_CHUNK` of 1,000 is ~1.5ms). The cached walk under `spotify:playlist:v4:{id}` / `spotify:album_tracks:v2:{id}` carries a `tracks` array beside `titles`, one `[name, artists, duration_secs, url]` row per title — which is what the key versions were bumped for, and roughly triples that value. A 10,000-track collection therefore holds ~2 MB of cache plus ~4 MB of queue mirror, against the 256 MB the bundled Redis is given; both keys carry a TTL, so they stay eviction candidates under `volatile-lru` (see the eviction rules). On a cache HIT the rows are rebuilt `_CACHE_ROWS_CHUNK` at a time with a loop yield between chunks: the rebuild is ~6ms for 10,000 rows and a hit takes neither the walk slot nor the single flight, so without the yield every caller paid it on one tick.
+
+**A queued-collection card lists -queue's rows.** `queued_rows` runs after the put: it finds the first queued track in the display order by identity, walks the ETA to that slot and lists from there, so the card's numbers and times are the ones `-queue` shows for the same tracks. On the card every row would share one requester and mostly one artist, so it takes the one-line density, and its facts line drops "Est. playing at" because each row has its own. A YouTube playlist's tracks are resolved songs already, so its card gets links, lengths and times from the same call with no new data.
 
 ---
 
@@ -1147,7 +1210,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 |---|---|---|---|
 | `guild:{id}:state` | Hash | 20 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
-| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and `requester_id` when known). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
+| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and, each only when known, `requester_id` and the display fields `title`, `uploader`, `duration`, `webpage_url`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
 | `bot:{application_id}:config` | Hash | One field per `-settings bot` knob, named as its env var in lower case (`Knob.field`); absent runs the knob on its environment value. Written only by `BotSettings.write`/`write_reset`, applied at startup by `BotSettings.hydrate`, skipped while `BOT_SETTINGS_OVERRIDES=ignore`. One per application, so bots sharing a Redis cannot retune each other; `debug-default` is never stored | **none, ever** |
 | `guild:{id}:config` | Hash | 8 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off), `queue_progress_delay_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
@@ -1159,7 +1222,8 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, 1.28 KB/rung measured, taking an entry from 4.66 KB to 8.49 KB of payload and 5.22 KB to 10.34 KB resident (it crosses jemalloc's 8192 size class) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:v3:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
+| `spotify:playlist:v4:{id}` | String | JSON object: `titles` (the kept tracks' search strings), `tracks` (one `[name, artists, duration_secs, url]` display row per title, index-aligned with `titles`), `name`, `duration_secs`, `duration_partial`, `unavailable`. Written only by a complete walk | 1 h (user-editable) |
+| `spotify:album_tracks:v2:{id}` | String | The playlist object's shape, `tracks` included, plus `artists` and `thumbnail`. Written only by a non-empty walk that counted exactly the album's `total` | 24 h |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1276,9 +1340,52 @@ the channel is told about it are one behaviour.
 
 The argument is parsed twice — once by `play_takes_the_queue` in `before_invoke` to
 decide the voice gate, once by `play()` for the body — and they agree only because both
-call `split_play_args`. A third flag that changes what "takes the queue" means has to be
+call `split_play_args`. A flag that changes what "takes the queue" means has to be
 reflected in both readings, not just the parser; at that point the gate should hand the
-parsed value forward instead.
+parsed value forward instead. `--timestamp` does not: it changes where a song starts,
+never where it lands.
+
+#### The play flag grammar
+
+`split_play_args` consumes a LEADING RUN of options and stops at the first token that is
+not one. Everything from the stopping token on is the query, verbatim — which is also the
+origin `-remove` matches on, so an option lifted out of mid-line would leave a value the
+user never typed. `-playnow` and `-playnext` parse their argument through the same
+grammar and then force the placement, so a flag spelled there anyway is not searched for
+as text and a `--timestamp` beside it still lands.
+
+**The options are a registry, not a chain of branches.** `_PLAY_OPTIONS` is the one
+place an option is declared; `split_play_args` reads it and names no option of its own.
+Each `_PlayOption` carries its canonical `name` (what every message and did-you-mean
+shows), the `spellings` a user may type, the `PlayArgs` `field` it sets, and either a
+`constant` it stands for or a `read` that parses its value — never both, since `read` is
+what decides whether the next token is consumed.
+
+Everything else derives from that table: `_OPTIONS` maps every spelling, and
+`_OPTION_STEMS` / `_NEAR_FLAG_RE` build the did-you-mean. **`field` is what makes two
+options mutually exclusive** —
+`--now` and `--next` both set `mode`, so the parser refuses the pair without a rule that
+names either, and the refusal lists that field's options in registry order so it reads
+the same whichever was typed first. Adding an option is one entry; the parser, the
+refusals, the suggestions and the usage line all follow.
+
+Three outcomes, all of which queue nothing:
+
+- **`error`** — an option repeated, two options over one field, a value that does not
+  parse or is missing, or a time at or past `MAX_START_OFFSET_SECS`. A finished sentence
+  rather than an exception: a typo is not worth a traceback and a trace id. An option's
+  `read` owns every message about its value, the empty case included, since only it
+  knows what its value is. The bound is what keeps an unbounded digit run out of `-ss`,
+  out of the play epoch and out of an embed description Discord would reject. A value is
+  always the next token: there is no `--ts=1:32` form.
+- **`dash_typo`** — a leading token one dash off an option (`-now`, an autocorrected
+  `—next`, a `–ts`), answered with the long form it names. The exact-match lookup runs
+  first, since a real `--now` also fits the near-miss pattern, and `-ts` is a real
+  spelling that never reaches it.
+- **an empty `query`** — reported by the command as a missing argument.
+
+Hand-parsed rather than a `FlagConverter`, whose grammar matches flags anywhere in the
+line and would lift a `--ts` out of a search term.
 
 1. **The player is not retired.** `MusicBot.cleanup()` stamps `MusicPlayer.mark_retired()`
    through `PlayRegistry.retire_player`, which takes the place lock so the stamp cannot
@@ -1428,12 +1535,16 @@ incrementally cannot: holding the lock for the length of the stream breaks the p
 rule, and taking it per batch makes "the generation matched at my insert" a per-batch
 claim, so a `-clear` mid-stream leaves the batches already placed and drops the rest.
 
-**This is written ahead of the code.** The pieces it names —
+**This is written ahead of the code, and nothing in this tree streams a collection.** A
+playlist or an album is walked whole and placed with one put
+([Spotify playlist paging](#spotify-playlist-paging)). The pieces named below —
 `_begin_collection_enqueue`, `_drain_collection_tail`, `put(..., expected_generation=)`,
-`bump_generation()` — live on `task/spotify-album-streaming` and are not in this tree.
-The point of deciding here is that the branch inherits a contract rather than inventing
-one at merge, where two mechanisms would both answer "may this put land?" and neither
-would answer "half of it did".
+`bump_generation()` — were built once, against an older queue, on
+`task/spotify-collection-streaming`; that branch merged in 2.43.0 with its albums ported
+onto the walk-then-place design and its streaming layer set aside, and `442a8d00` is the
+last commit carrying it. The contract stands for whoever builds streaming again: it
+inherits one rather than inventing one at merge, where two mechanisms would both answer
+"may this put land?" and neither would answer "half of it did".
 
 1. **The lock covers the first batch. The compare-and-put carries the tail.** A
    streaming request takes the place lock exactly once, for page 1, and gets one
@@ -1496,7 +1607,8 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | Method | Cache key | TTL | Returns |
 |---|---|---|---|
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
-| `playlist(id)` | `spotify:playlist:v3:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, the playlist's name, total length, unavailable-item count |
+| `playlist(id)` | `spotify:playlist:v4:{id}` | 1 h (playlists are user-editable) | `SpotifyPlaylist`: kept track titles, a `SpotifyTrack` display row beside each (name, artists, length, track page), the playlist's name, total length, unavailable-item count |
+| `album(id)` | `spotify:album_tracks:v2:{id}` | 24 h | The same `SpotifyPlaylist` shape, plus the album's `artists` and cover `thumbnail`. Page 1 rides `GET /v1/albums/{id}`, so a one-page album is one request and takes no walk slot; later pages follow its `next` cursor inside one. Cached only when the walk counted exactly the album's `total` and kept at least one title — see [Spotify playlist paging](#spotify-playlist-paging) |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
 
@@ -1999,7 +2111,9 @@ provisioned ahead of enforcement rather than after it.
 
 **A refusal is not a credential failure.** Spotify limits what a Development Mode app may read and can refuse it another user's playlist tracks while the credentials work. `http_call` raises `SpotifyAuthError` for any 401 or 403 because `validate()` relies on that, so the walk maps a 403 — and a page arriving with no `items` key at all — to `SpotifyPlaylistForbiddenError`, logs the playlist once at ERROR, and leaves `SpotifyStatus` alone. A 401 stays a credential failure. Tokens are refreshed `_TOKEN_EXPIRY_MARGIN_SECS` (60 s) before Spotify's own expiry, since the expiry is checked once before a retry loop that can sleep 30 s.
 
-**A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes.
+**An album is the same walk with three differences.** `Spotify.album` returns the playlist's `SpotifyPlaylist` plus the album's artists and cover, and takes the playlist's path from `queue_source` on. Page 1 rides `GET /v1/albums/{id}`, which carries the identity and the first tracks page, so a one-page album is one request and takes no walk slot, exactly as a track link takes none. Pages 2+ follow the `next` cursor inside a `_playlist_slot()` slot: the walk budget restarts once the slot is held, and the cache is read again first, which is the album's single flight — N pastes of one album walk it once, without `_INFLIGHT_PLAYLISTS`. The page cap is the album's own size, `ceil(total / page-1 stride) + 2`, and a cursor naming the page it came from ends the walk; an album is cached only on `walked == total` with at least one title, because an album never changes and a repeating cursor overshoots any `>=`. A 403 maps to the same `SpotifyPlaylistForbiddenError`, worded for an album.
+
+**A short walk is never silent.** The walk is meant to end by exhausting `next`; the page cap, a repeating cursor and a refused off-origin cursor all end it early. `walked` is compared against the API's `total` and a shortfall logs and marks the span — silent truncation at 100 tracks is the bug this pager exists to remove, so it must not come back as silent truncation at 10,000. A short walk is also not cached: every later paste would be answered with the partial list, and a hit logs nothing. `walked` counts items, so a playlist holding removed or nameless tracks still completes. The shortfall reaches the channel too: both walks set `SpotifyPlaylist.short`, and the queued card and the `--now` path put a notice above what they send, since the card's count is what was queued and not what the link holds.
 
 **The name is a request of its own.** `v1/playlists/{id}/tracks` does not carry the playlist's name, so after the walk, still inside its slot, `_playlist_name` sends one `GET v1/playlists/{id}?fields=name`, bounded by `_PLAYLIST_PAGE_TIMEOUT_SECS`. Folding the name into page 1 — fetching `v1/playlists/{id}` with a nested `tracks(...)` mask — does not work: the `tracks.next` cursor Spotify returns then carries that request's `fields=name,tracks(...)`, and page 2 fetched from it comes back as `{}`, which this walk reads as a refused playlist. The name only decorates the confirmation, so any failure there returns `None` and never fails the walk. The walk's own mask adds `duration_ms`, which costs no extra request: the result sums the kept tracks' milliseconds and divides once, and marks the total `duration_partial` when a kept track carried none. `unavailable` counts items walked and not kept.
 
@@ -2172,9 +2286,9 @@ as a backstop for any request that passes none: with no session timeout aiohttp 
 its 300 s default.
 
 **`DummyCookieJar` is load-bearing.** A default `CookieJar` would be process-wide and
-attacker-writable: `parse_url` hands any dotted domain to yt-dlp, whose generic
-extractor returns the input URL for the probe to fetch, so one `-play` reaches this
-session with a host the user chose. aiohttp applies no public-suffix check, so a
+attacker-writable: `parse_url` hands any http(s) host it does not special-case to
+yt-dlp, whose generic extractor returns the input URL for the probe to fetch, so one
+`-play` reaches this session with a host the user chose. aiohttp applies no public-suffix check, so a
 `Domain=com` cookie set by that host is replayed to `googlevideo.com` — and enough
 cookie bytes turns every probe into an HTTP 400, which maps to `DEAD`, deletes the
 cache entry and burns the one re-extraction, for every guild, until restart. Nothing

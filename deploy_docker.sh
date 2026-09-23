@@ -38,7 +38,7 @@ resolve_archive_profile
 # wrong — so repeating it costs nothing but a line.
 warn_default_postgres_password
 
-# Default matches what build_docker.sh / `just image` actually tagged, `-dirty`
+# Default matches what build_docker.sh / `just build` actually tagged, `-dirty`
 # suffix included — otherwise `just up` after a dirty build looks for a clean-SHA
 # tag that was never created and the guard below rejects it.
 #

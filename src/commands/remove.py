@@ -5,20 +5,25 @@ from typing import TYPE_CHECKING, Optional
 import discord
 from discord.ext import commands
 
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, matches_origin
+from src.guild_queue import (
+    RemoveMode,
+    RemoveOutcome,
+    item_label,
+    matches_origin,
+)
 from src.musicplayer import MusicPlayer
 from src.play_placement import play_key
 from src.sources import QUERY_SOURCE_SEARCH
 from src.util import (
     ECHO_ROW_MAX,
     EMBED_FIELD_LIMIT,
+    QUEUE_MESSAGE_ROWS_PLUS_ONE,
     notice_embed,
     pluralize,
     queue_message,
     send_embed,
     truncate,
 )
-from src.youtube import QueueObject
 from src.commands._common import await_restore, dropped_request_field, echo
 
 if TYPE_CHECKING:
@@ -29,14 +34,6 @@ if TYPE_CHECKING:
 
 # The most dropped positions worth spelling out.
 _MAX_SHOWN_POSITIONS = 60
-
-
-def _removed_label(item: QueueItem) -> str:
-    """A removed queue item's name for the reply, as MusicPlayer.queue_clear
-    renders it: `YTSource` has no title."""
-    if isinstance(item, QueueObject):
-        return item.title or "?"
-    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
 def _field(value: str) -> str:
@@ -125,9 +122,9 @@ async def run(
                 _field(
                     queue_message(
                         [
-                            echo(_removed_label(i), ECHO_ROW_MAX)
-                            # Sliced before the echo: queue_message keeps 10.
-                            for i in outcome.removed[:10]
+                            echo(item_label(i), ECHO_ROW_MAX)
+                            # Sliced before the echo; see the constant.
+                            for i in outcome.removed[:QUEUE_MESSAGE_ROWS_PLUS_ONE]
                         ]
                     )
                 ),

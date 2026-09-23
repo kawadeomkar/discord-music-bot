@@ -12,7 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Final, Optional, Union
+from typing import Any, Final, Literal, Optional, Union
 from collections.abc import AsyncGenerator, Callable, Coroutine
 
 import discord
@@ -22,6 +22,12 @@ from opentelemetry import trace
 
 from src import config
 from src.musicplayer import MusicPlayer
+from src.sources import (
+    MAX_START_OFFSET_SECS,
+    START_OFFSET_FORMATS,
+    TIMESTAMP_ECHO_MAX,
+    parse_start_offset,
+)
 from src.util import (
     DASHES,
     ECHO_ROW_MAX,
@@ -51,6 +57,7 @@ PLACE_TIMEOUT_SECS = 7.0
 
 NOW_FLAG: Final[str] = "--now"
 NEXT_FLAG: Final[str] = "--next"
+TIMESTAMP_FLAG: Final[str] = "--timestamp"
 
 
 class PlayMode(Enum):
@@ -60,12 +67,6 @@ class PlayMode(Enum):
     NORMAL = "normal"
     NOW = "now"
     NEXT = "next"
-
-
-_FLAG_MODES: Final[dict[str, PlayMode]] = {
-    NOW_FLAG: PlayMode.NOW,
-    NEXT_FLAG: PlayMode.NEXT,
-}
 
 
 class Placement(Enum):
@@ -99,48 +100,187 @@ def resolve_mode_for(placement: Placement) -> ResolveMode:
     return ResolveMode.FLAT_OK
 
 
-# Built from _FLAG_MODES' keys, so a renamed flag cannot leave a stale near-miss.
-# The group is the flag minus its dashes; split_play_args re-attaches them.
+# The PlayArgs field an option sets. Two options naming the same one are
+# alternatives — `--now` and `--next` both decide the placement — which is what
+# makes them mutually exclusive without a rule that names either.
+type PlayOptionField = Literal["mode", "start_offset"]
+
+# What an option's value parser returns: the value, or the sentence saying why
+# the text is not one.
+type OptionValue = PlayMode | int
+type ValueReader = Callable[[str], tuple[Optional[OptionValue], Optional[str]]]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _PlayOption:
+    """One option `-play` takes. `name` is the spelling every message and
+    did-you-mean uses; `spellings` is what a user may type, `-ts` included.
+
+    An option either stands for a `constant` or carries a value `read` parses,
+    never both: `read` is what decides whether the next token is consumed.
+    kw_only, because `name` and the spellings are adjacent and one reaches a
+    user."""
+
+    name: str
+    spellings: tuple[str, ...]
+    field: PlayOptionField
+    constant: Optional[OptionValue] = None
+    read: Optional[ValueReader] = None
+
+
+def _read_start_offset(value: str) -> tuple[Optional[OptionValue], Optional[str]]:
+    """`value` as seconds, or the sentence saying why it is not a time. safe_label
+    for the reason timestamp_warning uses it: the echo sits in a code span a
+    backtick would close, and the cap keeps a 2,000-char argument out of the
+    embed."""
+    if not value:
+        return None, (
+            f"⚠️ `{TIMESTAMP_FLAG}` needs a time after it, one of "
+            f"{START_OFFSET_FORMATS}."
+        )
+    offset = parse_start_offset(value)
+    shown = safe_label(value, TIMESTAMP_ECHO_MAX)
+    if offset is None:
+        return None, (
+            f"⚠️ Couldn't read the timestamp `{shown}`. `{TIMESTAMP_FLAG}` "
+            f"takes {START_OFFSET_FORMATS}."
+        )
+    if offset >= MAX_START_OFFSET_SECS:
+        return None, (
+            f"⚠️ `{shown}` is longer than a day — `{TIMESTAMP_FLAG}` starts a "
+            f"song, not a broadcast."
+        )
+    return offset, None
+
+
+_PLAY_OPTIONS: Final[tuple[_PlayOption, ...]] = (
+    _PlayOption(
+        name=NOW_FLAG, spellings=(NOW_FLAG,), field="mode", constant=PlayMode.NOW
+    ),
+    _PlayOption(
+        name=NEXT_FLAG, spellings=(NEXT_FLAG,), field="mode", constant=PlayMode.NEXT
+    ),
+    # `-ts` is the short form, one dash like the command prefix; `--ts` is what
+    # someone aiming between the two writes.
+    _PlayOption(
+        name=TIMESTAMP_FLAG,
+        spellings=(TIMESTAMP_FLAG, "--ts", "-ts"),
+        field="start_offset",
+        read=_read_start_offset,
+    ),
+)
+
+# Every spelling, and every stem a near-miss can name, resolved to its option.
+# Both are built from the registry, so an option added or renamed there cannot
+# leave a spelling unmatched or a stale did-you-mean behind.
+_OPTIONS: Final[dict[str, _PlayOption]] = {
+    spelling: option for option in _PLAY_OPTIONS for spelling in option.spellings
+}
+_OPTION_STEMS: Final[dict[str, _PlayOption]] = {
+    spelling.lstrip("-"): option for spelling, option in _OPTIONS.items()
+}
+
+# Longest stem first, so `timestamp` is not consumed as `ts` + trailing text.
 _NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
-    f"[{DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
+    f"[{DASHES}]{{1,2}}({'|'.join(sorted(_OPTION_STEMS, key=len, reverse=True))})"
 )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlayArgs:
-    """`-play`'s argument, split into the placement flag and the query. kw_only:
-    `query` and `dash_typo` are adjacent strings and one is echoed into an embed.
-    `dash_typo` names the flag a misspelt leading token meant; it only accompanies
-    PlayMode.NORMAL."""
+    """`-play`'s argument, split into its leading options and the query. kw_only:
+    `query`, `dash_typo` and `error` are adjacent strings and two are echoed into
+    an embed.
+
+    `dash_typo` names the flag a misspelt leading token meant, and `error` is a
+    finished sentence for a malformed option — a typo, not a fault worth a
+    traceback and a trace id. Either one means nothing is queued, and both come
+    with PlayMode.NORMAL."""
 
     mode: PlayMode
     query: str
+    start_offset: Optional[int] = None
     dash_typo: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _refused(argument: str, error: str) -> PlayArgs:
+    """A malformed option: the sentence to answer with, and nothing to queue."""
+    return PlayArgs(mode=PlayMode.NORMAL, query=argument.strip(), error=error)
+
+
+def _already_set(prior: _PlayOption, option: _PlayOption) -> str:
+    """A leading option restating a decision the run already made. The same option
+    twice is a repeat; two over one field are alternatives, and the sentence lists
+    that field's options in registry order, so the rule reads the same whichever
+    one was typed first."""
+    if prior is option:
+        return f"⚠️ `{option.name}` was given twice."
+    names = [f"`{o.name}`" for o in _PLAY_OPTIONS if o.field == option.field]
+    return f"⚠️ Only one of {' or '.join(names)} at a time."
 
 
 def split_play_args(argument: str) -> PlayArgs:
-    """Split a leading `--now`/`--next` off `-play`'s argument. Only the FIRST token
-    counts, so a flag further along stays part of the search and of the origin
-    `-remove` matches on; one flag, never a run. A leading token one dash off a
-    flag (`-now`, an autocorrected `—next`) sets `dash_typo`; the exact match runs
-    first, since a real `--now` also fits the near-miss pattern. A bare `now`/`next`
-    is a search (`-p next to me`)."""
-    stripped = argument.strip()
-    parts = stripped.split(maxsplit=1)
-    if not parts:
-        return PlayArgs(mode=PlayMode.NORMAL, query="")
-    head = parts[0].lower()
-    # No strip on the tail: `stripped` had none, and split() eats the separator run.
-    rest = parts[1] if len(parts) > 1 else ""
-    mode = _FLAG_MODES.get(head)
-    if mode is not None:
-        return PlayArgs(mode=mode, query=rest)
-    typo = _NEAR_FLAG_RE.fullmatch(head)
-    if typo is not None:
-        return PlayArgs(
-            mode=PlayMode.NORMAL, query=stripped, dash_typo=f"--{typo.group(1)}"
-        )
-    return PlayArgs(mode=PlayMode.NORMAL, query=stripped)
+    """Split the leading options off `-play`'s argument — at most one per field of
+    `_PLAY_OPTIONS`, in any order.
+
+    Only the leading run counts, so an option further along stays part of the
+    search and of the origin `-remove` matches on. Inside the run a repeat, two
+    options over one field, a missing value and a value that does not parse each
+    set `error`. A leading token one dash off an option (`-now`, an autocorrected
+    `—next`) sets `dash_typo`; the exact match runs first, since a real `--now`
+    also fits the near-miss pattern. A bare `now`/`next` is a search (`-p next to
+    me`). See docs/ARCHITECTURE.md#the-play-flag-grammar.
+
+    Every branch below reads the registry, so an option added there is parsed,
+    refused, suggested and documented without editing this function.
+
+    Hand-parsed rather than a FlagConverter, whose grammar matches options
+    anywhere in the line and would lift a `--ts` out of a search term.
+    """
+    values: dict[PlayOptionField, Optional[OptionValue]] = {}
+    chosen: dict[PlayOptionField, _PlayOption] = {}
+    # No strip on the tail at any step: `rest` never has one, and split() eats
+    # the separator run while leaving the whitespace inside the query alone.
+    rest = argument.strip()
+    while rest:
+        parts = rest.split(maxsplit=1)
+        head = parts[0].lower()
+        tail = parts[1] if len(parts) > 1 else ""
+        option = _OPTIONS.get(head)
+        if option is None:
+            typo = _NEAR_FLAG_RE.fullmatch(head)
+            if typo is None:
+                break
+            # The whole argument, unconsumed: nothing is queued, so what the run
+            # had taken so far says nothing the did-you-mean needs.
+            return PlayArgs(
+                mode=PlayMode.NORMAL,
+                query=argument.strip(),
+                dash_typo=_OPTION_STEMS[typo.group(1)].name,
+            )
+        prior = chosen.get(option.field)
+        if prior is not None:
+            return _refused(argument, _already_set(prior, option))
+        if option.read is None:
+            values[option.field], rest = option.constant, tail
+        else:
+            # The reader owns the empty case too: only it knows what its value is.
+            value_parts = tail.split(maxsplit=1)
+            value = value_parts[0] if value_parts else ""
+            rest = value_parts[1] if len(value_parts) > 1 else ""
+            parsed, refusal = option.read(value)
+            if refusal is not None:
+                return _refused(argument, refusal)
+            values[option.field] = parsed
+        chosen[option.field] = option
+    mode = values.get("mode")
+    offset = values.get("start_offset")
+    return PlayArgs(
+        mode=mode if isinstance(mode, PlayMode) else PlayMode.NORMAL,
+        query=rest,
+        start_offset=offset if isinstance(offset, int) else None,
+    )
 
 
 # ── The voice gate ────────────────────────────────────────────────────────────

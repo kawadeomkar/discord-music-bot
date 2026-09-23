@@ -2,8 +2,8 @@ import asyncio
 import contextlib
 import os
 import time
-from dataclasses import dataclass
-from typing import Any, Optional, Union, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 from collections.abc import Awaitable, Callable, Iterator
 
 import aiohttp
@@ -14,6 +14,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 
 from src.redis_client import (
+    cache_del,
     cache_get,
     cache_set,
     spotify_token_get_with_ttl,
@@ -22,6 +23,10 @@ from src.redis_client import (
 from src import config
 from src.telemetry import get_tracer
 from src.util import ProgressFn, get_logger
+
+if TYPE_CHECKING:
+    # Annotation only: this client stays free of the input-parsing layer.
+    from src.sources import CollectionNoun
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -71,18 +76,64 @@ _playlist_gate_loop: Optional[asyncio.AbstractEventLoop] = None
 _TOKEN_EXPIRY_MARGIN_SECS = 60
 
 
+class SpotifyRowMismatchError(Exception):
+    """A walk produced a different number of display rows than titles. The two are
+    read by index, so a row under the wrong title is worse than no rows; the walk
+    is refused instead. `user_message` keeps the internals out of the channel."""
+
+    def __init__(self, rows: int, titles: int) -> None:
+        super().__init__(f"{rows} rows for {titles} titles: the two are read by index")
+
+    @property
+    def user_message(self) -> str:
+        return (
+            "Spotify sent something I couldn't line up. Try that link again in a "
+            "moment."
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpotifyTrack:
+    """One walked track as a listing shows it: its own name, apart from the search
+    string it is queued as. The length and the link are what Spotify sent, so
+    either may be missing."""
+
+    name: str
+    artists: list[str]
+    duration_secs: Optional[int]
+    url: Optional[str]
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SpotifyPlaylist:
-    """One playlist walk. `titles` is what gets queued; the rest describes the
-    playlist to the confirmation. `unavailable` counts ITEMS walked and not kept,
-    and `duration_secs` sums the kept tracks only, marked `duration_partial` when
-    any of them carried no `duration_ms`."""
+    """One collection walk, a playlist's or an album's. `titles` is what gets
+    queued; the rest describes it to the confirmation. `unavailable` counts ITEMS
+    walked and not kept, and `duration_secs` sums the kept tracks only, marked
+    `duration_partial` when any of them carried no `duration_ms`. `artists` and
+    `thumbnail` are an album's: the playlist endpoints walked here carry neither.
+    `short` says the walk ended before Spotify's own count of the collection; a
+    short walk is never cached, so the cached shape has no field for it. `tracks`
+    is `titles` as a listing shows them, index for index, or empty."""
 
     name: Optional[str]
     titles: list[str]
     duration_secs: int
     duration_partial: bool
     unavailable: int
+    artists: list[str] = field(default_factory=list)
+    thumbnail: Optional[str] = None
+    short: bool = False
+    tracks: list[SpotifyTrack] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.tracks and len(self.tracks) != len(self.titles):
+            raise SpotifyRowMismatchError(len(self.tracks), len(self.titles))
+
+
+# Display rows rebuilt per event-loop turn on a cache HIT. A 10,000-track
+# collection is ~29ms of solid construction, and a hit takes neither the walk slot
+# nor the single flight, so every caller would pay it on one tick.
+_CACHE_ROWS_CHUNK = 1000
 
 
 def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
@@ -94,10 +145,15 @@ def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
         "duration_secs": playlist.duration_secs,
         "duration_partial": playlist.duration_partial,
         "unavailable": playlist.unavailable,
+        "artists": playlist.artists,
+        "thumbnail": playlist.thumbnail,
+        "tracks": [
+            [t.name, t.artists, t.duration_secs, t.url] for t in playlist.tracks
+        ],
     }
 
 
-def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
+async def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
     """Rebuild a cached walk; None is a MISS, for a value with no `titles` list
     or an unparseable number. The other fields default, and an absent
     `duration_partial` reads as partial: nothing vouched for that total."""
@@ -108,6 +164,8 @@ def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
     if not isinstance(titles, list):
         return None
     name = entry.get("name")
+    artists = entry.get("artists")
+    thumbnail = entry.get("thumbnail")
     try:
         return SpotifyPlaylist(
             name=name if isinstance(name, str) and name else None,
@@ -115,9 +173,37 @@ def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
             duration_secs=int(entry.get("duration_secs", 0)),
             duration_partial=bool(entry.get("duration_partial", True)),
             unavailable=int(entry.get("unavailable", 0)),
+            artists=[str(a) for a in artists] if isinstance(artists, list) else [],
+            thumbnail=thumbnail if isinstance(thumbnail, str) and thumbnail else None,
+            tracks=await _tracks_from_cache(entry.get("tracks"), len(titles)),
         )
     except TypeError, ValueError:
         return None
+
+
+async def _tracks_from_cache(raw: object, count: int) -> list[SpotifyTrack]:
+    """The cached display rows, or [] when they are absent, malformed or not one
+    per title: the titles still queue, as searches with nothing to show."""
+    if not isinstance(raw, list) or len(raw) != count:
+        return []
+    tracks: list[SpotifyTrack] = []
+    for i, row in enumerate(cast(list[Any], raw)):
+        if i and not i % _CACHE_ROWS_CHUNK:
+            await asyncio.sleep(0)
+        if not isinstance(row, list) or len(row) != 4:
+            return []
+        name, artists, secs, url = cast(list[Any], row)
+        if not isinstance(name, str) or not isinstance(artists, list):
+            return []
+        tracks.append(
+            SpotifyTrack(
+                name=name,
+                artists=[str(a) for a in cast(list[Any], artists)],
+                duration_secs=secs if isinstance(secs, int) else None,
+                url=_str_or_none(url),
+            )
+        )
+    return tracks
 
 
 # Every caller awaiting a walk, leader and joiners alike, keyed like the cache: a
@@ -131,21 +217,67 @@ _PLAYLIST_SUBSCRIBERS: dict[str, list[ProgressFn]] = {}
 _INFLIGHT_PLAYLISTS: dict[str, asyncio.Future[SpotifyPlaylist]] = {}
 
 
+def _report(report: ProgressFn, done: int, total: Optional[int]) -> None:
+    """One page's report to one card. A card that raises loses its tick, never
+    the walk."""
+    try:
+        report(done, total)
+    except Exception as e:
+        log.warning(f"spotify progress subscriber failed: {e!r}")
+
+
 def _publish(key: str, done: int, total: Optional[int]) -> None:
     """Hand one page's report to every caller awaiting that walk."""
     for report in list(_PLAYLIST_SUBSCRIBERS.get(key, ())):
-        try:
-            report(done, total)
-        except Exception as e:
-            log.warning(f"spotify playlist progress subscriber failed: {e!r}")
+        _report(report, done, total)
+
+
+def _str_or_none(value: object) -> Optional[str]:
+    """A non-empty str from a response field, else None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _list_or_empty(value: object) -> list[Any]:
+    """A list from a response field, else []."""
+    return cast(list[Any], value) if isinstance(value, list) else []
+
+
+def _row_url(raw: object) -> Optional[str]:
+    """A track link fit for a masked link's target. A ")" would close the link
+    early and spill the rest of the URL into the listing as text, so a row that
+    fails the shape renders unlinked instead."""
+    url = _str_or_none(raw)
+    if url is None or not url.startswith("https://"):
+        return None
+    return None if any(c in url for c in ") \t\n") else url
+
+
+def _track_row(track: dict[str, Any]) -> SpotifyTrack:
+    """A walked track's display row. The caller has checked it has a name."""
+    ms = track.get("duration_ms")
+    links = track.get("external_urls")
+    return SpotifyTrack(
+        name=track["name"],
+        artists=[
+            name
+            for a in _list_or_empty(track.get("artists"))
+            if isinstance(a, dict) and (name := _str_or_none(a.get("name"))) is not None
+        ],
+        duration_secs=ms // 1000 if isinstance(ms, int) else None,
+        url=_row_url(links.get("spotify")) if isinstance(links, dict) else None,
+    )
 
 
 def _track_search_title(track: dict[str, Any]) -> str:
     """ "<name> <artist1> <artist2> ...", the yt-dlp search string a Spotify
-    track resolves to. Shared by track() and playlist()."""
+    track resolves to. Shared by track(), playlist() and album()."""
     # artists defaulted: a playlist can hold a podcast episode, which carries a
-    # name and no artists at all.
-    return track["name"] + "".join(f" {a['name']}" for a in track.get("artists") or [])
+    # name and no artists at all. A nameless artist adds nothing to the search.
+    return track["name"] + "".join(
+        f" {name}"
+        for a in _list_or_empty(track.get("artists"))
+        if isinstance(a, dict) and (name := _str_or_none(a.get("name"))) is not None
+    )
 
 
 class SpotifyAuthError(Exception):
@@ -159,6 +291,21 @@ class SpotifyAuthError(Exception):
         super().__init__(
             f"Spotify rejected the credentials (HTTP {status})"
             + (f": {detail}" if detail else "")
+        )
+
+    @property
+    def user_message(self) -> str:
+        """`detail` is the request endpoint, which must not reach an embed. Only a
+        401 speaks about the credentials; a 403 refuses one request."""
+        if self.status == 403:
+            return (
+                "Spotify refused that request (HTTP 403). If it keeps happening, "
+                "the server owner should check this bot's Spotify app."
+            )
+        return (
+            "Spotify isn't accepting this bot's credentials right now — the "
+            "server owner needs to check them. Try a YouTube or SoundCloud link, "
+            "or just search by name."
         )
 
 
@@ -216,15 +363,23 @@ class SpotifyPlaylistTooSlowError(Exception):
     that used its whole budget will do so again on every attempt. Advising a
     retry for the second is advice that cannot work."""
 
-    def __init__(self, pages: int, titles: int, *, whole_walk: bool) -> None:
+    def __init__(
+        self,
+        pages: int,
+        titles: int,
+        *,
+        whole_walk: bool,
+        noun: CollectionNoun = "playlist",
+    ) -> None:
         self.pages = pages
         self.titles = titles
         self.whole_walk = whole_walk
+        self.noun = noun
         limit = (
             _PLAYLIST_WALK_TIMEOUT_SECS if whole_walk else _PLAYLIST_PAGE_TIMEOUT_SECS
         )
         super().__init__(
-            f"spotify playlist {'walk' if whole_walk else 'page'} exceeded "
+            f"spotify {noun} {'walk' if whole_walk else 'page'} exceeded "
             f"{limit}s after {pages} pages ({titles} titles)"
         )
 
@@ -232,14 +387,14 @@ class SpotifyPlaylistTooSlowError(Exception):
     def user_message(self) -> str:
         if self.whole_walk:
             return (
-                f"That Spotify playlist is too large to read in one go — "
+                f"That Spotify {self.noun} is too large to read in one go — "
                 f"{self.titles} tracks in and still going after "
                 f"{_PLAYLIST_WALK_TIMEOUT_SECS:.0f}s, so nothing was queued. "
                 "Retrying will hit the same limit; queue it in smaller parts."
             )
         return (
-            "Spotify stopped responding while reading that playlist, so nothing "
-            "was queued — try again."
+            f"Spotify stopped responding while reading that {self.noun}, so "
+            "nothing was queued — try again."
         )
 
 
@@ -260,17 +415,34 @@ class SpotifyBusyError(Exception):
 
 
 class SpotifyPlaylistForbiddenError(Exception):
-    """Spotify refused this app a playlist's tracks while the credentials work:
-    a 403 on the tracks endpoint, or a page with no `items` at all. Distinct from
-    SpotifyAuthError, which would tell an operator to rotate good credentials."""
+    """Spotify refused this app a playlist's or an album's tracks while the
+    credentials work: a 403 on the walk, or a playlist page with no `items` at
+    all. Distinct from SpotifyAuthError, which would tell an operator to rotate
+    good credentials."""
 
-    def __init__(self, pid: str, detail: str) -> None:
+    def __init__(
+        self, pid: str, detail: str, *, noun: CollectionNoun = "playlist"
+    ) -> None:
         self.pid = pid
-        super().__init__(f"spotify playlist {pid}: {detail}")
+        self.noun = noun
+        super().__init__(f"spotify {noun} {pid}: {detail}")
 
     @property
     def user_message(self) -> str:
-        return "Spotify won't share that playlist's tracks with this bot."
+        return f"Spotify won't share that {self.noun}'s tracks with this bot."
+
+
+async def _acquire_walk_slot() -> asyncio.Semaphore:
+    """A walk slot for the caller to release, or SpotifyBusyError once the resolve
+    wait has run with none free."""
+    slot = _playlist_slot()
+    wait_secs = config.play_resolve_wait_secs()
+    try:
+        async with asyncio.timeout(wait_secs):
+            await slot.acquire()
+    except TimeoutError as e:
+        raise SpotifyBusyError(wait_secs) from e
+    return slot
 
 
 def _playlist_slot() -> asyncio.Semaphore:
@@ -537,7 +709,7 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
         # Versioned by the VALUE's shape: under a 1h TTL, a deploy that changes it
         # would otherwise be answered from the previous build's entries.
-        cache_key = f"spotify:playlist:v3:{pid}"
+        cache_key = f"spotify:playlist:v4:{pid}"
 
         async def fetch() -> tuple[SpotifyPlaylist, bool]:
             # Under `fields` Spotify answers with only the keys named, so `next`
@@ -545,10 +717,14 @@ class Spotify:
             # terminate, without the second progress has no denominator.
             url = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
             params: Optional[dict[str, Union[str, int]]] = {
-                "fields": "items(track(name,artists(name),duration_ms)),next,total",
+                "fields": (
+                    "items(track(name,artists(name),duration_ms,"
+                    "external_urls(spotify))),next,total"
+                ),
                 "limit": _PLAYLIST_PAGE_SIZE,
             }
             titles: list[str] = []
+            tracks: list[SpotifyTrack] = []
             duration_ms = 0
             duration_partial = False
             unavailable = 0
@@ -590,6 +766,7 @@ class Spotify:
                                 unavailable += 1
                                 continue
                             titles.append(_track_search_title(track))
+                            tracks.append(_track_row(track))
                             ms = track.get("duration_ms")
                             if isinstance(ms, int):
                                 duration_ms += ms
@@ -649,6 +826,8 @@ class Spotify:
                 duration_secs=duration_ms // 1000,
                 duration_partial=duration_partial,
                 unavailable=unavailable,
+                short=not complete,
+                tracks=tracks,
             )
             return playlist, complete
 
@@ -656,13 +835,7 @@ class Spotify:
             # The slot is taken INSIDE the single flight, around the requests
             # alone: a joiner issues none and must not queue for a slot it will
             # not use. Same placement, and the same reason, as _extract_once's.
-            slot = _playlist_slot()
-            wait_secs = config.play_resolve_wait_secs()
-            try:
-                async with asyncio.timeout(wait_secs):
-                    await slot.acquire()
-            except TimeoutError as e:
-                raise SpotifyBusyError(wait_secs) from e
+            slot = await _acquire_walk_slot()
             try:
                 playlist, complete = await fetch()
             finally:
@@ -676,7 +849,7 @@ class Spotify:
             return playlist
 
         # A malformed entry reads as a miss, and the walk overwrites it.
-        cached = _playlist_from_cache(await cache_get(self._redis, cache_key))
+        cached = await _playlist_from_cache(await cache_get(self._redis, cache_key))
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
@@ -714,16 +887,205 @@ class Spotify:
             return None
         return name
 
-    def _forbidden(self, pid: str, detail: str) -> SpotifyPlaylistForbiddenError:
-        """The playlist refusal, logged once for the operator: the credentials work,
-        so it is the app's access, not something to rotate. See README's Spotify
+    def _forbidden(
+        self, pid: str, detail: str, *, noun: CollectionNoun = "playlist"
+    ) -> SpotifyPlaylistForbiddenError:
+        """The refusal, logged once for the operator: the credentials work, so it is
+        the app's access, not something to rotate. See README's Spotify
         requirements."""
         log.error(
-            f"spotify refused playlist {pid} ({detail}); a Development Mode app "
+            f"spotify refused {noun} {pid} ({detail}); a Development Mode app "
             "can be refused another user's playlist tracks — see README "
             "#requirements"
         )
-        return SpotifyPlaylistForbiddenError(pid, detail)
+        return SpotifyPlaylistForbiddenError(pid, detail, noun=noun)
+
+    @_tracer.start_as_current_span("spotify.album")
+    async def album(
+        self, aid: str, *, on_progress: Optional[ProgressFn] = None
+    ) -> SpotifyPlaylist:
+        """An album in the playlist's shape, plus its artists and cover; cached 24h.
+
+        Page 1 rides GET /v1/albums/{id}, which returns the album's identity AND its
+        first tracks page, so a one-page album is one request and takes no walk
+        slot, as a track link takes none. Later pages follow that paging object's
+        `next` cursor inside a slot, under the playlist walk's page and walk bounds.
+        `on_progress` reports as playlist()'s does.
+        """
+        trace.get_current_span().set_attribute("spotify.album_id", aid)
+        # Versioned by the value's shape, as the playlist key is.
+        cache_key = f"spotify:album_tracks:v2:{aid}"
+        cached = await _playlist_from_cache(await cache_get(self._redis, cache_key))
+        trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
+        if cached is not None:
+            return cached
+
+        job = _INFLIGHT_PLAYLISTS.get(cache_key)
+        if job is not None:
+            trace.get_current_span().set_attribute("spotify.walk_shared", True)
+        else:
+            job = asyncio.ensure_future(self._album_walk(aid, cache_key))
+            _INFLIGHT_PLAYLISTS[cache_key] = job
+            # Registered before the shield, so the key is gone before any awaiter
+            # resumes and a retry after a failure starts a fresh walk.
+            job.add_done_callback(lambda _f: _INFLIGHT_PLAYLISTS.pop(cache_key, None))
+        # Shielded: the walk is shared, so one caller's cancellation must not take
+        # it from the others.
+        with _subscribed(cache_key, on_progress):
+            return await asyncio.shield(job)
+
+    async def _album_walk(self, aid: str, cache_key: str) -> SpotifyPlaylist:
+        """The album walk itself, run once per album by album()'s single flight."""
+        url = self.spotify_endpoint + f"v1/albums/{aid}"
+        name: Optional[str] = None
+        artists: list[str] = []
+        thumbnail: Optional[str] = None
+        titles: list[str] = []
+        tracks: list[SpotifyTrack] = []
+        duration_ms = 0
+        duration_partial = False
+        unavailable = 0
+        total: Optional[int] = None
+        walked = 0
+        pages = 0
+        page_cap = _MAX_PLAYLIST_PAGES
+        slot: Optional[asyncio.Semaphore] = None
+        walk = asyncio.timeout(_PLAYLIST_WALK_TIMEOUT_SECS)
+        try:
+            async with walk:
+                while True:
+                    async with asyncio.timeout(_PLAYLIST_PAGE_TIMEOUT_SECS) as bound:
+                        bounds = (bound.when(), walk.when())
+                        try:
+                            resp = await self.http_call(
+                                url, deadline=min(t for t in bounds if t is not None)
+                            )
+                        except SpotifyAuthError as e:
+                            if e.status != 403:
+                                raise
+                            raise self._forbidden(aid, "HTTP 403", noun="album") from e
+                    if not isinstance(resp, dict):
+                        raise SpotifyRequestError(502, url)
+                    if pages == 0:
+                        # The album object; every later response IS a tracks page.
+                        # Its identity decorates the card, so a malformed part of
+                        # it is dropped rather than failing the album.
+                        name = _str_or_none(resp.get("name"))
+                        artists = [
+                            artist
+                            for a in _list_or_empty(resp.get("artists"))
+                            if isinstance(a, dict)
+                            and (artist := _str_or_none(a.get("name"))) is not None
+                        ]
+                        cover = next(iter(_list_or_empty(resp.get("images"))), None)
+                        cover_url = (
+                            _str_or_none(cover.get("url"))
+                            if isinstance(cover, dict)
+                            else None
+                        )
+                        if cover_url is not None and cover_url.startswith("https://"):
+                            thumbnail = cover_url
+                        paging = resp.get("tracks")
+                        page = paging if isinstance(paging, dict) else {}
+                        raw_total = page.get("total")
+                        total = raw_total if isinstance(raw_total, int) else None
+                        if total is not None:
+                            # The cursor carries page 1's stride forward. +2 is
+                            # slack for a `total` that under-reports.
+                            stride = len(_list_or_empty(page.get("items"))) or 50
+                            page_cap = min(page_cap, -(-total // stride) + 2)
+                    else:
+                        page = resp
+                    pages += 1
+                    items = _list_or_empty(page.get("items"))
+                    walked += len(items)
+                    for track in items:
+                        # An album item IS the track: no `track` wrapper.
+                        if not isinstance(track, dict) or not _str_or_none(
+                            track.get("name")
+                        ):
+                            unavailable += 1
+                            continue
+                        titles.append(_track_search_title(track))
+                        tracks.append(_track_row(track))
+                        ms = track.get("duration_ms")
+                        if isinstance(ms, int):
+                            duration_ms += ms
+                        else:
+                            duration_partial = True
+                    _publish(cache_key, walked, total)
+                    next_url = page.get("next")
+                    if not next_url:
+                        break
+                    if not str(next_url).startswith(self.spotify_endpoint):
+                        # The bearer token goes wherever this walk goes.
+                        log.error(f"spotify album {aid}: refusing off-origin cursor")
+                        break
+                    if next_url == url:
+                        log.error(f"spotify album {aid}: cursor stopped advancing")
+                        break
+                    if pages >= page_cap:
+                        log.error(
+                            f"spotify album {aid} still had pages after "
+                            f"{page_cap}; stopping at {walked} items"
+                        )
+                        break
+                    if slot is None:
+                        slot = await _acquire_walk_slot()
+                        # The walk budget starts once the slot is held, and a
+                        # walk that finished during the wait answers this one.
+                        walk.reschedule(
+                            asyncio.get_running_loop().time()
+                            + _PLAYLIST_WALK_TIMEOUT_SECS
+                        )
+                        cached = await _playlist_from_cache(
+                            await cache_get(self._redis, cache_key)
+                        )
+                        if cached is not None:
+                            return cached
+                    url = next_url
+        except TimeoutError as e:
+            raise SpotifyPlaylistTooSlowError(
+                pages, len(titles), whole_walk=walk.expired(), noun="album"
+            ) from e
+        finally:
+            if slot is not None:
+                slot.release()
+        span = trace.get_current_span()
+        span.set_attribute("spotify.track_count", len(titles))
+        span.set_attribute("spotify.album_pages", pages)
+        # Exactly the album's own total. An album never changes, so anything else
+        # is a short walk, a cursor that repeated, or a malformed response.
+        short = walked != total
+        album = SpotifyPlaylist(
+            name=name,
+            titles=titles,
+            duration_secs=duration_ms // 1000,
+            duration_partial=duration_partial,
+            unavailable=unavailable,
+            artists=artists,
+            thumbnail=thumbnail,
+            short=short,
+            tracks=tracks,
+        )
+        if short:
+            span.set_attribute("spotify.album_short", True)
+            log.error(
+                f"spotify album {aid} walked {walked} of {total} items in "
+                f"{pages} pages; not cached"
+            )
+        elif titles:
+            # A cache write would serve a wrong walk as the album for 24h, and an
+            # empty one is likelier a malformed response than an empty album.
+            await cache_set(
+                self._redis, cache_key, _playlist_to_cache(album), _ALBUM_TTL
+            )
+            # The previous version's value is unreadable and unreferenced from here
+            # on, and its 24h TTL would keep it resident beside this one.
+            await cache_del(self._redis, f"spotify:album_tracks:v1:{aid}")
+        else:
+            log.debug(f"spotify album {aid} kept no titles; not cached")
+        return album
 
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[list[str], str]) -> Any:

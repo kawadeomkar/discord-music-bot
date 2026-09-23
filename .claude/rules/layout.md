@@ -25,6 +25,8 @@ src/
 │                     # keeps the commands; the grammar and the registry are tested in
 │                     # test_play_placement.py, the placement itself in commands/test_play.py)
 ├── guild_queue.py    # GuildQueue — one deque + cursor, the mirror writer, bulk-mutation mutex
+├── queue_rows.py     # one queued item as a row of text, and the ETA walk down a listing (pure);
+│                     # -queue and the queued-collection cards list through it
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres) and its embeds; the command body is commands/history.py
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
 ├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), the alone-in-channel leave watchdog, and the two cold-start helpers -play and -resume share
@@ -58,7 +60,7 @@ src/
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source;
 │                     # is_mix (a YouTube Mix, which yt-dlp walks window by window)
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached); the playlist
-│                     # pager, its walk slot and single flight
+│                     # pager, its walk slot and single flight, and the album walk
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
 ├── dashboard.py      # optimistic-send + live-edit driver shared by -ping and -debug;
 │                     # LiveMessage (send/edit-on-change/floor) is also the card's
@@ -90,7 +92,8 @@ docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for 
 tests/                # one test_<module>.py per src module, commands/ mirroring src/commands/,
                       # + conftest.py (seams) + helpers.py + mock_spec_cache.py
                       # test_pg_integration.py / test_redis_integration.py are the opt-in tiers
-justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh compose them
+justfile              # every dev command; build_common.sh / build_docker.sh / deploy_docker.sh
+                      # compose them, and scripts/deploy.sh is `just deploy`'s no-`just` twin
 Dockerfile            # 3 stages: builder (deps) → test (adds test+lint groups) → runtime (ffmpeg, no poetry)
 docker-compose.yml    # bot (host network) + redis + postgres + db-migrate (one-shot,
                       # `archive` profile) + db-backfill (one-shot, `ops` profile, run by

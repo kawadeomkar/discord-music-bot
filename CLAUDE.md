@@ -27,7 +27,7 @@ The tier boundary is a rule, not a preference, and it governs reads in BOTH mode
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,050 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): a 99-test `pg` tier and a 58-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,500 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): a 99-test `pg` tier and a 58-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -77,11 +77,11 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    backoff loop is their error handler. Which helpers, and why `push_history`'s XADD leg
    sits on the swallowing side: `.claude/rules/state-and-recovery.md`.
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces eight duplicated name/version pairs — it is a dep of `check` AND its own CI
+   enforces nine duplicated name/version pairs — it is a dep of `check` AND its own CI
    step, deliberately: Dependabot opens SEPARATE PRs that each move one half, and those
-   are validated by CI, never by a local `check`. **Five more pairs are enforced by
-   nothing** (the PO-token sidecar, the published Prometheus port, the otel collector
-   images, `MPLCONFIGDIR`, and the liveness cap against the HEALTHCHECK window), and
+   are validated by CI, never by a local `check`. **Four more pairs are enforced by
+   nothing** (the published Prometheus port, the otel collector images, `MPLCONFIGDIR`,
+   and the liveness cap against the HEALTHCHECK window), and
    every one of them fails green: the build passes and the symptom lands at runtime.
    Both lists, with what each drift looks like: `.claude/rules/ci-and-build.md`.
 7. **Do not create `pyrightconfig.json`.** `[tool.pyright]` in `pyproject.toml` is the
@@ -132,7 +132,7 @@ just fmt            # ruff format + autofix (REWRITES files)     ~0.1s
 just fmt-justfile   # `just --fmt --check` on the justfile        ~0.01s
 just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
-just pins           # assert the eight duplicated version/name pins ~0.02s
+just pins           # assert the nine duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
 just test           # full suite, PARALLEL (-n auto), coverage gated (fail_under=80) ~35s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
@@ -150,12 +150,16 @@ just test -k spotify
 just test --maxfail=1
 
 # Operator and deploy recipes (db-migrate, backfill, outbox, bot-settings,
-# image, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
+# build, deploy, up/down/logs): .claude/rules/ci-and-build.md, or `just` to list them all.
 ```
 
-`DOCKER=1 just check` (prefix must come BEFORE the recipe) runs any of
-fmt/fmt-check/lint/types/test/check inside the test image — no local Python/Poetry/Node
-needed. `src/`, `tests/`, `pyproject.toml` are bind-mounted; formatting runs as your uid.
+fmt/fmt-check/lint/types/test/check run **inside the test image by default** — no local
+Python/Poetry/Node needed. `src/`, `tests/`, `pyproject.toml` are bind-mounted;
+formatting runs as your uid. `DOCKER=0 just check` (prefix must come BEFORE the recipe)
+opts back out to the local venv, which is what CI's lint/test jobs, `build_common.sh`'s
+deploy gate and the pre-push hooks pin so they keep mirroring CI. `test-pg` and
+`test-redis` run against the venv under either value: the image reaches neither the
+Docker socket nor a server on the host.
 
 Run the bot locally: `just setup`, then `just services` (Redis always; Postgres +
 `db-migrate` only when `.env` sets `HISTORY_ARCHIVE_ENABLED=true`), then **`just run`**.
@@ -176,7 +180,8 @@ src/commands/      ONE MODULE PER COMMAND, each exposing run()
 migrations/        NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  the only tracked file under docs/ (golden rule 2)
 tests/             one test_<module>.py per src module, commands/ mirroring src/commands/
-justfile           every dev command; build_*.sh / deploy_docker.sh compose them
+justfile           every dev command; build_*.sh / deploy_docker.sh compose them;
+                   scripts/deploy.sh is `just deploy`'s no-`just` twin
 Dockerfile         3 stages: builder (deps) → test (+ test/lint groups) → runtime
 docker-compose.yml bot + redis + postgres (archive profile) + pot-provider + otel-lgtm
 .github/workflows/ ci.yml, security.yml (pip-audit), todo-to-issue.yml
@@ -239,7 +244,7 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 
 | Rule file | Covers |
 |---|---|
-| `.claude/rules/playback.md` | the life of `-play` and the loop's bookkeeping, the per-guild object graph, `GuildQueue`, `--now`/`--next` and resume entries, the Now Playing host; the queue, placement and playback primitives |
+| `.claude/rules/playback.md` | the life of `-play` and the loop's bookkeeping, the per-guild object graph, `GuildQueue`, `--now`/`--next`/`--timestamp` and resume entries, the Now Playing host; the queue, placement and playback primitives |
 | `.claude/rules/state-and-recovery.md` | the Redis schema, the history backfill, crash recovery; the restore, archive and outbox primitives |
 | `.claude/rules/extraction.md` | the yt-dlp pool, client strategy and stream healing, Spotify; the extraction and playlist primitives |
 | `.claude/rules/config.md` | every environment variable, its default and its bounds; the settings primitives |
@@ -247,8 +252,7 @@ opening its files. `.gitignore` excludes `.claude/*` except `rules/`.
 | `.claude/rules/layout.md` | the annotated module map: what each file holds and where a change belongs |
 | `.claude/rules/ci-and-build.md` | the CI job graph, the image build and deploy, and every duplicated version pin — enforced and unenforced |
 | `.claude/rules/testing.md` | the test layout, the yt-dlp and Discord seams, fakeredis's divergences, the `pg` and `redis` tiers |
-| `.claude/rules/commands.md` | command registration, the one-module-per-command rule and the help copy each command carries |
-
+| `.claude/rules/commands.md` | command registration, the one-module-per-command rule, which argument mechanism a command takes (and why not argparse), and the help copy each command carries |
 ### Observability
 
 structlog JSON to stdout always; OTLP gRPC traces and logs when `OTEL_SDK_DISABLED`
@@ -339,15 +343,15 @@ Every environment variable, its default and its bounds: `.claude/rules/config.md
 | Where | Marker | Summary |
 |---|---|---|
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
-| sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
+| sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) — `-play --timestamp` is how such a track gets a start offset |
 | youtube.py `yt_source` / `_first_video_entry` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results (the marker moved to `_first_video_entry` with the loop it describes) |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | play_pipeline.py `enqueue_playlist` | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
-| musicplayer.py ETA zone | TODO | `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, which `-settings timezone` writes; a guild that never set one renders `DEFAULT_TIMEZONE` (US/Pacific). The `%Z` suffix fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Still owed: per-VIEWER rendering, since a guild-wide zone is one clock for everyone in the guild. Fix: Discord relative timestamps (`<t:epoch:R>`) |
+| musicplayer.py ETA zone | TODO | The marker sits in musicplayer.py, but the clock formatters it governs (`fmt_clock_time`, `fmt_eta`) live in `src/queue_rows.py`, and a queued collection's rows are a third surface beside these two. `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, which `-settings timezone` writes; a guild that never set one renders `DEFAULT_TIMEZONE` (US/Pacific). The `%Z` suffix fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Still owed: per-VIEWER rendering, since a guild-wide zone is one clock for everyone in the guild. Fix: Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
 | commands/jump.py `run` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
-| guild_state.py `from_crashed_state` | FIXME | A crash-recovered song is a resume in everything but the flag. A song that WAS a `-play --now` tail now round-trips `is_resume` correctly (`from_song` carries it), but a song merely interrupted mid-play comes back with `ts` set and `is_resume` false, so it announces "Starting song at N seconds" rather than resuming. Synthesizing the flag from `ts > 0` would also move the queue display and the interjection wording, so it wants its own change |
+| guild_state.py `from_crashed_state` | FIXME | A crash-recovered song is a resume in everything but the flag. A song that WAS a `-play --now` tail now round-trips `is_resume` correctly (`from_song` carries it), but a song merely interrupted mid-play comes back with `ts` set and `is_resume` false, so it announces "Starting song at 2:17" rather than resuming. Synthesizing the flag from `ts > 0` would also move the queue display and the interjection wording, so it wants its own change |
 
 ## Recipes for common changes
 

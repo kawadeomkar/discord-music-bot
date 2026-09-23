@@ -22,6 +22,11 @@ from src import util
 from src.util import channel_claim
 from src import config
 from src.play_placement import (
+    NEXT_FLAG,
+    NOW_FLAG,
+    TIMESTAMP_FLAG,
+    _OPTIONS,
+    _PLAY_OPTIONS,
     PlaceStalled,
     PlayArgs,
     _GuildPlays,
@@ -32,6 +37,7 @@ from src.play_placement import (
     slow_resolve_notice,
     split_play_args,
 )
+from src.sources import MAX_START_OFFSET_SECS, START_OFFSET_FORMATS
 from tests.helpers import (
     admit,
     command_callback,
@@ -44,9 +50,9 @@ from tests.helpers import (
 
 
 class TestSplitPlayArgs:
-    """`--now`/`--next` comes off the front of -play's argument, or not at all: the
-    remainder is both the search and the origin `-remove` matches on, so a flag
-    stripped from mid-line would leave a value the user never typed."""
+    """The leading options come off -play's argument, or none do: the remainder is
+    both the search and the origin `-remove` matches on, so a flag stripped from
+    mid-line would leave a value the user never typed."""
 
     @pytest.mark.parametrize(
         "argument,mode,query",
@@ -68,15 +74,9 @@ class TestSplitPlayArgs:
             ("-nowhere man", PlayMode.NORMAL, "-nowhere man"),
             ("--nextdoor", PlayMode.NORMAL, "--nextdoor"),
             ("-nextdoor", PlayMode.NORMAL, "-nextdoor"),
-            # Trailing and repeated flags stay in the text: only the head is read.
+            # A flag past the leading run stays in the text.
             ("song --now", PlayMode.NORMAL, "song --now"),
             ("song --next", PlayMode.NORMAL, "song --next"),
-            ("--now --now song", PlayMode.NOW, "--now song"),
-            # The two are mutually exclusive by construction, so the second is
-            # search text like any other repeat — it does not combine, and it does
-            # not override.
-            ("--now --next song", PlayMode.NOW, "--next song"),
-            ("--next --now song", PlayMode.NEXT, "--now song"),
             ("", PlayMode.NORMAL, ""),
             ("   ", PlayMode.NORMAL, ""),
         ],
@@ -84,7 +84,7 @@ class TestSplitPlayArgs:
     def test_the_head_decides(self, argument: str, mode: PlayMode, query: str) -> None:
         args = split_play_args(argument)
         assert (args.mode, args.query) == (mode, query)
-        assert args.dash_typo is None
+        assert (args.dash_typo, args.error, args.start_offset) == (None, None, None)
 
     @pytest.mark.parametrize(
         "argument,meant",
@@ -162,6 +162,168 @@ class TestSplitPlayArgs:
         args = split_play_args("--now song")
         with pytest.raises(AttributeError):
             setattr(args, "mode", PlayMode.NORMAL)
+
+
+class TestTheTimestampFlag:
+    """`--timestamp <time>` joins the leading run: at most one, alongside at most
+    one placement flag, in either order."""
+
+    @pytest.mark.parametrize("flag", [TIMESTAMP_FLAG, "--ts", "-ts"])
+    def test_every_spelling_takes_the_time(self, flag: str) -> None:
+        """`-ts` is the short form; `--ts` is what someone aiming between the two
+        writes, and all three reach the same parser."""
+        args = split_play_args(f"{flag} 1:32 never gonna give you up")
+        assert (args.mode, args.start_offset, args.query) == (
+            PlayMode.NORMAL,
+            92,
+            "never gonna give you up",
+        )
+
+    def test_the_value_is_the_next_token(self) -> None:
+        args = split_play_args("--ts 1:32 song")
+        assert (args.start_offset, args.query) == (92, "song")
+
+    @pytest.mark.parametrize(
+        "argument,mode,offset,query",
+        [
+            ("--now --ts 1:32 song", PlayMode.NOW, 92, "song"),
+            ("--ts 1:32 --now song", PlayMode.NOW, 92, "song"),
+            ("--next --ts 43 song", PlayMode.NEXT, 43, "song"),
+            (
+                "-ts 2:04:30 --next https://youtu.be/x",
+                PlayMode.NEXT,
+                7470,
+                "https://youtu.be/x",
+            ),
+            ("--TS 1:32 --NOW song", PlayMode.NOW, 92, "song"),
+        ],
+    )
+    def test_it_combines_with_a_placement_in_either_order(
+        self, argument: str, mode: PlayMode, offset: int, query: str
+    ) -> None:
+        args = split_play_args(argument)
+        assert (args.mode, args.start_offset, args.query) == (mode, offset, query)
+        assert args.error is None
+
+    @pytest.mark.parametrize(
+        "argument",
+        [
+            "--ts 1:32 --ts 2:00 song",
+            "--now --now song",
+            "--next --next song",
+            "--now --ts 1:32 --now song",
+        ],
+    )
+    def test_a_repeated_option_is_answered(self, argument: str) -> None:
+        """Searching YouTube for the user's own flag is the one outcome that is
+        certainly wrong, and a second value silently losing to the first is the
+        other."""
+        args = split_play_args(argument)
+        assert args.error is not None
+        assert "twice" in args.error
+        assert args.start_offset is None
+
+    @pytest.mark.parametrize("argument", ["--now --next song", "--next --now song"])
+    def test_the_two_placements_do_not_combine(self, argument: str) -> None:
+        args = split_play_args(argument)
+        assert args.error is not None
+        assert NOW_FLAG in args.error and NEXT_FLAG in args.error
+
+    @pytest.mark.parametrize("argument", ["--ts", "--ts song", "--now --ts"])
+    def test_a_time_that_is_missing_or_unreadable_is_answered(
+        self, argument: str
+    ) -> None:
+        args = split_play_args(argument)
+        assert args.error is not None
+        assert args.start_offset is None
+
+    def test_an_unreadable_time_names_the_shapes_it_takes(self) -> None:
+        args = split_play_args("--ts banana song")
+        assert args.error is not None
+        assert "banana" in args.error
+        assert START_OFFSET_FORMATS in args.error
+
+    def test_a_time_longer_than_a_day_is_answered(self) -> None:
+        """Unbounded, a digit run backdates the play epoch by geological spans and
+        renders an echo past Discord's description limit."""
+        args = split_play_args(f"--ts {MAX_START_OFFSET_SECS} song")
+        assert args.error is not None
+        assert split_play_args(f"--ts {MAX_START_OFFSET_SECS - 1} song").error is None
+
+    def test_the_echoed_value_cannot_break_out_of_its_code_span_or_run_long(
+        self,
+    ) -> None:
+        """The value is the user's own text on its way into a code span in an
+        embed, so it is capped and neutralized like every other echo."""
+        args = split_play_args("--ts `x`[y](z) song")
+        assert args.error is not None
+        assert "`x`" not in args.error and "[y](z)" not in args.error
+        long = split_play_args(f"--ts {'9' * 4000} song")
+        assert long.error is not None and len(long.error) < 300
+
+    @pytest.mark.parametrize(
+        "argument,mode,query",
+        [
+            ("song --ts 1:32", PlayMode.NORMAL, "song --ts 1:32"),
+            (
+                "never gonna --ts give you up",
+                PlayMode.NORMAL,
+                "never gonna --ts give you up",
+            ),
+            ("--now song --ts 1:32", PlayMode.NOW, "song --ts 1:32"),
+            ("--ts 43 song --now", PlayMode.NORMAL, "song --now"),
+        ],
+    )
+    def test_a_flag_past_the_leading_run_is_search_text(
+        self, argument: str, mode: PlayMode, query: str
+    ) -> None:
+        """The same rule the placement flags follow: only the run at the front is
+        parsed, so a search keeping its own words stays removable by them."""
+        args = split_play_args(argument)
+        assert (args.mode, args.query, args.error) == (mode, query, None)
+
+    def test_a_dash_away_from_the_long_form_asks(self) -> None:
+        """`-ts` is a real spelling, so only a dash Discord replaced can reach the
+        did-you-mean — and it names the long form."""
+        assert split_play_args("–ts 1:32 song").dash_typo == TIMESTAMP_FLAG
+        assert split_play_args("-timestamp 1:32 song").dash_typo == TIMESTAMP_FLAG
+        assert split_play_args("-ts 1:32 song").dash_typo is None
+
+    def test_a_near_miss_inside_the_run_still_asks(self) -> None:
+        args = split_play_args("--ts 1:32 -now song")
+        assert args.dash_typo == NOW_FLAG
+        assert args.query == "--ts 1:32 -now song"
+
+    def test_a_refusal_queues_nothing_and_carries_no_offset(self) -> None:
+        """`error` and `start_offset` are exclusive: a half-parsed run must not
+        leave an offset a caller could still apply."""
+        args = split_play_args("--ts 1:32 --ts 2:00 song")
+        assert (args.start_offset, args.mode) == (None, PlayMode.NORMAL)
+
+    def test_the_query_keeps_its_internal_whitespace(self) -> None:
+        """The query is the origin -remove matches on, so the flag path and the
+        no-flag path have to leave the same string behind."""
+        assert split_play_args("-ts 43  a   b").query == "a   b"
+        assert split_play_args("a   b").query == "a   b"
+
+    def test_a_quoted_search_survives_the_split(self) -> None:
+        """read_rest hands the quotes through and the command unquotes what the
+        split returns — an origin that keeps them is one -remove cannot match."""
+        assert split_play_args('-ts 43 "never gonna give you up"').query == (
+            '"never gonna give you up"'
+        )
+
+    def test_a_bare_zero_is_an_offset_not_an_absence(self) -> None:
+        """0 is falsy and `start_offset is not None` is what every consumer reads;
+        a truthiness test here would silently drop the flag's own refusals."""
+        args = split_play_args("--ts 0 song")
+        assert args.start_offset == 0
+
+    def test_nothing_to_play_leaves_an_empty_query(self) -> None:
+        """The command reports a missing argument; the split just says there is
+        none, so both spellings of "no song" answer the same way."""
+        args = split_play_args("--ts 1:32")
+        assert (args.start_offset, args.query, args.error) == (92, "", None)
 
 
 class TestPlayRegistry:
@@ -945,3 +1107,77 @@ class TestSlowResolveNotice:
             dropped.set()
             await asyncio.sleep(0.1)
         mock_ctx.channel.send.assert_not_awaited()
+
+
+class TestTheOptionRegistry:
+    """Every branch of split_play_args reads `_PLAY_OPTIONS`, so an option added
+    there is parsed, refused, suggested and documented without editing the parser.
+    These pin that, rather than the three options that happen to be registered."""
+
+    def test_every_spelling_reaches_its_option(self) -> None:
+        for option in _PLAY_OPTIONS:
+            for spelling in option.spellings:
+                assert _OPTIONS[spelling] is option
+
+    def test_every_option_is_recognised_by_every_spelling(self) -> None:
+        """The table is the only place a spelling is declared, so a spelling it
+        carries must parse rather than fall through to the search."""
+        for option in _PLAY_OPTIONS:
+            for spelling in option.spellings:
+                text = f"{spelling} 1:32 song" if option.read else f"{spelling} song"
+                args = split_play_args(text)
+                assert args.error is None, (spelling, args.error)
+                assert args.query == "song"
+
+    def test_an_option_either_stands_for_a_value_or_reads_one(self) -> None:
+        """`read` is what decides whether the next token is consumed, so an entry
+        carrying both would silently eat a word of the search."""
+        for option in _PLAY_OPTIONS:
+            assert (option.constant is None) != (option.read is None), option.name
+
+    @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
+    def test_every_option_refuses_its_own_repeat(self, option: Any) -> None:
+        text = (
+            f"{option.name} 1:32 {option.name} 1:32 s"
+            if option.read
+            else (f"{option.name} {option.name} s")
+        )
+        args = split_play_args(text)
+        assert args.error is not None and "twice" in args.error
+        assert option.name in args.error
+
+    @pytest.mark.parametrize("option", _PLAY_OPTIONS, ids=lambda o: o.name)
+    def test_a_near_miss_of_every_option_is_suggested(self, option: Any) -> None:
+        """One dash short, or the em dash iOS substitutes — each names the long
+        form, built from the registry rather than a second list."""
+        for spelling in option.spellings:
+            stem = spelling.lstrip("-")
+            assert split_play_args(f"—{stem} x").dash_typo == option.name
+
+    def test_options_over_one_field_are_mutually_exclusive(self) -> None:
+        """Two options naming the same field are alternatives; the message lists
+        that field's options in registry order, so it reads the same whichever was
+        typed first."""
+        first = split_play_args(f"{NOW_FLAG} {NEXT_FLAG} s").error
+        second = split_play_args(f"{NEXT_FLAG} {NOW_FLAG} s").error
+        assert first is not None and first == second
+        assert NOW_FLAG in first and NEXT_FLAG in first
+
+    def test_options_over_different_fields_combine(self) -> None:
+        """Only a shared field makes two options exclusive, so every cross-field
+        pair has to survive in both orders."""
+        for a in _PLAY_OPTIONS:
+            for b in _PLAY_OPTIONS:
+                if a.field == b.field:
+                    continue
+                spelled = [f"{o.name} 1:32" if o.read else o.name for o in (a, b)]
+                args = split_play_args(f"{' '.join(spelled)} song")
+                assert args.error is None, (a.name, b.name, args.error)
+                assert args.query == "song"
+
+    def test_a_missing_value_names_the_shapes_it_takes(self) -> None:
+        """The reader owns the empty case, so the hint is the one list of shapes
+        rather than a usage line rendered somewhere else."""
+        error = split_play_args(TIMESTAMP_FLAG).error
+        assert error is not None
+        assert TIMESTAMP_FLAG in error and START_OFFSET_FORMATS in error

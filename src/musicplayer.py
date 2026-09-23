@@ -58,10 +58,23 @@ from src.util import (
     record_span_error,
     trace_footer,
     traceparent_context,
+    EMBED_TITLE_LIMIT,
     safe_label,
     truncate,
     truncate_embed_title,
     get_logger,
+)
+from src.queue_rows import (
+    ROWS_BUDGET,
+    EtaWalk,
+    eta_at,
+    advance_walk,
+    fmt_clock_time,
+    fmt_eta,
+    fmt_total_duration,
+    queue_rows,
+    queue_runtime,
+    requester_mention,
 )
 from src.youtube import (
     YTDL,
@@ -85,58 +98,9 @@ _tracer = get_tracer(__name__)
 QueueItem = Union[QueueObject, YTSource]
 
 
-@dataclass(frozen=True)
-class EtaWalk:
-    """Accumulator for the queue's ETA walk; `now_pst` is invariant across a walk
-    and passed alongside. Frozen: advancing is `replace()` + rebind."""
-
-    cumulative_secs: int
-    uncertain: bool
-
-    def advance(self, remaining: Optional[int]) -> EtaWalk:
-        """The next walk state after an item whose remaining time is `remaining`,
-        or None when its duration is unknown."""
-        if remaining is None:
-            return replace(self, uncertain=True)
-        return replace(self, cumulative_secs=self.cumulative_secs + remaining)
-
-
 # TODO: ETAs render in one zone per guild, never per viewer: queue_embed()'s
 # "Est. playing at" and the NP "Estimated finish" read GuildConfig.timezone, which
 # -settings timezone sets. Owed: per-viewer rendering (<t:epoch:R>).
-
-
-def _fmt_total_duration(secs: int) -> str:
-    h, r = divmod(secs, 3600)
-    m, s = divmod(r, 60)
-    parts: list[str] = []
-    if h:
-        parts.append(f"{h}h")
-    if m:
-        parts.append(f"{m}m")
-    if s:
-        parts.append(f"{s}s")
-    return " ".join(parts) or "0s"
-
-
-def _fmt_clock_time(dt: datetime.datetime) -> str:
-    """A wall-clock time with the zone it is in, read off the datetime."""
-    hour = dt.hour % 12 or 12
-    ampm = "AM" if dt.hour < 12 else "PM"
-    # tzname(), not strftime("%Z"): same output, ~50x cheaper, and this runs on
-    # every NP tick. None is possible for a naive datetime, hence the `or ""`.
-    return f"{hour}:{dt.minute:02d} {ampm} {dt.tzname() or ''}".rstrip()
-
-
-def _fmt_eta(est_dt: datetime.datetime, uncertain: bool) -> str:
-    prefix = "~" if uncertain else ""
-    return f"{prefix}**{_fmt_clock_time(est_dt)}**"
-
-
-def _requester_mention(
-    requester: Optional[Union[discord.User, discord.Member]],
-) -> str:
-    return requester.mention if requester else "Unknown"
 
 
 # Collapses rapid -pause/-resume toggling into one trailing embed edit + Activity
@@ -236,32 +200,6 @@ def _reached_end(song: YTDL) -> bool:
     return song.position_secs >= song.duration_secs - _SONG_COMPLETE_MARGIN_SECS
 
 
-def _remaining_secs(item: QueueObject) -> Optional[int]:
-    """A queued item's expected playtime: full duration, minus the resume offset
-    for a resume entry, which plays only its tail."""
-    if item.duration is None:
-        return None
-    if item.is_resume and item.ts:
-        return max(0, item.duration - item.ts)
-    return item.duration
-
-
-def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
-    """Total remaining playtime of queued items, and whether any duration was
-    unknown (the total is then a lower bound, flagged with "~"). Shared by
-    queue_embed(), the resume notices and the queued-playlist card so they can't
-    disagree."""
-    total_secs = 0
-    partial = False
-    for item in items:
-        remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
-        if remaining is not None:
-            total_secs += remaining
-        else:
-            partial = True
-    return total_secs, partial
-
-
 def _clock(secs: float) -> str:
     """A progress_line label for a playing song's position and duration."""
     return fmt_duration(int(secs))
@@ -270,8 +208,8 @@ def _clock(secs: float) -> str:
 def _fmt_finish_time(duration_secs: int, tz: ZoneInfo) -> str:
     """Clock time `duration_secs` from now. No uncertainty prefix: a playing song's
     remaining duration is known."""
-    finish_dt = datetime.datetime.now(tz=tz) + datetime.timedelta(seconds=duration_secs)
-    return _fmt_clock_time(finish_dt)
+    finish_dt = eta_at(datetime.datetime.now(tz=tz), duration_secs)
+    return fmt_clock_time(finish_dt)
 
 
 # Discord rejects an empty embed field value (400), which fails the entire
@@ -465,7 +403,7 @@ class MusicPlayer:
         self.store = (
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
         )
-        self.queue = GuildQueue(guild, self.store)
+        self.queue = GuildQueue(guild, self.store, user_lookup=bot.get_user)
         # Only the DRAINER is wired in: history writes nudge it, nothing here reads
         # Postgres back. It lives on the app, present exactly when
         # HISTORY_ARCHIVE_ENABLED, so a None drainer wires the None notify
@@ -684,50 +622,8 @@ class MusicPlayer:
             else:
                 uncertain = True
         return datetime.datetime.now(tz=self.timezone), EtaWalk(
-            cumulative_secs, uncertain
+            cumulative_secs=cumulative_secs, uncertain=uncertain
         )
-
-    def _format_queue_line(
-        self,
-        item: QueueItem,
-        index: int,
-        now_pst: datetime.datetime,
-        walk: EtaWalk,
-    ) -> tuple[str, EtaWalk]:
-        """Format one -queue page row with its "Est. playing at" ETA. Returns
-        (line, updated walk) so the page can chain across consecutive items."""
-        est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
-        est_str = _fmt_eta(est_dt, walk.uncertain)
-
-        if isinstance(item, QueueObject):
-            # Capped (ten of these share one 4096-char description) and sanitized:
-            # a "]" in a masked link's label would close it early.
-            title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
-            requester = _requester_mention(item.requester)
-            dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
-            channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or (
-                "Unknown channel"
-            )
-            if item.is_resume and item.ts:
-                ts_note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
-            elif item.ts:
-                ts_note = f"  ·  starts at `{item.ts}s`"
-            else:
-                ts_note = ""
-            line = (
-                f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
-                f"{channel} · {requester}"
-            )
-            walk = walk.advance(_remaining_secs(item))
-        else:
-            search = safe_label(
-                (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
-                _NEXT_UP_TITLE_MAX,
-            )
-            line = f"`{index}` {search} · *resolving...*"
-            walk = walk.advance(None)
-
-        return line, walk
 
     def _eta_walk_to(self, index: int) -> tuple[datetime.datetime, EtaWalk]:
         """Seed the ETA walk and advance it over every item ahead of 1-based
@@ -735,9 +631,7 @@ class MusicPlayer:
         now would earn."""
         now_pst, walk = self._queue_eta_seed()
         for earlier in self._displayed_items()[: index - 1]:
-            walk = walk.advance(
-                _remaining_secs(earlier) if isinstance(earlier, QueueObject) else None
-            )
+            walk = advance_walk(walk, earlier)
         return now_pst, walk
 
     def _displayed(self, item: QueueItem) -> QueueItem:
@@ -764,21 +658,17 @@ class MusicPlayer:
 
         now_pst, walk = self._queue_eta_seed()
 
-        lines = []
-        for i, item in enumerate(items[:10], start=1):
-            line, walk = self._format_queue_line(item, i, now_pst, walk)
-            lines.append(line)
-
         header = f"Songs: **{total}**"
         if total_secs > 0:
             dur_prefix = "~" if duration_partial else ""
             header += (
-                f"\nTotal Duration: **{dur_prefix}{_fmt_total_duration(total_secs)}**"
+                f"\nTotal Duration: **{dur_prefix}{fmt_total_duration(total_secs)}**"
             )
 
-        songs_text = "\n\n".join(lines) if lines else "*The queue is empty.*"
-        if total > 10:
-            songs_text += f"\n\n*... and {total - 10} more*"
+        songs_text = (
+            queue_rows(items, first_index=1, now=now_pst, walk=walk)
+            or "*The queue is empty.*"
+        )
 
         return discord.Embed(
             title="Queue",
@@ -796,7 +686,7 @@ class MusicPlayer:
         stopped."""
         head = self.queue.peek_next()
         if isinstance(head, QueueObject) and not is_persisted(head) and head.title:
-            value = f"**{truncate_embed_title(head.title)}**"
+            value = f"**{safe_label(head.title, EMBED_TITLE_LIMIT)}**"
             if head.ts:
                 value += f"\n`{fmt_duration(head.ts)}`"
                 if head.duration:
@@ -806,7 +696,7 @@ class MusicPlayer:
         last = self.history.latest
         if last is None or not last.title:
             return None
-        value = f"**{truncate_embed_title(last.title)}**"
+        value = f"**{safe_label(last.title, EMBED_TITLE_LIMIT)}**"
         value += f"\n`{fmt_duration(last.played_secs)}`"
         if last.duration_secs > 0:
             value += f" / `{fmt_duration(last.duration_secs)}`"
@@ -833,7 +723,9 @@ class MusicPlayer:
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
-                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
+                # Discord renders markdown here, and a title is yt-dlp's.
+                f"Playing now: {safe_label(started.title, EMBED_TITLE_LIMIT)} - "
+                f"({started.webpage_url})\n\n"
                 f"**{count}** {songs} from the previous session "
                 f"{verb} after it."
             ),
@@ -885,7 +777,7 @@ class MusicPlayer:
             prefix = "~" if partial else ""
             embed.add_field(
                 name="Runtime",
-                value=f"{prefix}{_fmt_total_duration(total_secs)}",
+                value=f"{prefix}{fmt_total_duration(total_secs)}",
                 inline=True,
             )
 
@@ -1341,7 +1233,7 @@ class MusicPlayer:
             if bar:
                 lines.append(bar)
                 lines.append("")
-        requester_line = f"Requester: [{_requester_mention(song.requester)}]"
+        requester_line = f"Requester: [{requester_mention(song.requester)}]"
         if song.duration_secs > 0:
             # Remaining, not total: a song started mid-stream finishes sooner.
             remaining = max(0, song.duration_secs - int(position))
@@ -1412,19 +1304,39 @@ class MusicPlayer:
         """The body both single-entry cards render: one labelled fact per line,
         ending with the ETA position `index` earns."""
         now_pst, walk = self._eta_walk_to(index)
-        eta = _fmt_eta(
-            now_pst + datetime.timedelta(seconds=walk.cumulative_secs), walk.uncertain
-        )
+        eta = fmt_eta(eta_at(now_pst, walk.cumulative_secs), walk.uncertain)
         if not isinstance(item, QueueObject):
-            # Unresolved Spotify-playlist entry: only the search term exists yet.
-            search = safe_label(
-                (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
-                _NEXT_UP_TITLE_MAX,
+            if not item.title:
+                # A search with no display fields: only its term exists yet.
+                search = safe_label(
+                    (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
+                    _NEXT_UP_TITLE_MAX,
+                )
+                return f"{search}\n*resolving...*"
+            # An unresolved Spotify track, from the fields it was queued with.
+            title = safe_label(item.title, _NEXT_UP_TITLE_MAX)
+            linked = (
+                f"[**{title}**]({item.webpage_url})"
+                if item.webpage_url
+                else f"**{title}**"
             )
-            return f"{search}\n*resolving...*"
-        # Sanitized and capped: a "]" in a masked link's label would close it early.
+            artist = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown"
+            length = (
+                fmt_duration(item.duration) if item.duration is not None else "?:??"
+            )
+            who = f"<@{item.requester_id}>" if item.requester_id else "Unknown"
+            return "\n".join(
+                [
+                    f"Requested by: [{who}]",
+                    linked,
+                    f"Artist: {artist}  ·  Duration: `{length}`",
+                    f"Est. playing at {eta}",
+                ]
+            )
+        # Sanitized and capped: a "]" in a masked link's label would close it early,
+        # and an uploader is third-party text on the same line as one.
         title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
-        channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
+        channel = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
         duration = fmt_duration(item.duration) if item.duration is not None else "?:??"
         detail = [f"Channel: {channel}", f"Duration: `{duration}`"]
         if isinstance(item, QueueObject) and item.is_replay:
@@ -1432,10 +1344,10 @@ class MusicPlayer:
         elif item.is_resume and item.ts:
             detail.append(f"⏮ Resumes at `{fmt_duration(item.ts)}`")
         elif item.ts:
-            detail.append(f"Starts at `{item.ts}s`")
+            detail.append(f"Starts at `{fmt_duration(item.ts)}`")
         return "\n".join(
             [
-                f"Requested by: [{_requester_mention(item.requester)}]",
+                f"Requested by: [{requester_mention(item.requester)}]",
                 f"[**{title}**]({item.webpage_url})",
                 "  ·  ".join(detail),
                 f"Est. playing at {eta}",
@@ -1469,10 +1381,7 @@ class MusicPlayer:
         """The -play confirmation. `item` is located by identity, so the ETA is the
         one its real position earns; an entry a concurrent -clear removed renders at
         the tail."""
-        items = self.queue.display_items()
-        index = next(
-            (i for i, queued in enumerate(items, 1) if queued is item), len(items) + 1
-        )
+        index = self.queue.display_index(item) or self.queue.display_size() + 1
         return self._build_queue_entry_embed(
             item,
             index=index,
@@ -1481,25 +1390,58 @@ class MusicPlayer:
             warning=warning,
         )
 
-    def playlist_facts(self, *, ahead: int, runtime: tuple[int, bool]) -> str:
+    def queued_slot(self, tracks: Sequence[QueueItem], *, ahead: int) -> int:
+        """The 1-based slot a collection just queued actually took. By IDENTITY —
+        a collection may hold the same track twice, and equality would return the
+        first one's slot for both. One a concurrent -clear already took is not
+        there, and falls back to `ahead`, the depth the insert saw."""
+        if not tracks:
+            return ahead + 1
+        return self.queue.display_index(tracks[0]) or ahead + 1
+
+    def queued_rows(
+        self, tracks: Sequence[QueueItem], *, first: int, budget: int = ROWS_BUDGET
+    ) -> str:
+        """The rows of a collection just queued, as -queue lists them: numbered
+        from the slot it took and timed by the walk to it. Read after the insert.
+        `budget` is the room the card has left, so the rows and everything around
+        them share one bound rather than two."""
+        if not tracks:
+            return ""
+        now_pst, walk = self._eta_walk_to(first)
+        return queue_rows(
+            tracks,
+            first_index=first,
+            now=now_pst,
+            walk=walk,
+            byline=False,
+            budget=budget,
+        )
+
+    def playlist_facts(
+        self, *, ahead: int, runtime: tuple[int, bool], eta: bool = True
+    ) -> str:
         """The queued-playlist card's facts, read after the insert like the single-song
         card's: total runtime (queue_runtime's shape), the queued songs that play
         before it, and when its first song starts. A playlist that starts at once
-        has no start time to give."""
+        has no start time to give, and a card whose rows carry their own times
+        passes `eta=False`."""
         runtime_secs, partial = runtime
         facts = []
         if runtime_secs > 0:
             prefix = "~" if partial else ""
             facts.append(
-                f"Total Duration: **{prefix}{_fmt_total_duration(runtime_secs)}**"
+                f"Total Duration: **{prefix}{fmt_total_duration(runtime_secs)}**"
             )
         if ahead:
             facts.append(f"Songs ahead: **{ahead}**")
         lines = ["  ·  ".join(facts)] if facts else []
+        if not eta:
+            return "\n".join(lines)
         now_pst, walk = self._eta_walk_to(ahead + 1)
         if walk.cumulative_secs or walk.uncertain:
-            eta = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
-            lines.append(f"Est. playing at {_fmt_eta(eta, walk.uncertain)}")
+            start = eta_at(now_pst, walk.cumulative_secs)
+            lines.append(f"Est. playing at {fmt_eta(start, walk.uncertain)}")
         return "\n".join(lines)
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
@@ -2013,7 +1955,7 @@ class MusicPlayer:
         try:
             await self._channel.send(
                 embed=self._notice(
-                    f"Starting song at {song.start_offset} seconds",
+                    f"Starting song at {fmt_duration(song.start_offset)}",
                     discord.Color.blue(),
                 )
             )

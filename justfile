@@ -40,7 +40,10 @@ set positional-arguments
 set lazy
 
 IMAGE := "discord-music-bot"
-DOCKER := env('DOCKER', '0')
+# Defaults to 1: recipes run inside the test image so a contributor needs only Docker
+# and just. Pass DOCKER=0 to run natively against the local venv (faster, needs the
+# Python toolchain). See the header note below for which recipes honour this.
+DOCKER := env('DOCKER', '1')
 REPO := justfile_directory()
 
 # Call the venv's binaries directly rather than `poetry run`: poetry re-resolves the
@@ -55,15 +58,24 @@ REPO := justfile_directory()
 # from any subdirectory.
 VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } else { REPO / ".venv/bin" }
 
-# ── Where the tools run: local venv (default) or the test image (DOCKER=1) ────
+# ── Where the tools run: the test image (default) or a local venv (DOCKER=0) ──
 #
-#   just check            native, fast — needs Python, Poetry and the venv
-#   DOCKER=1 just check   same checks inside the image — needs only Docker and just
+#   just check            inside the test image — needs only Docker and just
+#   DOCKER=0 just check   same checks native, fast — needs Python, Poetry and the venv
 #
-# DOCKER=1 exists so the project can be handed to someone with no Python toolchain.
-# The checks are the same commands either way; only the interpreter they run under
-# differs. Note the override must PRECEDE the recipe (`DOCKER=1 just check`, not
-# `just check DOCKER=1` — that is a "recipe not found" error).
+# Docker is the DEFAULT so the project can be handed to someone with no Python
+# toolchain: the checks run with only Docker and just installed. Pass DOCKER=0 to run
+# natively against the local venv instead. The checks are the same commands either
+# way; only the interpreter they run under differs. Note the override must PRECEDE the
+# recipe (`DOCKER=0 just check`, not `just check DOCKER=0` — that is a "recipe not
+# found" error).
+#
+# test-pg and test-redis do not honour the switch: see PYTEST_NATIVE.
+#
+# Automated callers that must mirror CI pin DOCKER=0 so they stay native like CI
+# itself: ci.yml's lint/test jobs, build_common.sh's deploy gate, and all five pre-push
+# hooks. Flip the default here and those pins are what keep them from silently moving
+# into Docker.
 #
 # Mount src/ and tests/ as SUBDIRECTORIES, never the repo root. The image keeps its
 # virtualenv at /app/.venv and puts it on PATH, so mounting over /app would shadow the
@@ -116,12 +128,17 @@ RUFF := if DOCKER == "1" { DOCKER_RUN_USER + ' ruff' } else { quote(VENV_BIN / '
 PYRIGHT := if DOCKER == "1" { DOCKER_RUN_USER + ' pyright --pythonpath /app/.venv/bin/python' } else { quote(VENV_BIN / 'pyright') + ' --pythonpath ' + quote(VENV_BIN / 'python') }
 PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { quote(VENV_BIN / 'pytest') }
 
+# The integration tiers run the venv's pytest under either DOCKER value. A tier test
+# starts a container through the Docker socket, or dials the server CI publishes on
+# the runner's localhost; the test image reaches neither.
+PYTEST_NATIVE := quote(VENV_BIN / 'pytest')
+
 [private]
 default:
     @{{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
     @echo ""
-    @echo "Prefix DOCKER=1 to run fmt/lint/types/test inside the test image instead"
-    @echo "of a local venv — requires only Docker and just, no Python or Poetry."
+    @echo "fmt/lint/types/test run inside the test image by DEFAULT (needs only Docker"
+    @echo "and just, no Python or Poetry). Prefix DOCKER=0 to run against a local venv."
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
@@ -161,6 +178,11 @@ test-image-rebuild:
 [private]
 _venv:
     @test -x {{ quote(VENV_BIN / 'pre-commit') }} || { echo "No usable venv at {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }
+
+# The tiers' counterpart to _tools, which under DOCKER=1 checks the image and not the venv.
+[private]
+_venv_pytest:
+    @test -x {{ PYTEST_NATIVE }} || { echo "pytest not found in {{ VENV_BIN }}/ — test-pg and test-redis run against the venv under either DOCKER value: run 'just install' first." >&2; exit 1; }
 
 # Make sure the ONE tool this check calls actually exists, on whichever path is selected.
 #
@@ -294,10 +316,10 @@ test *ARGS: (_tools 'pytest')
 # The tiers are 99 and 49 tests behind a container start; nothing to parallelize.
 [doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
 [group('check')]
-test-pg *ARGS: (_tools 'pytest')
+test-pg *ARGS: _venv_pytest
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_PG_TESTS=1 {{ PYTEST }} -p no:xdist -m pg --no-cov --tb=short -q "$@"
+    RUN_PG_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m pg --no-cov --tb=short -q "$@"
 
 # Opt-in real-Redis tier (testcontainers; needs Docker)
 #
@@ -310,10 +332,10 @@ test-pg *ARGS: (_tools 'pytest')
 # rather than a description. Its sibling test-pg carries both attributes.
 [doc('Run the real-Redis integration tier (needs Docker, or REDIS_TEST_URL)')]
 [group('check')]
-test-redis *ARGS: (_tools 'pytest')
+test-redis *ARGS: _venv_pytest
     #!/usr/bin/env bash
     set -euo pipefail
-    RUN_REDIS_TESTS=1 {{ PYTEST }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
+    RUN_REDIS_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
 
 # Check this file's own formatting (~0.01s)
 [group('check')]
@@ -451,14 +473,31 @@ pins:
         fi
     done
 
+    # The bgutil plugin and the sidecar that serves it are released in lockstep, and
+    # a major mismatch makes the server REFUSE to mint: "Update both the plugin and
+    # the HTTP server to the same version to proceed." Nothing failed when Dependabot
+    # bumped the pip half alone — the build stayed green and the bot lost its `web`
+    # fallback in production, silently, because the primary client needs no PO token.
+    want_pot="$(sed -n 's/^bgutil-ytdlp-pot-provider = "\(.*\)"$/\1/p' pyproject.toml)"
+    compose_pot="$(awk '/^  bgutil-pot-provider:/{f=1} f && /image: brainicism\/bgutil-ytdlp-pot-provider:/{sub(/.*:/, "", $2); print $2; exit}' docker-compose.yml)"
+    if [ -z "$want_pot" ] || [ "$want_pot" != "$compose_pot" ]; then
+        echo "PO-token pin drift: pyproject.toml=[$want_pot] docker-compose.yml=[$compose_pot]" >&2
+        echo "  Plugin and sidecar are released in lockstep; bump both in the same commit." >&2
+        fail=1
+    fi
+
     # `check`'s dependency list and the pre-push hooks are the same five recipes in the
     # same order, written twice. Drift is silent and runs one way: a step added to
     # `check` alone stops running on push while the gate still reports green.
+    #
+    # The optional `env DOCKER=0 ` prefix is the hooks' native pin. Matched rather than
+    # ignored: an entry that misspells it is a hook running in a container the gate did
+    # not ask for, so it must fail here.
     check_deps="$(sed -n 's/^check: //p' justfile)"
     hook_deps="$(awk '
         function flush() {
-            if (entry ~ /^just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
-                sub(/^just /, "", entry)
+            if (entry ~ /^(env DOCKER=0 )?just [a-z][a-z-]*$/ && stages ~ /pre-push/) {
+                sub(/^(env DOCKER=0 )?just /, "", entry)
                 out = out (out == "" ? "" : " ") entry
             }
             entry = ""; stages = ""
@@ -750,7 +789,7 @@ ytdl-formats URL:
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
 # A raw `docker compose` still works — it just never deploys the archive tier.
 [doc('Run `docker compose` with the archive profile derived from HISTORY_ARCHIVE_ENABLED')]
-[group('deploy')]
+[group('ops')]
 compose *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1055,8 +1094,8 @@ db-restore FILE DB='':
 # a gate you cannot skip is a gate you route around.
 
 # Build the runtime image as :latest and :<git-sha> — no test gate
-[group('build')]
-image:
+[group('ops')]
+build:
     #!/usr/bin/env bash
     set -euo pipefail
     source ./build_common.sh
@@ -1076,7 +1115,7 @@ image:
     CHART_EXTRAS= build_runtime_image "{{ IMAGE }}:latest-slim" "{{ IMAGE }}:$tag-slim"
 
 # Deploy an already-built image; pass a git sha to roll back
-[group('deploy')]
+[group('ops')]
 up TAG='':
     # Quoted: unquoted, `just up '*'` globbed against the repo root and `just up "a b"`
     # passed two arguments. Both ended at the deploy guard's refusal, but naming a tag
@@ -1084,8 +1123,28 @@ up TAG='':
     # rather than none, which is why deploy_docker.sh tests `-n "${1:-}"` and not `$#`.
     ./deploy_docker.sh "{{ TAG }}"
 
+# Pull the current branch, build the image, and (re)deploy the containers — the "catch up
+# to origin and refresh my stack" shortcut, and the first-run "clone and start the
+# containers" path (compose creates them when none exist, rebuilds/recreates only the bot
+# container when they do).
+#
+# Delegates to scripts/deploy.sh rather than chaining `build`/`up` here, on purpose: that
+# script is the no-`just` entry point a regular user runs (`./scripts/deploy.sh` with only
+# Docker installed), and routing the recipe through it keeps the two a SINGLE code path
+# that cannot drift. The step-by-step rationale (best-effort --ff-only pull, tag matching,
+# why no gate) lives in that script now.
+#
+# NO test gate — for the gated build → check → deploy use ./build_docker.sh; to gate by
+# hand first, run `just check` (or `just ci`) and then this.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Pull the current branch, build the image, and (re)deploy the containers (no gate)')]
+[group('ops')]
+deploy:
+    ./scripts/deploy.sh
+
 # Stop the compose stack (volumes are kept)
-[group('deploy')]
+[group('ops')]
 down:
     # --profile archive is load-bearing, not decoration. `docker compose down`
     # with the profile INACTIVE removes only un-profiled containers and leaves
@@ -1100,23 +1159,23 @@ down:
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text
-# said "recreate", which sent `image && restart` down a path that silently kept running
+# said "recreate", which sent `build && restart` down a path that silently kept running
 # the old code. Use `just up` to deploy.
 #
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Restart the running bot in place — does NOT pick up a new image (use `just up`)')]
-[group('deploy')]
+[group('ops')]
 restart:
     docker compose restart discord-music-bot
 
 # Follow the bot's logs
-[group('deploy')]
+[group('ops')]
 logs *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     docker compose logs -f discord-music-bot "$@"
 
 # Show compose service status
-[group('deploy')]
+[group('ops')]
 ps:
     docker compose ps

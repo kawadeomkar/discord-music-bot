@@ -1610,6 +1610,20 @@ class TestRemoveMatcher:
             is RemoveMode.ORIGIN
         )
 
+    def test_a_spotify_uri_keeps_its_case(self) -> None:
+        """`-play spotify:track:<id>` queues that track, so its origin is a link
+        and the id in it is case-sensitive base62 like any other."""
+        item = self._song("https://yt.com/v=1", "spotify:track:4uLU6hMCjMI75M1A2tKUQC")
+        assert remove_matcher("spotify:track:4ulu6hmcjmi75m1a2tkuqc")(item) is None
+
+    def test_a_wrapped_link_keeps_its_case(self) -> None:
+        """-play takes a link inside Discord's markup and the wrapper is still on
+        the origin, so the needle has to be unwrapped before the link test — or a
+        video id folds and two that differ only in case become one."""
+        item = self._song("https://yt.com/v=1", "||https://youtu.be/aBcDeFgHiJk||")
+        assert remove_matcher("||https://youtu.be/AbCdEfGhIjK||")(item) is None
+        assert remove_matcher("https://youtu.be/aBcDeFgHiJk")(item) is not None
+
     def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
         only thing it can be matched by, and the only place that link is."""
@@ -1870,12 +1884,66 @@ class TestRestoreEntries:
         # In-memory only: the entries were already on the Redis list.
         assert await fake_redis.exists(store.queue_key()) == 0
 
+    async def test_a_restored_search_keeps_what_the_listing_shows(
+        self, gq: GuildQueue
+    ) -> None:
+        """Dropped here, a restart turns every queued album track back into
+        "resolving..." with no length."""
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:DNA. Kendrick Lamar",
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
+        assert await gq.restore_entries([entry]) == 1
+
+        (item,) = gq.display_items()
+        assert isinstance(item, YTSource)
+        assert (item.title, item.uploader, item.duration, item.webpage_url) == (
+            "DNA.",
+            "Kendrick Lamar",
+            185,
+            "https://open.spotify.com/track/abc",
+        )
+
     async def test_departed_member_falls_back_to_owner(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
         mock_guild.get_member = MagicMock(return_value=None)
         count = await gq.restore_entries([self._entry(1, 12345)])
         assert count == 1
+        assert queue_object(gq.display_items()[0]).requester is mock_guild.owner
+
+    async def test_a_departed_member_still_resolves_through_the_user_cache(
+        self, mock_guild: MagicMock, store: GuildRedisStore
+    ) -> None:
+        """MusicPlayer._resolve_requester reads the user cache for the lazy searches,
+        so without this leg one restored snapshot archives the same person's songs
+        and searches under two requesters."""
+        departed = MagicMock()
+        departed.id = 4242
+        mock_guild.get_member = MagicMock(return_value=None)
+        gq = GuildQueue(
+            mock_guild,
+            store,
+            user_lookup=lambda uid: departed if uid == 4242 else None,
+        )
+
+        assert await gq.restore_entries([self._entry(1, 4242)]) == 1
+
+        assert queue_object(gq.display_items()[0]).requester is departed
+
+    async def test_the_user_cache_leg_still_falls_back_when_it_misses(
+        self, mock_guild: MagicMock, store: GuildRedisStore
+    ) -> None:
+        """A second chance, not a replacement: an id neither cache knows lands on
+        the fallback rather than dropping the song."""
+        mock_guild.get_member = MagicMock(return_value=None)
+        gq = GuildQueue(mock_guild, store, user_lookup=lambda _uid: None)
+
+        assert await gq.restore_entries([self._entry(1, 4242)]) == 1
+
         assert queue_object(gq.display_items()[0]).requester is mock_guild.owner
 
     async def test_unresolvable_requester_drops_entry(
@@ -2458,7 +2526,7 @@ class TestRequeueFrontSwap:
         assert outcome.removed == [second]
         assert calls == ["rebuild_queue"]
         stored = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert [parse_queue_entry(b).webpage_url for b in stored] == [  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]
+        assert [parse_queue_entry(b).webpage_url for b in stored] == [  # pyright: ignore[reportOptionalMemberAccess]
             item.webpage_url for item in [other, *pads]
         ]
 
@@ -3246,6 +3314,10 @@ class TestItemLabelNamesEveryItemType:
     def test_an_unresolved_search_uses_its_search_text(self) -> None:
         item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
         assert item_label(item) == "Artist - Song"
+
+    def test_an_unresolved_track_that_carries_a_title_uses_it(self) -> None:
+        item = YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", title="DNA.")
+        assert item_label(item) == "DNA."
 
     def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
         item = YTSource(url="https://yt.com/v=2", process=True)

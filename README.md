@@ -16,22 +16,25 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 ## Features
 
 - **Multi-source playback** — YouTube URLs and playlists, plain-text YouTube search,
-  Spotify tracks and playlists (expanded to YouTube searches), SoundCloud links, and
+  Spotify tracks, albums and playlists (expanded to YouTube searches), SoundCloud links, and
   any other site yt-dlp supports (TikTok, Vimeo, Bandcamp, Twitch clips, …)
-- **Near-zero inter-song latency** — a three-phase yt-dlp pipeline resolves metadata
-  instantly at enqueue time, prefetches stream URLs in the background while the current
-  song plays, and caches them in Redis
-- **Live Now Playing card** — an embed with a live-updating progress bar that stays
-  pinned to the bottom of the channel, re-attaching itself beneath every bot response
+- **Prefetched playback** — a three-phase yt-dlp pipeline resolves metadata at enqueue
+  time, prefetches stream URLs in the background while the current song plays, and
+  caches them in Redis
+- **Live Now Playing card** — an embed with a live-updating progress bar that stays at
+  the bottom of the channel, re-attaching beneath every bot response
 - **`-play --now` interjection** — interrupt the current song with another one; the
-  interrupted song resumes afterward from the exact position it left off
+  interrupted song resumes afterward from the position it left off
 - **`-play --next` queue jump** — put a song (or a whole playlist) at the front of the
   queue without interrupting what is playing
+- **`-play --timestamp` start offset** — start any song partway in, whatever the link:
+  a search, a Spotify track and a SoundCloud link can all take one, and it beats a `?t=`
+  on the link it is given
 - **Crash recovery** — queue, current song (with playback position), volume, and
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
-- **Per-guild isolation** — every server gets its own player, queue, history, and volume
-- **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
+- **Per-guild isolation** — every server has its own player, queue, history, and volume
+- **Queue management** — shuffle, clear, remove by link (one album or playlist link takes out every track it queued), per-song ETA estimates,
   persistent play history
 - **Opt-in play-history archive** — off by default, and a default deployment keeps
   nothing long-term: the newest 50 plays per guild live in Redis and no Postgres is
@@ -39,13 +42,13 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   Postgres, apply the schema, and record every play permanently
   ([details](#operating-the-play-history-archive))
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
-- **Rich `-help`** — a custom man-page-style help command with aliases, examples,
-  and per-command notes
-- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback client a
-  working fallback client when the primary client is throttled or blocked
+- **`-help` manual** — a man-page-style help command with aliases, examples, and
+  per-command notes
+- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback
+  client usable when the primary client is throttled or blocked
 - **Observability** — OpenTelemetry tracing and structured logging (structlog), with a
   bundled Grafana LGTM stack in Docker Compose
-- **Sharding-ready** — built on `AutoShardedBot`; FFmpeg streaming auto-reconnects on
+- **Sharding-ready** — built on `AutoShardedBot`; FFmpeg streaming reconnects on
   network drops
 
 ## Commands
@@ -57,9 +60,9 @@ details, aliases, and examples.
 
 | Command | Aliases | Description |
 |---|---|---|
-| `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything. A playlist that takes more than a couple of seconds to read shows a live card with its progress, which disappears when the songs land |
-| `-playnow <url\|search>` | `pn` | The same request as `-play --now`, kept as its own command |
-| `-playnext <url\|search>` | `pnx` | The same request as `-play --next`, kept as its own command |
+| `-play [--now\|--next] [--timestamp <time>] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything. `--timestamp` (or `-ts`) starts the song partway in — `1:32`, `2:04:30`, `90`, `90s`, `2h30m15s` — and beats a `?t=` on the link; a time past the end of the song queues nothing and says so. The options go before the song, in any order. A playlist that takes more than a couple of seconds to read shows a live card with its progress, which disappears when the songs land |
+| `-playnow <url\|search>` | `pn` | The same request as `-play --now`, kept as its own command; takes `--timestamp` too |
+| `-playnext <url\|search>` | `pnx` | The same request as `-play --next`, kept as its own command; takes `--timestamp` too |
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
@@ -78,7 +81,7 @@ details, aliases, and examples.
 | `-analytics [--days N]` | `an` | A six-panel chart of this server's listening — plays per day by source, when it listens, listening time, how much of each song gets played, song lengths and queue wait — plus top listeners, artists and songs. `--days` is one of 7, 30, 90, 365; the window covers COMPLETE UTC days, so today is not included — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
-| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one playlist link takes back out every track it queued |
+| `-remove <url\|search>` | `rm` | Remove every queued song matching the resolved link, or matching what you originally typed — so one album or playlist link takes back out every track it queued |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
 
 ### Utility
@@ -101,15 +104,23 @@ https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
 https://www.youtube.com/watch?v=ID&list=LIST_ID&index=4  # playlist from #4 on
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
+https://open.spotify.com/album/ALBUM_ID
+spotify:track:TRACK_ID                           # a Spotify URI works too
 https://soundcloud.com/artist/track
 https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported site
 never gonna give you up                          # plain text searches YouTube
 ```
 
+Any one of these can start partway in: `-play --timestamp 1:32 <input>`.
+
 A video link carrying `&list=` queues that whole list, not just the video. The link
 YouTube's player hands you for a song you reached through a Mix carries
 `&list=RD…`, and a Mix is hundreds of songs, each queued once. Delete the
 `&list=…` part to queue only the video, or `-remove` the link to take the Mix back out.
+
+A link wrapped the way Discord lets you wrap one still plays: `<link>` to hide its
+preview, a spoiler, a masked `[text](link)`, or a sentence's full stop on the end.
+Spotify artist and podcast links are refused with a message saying so.
 
 YouTube, Spotify, and SoundCloud get first-class handling (timestamps, playlist
 expansion, Spotify→YouTube matching). Any other link is handed straight to
@@ -188,7 +199,7 @@ places a copy at `.venv/bin/just`, but a virtualenv's `bin/` is on `PATH` only
 while the environment is activated, and the pre-push git hook does not activate it.
 
 With `just` and Docker, Poetry, Python and FFmpeg are not required: every check
-runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
+runs in a container by default — see [Just recipes](#just-recipes).
 
 ### 1. Create the Discord application
 
@@ -273,17 +284,20 @@ purpose.
 Multi-step pipelines live in the shell scripts (`./build_docker.sh`,
 `./deploy_docker.sh`); the justfile indexes the primitives those scripts compose.
 
-**With only Docker and `just`**, prefix `DOCKER=1` to `fmt`, `fmt-check`, `lint`,
-`types`, `test` or `check` to run it inside the test image instead of a local
-virtualenv. No Python, Poetry or Node is required on the host:
+**Recipes run inside the test image by default** — `fmt`, `fmt-check`, `lint`,
+`types`, `test` and `check` each run in a container, so **with only Docker and `just`**
+a contributor needs no Python, Poetry or Node on the host. Prefix `DOCKER=0` to run a
+recipe against a local virtualenv instead (faster, but needs the Python toolchain from
+`just install`):
 
 ```bash
-DOCKER=1 just check    # the full gate, container-only
-DOCKER=1 just fmt      # ruff rewrites your files, not the image's
+just check             # the full gate, container-only
+just fmt               # ruff rewrites your working tree (bind-mounted), not the image's
+DOCKER=0 just check    # opt out: run against the local venv instead
 ```
 
-The prefix must come **before** the recipe name. `just check DOCKER=1` is an error
-(`just` reads it as a second recipe to run), unlike `make check DOCKER=1`.
+The prefix must come **before** the recipe name. `just check DOCKER=0` is an error
+(`just` reads it as a second recipe to run), unlike `make check DOCKER=0`.
 
 `src/`, `tests/` and `pyproject.toml` are bind-mounted, so the container reads and
 writes your working tree. Formatting runs as your uid, so rewritten files are owned
@@ -291,9 +305,14 @@ by you rather than by root. The image is built automatically the first time; aft
 changing `pyproject.toml` or `poetry.lock`, run `just test-image-rebuild` so the
 container picks up the new dependencies.
 
-The native path is the default because it is faster: the difference is container
-startup, paid on every invocation, and it dominates the short recipes (a bare
-`just lint` is ~0.05s native against ~0.6s containerized).
+Docker is the default so a fresh contributor needs nothing but Docker and `just`. The
+native path (`DOCKER=0`) is faster: the difference is container startup, paid on every
+invocation, and it dominates the short recipes (a bare `just lint` is ~0.05s native
+against ~0.6s containerized). It needs the Python toolchain installed by `just install`.
+
+`just test-pg` and `just test-redis` always run against the local venv, whatever
+`DOCKER` says: each starts its own server container or dials one on the host, and the
+test image can do neither. They need `just install` as well as Docker.
 
 **Setup**
 
@@ -305,9 +324,10 @@ startup, paid on every invocation, and it dominates the short recipes (a bare
 | `just hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
 | `just hooks-run` | Run every hook against every file, not just staged ones |
 | `just hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
-| `just test-image-rebuild` | Rebuild the image `DOCKER=1` uses — needed after a dependency change |
+| `just test-image-rebuild` | Rebuild the test image recipes run in by default — needed after a dependency change |
 
-**Develop** — ordered fastest first
+**Develop** — ordered fastest first (costs are the native `DOCKER=0` path; the default
+container path adds ~0.5s of startup per recipe)
 
 | Recipe | Does | Cost |
 |---|---|---|
@@ -364,10 +384,10 @@ count, so there is nothing to configure.
 
 | Recipe | Does |
 |---|---|
-| `just image` | Build the runtime image as `:latest` and `:<git-sha>`, plus the `-slim` pair without the chart renderer — no test gate |
+| `just build` | Build the runtime image as `:latest` and `:<git-sha>`, plus the `-slim` pair without the chart renderer — no test gate |
 
-`just image` has no test gate; the gate lives in the pipeline
-(`./build_docker.sh`). Use `just image` when you want the artifact and have already
+`just build` has no test gate; the gate lives in the pipeline
+(`./build_docker.sh`). Use `just build` when you want the artifact and have already
 run `just check`.
 
 **Database** — see [Operating the play-history archive](#operating-the-play-history-archive)
@@ -394,12 +414,19 @@ external one. A value already exported in your shell wins over `.env`, so
 
 | Recipe | Does |
 |---|---|
+| `just deploy` | Pull the current branch, build the image, and (re)deploy the containers — all three steps, no test gate. Covers a first run (no image, no containers) as well as a refresh |
 | `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA. With `HISTORY_ARCHIVE_ENABLED=true` it also deploys Postgres and applies pending migrations first, aborting the deploy if they fail |
 | `just down` | Stop the compose stack (volumes are kept) |
 | `just restart` | Restart the running bot in place — does **not** pick up a new image |
 | `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
 | `just ps` | Show compose service status |
 | `just compose <args>` | Any `docker compose` command, with the `archive` profile derived from the flag |
+
+`just deploy` needs no prior `just build`: it fast-forwards to `origin/<branch>`
+(best-effort — offline or diverged falls through to the current tree), builds, and
+deploys exactly the SHA it built. It builds the full image only, not the `-slim`
+pair, and it has no test gate — the gated form is `./build_docker.sh`. On a host
+without `just`, `./scripts/deploy.sh` is the same code path.
 
 `just up` never builds. If no image exists for the current commit it fails rather
 than letting Compose build one and label it with that SHA — see
@@ -416,8 +443,11 @@ just fmt && just check
 # Gate, build and deploy in one step
 ./build_docker.sh
 
+# Pull, build and deploy in one step — no gate
+just deploy
+
 # The same steps individually
-just check && just image && just up
+just check && just build && just up
 
 # Inspect a running deployment, then roll back
 just logs
@@ -444,7 +474,7 @@ The Compose stack runs the bot plus its supporting services:
 
 # Or the individual steps
 just check            # lint + type-check + tests (the gate)
-just image            # build the runtime image, no gate
+just build            # build the runtime image, no gate
 ./deploy_docker.sh    # deploy the image already built for HEAD
 
 # Just the essentials (bot + Redis, no observability/PO-token sidecar)
@@ -544,6 +574,111 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.48.0
+
+**`-play` takes a start offset, and three things it already did read differently.**
+Nothing to configure and no data touched; rolling back is only a redeploy.
+
+- **New:** `-play --timestamp 1:32 <song>` (or `-ts`) starts any song partway in —
+  a search, a Spotify track and a SoundCloud link included, none of which could carry
+  a start offset before. It takes `1:32`, `2:04:30`, `90`, `90s` or `2h30m15s`, goes
+  among the leading options in any order, and works on `-playnow` and `-playnext` too.
+  It beats a `?t=` on the same link. A time at or past the end of the song queues
+  nothing and says so; a link that queues a playlist is refused, unless it names a
+  `v=` video, where it starts that track exactly as a `&t=` on it already did.
+- **Queue ETAs shrink for a song with a start offset.** A `?t=` song used to be billed
+  its full length, so every song behind it was estimated that much too late. It is now
+  billed what actually plays. Nothing about playback changes — only the estimates, and
+  only for a queue holding such a song.
+- **A start offset renders as a clock.** `starts at 1:30` in the queue and the Now
+  Playing card, and `Starting song at 1:30` when it begins, where all three read
+  `90s` / `90 seconds` before.
+- **For operators:** a `-play` span now carries `play.start_offset` when the flag set
+  one (absent otherwise, so a filter for offset plays does not match every `-play`), and
+  `play.refused` naming why a request queued nothing. A refusal sends an embed and logs
+  nothing, so without that attribute it left no record it had run.
+- **A repeated or conflicting option on `-play` is now answered, not searched for.**
+  `-play --now --next <song>` and `-play --now --now <song>` used to search YouTube for
+  the leftover flag as part of the text; they now reply and queue nothing. An option
+  after the song is unaffected — `-play <song> --now` is still a search for all of it.
+
+## Upgrading to 2.45.0
+
+**Some links now play that failed, and a few route differently.** Nothing to configure and
+no data touched; rolling back is only a redeploy.
+
+- **Now plays:** a link in `<…>`, `||…||`, a masked `[text](link)`, a code span or
+  parentheses, or with a full stop or comma on the end. Spotify URIs (`spotify:track:…`),
+  localized and embed Spotify links (`/intl-de/track/…`, `/embed/track/…`),
+  `play.spotify.com`, and the old `/user/<name>/playlist/…` path. A YouTube share link
+  (`attribution_link?u=…`) plays what it points at.
+- **Routes like the lowercase link:** a link with any uppercase in its host
+  (`WWW.YOUTUBE.COM/…`, `YOUTU.BE/…`). A `watch?v=…&list=…` spelled that way now queues
+  the playlist, like its lowercase twin, instead of one song.
+- **Starts at its timestamp:** `youtu.be/<video>?list=…&t=30`, when the video is the
+  playlist's first queued track.
+- **Refused with a message:** Spotify artist, show and episode links, and any other
+  Spotify link that names nothing playable. These used to fail with an internal error.
+- **Now a search:** a token whose link does not start it, such as `ftp://…`,
+  `//host/…`, `user@host/…` or `listen:https://…`. yt-dlp failed all of these before.
+
+In the archive, `query_source` moves for two of these: `YOUTU.BE/…` records
+`youtube.com`, and `play.spotify.com` records `spotify.com`. A scheme-less link
+(`youtu.be/…`) gets its own source-cache entry on its first play after the upgrade,
+since its key no longer folds case.
+
+A single long word in `-play` used to stall audio in every guild for up to a few hundred
+milliseconds; the link test now runs in linear time.
+
+## Upgrading to 2.44.0
+
+**A queued album or playlist is listed the way `-queue` lists songs.** The "Queued album"
+and "Queued playlist" replies used to print their own numbered list of search strings
+("DNA. Kendrick Lamar"). They now show `-queue`'s row for each track: its queue position,
+its name as a link, its length and when it is expected to start. `-queue` itself shows the
+same for album and Spotify-playlist tracks, which used to read `resolving...` with no
+length until just before they played; the queue's total now counts them.
+
+Two things to know. A Spotify track has no YouTube page until it is about to play, so its
+title links to the track on Spotify until then. And its length is Spotify's, not the
+YouTube match's, so start times behind it carry a `~`.
+
+Nothing to configure. Each album and Spotify playlist is read from Spotify once more after
+the upgrade, because the cached copies do not hold the new per-track details. Tracks
+already in a queue when you upgrade keep the old `resolving...` row until they play.
+Rolling back is only a redeploy.
+
+**It costs Redis memory.** Holding a name, artists, length and link for every queued track
+makes a saved queue entry about 400 bytes instead of about 270, and roughly triples the
+cached copy of a collection. A 10,000-track playlist that is both queued and cached now
+holds around 6 MB rather than around 3 MB. That matters only if you run enormous
+collections: the bundled Redis is capped at 256 MB, and when it fills it evicts the keys
+that carry a TTL — which includes saved queues, and an evicted queue is not restored after
+a restart. `-queue`, `-remove` and `-clear` are unaffected either way.
+
+## Upgrading to 2.43.0
+
+**Spotify album links now queue.** `-play https://open.spotify.com/album/…` takes the
+whole album, the way a playlist link already did: under `--now` and `--next` too, with
+the same live card while a long one is read, and one `-remove <the link>` takes it back
+out. The confirmation names the album, its artists and its cover. An album is read once
+and kept for 24 hours; Spotify is asked again after that.
+
+Three smaller changes to what a pasted Spotify link does:
+
+- **A share link from a non-English client works.** Spotify's own share sheet produces
+  `open.spotify.com/intl-de/album/…`; the locale segment used to make the link fail.
+- **A link the bot cannot queue says so.** An `/artist/` or `/show/` link, or one with no
+  id, used to answer with a Python exception. It now names the three kinds it takes.
+- **A link pasted as `<link>`** (how Discord sends one whose preview you suppressed) is
+  read as the link inside.
+
+If Spotify stops sending an album or playlist before its own count of it, the
+confirmation is now preceded by a line saying some songs may be missing, instead of
+reporting the partial count as the whole. Nothing to configure, and no data moves.
+Rolling back is only a redeploy; the album cache entries an older build never reads
+expire on their own.
+
 ## Upgrading to 2.40.0
 
 **Three settings now refuse startup when they are out of range**, the way the other
@@ -568,7 +703,6 @@ check, so a value above the container HEALTHCHECK's 90s staleness window made a 
 bot report unhealthy between touches, and `0` turned the touch loop into a spin. Either
 now stops the bot at startup, naming the variable, instead of starting. If yours is unset
 or inside that range, nothing changes. Rolling back is only a redeploy.
-
 ## Upgrading to 2.37.0
 
 **A Spotify playlist over 100 tracks now queues in full.** Only the first page was ever
@@ -847,7 +981,7 @@ just db-backfill --dry-run   # count what would move, write nothing
 just db-backfill             # do it
 
 # Docker-only host (no local venv). Build FIRST — see below:
-just image
+just build
 just db-backfill-docker --dry-run
 just db-backfill-docker
 
@@ -856,7 +990,7 @@ just db-backfill-docker
 COMPOSE_PROFILES=archive docker compose run --rm db-backfill --dry-run
 ```
 
-**The Docker path needs `just image` first, and the order is build → backfill → deploy.**
+**The Docker path needs `just build` first, and the order is build → backfill → deploy.**
 `docker compose run` uses a locally-present tag and will not rebuild a stale one, but
 `db-backfill` is pinned to `discord-music-bot:${GIT_SHA:-latest}` — the tag your *running*
 deployment already has. On a host that has not built this commit yet, that image predates
@@ -867,7 +1001,7 @@ the backfill and the run ends at:
 ```
 
 It fails loudly rather than silently, but the obvious reaction ("deploy the new image
-first, then backfill") is the unrecoverable direction. `just image` builds and tags
+first, then backfill") is the unrecoverable direction. `just build` builds and tags
 without deploying anything, which is why it is a separate step from `./build_docker.sh`.
 
 Rehearse with `--dry-run` first: it checks the database is reachable and migrated, then
