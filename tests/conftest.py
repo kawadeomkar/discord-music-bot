@@ -68,6 +68,7 @@ def pytest_collection_modifyitems(
     enablers = {
         "pg": ("RUN_PG_TESTS", "POSTGRES_TEST_URL"),
         "redis": ("RUN_REDIS_TESTS", "REDIS_TEST_URL"),
+        "ffmpeg": ("RUN_FFMPEG_TESTS",),
     }
     markexpr = config.option.markexpr
     selected = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", markexpr)) - {
@@ -83,13 +84,16 @@ def pytest_collection_modifyitems(
         # reporter.
         return
     tier = tiers[0]
-    flag, url = enablers[tier]
-    if tier_enabled(flag, url):
+    names = enablers[tier]
+    if tier_enabled(*names):
         return
+    # A tier is enabled by its flag, or by a URL naming the server it needs. The
+    # ffmpeg tier has no server, so it lists one name where the others list two
+    # — hence the join rather than an unpack.
+    how = " or ".join([f"{names[0]}=1"] + list(names[1:]))
     print(
         f"\nERROR: `-m {markexpr}` selects the {tier} tier but it is disabled, "
-        f"so every test would skip.\n       Set {flag}=1 (needs Docker) or "
-        f"{url}.",
+        f"so every test would skip.\n       Set {how}.",
         file=sys.stderr,
     )
     raise pytest.UsageError(f"{tier} tier selected but not enabled")
