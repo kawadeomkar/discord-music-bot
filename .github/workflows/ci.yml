@@ -424,9 +424,10 @@ jobs:
           groups: main,test,dev
           cache-prefix: test
 
-      # The runner image ships ffmpeg, but this tier is worthless without it and
-      # the recipe refuses to run rather than skipping — so install it if a future
-      # image drops it, instead of turning the gate red for an unrelated reason.
+      # Load-bearing: the ubuntu runner image does NOT ship ffmpeg, so without
+      # this the recipe's own guard fails the job. Written as a conditional
+      # install rather than an unconditional one so a future image that does
+      # carry it pays nothing.
       - name: Ensure ffmpeg is present
         run: command -v ffmpeg || { sudo apt-get update && sudo apt-get install -y ffmpeg; }
 
