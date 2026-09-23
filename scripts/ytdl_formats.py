@@ -87,7 +87,7 @@ def render(info: dict[str, Any]) -> list[str]:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: python -m src.ytdl_formats <url-or-search>", file=sys.stderr)
+        print("usage: python -m scripts.ytdl_formats <url-or-search>", file=sys.stderr)
         return 2
     # Copy and drop the logger: yt-dlp's warnings are the interesting part here, so
     # they go to stderr rather than through the bot's structlog routing.

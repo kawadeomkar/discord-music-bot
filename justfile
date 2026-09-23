@@ -236,19 +236,19 @@ _tools TOOL:
 fmt: (_tools 'ruff')
     #!/usr/bin/env bash
     set -uo pipefail
-    {{ RUFF }} check --fix src/ tests/ || lint_rc=$?
-    {{ RUFF }} format src/ tests/
+    {{ RUFF }} check --fix src/ tests/ scripts/ || lint_rc=$?
+    {{ RUFF }} format src/ tests/ scripts/
     exit "${lint_rc:-0}"
 
 # Check formatting only, no rewrites (~0.04s)
 [group('check')]
 fmt-check: (_tools 'ruff')
-    {{ RUFF }} format --check src/ tests/
+    {{ RUFF }} format --check src/ tests/ scripts/
 
 # Check lint rules only, no rewrites (~0.05s)
 [group('check')]
 lint: (_tools 'ruff')
-    {{ RUFF }} check src/ tests/
+    {{ RUFF }} check src/ tests/ scripts/
 
 # Type-check src/ AND tests/ with pyright (~6s)
 [group('check')]
@@ -783,7 +783,7 @@ services:
 [doc('Print the format yt-dlp selects and the fallback ladder for a URL')]
 [group('dev')]
 ytdl-formats URL:
-    {{ quote(VENV_BIN / 'python') }} -m src.ytdl_formats {{ quote(URL) }}
+    {{ quote(VENV_BIN / 'python') }} -m scripts.ytdl_formats {{ quote(URL) }}
 
 # Escape hatch for compose commands this file does not wrap, with the archive
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.

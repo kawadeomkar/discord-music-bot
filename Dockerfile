@@ -77,6 +77,8 @@ RUN test -d /app/.venv/lib/python*/site-packages \
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# Diagnostics the bot never imports, but whose tests run in this tier.
+COPY scripts/ ./scripts/
 # The migration runner discovers .sql files at run time, and a test asserts the
 # directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
 # them present, not just the module.

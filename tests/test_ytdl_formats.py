@@ -1,4 +1,4 @@
-"""Tests for src/ytdl_formats.py — the `just ytdl-formats` diagnostic.
+"""Tests for scripts/ytdl_formats.py — the `just ytdl-formats` diagnostic.
 
 render() is where the report can quietly stop reflecting what the bot does — it
 mines and reconstructs with the real functions, so a change to those rules shows up
@@ -11,7 +11,7 @@ is someone re-inlining the rule instead of calling the shared picker."""
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from src.ytdl_formats import main, render
+from scripts.ytdl_formats import main, render
 
 
 def _info(**overrides: Any) -> dict[str, Any]:
@@ -92,8 +92,8 @@ class TestMainEntrySelection:
         ydl = MagicMock()
         ydl.extract_info.return_value = raw
         with (
-            patch("src.ytdl_formats.sys.argv", ["ytdl-formats", "some search"]),
-            patch("src.ytdl_formats.yt_dlp.YoutubeDL", return_value=ydl),
+            patch("scripts.ytdl_formats.sys.argv", ["ytdl-formats", "some search"]),
+            patch("scripts.ytdl_formats.yt_dlp.YoutubeDL", return_value=ydl),
             patch("builtins.print") as printer,
         ):
             return main(), printer

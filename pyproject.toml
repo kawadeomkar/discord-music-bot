@@ -256,7 +256,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 branch = true
-source = ["src", "tests/mock_spec_cache.py"]
+source = ["src", "scripts", "tests/mock_spec_cache.py"]
 
 [tool.coverage.report]
 fail_under = 80
