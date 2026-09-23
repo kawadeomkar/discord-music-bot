@@ -696,17 +696,18 @@ container-test: test-image-rebuild
 
 # Full local mirror of the CI workflow
 #
-# test-pg and test-redis are here because CI's pg-integration and
-# redis-integration jobs are merge gates (`build` needs both), so a green `ci`
-# that skipped them would not mean what it says. They need Docker, which
-# `container-test` already required of this recipe.
+# All three tiers are here because CI's pg-integration, redis-integration and
+# ffmpeg-integration jobs are merge gates (`build` needs all three), so a green
+# `ci` that skipped one would not mean what it says. The first two need Docker,
+# which `container-test` already required of this recipe; test-ffmpeg needs only
+# ffmpeg on PATH, which running the bot at all already does.
 #
 # [doc(...)] because `just --list` shows only the LAST comment line, so the
 # multi-line reasoning above would otherwise replace this recipe's description
 # with "needs Docker, which `container-test` already required of this recipe."
-[doc('Full local mirror of CI (check + container-test + test-pg + test-redis)')]
+[doc('Full local mirror of CI (check + container-test + the three tiers)')]
 [group('check')]
-ci: check container-test test-pg test-redis
+ci: check container-test test-pg test-redis test-ffmpeg
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
 #
