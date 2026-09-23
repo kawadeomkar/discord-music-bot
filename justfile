@@ -337,6 +337,24 @@ test-redis *ARGS: _venv_pytest
     set -euo pipefail
     RUN_REDIS_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m redis --no-cov --tb=short -q "$@"
 
+# Opt-in real-ffmpeg tier (needs ffmpeg on PATH; no Docker, no network)
+#
+# `stream_failed` is computed from ffmpeg's exit code and the error discord.py
+# stores, and the default suite injects both rather than observing them — so a
+# build where ffmpeg starts exiting 0 on a refused URL turns the retry ladder off
+# and stays green. This spawns the real binary against a local server that fails
+# on purpose. See tests/test_ffmpeg_integration.py's docstring.
+#
+# Native like its siblings, and for a plainer reason than theirs: the test image
+# has no ffmpeg — only the runtime stage installs it.
+[doc('Run the real-ffmpeg integration tier (needs ffmpeg on PATH)')]
+[group('check')]
+test-ffmpeg *ARGS: _venv_pytest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v ffmpeg >/dev/null || { echo "ffmpeg not on PATH — this tier spawns the real binary." >&2; exit 1; }
+    RUN_FFMPEG_TESTS=1 {{ PYTEST_NATIVE }} -p no:xdist -m ffmpeg --no-cov --tb=short -q "$@"
+
 # Check this file's own formatting (~0.01s)
 [group('check')]
 fmt-justfile:
@@ -678,17 +696,18 @@ container-test: test-image-rebuild
 
 # Full local mirror of the CI workflow
 #
-# test-pg and test-redis are here because CI's pg-integration and
-# redis-integration jobs are merge gates (`build` needs both), so a green `ci`
-# that skipped them would not mean what it says. They need Docker, which
-# `container-test` already required of this recipe.
+# All three tiers are here because CI's pg-integration, redis-integration and
+# ffmpeg-integration jobs are merge gates (`build` needs all three), so a green
+# `ci` that skipped one would not mean what it says. The first two need Docker,
+# which `container-test` already required of this recipe; test-ffmpeg needs only
+# ffmpeg on PATH, which running the bot at all already does.
 #
 # [doc(...)] because `just --list` shows only the LAST comment line, so the
 # multi-line reasoning above would otherwise replace this recipe's description
 # with "needs Docker, which `container-test` already required of this recipe."
-[doc('Full local mirror of CI (check + container-test + test-pg + test-redis)')]
+[doc('Full local mirror of CI (check + container-test + the three tiers)')]
 [group('check')]
-ci: check container-test test-pg test-redis
+ci: check container-test test-pg test-redis test-ffmpeg
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
 #

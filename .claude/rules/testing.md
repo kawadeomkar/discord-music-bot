@@ -75,6 +75,18 @@ plus the traps that make a green run mean nothing if they are broken.
   NUL byte that `jsonb` and `text` both refuse),
   so a conftest hook fails `-m pg` outright if the tier is selected but disabled — an
   all-skipped tier used to exit 0 and look green.
+- **The `ffmpeg` tier** (`tests/test_ffmpeg_integration.py`, marker `ffmpeg`,
+  `just test-ffmpeg`) spawns the REAL binary against a local HTTP server that fails on
+  purpose, and the conftest hook gates it like the other two. It exists because
+  `stream_failed = not song.produced_audio and play_error[0] is not None` is built on two
+  facts about ffmpeg and discord.py that the default suite INJECTS rather than observes:
+  that a refused URL exits non-zero (so discord.py stores an error and the retry ladder
+  fires) and that a connection dying after the container header exits ZERO (so it falls
+  to `_drop_unplayable_stream_cache` instead — deliberate, see playback.md). A build
+  where ffmpeg starts exiting 0 on a 403 turns the retry off in production and leaves the
+  unit suite green. It also pins `_OGG_HEADER_PACKETS` against what a container actually
+  emits. Needs ffmpeg on PATH, not Docker: only the runtime stage installs it, so this
+  cannot run in the container tier. No network, and the sample is synthesised per session.
 - **The `redis` tier** (`tests/test_redis_integration.py`, marker `redis`) is the same
   shape against a real `redis:7-alpine` (`just test-redis`, or `REDIS_TEST_URL` in CI),
   and the conftest hook gates it identically. It exists because of the divergence list
