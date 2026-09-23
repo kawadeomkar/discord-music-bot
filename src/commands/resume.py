@@ -37,8 +37,8 @@ async def run(ctx: commands.Context, *, cog: MusicBot) -> None:
     mp = cog.get_mp(ctx)
     await mp.resume(vc)
     await ctx.message.add_reaction("⏭️")
-    # A -pause confirmation hosting the block would otherwise sit beneath a
-    # live, advancing bar for the rest of the song.
+    # A command response hosting the block would otherwise keep a live,
+    # advancing bar beneath whatever it said for the rest of the song.
     await mp.rehost_np_after_resume()
 
 

@@ -118,7 +118,7 @@ pair); and `format_id` in `{249, 250, 251}`, which stands in for the 20 ms frame
 duration the info-dict does not report. Absent fields mean re-encode.
 `read()` counts AUDIO frames (the first two packets are OpusHead and OpusTags, which
 discord.py yields like any other) → `elapsed_secs`/`position_secs` is the single source
-of truth for every position surface (bar, presence, pause confirmation, history,
+of truth for every position surface (bar, presence, paused card, history,
 interject resume point) and freezes during any pause automatically.
 
 ### Spotify

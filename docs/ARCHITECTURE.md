@@ -305,7 +305,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-skip` | `sk` | — | Stop the current song and advance to the next. |
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
-| `-resume` | `r` | — | Resume paused playback; re-hosts the Now Playing block so the pause confirmation becomes plain history. |
+| `-resume` | `r` | — | Resume paused playback; the paused card leaves the block, and a response hosting it is re-hosted so the bar sits at the channel bottom. |
 | `-replay` | `rp`, `restart` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`commands/replay.py`'s `replay_current()` → `ReplayOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `MIN_REPLAY_POSITION_SECS`. See [-replay](#-replay). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
@@ -977,7 +977,7 @@ The hold is bounded by `_START_WRITE_TIMEOUT` (5s, musicplayer.py). The pool set
 
 ### Now Playing Host Model
 
-While a song is live, the **Now Playing embed block** (`[now_playing, next_up?]`, built by `np_embed_block()`) lives in exactly one **host message** — the newest bot message in the player's channel — so the live progress bar is always at the bottom. Full design: [NOW_PLAYING_EMBED_ATTACH_PLAN.md](NOW_PLAYING_EMBED_ATTACH_PLAN.md).
+While a song is live, the **Now Playing embed block** (`[now_playing, paused?, next_up?]`, built by `np_embed_block()`) lives in exactly one **host message** — the newest bot message in the player's channel — so the live progress bar is always at the bottom. Full design: [NOW_PLAYING_EMBED_ATTACH_PLAN.md](NOW_PLAYING_EMBED_ATTACH_PLAN.md).
 
 Mechanics:
 
@@ -988,9 +988,9 @@ Mechanics:
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
-- Discord's 10-embed cap is checked defensively at attach time (worst case here is 5: the two-embed block, a collection card, its unavailable-songs notice and a short-walk notice).
+- Discord's 10-embed cap is checked defensively at attach time (worst case here is 6: the three-embed block, a collection card, its unavailable-songs notice and a short-walk notice).
 
-**Progress bar**: `_progress_updater` edits the host's NP embed every `GuildSettings.np_refresh_secs()`: the larger of the server's `np-refresh` and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s), read before each sleep, so a change lands after the tick in progress. A server can slow its bar but never speed it past the bot's value, because the channel's edit bucket is shared with everything else the bot sends and edits there; the write is refused below the bot's value, and a stored value the bot has since overtaken runs at the bot's value and shows as `bot minimum` on the card. Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
+**Progress bar**: `_progress_updater` edits the host's NP embed every `GuildSettings.np_refresh_secs()`: the larger of the server's `np-refresh` and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s), read before each sleep, so a change lands after the tick in progress. A server can slow its bar but never speed it past the bot's value, because the channel's edit bucket is shared with everything else the bot sends and edits there; the write is refused below the bot's value, and a stored value the bot has since overtaken runs at the bot's value and shows as `bot minimum` on the card. Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, paused card).
 
 **Identical re-renders are not pushed.** `_push_np_edit` compares the rendered payload
 (`[e.to_dict() for e in embeds]`) and the host id against the last pair it sent
@@ -1088,7 +1088,7 @@ resume(vc): vc.resume() → store.on_resume(now)       → mark_resumed()
 - **The exact pause point**: `pause()` records the position itself because the ticker skips paused songs (frames are frozen, so it would rewrite one value for the whole pause). Both writes take the same `t`, so the legacy math below cannot count the gap between them as playback. Skipped when nothing is playing — `-pause` is reachable with no song.
 - **Redis epoch accounting** (crash-recovery correctness): `on_pause` writes `pause_start_epoch`; `on_resume` folds the pause interval into `total_pause_seconds` and clears `pause_start_epoch`. Recovery position is read from `last_position_secs`, recorded by the heartbeat while the song played — no clock is consulted, so downtime is never credited. The epoch accounting above feeds only `_legacy_wall_clock_position_at`, the fallback for a hash written before the heartbeat existed, and goes with it one release after this ships.
 - **`mark_paused`/`mark_resumed`** both fire `_fire_pause_state_updates()` — a debounced one-off NP-embed edit + presence refresh, so the bar and tooltip freeze/unfreeze promptly rather than waiting for the next 3 s tick.
-- `-pause` replies with a **confirmation embed** (`build_pause_confirmation_embed`) showing the frozen position; `-resume` calls `rehost_np_after_resume()` so a pause confirmation hosting the block becomes plain history rather than sitting beneath a live, advancing bar.
+- `-pause` replies with the **block itself**, re-pinned (`repin_now_playing()`): the paused card (`_build_paused_embed`) is the block's second embed, built from live client state, so it appears under the song it describes and is gone the moment `-resume` rebuilds the block — nothing deletes it. It shows the frozen position, who paused and when (a Discord timestamp, so each viewer reads their own clock), and points at `-resume`. `-resume` calls `rehost_np_after_resume()` so a response that was hosting the block does not keep a live, advancing bar beneath whatever it said. `-pause` with nothing to pause answers too, separating an already-paused song from no song at all.
 
 ---
 
@@ -1671,7 +1671,7 @@ Measured: copy and libopus produce identical packet counts for YouTube's Opus (2
 
 Three differences are accepted, and ffmpeg warns about none of them, since no encoder is instantiated to ignore them: a mono source stays mono rather than being upmixed; the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band forward error correction, so packet loss on the voice path produces dropouts libopus used to conceal. YouTube's files carry no FEC of their own, which makes that last one a real regression for lossy listeners and the reason to keep the gate narrow rather than widen it.
 
-**Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and pause confirmation.
+**Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
 
 **Timestamp seek**: a `?t=N` URL parameter is carried on `QueueObject.ts` → FFmpeg `-ss N` → recorded as `YTDL.start_offset` so position surfaces and the backdated `play_start_epoch` agree.
 

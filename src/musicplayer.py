@@ -159,6 +159,21 @@ RESTORE_WAIT_SECS = 5.0
 DEPTH_RESTORE_WAIT_SECS = 1.0
 
 
+@dataclass(frozen=True, slots=True)
+class PauseContext:
+    """Who paused the current song and when, for the paused card's byline.
+
+    Keyed by the song itself, not a flag: the card is rebuilt from whatever the
+    voice client holds, and an identity check is what stops one song's byline
+    reaching the next. `by` is None for a song the loop parked paused on its own
+    (a -playnow tail returning, a crash-recovered head) — nobody asked for that
+    pause, so the byline is omitted rather than attributed."""
+
+    song: YTDL
+    at: float  # epoch seconds, rendered as a per-viewer Discord timestamp
+    by: Optional[Union[discord.User, discord.Member]] = None
+
+
 @dataclass(frozen=True)
 class InterjectOutcome:
     """What MusicPlayer.interject() did — everything `-play --now` needs for its
@@ -223,6 +238,12 @@ _FIELD_PLACEHOLDER = "—"
 _FIELD_VALUE_MAX = 200
 # Same budget, for the one queue line the "Up next" embed renders.
 _NEXT_UP_TITLE_MAX = 200
+
+# The card's title says which state the song is in. One definition each, because
+# the paused card below it renders the paused one too and the two sit in the same
+# message — a drifted copy would read as two different songs.
+_NOW_PLAYING_TITLE_PREFIX = "Now playing: "
+_PAUSED_TITLE_PREFIX = "⏸️ Paused: "
 
 
 def _field_value(value: str) -> str:
@@ -310,6 +331,7 @@ class MusicPlayer:
         "_np_host_dedicated",
         "_np_edit_lock",
         "_pause_debounce_task",
+        "_pause_context",
         "_skip_history_for",
         "_pending_resume_tail",
         "_retire_np_for",
@@ -359,6 +381,7 @@ class MusicPlayer:
     _np_host_dedicated: bool
     _np_edit_lock: asyncio.Lock
     _pause_debounce_task: Optional[asyncio.Task]
+    _pause_context: Optional[PauseContext]
     _skip_history_for: Optional[YTDL]
     _pending_resume_tail: Optional[QueueObject]
     _retire_np_for: Optional[YTDL]
@@ -457,6 +480,8 @@ class MusicPlayer:
         self._np_host_own_embeds: list[discord.Embed] = []
         self._np_host_dedicated: bool = False
         self._np_edit_lock = asyncio.Lock()
+        # Who paused the live song and when, for the paused card's byline.
+        self._pause_context: Optional[PauseContext] = None
 
         # Interjection bookkeeping. _skip_history_for is the song interject()
         # stopped with a resume entry pending, so it is recorded once, when its
@@ -1214,6 +1239,22 @@ class MusicPlayer:
         playback span. See docs/ARCHITECTURE.md#debug-footer-seams."""
         self._cog.debug_settings.decorate(embeds, self._guild, span=span)
 
+    def _is_paused_song(self, song: YTDL) -> bool:
+        """True only while the voice client holds THIS song paused. The source check
+        scopes it to the live card: a finalize edit for the song that just ended can
+        land after the next one has started paused, and that card is not paused."""
+        vc = self._guild.voice_client
+        return (
+            isinstance(vc, discord.VoiceClient) and vc.source is song and vc.is_paused()
+        )
+
+    def _title_prefix_for(self, song: YTDL) -> str:
+        return (
+            _PAUSED_TITLE_PREFIX
+            if self._is_paused_song(song)
+            else _NOW_PLAYING_TITLE_PREFIX
+        )
+
     def _build_now_playing_embed(
         self, song: YTDL, *, position_override: Optional[float] = None
     ) -> discord.Embed:
@@ -1245,7 +1286,7 @@ class MusicPlayer:
         fields = NowPlayingData.from_song(song)
         return _build_now_playing_base_embed(
             # No markdown: Discord renders embed titles literally.
-            title=f"Now playing: {song.title}",
+            title=f"{self._title_prefix_for(song)}{song.title}",
             description=description,
             webpage_url=fields.webpage_url,
             uploader=fields.uploader,
@@ -1257,25 +1298,42 @@ class MusicPlayer:
             thumbnail=fields.thumbnail,
         )
 
-    def build_pause_confirmation_embed(self) -> Optional[discord.Embed]:
-        """Slim -pause confirmation: just the pause position, since the response
-        hosts the live NP block right below. position_secs is frozen while paused.
-        None when no song is live."""
-        song = self.current_song
-        if song is None:
+    def _build_paused_embed(self, song: YTDL) -> Optional[discord.Embed]:
+        """The paused card, second in the block. None unless the client holds THIS
+        song paused, which is what makes it appear on -pause and vanish on -resume:
+        every render path rebuilds the block, so nothing has to remove it.
+
+        Slim, because the card above it already carries the title, the frozen bar
+        and the thumbnail. position_secs is frozen while paused, so the position is
+        the exact point (-ss offset included)."""
+        if not self._is_paused_song(song):
             return None
         position = int(song.position_secs)
-        duration_secs = song.duration_secs
-        paused_at = (
-            f"{fmt_duration(position)} / {fmt_duration(duration_secs)}"
-            if duration_secs > 0
-            else fmt_duration(position)
-        )
-        return discord.Embed(
-            title=f"⏸️ Paused: {song.title}",
-            description=f"Paused at: `{paused_at}`",
+        if song.duration_secs > 0:
+            paused_at = f"{fmt_duration(position)} / {fmt_duration(song.duration_secs)}"
+        else:
+            paused_at = fmt_duration(position)
+        lines = [f"Paused at: `{paused_at}`"]
+        ctx = self._pause_context
+        if ctx is not None and ctx.song is song:
+            # Discord timestamps, not this guild's clock: they render in each
+            # viewer's own zone, and the relative one keeps counting on a card no
+            # tick will edit again for as long as the song stays paused.
+            when = f"<t:{int(ctx.at)}:t>  ·  <t:{int(ctx.at)}:R>"
+            lines.append(
+                f"Paused by: [{requester_mention(ctx.by)}]  ·  {when}"
+                if ctx.by is not None
+                else f"Paused since: {when}"
+            )
+        embed = discord.Embed(
+            title=f"{_PAUSED_TITLE_PREFIX}{song.title}",
+            description="\n".join(lines),
             color=discord.Color.orange(),
         )
+        # Plain text: Discord renders no markdown in a footer, so the command name
+        # cannot be code-formatted here.
+        embed.set_footer(text="Use -resume to pick this song back up.")
+        return embed
 
     @staticmethod
     def _build_now_playing_embed_from_data(data: NowPlayingData) -> discord.Embed:
@@ -1288,7 +1346,7 @@ class MusicPlayer:
             lines.append("")
         lines.append(f"Requester: [{data.requester_mention}]")
         return _build_now_playing_base_embed(
-            title=f"Now playing: {data.title}",  # literal, as above
+            title=f"{_NOW_PLAYING_TITLE_PREFIX}{data.title}",  # literal, as above
             description="\n".join(lines),
             webpage_url=data.webpage_url,
             uploader=data.uploader,
@@ -1458,29 +1516,50 @@ class MusicPlayer:
     # prepending at send time (MusicContext.send). The previous host is retired:
     # deleted if it was a dedicated NP message, strip-edited otherwise.
 
+    def _build_np_block(
+        self,
+        song: YTDL,
+        *,
+        now_playing: Optional[discord.Embed] = None,
+        position_override: Optional[float] = None,
+        span: Optional[trace.Span] = None,
+    ) -> list[discord.Embed]:
+        """[now_playing, paused?, next_up?] — the one place encoding the block's
+        contents and their order, shared by the attach path and the edit path so a
+        card cannot reach one and miss the other.
+
+        The paused card sits directly under the song it describes and is built from
+        live client state, so it appears on -pause and is gone on -resume without
+        anything deleting it. `now_playing` lets a caller that already built this
+        song's embed supply it instead of building an identical one.
+
+        Decorated here, so every render site gets it from one place; decorate
+        replaces rather than appends, so a cached play_message decorated more than
+        once is safe. `span` follows `song` and is passed by the caller — see
+        _push_np_edit."""
+        block = [
+            now_playing
+            if now_playing is not None
+            else self._build_now_playing_embed(
+                song, position_override=position_override
+            )
+        ]
+        for extra in (self._build_paused_embed(song), self._build_next_up_embed()):
+            if extra is not None:
+                block.append(extra)
+        self._decorate_for_debug(block, span=span)
+        return block
+
     def np_embed_block(
         self, *, now_playing: Optional[discord.Embed] = None
     ) -> list[discord.Embed]:
-        """The [now_playing, next_up?] block, or [] when no song is live. A caller
-        that already built this song's embed supplies it as `now_playing`.
-        Decorated here, so every attach site gets it from one place; decorate
-        replaces rather than appends, so a cached play_message decorated more than
-        once is safe."""
+        """The block for the live song, or [] when none is."""
         song = self.current_song
         if song is None:
             return []
-        block = [
-            (
-                now_playing
-                if now_playing is not None
-                else self._build_now_playing_embed(song)
-            )
-        ]
-        next_up = self._build_next_up_embed()
-        if next_up is not None:
-            block.append(next_up)
-        self._decorate_for_debug(block, span=self._playback_span)
-        return block
+        return self._build_np_block(
+            song, now_playing=now_playing, span=self._playback_span
+        )
 
     def _adopt_np_host(
         self,
@@ -1686,10 +1765,27 @@ class MusicPlayer:
         except Exception as e:
             log.warning(f"Failed to update bot activity: {e}", exc_info=True)
 
-    async def pause(self, vc: discord.VoiceClient) -> None:
-        """Pause playback and sync the Redis crash-recovery accounting and the
-        progress-bar/Activity refresh in one place."""
+    async def pause(
+        self,
+        vc: discord.VoiceClient,
+        *,
+        by: Optional[Union[discord.User, discord.Member]] = None,
+    ) -> None:
+        """Pause playback and sync all pause-tracking state in one place: the Redis
+        crash-recovery epoch accounting, the paused card's byline, and the
+        progress-bar/Activity refresh. One entry point, so a future call site can't
+        forget any of them.
+
+        `by` is the member who asked; the loop parks a returning tail with none, and
+        the card omits the byline rather than crediting the pause to whoever
+        happened to queue the song."""
         vc.pause()
+        song = self.current_song
+        # Stamped before the awaits below, so the card cannot render a pause it has
+        # no time for. Carries the song so the next one cannot inherit this byline.
+        self._pause_context = (
+            PauseContext(song=song, at=time.time(), by=by) if song is not None else None
+        )
         if self.store is not None:
             # One instant for both writes, so the legacy wall-clock math cannot
             # count the gap between them as playback.
@@ -1703,6 +1799,7 @@ class MusicPlayer:
 
     async def resume(self, vc: discord.VoiceClient) -> None:
         vc.resume()
+        self._pause_context = None
         if self.store is not None:
             await self.store.on_resume(time.time())
         self.mark_resumed()
@@ -1732,7 +1829,10 @@ class MusicPlayer:
             await asyncio.sleep(_PAUSE_DEBOUNCE_SECS)
         except asyncio.CancelledError:
             return
-        if self._progress_task is not None and self._np_host_message is not None:
+        # Gated on the host alone. The block gains and loses a whole card here, so
+        # a song too short for a progress task still needs the edit — without it a
+        # paused card outlives the pause that built it.
+        if self._np_host_message is not None:
             self._spawn_background(self._edit_now_playing_once())
         self._spawn_background(self.update_activity(self.current_song))
 
@@ -2239,10 +2339,11 @@ class MusicPlayer:
         return await self._send_np_host_message() is not None
 
     async def rehost_np_after_resume(self) -> None:
-        """-resume: when a command response hosts the block (typically the -pause
-        confirmation), re-host onto a fresh dedicated message so "⏸️ Paused at…"
-        is not re-rendered beneath a live bar every tick. A dedicated host is left
-        alone."""
+        """-resume: when a command response hosts the block, re-host onto a fresh
+        dedicated message so the resumed bar sits at the bottom of the channel
+        rather than under whatever that response said. A dedicated host is left
+        alone — it carries nothing but the block, which the resume edit rebuilds
+        in place."""
         if self._np_host_message is None or self._np_host_dedicated:
             return
         await self._send_np_host_message()
@@ -2277,12 +2378,9 @@ class MusicPlayer:
         `span` follows `song` and is passed by the caller: the finalize awaits
         _np_edit_lock, and by then _playback_span may name the next song."""
         try:
-            embed = self._build_now_playing_embed(
-                song, position_override=position_override
+            block = self._build_np_block(
+                song, position_override=position_override, span=span
             )
-            next_up = self._build_next_up_embed()
-            block = [embed] + ([next_up] if next_up else [])
-            self._decorate_for_debug(block, span=span)
             embeds = block + own_embeds
             # Discord's per-message cap: drop the own-embeds tail, never the block.
             embeds = embeds[:10]

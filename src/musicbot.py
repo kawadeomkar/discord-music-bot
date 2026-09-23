@@ -765,9 +765,13 @@ class MusicBot(commands.Cog):
         aliases=["po"],
         brief="pause the current song",
         help=(
-            "Pauses playback and posts the exact position the song stopped at. "
-            "The queue and the bot's voice connection are kept — `-resume` picks "
-            "the song back up from that position."
+            "Pauses playback and re-pins the Now Playing card, which gains a "
+            "second card naming the exact position the song stopped at, who "
+            "paused it and when. The queue and the bot's voice connection are "
+            "kept — `-resume` picks the song back up from that position, and "
+            "that second card goes away with the pause.\n\n"
+            "With nothing to pause it says so, and tells an already-paused "
+            "song apart from no song at all."
         ),
         extras={"category": "Playback", "examples": ["-pause", "-po"]},
     )

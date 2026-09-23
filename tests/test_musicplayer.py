@@ -44,6 +44,7 @@ from src.commands import replay as replay_cmd
 from src.queue_rows import advance_walk, queue_row
 from src.musicplayer import (
     MusicPlayer,
+    PauseContext,
     StreamFailure,
     _START_WRITE_TIMEOUT,
     _STREAM_FAILURE_CIRCUIT,
@@ -2935,6 +2936,35 @@ class TestBuildNowPlayingEmbed:
         assert "*" not in embed.title
         assert embed.title.startswith("Now playing: ")
 
+    def test_embed_title_says_paused_while_this_song_is_paused(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = True
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert embed.title == f"⏸️ Paused: {mock_song.title}"
+
+    def test_embed_title_says_now_playing_while_this_song_plays(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert embed.title == f"Now playing: {mock_song.title}"
+
+    def test_embed_title_ignores_a_pause_belonging_to_another_song(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The finalize edit for a song that just ended can land after the next one
+        started paused. That card is a record of a finished song, not a paused one."""
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = MagicMock()  # the song that started paused after this one ended
+        vc.is_paused.return_value = True
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert embed.title == f"Now playing: {mock_song.title}"
+
     def test_embed_title_truncated_to_discord_limit(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -3115,101 +3145,150 @@ class TestBuildNowPlayingEmbed:
         assert fmt_duration(30) not in bar_line
 
 
-class TestBuildPauseConfirmationEmbed:
-    """Slim by design: the -pause response hosts the live NP block directly below
-    this embed, so a bar, requester, links or thumbnail here would render twice. It
-    carries only what the NP block doesn't — paused state and pause position."""
+class TestBuildPausedEmbed:
+    """The block's second card. Slim by design: the now-playing card directly above
+    it carries the bar, the requester, the links and the thumbnail, so this one
+    carries the pause position, who paused and when, and the way back."""
 
-    def test_returns_none_when_no_current_song(self, music_player: MusicPlayer) -> None:
-        music_player.current_song = None
-        assert music_player.build_pause_confirmation_embed() is None
-
-    def test_returns_discord_embed(
-        self, music_player: MusicPlayer, mock_song: MagicMock
-    ) -> None:
+    @pytest.fixture
+    def paused(self, music_player: MusicPlayer, mock_song: MagicMock) -> MagicMock:
+        """The one state the card renders in: this client holding THIS song paused."""
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = True
         music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
-        assert embed is not None
-        assert isinstance(embed, discord.Embed)
+        return mock_song
 
-    def test_title_contains_song_title(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+    def test_title_prefix_matches_the_np_card(
+        self, music_player: MusicPlayer, paused: MagicMock
     ) -> None:
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        """Both titles sit in one message, so a drift reads as two songs."""
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
-        assert mock_song.title in embed.title
+        assert embed.title == music_player._build_now_playing_embed(paused).title
+
+    def test_returns_none_while_the_song_plays(
+        self, music_player: MusicPlayer, paused: MagicMock
+    ) -> None:
+        """The absence IS the removal: -resume rebuilds the block and the card is
+        simply not in it."""
+        mocked(music_player._guild.voice_client).is_paused.return_value = False
+        assert music_player._build_paused_embed(paused) is None
+
+    def test_returns_none_when_another_song_is_the_paused_one(
+        self, music_player: MusicPlayer, paused: MagicMock
+    ) -> None:
+        mocked(music_player._guild.voice_client).source = MagicMock()
+        assert music_player._build_paused_embed(paused) is None
 
     def test_color_is_orange(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+        self, music_player: MusicPlayer, paused: MagicMock
     ) -> None:
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         assert embed.colour == discord.Color.orange()
 
     def test_paused_at_reflects_elapsed_secs(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+        self, music_player: MusicPlayer, paused: MagicMock
     ) -> None:
-        mock_song.elapsed_secs = 65.0
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        paused.elapsed_secs = 65.0
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         # position 1:05 of total 3:30
         assert "Paused at: `1:05 / 3:30`" in described(embed)
 
     def test_paused_at_includes_start_offset(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+        self, music_player: MusicPlayer, paused: MagicMock
     ) -> None:
         """A song resumed mid-stream via FFmpeg -ss reports true audio position
         (YTDL.position_secs), not just elapsed_secs."""
-        mock_song.start_offset = 60
-        mock_song.elapsed_secs = 65.0
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        paused.start_offset = 60
+        paused.elapsed_secs = 65.0
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         # position = 60 + 65 = 125s = 2:05
         assert "Paused at: `2:05 / 3:30`" in described(embed)
 
     def test_paused_at_omits_total_when_duration_unknown(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+        self, music_player: MusicPlayer, paused: MagicMock
     ) -> None:
-        mock_song.elapsed_secs = 65.0
-        mock_song.duration_secs = 0
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        paused.elapsed_secs = 65.0
+        paused.duration_secs = 0
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         assert "Paused at: `1:05`" in described(embed)
         assert "/" not in described(embed).split("Paused at:")[1].split("\n")[0]
 
-    def test_no_progress_bar(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+    def test_byline_names_who_paused_and_when(
+        self, music_player: MusicPlayer, paused: MagicMock, mock_author: MagicMock
     ) -> None:
-        mock_song.elapsed_secs = 65.0
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        music_player._pause_context = PauseContext(
+            song=paused, at=1756400000.0, by=mock_author
+        )
+        embed = music_player._build_paused_embed(paused)
+        assert embed is not None
+        body = described(embed)
+        assert f"Paused by: [{mock_author.mention}]" in body
+        # Discord timestamps, so every viewer reads the clock in their own zone.
+        assert "<t:1756400000:t>" in body
+        assert "<t:1756400000:R>" in body
+
+    def test_byline_omits_the_author_when_the_loop_parked_it(
+        self, music_player: MusicPlayer, paused: MagicMock
+    ) -> None:
+        """A -playnow tail comes back paused with nobody having asked for it."""
+        music_player._pause_context = PauseContext(song=paused, at=1756400000.0)
+        embed = music_player._build_paused_embed(paused)
+        assert embed is not None
+        body = described(embed)
+        assert "Paused by" not in body
+        assert "Paused since: <t:1756400000:t>" in body
+
+    def test_byline_absent_for_a_pause_belonging_to_another_song(
+        self, music_player: MusicPlayer, paused: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """A crash-recovered or loop-parked song has no context of its own; the
+        previous song's must not become its byline."""
+        music_player._pause_context = PauseContext(
+            song=MagicMock(), at=1756400000.0, by=mock_author
+        )
+        embed = music_player._build_paused_embed(paused)
+        assert embed is not None
+        body = described(embed)
+        assert "Paused by" not in body
+        assert "1756400000" not in body
+
+    def test_footer_points_at_resume(
+        self, music_player: MusicPlayer, paused: MagicMock
+    ) -> None:
+        embed = music_player._build_paused_embed(paused)
+        assert embed is not None
+        assert embed.footer.text is not None
+        assert "-resume" in embed.footer.text
+
+    def test_no_progress_bar(
+        self, music_player: MusicPlayer, paused: MagicMock
+    ) -> None:
+        paused.elapsed_secs = 65.0
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         assert "🔘" not in described(embed)
 
     def test_no_requester_line(
-        self, music_player: MusicPlayer, mock_song: MagicMock
+        self, music_player: MusicPlayer, paused: MagicMock
     ) -> None:
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+        """The card above carries the requester; this one names the PAUSER."""
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
-        assert mock_song.requester.mention not in described(embed)
+        assert paused.requester.mention not in described(embed)
 
-    def test_no_fields(self, music_player: MusicPlayer, mock_song: MagicMock) -> None:
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+    def test_no_fields(self, music_player: MusicPlayer, paused: MagicMock) -> None:
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         assert embed.fields == []
 
-    def test_no_thumbnail(
-        self, music_player: MusicPlayer, mock_song: MagicMock
-    ) -> None:
-        music_player.current_song = mock_song
-        embed = music_player.build_pause_confirmation_embed()
+    def test_no_thumbnail(self, music_player: MusicPlayer, paused: MagicMock) -> None:
+        embed = music_player._build_paused_embed(paused)
         assert embed is not None
         assert not embed.thumbnail.url
 
@@ -5258,6 +5337,45 @@ class TestNpEmbedBlock:
         assert block[0].colour == discord.Color.green()
         assert block[1].title == "Up next"
 
+    async def test_pause_adds_the_card_and_resume_removes_it(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The whole lifecycle, from the block's side: -pause puts the card directly
+        under the song it describes, and -resume takes it away with no deletion —
+        the rebuild simply does not include it."""
+        vc = mocked(music_player._guild.voice_client)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        music_player.current_song = mock_song
+        seed_queue(
+            music_player.queue,
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+        )
+        vc.pause.side_effect = lambda: vc.is_paused.configure_mock(return_value=True)
+        vc.resume.side_effect = lambda: vc.is_paused.configure_mock(return_value=False)
+
+        await music_player.pause(cast(discord.VoiceClient, vc), by=mock_author)
+
+        block = music_player.np_embed_block()
+        # Second: under the now-playing card, above the queue head.
+        assert [e.title for e in block] == [
+            f"⏸️ Paused: {mock_song.title}",
+            f"⏸️ Paused: {mock_song.title}",
+            "Up next",
+        ]
+        assert f"Paused by: [{mock_author.mention}]" in described(block[1])
+
+        await music_player.resume(cast(discord.VoiceClient, vc))
+
+        assert [e.title for e in music_player.np_embed_block()] == [
+            f"Now playing: {mock_song.title}",
+            "Up next",
+        ]
+        # Pinned separately from the render, which stops reading the context the
+        # moment the client reports playing: a byline outliving its pause is
+        # unreachable today only by that second guard.
+        assert music_player._pause_context is None
+
 
 # A song's playback trace, distinct from _current_span()'s so a test can tell which
 # of the two a card is naming.
@@ -6223,10 +6341,9 @@ class TestRetireNpHostOnStop:
 
 
 class TestRehostNpAfterResume:
-    """-resume re-hosting: a command-response host —
-    typically the -pause confirmation — is strip-retired in favor of a fresh
-    dedicated NP message, so "⏸️ Paused at…" becomes plain history instead of
-    being re-rendered beneath a live bar by every tick."""
+    """-resume re-hosting: a command-response host is strip-retired in favor of a
+    fresh dedicated NP message, so the resumed bar sits at the bottom of the
+    channel instead of under whatever that response said."""
 
     async def test_rehosts_when_response_hosts_the_block(
         self, music_player: MusicPlayer, mock_song: MagicMock
