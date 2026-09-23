@@ -77,6 +77,8 @@ RUN test -d /app/.venv/lib/python*/site-packages \
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# Diagnostics the bot never imports, but whose tests run in this tier.
+COPY scripts/ ./scripts/
 # The migration runner discovers .sql files at run time, and a test asserts the
 # directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
 # them present, not just the module.
@@ -107,11 +109,18 @@ ARG ENVIRONMENT=development
 # fall back to a temp dir and warn on every import. Its three sites — here, the
 # runtime stage and tests/conftest.py — hold DIFFERENT paths and are hand-checked on
 # the property that each is writable by the uid running there (CLAUDE.md rule 6d).
+# MOCK_SPEC_CACHE_DISABLE makes this tier the reference run: the suite executes stock
+# unittest.mock, so a disagreement with the venv tier — where the cache is on — is the
+# cache answering something upstream would not. Set here rather than on each `docker
+# run`, which the justfile and ci.yml issue separately. The cache's own tests skip
+# themselves when it is off, so they run in the venv tier.
+# See docs/ARCHITECTURE.md#the-mock-spec-cache.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
     ENVIRONMENT="${ENVIRONMENT}" \
     RUFF_CACHE_DIR=/tmp/ruff-cache \
-    MPLCONFIGDIR=/tmp/mplcache
+    MPLCONFIGDIR=/tmp/mplcache \
+    MOCK_SPEC_CACHE_DISABLE=1
 
 CMD ["python", "-m", "pytest", "--tb=short", "-q"]
 

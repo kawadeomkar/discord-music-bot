@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, item_label
 from src.musicbot import MusicBot
-from src.commands.remove import _echo, _removed_label
+from src.commands._common import echo
 from src.sources import YTSource
 from src.util import EMBED_FIELD_LIMIT
 from src.youtube import QueueObject
@@ -32,7 +32,7 @@ class TestEchoIsSafeInAnEmbed:
         `](` pair survives to pick a link's label and destination. Escaping alone
         does not cover it — brackets are not in escape_markdown's set."""
         attack = "[Free Discord Nitro](https://evil.example/phish)"
-        out = _echo(attack)
+        out = echo(attack)
         assert "[" not in out and "]" not in out
 
     def test_markdown_riding_behind_a_url_is_neutralized(self) -> None:
@@ -40,7 +40,7 @@ class TestEchoIsSafeInAnEmbed:
         URL through UNTOUCHED — so an attack prefixed with a bare link reaches the
         embed verbatim unless safe_label overrides that default."""
         attack = "https://x.com/`[FREE NITRO](https://evil.example/phish)"
-        out = _echo(attack)
+        out = echo(attack)
         assert "[" not in out and "]" not in out
         assert "`" not in out
 
@@ -49,7 +49,7 @@ class TestEchoIsSafeInAnEmbed:
         neutralized outright: escape_markdown's URL exemption covers the WHOLE
         token, so emphasis after a scheme renders styled unless the flag is off.
         Pinned separately because the masked-link tests above pass either way."""
-        out = _echo("https://x.com/**bold**_em_")
+        out = echo("https://x.com/**bold**_em_")
         assert "\\*\\*" in out
         assert "\\_" in out
 
@@ -57,43 +57,82 @@ class TestEchoIsSafeInAnEmbed:
         """Two call sites wrap this in a code span, and Discord gives a backslash
         NO meaning inside one — so an ESCAPED backtick still closes the span and
         renders everything after it. The backtick has to go, not be escaped."""
-        out = _echo("foo` **bold** `bar")
+        out = echo("foo` **bold** `bar")
         assert "`" not in out
         assert "\\*\\*" in out
 
     def test_control_characters_cannot_end_the_line_early(self) -> None:
         """A control character truncates the rendered line, hiding whatever the
         needle put after it."""
-        assert _echo("a\x00b\x1fc\x7fd") == "a b c d"
+        assert echo("a\x00b\x1fc\x7fd") == "a b c d"
 
     def test_the_echo_is_bounded_well_inside_the_field_cap(self) -> None:
         """Discord 400s the whole send past 1024 chars in a field value, and
         escaping can double the length. The removal has already committed by then,
         so the user sees "Command failed" for a removal that happened. `*`, not
         `x`: escaping leaves `x` alone and would not exercise the doubling."""
-        assert len(_echo("*" * 5000)) <= 1024
+        assert len(echo("*" * 5000)) <= 1024
 
     def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
-        assert _echo("never gonna give you up") == "never gonna give you up"
+        assert echo("never gonna give you up") == "never gonna give you up"
 
 
-class TestRemovedLabelNamesEveryItemType:
-    """The Songs field exists because one argument can now take out a whole
-    playlist and there is no undo. `YTSource` has no `.title` at all, so reaching
-    for it rendered every unresolved Spotify-playlist track as `?` — the exact
-    case the field was added for, and the one the -remove help now advertises."""
+def _songs_field(mock_ctx: MagicMock) -> str:
+    """The assembled reply's Songs field."""
+    fields = list(mock_ctx.send.await_args_list[0][1]["embed"].fields)
+    return next(f.value for f in fields if f.name == "Songs")
 
-    def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
-        item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
-        assert _removed_label(item) == "Real Title"
 
-    def test_an_unresolved_search_uses_its_search_text(self) -> None:
+async def _run_remove(
+    music_bot: MusicBot,
+    mock_ctx: MagicMock,
+    *,
+    removed: list[QueueItem],
+    positions: list[int],
+) -> None:
+    """Drive -remove through the cog wrapper over a stubbed removal outcome."""
+    mp = MagicMock()
+    mp.queue_remove = AsyncMock(
+        return_value=RemoveOutcome(
+            removed=removed, positions=positions, mode=RemoveMode.RESOLVED
+        )
+    )
+    mp.wait_for_restore = AsyncMock(return_value=True)
+    mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+    music_bot.get_mp = MagicMock(return_value=mp)
+    await command_callback(MusicBot.remove)(
+        music_bot, mock_ctx, needle="https://yt.com/v=0"
+    )
+
+
+class TestTheSongsFieldNamesItemsAsClearDoes:
+    """The Songs field exists because one argument can take out a whole playlist
+    and there is no undo, so it has to name what went in the words the user will
+    see again from -clear. Both read item_label; a second spelling here is how the
+    two commands drifted apart, naming one track two ways."""
+
+    async def test_a_queued_spotify_track_is_named_by_its_title(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        track = YTSource(
+            ytsearch="ytsearch:DNA. Kendrick Lamar",
+            process=True,
+            title="DNA.",
+            uploader="Kendrick Lamar",
+        )
+        await _run_remove(music_bot, mock_ctx, removed=[track], positions=[3])
+        songs = _songs_field(mock_ctx)
+        assert item_label(track) == "DNA."
+        assert songs == "1: DNA."
+        assert "Kendrick Lamar" not in songs
+
+    async def test_a_search_with_no_title_still_falls_back_to_its_term(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
         item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
-        assert _removed_label(item) == "Artist - Song"
-
-    def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
-        item = YTSource(url="https://yt.com/v=2", process=True)
-        assert _removed_label(item) == "https://yt.com/v=2"
+        await _run_remove(music_bot, mock_ctx, removed=[item], positions=[1])
+        assert item_label(item) == "Artist - Song"
+        assert _songs_field(mock_ctx) == "1: Artist - Song"
 
 
 class TestRemoveReplyStaysInsideDiscordsCaps:
@@ -159,6 +198,30 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         )
         for field in self._fields(mock_ctx):
             assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    def _songs_field(self, mock_ctx: MagicMock) -> str:
+        return next(f.value or "" for f in self._fields(mock_ctx) if f.name == "Songs")
+
+    async def test_more_songs_than_the_list_shows_ends_in_the_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """queue_message marks a cut only when handed more rows than it renders."""
+        songs: list[QueueItem] = [_removed_song(i) for i in range(25)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 26))
+        )
+        songs_field = self._songs_field(mock_ctx)
+        assert songs_field.endswith("...")
+        assert songs_field.count("\n") == 10
+
+    async def test_ten_songs_are_listed_without_the_mark(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        songs: list[QueueItem] = [_removed_song(i) for i in range(10)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        assert not self._songs_field(mock_ctx).endswith("...")
 
     async def test_a_playlists_worth_of_positions_fits(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -440,3 +503,36 @@ class TestRemoveCommand:
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         assert removal_embed.colour == discord.Color.orange()
+
+    async def test_lazy_playlist_tracks_are_named_not_rendered_as_unknown(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A Spotify playlist enqueues one lazy YTSource per track, and YTSource has
+        no `title`, so the Songs field rendered `?` for every track — the case the
+        field exists for, since there is no undo."""
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[
+                    YTSource(ytsearch=f"ytsearch:Track {i} Artist") for i in range(3)
+                ],
+                positions=[1, 2, 3],
+                mode=RemoveMode.ORIGIN,
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://open.spotify.com/playlist/abc"
+        )
+
+        songs = next(
+            f
+            for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
+            if f.name == "Songs"
+        )
+        assert "Track 0 Artist" in (songs.value or "")
+        assert "ytsearch:" not in (songs.value or "")
+        assert "?" not in (songs.value or "")

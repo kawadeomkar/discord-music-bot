@@ -308,6 +308,19 @@ class TestConfigureStructlog:
         telemetry._configure_structlog()
         assert any(isinstance(h, logging.StreamHandler) for h in logging.root.handlers)
 
+    def test_a_percent_style_call_is_rendered_into_the_event(
+        self, clean_setup: None, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Unformatted, the args ride beside the event as `positional_args`, and a
+        Loki search for the rendered text finds nothing."""
+        logging.root.handlers = []
+        telemetry._configure_structlog()
+        structlog.get_logger("percent-style").warning("Dropped %d from %s", 12, "RDx")
+
+        out = capsys.readouterr().out
+        assert "Dropped 12 from RDx" in out
+        assert "positional_args" not in out
+
     def test_does_not_stack_duplicate_stdout_handlers(self, clean_setup: None) -> None:
         """Double-printing every line is the failure this guard prevents."""
         logging.root.handlers = []

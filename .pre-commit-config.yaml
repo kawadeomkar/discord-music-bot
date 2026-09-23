@@ -93,11 +93,18 @@ repos:
       # with `language: python` + `additional_dependencies: [rust-just]`:
       # pre-commit sets VIRTUAL_ENV to the isolated hook env, the justfile's
       # VENV_BIN follows $VIRTUAL_ENV, and every tool would then be looked up
-      # inside a venv containing only `just`.
+      # inside a venv containing only `just`. Measured, not theorised.
       #
       # Unlike `make`, these can fail for want of the runner. A push from a GUI
       # client with a minimal PATH may not find `just`; --no-verify is the escape
       # hatch.
+      #
+      # `env DOCKER=0` on every entry pins these native. The gate mirrors CI's lint and
+      # test jobs, and its user already has the venv (they ran `just install`); under
+      # DOCKER=1 the first push would build the test image and every push would need a
+      # running Docker daemon. Pinned explicitly rather than inherited, so the justfile's
+      # default cannot move them. `just pins` reads the recipe name through the prefix,
+      # so these stay part of the mirrored list.
       #
       # Every one needs pass_filenames: false and always_run: true. The first because
       # pyright is a whole-program analysis and the test suite is not partitioned by
@@ -108,7 +115,7 @@ repos:
       # No fail_fast on any of them: a red push reports every failure at once.
       - id: just-fmt-justfile
         name: justfile format
-        entry: just fmt-justfile
+        entry: env DOCKER=0 just fmt-justfile
         language: system
         pass_filenames: false
         always_run: true
@@ -116,7 +123,7 @@ repos:
 
       - id: just-pins
         name: version pins
-        entry: just pins
+        entry: env DOCKER=0 just pins
         language: system
         pass_filenames: false
         always_run: true
@@ -124,7 +131,7 @@ repos:
 
       - id: just-fmt-check
         name: ruff format
-        entry: just fmt-check
+        entry: env DOCKER=0 just fmt-check
         language: system
         pass_filenames: false
         always_run: true
@@ -132,7 +139,7 @@ repos:
 
       - id: just-lint
         name: ruff lint
-        entry: just lint
+        entry: env DOCKER=0 just lint
         language: system
         pass_filenames: false
         always_run: true
@@ -140,7 +147,7 @@ repos:
 
       - id: just-check-heavy
         name: pyright + pytest (concurrent)
-        entry: just check-heavy
+        entry: env DOCKER=0 just check-heavy
         language: system
         pass_filenames: false
         always_run: true

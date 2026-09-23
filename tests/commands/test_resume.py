@@ -34,9 +34,9 @@ class TestResumeCommand:
     async def test_rehosts_np_block_after_resume(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """If the -pause confirmation hosts the block, resume re-hosts it so
-        "⏸️ Paused at…" becomes plain history instead of sitting beneath a
-        live, advancing bar."""
+        """If a command response hosts the block, resume re-hosts it so the
+        resumed bar sits at the bottom of the channel rather than beneath
+        whatever that response said."""
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.is_paused = MagicMock(return_value=True)
@@ -67,7 +67,7 @@ class TestResumeCommand:
     ) -> None:
         """Silence was the old answer on every no-op branch; a reply has to say
         why nothing happened."""
-        mock_ctx.voice_client = playing_vc()
+        mock_ctx.voice_client = playing_vc(mock_ctx)
         mp = MagicMock()
         mp.resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -145,7 +145,7 @@ class TestResumeCommand:
         async def fake_invoke(*_a: Any, **_kw: Any) -> None:
             if calls is not None:
                 calls.append("join")
-            mock_ctx.voice_client = paused_vc()
+            mock_ctx.voice_client = paused_vc(mock_ctx)
 
         return AsyncMock(side_effect=fake_invoke)
 
