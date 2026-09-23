@@ -112,9 +112,11 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
     command is a minor bump, not a major one: the version is a deploy tag for a
     self-hosted bot, nothing links against these names, and CI validates only that the
     string is semver-shaped. `-playnow` and `-playnext` survive as spellings of
-    `-p --now` / `-p --next`, and renaming them would be minor too. A removal still owes users an
-    `## Upgrading to <version>` section in README.md — nothing else records the
-    migration, and the release notes are minted from the tag.
+    `-p --now` / `-p --next`, and renaming them would be minor too. A removal still owes
+    users a `## <version> — <date>` section in CHANGELOG.md — the GitHub release notes
+    are `--generate-notes`' PR list, which records that a PR merged and not what a
+    deployment has to do about it. Write that section for anyone who RUNS the bot, and
+    only when a deployment could notice the release at all.
 
 ## Commands
 

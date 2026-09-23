@@ -375,8 +375,8 @@ per-tick-varying footer would edit the board until its deadline (which is why th
 suffix omits elapsed-ms).
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
-10-embed cap; worst case here is 5, a collection card under its unavailable-songs and
-short-walk notices), then `_adopt_np_host_if_current` makes that message
+10-embed cap; worst case here is 6, a three-card block above a collection card and its
+unavailable-songs and short-walk notices), then `_adopt_np_host_if_current` makes that message
 the new host and retires the previous one (dedicated NP message → deleted; command
 response → strip-edited back to its own embeds). Attaching at send time makes response +
 block one atomic message, so the bar is never momentarily buried. Song end: host is
