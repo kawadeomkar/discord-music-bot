@@ -12,8 +12,8 @@ silently turns the retry off in production while the suite stays green.
 So this tier spawns the real binary against a local HTTP server that fails on
 purpose, and pins the two numbers the decision is built on:
 
-- a refused URL (403) exits NON-ZERO, so discord.py stores an FFmpegProcessError
-  and the retry fires;
+- a refused URL (403) exits NON-ZERO, so discord.py turns that into an
+  FFmpegProcessError and the retry can fire;
 - a connection that dies after the container header exits ZERO with no error, so
   the decision falls to `_drop_unplayable_stream_cache` instead — which is
   deliberate (see .claude/rules/playback.md: widening `stream_failed` onto the
@@ -25,7 +25,14 @@ seek into an offset Range request depends on the file being large enough to be
 worth one — a 29 KB sample is fetched whole either way — and a sample big enough
 to show the difference takes longer to prove than the stall it prevents.
 
-Needs ffmpeg on PATH — the same requirement `just run` already has. No network:
+What it does NOT assert is that discord.py catches the exit code in time. ffmpeg
+closes stdout before it is reaped, so `read()`'s own `poll()` can return None and
+store nothing — the window playback.md names, whose backstop is
+`_drop_unplayable_stream_cache`. That is a race, not a fact, and asserting it is
+how the first version of this file passed on a laptop and failed on a runner.
+
+Needs ffmpeg on PATH — the same requirement `just run` already has, though note
+GitHub's runner image does NOT ship it, so the CI job installs it. No network:
 the server is local, and the sample is synthesised by ffmpeg at session scope.
 """
 
@@ -138,21 +145,34 @@ def server(opus_sample: bytes) -> Iterator[type[_FailingHandler]]:
             thread.join(timeout=5)
 
 
-def _drain(url: str) -> tuple[int, Optional[int], Optional[Exception]]:
-    """Read a source to exhaustion the way discord.py's AudioPlayer does.
+# A child that has closed stdout is about to exit; this only bounds the wait so
+# a hung ffmpeg fails the test rather than the run.
+_EXIT_TIMEOUT_SECS = 10
 
-    Returns (packets, ffmpeg's exit code, the error discord.py stored) — the
-    three values `stream_failed` is computed from, before any of our own code
-    interprets them."""
+
+def _drain(url: str) -> tuple[int, int, Optional[Exception]]:
+    """Read a source to exhaustion the way discord.py's AudioPlayer does, then
+    let the child exit and ask discord.py what it makes of the exit code.
+
+    Returns (packets, ffmpeg's final exit code, the error discord.py stored).
+
+    `wait()`, not the `poll()` that `read()` itself uses: ffmpeg closes stdout
+    before it is reaped, so polling the instant the loop ends reads None on a
+    fast host and the real code on a slow one — this asserted `code == 0` on a
+    laptop and `code is None` on a CI runner. That window is real and the
+    production code owns it (playback.md: `_drop_unplayable_stream_cache` is its
+    backstop), but it is a race, and what this tier exists to pin is the exit
+    code itself. `_check_process_returncode` is then called explicitly, which is
+    what `read()` would have done had the child been reaped in time."""
     source = discord.FFmpegOpusAudio(url, options="-vn")
     process = source._process
     packets = 0
     try:
         while source.read():
             packets += 1
-        # read() checks the return code only when it hands back an empty packet,
-        # which is exactly the call that ended the loop above.
-        return packets, process.poll(), getattr(source, "_current_error", None)
+        code = process.wait(timeout=_EXIT_TIMEOUT_SECS)
+        source._check_process_returncode()
+        return packets, code, getattr(source, "_current_error", None)
     finally:
         source.cleanup()
         # cleanup() kills the child but leaves its pipes open, and this suite
@@ -184,7 +204,7 @@ class TestWhatFFmpegReportsForAFailedStream:
         packets, code, error = _drain(server.url)  # type: ignore[attr-defined]
 
         assert packets <= _OGG_HEADER_PACKETS, "a 403 must not look like audio"
-        assert code not in (0, None), "ffmpeg reported success for a refused URL"
+        assert code != 0, "ffmpeg reported success for a refused URL"
         assert isinstance(error, discord.errors.ClientException), (
             "discord.py did not store an error, so `after` receives None and "
             "stream_failed is False"
