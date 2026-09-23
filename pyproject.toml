@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.49.0"
+version = "2.50.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -232,6 +232,11 @@ markers = [
     # lock in both directions, and a rejected payload holding a NUL byte that
     # jsonb and text both refuse) — see tests/test_pg_integration.py.
     "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
+    # Integration tier against the REAL ffmpeg binary, excluded from the default
+    # run: `stream_failed` is computed from ffmpeg's exit code and discord.py's
+    # stored error, and the default suite injects both rather than observing them
+    # — see tests/test_ffmpeg_integration.py.
+    "ffmpeg: real-ffmpeg integration test (needs ffmpeg on PATH)",
     # Integration tier against a real Redis, excluded from the default run:
     # redis:7-alpine via testcontainers locally, a service container in CI.
     # fakeredis executes every stream command the outbox uses but gets five of
