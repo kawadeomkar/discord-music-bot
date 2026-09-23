@@ -236,19 +236,19 @@ _tools TOOL:
 fmt: (_tools 'ruff')
     #!/usr/bin/env bash
     set -uo pipefail
-    {{ RUFF }} check --fix src/ tests/ || lint_rc=$?
-    {{ RUFF }} format src/ tests/
+    {{ RUFF }} check --fix src/ tests/ scripts/ || lint_rc=$?
+    {{ RUFF }} format src/ tests/ scripts/
     exit "${lint_rc:-0}"
 
 # Check formatting only, no rewrites (~0.04s)
 [group('check')]
 fmt-check: (_tools 'ruff')
-    {{ RUFF }} format --check src/ tests/
+    {{ RUFF }} format --check src/ tests/ scripts/
 
 # Check lint rules only, no rewrites (~0.05s)
 [group('check')]
 lint: (_tools 'ruff')
-    {{ RUFF }} check src/ tests/
+    {{ RUFF }} check src/ tests/ scripts/
 
 # Type-check src/ AND tests/ with pyright (~6s)
 [group('check')]
@@ -772,6 +772,18 @@ services:
     else
         docker compose up -d redis
     fi
+
+# Answers "what would the bot actually play for this?" with the real stream opts —
+# selected format, the ladder it chose from, and the fallback candidates the retry
+# would walk. Run it at every yt-dlp bump: the repo's claims about format selection
+# are empirical, and both YouTube and yt-dlp move under them.
+# Host venv only: it makes a live network call, so there is nothing DOCKER=1 would
+# buy, and depending on `_tools` would trigger a test-image rebuild before running
+# the local interpreter anyway.
+[doc('Print the format yt-dlp selects and the fallback ladder for a URL')]
+[group('dev')]
+ytdl-formats URL:
+    {{ quote(VENV_BIN / 'python') }} -m scripts.ytdl_formats {{ quote(URL) }}
 
 # Escape hatch for compose commands this file does not wrap, with the archive
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.

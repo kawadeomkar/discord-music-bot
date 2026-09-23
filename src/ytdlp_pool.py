@@ -24,6 +24,7 @@ from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from logging.handlers import QueueListener
+from multiprocessing.context import BaseContext
 from queue import Empty
 from typing import Any, Optional, TypeVar
 
@@ -37,6 +38,11 @@ from src.util import get_logger
 log = get_logger(__name__)
 
 T = TypeVar("T")
+
+# Extractions a worker serves before the pool replaces it. A worker's resident set
+# grows with every extraction and never flattens, so 16 caps one near 300MB and keeps
+# four inside the container. See docs/ARCHITECTURE.md#yt-dlp-process-boundary.
+_MAX_TASKS_PER_CHILD = 16
 
 # How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30
 # with retries=10 can outlive any shutdown.
@@ -63,6 +69,22 @@ def worker_progress_queue() -> Optional[Any]:
     the initializer, after import. This module owns the transport and knows
     nothing about what rides it."""
     return _PROGRESS_Q
+
+
+def _pool_context() -> BaseContext:
+    """The start method the pool spawns workers with: the platform default, unless
+    that is `fork`, which a task budget rejects and which is unsafe to fork a
+    multi-threaded asyncio process from.
+
+    Passed EXPLICITLY. Supplying max_tasks_per_child without an mp_context makes
+    ProcessPoolExecutor force spawn, replacing 3.14's forkserver default on Linux at
+    ~23x the worker startup cost. See docs/ARCHITECTURE.md#yt-dlp-process-boundary.
+    """
+    method = multiprocessing.get_start_method()
+    if method == "fork":
+        available = multiprocessing.get_all_start_methods()
+        method = "forkserver" if "forkserver" in available else "spawn"
+    return multiprocessing.get_context(method)
 
 
 def _warmup_noop() -> None:
@@ -176,9 +198,14 @@ class YtdlpPool:
         executor_factory: Optional[Callable[[], Executor]] = None,
         name: str = "yt-dlp extraction",
         progress_sink: Optional[Callable[[Any], None]] = None,
+        recycle_workers: bool = True,
     ) -> None:
         self._max_workers = max_workers
         self._name = name
+        # Whether a worker is replaced after _MAX_TASKS_PER_CHILD calls. False for
+        # the chart pool, whose one worker pays matplotlib's import again on every
+        # replacement.
+        self._recycle_workers = recycle_workers
         # What a worker's progress messages are handed to, on the drain THREAD.
         # It must not block and must not touch the event loop. None (the default,
         # and the chart pool's) builds no queue and no drain at all.
@@ -221,6 +248,12 @@ class YtdlpPool:
             max_workers=self._max_workers,
             initializer=_worker_init,
             initargs=(self._log_queue, self._progress_queue),
+            # A recycled worker re-runs the initializer, so worker logging and the
+            # progress transport survive the turnover.
+            max_tasks_per_child=(
+                _MAX_TASKS_PER_CHILD if self._recycle_workers else None
+            ),
+            mp_context=_pool_context(),
         )
 
     def _start_progress_drain(self) -> None:

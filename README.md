@@ -574,6 +574,38 @@ reset. A variable you set outside that range still applies, and `-settings bot` 
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.49.0
+
+**Songs that used to fail quietly now play.** Nothing to configure and no data touched;
+rolling back is only a redeploy.
+
+- **A song with a start offset actually starts.** The seek went *after* ffmpeg's input,
+  so it downloaded and decoded from `0:00` and threw the audio away until it reached the
+  offset — and because that open carries no Range header, YouTube served it at a trickle
+  and then stopped. A link at `48:10` of a 58-minute song read 408 KB, produced no audio
+  and never started, **with nothing in the logs, because nothing had failed**. The seek
+  is now a range request straight to the offset. This is reached by a `?t=` link,
+  `-play --timestamp`, the song `-play --now` interrupted coming back, and a restart
+  resuming into a long song.
+- **A stream that will not open is retried rather than abandoned.** One dead URL used to
+  be one red embed. A song now gets three attempts: the second with a fresh URL, which
+  cures a link revoked between the check and playback; the third on a different audio
+  format. Two dead songs in a row stop the retries until one plays.
+- **Less CPU per song.** Most of what YouTube serves is already in the format Discord
+  wants, and it was being decoded and re-encoded to the same thing. It is now passed
+  through untouched where that is safe.
+- **The lookup workers stop being killed.** Each one grew about 5 MB per lookup and never
+  gave it back, so a long-running bot eventually lost a worker to the kernel and had to
+  rebuild the pool. Workers are now retired and replaced before they get that large.
+- **A search picks a result it can actually play**, instead of accepting one with no
+  playable format and failing later, where the error looks unrelated to the search.
+
+**For operators:** `just ytdl-formats <url-or-search>` prints the format yt-dlp selects,
+the ladder it chose from, and the fallback ladder the retry would walk. It calls the
+bot's own picker rather than a copy, so what it prints is what the bot does. Run it after
+every yt-dlp bump: the format choices in the code are empirical, and both YouTube and
+yt-dlp move under them.
+
 ## Upgrading to 2.48.0
 
 **`-play` takes a start offset, and three things it already did read differently.**

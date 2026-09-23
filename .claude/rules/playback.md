@@ -141,10 +141,22 @@ code in the repo. Its bookkeeping invariants:
 - Stream-never-opened detection: `stream_failed = not song.produced_audio and
   play_error[0] is not None` — zero frames alone also describes a paused-parked song;
   an error alone also describes a mid-song death that earned its history entry. A dead
-  stream drops the cached URL (`_handle_dead_stream`) and notifies the channel.
+  stream drops the cached URL and gets **`_STREAM_PLAY_ATTEMPTS` (3) plays total**:
+  `_retry_failed_stream` re-queues it next (`queue_put_next`) carrying
+  `stream_attempts + 1`, and from the second retry the format that failed, so the fresh
+  resolve walks the rest of the ladder first; the terminal failure falls through to
+  `_handle_dead_stream`'s red embed, and `_STREAM_FAILURE_CIRCUIT` (2) consecutive dead
+  songs withdraw the retries until one produces audio. Two placements are load-bearing:
+  the retry DECISION and `_neutralize_prefetch()` run where `stream_failed` is computed,
+  because by the iteration tail the loop has claimed `_prefetch_task` into a local and
+  the already-resolved next song would play instead of the retry; and the history write
+  carries `and not retrying`, so a retried fragment never records and the terminal
+  attempt records exactly once. A `--now` that parked a tail inside the death window IS
+  the requeue (`folded_into_tail`), stamped with the spent budget. Mid-song death is not
+  retried: it produced audio and earned its entry.
   discord.py **does** report a failing ffmpeg — `FFmpegOpusAudio.read()` calls
   `_check_process_returncode()` on an empty packet, which reaches `after` as
-  `FFmpegProcessError`. So `stream_failed` is the main path and `_handle_dead_stream`
+  `FFmpegProcessError`. So `stream_failed` is the main path and the retry flow above
   owns it. The one window that check declines to judge is `poll()` returning None — a
   child that closed stdout but has not been reaped — and `_drop_unplayable_stream_cache`
   is the backstop for it, guarded by `note_deliberate_stop()` (a stop we initiate ends
@@ -450,8 +462,10 @@ instance assignment, and the `cls(...)` call in `yt_stream` in `src/youtube.py`*
 miss these three and the field is
 silently dropped the moment the queue object becomes a playing song, which is where every
 read of it happens → then **BOTH places a playing song is turned back into a
-QueueObject**: `MusicPlayer._queue_object_of` (the rebuild `_neutralize_prefetch` and
-the volume rebuild in `loop()` share) and `MusicPlayer.interject()`'s resume tail.
+QueueObject**: `MusicPlayer._requeued_form` (the rebuild `_neutralize_prefetch` and
+the stream retry share — carry it) and `MusicPlayer.interject()`'s resume tail (a
+different entry by construction — decide, don't copy: it resets `stream_attempts` and
+`failed_format_ids`, which `_requeued_form` inherits, and both are runtime-only).
 `YTDL.volume` is the one keyword that is never carried: it is the level baked into that
 source, and a requeued song is rebuilt at the level current then. **Not gated on "playback-relevant"** —
 `user_input` and `persisted` are neither, and both were lost through exactly that gap.

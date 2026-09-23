@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.48.0"
+version = "2.49.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -256,7 +256,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 branch = true
-source = ["src", "tests/mock_spec_cache.py"]
+source = ["src", "scripts", "tests/mock_spec_cache.py"]
 
 [tool.coverage.report]
 fail_under = 80

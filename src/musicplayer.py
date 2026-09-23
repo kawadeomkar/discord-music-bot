@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import datetime
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -113,6 +113,18 @@ _MIN_RESUME_REMAINING_SECS = 5
 # EOF guard for the resume seek (duration metadata is imprecise), matching the
 # crash-recovery position cap in _restore_state().
 _RESUME_EOF_MARGIN_SECS = 10
+
+# ── Stream retry ─────────────────────────────────
+# Plays one song gets before a stream that never opens is reported as a failure.
+# Attempt 2 cures a revoked URL in place, attempt 3 walks past a dead format (see
+# _blacklist_after). Each attempt drops the cache entry and re-extracts, so a dead
+# song costs ~4.5s per attempt. See docs/ARCHITECTURE.md#stream-retry-ladder.
+_STREAM_PLAY_ATTEMPTS = 3
+
+# Consecutive songs that may burn their whole budget before retries are withdrawn.
+# Systemic failure — PO-token enforcement, a flagged IP — fails every song alike, and
+# the budget then buys only dead air. Any song that produces audio resets this.
+_STREAM_FAILURE_CIRCUIT = 2
 
 # ── Progress-bar finalize ─────────────────
 # Tolerance for "this song reached its end", absorbing drift between yt-dlp's
@@ -302,6 +314,7 @@ class MusicPlayer:
         "_pending_resume_tail",
         "_retire_np_for",
         "_replay_of",
+        "_consecutive_dead_songs",
         "_ended_song",
         "_last_stream_error",
     )
@@ -350,6 +363,7 @@ class MusicPlayer:
     _pending_resume_tail: Optional[QueueObject]
     _retire_np_for: Optional[YTDL]
     _replay_of: Optional[trace.SpanContext]
+    _consecutive_dead_songs: int
     _ended_song: Optional[YTDL]
     _last_stream_error: Optional[StreamFailure]
 
@@ -458,6 +472,9 @@ class MusicPlayer:
         # The trace of the play a -replay stopped, linked from the replay's own
         # trace when that starts: one song is one trace, and a replay is two.
         self._replay_of: Optional[trace.SpanContext] = None
+        # Songs in a row that spent their whole stream-retry budget; any song that
+        # produces audio resets it (see _STREAM_FAILURE_CIRCUIT).
+        self._consecutive_dead_songs = 0
         # The song whose playback ended but whose history row is not written yet;
         # keeps the play claimable across the prefetch await — see
         # claim_current_song_for_history.
@@ -781,8 +798,10 @@ class MusicPlayer:
             # An interjection parked this song's tail, and a teardown leaves the
             # queue intact under its 24h TTL — so -resume plays it and records it.
             return None
-        if not song.produced_audio:
-            # ffmpeg exited without a frame: nobody heard it.
+        if not song.produced_audio and not (song.is_resume and song.start_offset > 0):
+            # ffmpeg exited without a frame: nobody heard it. A resume tail is the
+            # exception the loop's `heard_before` also makes: its offset is audio
+            # heard under the fragment that parked it.
             return None
         # Captured before cleanup()'s retire_np_host_on_stop() disposes of it: the
         # history row names this message.
@@ -1804,6 +1823,9 @@ class MusicPlayer:
                     played_at=current.played_at,
                     query_source=current.query_source,
                     user_input=current.user_input,
+                    # stream_attempts/failed_format_ids reset here, unlike
+                    # _requeued_form's inherit: this song is producing audio,
+                    # which ends its retry chain.
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
@@ -1904,22 +1926,26 @@ class MusicPlayer:
             song.title or "",
             song.requester or self._require_requester(),
             ts=song.start_offset or None,
+            user_input=song.user_input,
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
+            persisted=song.persisted,
             interjected=song.interjected,
             is_resume=song.is_resume,
             start_paused=song.start_paused,
             analytics=song.analytics,
             query_source=song.query_source,
-            user_input=song.user_input,
-            persisted=song.persisted,
             played_at=song.played_at,
             np_message_id=song.np_message_id,
             np_channel_id=song.np_channel_id,
             np_dedicated=song.np_dedicated,
             np_host_ref=song.np_host_ref,
             is_replay=song.is_replay,
+            # Inherited, not reset: a prefetched song has not played, so its retry
+            # chain is live. A fresh budget here would loop a dead song past the cap.
+            stream_attempts=song.stream_attempts,
+            failed_format_ids=song.failed_format_ids,
         )
 
     async def _announce_start_offset(self, song: YTDL) -> None:
@@ -2055,6 +2081,74 @@ class MusicPlayer:
         self._replay_of = self._playback_span.get_span_context()
         return self._replay_of
 
+    @staticmethod
+    def _blacklist_after(song: YTDL, attempts_used: int) -> frozenset[str]:
+        """The formats the next attempt should deprioritize.
+
+        The FIRST retry blacklists nothing: attempt 2 retries in place with a fresh
+        URL, and only attempt 3 goes sideways. Demoting sooner promotes AAC 140,
+        which costs a lossy generation and ~18x the ffmpeg CPU.
+        """
+        if attempts_used < 2:
+            return song.failed_format_ids
+        format_id = song.data.get("format_id")
+        return song.failed_format_ids | ({str(format_id)} if format_id else frozenset())
+
+    async def _retry_failed_stream(self, song: YTDL) -> None:
+        """Re-queue a song whose stream never opened, so it plays again from the next
+        rung of its audio ladder.
+
+        The loop neutralized the prefetch when it decided to retry, and
+        queue_put_next gives back any claim a command opened since, so the retry
+        lands ahead of the song that was going to play next. The cache entry is
+        dropped first so the retry resolves fresh, and the failed format rides the
+        entry so the fresh walk tries the others first.
+        """
+        # A crash-recovered head stays persisted=False through the rebuild, so its
+        # retry exists only in this process — a restart drops it, notice and all.
+        attempts_used = song.stream_attempts + 1
+        log.warning(
+            f"stream produced no audio for {song.webpage_url} "
+            f"(format {song.data.get('format_id')}) — retrying, attempt "
+            f"{attempts_used + 1} of {_STREAM_PLAY_ATTEMPTS}"
+        )
+        if self.store is not None and song.webpage_url:
+            await invalidate_stream_cache(self.store.redis, song.webpage_url)
+        # played_at means "audio started", and none did, so the retry carries no
+        # stamp and the loop stamps it when a stream opens. A resume tail is the
+        # exception: its offset IS audio someone heard.
+        heard_before = song.is_resume and song.start_offset > 0
+        retry = replace(
+            self._requeued_form(song),
+            played_at=song.played_at if heard_before else 0.0,
+            stream_attempts=attempts_used,
+            failed_format_ids=self._blacklist_after(song, attempts_used),
+            # NOT carried: nothing resets this flag once the user resumes, so a
+            # retried tail would park itself paused again on every attempt.
+            start_paused=False,
+            # Dropped: the pointer is a one-shot, and this song already started and
+            # disposed of its predecessor's card. Carrying it re-announces "Resuming…"
+            # on every further attempt.
+            np_message_id=0,
+            np_channel_id=0,
+            np_dedicated=False,
+            np_host_ref=None,
+        )
+        # prefetch=False: the entry was just invalidated, and the loop resolves
+        # this song in-band on its next iteration.
+        await self.queue_put_next(retry, prefetch=False)
+        embed = self._notice(
+            f"YouTube refused the audio stream for **{song.title}** — retrying "
+            f"(attempt {attempts_used + 1}/{_STREAM_PLAY_ATTEMPTS})…",
+            discord.Color.orange(),
+        )
+        try:
+            await self._channel.send(embed=embed)
+        except Exception as e:
+            log.warning(
+                f"Failed to send stream-retry notice in guild {self._guild.id}: {e}"
+            )
+
     def note_deliberate_stop(self) -> None:
         """Record that the live song is about to be stopped by us, not by ffmpeg.
         Call BEFORE vc.stop(); the loop clears it at each vc.play(). A stop we
@@ -2088,17 +2182,19 @@ class MusicPlayer:
             )
 
     async def _handle_dead_stream(self, song: YTDL) -> None:
-        """Recover from a song whose stream never opened — revoked between
-        yt_stream()'s probe and the first read. Drop the cached URL and say so in
-        the channel: a failure ffmpeg swallows is invisible to the listener."""
+        """Report a song whose stream never opened and whose retries are spent.
+        Drop the cached URL, else the next -play replays the dead one, and say so
+        in the channel: a failure ffmpeg swallows is invisible to the listener."""
         log.error(
             f"stream produced no audio, treating as failed playback: {song.webpage_url}"
         )
         if self.store is not None and song.webpage_url:
             await invalidate_stream_cache(self.store.redis, song.webpage_url)
+        attempts = song.stream_attempts + 1
         embed = self._notice(
-            f"Could not play **{song.title}** — YouTube refused the audio "
-            "stream. Queue it again to retry.",
+            f"Could not play **{song.title}** — YouTube refused the audio stream "
+            f"on {attempts} attempt{'s' if attempts != 1 else ''}. "
+            "Queue it again to retry.",
             discord.Color.red(),
         )
         try:
@@ -2715,11 +2811,27 @@ class MusicPlayer:
                     )
                     span.set_attribute("song.stream_failed", stream_failed)
 
+                    # Decided HERE, not beside the requeue at the iteration tail:
+                    # by the tail _prefetch_task is claimed into a local, so the
+                    # neutralize below would no-op and the already-resolved next
+                    # song would play INSTEAD of the retry. stream_attempts counts
+                    # plays spent before this one.
+                    retrying = (
+                        stream_failed
+                        and song.stream_attempts + 1 < _STREAM_PLAY_ATTEMPTS
+                        and self._consecutive_dead_songs < _STREAM_FAILURE_CIRCUIT
+                    )
+                    span.set_attribute("song.stream_retrying", retrying)
+
                     # Must fully retire before the next iteration's
                     # _send_now_playing(), or an in-flight edit for this song could
-                    # race the new message being sent.
+                    # race the new message being sent. Before the neutralize below
+                    # too, which can sit for the yt-dlp socket timeout while the
+                    # updater keeps advancing a dead song's bar.
                     await self._cancel_progress_task()
                     await self._cancel_pause_debounce()
+                    if retrying:
+                        await self._neutralize_prefetch()
 
                     # Capture the host, release it (the finished bar stays behind as
                     # a record), then fire one last edit so the bar shows its true
@@ -2806,6 +2918,21 @@ class MusicPlayer:
                     # guards them as hostile input.
                     pending_tail = self._pending_resume_tail
                     self._pending_resume_tail = None
+                    # A -playnow that landed in this song's death window parked a
+                    # tail, and that tail IS the re-queue — retrying as well queues
+                    # the song twice. The tail is stamped with the spent budget
+                    # instead, since interject() built it with a fresh one.
+                    folded_into_tail = (
+                        retrying
+                        and pending_tail is not None
+                        and pending_tail.webpage_url == song.webpage_url
+                    )
+                    if folded_into_tail and pending_tail is not None:
+                        attempts_used = song.stream_attempts + 1
+                        pending_tail.stream_attempts = attempts_used
+                        pending_tail.failed_format_ids = self._blacklist_after(
+                            song, attempts_used
+                        )
                     if skip_history and pending_tail is not None:
                         pending_tail.np_host_ref = (
                             NpHostRef(finished_host, finished_own, finished_dedicated)
@@ -2822,9 +2949,16 @@ class MusicPlayer:
                     # stream_failed means THIS fragment never opened a stream —
                     # "nobody heard it" for a fresh song, but not for a resume tail,
                     # whose offset is audio heard under the fragment that parked it
-                    # and declined to record.
+                    # and declined to record. A retried fragment never records; the
+                    # terminal attempt records exactly once, so a stream-failed
+                    # resume tail cannot write twice. Exhaustion falls through
+                    # unchanged, so a tail's final failure still records.
                     heard_before = song.is_resume and song.start_offset > 0
-                    if not skip_history and (not stream_failed or heard_before):
+                    if (
+                        not skip_history
+                        and not retrying
+                        and (not stream_failed or heard_before)
+                    ):
                         await self.history.add(
                             HistoryEntry.from_song(
                                 song,
@@ -2845,8 +2979,11 @@ class MusicPlayer:
                         )
 
                     # Written, or declined — either way a teardown from here has
-                    # nothing left to claim.
-                    self._ended_song = None
+                    # nothing left to claim. One exception: until the retry's put
+                    # lands, a retried resume tail exists only as this local, so it
+                    # stays claimable or a -stop there loses the audio silently.
+                    if not (retrying and heard_before and not folded_into_tail):
+                        self._ended_song = None
 
                     if self.store is not None:
                         await self.store.clear_song_end_state()
@@ -2855,9 +2992,23 @@ class MusicPlayer:
 
                     # Last: current_song is already cleared, so the notice goes out
                     # alone rather than re-hosting an NP block for a song that never
-                    # played.
+                    # played. The retry's put lands here too, after the iteration's
+                    # own bookkeeping, so the requeue never races it.
                     if stream_failed:
-                        await self._handle_dead_stream(song)
+                        if folded_into_tail:
+                            # Already back on the queue, carrying the budget.
+                            pass
+                        elif retrying:
+                            await self._retry_failed_stream(song)
+                            # Now a queue object, so _flush_played covers it and a
+                            # teardown must not claim it a second time.
+                            self._ended_song = None
+                        else:
+                            self._consecutive_dead_songs += 1
+                            await self._handle_dead_stream(song)
+                    elif song.produced_audio:
+                        # Audio played, so the next failure gets a full budget.
+                        self._consecutive_dead_songs = 0
                     elif (
                         not song.produced_audio
                         and not self._stopped_deliberately

@@ -6,6 +6,7 @@ no worker process: the class owns lifecycle, not extraction, and its logic is ab
 exception — it spawns for real; see its docstring."""
 
 import asyncio
+import multiprocessing
 import os
 import pickle
 import threading
@@ -20,7 +21,7 @@ from concurrent.futures import (
 from concurrent.futures.process import BrokenProcessPool
 from logging.handlers import QueueListener
 from queue import Empty
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -32,6 +33,8 @@ from src.ytdlp_pool import (
     YtdlpPool,
     _call_with_context,
     _picklable_call,
+    _MAX_TASKS_PER_CHILD,
+    _pool_context,
     _warmup_noop,
     _worker_init,
     worker_progress_queue,
@@ -171,6 +174,17 @@ class TestLazyCreation:
                 max_workers=3,
                 initializer=_worker_init,
                 initargs=(pool._log_queue, None),
+                max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+                mp_context=ANY,
+            )
+            # The context is passed EXPLICITLY, and it is the platform's own default.
+            # Omit it and CPython silently forces spawn wherever a task budget is set,
+            # which on Linux replaces 3.14's forkserver default and measured 23-30x
+            # slower worker startup — invisible on macOS, where spawn is the default
+            # anyway, so only an assertion on the passed value can catch it.
+            assert (
+                ctor.call_args.kwargs["mp_context"].get_start_method()
+                == multiprocessing.get_start_method()
             )
             # the real spawn path starts a listener to drain that queue into the parent
             assert pool._log_listener is not None
@@ -180,6 +194,41 @@ class TestLazyCreation:
             assert pool._progress_thread is None
         finally:
             pool.shutdown(wait=False)
+
+    def test_a_pool_that_opts_out_is_given_no_task_budget(self) -> None:
+        """The chart pool's one worker pays matplotlib's import and a warm render on
+        every replacement, so it is built without a budget. The context still goes
+        in: it is the platform's own default either way."""
+        pool = YtdlpPool(max_workers=1, name="chart render", recycle_workers=False)
+        with patch("src.ytdlp_pool.ProcessPoolExecutor") as ctor:
+            pool._acquire()
+        try:
+            assert ctor.call_args.kwargs["max_tasks_per_child"] is None
+        finally:
+            pool.shutdown(wait=False)
+
+    def test_the_chart_pool_opts_out(self) -> None:
+        """Reloaded, because conftest swaps the module's pool for a thread-backed
+        one: what is asserted is the pool the module itself builds."""
+        import importlib
+
+        from src import chart_pool
+
+        swapped = chart_pool.chart_pool
+        try:
+            built = importlib.reload(chart_pool).chart_pool
+            assert built._recycle_workers is False
+        finally:
+            setattr(chart_pool, "chart_pool", swapped)
+
+    def test_the_pool_context_never_uses_fork(self) -> None:
+        """`fork` is rejected outright by max_tasks_per_child, and forking a
+        multi-threaded asyncio process is unsafe regardless — so a host whose default
+        is fork falls to forkserver rather than failing to build a pool at all."""
+        with patch(
+            "src.ytdlp_pool.multiprocessing.get_start_method", return_value="fork"
+        ):
+            assert _pool_context().get_start_method() in ("forkserver", "spawn")
 
     def test_generation_increments_per_executor_built(self) -> None:
         """Rebuild bumps the counter so logs from either side of a break are
@@ -698,8 +747,26 @@ class TestRealWorkerProcess:
     a callable crossing a real boundary with a late submit refused; an
     ExtractionError surviving pickling with its fields and cause, which the seam can
     never exercise since it never pickles an exception; a worker log record reaching
-    a parent handler with worker_id and trace_id. Argument picklability stays with
-    TestProcessBoundaryContract."""
+    a parent handler with worker_id and trace_id; and worker recycling, which is a
+    property of the real executor and invisible to the seam. Argument picklability
+    stays with TestProcessBoundaryContract."""
+
+    async def test_a_worker_is_recycled_after_its_task_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """max_tasks_per_child is what turns "a worker grew until the OS killed it"
+        into routine turnover, and only a real executor honours it — the thread-pool
+        seam ignores the argument entirely. Budget of 1 so the test costs one extra
+        spawn rather than 64."""
+        monkeypatch.setattr("src.ytdlp_pool._MAX_TASKS_PER_CHILD", 1)
+        pool = YtdlpPool(max_workers=1)
+        try:
+            first, _ = await pool.run(_double_in_worker, 1)
+            second, _ = await pool.run(_double_in_worker, 2)
+        finally:
+            await pool.aclose()
+
+        assert first != second, "the worker served both tasks — it was never recycled"
 
     async def test_a_real_worker_process_runs_the_submitted_callable(self) -> None:
         pool = YtdlpPool(max_workers=1)

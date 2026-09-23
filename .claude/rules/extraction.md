@@ -20,7 +20,14 @@ decryption, format selection), so it runs on a `ProcessPoolExecutor`
 (`YTDLP_POOL_WORKERS`, default 4; ~80–120 MB RSS each). Lifecycle only — the callable is
 supplied per call, which is the seam tests use. Lazy creation (workers re-import parent
 modules under spawn); `prewarm()` from setup_hook; a `BrokenProcessPool` (e.g. OOM-killed
-worker) is healed by rebuild-and-retry ONCE; worker logs travel a
+worker) is healed by rebuild-and-retry ONCE, and `max_tasks_per_child=16`
+(`_MAX_TASKS_PER_CHILD`) replaces a worker before it grows enough to get there — RSS
+climbs ~5 MB per extraction and never flattens, so 16 caps a worker near 300 MB. The
+start method is passed EXPLICITLY (`_pool_context`): a task budget with no `mp_context`
+makes CPython force `spawn`, which on Linux replaces 3.14's forkserver default and
+measured 23–30× slower worker startup. The chart pool opts out
+(`recycle_workers=False`): its one worker would re-import matplotlib on every
+replacement. Worker logs travel a
 multiprocessing Queue → parent `QueueListener` → the parent's handlers (so yt-dlp's
 SABR/PO-token/signature warnings — the early-warning system for YouTube rule changes —
 reach Loki structured, with `worker_id` and propagated `trace_id`). A second, OPT-IN queue
@@ -36,7 +43,10 @@ that `_wlock` is a POSIX semaphore nothing will release, so a parent write could
 forever. See docs/ARCHITECTURE.md#progress-out-of-a-yt-dlp-worker. Results are made
 picklable and small in the worker: exceptions flattened to `ExtractionError` (yt-dlp's
 own exceptions carry live tracebacks and can't cross), successes `_slim_info`'d
-(sanitize + drop `formats`/`thumbnails`/etc., commonly 100 KB–1 MB nobody reads).
+(sanitize + drop `formats`/`thumbnails`/etc., commonly 100 KB–1 MB nobody reads). The
+one thing kept out of `formats` is the **fallback audio ladder**: `_slim_info` mines
+the top `_STREAM_CANDIDATES` (3) audio-only formats into `audio_candidates` first,
+because after the drop those URLs exist nowhere in the process.
 
 **Client strategy** (comment block above `_EXTRACTOR_ARGS` in youtube.py):
 the config names **no client** — it passes `default`, yt-dlp's own list, which is
@@ -59,15 +69,26 @@ designed so every rung lands on a previously-working configuration.
 
 **Revoked-URL healing** (`_resolve_playable_stream`): a revoked URL fails in the worst
 way — ffmpeg 403s and exits, discord.py reports "song finished", silence. So every URL
-is probed pre-play; a revoked cached URL is dropped and re-extracted once; a URL revoked
-in the seconds between probe and first read is caught post-hoc by `produced_audio` and
-its cache entry invalidated. The probe is **tri-state** (`StreamProbe`), and the third
+is probed pre-play, and the probe walks the mined ladder: **sideways before in place.**
+The next format is a ~100 ms probe against a 3–5 s re-extraction that would re-select
+the *same* format — curing a stale URL but not a format YouTube has stopped serving. A
+winning fallback is promoted onto the info-dict wholesale (URL plus format shape, so
+`_record_serving_format` and the source's abr/asr/acodec describe what is really
+playing) and the entry is **rewritten**, or a cached ladder re-probes its own dead head
+every play until the TTL lapses. A freshly extracted dict is copied before the walk,
+since `_extract_once` shares it with every joiner. Only when every rung is dead is the
+entry dropped and re-extracted once. Prefetch and the stream warm probe only the head.
+A URL revoked in the seconds between probe and first read is caught post-hoc by
+`produced_audio`, and the loop then retries the song (see playback.md). The probe is **tri-state** (`StreamProbe`), and the third
 value is load-bearing: a probe that never completed is `UNCONFIRMED`, not `DEAD` and not
 `PLAYABLE`. Read as `DEAD` it would fail songs over a blocked probe; read as `PLAYABLE`
 the URL gets **cached**, which is how one unreachable CDN edge made a single song
 unplayable for a full 30-minute TTL. So an unconfirmed URL still plays (ffmpeg judges
 it) and is cached for `_UNCONFIRMED_STREAM_TTL` (120s) — probe failures are
-process-wide, so declining the write would stop anything repopulating the cache. An
+process-wide, so declining the write would stop anything repopulating the cache.
+**UNCONFIRMED also ends the ladder walk** where it stands and promotes that rung: every
+candidate shares one host and one `expire`, so a probe that could not complete for one
+rung will not complete for the next. An
 unconfirmed **cached** URL is dropped and re-extracted for a freshly signed one, which
 lands on the same edge and format and so cures an early revocation; that drop is FREE
 (never charged against `_MAX_STREAM_EXTRACTIONS`, which is **1**), is suppressed once
@@ -80,10 +101,23 @@ See `docs/ARCHITECTURE.md#yt-dlp-client-strategy` for the measurements behind bo
 
 **FFmpeg**: `YTDL(discord.FFmpegOpusAudio)` with
 `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` and `-vn`; `?t=`/interject
-seeks via `-ss`; volume via `-filter:a volume=` (which is why `-volume` applies from the
+seeks are a **two-pass `-ss`** — `-ss N` before `-i` for the HTTP range request, `-ss 0`
+after it to drop the pre-roll that lands in. Output-side alone downloads and decodes
+from 0:00, which YouTube throttles to a stall on a deep offset; input-side alone lands
+on the nearest webm cluster, measured **5–10s early**, which `position_secs` would then
+overstate everywhere. Volume via `-filter:a volume=` (which is why `-volume` applies from the
 song after next — the prefetch has already built the next one at the old level, and
 rebuilding it would re-request a signed URL that may since have been revoked).
-`read()` counts frames → `elapsed_secs`/`position_secs` is the single source
+**Opus passthrough**: `codec="copy"` remuxes instead of re-encoding. `_passthrough_codec`
+is the gate and all four clauses are required, because `-c:a copy` also discards the
+`-ac 2 -ar 48000 -b:a 128k` discord.py always emits: `acodec` opus; no filter (ffmpeg
+refuses copy alongside a filtergraph — exit 234, zero bytes — so `yt_stream` asks
+`_audio_filters` what it produced rather than re-testing volume); `audio_channels` in
+(1, 2) (a 5.1 serve reaches Discord as multistream and clients decode only the front
+pair); and `format_id` in `{249, 250, 251}`, which stands in for the 20 ms frame
+duration the info-dict does not report. Absent fields mean re-encode.
+`read()` counts AUDIO frames (the first two packets are OpusHead and OpusTags, which
+discord.py yields like any other) → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, pause confirmation, history,
 interject resume point) and freezes during any pause automatically.
 
@@ -141,6 +175,10 @@ quietly becoming permanent. **Rolling the image back reinstates the broken stabl
 change is data-safe (nothing new is persisted; both caches are TTL'd and self-heal within
 the hour) but rolling back restores the outage this pin exists to fix, so never do it to
 chase an unrelated symptom. After any dependency change, `just
-test-image-rebuild` before `DOCKER=1` recipes. Watch `_record_serving_format` warnings
+test-image-rebuild` before `DOCKER=1` recipes. Then run **`just ytdl-formats <url>`**
+against a real video and reconcile what it prints with the format claims in
+`src/youtube.py` (the client ladder, `_STREAM_CANDIDATES`, the passthrough itag
+allowlist) — those claims are empirical and both YouTube and yt-dlp move under them.
+Watch `_record_serving_format` warnings
 and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
 YouTube-side changes.

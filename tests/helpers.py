@@ -336,6 +336,8 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     song.query_source = ""
     song.played_at = 0.0
     song.persisted = True
+    song.stream_attempts = 0
+    song.failed_format_ids = frozenset()
     song.data = {}
     return song
 

@@ -53,7 +53,8 @@ src/
 ├── guild_state.py    # Pure Redis schema: frozen value objects, field constants, orjson wire formats
 ├── redis_client.py   # Connection pool, GuildRedisStore (@_guild_op), cache helpers, recovery lock
 ├── youtube.py        # yt-dlp integration: caches, stream probe/heal, YTDL audio source, worker fn
-├── ytdlp_pool.py     # ProcessPoolExecutor lifecycle: lazy spawn, break-healing, worker log plumbing
+├── ytdlp_pool.py     # ProcessPoolExecutor lifecycle: lazy spawn, break-healing, worker recycling,
+│                     # worker log plumbing
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source;
 │                     # is_mix (a YouTube Mix, which yt-dlp walks window by window)
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached); the playlist
@@ -84,6 +85,12 @@ src/
                       # set_within), channel_claim, ProgressFn, PoolSlotUnavailable,
                       # is_operator (the owner check -debug and -ping share)
 
+scripts/              # run by hand, never imported by the bot — so the runtime image
+                      # does not carry them. ytdl_formats.py is `just ytdl-formats
+                      # <url>` (the format yt-dlp selects and the fallback ladder the
+                      # retry would walk; run at every yt-dlp bump), deploy.sh is
+                      # `just deploy`'s no-`just` twin. The TEST image copies this
+                      # directory, because their tests are a merge gate like any other
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
 docs/ARCHITECTURE.md  # the only tracked file under docs/ — anchor target for comments (rule 2)
 tests/                # one test_<module>.py per src module, commands/ mirroring src/commands/,
