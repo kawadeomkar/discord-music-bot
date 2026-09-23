@@ -17,6 +17,31 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.52.0 — 2026-09-23
+
+**An enabled history archive that cannot reach Postgres now says so at startup.** Only
+affects deployments running with `HISTORY_ARCHIVE_ENABLED=true`; the default (archive
+off) is untouched, nothing is configured and no data moves. Rolling back is only a
+redeploy.
+
+- **A new ERROR about a minute after startup, when it applies.** If the flag is true and
+  Postgres has not answered by then, the log names what is accumulating and how to
+  deploy the database. Previously this combination started clean and stayed quiet: the
+  bot played music, answered commands, and wrote nothing durable.
+- **Why it could go unnoticed.** A bare `docker compose up` does not activate the
+  `archive` profile, so no Postgres is deployed — but the connection string is handed to
+  the bot either way, so its existing "the archive needs a database" check passes. The
+  connection is only opened at the first song end, and a failure there is a warning
+  among the playback logs. Meanwhile every play is appended to a Redis key that has no
+  expiry and is exempt from eviction, so it grows until Redis runs out of memory and
+  stops accepting writes — at which point the bot stops working for reasons that look
+  nothing like this.
+- **Nothing to do if your archive is healthy.** One INFO line says the probe got an
+  answer. If you see the ERROR, `just up` deploys Postgres alongside the bot — it
+  derives the profile from the flag, which a raw compose invocation cannot.
+- **Nothing is written or deleted by this.** The probe runs `SELECT 1`, and the entries
+  already queued in Redis drain on their own once the database is reachable.
+
 ## 2.51.0 — 2026-09-23
 
 **The alone-disconnect warning counts down, and says which way it went.** Nothing to

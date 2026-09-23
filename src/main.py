@@ -25,7 +25,7 @@ from src.redis_client import (
     outbox_depth,
 )
 from src.settings import BotSettings
-from src.util import get_logger
+from src.util import cancel_task, get_logger
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
@@ -56,6 +56,14 @@ def _build_intents() -> discord.Intents:
 
 intents = _build_intents()
 EXTENSIONS = ("src.musicbot",)
+
+# The enabled archive's startup reachability probe. 12 x 5s outlasts a cold `up`,
+# where the bot is ready seconds before Postgres passes its healthcheck (interval
+# 5s), so the error fires only for a database that is not coming at all.
+_ARCHIVE_PROBE_ATTEMPTS = 12
+_ARCHIVE_PROBE_INTERVAL_SECS = 5.0
+# Caps one attempt above health_check's own 10s connect bound.
+_ARCHIVE_PROBE_STEP_TIMEOUT_SECS = 15.0
 
 
 class MusicContext(commands.Context):
@@ -166,6 +174,9 @@ class MusicBotApp(commands.AutoShardedBot):
         # Built in setup_hook, once the pool exists; hydrated in the background.
         self.bot_settings: Optional[BotSettings] = None
         self._bot_settings_hydration: Optional[asyncio.Task] = None
+        # Spawned by the enabled archive arm; tracked so close() can cancel a probe
+        # still between attempts rather than leave it holding the pool it reads.
+        self._archive_probe_task: Optional[asyncio.Task] = None
         self._teardown_started = False  # close() runs at most once
 
     async def _liveness_heartbeat(self) -> None:
@@ -284,6 +295,49 @@ class MusicBotApp(commands.AutoShardedBot):
         self.history_archive = archive
         self.history_drainer = HistoryOutboxDrainer(redis, archive)
         self.history_drainer.start()
+        # A task, not an await: the lazy pool above keeps startup off Postgres and
+        # this must too.
+        self._archive_probe_task = asyncio.create_task(
+            self._verify_archive_reachable(archive)
+        )
+
+    async def _verify_archive_reachable(self, archive: PostgresHistoryArchive) -> None:
+        """Retry `health_check` for ~a minute, then log ONE error naming the cause.
+
+        An enabled archive with no database reachable is otherwise silent until a
+        play lands: the DSN is interpolated whether or not the `archive` compose
+        profile deployed Postgres behind it, so the required-URL check above passes
+        and the lazy pool connects for the first time at the first song end. Until
+        then every play XADDs onto the non-evictable `history:outbox`.
+
+        Never raises (nothing awaits it) and never repeats — once plays are moving
+        the drainer's backoff loop owns the reporting.
+        """
+        last_error: Optional[Exception] = None
+        for attempt in range(_ARCHIVE_PROBE_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_ARCHIVE_PROBE_INTERVAL_SECS)
+            try:
+                # health_check bounds its own connect at 10s; this caps a route
+                # that hangs past it, so the loop keeps its advertised minute.
+                async with asyncio.timeout(_ARCHIVE_PROBE_STEP_TIMEOUT_SECS):
+                    await archive.health_check()
+            except Exception as e:  # noqa: BLE001 — reported once, below
+                last_error = e
+                continue
+            log.info("History archive probe: Postgres answered, the archive is live")
+            return
+        waited = int(_ARCHIVE_PROBE_ATTEMPTS * _ARCHIVE_PROBE_INTERVAL_SECS)
+        log.error(
+            f"HISTORY_ARCHIVE_ENABLED is true but Postgres has not answered in "
+            f"{waited}s ({type(last_error).__name__}: {last_error}). Every play is "
+            "being XADDed onto history:outbox, which carries no TTL and is not an "
+            "eviction candidate, and nothing is draining it. If this stack came up "
+            "with a bare `docker compose up`, the `archive` profile was never "
+            "activated and no Postgres was deployed: bring it up with `just up`, "
+            "which derives the profile from the flag. If POSTGRES_URL names an "
+            "external database, check that it is reachable from this host."
+        )
 
     async def _report_archive_disabled(self) -> None:
         """The disabled arm (the default): say so once and warn about leftovers.
@@ -424,6 +478,15 @@ class MusicBotApp(commands.AutoShardedBot):
         if hydration is not None:
             hydration.cancel()
             self._bot_settings_hydration = None
+        # Before the archive closes below: a probe mid-attempt holds a connection
+        # from its pool, and one between attempts would wake onto a closed one.
+        probe = getattr(self, "_archive_probe_task", None)
+        if probe is not None:
+            try:
+                await cancel_task(probe)
+            except Exception as e:
+                log.warning(f"archive probe shutdown failed: {e}")
+            self._archive_probe_task = None
         # Ordering: drainer before archive and Redis (its final drain needs both);
         # super().close() before the Redis pool (it disconnects voice clients and can
         # still dispatch on_voice_state_update, whose cleanup() must reach a live
