@@ -2338,14 +2338,17 @@ that covers `-ping`, `-debug` and the queue-progress card, all three through
 `dashboard.LiveMessage`, and the alone-disconnect countdown card, which runs its own
 tick loop in `recovery.py`. A message we DELETE must not be the host either, or the
 retraction drags the live bar onto a message that is about to vanish: that covers
-`play_placement.slow_resolve_notice`. All five send with `ctx.channel.send` rather
-than `MusicContext.send`, so they neither carry an NP block nor retire the current
+`play_placement.slow_resolve_notice`. All five send plainly — `ctx.channel.send`, or
+`mp.home_channel.send` for the countdown, which has no `ctx` — rather than
+`MusicContext.send`, so they neither carry an NP block nor retire the current
 host, which stays above them — edited invisibly — until the next ordinary `ctx.send`
 adopts a new one. They also miss debug-mode decoration: the first four are handed a
 pre-rendered `debug_suffix`, while the countdown card goes through `_decorate` in
 recovery.py with the span held from its first frame. The countdown is the only one
 that repairs the burial itself, re-hosting the block on the path where a song is
-still live when it ends. Add a sixth and it belongs in this list, in CLAUDE.md's host
+still live when it ends. That is the rule, not an exception: a card a USER asked
+for is followed by their next command, whose `MusicContext.send` adopts a fresh
+host; a bot-initiated card has no such follow-up, so it owes the repin. Add a sixth and it belongs in this list, in CLAUDE.md's host
 section, and on whichever of the two reasons it takes.
 
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the

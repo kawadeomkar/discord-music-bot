@@ -343,6 +343,16 @@ def progress_bar(ratio: float, *, width: int = BAR_WIDTH) -> str:
     )
 
 
+def drain_bar(remaining: float, total: float, *, width: int = BAR_WIDTH) -> str:
+    """The glyph run for what is LEFT of `total`, clamped to 0..1. No head: this
+    bar empties rather than advancing a position, so there is nothing to mark."""
+    if width <= 0:
+        return ""
+    ratio = remaining / total if total > 0 else 0.0
+    left = round(max(0.0, min(1.0, ratio)) * width)
+    return _BAR_FILL_DONE * left + _BAR_FILL_REMAINING * (width - left)
+
+
 def progress_line(
     position: float,
     total: float,

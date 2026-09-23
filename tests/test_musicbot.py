@@ -14,6 +14,7 @@ from discord.ext import commands
 import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_state import Analytics, HistoryEntry
+from src.recovery import _Countdown
 from src.musicbot import MusicBot, SpotifyDisabledError
 from src.play_placement import check_voice_permissions, play_takes_the_queue
 from src.sources import UnsupportedSpotifyLinkError
@@ -354,8 +355,10 @@ class TestMusicBotInit:
     def test_mps_starts_empty(self, mock_bot: MagicMock) -> None:
         assert MusicBot(mock_bot).mps == {}
 
-    def test_voice_watchdog_starts_with_no_timers(self, mock_bot: MagicMock) -> None:
-        assert MusicBot(mock_bot).voice_watchdog._timers == {}
+    def test_voice_watchdog_starts_with_no_countdowns(
+        self, mock_bot: MagicMock
+    ) -> None:
+        assert MusicBot(mock_bot).voice_watchdog._countdowns == {}
 
     def test_reads_redis_from_bot(self, mock_bot: MagicMock) -> None:
         mock_redis = MagicMock()
@@ -433,8 +436,9 @@ class TestCleanup:
         """cleanup() skips cancellation when the alone-timer is the running task (self-cancel guard)."""
         current = asyncio.current_task()
         assert current is not None, "test must run inside an asyncio.Task"
-        music_bot.voice_watchdog._timers[mock_guild.id] = (
-            current  # simulate countdown calling cleanup on itself
+        # Simulate the countdown calling cleanup on itself.
+        music_bot.voice_watchdog._countdowns[mock_guild.id] = _Countdown(
+            task=current, rejoined=asyncio.Event()
         )
 
         self._make_minimal_mp(music_bot, mock_guild)
@@ -445,7 +449,7 @@ class TestCleanup:
         # If the guard were missing, current_task().cancel() would have been called
         # and this coroutine would receive CancelledError at the next await.
         assert not current.cancelled()
-        assert mock_guild.id not in music_bot.voice_watchdog._timers
+        assert mock_guild.id not in music_bot.voice_watchdog._countdowns
 
     async def test_disconnects_voice_client(
         self, music_bot: MusicBot, mock_guild: MagicMock
@@ -562,7 +566,9 @@ class TestCleanup:
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
         timer = make_mock_task()
-        music_bot.voice_watchdog._timers[mock_guild.id] = timer
+        music_bot.voice_watchdog._countdowns[mock_guild.id] = _Countdown(
+            task=timer, rejoined=asyncio.Event()
+        )
 
         self._make_minimal_mp(music_bot, mock_guild)
         mock_guild.voice_client = None
@@ -570,7 +576,7 @@ class TestCleanup:
         await music_bot.cleanup(mock_guild)
 
         timer.cancel.assert_called_once()
-        assert mock_guild.id not in music_bot.voice_watchdog._timers
+        assert mock_guild.id not in music_bot.voice_watchdog._countdowns
 
     async def test_noop_cleanup_does_not_error_without_timer(
         self, music_bot: MusicBot, mock_guild: MagicMock

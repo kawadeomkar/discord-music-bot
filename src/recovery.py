@@ -16,6 +16,7 @@ Do not rename the `guild.restore` span — Tempo queries match on it.
 import asyncio
 import contextlib
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import discord
@@ -23,14 +24,18 @@ from discord.ext import commands
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src.dashboard import safe_edit
 from src.musicplayer import MusicPlayer
 from src.redis_client import GuildRedisStore
 from src.telemetry import get_tracer
 from src.util import (
+    drain_bar,
     first_sendable_channel,
     get_logger,
     notice_embed,
+    pluralize,
     record_span_error,
+    set_within,
 )
 
 if TYPE_CHECKING:
@@ -46,21 +51,6 @@ _tracer = get_tracer(__name__)
 # a frame instead of quoting a number the clock has already passed.
 _COUNTDOWN_TICK_SECS = 1.0
 
-# The countdown bar drains rather than fills. Same width and glyphs as the Now
-# Playing bar, the only other bar a guild sees.
-_COUNTDOWN_BAR_WIDTH = 10
-_COUNTDOWN_BAR_LEFT = "🟦"
-_COUNTDOWN_BAR_SPENT = "⬜"
-
-
-def _countdown_bar(remaining_secs: float, total_secs: float) -> str:
-    """A `total_secs` bar with `remaining_secs` still to run."""
-    ratio = remaining_secs / total_secs if total_secs > 0 else 0.0
-    left = round(max(0.0, min(ratio, 1.0)) * _COUNTDOWN_BAR_WIDTH)
-    return _COUNTDOWN_BAR_LEFT * left + _COUNTDOWN_BAR_SPENT * (
-        _COUNTDOWN_BAR_WIDTH - left
-    )
-
 
 def _seconds_left(deadline: float, now: float) -> int:
     """Whole seconds still on the clock, floored at zero. Every frame derives its
@@ -71,13 +61,13 @@ def _seconds_left(deadline: float, now: float) -> int:
 
 def _countdown_embed(remaining_secs: int, total_secs: float) -> discord.Embed:
     """One frame of the live card, built from whole seconds left."""
-    unit = "second" if remaining_secs == 1 else "seconds"
     return discord.Embed(
         title="No users remaining in voice channel",
         description=(
             f"All users have disconnected. The bot will disconnect in "
-            f"**{remaining_secs} {unit}** unless someone rejoins.\n\n"
-            f"{_countdown_bar(remaining_secs, total_secs)}"
+            f"**{remaining_secs} {pluralize(remaining_secs, 'second')}** "
+            "unless someone rejoins.\n\n"
+            f"{drain_bar(remaining_secs, total_secs)}"
         ),
         color=discord.Color.orange(),
     )
@@ -239,26 +229,33 @@ async def restore_guild(cog: MusicBot, guild: discord.Guild) -> None:
         await store.release_recovery_lock()
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Countdown:
+    """A guild's running countdown: the task, and the event a rejoin sets to end it
+    early. One entry, so the two can never fall out of step."""
+
+    task: asyncio.Task
+    rejoined: asyncio.Event
+
+
 class VoiceWatchdog:
     """Disconnects the bot once it is alone in a voice channel, counting the
     warning down in the text channel while it waits.
 
-    Owns the per-guild timer tasks and the rejoin events that end them early. Three
-    rules are the whole of this feature's correctness and belong with the state they
-    protect: cancel before pop, only the current task clears its own dict entries,
-    and a rejoin SIGNALS a countdown rather than cancelling it — a cancelled task
-    cannot edit its card to say what happened, so cancellation is left to teardown,
-    which wants no card update anyway.
+    Owns one _Countdown per guild. Two rules are the whole of this feature's
+    correctness and belong with the state they protect: only the current task clears
+    its own entry, and a rejoin SIGNALS a countdown rather than cancelling it — a
+    cancelled task cannot edit its card to say what happened, so cancellation is
+    left to teardown, which wants no card update anyway.
 
     One instance per cog, built in MusicBot.__init__.
     """
 
-    __slots__ = ("_cog", "_rejoins", "_timers")
+    __slots__ = ("_cog", "_countdowns")
 
     def __init__(self, cog: MusicBot) -> None:
         self._cog = cog
-        self._timers: dict[int, asyncio.Task] = {}
-        self._rejoins: dict[int, asyncio.Event] = {}
+        self._countdowns: dict[int, _Countdown] = {}
 
     def cancel(self, guild_id: int) -> None:
         """Drop a guild's pending countdown, if any. Teardown only — see the class
@@ -268,22 +265,20 @@ class VoiceWatchdog:
         calls straight back here, and cancelling yourself mid-teardown raises
         CancelledError out of cleanup and abandons the rest of it.
         """
-        self._rejoins.pop(guild_id, None)
-        existing = self._timers.pop(guild_id, None)
-        if existing and not existing.done() and existing is not asyncio.current_task():
-            existing.cancel()
+        entry = self._countdowns.pop(guild_id, None)
+        if entry and not entry.task.done() and entry.task is not asyncio.current_task():
+            entry.task.cancel()
 
     def _signal_rejoin(self, guild_id: int) -> None:
         """Someone is back — let the countdown run to its own end so it can finalize
         its card. The post-wait membership re-check is what actually stops the
         disconnect, so a countdown that never observes this event still cannot leave.
-        Falls back to cancelling a timer that has no event to signal."""
-        rejoined = self._rejoins.get(guild_id)
-        if rejoined is None:
-            self.cancel(guild_id)
+        """
+        entry = self._countdowns.get(guild_id)
+        if entry is None:
             return
         log.info(f"User rejoined guild {guild_id}, ending alone countdown")
-        rejoined.set()
+        entry.rejoined.set()
 
     async def on_voice_state_update(
         self,
@@ -344,9 +339,11 @@ class VoiceWatchdog:
                 f"Bot is alone in guild {guild.id}, starting {secs:g}s disconnect timer"
             )
             rejoined = asyncio.Event()
-            self._rejoins[guild.id] = rejoined
-            self._timers[guild.id] = asyncio.create_task(
-                self._countdown(guild, secs, rejoined)
+            # create_task only schedules, and nothing awaits between it and the
+            # write, so a rejoin cannot arrive before the guild is registered.
+            self._countdowns[guild.id] = _Countdown(
+                task=asyncio.create_task(self._countdown(guild, secs, rejoined)),
+                rejoined=rejoined,
             )
         else:
             self._signal_rejoin(guild.id)
@@ -379,21 +376,27 @@ class VoiceWatchdog:
     async def _push_card(
         self,
         guild: discord.Guild,
-        message: discord.Message,
+        message: Optional[discord.Message],
         embed: discord.Embed,
         span: Optional[trace.Span],
     ) -> Optional[discord.Message]:
         """Push one frame. None once the message is gone, so the loop stops spending
-        edits on it; every other failure is swallowed and keeps the message, because
-        a card that stopped updating must not stop the disconnect behind it."""
-        try:
-            await message.edit(embed=_decorate(self._cog, guild, embed, span))
-            return message
-        except discord.NotFound:
+        edits on it; every other failure keeps the message, because a card that
+        stopped updating must not stop the disconnect behind it.
+
+        Takes an Optional so the final frame needs no separate no-card branch.
+        safe_edit logs a refusing channel ONCE per message, which a countdown needs
+        more than the dashboards do: it can push a frame a second for two minutes.
+        """
+        if message is None:
             return None
+        try:
+            alive = await safe_edit(message, [_decorate(self._cog, guild, embed, span)])
         except Exception as e:
+            # safe_edit swallows HTTPException; this covers a dead session.
             log.warning(f"alone-countdown card edit failed in guild {guild.id}: {e}")
             return message
+        return message if alive else None
 
     async def _repin_now_playing(self, guild: discord.Guild) -> None:
         """Re-host the Now Playing block at the channel bottom, where the card has
@@ -437,19 +440,24 @@ class VoiceWatchdog:
                         guild, mp, _countdown_embed(opening, secs), card_span
                     )
 
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(min(_COUNTDOWN_TICK_SECS, remaining)):
-                        await rejoined.wait()
+            while (remaining := deadline - loop.time()) > 0:
+                # With no card up there is nothing to tick for, so wait the rest out
+                # in one go rather than waking every second to render nothing.
+                wait = (
+                    remaining
+                    if message is None
+                    else min(_COUNTDOWN_TICK_SECS, remaining)
+                )
+                # The return is not read: a timeout that ties with a set() landing in
+                # the same iteration still means someone is back, and is_set() covers
+                # both. Branching on the return would spend one more frame first.
+                await set_within(rejoined, wait)
                 if rejoined.is_set():
                     break
                 left = _seconds_left(deadline, loop.time())
                 # A frame reading zero is skipped: the final one lands on its heels
                 # and says which way it went.
-                if message is not None and left > 0:
+                if left > 0:
                     message = await self._push_card(
                         guild, message, _countdown_embed(left, secs), card_span
                     )
@@ -464,20 +472,20 @@ class VoiceWatchdog:
                 if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
                     # The bot left voice by another route while this counted down;
                     # cleanup() has run or is about to, so don't run a second one.
-                    await self._close_card(
+                    await self._push_card(
                         guild, message, _disconnected_embed(), card_span
                     )
                 elif rejoined.is_set() or any(not m.bot for m in vc.channel.members):
                     # The membership read is the authority; the event only makes the
                     # card prompt, and covers a rejoin the gateway never reported.
-                    await self._close_card(guild, message, _rejoined_embed(), card_span)
+                    await self._push_card(guild, message, _rejoined_embed(), card_span)
                     await self._repin_now_playing(guild)
                 else:
                     log.info(
                         f"Bot still alone in guild {guild.id} after "
                         f"{secs:g}s — disconnecting"
                     )
-                    await self._close_card(
+                    await self._push_card(
                         guild, message, _disconnected_embed(), card_span
                     )
                     await self._cog.cleanup(guild)
@@ -486,25 +494,13 @@ class VoiceWatchdog:
         except Exception as e:
             log.error(f"alone countdown error in guild {guild.id}: {e}", exc_info=True)
         finally:
-            # Only ever clear our OWN entries: a restart registers the replacement
+            # Only ever clear our OWN entry: a restart registers the replacement
             # before this task processes its cancellation, and an unguarded pop here
-            # would drop the new countdown out of both dicts — leaving it running
-            # and unreachable, so a later rejoin could not stop it.
-            if self._timers.get(guild.id) is asyncio.current_task():
-                del self._timers[guild.id]
-            if self._rejoins.get(guild.id) is rejoined:
-                del self._rejoins[guild.id]
-
-    async def _close_card(
-        self,
-        guild: discord.Guild,
-        message: Optional[discord.Message],
-        embed: discord.Embed,
-        span: Optional[trace.Span],
-    ) -> None:
-        """The countdown's last frame, if it ever got a card up."""
-        if message is not None:
-            await self._push_card(guild, message, embed, span)
+            # would drop the new countdown out of the dict — leaving it running and
+            # unreachable, so a later rejoin could not stop it.
+            entry = self._countdowns.get(guild.id)
+            if entry is not None and entry.task is asyncio.current_task():
+                del self._countdowns[guild.id]
 
 
 def join_succeeded(ctx: commands.Context) -> bool:
