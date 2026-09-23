@@ -358,21 +358,25 @@ same-channel rule (`play_takes_the_queue`): line-jumping is queue control, like
 
 The NP card (embed with a 10-segment live progress bar, edited every
 `NOW_PLAYING_UPDATE_INTERVAL_SECS` = 3.0s) stays glued to the bottom of the channel.
-**Four sends are documented exceptions**, and they bypass for two distinct reasons.
-`-ping`, `-debug` and the queue-progress card (`dashboard.LiveMessage.start`) bypass
-because a message an edit loop OWNS must not also be the NP host — the progress
-updater would re-render it every 3s. `play_placement.slow_resolve_notice` is not an
-edit loop at all; it bypasses because a message we DELETE must not be the host, or
-the retraction drags the live bar onto a message that is about to vanish. All four
-reply through `ctx.channel.send`, not `MusicContext.send`, so they carry no NP block
-AND do not retire the current host, which stays above them until the next ordinary
-`ctx.send` adopts a new one. See `docs/ARCHITECTURE.md#now-playing-host-invariants`,
-which lists them.
+**Five sends are documented exceptions**, and they bypass for two distinct reasons.
+`-ping`, `-debug` and the queue-progress card (`dashboard.LiveMessage.start`), plus
+the alone-disconnect countdown card (`VoiceWatchdog._send_card`), bypass because a
+message an edit loop OWNS must not also be the NP host — the progress updater
+rebuilds a host from its CACHED send-time own embeds every 3s, which would undo the
+other writer's frames. `play_placement.slow_resolve_notice` is not an edit loop at
+all; it bypasses because a message we DELETE must not be the host, or the retraction
+drags the live bar onto a message that is about to vanish. All five reply through
+`channel.send`, not `MusicContext.send`, so they carry no NP block AND do not retire
+the current host, which stays above them until the next ordinary `ctx.send` adopts a
+new one — except the countdown, which re-hosts the block itself
+(`repin_now_playing()`) on the one path where a song is still live when it ends. See
+`docs/ARCHITECTURE.md#now-playing-host-invariants`, which lists them.
 Bypassing `MusicContext.send` also bypasses debug-mode decoration, so the cog hands
-all four a pre-rendered `debug_suffix` instead — computed ONCE per invocation and
-held constant, because the driver only edits when the render changes and a
-per-tick-varying footer would edit the board until its deadline (which is why that
-suffix omits elapsed-ms).
+the four dashboard sends a pre-rendered `debug_suffix` instead — computed ONCE per
+invocation and held constant, because the driver only edits when the render changes
+and a per-tick-varying footer would edit the board until its deadline (which is why
+that suffix omits elapsed-ms). The countdown card holds its SPAN constant across
+frames for the same reason, decorating through `_decorate` in recovery.py.
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
 10-embed cap; worst case here is 6, a three-card block above a collection card and its

@@ -29,7 +29,7 @@ src/
 │                     # -queue and the queued-collection cards list through it
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres) and its embeds; the command body is commands/history.py
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
-├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), the alone-in-channel leave watchdog, and the two cold-start helpers -play and -resume share
+├── recovery.py       # Voice-session lifecycle: rejoin after restart (crash recovery), the alone-in-channel leave watchdog (a countdown card ticked down to a final frame saying which way it went), and the two cold-start helpers -play and -resume share
 ├── commands/         # ONE MODULE PER COMMAND — commands/<command>.py, each exposing
 │                     # run(). The cog holds registration and one try/except; every
 │                     # body is here. _common.py holds the restore guard three of the

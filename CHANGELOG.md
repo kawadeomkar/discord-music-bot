@@ -17,6 +17,30 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.51.0 — 2026-09-23
+
+**The alone-disconnect warning counts down, and says which way it went.** Nothing to
+configure and no data touched; rolling back is only a redeploy. The countdown's length
+is still `-settings alone-timeout` (10s by default, up to 2 minutes) — only what you
+see while it runs has changed.
+
+- **The warning is now a live card.** It used to post once, quote a fixed number of
+  seconds, and then sit there — so the only way to know how long was left was to watch
+  the voice channel and guess. It now re-renders about once a second, with a bar that
+  drains, and it counts from *your server's* timeout rather than a hardcoded 10.
+- **It closes with a final frame instead of going stale.** When someone comes back the
+  card says `Someone rejoined` and playback carries on; when the timer runs out it says
+  `Disconnected from voice channel` and reminds you the queue is kept for 24 hours and
+  `-resume` picks it back up. Previously the last thing in the channel was a warning
+  about a disconnect that may or may not have happened.
+- **A rejoin now ends the countdown gracefully.** It used to cancel the countdown
+  outright, which is why it could never report the outcome. Whether the bot actually
+  leaves is still decided by who is in the channel when the clock runs out, not by the
+  card — a rejoin the gateway never told us about still keeps the bot in place.
+- **The Now Playing block goes back to the bottom of the channel.** The card sits on
+  top of the block while it ticks, so when a song is still playing and someone rejoins,
+  the block is re-pinned underneath it.
+
 ## 2.50.0 — 2026-09-23
 
 **`-pause` always answers, and the paused card lives with the song it describes.**
