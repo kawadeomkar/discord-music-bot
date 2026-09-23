@@ -131,38 +131,54 @@ async def run_next(ctx: commands.Context, url: str, *, cog: MusicBot) -> None:
     await run(ctx, url, cog=cog, force_mode=PlayMode.NEXT)
 
 
+async def _refuse(
+    ctx: commands.Context, text: str, reason: str, *, color: discord.Color
+) -> None:
+    """Answer a request that queues nothing, and record WHY on the span. Without
+    the stamp a refused -play leaves no trace at all — it logs nothing, and the
+    embed is the only evidence it ever ran."""
+    trace.get_current_span().set_attribute("play.refused", reason)
+    await ctx.send(embed=notice_embed(text, color))
+
+
 async def _run_placed(
     ctx: commands.Context, args: PlayArgs, req: PlayRequest, *, cog: MusicBot
 ) -> None:
     """The body behind -play, taking the argument already split and the request
     the registry admitted."""
-    trace.get_current_span().set_attribute("play.mode", args.mode.value)
+    span = trace.get_current_span()
+    span.set_attribute("play.mode", args.mode.value)
+    # A `--timestamp` changes where the song starts and what the archive records,
+    # and leaves `play.mode` at "normal" — so without this the span cannot tell an
+    # offset play from an ordinary one, and neither can anyone reading a trace.
+    if args.start_offset is not None:
+        span.set_attribute("play.start_offset", args.start_offset)
     # ONE rebind, so every `origin=url` below is the query with the flag off: a
     # leaked flag persists a user_input -remove cannot match. read_rest hands the
     # quotes through, so a quoted origin would need a literal match.
     url = unquote_argument(args.query)
     async with background_typing(ctx):
         if args.dash_typo is not None:
-            await ctx.send(
-                embed=notice_embed(
-                    f"Did you mean `{args.dash_typo}`? Options take two dashes.",
-                    discord.Color.orange(),
-                )
+            await _refuse(
+                ctx,
+                f"Did you mean `{args.dash_typo}`? Options take two dashes.",
+                "dash_typo",
+                color=discord.Color.orange(),
             )
             return
         if args.error is not None:
-            await ctx.send(embed=notice_embed(args.error, discord.Color.red()))
+            await _refuse(ctx, args.error, "bad_option", color=discord.Color.red())
             return
         if not url:
             # The command's own `usage=`, which is what -help renders, so the two
             # cannot drift. Composed as cog_command_error composes its twin.
             cmd = ctx.command
             usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
-            await ctx.send(
-                embed=notice_embed(
-                    "Missing argument: `url`." + (f" Usage: {usage}" if usage else ""),
-                    discord.Color.red(),
-                )
+            await _refuse(
+                ctx,
+                "Missing argument: `url`." + (f" Usage: {usage}" if usage else ""),
+                "no_query",
+                color=discord.Color.red(),
             )
             return
 
@@ -206,7 +222,9 @@ async def _run_placed(
         if args.start_offset is not None:
             refusal = start_offset_refusal(source)
             if refusal is not None:
-                await ctx.send(embed=notice_embed(refusal, discord.Color.red()))
+                await _refuse(
+                    ctx, refusal, "offset_collection", color=discord.Color.red()
+                )
                 return
 
         notice = await _resolve_and_place(ctx, args, req, mp, source, url, cog=cog)
@@ -384,6 +402,7 @@ async def _resolve_and_place(
         # first, so the refusal is the last thing the channel sees.
         refusal = past_end_refusal(qobj, args.start_offset)
         if refusal is not None:
+            trace.get_current_span().set_attribute("play.refused", "offset_past_end")
             if cold_start:
                 await abandon_cold_start(cog, ctx, mp)
             return notice_embed(refusal, discord.Color.red())

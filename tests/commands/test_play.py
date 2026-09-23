@@ -6133,3 +6133,65 @@ class TestUnsupportedSpotifyLink:
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "Failed to play song now" in (embed.title or "")
         assert "aren't supported" in (embed.description or "")
+
+
+class TestTheSpanCanSeeAnOffsetPlay:
+    """A `-ts` play leaves `play.mode` at "normal" — only the offset differs — so
+    without these attributes a trace cannot tell it from an ordinary play, and a
+    refusal (which logs nothing) leaves no record it ran at all."""
+
+    async def _play(self, music_bot: MusicBot, mock_ctx: MagicMock, url: str) -> None:
+        mp = mock_mp()
+        mp.current_song = None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._command_error = AsyncMock()
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject(
+                "https://yt.com/v=1", "Song", mock_ctx.author, duration=210
+            )
+        )
+        play_pipeline.enqueue_single = AsyncMock()
+        play_cmd.abandon_cold_start = AsyncMock()
+        mock_ctx.voice_client = connected_vc(mock_ctx)
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+    async def test_an_offset_play_stamps_the_offset(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        with recording_span() as span:
+            await self._play(music_bot, mock_ctx, "--ts 1:32 never gonna give")
+        recorded = {c.args[0]: c.args[1] for c in span.set_attribute.call_args_list}
+        assert recorded["play.mode"] == "normal"
+        assert recorded["play.start_offset"] == 92
+
+    async def test_an_ordinary_play_stamps_no_offset(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Absent, not zero: a trace filter for offset plays must not match every
+        -play ever sent."""
+        with recording_span() as span:
+            await self._play(music_bot, mock_ctx, "never gonna give")
+        recorded = {c.args[0]: c.args[1] for c in span.set_attribute.call_args_list}
+        assert "play.start_offset" not in recorded
+
+    @pytest.mark.parametrize(
+        "argument,reason",
+        [
+            ("--ts banana song", "bad_option"),
+            ("--now --next song", "bad_option"),
+            ("-now song", "dash_typo"),
+            ("--ts 1:32", "no_query"),
+            ("-ts 1:32 https://youtube.com/playlist?list=PL1", "offset_collection"),
+        ],
+    )
+    async def test_every_refusal_records_why(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, argument: str, reason: str
+    ) -> None:
+        with recording_span() as span:
+            await self._play(music_bot, mock_ctx, argument)
+        recorded = {c.args[0]: c.args[1] for c in span.set_attribute.call_args_list}
+        assert recorded["play.refused"] == reason
