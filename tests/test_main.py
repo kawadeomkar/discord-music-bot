@@ -76,11 +76,19 @@ class TestAppInitDefaults:
         # a stale True would skip teardown entirely.
         assert MusicBotApp()._teardown_started is False
 
-    def test_the_shard_ready_wait_is_shortened(self) -> None:
-        """discord.py's _delay_ready loop exits only by timing out, so this value
-        is charged to every start. Dropping the default 2.0 is the whole saving;
-        a revert would silently add 1.5s back to each restart."""
-        assert MusicBotApp()._connection.guild_ready_timeout == 0.5
+    def test_the_shard_ready_wait_comes_from_the_setting(self) -> None:
+        """_delay_ready's loop exits only by timing out, so this is charged to every
+        start. Read off _connection, which is what discord.py actually consults: the
+        kwarg could stop being honoured and a check on our own value would not see
+        it. Against config, not a literal, so the two cannot drift."""
+        assert (
+            MusicBotApp()._connection.guild_ready_timeout
+            == config.GUILD_READY_TIMEOUT_SECS
+        )
+
+    def test_the_shard_ready_default_is_shorter_than_the_librarys(self) -> None:
+        """2.0 is discord.py's default and the whole saving is in not paying it."""
+        assert config.GUILD_READY_TIMEOUT_SECS < 2.0
 
 
 class TestSetupHook:

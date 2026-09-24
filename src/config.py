@@ -254,6 +254,22 @@ LIVENESS_INTERVAL_SECS: float = _float_env(
 # sized when it spawns, so this is read once and never changes at runtime.
 YTDLP_POOL_WORKERS: int = _int_env("YTDLP_POOL_WORKERS", 4, minimum=1)
 
+# The ceiling is a typo guard: the value is charged to every start, so a stray
+# `50` for `5.0` makes startup look wedged rather than slow. The floor keeps it a
+# wait rather than a formality.
+_MIN_GUILD_READY_SECS: Final[float] = 0.1
+_MAX_GUILD_READY_SECS: Final[float] = 10.0
+
+# How long discord.py waits for ANOTHER GUILD_CREATE before declaring the shard
+# ready (its default is 2.0). Read once, at MusicBotApp construction. Raise it if a
+# guild is ever missing from bot.guilds at on_ready.
+GUILD_READY_TIMEOUT_SECS: float = _float_env(
+    "GUILD_READY_TIMEOUT_SECS",
+    0.5,
+    minimum=_MIN_GUILD_READY_SECS,
+    maximum=_MAX_GUILD_READY_SECS,
+)
+
 # Opt-in ceiling on the history outbox, in entries; 0 is unbounded (the
 # durability contract). A cap destroys the OLDEST entries, which exist nowhere
 # else, so every drop logs ERROR. Enforced after each drain batch and against

@@ -27,8 +27,10 @@ redeploy. Both changes are deployment-level — no command behaves differently.
   waiting to see whether another server would arrive, whether or not one ever did:
   the library waits that long after the last server for one more, and the wait only
   ever ends by expiring. It is now half a second, which measured 1.9× more headroom
-  than the whole server list needed here. If a server is ever missing from the bot's
-  list at startup, this is the dial to raise.
+  than the whole server list needed here. A server that arrives late is still picked
+  up, so nothing is lost by not waiting. If a server is ever missing from the bot's
+  list at startup, raise `GUILD_READY_TIMEOUT_SECS` — it is the new setting behind
+  this, accepts 0.1 to 10 seconds, and refuses startup outside that.
 - **Every container caps its own log at 30 MB.** Previously they were unbounded. A
   container that is crash-looping writes to the same disk that is usually the reason
   it is crashing — Postgres in particular PANICs when it cannot write, restarts, and

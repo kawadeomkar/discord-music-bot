@@ -1552,3 +1552,64 @@ class TestLivenessInterval:
             ValueError, match=f"LIVENESS_INTERVAL_SECS must be {message}"
         ):
             self._reload(monkeypatch)
+
+
+class TestGuildReadyTimeout:
+    """The shard-ready wait is refused at import outside 0.1-10s. It is charged to
+    every start, so a stray `50` for `5.0` would make startup look wedged."""
+
+    @pytest.fixture(autouse=True)
+    def _restore(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """Undo BEFORE the reload, as TestLivenessInterval does: teardown runs ahead
+        of monkeypatch's own, so a reload here would re-read the value under test."""
+        yield
+        monkeypatch.undo()
+        importlib.reload(config)
+
+    @staticmethod
+    def _reload(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        return importlib.reload(config)
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_unset_or_empty_is_the_default(
+        self, raw: Optional[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("GUILD_READY_TIMEOUT_SECS", raising=False)
+        else:
+            monkeypatch.setenv("GUILD_READY_TIMEOUT_SECS", raw)
+        assert self._reload(monkeypatch).GUILD_READY_TIMEOUT_SECS == 0.5
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [("0", ">= 0.1"), ("0.05", ">= 0.1"), ("11", "<= 10.0"), ("50", "<= 10.0")],
+    )
+    def test_outside_the_bounds_refuses_startup(
+        self, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GUILD_READY_TIMEOUT_SECS", raw)
+        with pytest.raises(
+            ValueError,
+            match=f"GUILD_READY_TIMEOUT_SECS must be {re.escape(message)}",
+        ):
+            self._reload(monkeypatch)
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [("nan", "a finite number"), ("inf", "a finite number"), ("2s", "a number")],
+    )
+    def test_non_finite_or_garbage_names_the_variable(
+        self, raw: str, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GUILD_READY_TIMEOUT_SECS", raw)
+        with pytest.raises(
+            ValueError, match=f"GUILD_READY_TIMEOUT_SECS must be {message}"
+        ):
+            self._reload(monkeypatch)
+
+    def test_a_raised_value_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The documented response to a guild missing from bot.guilds at on_ready is
+        to raise this, so the library's own 2.0 has to be reachable."""
+        monkeypatch.setenv("GUILD_READY_TIMEOUT_SECS", "2.0")
+        assert self._reload(monkeypatch).GUILD_READY_TIMEOUT_SECS == 2.0
