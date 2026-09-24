@@ -13,7 +13,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from src import config
+from src import config, main
 from src.main import EXTENSIONS, MusicBotApp, intents
 from src.musicbot import MusicBot
 from src.redis_client import HISTORY_OUTBOX_KEY
@@ -51,6 +51,17 @@ def app() -> MusicBotApp:
     instance.ws = discord.utils.MISSING
     instance.change_presence = AsyncMock()
     return instance
+
+
+@pytest.fixture(autouse=True)
+def stub_archive_probe() -> Iterator[AsyncMock]:
+    """conftest pins HISTORY_ARCHIVE_ENABLED true for the whole suite, so every
+    setup_hook test here takes the enabled arm and would spawn a reachability
+    probe against a MagicMock archive, left sleeping between attempts. Stubbed for
+    the file; TestArchiveReachabilityProbe drives the real coroutine directly."""
+    stub = AsyncMock()
+    with patch.object(MusicBotApp, "_verify_archive_reachable", new=stub):
+        yield stub
 
 
 class TestAppInitDefaults:
@@ -691,6 +702,204 @@ class TestDefaultPostgresPassword:
         ):
             await app.setup_hook()
         assert "still the default" not in caplog.text
+
+
+class TestArchiveReachabilityProbe:
+    """The enabled archive's startup probe.
+
+    A bare `docker compose up` never activates the `archive` profile, so no
+    Postgres is deployed — but compose interpolates POSTGRES_URL before profile
+    filtering, so the required-URL check in the enabled arm still passes and the
+    lazy pool does not connect until the first song end. Every play until then
+    XADDs onto history:outbox, which carries no TTL and cannot be evicted."""
+
+    @pytest.fixture(autouse=True)
+    def stub_archive_probe(self) -> Iterator[None]:
+        """Shadow the file-wide stub: these drive the real coroutine."""
+        yield None
+
+    @staticmethod
+    def _archive(health_check: Any) -> MagicMock:
+        archive = MagicMock()
+        archive.health_check = health_check
+        return archive
+
+    async def test_a_reachable_database_logs_one_info_and_stops(
+        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        health = AsyncMock()
+        with caplog.at_level("INFO"):
+            await app._verify_archive_reachable(self._archive(health))
+        assert health.await_count == 1
+        assert "the archive is live" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    async def test_it_retries_until_the_database_answers(
+        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A cold `up` starts the bot seconds before Postgres passes its
+        healthcheck, so the first attempts failing is the NORMAL case and must
+        not produce the error."""
+        health = AsyncMock(side_effect=[OSError("refused"), OSError("refused"), None])
+        with caplog.at_level("INFO"), patch("asyncio.sleep", new=AsyncMock()):
+            await app._verify_archive_reachable(self._archive(health))
+        assert health.await_count == 3
+        assert "the archive is live" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+    async def test_an_unreachable_database_logs_one_error_after_every_attempt(
+        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        health = AsyncMock(side_effect=OSError("no route"))
+        with caplog.at_level("INFO"), patch("asyncio.sleep", new=AsyncMock()):
+            await app._verify_archive_reachable(self._archive(health))
+        assert health.await_count == main._ARCHIVE_PROBE_ATTEMPTS
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert "the archive is live" not in caplog.text
+
+    async def test_the_error_names_the_outbox_and_the_way_out(
+        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The operator reading this line has a bot that looks healthy. It has to
+        say what is accumulating and which command deploys the database, or it
+        sends them looking at Discord."""
+        health = AsyncMock(side_effect=OSError("no route"))
+        with caplog.at_level("ERROR"), patch("asyncio.sleep", new=AsyncMock()):
+            await app._verify_archive_reachable(self._archive(health))
+        message = caplog.text
+        assert "history:outbox" in message
+        assert "archive" in message and "profile" in message
+        assert "just up" in message
+        # The failure itself, not just the diagnosis: a wrong password and an
+        # absent container read identically without it.
+        assert "OSError" in message and "no route" in message
+
+    async def test_one_hanging_attempt_does_not_consume_the_whole_budget(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """health_check bounds its own connect, but a route that blackholes packets
+        can outlast it; without the per-attempt cap the loop never reaches its
+        report."""
+        monkeypatch.setattr(main, "_ARCHIVE_PROBE_STEP_TIMEOUT_SECS", 0.01)
+        monkeypatch.setattr(main, "_ARCHIVE_PROBE_ATTEMPTS", 1)
+
+        async def _hang() -> None:
+            await asyncio.Event().wait()  # never set
+
+        # Bounded well under the 0.01s cap x 1 attempt would need to matter.
+        async with asyncio.timeout(5):
+            await app._verify_archive_reachable(self._archive(_hang))
+
+    async def test_it_never_raises_out(self, app: MusicBotApp) -> None:
+        """Nothing awaits the task, so an escaping exception would surface only as
+        an asyncio "exception was never retrieved" at garbage-collection time."""
+        health = AsyncMock(side_effect=RuntimeError("unexpected"))
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await app._verify_archive_reachable(self._archive(health))
+
+    async def test_a_cancellation_is_not_swallowed(self, app: MusicBotApp) -> None:
+        """close() cancels the probe; swallowing that would mark the task complete
+        while it was still between attempts."""
+        started = asyncio.Event()
+
+        async def _fail() -> None:
+            started.set()
+            raise OSError("refused")
+
+        task = asyncio.create_task(app._verify_archive_reachable(self._archive(_fail)))
+        await started.wait()
+        await asyncio.sleep(0)  # let it reach the inter-attempt sleep
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+
+
+class TestArchiveProbeWiring:
+    """That the probe is started for an enabled archive and stopped by close()."""
+
+    async def test_the_enabled_arm_spawns_it(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        stub_archive_probe: AsyncMock,
+    ) -> None:
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.PostgresHistoryArchive") as archive_cls,
+            patch("src.main.HistoryOutboxDrainer"),
+            patch("src.main.ensure_outbox_group", new=AsyncMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+            assert app._archive_probe_task is not None
+            await app._archive_probe_task
+        stub_archive_probe.assert_awaited_once_with(archive_cls.return_value)
+
+    async def test_the_disabled_arm_spawns_none(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        stub_archive_probe: AsyncMock,
+    ) -> None:
+        """The default deployment has no Postgres by design; a probe there would
+        report the supported configuration as broken."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        # getattr: the app fixture bypasses __init__, so "never assigned" is the
+        # shape close()'s own guard exists for.
+        assert getattr(app, "_archive_probe_task", None) is None
+        stub_archive_probe.assert_not_awaited()
+
+    async def test_close_cancels_a_probe_still_waiting(self, app: MusicBotApp) -> None:
+        forever = asyncio.Event()
+
+        async def _wait() -> None:
+            await forever.wait()
+
+        app._archive_probe_task = asyncio.create_task(_wait())
+        await asyncio.sleep(0)
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await app.close()
+        assert app._archive_probe_task is None
+
+    async def test_close_cancels_the_probe_before_closing_the_archive(
+        self, app: MusicBotApp
+    ) -> None:
+        """Ordering, not merely presence: the probe reads the archive's pool, and
+        _ensure() refuses once close() has latched it shut, so a probe outliving
+        the archive spends its remaining attempts failing for the wrong reason."""
+        order: list[str] = []
+        probe_cancelled = asyncio.Event()
+
+        async def _probe() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                order.append("probe")
+                probe_cancelled.set()
+                raise
+
+        archive = MagicMock()
+        archive.close = AsyncMock(side_effect=lambda: order.append("archive"))
+        app.history_archive = archive
+        app.history_drainer = None
+        app._archive_probe_task = asyncio.create_task(_probe())
+        await asyncio.sleep(0)
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await app.close()
+        assert probe_cancelled.is_set()
+        assert order == ["probe", "archive"]
 
 
 class TestClose:
