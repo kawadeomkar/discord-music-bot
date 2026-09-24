@@ -188,11 +188,15 @@ exclude = ["docs", "**/node_modules", "**/__pycache__", "**/.*"]
 
 [tool.ruff]
 target-version = "py314"
-# Default lint rules (pyflakes F + a pycodestyle E subset) already cover unused
-# imports, undefined names, and import placement. ruff format is black-compatible
-# and replaces black as the formatter.
+# The lint rules (named in [tool.ruff.lint] below) cover unused imports, undefined
+# names, and import placement. ruff format is black-compatible and replaces black
+# as the formatter.
 
 [tool.ruff.lint]
+# Named rather than inherited: ruff's DEFAULT set expanded in 0.16, so riding the
+# default makes a version bump a repo-wide rewrite — 1,086 findings on a tree
+# 0.15.21 called clean. This is 0.15's default; adding a family is its own change.
+select = ["E4", "E7", "E9", "F"]
 # Return-annotation enforcement lives here, not in [tool.pyright]. This section
 # replaces a `reportMissingReturnType = "error"` key that pyright never
 # implemented: pyright reports unrecognized settings on stderr without changing
