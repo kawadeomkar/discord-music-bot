@@ -7,16 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 import pytest
-import redis.asyncio as aioredis
 from discord.ext import commands
-from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import ResponseError
-from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from src import config, main
+from src import config
 from src.main import EXTENSIONS, MusicBotApp, intents
 from src.musicbot import MusicBot
-from src.redis_client import HISTORY_OUTBOX_KEY
 from tests.helpers import mocked
 
 
@@ -60,18 +55,18 @@ def stub_archive_probe() -> Iterator[AsyncMock]:
     probe against a MagicMock archive, left sleeping between attempts. Stubbed for
     the file; TestArchiveReachabilityProbe drives the real coroutine directly."""
     stub = AsyncMock()
-    with patch.object(MusicBotApp, "_verify_archive_reachable", new=stub):
+    with patch("src.archive_tier.verify_reachable", new=stub):
         yield stub
 
 
 class TestAppInitDefaults:
     """The real __init__, against the real constructor — no fixture in the way.
 
-    Everywhere else the `app` fixture bypasses __init__, and the disabled-mode
-    tests below seed both attributes by hand, so `assert app.history_archive is
-    None` would otherwise assert against a value the fixture wrote. Reverting the
-    two assignments to bare annotations passes every other test in the repo and
-    makes the default deployment raise AttributeError on its first -play.
+    Everywhere else the `app` fixture bypasses __init__, so this is the only
+    place `_archive_tier = None` is asserted to be what the constructor actually
+    produces. Reverting it to a bare annotation passes every other test in the
+    repo and makes the default deployment raise AttributeError on its first
+    -play, through the two properties below.
     """
 
     def test_the_archive_pair_defaults_to_none(self) -> None:
@@ -112,9 +107,9 @@ class TestSetupHook:
         TestOutboxGroupBootstrap, which re-patches it locally."""
         monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
         with (
-            patch("src.main.PostgresHistoryArchive"),
-            patch("src.main.HistoryOutboxDrainer"),
-            patch("src.main.ensure_outbox_group", new=AsyncMock()),
+            patch("src.archive_tier.PostgresHistoryArchive"),
+            patch("src.archive_tier.HistoryOutboxDrainer"),
+            patch("src.archive_tier.ensure_outbox_group", new=AsyncMock()),
         ):
             yield
 
@@ -220,10 +215,10 @@ class TestSetupHook:
             patch("src.main.get_redis", return_value=MagicMock()),
             patch.object(app, "load_extension", new=AsyncMock()),
             patch(
-                "src.main.PostgresHistoryArchive", return_value=mock_archive
+                "src.archive_tier.PostgresHistoryArchive", return_value=mock_archive
             ) as mock_pg,
             patch(
-                "src.main.HistoryOutboxDrainer", return_value=mock_drainer
+                "src.archive_tier.HistoryOutboxDrainer", return_value=mock_drainer
             ) as mock_dr,
         ):
             await app.setup_hook()
@@ -243,8 +238,6 @@ class TestBotSettingsStartup:
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
-        app.history_archive = None
-        app.history_drainer = None
 
     async def test_garbage_aborts_before_the_pool(
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
@@ -270,7 +263,7 @@ class TestBotSettingsStartup:
         with (
             patch("src.main.create_redis_pool", return_value=MagicMock()),
             patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch("src.archive_tier.outbox_depth", new=AsyncMock(return_value=0)),
             patch.object(app, "load_extension", new=AsyncMock()),
             patch("src.settings.BotConfigStore.read_config", new=never_answers),
         ):
@@ -293,7 +286,7 @@ class TestBotSettingsStartup:
         with (
             patch("src.main.create_redis_pool", return_value=MagicMock()),
             patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch("src.archive_tier.outbox_depth", new=AsyncMock(return_value=0)),
             patch.object(app, "load_extension", new=AsyncMock()),
         ):
             await app.setup_hook()
@@ -326,583 +319,14 @@ class TestBotSettingsStartup:
         bot_settings.hydrate_until_read.assert_awaited_once()
 
 
-class TestSetupHookDisabledArchive:
-    """The disabled arm — the SHIP default, inverted from the suite-wide
-    conftest pin per test here. No Postgres requirement, no archive/drainer
-    objects, no consumer group, and the leftover-outbox probe in place of the
-    enabled arm's fail-fast pair."""
-
-    @pytest.fixture(autouse=True)
-    def archive_disabled(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Flip the flag to the ship default and model the post-__init__ attrs:
-        the app fixture bypasses __init__ (which assigns None) and the disabled
-        arm deliberately never assigns them, so seed None to make "still None
-        after setup_hook" a real assertion. TestAppInitDefaults above is what
-        pins that None is genuinely what __init__ produces."""
-        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
-        app.history_archive = None
-        app.history_drainer = None
-
-    async def test_starts_without_postgres_url(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The headline behavior: a token-only environment boots. The enabled
-        arm's RuntimeError is the consent trade — no archive, no requirement."""
-        monkeypatch.delenv("POSTGRES_URL", raising=False)
-        mock_load = AsyncMock()
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
-            patch.object(app, "load_extension", new=mock_load),
-        ):
-            await app.setup_hook()
-        assert app.history_archive is None
-        assert app.history_drainer is None
-        mock_load.assert_awaited()
-
-    async def test_a_present_postgres_url_is_ignored_with_a_note(
-        self,
-        app: MusicBotApp,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """The flag wins over URL presence: compose interpolates POSTGRES_URL
-        whether or not the archive profile is active, so a DSN is not consent.
-        One INFO tells the operator who expected archiving why there is none."""
-        caplog.set_level("INFO")
-        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
-            patch("src.main.PostgresHistoryArchive") as mock_pg,
-            patch("src.main.HistoryOutboxDrainer") as mock_dr,
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        mock_pg.assert_not_called()
-        mock_dr.assert_not_called()
-        assert "POSTGRES_URL is set but ignored" in caplog.text
-
-    async def test_no_outbox_group_or_key_is_created(
-        self, app: MusicBotApp, fake_redis: aioredis.Redis
-    ) -> None:
-        """ensure_outbox_group is real and simply not called: creating the
-        group would MKSTREAM the non-evictable key into existence, which is
-        collection infrastructure the operator declined. EXISTS, not XLEN —
-        the key must not exist at all."""
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=fake_redis),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
-
-    async def test_no_default_password_warning_when_disabled(
-        self,
-        app: MusicBotApp,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """With no Postgres deployed, a credential warning about it is noise
-        that trains operators to ignore warnings — the startup ERROR gates on
-        the flag (as do the -ping surfaces)."""
-        monkeypatch.setenv(
-            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
-        )
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert "still the default" not in caplog.text
-
-    async def test_garbage_flag_aborts_startup_before_anything(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Validation placement is the feature: the flag is read first, so a typo
-        aborts startup with a named error instead of surfacing inside
-        @_guild_op-wrapped push_history, where the ValueError would be swallowed
-        into one warning per song while archiving silently stayed off."""
-        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "maybe")
-        mock_load = AsyncMock()
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()) as mock_pool,
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch.object(app, "load_extension", new=mock_load),
-            pytest.raises(ValueError, match="HISTORY_ARCHIVE_ENABLED"),
-        ):
-            await app.setup_hook()
-        # Before the Redis pool, before the cogs: nothing is half-started.
-        mock_pool.assert_not_called()
-        mock_load.assert_not_awaited()
-
-
-class TestLeftoverOutboxWarning:
-    """A previously-enabled archive left entries behind and the bot now starts
-    disabled. Warn — never auto-delete (an accidental toggle must not destroy
-    un-archived plays), never stay silent (a non-evictable key holding exactly
-    the data the operator opted out of keeping must not linger invisibly)."""
-
-    @pytest.fixture(autouse=True)
-    def archive_disabled(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Same shape as TestSetupHookDisabledArchive's fixture, for the same
-        # reason; TestAppInitDefaults pins that None is what __init__ assigns.
-        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
-        app.history_archive = None
-        app.history_drainer = None
-
-    async def test_warns_with_the_depth_when_entries_remain(
-        self,
-        app: MusicBotApp,
-        fake_redis: aioredis.Redis,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        await fake_redis.xadd(HISTORY_OUTBOX_KEY, {b"e": b"play"})
-        await fake_redis.xadd(HISTORY_OUTBOX_KEY, {b"e": b"play"})
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=fake_redis),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert "2 entries" in caplog.text
-        assert "NEVER drain" in caplog.text
-        # Both remedies named: draining them and discarding them are operator
-        # decisions, and the warning is only useful if it says what to do.
-        assert "Re-enable" in caplog.text
-        assert "DEL history:outbox" in caplog.text
-
-    async def test_an_empty_outbox_is_silent(
-        self,
-        app: MusicBotApp,
-        fake_redis: aioredis.Redis,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=fake_redis),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert "history:outbox" not in caplog.text
-
-    @pytest.mark.parametrize(
-        "exc",
-        [
-            RedisConnectionError("Error 111 connecting to localhost:6379"),
-            RedisTimeoutError("Timeout connecting to server"),
-        ],
-        ids=["connection-refused", "timeout"],
-    )
-    async def test_an_unreachable_redis_skips_the_probe(
-        self,
-        app: MusicBotApp,
-        caplog: pytest.LogCaptureFixture,
-        exc: Exception,
-    ) -> None:
-        """Same rule as the enabled arm's group probe: a Redis blip must not
-        stop the music. The probe reuses the RAISING outbox_depth helper and
-        handles the error here — golden rule 5's split, unchanged."""
-        mock_load = AsyncMock()
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(side_effect=exc)),
-            patch.object(app, "load_extension", new=mock_load),
-        ):
-            await app.setup_hook()
-        assert "could not reach Redis" in caplog.text
-        mock_load.assert_awaited()  # startup still completed
-
-    async def test_a_wrongtype_key_downgrades_to_a_warning(
-        self,
-        app: MusicBotApp,
-        fake_redis: aioredis.Redis,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """The enabled path ABORTS on a mis-shaped outbox; disabled, the XADD leg
-        is off and the key is inert, so warn and serve.
-
-        STAGED, not patched: a mocked `outbox_depth(side_effect=ResponseError)`
-        proved only that `except ResponseError` catches what is handed to it, and
-        stayed green through any change to which helper the probe calls. XLEN
-        models the real ResponseError faithfully, so the path runs here honestly.
-        """
-        # A list at the stream's key: the real leftover shape, from a build
-        # predating the switch to a stream outbox.
-        await fake_redis.rpush(HISTORY_OUTBOX_KEY, b"legacy-entry")
-        mock_load = AsyncMock()
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=fake_redis),
-            patch.object(app, "load_extension", new=mock_load),
-        ):
-            await app.setup_hook()
-        assert "not a stream" in caplog.text
-        mock_load.assert_awaited()  # startup still completed
-
-
-class TestOutboxGroupBootstrap:
-    """The setup_hook leg of ensure_outbox_group — the wiring, not the helper.
-
-    The helper's own discrimination (BUSYGROUP tolerated, WRONGTYPE raised) is
-    asserted in test_redis_client and against real Redis; these pin that it runs,
-    that it runs before the drainer, and that a WRONGTYPE aborts startup. The abort
-    has to happen there: push_history is @_guild_op, so a leftover list would
-    otherwise be swallowed into one warning per song."""
-
-    async def test_wrongtype_aborts_startup_before_anything_starts(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
-        wrongtype = ResponseError(
-            "WRONGTYPE Operation against a key holding the wrong kind of value"
-        )
-        mock_load = AsyncMock()
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.ensure_outbox_group", new=AsyncMock(side_effect=wrongtype)),
-            patch("src.main.PostgresHistoryArchive") as mock_pg,
-            patch("src.main.HistoryOutboxDrainer") as mock_dr,
-            patch.object(app, "load_extension", new=mock_load),
-            pytest.raises(ResponseError, match="WRONGTYPE"),
-        ):
-            await app.setup_hook()
-        # Aborted before the archive tier or the cogs: a drainer started
-        # against a mis-typed key would raise on every read, and a loaded cog
-        # would accept plays whose history has nowhere to go.
-        mock_pg.assert_not_called()
-        mock_dr.assert_not_called()
-        mock_load.assert_not_awaited()
-
-    async def test_group_exists_before_the_drainer_starts(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Order, not just occurrence: a drainer started first would XREADGROUP
-        against a group that does not exist yet and burn its NOGROUP
-        heal-once on a plain startup race."""
-        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
-        order: list[str] = []
-        ensure = AsyncMock(side_effect=lambda *_: order.append("group"))
-        mock_drainer = MagicMock()
-        mock_drainer.start = MagicMock(side_effect=lambda: order.append("drainer"))
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.ensure_outbox_group", new=ensure),
-            patch("src.main.PostgresHistoryArchive"),
-            patch("src.main.HistoryOutboxDrainer", return_value=mock_drainer),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert order == ["group", "drainer"]
-        ensure.assert_awaited_once_with(app.redis)
-
-    @pytest.mark.parametrize(
-        "exc",
-        [
-            RedisConnectionError("Error 111 connecting to localhost:6379"),
-            RedisTimeoutError("Timeout connecting to server"),
-        ],
-        ids=["connection-refused", "timeout"],
-    )
-    async def test_unreachable_redis_degrades_instead_of_aborting(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch, exc: Exception
-    ) -> None:
-        """The other side of the WRONGTYPE abort, and why the two are told apart.
-        Redis being DOWN is what this bot survives everywhere else, so a fatal
-        probe would turn a blip during a deploy into a bot that refuses to boot.
-        Safe because _read_batch heals NOGROUP by calling ensure_outbox_group
-        itself, so the drainer creates the group once Redis returns."""
-        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
-        mock_load = AsyncMock()
-        mock_drainer = MagicMock()
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.ensure_outbox_group", new=AsyncMock(side_effect=exc)),
-            patch("src.main.PostgresHistoryArchive") as mock_pg,
-            patch("src.main.HistoryOutboxDrainer", return_value=mock_drainer),
-            patch.object(app, "load_extension", new=mock_load),
-        ):
-            await app.setup_hook()
-        # Everything downstream still came up — that is the whole claim.
-        mock_pg.assert_called_once()
-        mock_drainer.start.assert_called_once()
-        mock_load.assert_awaited()
-
-
-class TestDefaultPostgresPassword:
-    """compose falls back to a known password so `docker compose up` works with
-    only a Discord token. The bot pays for that convenience with noise: an ERROR
-    at every startup and a standing -ping warning, until it is changed.
-    """
-
-    async def test_default_postgres_password_logs_an_error_but_starts(
-        self,
-        app: MusicBotApp,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Loud, not fatal. compose defaults the password so `docker compose up`
-        works with only a Discord token — refusing to start would put the
-        first-run cliff straight back, so the bot runs and complains instead."""
-        monkeypatch.setenv(
-            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
-        )
-        with (
-            patch("src.main.create_redis_pool"),
-            patch("src.main.get_redis"),
-            patch("src.main.ensure_outbox_group", new=AsyncMock()),
-            patch("src.main.HistoryOutboxDrainer"),
-            patch("src.main.PostgresHistoryArchive"),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert any(r.levelname == "ERROR" for r in caplog.records)
-        assert "still the default" in caplog.text
-        # The remedy has to be the one that works: an .env edit alone leaves an
-        # initialized volume on its old password and locks the bot out.
-        assert "ALTER USER" in caplog.text
-        assert "up -d" in caplog.text  # the container recreate, or the DSN is stale
-
-        # And in the order that works. This check reads the bot's DSN, so
-        # `setup_env.sh --force` silences it while the server still accepts the
-        # old password — running that first walks the operator through the one
-        # window where they are exposed and nothing says so.
-        assert caplog.text.index("ALTER USER") < caplog.text.index("setup_env.sh")
-        assert "IN THIS ORDER" in caplog.text
-
-    async def test_a_real_postgres_password_logs_nothing(
-        self,
-        app: MusicBotApp,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        monkeypatch.setenv(
-            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
-        )
-        with (
-            patch("src.main.create_redis_pool"),
-            patch("src.main.get_redis"),
-            patch("src.main.ensure_outbox_group", new=AsyncMock()),
-            patch("src.main.HistoryOutboxDrainer"),
-            patch("src.main.PostgresHistoryArchive"),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        assert "still the default" not in caplog.text
-
-
-class TestArchiveReachabilityProbe:
-    """The enabled archive's startup probe.
-
-    A bare `docker compose up` never activates the `archive` profile, so no
-    Postgres is deployed — but compose interpolates POSTGRES_URL before profile
-    filtering, so the required-URL check in the enabled arm still passes and the
-    lazy pool does not connect until the first song end. Every play until then
-    XADDs onto history:outbox, which carries no TTL and cannot be evicted."""
-
-    @pytest.fixture(autouse=True)
-    def stub_archive_probe(self) -> Iterator[None]:
-        """Shadow the file-wide stub: these drive the real coroutine."""
-        yield None
-
-    @staticmethod
-    def _archive(health_check: Any) -> MagicMock:
-        archive = MagicMock()
-        archive.health_check = health_check
-        return archive
-
-    async def test_a_reachable_database_logs_one_info_and_stops(
-        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        health = AsyncMock()
-        with caplog.at_level("INFO"):
-            await app._verify_archive_reachable(self._archive(health))
-        assert health.await_count == 1
-        assert "the archive is live" in caplog.text
-        assert not [r for r in caplog.records if r.levelname == "ERROR"]
-
-    async def test_it_retries_until_the_database_answers(
-        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A cold `up` starts the bot seconds before Postgres passes its
-        healthcheck, so the first attempts failing is the NORMAL case and must
-        not produce the error."""
-        health = AsyncMock(side_effect=[OSError("refused"), OSError("refused"), None])
-        with caplog.at_level("INFO"), patch("asyncio.sleep", new=AsyncMock()):
-            await app._verify_archive_reachable(self._archive(health))
-        assert health.await_count == 3
-        assert "the archive is live" in caplog.text
-        assert not [r for r in caplog.records if r.levelname == "ERROR"]
-
-    async def test_an_unreachable_database_logs_one_error_after_every_attempt(
-        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        health = AsyncMock(side_effect=OSError("no route"))
-        with caplog.at_level("INFO"), patch("asyncio.sleep", new=AsyncMock()):
-            await app._verify_archive_reachable(self._archive(health))
-        assert health.await_count == main._ARCHIVE_PROBE_ATTEMPTS
-        errors = [r for r in caplog.records if r.levelname == "ERROR"]
-        assert len(errors) == 1
-        assert "the archive is live" not in caplog.text
-
-    async def test_the_error_names_the_outbox_and_the_way_out(
-        self, app: MusicBotApp, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The operator reading this line has a bot that looks healthy. It has to
-        say what is accumulating and which command deploys the database, or it
-        sends them looking at Discord."""
-        health = AsyncMock(side_effect=OSError("no route"))
-        with caplog.at_level("ERROR"), patch("asyncio.sleep", new=AsyncMock()):
-            await app._verify_archive_reachable(self._archive(health))
-        message = caplog.text
-        assert "history:outbox" in message
-        assert "archive" in message and "profile" in message
-        assert "just up" in message
-        # The failure itself, not just the diagnosis: a wrong password and an
-        # absent container read identically without it.
-        assert "OSError" in message and "no route" in message
-
-    async def test_one_hanging_attempt_does_not_consume_the_whole_budget(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """health_check bounds its own connect, but a route that blackholes packets
-        can outlast it; without the per-attempt cap the loop never reaches its
-        report."""
-        monkeypatch.setattr(main, "_ARCHIVE_PROBE_STEP_TIMEOUT_SECS", 0.01)
-        monkeypatch.setattr(main, "_ARCHIVE_PROBE_ATTEMPTS", 1)
-
-        async def _hang() -> None:
-            await asyncio.Event().wait()  # never set
-
-        # Bounded well under the 0.01s cap x 1 attempt would need to matter.
-        async with asyncio.timeout(5):
-            await app._verify_archive_reachable(self._archive(_hang))
-
-    async def test_it_never_raises_out(self, app: MusicBotApp) -> None:
-        """Nothing awaits the task, so an escaping exception would surface only as
-        an asyncio "exception was never retrieved" at garbage-collection time."""
-        health = AsyncMock(side_effect=RuntimeError("unexpected"))
-        with patch("asyncio.sleep", new=AsyncMock()):
-            await app._verify_archive_reachable(self._archive(health))
-
-    async def test_a_cancellation_is_not_swallowed(self, app: MusicBotApp) -> None:
-        """close() cancels the probe; swallowing that would mark the task complete
-        while it was still between attempts."""
-        started = asyncio.Event()
-
-        async def _fail() -> None:
-            started.set()
-            raise OSError("refused")
-
-        task = asyncio.create_task(app._verify_archive_reachable(self._archive(_fail)))
-        await started.wait()
-        await asyncio.sleep(0)  # let it reach the inter-attempt sleep
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert task.cancelled()
-
-
-class TestArchiveProbeWiring:
-    """That the probe is started for an enabled archive and stopped by close()."""
-
-    async def test_the_enabled_arm_spawns_it(
-        self,
-        app: MusicBotApp,
-        monkeypatch: pytest.MonkeyPatch,
-        stub_archive_probe: AsyncMock,
-    ) -> None:
-        monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.PostgresHistoryArchive") as archive_cls,
-            patch("src.main.HistoryOutboxDrainer"),
-            patch("src.main.ensure_outbox_group", new=AsyncMock()),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-            assert app._archive_probe_task is not None
-            await app._archive_probe_task
-        stub_archive_probe.assert_awaited_once_with(archive_cls.return_value)
-
-    async def test_the_disabled_arm_spawns_none(
-        self,
-        app: MusicBotApp,
-        monkeypatch: pytest.MonkeyPatch,
-        stub_archive_probe: AsyncMock,
-    ) -> None:
-        """The default deployment has no Postgres by design; a probe there would
-        report the supported configuration as broken."""
-        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
-        monkeypatch.delenv("POSTGRES_URL", raising=False)
-        with (
-            patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
-            patch.object(app, "load_extension", new=AsyncMock()),
-        ):
-            await app.setup_hook()
-        # getattr: the app fixture bypasses __init__, so "never assigned" is the
-        # shape close()'s own guard exists for.
-        assert getattr(app, "_archive_probe_task", None) is None
-        stub_archive_probe.assert_not_awaited()
-
-    async def test_close_cancels_a_probe_still_waiting(self, app: MusicBotApp) -> None:
-        forever = asyncio.Event()
-
-        async def _wait() -> None:
-            await forever.wait()
-
-        app._archive_probe_task = asyncio.create_task(_wait())
-        await asyncio.sleep(0)
-        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
-            await app.close()
-        assert app._archive_probe_task is None
-
-    async def test_close_cancels_the_probe_before_closing_the_archive(
-        self, app: MusicBotApp
-    ) -> None:
-        """Ordering, not merely presence: the probe reads the archive's pool, and
-        _ensure() refuses once close() has latched it shut, so a probe outliving
-        the archive spends its remaining attempts failing for the wrong reason."""
-        order: list[str] = []
-        probe_cancelled = asyncio.Event()
-
-        async def _probe() -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                order.append("probe")
-                probe_cancelled.set()
-                raise
-
-        archive = MagicMock()
-        archive.close = AsyncMock(side_effect=lambda: order.append("archive"))
-        app.history_archive = archive
-        app.history_drainer = None
-        app._archive_probe_task = asyncio.create_task(_probe())
-        await asyncio.sleep(0)
-        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
-            await app.close()
-        assert probe_cancelled.is_set()
-        assert order == ["probe", "archive"]
-
-
 class TestClose:
+    @staticmethod
+    def _tier(aclose: Optional[AsyncMock] = None) -> MagicMock:
+        """The archive tier as close() sees it: one participant with one aclose().
+        What order the three things INSIDE it come down in is asserted in
+        tests/test_archive_tier.py, which is where that order now lives."""
+        return MagicMock(aclose=aclose or AsyncMock())
+
     @pytest.fixture(autouse=True)
     def stub_telemetry_shutdown(self) -> Iterator[None]:
         """close() awaits shutdown_telemetry in an executor for real, and it blocks on an
@@ -956,8 +380,6 @@ class TestClose:
         that way. The `is not None` guards skip the tier's two steps entirely
         and everything downstream still runs — same guards, second meaning
         (the first is surviving a close() before setup_hook ever assigned)."""
-        app.history_archive = None
-        app.history_drainer = None
         app._redis_pool = MagicMock()
         with (
             patch("src.main.close_redis_pool", new=AsyncMock()) as mock_pool_close,
@@ -986,11 +408,8 @@ class TestClose:
         async def record_redis_close(_pool: object) -> None:
             order.append("pool")
 
-        app.history_drainer = MagicMock(
-            stop=AsyncMock(side_effect=lambda: order.append("drainer"))
-        )
-        app.history_archive = MagicMock(
-            close=AsyncMock(side_effect=lambda: order.append("archive"))
+        app._archive_tier = self._tier(
+            AsyncMock(side_effect=lambda: order.append("tier"))
         )
         app._redis_pool = MagicMock()
         with (
@@ -1000,23 +419,21 @@ class TestClose:
             ),
         ):
             await app.close()
-        assert order == ["drainer", "archive", "disconnect", "pool"]
+        assert order == ["tier", "disconnect", "pool"]
 
-    @pytest.mark.parametrize("sick", ["drainer", "archive"])
     async def test_teardown_completes_when_a_step_raises(
-        self, app: MusicBotApp, sick: str
+        self, app: MusicBotApp
     ) -> None:
-        """regression: drainer.stop() and archive.close() were both unguarded and
-        both can raise (a hung Postgres, a drainer task that died). Because
-        _teardown_started is already set the retry path short-circuits, so every
-        step after the raiser was skipped permanently: Redis pool left open,
-        discord.py never closed, the yt-dlp pool left to its 61s atexit join, and
-        no spans flushed — which hid the very failure that caused it.
+        """regression: the archive steps were unguarded and can raise (a hung
+        Postgres, a drainer task that died). Because _teardown_started is already
+        set the retry path short-circuits, so every step after the raiser was
+        skipped permanently: Redis pool left open, discord.py never closed, the
+        yt-dlp pool left to its 61s atexit join, and no spans flushed — which hid
+        the very failure that caused it. The tier guards its own three; this is
+        the guard around the tier itself.
         """
-        boom = AsyncMock(side_effect=RuntimeError(f"{sick} is wedged"))
-        app.history_drainer = MagicMock(stop=boom if sick == "drainer" else AsyncMock())
-        app.history_archive = MagicMock(
-            close=boom if sick == "archive" else AsyncMock()
+        app._archive_tier = self._tier(
+            AsyncMock(side_effect=RuntimeError("tier is wedged"))
         )
         app._redis_pool = MagicMock()
         with (
@@ -1035,8 +452,7 @@ class TestClose:
     ) -> None:
         # super().close() is guarded for the same reason as the two above, now
         # that a step follows it: no participant may skip a later one.
-        app.history_drainer = MagicMock(stop=AsyncMock())
-        app.history_archive = MagicMock(close=AsyncMock())
+        app._archive_tier = self._tier()
         app._redis_pool = MagicMock()
         with (
             patch("src.main.close_redis_pool", new=AsyncMock()) as mock_pool_close,
@@ -1052,10 +468,10 @@ class TestClose:
     async def test_teardown_runs_only_once(self, app: MusicBotApp) -> None:
         # discord.py calls close() from run()'s finally as well as on demand, and
         # its own idempotence check lives inside super().close(). Without the
-        # reentrancy guard a second close() re-runs drainer.stop(), and two
-        # concurrent final drains each peek → insert → retire.
-        app.history_drainer = MagicMock(stop=AsyncMock())
-        app.history_archive = MagicMock(close=AsyncMock())
+        # reentrancy guard a second close() re-runs the tier's final drain, and
+        # two concurrent drains each peek → insert → retire.
+        tier = self._tier()
+        app._archive_tier = tier
         app._redis_pool = MagicMock()
         with (
             patch("src.main.close_redis_pool", new=AsyncMock()) as mock_pool_close,
@@ -1063,20 +479,19 @@ class TestClose:
         ):
             await app.close()
             await app.close()
-        app.history_drainer.stop.assert_awaited_once()
-        app.history_archive.close.assert_awaited_once()
+        assert tier.aclose.await_count == 1
         mock_pool_close.assert_awaited_once()
         # super().close() still runs on the second call — discord.py's own
         # teardown is idempotent and expects to be reached.
         assert sup.await_count == 2
 
     async def test_concurrent_closes_teardown_once(self, app: MusicBotApp) -> None:
-        app.history_drainer = MagicMock(stop=AsyncMock())
-        app.history_archive = MagicMock(close=AsyncMock())
+        tier = self._tier()
+        app._archive_tier = tier
         app._redis_pool = None
         with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
             await asyncio.gather(app.close(), app.close())
-        app.history_drainer.stop.assert_awaited_once()
+        assert tier.aclose.await_count == 1
 
     async def test_shuts_down_the_ytdlp_pool(self, app: MusicBotApp) -> None:
         """The extraction workers are child processes — a clean close must join them
@@ -1412,7 +827,7 @@ class TestLivenessHeartbeat:
         with (
             patch("src.main.create_redis_pool", return_value=MagicMock()),
             patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch("src.archive_tier.outbox_depth", new=AsyncMock(return_value=0)),
             patch.object(app, "load_extension", new=AsyncMock()),
         ):
             await app.setup_hook()
@@ -1480,7 +895,7 @@ class TestChartPoolWarm:
         with (
             patch("src.chart_pool.warm") as warm,
             patch.object(app, "load_extension", new=AsyncMock()),
-            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.start_archive_tier", new=AsyncMock(return_value=None)),
             patch("src.main.create_redis_pool"),
             patch("src.youtube.ytdlp_pool.prewarm"),
         ):
@@ -1497,7 +912,7 @@ class TestChartPoolWarm:
         with (
             patch("src.chart_pool.warm") as warm,
             patch.object(app, "load_extension", new=AsyncMock()),
-            patch.object(app, "_report_archive_disabled", new=AsyncMock()),
+            patch("src.main.start_archive_tier", new=AsyncMock(return_value=None)),
             patch("src.main.create_redis_pool"),
             patch("src.youtube.ytdlp_pool.prewarm"),
         ):
@@ -1520,7 +935,7 @@ class TestChartPoolWarm:
                 side_effect=lambda *a, **k: order.append("ytdlp"),
             ),
             patch.object(app, "load_extension", new=AsyncMock()),
-            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.start_archive_tier", new=AsyncMock(return_value=None)),
             patch("src.main.create_redis_pool"),
         ):
             await app.setup_hook()
@@ -1539,7 +954,7 @@ class TestChartPoolWarm:
             patch("src.chart_pool.chart_available", return_value=False),
             patch("src.chart_pool.warm"),
             patch.object(app, "load_extension", new=AsyncMock()),
-            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.start_archive_tier", new=AsyncMock(return_value=None)),
             patch("src.main.create_redis_pool"),
             patch("src.youtube.ytdlp_pool.prewarm"),
             patch("src.main.log.warning") as warn,
@@ -1558,7 +973,7 @@ class TestChartPoolWarm:
             patch("src.chart_pool.chart_available", return_value=True),
             patch("src.chart_pool.warm"),
             patch.object(app, "load_extension", new=AsyncMock()),
-            patch.object(app, "_setup_history_archive", new=AsyncMock()),
+            patch("src.main.start_archive_tier", new=AsyncMock(return_value=None)),
             patch("src.main.create_redis_pool"),
             patch("src.youtube.ytdlp_pool.prewarm"),
             patch("src.main.log.warning") as warn,
