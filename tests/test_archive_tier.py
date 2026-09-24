@@ -443,6 +443,33 @@ class TestTeardown:
             archive.close.assert_awaited_once()
         assert "shutdown failed" in caplog.text
 
+    async def test_a_cancelled_teardown_stops_rather_than_finishing(self) -> None:
+        """The one exception to the guarding above, and it is deliberate: a
+        CancelledError here means the shutdown itself was cancelled, so the
+        remaining steps are moot. Un-drained outbox entries are durable in Redis
+        and drain on the next start, which is what makes stopping safe."""
+        ran: list[str] = []
+
+        async def _idle() -> None:
+            await asyncio.Event().wait()
+
+        tier = self._tier(
+            probe=asyncio.create_task(_idle()),
+            drainer=MagicMock(
+                stop=AsyncMock(side_effect=lambda: ran.append("drainer"))
+            ),
+            archive=MagicMock(
+                close=AsyncMock(side_effect=lambda: ran.append("archive"))
+            ),
+        )
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(tier.aclose())
+        await asyncio.sleep(0)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert ran == []
+
     async def test_a_settled_probe_is_not_an_error(self) -> None:
         """The common case: the probe reported minutes ago and the task is done.
         cancel_task no-ops on it."""

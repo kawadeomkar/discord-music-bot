@@ -55,9 +55,10 @@ class ArchiveTier:
         Then the drainer, whose final drain needs Redis AND the archive alive.
         Then the archive.
 
-        Each step is guarded separately: a hung Postgres once made
-        `archive.close()` raise after 30s, and a step that raises must not take
-        the ones after it with it.
+        Each step is guarded separately, so an Exception in one cannot skip the
+        rest — a hung Postgres once made `archive.close()` raise after 30s. A
+        CancelledError does skip them, and should: it means this teardown was
+        itself cancelled, which `cancel_task` re-raises rather than swallowing.
         """
         try:
             await cancel_task(self.probe)
