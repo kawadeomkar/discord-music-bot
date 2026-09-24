@@ -302,7 +302,8 @@ class MusicBotApp(commands.AutoShardedBot):
         )
 
     async def _verify_archive_reachable(self, archive: PostgresHistoryArchive) -> None:
-        """Retry `health_check` for ~a minute, then log ONE error naming the cause.
+        """Retry `health_check` for about a minute — longer where attempts hang
+        rather than refuse — then log ONE error naming the cause.
 
         An enabled archive with no database reachable is otherwise silent until a
         play lands: the DSN is interpolated whether or not the `archive` compose
@@ -314,12 +315,13 @@ class MusicBotApp(commands.AutoShardedBot):
         the drainer's backoff loop owns the reporting.
         """
         last_error: Optional[Exception] = None
+        started = asyncio.get_running_loop().time()
         for attempt in range(_ARCHIVE_PROBE_ATTEMPTS):
             if attempt:
                 await asyncio.sleep(_ARCHIVE_PROBE_INTERVAL_SECS)
             try:
-                # health_check bounds its own connect at 10s; this caps a route
-                # that hangs past it, so the loop keeps its advertised minute.
+                # health_check bounds its own connect at 10s; this caps a route that
+                # hangs past it, so one dead attempt cannot swallow the whole run.
                 async with asyncio.timeout(_ARCHIVE_PROBE_STEP_TIMEOUT_SECS):
                     await archive.health_check()
             except Exception as e:  # noqa: BLE001 — reported once, below
@@ -327,7 +329,11 @@ class MusicBotApp(commands.AutoShardedBot):
                 continue
             log.info("History archive probe: Postgres answered, the archive is live")
             return
-        waited = int(_ARCHIVE_PROBE_ATTEMPTS * _ARCHIVE_PROBE_INTERVAL_SECS)
+        # Measured, not computed from the constants: the first attempt does not
+        # sleep, and a route that hangs rather than refusing stretches the run by
+        # up to the step timeout per attempt. Either arithmetic would print a
+        # number the operator's own clock disagrees with.
+        waited = round(asyncio.get_running_loop().time() - started)
         log.error(
             f"HISTORY_ARCHIVE_ENABLED is true but Postgres has not answered in "
             f"{waited}s ({type(last_error).__name__}: {last_error}). Every play is "
