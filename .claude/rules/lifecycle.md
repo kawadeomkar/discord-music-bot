@@ -1,6 +1,7 @@
 ---
 paths:
   - "src/main.py"
+  - "src/archive_tier.py"
   - "src/musicbot.py"
   - "src/telemetry.py"
   - "src/debug.py"
@@ -8,7 +9,7 @@ paths:
   - "src/dashboard.py"
   - "src/commands/debug.py"
   - "src/commands/ping.py"
-  - "tests/test_{main,musicbot,telemetry,debug,ping,dashboard}.py"
+  - "tests/test_{main,archive_tier,musicbot,telemetry,debug,ping,dashboard}.py"
 ---
 
 # Process lifecycle and observability
@@ -30,7 +31,7 @@ reason; creates the Redis pool and `MusicBotApp.bot_settings`, then branches. En
 **requires `POSTGRES_URL`** (it raises otherwise — an enabled bot running without the
 archive would XADD onto an outbox nobody drains), constructs `PostgresHistoryArchive`
 (lazy: no connection is made here, so startup never blocks on Postgres), starts the
-`HistoryOutboxDrainer`, and spawns `_verify_archive_reachable` — a background probe
+`HistoryOutboxDrainer`, and spawns `verify_reachable` — a background probe
 that retries `health_check` for ~a minute and then logs ONE error. It exists because
 the required-`POSTGRES_URL` check above cannot see this failure: compose interpolates
 the DSN before profile filtering, so a bare `docker compose up` (which never activates
@@ -51,11 +52,12 @@ latency (the pool stays lifecycle-only: the warm-up callable comes from
 short-circuits `--help` anywhere in a command message straight to that command's help
 embed, before voice checks or argument parsing.
 
-`close()` order: cancel `_archive_probe_task` (before the archive: the probe reads its
-pool, and `_ensure()` refuses once `close()` has latched it shut) →
-`history_drainer.stop()` (final drain, needs Redis AND the archive) →
-`history_archive.close()` — all three skipped when the archive tier is off (the attrs
-are `None`) → close Redis pool → `super().close()` → `ytdlp_pool.aclose()`
+`close()` order: `ArchiveTier.aclose()` — which is itself probe (before the archive: it
+reads that pool, and `_ensure()` refuses once `close()` has latched it shut) → drainer
+(final drain, needs Redis AND the archive) → archive, each guarded separately; skipped
+whole when the tier is off (`_archive_tier` is `None`, which the `history_archive` /
+`history_drainer` properties publish as the `None` every consumer handles) → close Redis
+pool → `super().close()` → `ytdlp_pool.aclose()`
 → `chart_pool.aclose()` (inert when the worker was never spawned)
 (10s join timeout, then `terminate_workers()` — an unbounded join measured 61s to exit)
 → `close_probe_session()` (latches the module closed, so a player loop still running
