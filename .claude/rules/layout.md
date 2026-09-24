@@ -13,6 +13,11 @@ them. Read it to find where a change belongs before opening files.
 ```
 src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
+├── archive_tier.py   # starting and stopping the history archive: the enabled arm's DSN
+│                     # requirement and password advisory, the outbox consumer group, the
+│                     # archive + drainer + reachability probe, the disabled arm's reporting,
+│                     # and the order aclose() unwinds the three in. main.py decides WHETHER
+│                     # to run it (it reads the flag first); this owns what running it means
 ├── musicbot.py       # MusicBot cog — command REGISTRATION and one try/except each;
 │                     # per-guild player registry (mps), the discord.py hooks, crash-recovery entry
 ├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch (ensure_prefetch), gate,

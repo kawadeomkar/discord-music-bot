@@ -7,29 +7,18 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
 from discord.ext import commands
-from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import ResponseError
-from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src import config
+from src.archive_tier import ArchiveTier, start_archive_tier
 from src.config import spotify_enabled
 
 from src.help import MusicHelpCommand
-from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
-from src.redis_client import (
-    HISTORY_CACHE_LIMIT,
-    close_redis_pool,
-    create_redis_pool,
-    ensure_outbox_group,
-    get_redis,
-    outbox_depth,
-)
+from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.settings import BotSettings
-from src.util import cancel_task, get_logger
+from src.util import get_logger
 
 if TYPE_CHECKING:
-    import redis.asyncio as aioredis
-
+    from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
     from src.musicbot import MusicBot
     from src.musicplayer import MusicPlayer
 
@@ -56,14 +45,6 @@ def _build_intents() -> discord.Intents:
 
 intents = _build_intents()
 EXTENSIONS = ("src.musicbot",)
-
-# The enabled archive's startup reachability probe. 12 x 5s outlasts a cold `up`,
-# where the bot is ready seconds before Postgres passes its healthcheck (interval
-# 5s), so the error fires only for a database that is not coming at all.
-_ARCHIVE_PROBE_ATTEMPTS = 12
-_ARCHIVE_PROBE_INTERVAL_SECS = 5.0
-# Caps one attempt above health_check's own 10s connect bound.
-_ARCHIVE_PROBE_STEP_TIMEOUT_SECS = 15.0
 
 
 class MusicContext(commands.Context):
@@ -168,16 +149,28 @@ class MusicBotApp(commands.AutoShardedBot):
         self.redis = None
         self._liveness_task: Optional[asyncio.Task] = None
         # Built in setup_hook while HISTORY_ARCHIVE_ENABLED; None is the disabled
-        # shape (the default) and every consumer handles it.
-        self.history_archive: Optional[PostgresHistoryArchive] = None
-        self.history_drainer: Optional[HistoryOutboxDrainer] = None
+        # shape (the default), which history_archive/history_drainer publish as
+        # the None every consumer already handles.
+        self._archive_tier: Optional[ArchiveTier] = None
         # Built in setup_hook, once the pool exists; hydrated in the background.
         self.bot_settings: Optional[BotSettings] = None
         self._bot_settings_hydration: Optional[asyncio.Task] = None
-        # Spawned by the enabled archive arm; tracked so close() can cancel a probe
-        # still between attempts rather than leave it holding the pool it reads.
-        self._archive_probe_task: Optional[asyncio.Task] = None
         self._teardown_started = False  # close() runs at most once
+
+    @property
+    def history_archive(self) -> Optional[PostgresHistoryArchive]:
+        """The archive, or None while the tier is off. A property, not a field:
+        the tier owns the three objects as one, and MusicBot reads this name off
+        the bot by getattr. See src/archive_tier.py."""
+        tier = getattr(self, "_archive_tier", None)
+        return tier.archive if tier is not None else None
+
+    @property
+    def history_drainer(self) -> Optional[HistoryOutboxDrainer]:
+        """The drainer, or None while the tier is off. MusicPlayer reads it for
+        its notify hook."""
+        tier = getattr(self, "_archive_tier", None)
+        return tier.drainer if tier is not None else None
 
     async def _liveness_heartbeat(self) -> None:
         """Touch LIVENESS_FILE on a fixed cadence for the container HEALTHCHECK.
@@ -202,14 +195,14 @@ class MusicBotApp(commands.AutoShardedBot):
         if config.LIVENESS_FILE:
             self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
-        self.redis = get_redis(self._redis_pool)
+        # A local as well as the attribute: the checker does not narrow
+        # Optional[Redis] across the calls below.
+        redis = get_redis(self._redis_pool)
+        self.redis = redis
         self.bot_settings = BotSettings(
-            self, redis=self.redis, ignore_stored=ignore_bot_overrides
+            self, redis=redis, ignore_stored=ignore_bot_overrides
         )
-        if archive_enabled:
-            await self._setup_history_archive(self.redis)
-        else:
-            await self._report_archive_disabled()
+        self._archive_tier = await start_archive_tier(redis, enabled=archive_enabled)
         for extension in EXTENSIONS:
             await self.load_extension(extension)
         # Not awaited: every knob runs on its environment value until this lands,
@@ -240,160 +233,6 @@ class MusicBotApp(commands.AutoShardedBot):
             except Exception as e:
                 # A raise here would abort startup over an optional feature.
                 log.warning(f"chart pool warm failed: {e}")
-
-    async def _setup_history_archive(self, redis: aioredis.Redis) -> None:
-        """The enabled arm: required DSN, default-password advisory, outbox
-        consumer group, archive + drainer. `redis` is a parameter because the
-        checker's narrowing does not cross the method boundary."""
-        # Fail fast: a bot silently running without the archive would XADD every
-        # song-end onto an outbox nobody drains. The remedy names `just run`
-        # because this process reads only the environment.
-        postgres_url = config.postgres_url()
-        if not postgres_url:
-            raise RuntimeError(
-                "POSTGRES_URL is not set but HISTORY_ARCHIVE_ENABLED is true — "
-                "the enabled archive requires its database. Under docker "
-                "compose it is supplied for you; for a local run use `just "
-                "run`, which loads .env and derives the URL from it. Otherwise "
-                "export POSTGRES_URL yourself "
-                "(postgresql://user:password@host:5432/dbname). To run without "
-                "the archive instead, remove HISTORY_ARCHIVE_ENABLED."
-            )
-        # Loud but not fatal: compose defaults POSTGRES_PASSWORD so a token-only
-        # `docker compose up` works.
-        if config.using_default_postgres_password():
-            log.error(
-                "POSTGRES_PASSWORD is still the default "
-                f"({config.DEFAULT_POSTGRES_PASSWORD!r}). The play-history "
-                "database accepts it from anything that can reach the host's "
-                "published port. Fix it IN THIS ORDER: (1) change the server "
-                'itself — `docker compose exec postgres psql -U <user> -c "ALTER '
-                "USER <user> PASSWORD '<new>'\"`; (2) put the same value in "
-                ".env via `./setup_env.sh --force`; (3) `docker compose up -d` "
-                "to recreate the bot with the new DSN. To start clean instead, "
-                "drop ONLY the database volume — `docker compose down && docker "
-                "volume rm discord-music-bot_postgres-data` — not `down -v`, "
-                "which also removes the Redis volume holding plays that are not "
-                "durable in Postgres yet. The order matters: this "
-                "warning reads the bot's DSN, so doing (2) first silences it "
-                "while the database still accepts the old password. And "
-                "Postgres reads POSTGRES_PASSWORD only when initializing an "
-                "EMPTY data directory, so editing .env alone never changes the "
-                "server — it just locks the bot out of its own database."
-            )
-        # Create the group before anything can write: push_history is @_guild_op-
-        # wrapped, so a WRONGTYPE at history:outbox would be swallowed into one
-        # warning per song while every play was lost. Only here is it loud.
-        # An UNREACHABLE Redis must not abort startup — the pool connects lazily,
-        # and _read_batch heals NOGROUP on its first tick after Redis returns.
-        try:
-            await ensure_outbox_group(redis)
-        except (RedisConnectionError, RedisTimeoutError) as e:
-            log.warning(f"outbox group probe could not reach Redis: {e}")
-        # Lazy: no connection is made here, so startup never blocks on Postgres.
-        archive = PostgresHistoryArchive(postgres_url)
-        self.history_archive = archive
-        self.history_drainer = HistoryOutboxDrainer(redis, archive)
-        self.history_drainer.start()
-        # A task, not an await: the lazy pool above keeps startup off Postgres and
-        # this must too.
-        self._archive_probe_task = asyncio.create_task(
-            self._verify_archive_reachable(archive)
-        )
-
-    async def _verify_archive_reachable(self, archive: PostgresHistoryArchive) -> None:
-        """Retry `health_check` for about a minute — longer where attempts hang
-        rather than refuse — then log ONE error naming the cause.
-
-        An enabled archive with no database reachable is otherwise silent until a
-        play lands: the DSN is interpolated whether or not the `archive` compose
-        profile deployed Postgres behind it, so the required-URL check above passes
-        and the lazy pool connects for the first time at the first song end. Until
-        then every play XADDs onto the non-evictable `history:outbox`.
-
-        Never raises (nothing awaits it) and never repeats — once plays are moving
-        the drainer's backoff loop owns the reporting.
-        """
-        last_error: Optional[Exception] = None
-        started = asyncio.get_running_loop().time()
-        for attempt in range(_ARCHIVE_PROBE_ATTEMPTS):
-            if attempt:
-                await asyncio.sleep(_ARCHIVE_PROBE_INTERVAL_SECS)
-            try:
-                # health_check bounds its own connect at 10s; this caps a route that
-                # hangs past it, so one dead attempt cannot swallow the whole run.
-                async with asyncio.timeout(_ARCHIVE_PROBE_STEP_TIMEOUT_SECS):
-                    await archive.health_check()
-            except Exception as e:  # noqa: BLE001 — reported once, below
-                last_error = e
-                continue
-            log.info("History archive probe: Postgres answered, the archive is live")
-            return
-        # Measured, not computed from the constants: the first attempt does not
-        # sleep, and a route that hangs rather than refusing stretches the run by
-        # up to the step timeout per attempt. Either arithmetic would print a
-        # number the operator's own clock disagrees with.
-        waited = round(asyncio.get_running_loop().time() - started)
-        log.error(
-            f"HISTORY_ARCHIVE_ENABLED is true but Postgres has not answered in "
-            f"{waited}s ({type(last_error).__name__}: {last_error}). Every play is "
-            "being XADDed onto history:outbox, which carries no TTL and is not an "
-            "eviction candidate, and nothing is draining it. If this stack came up "
-            "with a bare `docker compose up`, the `archive` profile was never "
-            "activated and no Postgres was deployed: bring it up with `just up`, "
-            "which derives the profile from the flag. If POSTGRES_URL names an "
-            "external database, check that it is reachable from this host."
-        )
-
-    async def _report_archive_disabled(self) -> None:
-        """The disabled arm (the default): say so once and warn about leftovers.
-        No consumer-group creation, which would MKSTREAM the non-evictable
-        outbox key into existence."""
-        # States what IS retained: guild:{id}:history is PERSISTed, so an
-        # opted-out deployment still holds 50 plays per guild indefinitely.
-        log.info(
-            "History archive disabled (the default; HISTORY_ARCHIVE_ENABLED=true "
-            f"opts in). Plays are kept only in the per-guild Redis list behind "
-            f"-history — the newest {HISTORY_CACHE_LIMIT} per guild, retained "
-            "until deleted (no expiry); nothing is written to Postgres."
-        )
-        if config.postgres_url():
-            # Compose interpolates POSTGRES_URL whether or not the archive
-            # profile is active, so a DSN here is not consent.
-            log.info(
-                "POSTGRES_URL is set but ignored: the archive is enabled by "
-                "HISTORY_ARCHIVE_ENABLED=true, never by URL presence."
-            )
-        await self._warn_if_outbox_left_over()
-
-    async def _warn_if_outbox_left_over(self) -> None:
-        """One WARNING when a previously-enabled archive left outbox entries in
-        a non-evictable key that will never drain. Never auto-deleted. The error
-        handler for the raising outbox_depth helper: an unreachable Redis skips
-        the probe, and a WRONGTYPE only warns since the XADD leg is off."""
-        if self.redis is None:
-            return
-        try:
-            depth = await outbox_depth(self.redis)
-        except (RedisConnectionError, RedisTimeoutError) as e:
-            log.warning(f"leftover-outbox probe could not reach Redis: {e}")
-            return
-        except ResponseError as e:
-            log.warning(
-                f"history:outbox exists but is not a stream ({e}). With the "
-                "archive disabled it is inert; `DEL history:outbox` with the "
-                "bot stopped clears it."
-            )
-            return
-        if depth > 0:
-            log.warning(
-                f"history:outbox still holds {depth} entries from a "
-                "previously-enabled archive. They were buffered for Postgres, "
-                "sit in a non-evictable key, and will NEVER drain while the "
-                "archive is disabled. Re-enable HISTORY_ARCHIVE_ENABLED to "
-                "drain them into the archive, or discard them with `DEL "
-                "history:outbox` (inspect first: `just outbox`)."
-            )
 
     async def get_context(
         self,
@@ -484,33 +323,20 @@ class MusicBotApp(commands.AutoShardedBot):
         if hydration is not None:
             hydration.cancel()
             self._bot_settings_hydration = None
-        # Before the archive closes below: a probe mid-attempt holds a connection
-        # from its pool, and one between attempts would wake onto a closed one.
-        probe = getattr(self, "_archive_probe_task", None)
-        if probe is not None:
+        # The tier unwinds itself, in its own order: probe, drainer, archive.
+        tier = getattr(self, "_archive_tier", None)
+        if tier is not None:
             try:
-                await cancel_task(probe)
+                await tier.aclose()
             except Exception as e:
-                log.warning(f"archive probe shutdown failed: {e}")
-            self._archive_probe_task = None
-        # Ordering: drainer before archive and Redis (its final drain needs both);
+                log.warning(f"history archive tier shutdown failed: {e}")
+            self._archive_tier = None
+        # Ordering: the tier above before Redis (its final drain needs it);
         # super().close() before the Redis pool (it disconnects voice clients and can
         # still dispatch on_voice_state_update, whose cleanup() must reach a live
         # pool or the next start runs spurious recovery for stopped guilds).
         # Every step is individually guarded: a hung participant must not skip
         # the steps after it, and _teardown_started prevents any retry.
-        drainer = getattr(self, "history_drainer", None)
-        if drainer is not None:
-            try:
-                await drainer.stop()
-            except Exception as e:
-                log.warning(f"history drainer shutdown failed: {e}")
-        archive = getattr(self, "history_archive", None)
-        if archive is not None:
-            try:
-                await archive.close()
-            except Exception as e:
-                log.warning(f"history archive shutdown failed: {e}")
         try:
             await super().close()
         except Exception as e:
