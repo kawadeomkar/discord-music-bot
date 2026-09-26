@@ -37,7 +37,7 @@ from src.musicplayer import (
     MusicPlayer,
 )
 from src.play_pipeline import (
-    ResolvedYoutubePlaylist,
+    ResolvedPlaylist,
 )
 from src.sources import (
     YTSource,
@@ -925,7 +925,7 @@ class TestPlayFrontInsertion:
         await play_pipeline.enqueue_playlist(
             mock_ctx,
             source,
-            ResolvedYoutubePlaylist(tracks),
+            ResolvedPlaylist(tracks),
             mp,
             admit(music_bot, mock_ctx, mp),
             placement=Placement.COLD_FRONT,
@@ -950,9 +950,7 @@ class TestPlayFrontInsertion:
             for i in range(3)
         ]
 
-        play_pipeline.queue_source = AsyncMock(
-            return_value=ResolvedYoutubePlaylist(tracks)
-        )
+        play_pipeline.queue_source = AsyncMock(return_value=ResolvedPlaylist(tracks))
         play_pipeline.enqueue_playlist = AsyncMock()
         play_pipeline.enqueue_single = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mock_mp())
@@ -977,7 +975,7 @@ class TestPlayFrontInsertion:
         pl_call = play_pipeline.enqueue_playlist.await_args
         assert pl_call is not None
         assert pl_call.kwargs["placement"] is Placement.COLD_FRONT
-        assert pl_call.args[2] == ResolvedYoutubePlaylist(tracks)
+        assert pl_call.args[2] == ResolvedPlaylist(tracks)
 
     async def test_front_insert_after_restore_orders_both_legs(
         self,
@@ -1777,7 +1775,7 @@ class TestNowFlag:
         # searches, which is what keeps a 100-track album from paying 100 searches
         # before a note is heard.
         follow_on = live_mp.interject.call_args.kwargs["follow_on"]
-        assert [item.ytsearch for item in follow_on] == ["ytsearch:Second"]
+        assert [item.search for item in follow_on] == ["ytsearch:Second"]
         notices = [
             c.kwargs["embed"].description
             for c in mock_ctx.send.call_args_list
@@ -2365,7 +2363,7 @@ class TestPlacementInsertsAndConfirmations:
         await play_pipeline.enqueue_playlist(
             mock_ctx,
             source,
-            ResolvedYoutubePlaylist(tracks),
+            ResolvedPlaylist(tracks),
             mp,
             admit(music_bot, mock_ctx, mp),
             placement=Placement.NEXT,
@@ -2411,7 +2409,7 @@ class TestPlacementInsertsAndConfirmations:
             await play_pipeline.enqueue_playlist(
                 mock_ctx,
                 source,
-                ResolvedYoutubePlaylist(tracks),
+                ResolvedPlaylist(tracks),
                 mp,
                 admit(music_bot, mock_ctx, mp),
                 placement=placement,
@@ -3697,9 +3695,9 @@ class TestPlaceRefuses:
         mp = self._warm(music_bot, mock_ctx)
         tracks = [song(1, mock_ctx), song(2, mock_ctx)]
 
-        async def _cleared(*_a: Any, **_kw: Any) -> ResolvedYoutubePlaylist:
+        async def _cleared(*_a: Any, **_kw: Any) -> ResolvedPlaylist:
             mp.queue.generation += 1
-            return ResolvedYoutubePlaylist(tracks)
+            return ResolvedPlaylist(tracks)
 
         play_pipeline.queue_source = AsyncMock(side_effect=_cleared)
 
@@ -4451,7 +4449,7 @@ class TestTheGateHoldEndsAtTheInsert:
         mp = self._cold(music_bot, mock_ctx)
         tracks = [song(1, mock_ctx), song(2, mock_ctx)]
         play_pipeline.queue_source = AsyncMock(
-            return_value=ResolvedYoutubePlaylist(tracks, skipped=0)
+            return_value=ResolvedPlaylist(tracks, skipped=0)
         )
         play_pipeline._warm_front_track = AsyncMock()
         holds_at_reply: list[int] = []
@@ -5810,7 +5808,7 @@ class TestTheTimestampFlag:
         """The shape YouTube's share button emits while a playlist is queued: the
         `t=` on this link already starts its queued head, so the flag does too."""
         seams = self._wire(music_bot, mock_ctx)
-        seams.queue_source.return_value = ResolvedYoutubePlaylist(
+        seams.queue_source.return_value = ResolvedPlaylist(
             [QueueObject("https://yt.com/v=v4", "S4", mock_ctx.author, duration=210)]
         )
         play_pipeline.enqueue_playlist = AsyncMock()

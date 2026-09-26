@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.guild_queue import (
-    QueueItem,
     _to_entry,
     _LREM_MAX_ENTRIES,
     _LREM_MAX_SHARE,
@@ -29,9 +28,13 @@ from src.guild_queue import (
 )
 from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
 from src.redis_client import GUILD_TTL, GuildRedisStore
-from src.sources import YTSource
 from src.youtube import QueueObject
-from tests.helpers import queue_object, seed_queue
+from tests.helpers import (
+    queue_object,
+    seed_queue,
+    stub_requester,
+    unresolved,
+)
 
 
 @pytest.fixture
@@ -77,8 +80,8 @@ class TestIsPersisted:
         assert is_persisted(_qobj(1, mock_author)) is True
         assert is_persisted(_qobj(1, mock_author, persisted=False)) is False
 
-    def test_ytsource_always_persisted(self) -> None:
-        assert is_persisted(YTSource(ytsearch="artist song")) is True
+    def test_an_unresolved_item_is_always_persisted(self) -> None:
+        assert is_persisted(unresolved("artist song")) is True
 
     def test_none_is_persisted(self) -> None:
         # The default for "no item to ask", which is what the ordinary dequeue
@@ -251,13 +254,15 @@ class TestPut:
         assert len(redis_items) == 2
         await _assert_mirror_matches(gq, fake_redis, store)
 
-    async def test_ytsource_items_persist_as_search_entries(
+    async def test_unresolved_items_persist_as_search_entries(
         self, gq: GuildQueue, fake_redis: aioredis.Redis, store: GuildRedisStore
     ) -> None:
-        src = YTSource(ytsearch="ytsearch:some song", process=True)
+        src = unresolved("some song")
         await gq.put([src], batch=True)
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert parse_queue_entry(redis_items[0]) == SearchQueueEntry.from_ytsource(src)
+        assert parse_queue_entry(redis_items[0]) == SearchQueueEntry.from_queue_object(
+            src
+        )
 
     async def test_in_memory_before_redis(
         self, mock_guild: MagicMock, store: GuildRedisStore, mock_author: MagicMock
@@ -302,7 +307,7 @@ class TestRemoveByOriginSurvivesARestart:
         album = "https://open.spotify.com/album/abc123"
         await gq.put(
             [
-                YTSource(ytsearch=f"ytsearch:Track {n}", process=True, user_input=album)
+                unresolved(f"Track {n}", mock_author, user_input=album)
                 for n in range(1, 4)
             ]
             + [_qobj(99, mock_author)],  # queued separately, must survive
@@ -890,8 +895,8 @@ class TestCursorAndWakeDiscipline:
                 )
             )
         assert owners == {
-            "async def get(self) -> QueueItem:",
-            "def get_nowait(self) -> QueueItem:",
+            "async def get(self) -> QueueObject:",
+            "def get_nowait(self) -> QueueObject:",
         }
 
 
@@ -1442,13 +1447,13 @@ class TestClear:
         names, so an unresolved Spotify-playlist track dropped here loses a
         play_history row with no error."""
         song = _qobj(1, mock_author)
-        search = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
+        search = unresolved("Artist - Song", mock_author)
         await gq.put([song, search])
 
         cleared = await gq.clear()
 
         assert cleared == [song, search]
-        assert [type(i) for i in cleared] == [QueueObject, YTSource]
+        assert [i.unresolved for i in cleared] == [False, True]
 
     async def test_empty_queue_clear_returns_empty(self, gq: GuildQueue) -> None:
         assert await gq.clear() == []
@@ -1581,7 +1586,7 @@ class TestRemoveMatcher:
         "" — so an empty needle compares equal to it and `-remove` takes out every
         lazily-queued Spotify track in the guild."""
         match = remove_matcher("")
-        assert match(YTSource(ytsearch="ytsearch:a song")) is None
+        assert match(unresolved("a song")) is None
         assert match(self._song("https://yt.com/v=1", "")) is None
         assert match(self._song("", None)) is None
 
@@ -1628,7 +1633,7 @@ class TestRemoveMatcher:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
         only thing it can be matched by, and the only place that link is."""
         album = "https://open.spotify.com/album/xyz"
-        item = YTSource(ytsearch="ytsearch:Track One", user_input=album)
+        item = unresolved("Track One", user_input=album)
         assert remove_matcher(album)(item) is RemoveMode.ORIGIN
 
     def test_no_origin_recorded_never_matches_by_origin(self) -> None:
@@ -1707,18 +1712,21 @@ class TestRemove:
         assert outcome.positions == [1]
         assert await fake_redis.exists(store.queue_key()) == 0
 
-    async def test_matches_ytsource_by_url(
+    async def test_matches_an_unresolved_item_by_its_origin(
         self,
         gq: GuildQueue,
         fake_redis: aioredis.Redis,
         store: GuildRedisStore,
         mock_author: MagicMock,
     ) -> None:
-        src = YTSource(url="https://yt.com/v=7", process=False)
+        """An item still waiting to resolve has no URL to match, so the pasted
+        collection link is the only thing that can take it out — and it comes back
+        in `removed`, which is what earns its play_history row."""
+        src = unresolved("Track One", mock_author, user_input="https://sp/p")
         await gq.put([src, _qobj(1, mock_author)])
-        outcome = await gq.remove(remove_matcher("https://yt.com/v=7"))
+        outcome = await gq.remove(remove_matcher("https://sp/p"))
         assert outcome.positions == [1]
-        assert outcome.removed == [src]  # YTSources come back too; the caller filters
+        assert outcome.removed == [src]
         assert len(gq.display_items()) == 1
 
 
@@ -1819,7 +1827,7 @@ class TestResumeTailDepth:
             [
                 _qobj(9, mock_author),
                 self._tail(1, mock_author),
-                YTSource(ytsearch="ytsearch:something"),
+                unresolved("something", mock_author),
                 self._tail(2, mock_author),
             ]
         )
@@ -1834,24 +1842,60 @@ class TestRestoreEntries:
         self, gq: GuildQueue
     ) -> None:
         """A restart is when the fallback requester is most wrong: the player that
-        resolves these was built by whoever's command brought the bot back."""
+        restores these was built by whoever's command brought the bot back. The id
+        is resolved here rather than at dequeue, through the guild and then the
+        bot's user cache, so a member who has left still keeps their plays."""
+        left_the_guild = stub_requester(424242424242424242, "Gone")
+        gq._guild.get_member = MagicMock(return_value=None)
+        gq._user_lookup = lambda uid: (
+            left_the_guild if uid == 424242424242424242 else None
+        )
         entry = SearchQueueEntry(
             ytsearch="ytsearch:abc", requester_id=424242424242424242
         )
         assert await gq.restore_entries([entry]) == 1
-        item = gq.display_items()[0]
-        assert isinstance(item, YTSource)
-        assert item.requester_id == 424242424242424242
+        assert gq.display_items()[0].requester is left_the_guild
 
     async def test_a_search_entry_without_a_requester_is_kept(
         self, gq: GuildQueue
     ) -> None:
-        """Unlike a song, a requesterless search is not dropped: it resolves to the
-        fallback at dequeue, as it always has."""
+        """An entry written before searches carried a requester: it restores
+        against the guild owner, the same fallback a song entry takes, rather than
+        being dropped."""
         assert await gq.restore_entries([SearchQueueEntry(ytsearch="y")]) == 1
-        item = gq.display_items()[0]
-        assert isinstance(item, YTSource)
-        assert item.requester_id is None
+        assert gq.display_items()[0].requester is gq._guild.owner
+
+    async def test_the_callers_fallback_is_taken_before_the_owner(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The restore hands the player's last author down. Without it an entry
+        with no requester id rests entirely on `guild.owner`, which is uncached
+        exactly when a restart is still filling its caches."""
+        mock_guild.owner = None
+        count = await gq.restore_entries(
+            [SearchQueueEntry(ytsearch="y")], requester_fallback=mock_author
+        )
+        assert count == 1
+        assert gq.display_items()[0].requester is mock_author
+
+    async def test_an_entry_nobody_can_be_found_for_is_reported(
+        self,
+        gq: GuildQueue,
+        mock_guild: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A dropped entry is still on the Redis list, and the next mutation that
+        rebuilds the mirror writes the shorter queue back — so the count has to
+        reach the log rather than only the return value."""
+        mock_guild.owner = None
+        mock_guild.get_member = MagicMock(return_value=None)
+        with caplog.at_level(logging.WARNING):
+            count = await gq.restore_entries(
+                [SearchQueueEntry(ytsearch="y"), SearchQueueEntry(ytsearch="z")]
+            )
+        assert count == 0
+        assert gq.display_items() == []
+        assert "dropped 2 restored queue entries" in caplog.text
 
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:
         return SongQueueEntry(
@@ -1899,7 +1943,6 @@ class TestRestoreEntries:
         assert await gq.restore_entries([entry]) == 1
 
         (item,) = gq.display_items()
-        assert isinstance(item, YTSource)
         assert (item.title, item.uploader, item.duration, item.webpage_url) == (
             "DNA.",
             "Kendrick Lamar",
@@ -2011,7 +2054,6 @@ class TestRestoreEntries:
             == 1
         )
         (restored,) = gq.display_items()
-        assert isinstance(restored, YTSource)
         assert restored.user_input == album
 
     async def test_enqueue_stamps_rehydrate_on_both_entry_types(
@@ -2045,15 +2087,18 @@ class TestRestoreEntries:
             restored_search.analytics.queue_position,
         ) == (1752529111.5, 7)
 
-    async def test_search_entries_rehydrate_to_ytsource(
+    async def test_search_entries_rehydrate_as_unresolved_items(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
         entry = SearchQueueEntry(ytsearch="ytsearch:abc", process=True)
         count = await gq.restore_entries([entry])
         assert count == 1
         item = gq.display_items()[0]
-        assert isinstance(item, YTSource)
-        assert item.ytsearch == "ytsearch:abc"
+        assert (item.search, item.title, item.webpage_url) == (
+            "ytsearch:abc",
+            "",
+            "",
+        )
 
 
 class TestRestoreCrashed:
@@ -2225,7 +2270,7 @@ class TestDequeueBookkeeping:
         mock_author: MagicMock,
     ) -> None:
         """item=None defaults to popping; the override is the only way a caller
-        whose claim is not a QueueItem can say otherwise. The playback loop's
+        whose claim is not a QueueObject can say otherwise. The playback loop's
         prefetched branch is that caller."""
         await gq.put([_qobj(1, mock_author)])
         await gq.redis_pop_for(None, persisted=False)
@@ -2441,8 +2486,8 @@ class TestRequeueFront:
     async def test_accepts_resolved_substitute(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        # A YTSource dequeued by the prefetch may come back in resolved form.
-        src = YTSource(ytsearch="artist song")
+        # An unresolved item dequeued by the prefetch comes back resolved.
+        src = unresolved("artist song", mock_author)
         await gq_no_redis.put([src])
         gq_no_redis.get_nowait()
         resolved = _qobj(9, mock_author)
@@ -2451,17 +2496,21 @@ class TestRequeueFront:
         assert gq_no_redis.get_nowait() is resolved
 
 
-def _restyled(item: QueueItem) -> QueueObject:
+def _restyled(item: QueueObject) -> QueueObject:
     """What _neutralize_prefetch requeues for a flat playlist entry: the same ask,
     with the metadata the stream extraction filled in."""
     assert isinstance(item, QueueObject)
     return replace(item, duration=201, uploader="Channel", thumbnail="https://i/hq.jpg")
 
 
-def _resolved(source: YTSource, requester: Any) -> QueueObject:
-    """What the prefetch requeues for a lazy search it had already resolved."""
-    return QueueObject(
-        "https://yt.com/v=resolved", "Resolved", requester, user_input=source.user_input
+def _resolved(source: QueueObject, requester: Any) -> QueueObject:
+    """What the prefetch requeues for a search it had already resolved."""
+    return replace(
+        source,
+        webpage_url="https://yt.com/v=resolved",
+        title="Resolved",
+        requester=requester,
+        search="",
     )
 
 
@@ -2480,7 +2529,7 @@ class TestRequeueFrontSwap:
         mock_author: MagicMock,
     ) -> None:
         head: Any = (
-            YTSource(ytsearch="ytsearch:artist song", user_input="https://sp/p")
+            unresolved("artist song", mock_author, user_input="https://sp/p")
             if kind == "lazy"
             else _qobj(1, mock_author)
         )
@@ -3301,27 +3350,28 @@ class TestGenerationCounter:
         assert gq.generation == gen + 1
 
 
-class TestItemLabelNamesEveryItemType:
+class TestItemLabelNamesEveryItem:
     """The Songs field exists because one argument can now take out a whole
-    playlist and there is no undo. `YTSource` has no `.title` at all, so reaching
-    for it rendered every unresolved Spotify-playlist track as `?` — the exact
-    case the field was added for, and the one the -remove help now advertises."""
+    playlist and there is no undo. An unresolved item used to be a YTSource with
+    no `.title` at all, which rendered every Spotify-playlist track as `?` — the
+    exact case the field was added for, and the one the -remove help advertises."""
 
     def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
         item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
         assert item_label(item) == "Real Title"
 
-    def test_an_unresolved_search_uses_its_search_text(self) -> None:
-        item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
-        assert item_label(item) == "Artist - Song"
+    def test_an_unresolved_item_uses_its_search_text(self) -> None:
+        assert item_label(unresolved("Artist - Song")) == "Artist - Song"
 
     def test_an_unresolved_track_that_carries_a_title_uses_it(self) -> None:
-        item = YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", title="DNA.")
+        item = unresolved("DNA. Kendrick Lamar")
+        item.title = "DNA."
         assert item_label(item) == "DNA."
 
-    def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
-        item = YTSource(url="https://yt.com/v=2", process=True)
-        assert item_label(item) == "https://yt.com/v=2"
+    def test_an_item_with_no_title_at_all_is_named(
+        self, mock_author: MagicMock
+    ) -> None:
+        assert item_label(QueueObject("https://yt.com/v=2", "", mock_author)) == "?"
 
 
 class TestASwallowedAppendMarksTheMirrorStale:

@@ -287,6 +287,8 @@ def _carried_queueobject_fields() -> set[str]:
         "thumbnail",
         # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
         "ts",
+        # Empty by the time anything can stream the item: the resolve clears it.
+        "search",
     }
     return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
 
@@ -351,6 +353,13 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         assert song.queued is qobj
         # The one field renamed at the boundary.
         assert song.start_offset == 45
+
+    async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
+        """A field added to QueueObject and forgotten dies at playback, where every
+        read of it happens. Compares values across the hop, and fails when one is
+        left at its default — a field this test cannot see dropped is no guard."""
+        import dataclasses
+
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
@@ -374,7 +383,6 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
         )
-        import dataclasses
 
         carried = _carried_queueobject_fields()
         defaults = {

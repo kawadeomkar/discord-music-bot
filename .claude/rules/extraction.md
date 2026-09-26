@@ -132,12 +132,12 @@ failures are inconclusive and leave it ENABLED. `_require_spotify()` at every di
 raises `SpotifyDisabledError` with a status-specific user-facing message. Client caches
 the bearer token in Redis (TTL = expires_in − 30s, skipped if that margin would exceed
 the token's life) and track/album/playlist lookups. Spotify content resolves to **YouTube
-searches** (`"<name> <artist1> <artist2>"`); album and playlist tracks enqueue as lazy
-`SearchQueueEntry`s resolved per-song at dequeue, each carrying the requester's ID
-(`spotify_playlist_to_ytsearch` requires it): the resolve runs long after the command,
-when `_last_author` is whoever typed most recently. Both walks keep a `SpotifyTrack`
-beside every title (name, artists, Spotify's length, the track's page), index for index,
-and `spotify_playlist_to_ytsearch` sets them as the search's display fields: that is
+searches** (`"<name> <artist1> <artist2>"`); album and playlist tracks enqueue as
+unresolved `QueueObject`s resolved per-song at dequeue, each carrying the requester
+itself (`play_pipeline._searches_for` puts it there): the resolve runs long after the
+command, when the player's last author is whoever typed most recently. Both walks keep a
+`SpotifyTrack` beside every title (name, artists, Spotify's length, the track's page),
+index for index, and `_searches_for` sets them as the item's display fields: that is
 what `-queue` and the queued card list until the track resolves (`src/queue_rows.py`).
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes

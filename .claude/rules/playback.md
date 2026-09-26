@@ -487,17 +487,16 @@ needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
 crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
 back `None` on the one song that was playing).
 
-**Add a SEARCH-entry field** (a field on an unresolved `YTSource`, e.g. a listing's display
-fields) — a different checklist, and the step that differs is the one upgrades depend on:
-`YTSource` field with an `Optional` default → `SearchQueueEntry` field with the same
-default → `SearchQueueEntry.from_ytsource` → `to_redis`, written **only when the value is
-not None**, never as a flat table entry → `parse_queue_entry` with `.get` →
-`GuildQueue._rehydrate` → a golden-bytes test beside `_GOLDEN_YTSOURCE`. The when-known
-write is what keeps an entry queued by the previous build byte-identical, and LREM matches
-these entries by their exact bytes: write the key unconditionally and every `-remove` and
-`-clear` misses on every entry already in Redis, each one then rewriting the whole list
-under the bulk mutex. Nothing here goes near `YTDL`: a search has no playing-song form
-until it resolves, and resolution builds a fresh `QueueObject`.
+**An UNRESOLVED item takes the same checklist**, with one step of its own: a collection's
+tracks wait as `QueueObject`s with `search` set and `webpage_url` empty, and they
+serialize as `"ytsource"` entries for one release so a rollback can still read the list.
+So a field that an unresolved item must carry needs the `SearchQueueEntry` leg of
+`to_redis` too, written **only when the value is not None**, never as a flat table entry.
+That when-known write keeps an entry queued by the previous build byte-identical, and
+LREM matches these entries by their exact bytes: write the key unconditionally and every
+`-remove` and `-clear` misses on every entry already in Redis, each one then rewriting the
+whole list under the bulk mutex. Pin it with a golden-bytes test beside `_GOLDEN_YTSOURCE`.
+The leg goes when `SearchQueueEntry` does, one release after the shape landed.
 
 **Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
 the loop() bookkeeping comments first; every claim, release, and Redis

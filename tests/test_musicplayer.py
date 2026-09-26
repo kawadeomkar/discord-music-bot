@@ -25,7 +25,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_history import GuildHistory
 
-from src.guild_queue import GuildQueue, QueueItem, RemoveMode
+from src.guild_queue import GuildQueue, RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
@@ -54,7 +54,6 @@ from src.musicplayer import (
     _fmt_finish_time,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
-from src.sources import YTSource
 from src.util import (
     cancel_task,
     current_traceparent,
@@ -74,6 +73,7 @@ from tests.helpers import (
     seed_queue,
     stalled_config_reads,
     stub_create_task,
+    unresolved,
 )
 
 
@@ -271,9 +271,9 @@ class TestQueuePut:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         sources = [
-            YTSource(ytsearch="ytsearch:song one", process=True),
-            YTSource(ytsearch="ytsearch:song two", process=True),
-            YTSource(ytsearch="ytsearch:song three", process=True),
+            unresolved("song one"),
+            unresolved("song two"),
+            unresolved("song three"),
         ]
         await music_player.queue_put(sources)
         assert music_player.queue.qsize() == 3
@@ -303,11 +303,11 @@ class TestQueuePut:
         assert data["title"] == queue_obj.title
         assert data["webpage_url"] == queue_obj.webpage_url
 
-    async def test_put_mirrors_yt_source_to_redis(
+    async def test_put_mirrors_an_unresolved_item_to_redis(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         assert music_player.store is not None
-        src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True)
+        src = unresolved("Never Gonna Give You Up")
         await music_player.queue_put(src)
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
@@ -315,7 +315,7 @@ class TestQueuePut:
         assert data["type"] == "ytsource"
         assert data["ytsearch"] == "ytsearch:Never Gonna Give You Up"
 
-    async def test_put_yt_source_does_not_spawn_prefetch(
+    async def test_put_does_not_warm_an_unresolved_item(
         self,
         music_player: MusicPlayer,
         fake_redis: aioredis.Redis,
@@ -324,7 +324,7 @@ class TestQueuePut:
         assert music_player.store is not None
         from unittest.mock import patch, AsyncMock
 
-        src = YTSource(ytsearch="ytsearch:test", process=True)
+        src = unresolved("test")
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
         ) as mock_pf:
@@ -356,10 +356,10 @@ class TestQueuePut:
         mock_pf.assert_awaited_once()
         assert mock_pf.call_args[0][0] == queue_obj
 
-    async def test_put_does_not_spawn_prefetch_for_yt_source(
+    async def test_put_front_does_not_warm_an_unresolved_item(
         self, music_player: MusicPlayer
     ) -> None:
-        source = YTSource(ytsearch="ytsearch:test song", process=True)
+        source = unresolved("test song")
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
         ) as mock_pf:
@@ -679,7 +679,7 @@ class TestQueueClearFlushesPlayedSongs:
         await music_player.queue_put(
             QueueObject("https://yt.com/v=never", "Never Played", mock_author)
         )
-        await music_player.queue_put(YTSource(ytsearch="ytsearch:some song"))
+        await music_player.queue_put(unresolved("some song"))
 
         cleared = await music_player.queue_clear()
 
@@ -696,7 +696,7 @@ class TestQueueClearFlushesPlayedSongs:
         await music_player.queue_put(
             QueueObject("https://yt.com/v=queued", "Queued", mock_author)
         )
-        await music_player.queue_put(YTSource(url="https://yt.com/v=lazy"))
+        await music_player.queue_put(unresolved("lazy song", mock_author))
 
         await music_player.queue_clear()
 
@@ -1619,7 +1619,7 @@ class TestQueueRemoveWithAPrefetch:
         swaps back in serialized differently from its list entry, and the removal
         still takes one LREM."""
         head: Any = (
-            YTSource(ytsearch="ytsearch:artist song", user_input="https://sp/p")
+            unresolved("artist song", user_input="https://sp/p")
             if kind == "lazy"
             else QueueObject("https://yt.com/v=head", "Head", mock_author)
         )
@@ -1663,11 +1663,7 @@ class TestQueueRemoveWithAPrefetch:
         assert store is not None
         await music_player.queue.put(
             [
-                YTSource(
-                    ytsearch="ytsearch:artist song",
-                    process=True,
-                    user_input="https://sp/p",
-                ),
+                unresolved("artist song", user_input="https://sp/p"),
                 *(
                     QueueObject(f"https://yt.com/v={n}", f"S{n}", mock_author)
                     for n in range(7)
@@ -1813,16 +1809,14 @@ class TestGetQueue:
         embed = music_player.queue_embed()
         assert "~" in described(embed)
 
-    def test_total_duration_partial_with_ytsource(
+    def test_total_duration_partial_with_an_unresolved_item(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         seed_queue(
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
         )
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:unresolved", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("unresolved"))
         embed = music_player.queue_embed()
         assert "~" in described(embed)
 
@@ -1932,10 +1926,10 @@ class TestGetQueue:
         embed = music_player.queue_embed()
         assert "... and 5 more" in described(embed)
 
-    def test_ytsource_shows_resolving(self, music_player: MusicPlayer) -> None:
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
-        )
+    def test_an_unresolved_item_shows_resolving(
+        self, music_player: MusicPlayer
+    ) -> None:
+        seed_queue(music_player.queue, unresolved("some song"))
         embed = music_player.queue_embed()
         assert "resolving..." in described(embed)
 
@@ -2119,9 +2113,7 @@ class TestResumeNoticeEmbed:
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
         )
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:unresolved", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("unresolved"))
 
         embed = music_player.build_resume_notice_embed(started)
 
@@ -2739,7 +2731,7 @@ class TestPlaylistFacts:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        seed_queue(music_player.queue, YTSource(ytsearch="ytsearch:lazy song"))
+        seed_queue(music_player.queue, unresolved("lazy song"))
         facts = music_player.playlist_facts(ahead=1, runtime=(600, False))
         assert "Est. playing at ~**" in facts
 
@@ -2761,18 +2753,25 @@ class TestPlaylistFacts:
         assert facts == "Total Duration: **~10m**"
 
 
-def _album_track(n: int, secs: int) -> YTSource:
-    return YTSource(
-        ytsearch=f"ytsearch:Track {n} Artist",
-        requester_id=4242,
-        title=f"Track {n}",
+# One requester for every album-track stand-in, so two items built from the same
+# track compare EQUAL — which is what the identity lookup has to see past.
+_ALBUM_ASKER = stub_requester()
+
+
+def _album_track(n: int, secs: int) -> QueueObject:
+    """One album track as the walk queues it: a search, with the display fields
+    its row is rendered from."""
+    return QueueObject(
+        f"https://open.spotify.com/track/{n}",
+        f"Track {n}",
+        _ALBUM_ASKER,
+        search=f"ytsearch:Track {n} Artist",
         uploader="Artist",
         duration=secs,
-        webpage_url=f"https://open.spotify.com/track/{n}",
     )
 
 
-def _card_rows(mp: MusicPlayer, tracks: Sequence[QueueItem], *, ahead: int) -> str:
+def _card_rows(mp: MusicPlayer, tracks: Sequence[QueueObject], *, ahead: int) -> str:
     """What enqueue_playlist builds: ONE slot read, then the rows from it. The
     card's "Songs ahead" is derived from the same read."""
     return mp.queued_rows(tracks, first=mp.queued_slot(tracks, ahead=ahead))
@@ -2841,7 +2840,7 @@ class TestQueuedRows:
     def test_the_slot_is_found_by_identity_not_by_equality(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """A playlist holding the same track twice queues two EQUAL YTSources. An
+        """A collection holding the same track twice queues two EQUAL items. An
         equality lookup returns the first one's slot for both, so the second block
         of rows would be numbered from the first block's position."""
         first, second = _album_track(1, 100), _album_track(1, 100)
@@ -3965,7 +3964,7 @@ class TestQueuePutFront:
 
         mock_prefetch.assert_not_awaited()
 
-    async def test_ytsource_items_are_not_prefetched(
+    async def test_unresolved_items_are_not_prefetched(
         self, music_player: MusicPlayer
     ) -> None:
         """YTSource has no stable webpage_url at enqueue time — same rule
@@ -3975,9 +3974,7 @@ class TestQueuePutFront:
         with patch.object(
             youtube.YTDL, "prefetch_stream", new=AsyncMock()
         ) as mock_prefetch:
-            await music_player.queue_put_front(
-                [YTSource(ytsearch="ytsearch:a song", process=True)]
-            )
+            await music_player.queue_put_front([unresolved("a song")])
             await asyncio.sleep(0)
 
         mock_prefetch.assert_not_awaited()
@@ -4167,15 +4164,22 @@ class TestEnqueueDepth:
         # A Spotify playlist track sat in the queue as a search; _resolve_source
         # threads its ask-time analytics into yt_source, which is REQUIRED to
         # take it — there is no post-copy left to forget.
-        source = YTSource(
-            ytsearch="ytsearch:a song",
-            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+        source = unresolved(
+            "a song", analytics=Analytics(queued_at=1752530000.5, queue_position=4)
         )
-        resolved = QueueObject("https://yt.com/v=1", "One", mock_author)
+        resolved = QueueObject("https://yt.com/v=1", "One", mock_author, duration=61)
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
             out = await music_player._resolve_source(source)
-        assert out is resolved
+        # What yt-dlp found, written onto the item that was queued: the ask it
+        # carries is the one the resolve was given, not the resolve's own.
+        assert (out.webpage_url, out.title, out.duration, out.search) == (
+            "https://yt.com/v=1",
+            "One",
+            61,
+            "",
+        )
+        assert out.analytics == source.analytics
         assert spy.await_args is not None
         assert spy.await_args.kwargs["analytics"] == source.analytics
 
@@ -4184,7 +4188,7 @@ class TestEnqueueDepth:
     ) -> None:
         # A Spotify playlist track resolves to a YouTube URL here, so this hop is
         # the only thing keeping the archive from recording it as YouTube.
-        source = YTSource(ytsearch="ytsearch:a song", query_source="spotify.com")
+        source = unresolved("a song", query_source="spotify.com")
         resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
@@ -4202,7 +4206,7 @@ class TestEnqueueDepth:
         SongQueueEntry.from_song parks it in current_song_user_input, so a
         recovered head stays removable by the collection link."""
         album = "https://open.spotify.com/album/xyz"
-        source = YTSource(ytsearch="ytsearch:Artist - Title", user_input=album)
+        source = unresolved("Artist - Title", user_input=album)
         resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
@@ -4929,61 +4933,34 @@ class TestResolveSource:
         with patch(
             "src.musicplayer.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
-            result = await music_player._resolve_source(
-                YTSource(ytsearch="ytsearch:test", process=True)
-            )
+            result = await music_player._resolve_source(unresolved("test"))
         assert isinstance(result, QueueObject)
         assert result.title == "Resolved"
 
 
-class TestResolveRequester:
-    """A playlist's lazy tracks resolve minutes to an hour after the command that
-    queued them returned, when _last_author is whoever typed most recently."""
+class TestResolveUsesTheItemsRequester:
+    """A playlist's tracks resolve minutes to an hour after the command that
+    queued them returned, when _last_author is whoever typed most recently. The
+    item carries the requester it was queued by, so the resolve asks nobody:
+    restoring an entry is where an id becomes a user
+    (docs/ARCHITECTURE.md#one-queue-item)."""
 
-    async def test_the_stored_requester_beats_the_last_author(
+    async def test_the_resolve_attributes_the_track_to_whoever_queued_it(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         queuer = MagicMock(spec=discord.Member)
         queuer.id = 424242424242424242
-        music_player._guild.get_member = MagicMock(return_value=queuer)
         music_player._last_author = mock_author
         yt_source = AsyncMock(
             return_value=QueueObject("https://yt.com/v=1", "Resolved", queuer)
         )
 
         with patch("src.musicplayer.YTDL.yt_source", new=yt_source):
-            await music_player._resolve_source(
-                YTSource(ytsearch="ytsearch:test", requester_id=424242424242424242)
-            )
+            out = await music_player._resolve_source(unresolved("test", queuer))
 
         assert yt_source.await_args is not None
         assert yt_source.await_args.args[0] is queuer
-
-    def test_no_stored_id_falls_back_to_the_last_author(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        music_player._last_author = mock_author
-        assert music_player._resolve_requester(None) is mock_author
-
-    def test_a_member_who_left_resolves_through_the_user_cache(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        gone = MagicMock(spec=discord.User)
-        gone.id = 424242424242424242
-        music_player._guild.get_member = MagicMock(return_value=None)
-        mocked(music_player.bot).get_user = MagicMock(return_value=gone)
-        music_player._last_author = mock_author
-
-        assert music_player._resolve_requester(424242424242424242) is gone
-
-    def test_an_id_nobody_answers_to_falls_back(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        music_player._guild.get_member = MagicMock(return_value=None)
-        mocked(music_player.bot).get_user = MagicMock(return_value=None)
-        music_player._last_author = mock_author
-
-        assert music_player._resolve_requester(424242424242424242) is mock_author
+        assert out.requester is queuer
 
 
 # ── StreamSource ──────────────────────────────────────────────────────────────
@@ -5130,29 +5107,6 @@ class TestSetContext:
         mock_ctx.author = new_author
         music_player.set_context(mock_ctx)
         assert music_player._last_author is new_author
-
-
-# ── RequireRequester ──────────────────────────────────────────────────────────
-
-
-class TestRequireRequester:
-    def test_returns_last_author(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        music_player._last_author = mock_author
-        assert music_player._require_requester() is mock_author
-
-    def test_raises_when_no_author_resolved(self, music_player: MusicPlayer) -> None:
-        """Reached only when guild.me AND guild.owner were both uncached at
-        construction and no command has run since — QueueObject.requester is
-        non-optional, so this must fail here rather than as an AttributeError
-        on None inside serialization."""
-        music_player._last_author = None
-        with pytest.raises(RuntimeError, match="No requester available"):
-            music_player._require_requester()
-
-
-# ── Stop ──────────────────────────────────────────────────────────────────────
 
 
 class TestStop:
@@ -7177,12 +7131,10 @@ class TestBuildNextUpEmbed:
         assert "`1:30`" in described(embed)
         assert mock_author.mention in embed.description
 
-    def test_shows_resolving_for_unresolved_ytsource(
+    def test_shows_resolving_for_an_unresolved_item(
         self, music_player: MusicPlayer
     ) -> None:
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("some song"))
         embed = music_player._build_next_up_embed()
         assert embed is not None
         assert "resolving..." in described(embed)
@@ -7257,8 +7209,8 @@ class TestPrefetchedHeadIsShownResolved:
     for a Spotify track until it started. The cards show what it resolved to."""
 
     @staticmethod
-    def _lazy() -> YTSource:
-        return YTSource(ytsearch="ytsearch:changes ayris", process=True)
+    def _lazy() -> QueueObject:
+        return unresolved("changes ayris")
 
     @staticmethod
     def _resolved(author: MagicMock) -> QueueObject:
@@ -7337,9 +7289,7 @@ class TestPrefetchedHeadIsShownResolved:
         """Matched by identity: a -clear, -shuffle or failed stream moves the entry,
         and the next head must not borrow its title."""
         stale = self._lazy()
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:other", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("other"))
         music_player._prefetched_head = (stale, self._resolved(mock_author))
 
         embed = music_player._build_next_up_embed()
@@ -7479,18 +7429,12 @@ class TestQueueEntryCard:
     def test_an_unresolved_track_renders_the_fields_it_was_queued_with(
         self, music_player: MusicPlayer
     ) -> None:
-        seed_queue(
-            music_player.queue,
-            YTSource(
-                ytsearch="ytsearch:DNA. Kendrick Lamar",
-                process=True,
-                requester_id=4242,
-                title="DNA.",
-                uploader="Kendrick Lamar",
-                duration=185,
-                webpage_url="https://open.spotify.com/track/abc",
-            ),
-        )
+        item = unresolved("DNA. Kendrick Lamar")
+        item.title = "DNA."
+        item.uploader = "Kendrick Lamar"
+        item.duration = 185
+        item.webpage_url = "https://open.spotify.com/track/abc"
+        seed_queue(music_player.queue, item)
 
         lines = self._next_up_body(music_player).split("\n")
         assert lines[0] == "Requested by: [<@4242>]"
@@ -7504,7 +7448,6 @@ class TestQueueEntryCard:
             ("webpage_url", "**DNA.**"),
             ("uploader", "Artist: Unknown  ·  Duration: `3:05`"),
             ("duration", "Artist: Kendrick Lamar  ·  Duration: `?:??`"),
-            ("requester_id", "Requested by: [Unknown]"),
         ],
     )
     def test_an_unresolved_track_falls_back_field_by_field(
@@ -7514,17 +7457,17 @@ class TestQueueEntryCard:
         one too, and the row is built from whatever the walk got. Each field falls
         back on its own; the happy path above covers none of them."""
         fields: dict[str, object] = {
-            "requester_id": 4242,
             "title": "DNA.",
             "uploader": "Kendrick Lamar",
             "duration": 185,
             "webpage_url": "https://open.spotify.com/track/abc",
         }
-        fields[missing] = None
-        seed_queue(
-            music_player.queue,
-            YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", process=True, **fields),  # pyright: ignore[reportArgumentType]
-        )
+        # webpage_url is a `str`, so "no link" is empty rather than None.
+        fields[missing] = "" if missing == "webpage_url" else None
+        item = unresolved("DNA. Kendrick Lamar")
+        for name, value in fields.items():
+            setattr(item, name, value)
+        seed_queue(music_player.queue, item)
 
         body = self._next_up_body(music_player)
         assert expected in body
@@ -7532,14 +7475,12 @@ class TestQueueEntryCard:
         assert "DNA." in body and "Est. playing at " in body
         assert "resolving..." not in body
 
-    def test_unresolved_ytsource_renders_resolving(
+    def test_an_unresolved_item_renders_resolving(
         self, music_player: MusicPlayer
     ) -> None:
         """A lazy Spotify-playlist entry has no title, URL, duration or requester
         yet, so the search term and its state are the whole body."""
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("some song"))
 
         body = self._next_up_body(music_player)
         assert body == "some song\n*resolving...*"

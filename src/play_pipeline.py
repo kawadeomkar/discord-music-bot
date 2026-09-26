@@ -17,7 +17,6 @@ from collections.abc import Awaitable, Callable, Sequence
 import discord
 from discord.ext import commands
 
-from src.guild_queue import QueueItem
 from src.guild_state import Analytics
 from src.musicplayer import InterjectOutcome, MusicPlayer
 from src.play_placement import (
@@ -28,6 +27,7 @@ from src.play_placement import (
     slow_resolve_notice,
 )
 from src.sources import (
+    QUERY_SOURCE_SPOTIFY,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -37,7 +37,6 @@ from src.sources import (
     collection_noun,
     parse_input,
     query_source_of,
-    spotify_playlist_to_ytsearch,
     timestamp_warning,
 )
 from src.spotify import SpotifyPlaylist, SpotifyTrack
@@ -126,31 +125,24 @@ class EmptyPlaylistError(PlaylistInputError):
 
 
 @dataclass
-class ResolvedSpotifyPlaylist:
-    """A Spotify playlist or album resolved to track titles, still needing
-    per-title YouTube search resolution. The rest is what the enqueue embed
-    reports: `tracks` carries Spotify's own lengths and links, `artists` and
-    `thumbnail` are an album's, and `short` is a walk Spotify ended early."""
+class ResolvedPlaylist:
+    """A collection resolved to queue items. A Spotify collection's items are
+    still searches, resolved at dequeue; a YouTube walk's are playable already —
+    one type, because the enqueue does the same thing with either.
 
-    titles: list[str]
-    name: Optional[str] = None
+    `skipped` is how many leading tracks the link's `index=` dropped, for the
+    enqueue embed alone: `tracks` is already sliced. `link` is what the heading
+    points at, taken where the source is still in hand. `artists` and `thumbnail`
+    are an album's, and `short` is a walk Spotify ended early."""
+
+    tracks: list[QueueObject]
+    title: Optional[str] = None
+    link: Optional[str] = None
+    skipped: int = 0
     unavailable: int = 0
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
     short: bool = False
-    tracks: list[SpotifyTrack] = field(default_factory=list)
-
-
-@dataclass
-class ResolvedYoutubePlaylist:
-    """A YouTube playlist resolved to playable QueueObjects. `skipped` is how
-    many leading tracks the URL's `index=` dropped, for the enqueue embed alone:
-    `tracks` is already sliced."""
-
-    tracks: list[QueueObject]
-    skipped: int = 0
-    title: Optional[str] = None
-    unavailable: int = 0
 
 
 def _apply_playlist_index(
@@ -223,7 +215,7 @@ def start_offset_refusal(
 
 
 def past_end_refusal(
-    qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
+    qobj: Union[QueueObject, ResolvedPlaylist],
     start_offset: Optional[int],
 ) -> Optional[str]:
     """Why `start_offset` cannot start the resolved song, or None. A duration of
@@ -237,8 +229,11 @@ def past_end_refusal(
         return None
     if isinstance(qobj, QueueObject):
         head = qobj
-    elif isinstance(qobj, ResolvedYoutubePlaylist) and qobj.tracks:
+    elif qobj.tracks:
         head = qobj.tracks[0]
+        # Only when the offset actually landed on the head: a Spotify
+        # collection's items are searches _apply_playlist_timestamp never
+        # stamps, so their ts never matches and ffmpeg judges the offset.
         if head.ts != start_offset:
             return None
     else:
@@ -271,14 +266,10 @@ def plays_after_note(
     return note
 
 
-def with_queue_position(item: QueueItem, position: int) -> QueueItem:
-    """Re-mint one item's `queue_position`. A QueueObject is stamped in place, a
-    frozen YTSource returns a copy — use the return value either way."""
-    analytics = replace(item.analytics, queue_position=position)
-    if isinstance(item, QueueObject):
-        item.analytics = analytics
-        return item
-    return replace(item, analytics=analytics)
+def with_queue_position(item: QueueObject, position: int) -> QueueObject:
+    """Re-mint one item's `queue_position`, in place."""
+    item.analytics = replace(item.analytics, queue_position=position)
+    return item
 
 
 def _is_spotify_collection(
@@ -343,14 +334,19 @@ def collection_note(
 async def _searches_for(
     titles: Sequence[str],
     *,
+    requester: Union[discord.User, discord.Member],
     analytics: Analytics,
     origin: str,
-    requester_id: int,
     rows: Sequence[SpotifyTrack] = (),
-) -> list[YTSource]:
-    """spotify_playlist_to_ytsearch, a chunk per event-loop turn. Positions count on
-    from `analytics` across chunks, as they would in one call. `rows` is the walk's
-    display rows, one per title; a set that does not pair up is dropped whole, because
+) -> list[QueueObject]:
+    """A Spotify collection's titles as queue items still to resolve, yielding the
+    loop every chunk so 10,000 of them do not hold it. Positions count on from
+    `analytics` across chunks, as they would in one pass. The Spotify token, the
+    pasted collection link and the requester are set here, the last point that
+    knows where these came from.
+
+    `rows` is the walk's display rows, one per title, which is what a listing shows
+    until the search resolves; a set that does not pair up is dropped whole, because
     a row read against the wrong title is worse than no row."""
     if rows and len(rows) != len(titles):
         log.warning(
@@ -358,29 +354,55 @@ async def _searches_for(
             f"({len(rows)} rows, {len(titles)} titles); queueing without them"
         )
         rows = ()
-    tracks: list[YTSource] = []
-    for start in range(0, len(titles), _SEARCH_BUILD_CHUNK):
-        if start:
+    # One joined byline per distinct artist tuple: a collection is usually one
+    # artist, and a fresh join per track is the only string this pass keeps for the
+    # life of the queue (measured ~800 KiB over 10,000 tracks).
+    bylines: dict[tuple[str, ...], Optional[str]] = {}
+
+    def byline(row: SpotifyTrack) -> Optional[str]:
+        key = tuple(row.artists)
+        if key not in bylines:
+            bylines[key] = ", ".join(key) or None
+        return bylines[key]
+
+    tracks: list[QueueObject] = []
+    for offset, title in enumerate(titles):
+        if offset and offset % _SEARCH_BUILD_CHUNK == 0:
             await asyncio.sleep(0)
-        tracks += spotify_playlist_to_ytsearch(
-            list(titles[start : start + _SEARCH_BUILD_CHUNK]),
-            analytics=replace(
-                analytics, queue_position=analytics.queue_position + start
-            ),
-            origin=origin,
-            requester_id=requester_id,
-            tracks=rows[start : start + _SEARCH_BUILD_CHUNK],
+        row = rows[offset] if rows else None
+        tracks.append(
+            QueueObject(
+                # The track's own page until the search resolves: what the listing
+                # links, and what -remove accepts for it.
+                row.url or "" if row else "",
+                # Empty without a row: every renderer falls back to the term.
+                row.name if row else "",
+                requester,
+                search=f"ytsearch:{title}",
+                user_input=origin,
+                query_source=QUERY_SOURCE_SPOTIFY,
+                uploader=byline(row) if row else None,
+                duration=row.duration_secs if row else None,
+                analytics=replace(
+                    analytics, queue_position=analytics.queue_position + offset
+                ),
+            )
         )
     return tracks
 
 
 def _rebase_positions(
-    tracks: Sequence[QueueItem], minted_from: int, base: int
-) -> Sequence[QueueItem]:
+    tracks: Sequence[QueueObject], minted_from: int, base: int
+) -> Sequence[QueueObject]:
     """Move a resolved collection's `queue_position`s from one head depth to
-    another; a no-op when the head has not moved, so the O(N) copy (milliseconds at
-    5,000 tracks) runs only when another request placed in between, not under the
-    lock on every enqueue."""
+    another, returning `tracks` unchanged when the head has not moved.
+
+    Called twice per collection enqueue. The first is unconditional: the resolve
+    mints depths against the ASK, which is 0 for every collection, so the copy
+    (milliseconds at 5,000 tracks) is what buys one minting rule for both
+    collection kinds — and it runs before the place lock, where no sibling `-play`
+    waits it out. The second, under the lock, moves only when another request
+    placed in between."""
     if base == minted_from:
         return tracks
     return [with_queue_position(t, base + offset) for offset, t in enumerate(tracks)]
@@ -453,16 +475,16 @@ def front_insert_depth(mp: MusicPlayer) -> int:
 
 @_tracer.start_as_current_span("bot.warm_front_track")
 async def _warm_front_track(
-    tracks: Sequence[QueueItem], placement: Placement, *, cog: MusicBot
+    tracks: Sequence[QueueObject], placement: Placement, *, cog: MusicBot
 ) -> None:
     """Warm the stream URL of a playlist's head when it is about to play. Bulk
     enqueues pass prefetch=False, and under `--next` queue_put_next killed the
-    loop's one-ahead prefetch, so the head is left with no warm at all. A lazy
-    Spotify entry has no URL yet; it resolves at dequeue."""
+    loop's one-ahead prefetch, so the head is left with no warm at all. An item
+    that has not resolved has no URL yet; it resolves at dequeue."""
     if placement is not Placement.NEXT or not tracks:
         return
     head = tracks[0]
-    if isinstance(head, QueueObject):
+    if not head.unresolved:
         await YTDL.prefetch_stream(head, redis=cog.redis)
 
 
@@ -494,7 +516,7 @@ async def queue_source(
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     start_offset: Optional[int] = None,
     cog: MusicBot,
-) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
+) -> Union[QueueObject, ResolvedPlaylist]:
     """Resolve a parsed source into something enqueueable. `analytics` is the
     command's ask-time head value; playlist tracks derive per-track positions
     from it. `origin` is the raw command argument, carried onto every item —
@@ -521,14 +543,23 @@ async def queue_source(
         # Titles, not QueueObjects — enqueue_playlist mints the YTSources
         # they become, carrying this command's analytics.
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
-        return ResolvedSpotifyPlaylist(
-            playlist.titles,
-            name=playlist.name,
+        return ResolvedPlaylist(
+            # Items that are still searches: a collection nobody plays to the end
+            # never resolves its tail, and the ask depth they are minted against
+            # is rebased onto the head's at the insert.
+            await _searches_for(
+                playlist.titles,
+                requester=ctx.author,
+                analytics=analytics,
+                origin=origin,
+                rows=playlist.tracks,
+            ),
+            title=playlist.name,
+            link=source.url,
             unavailable=playlist.unavailable,
             artists=playlist.artists,
             thumbnail=playlist.thumbnail,
             short=playlist.short,
-            tracks=playlist.tracks,
         )
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
@@ -547,10 +578,11 @@ async def queue_source(
         _apply_playlist_timestamp(
             tracks, source, effective_start_offset(source, start_offset)
         )
-        return ResolvedYoutubePlaylist(
+        return ResolvedPlaylist(
             tracks,
-            skipped=skipped,
             title=playlist.title,
+            link=source.playlist_url,
+            skipped=skipped,
             unavailable=playlist.unavailable,
         )
     ts = effective_start_offset(source, start_offset)
@@ -585,7 +617,7 @@ async def queue_source(
 async def enqueue_playlist(
     ctx: commands.Context,
     source: Union[SpotifySource, YTSource, SoundcloudSource],
-    qobj: Union[ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
+    qobj: ResolvedPlaylist,
     mp: MusicPlayer,
     req: PlayRequest,
     *,
@@ -596,9 +628,9 @@ async def enqueue_playlist(
     cog: MusicBot,
 ) -> None:
     """Queue a resolved playlist under the place lock and notify the channel.
-    Spotify playlists arrive as titles needing YouTube search, YouTube playlists
-    pre-resolved. Positions are minted at the insert: `analytics` carries the
-    ask time and its depth is replaced by the one the head takes."""
+    Every collection arrives as queue items, whether or not they are resolved
+    yet. Positions are minted at the resolve and rebased here: `analytics`
+    carries the ask time, and its depth is replaced by the one the head takes."""
     # A collection front-inserts in full, in order, under either flag. NEXT goes
     # through queue_put_next, for the claim the loop's prefetch holds.
     enqueue = {
@@ -613,65 +645,32 @@ async def enqueue_playlist(
     warning = timestamp_warning(source)
     # "Queued playlist" on its own reads as "at the back".
     next_suffix = " — plays next" if placement is Placement.NEXT else ""
-    tracks: Sequence[QueueItem]
+    tracks: Sequence[QueueObject] = qobj.tracks
+    count = len(tracks)
     ahead = 0
-    if isinstance(qobj, ResolvedSpotifyPlaylist):
-        titles = qobj.titles
-        count = len(titles)
-        link = source.url if isinstance(source, SpotifySource) else None
-        heading = [_playlist_heading(qobj.name, link)]
-        if qobj.artists:
-            heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
-        # Built outside the lock: one YTSource per title, and the depth it
-        # is minted against is almost always still the depth at the insert.
-        provisional = _head_depth(mp, placement)
-        tracks = await _searches_for(
-            titles,
-            analytics=replace(analytics, queue_position=provisional),
-            origin=origin,
-            requester_id=ctx.author.id,
-            rows=qobj.tracks,
+    log.info(f"{collection_noun(source)} track count: {count}")
+    heading = [_playlist_heading(qobj.title, qobj.link)]
+    if qobj.artists:
+        heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
+    # Stated: only the `index=` in the user's own URL explains fewer songs.
+    if qobj.skipped:
+        heading.append(
+            f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
+            f"earlier {pluralize(qobj.skipped, 'song')}"
         )
-        # The same sum -queue shows for these tracks: Spotify's lengths, added as
-        # whole seconds, so the two totals cannot drift apart.
-        runtime = queue_runtime(tracks)
-        log.info(f"spotify {collection_noun(source)} track count: {len(tracks)}")
-        async with cog._plays.place(req) as verdict:
-            if verdict.placed:
-                ahead = _songs_ahead(mp, placement)
-                tracks = _rebase_positions(
-                    tracks, provisional, _head_depth(mp, placement)
-                )
-                await enqueue(tracks, prefetch=False)
-    else:
-        # HACK: this assert stands in for a correlation the signature cannot
-        # express — a ResolvedYoutubePlaylist always arrives with a YTSource,
-        # but they are separate parameters. `python -O` strips it, leaving the
-        # attribute reads unguarded. Fix: have the Resolved*Playlist dataclasses
-        # carry their own source.
-        assert isinstance(source, YTSource)
-        tracks = qobj.tracks
-        count = len(tracks)
-        log.info(f"yt playlist track count: {count}")
-        heading = [_playlist_heading(qobj.title, source.playlist_url)]
-        # Stated: only the `index=` in the user's own URL explains fewer songs.
-        if qobj.skipped:
-            heading.append(
-                f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
-                f"earlier {pluralize(qobj.skipped, 'song')}"
-            )
-        runtime = queue_runtime(tracks)
-        # Minted before the lock: at 5,000 tracks the pass is milliseconds of
-        # event-loop time every sibling -play would wait out (_rebase_positions).
-        provisional = _head_depth(mp, placement)
-        tracks = _rebase_positions(tracks, 0, provisional)
-        async with cog._plays.place(req) as verdict:
-            if verdict.placed:
-                ahead = _songs_ahead(mp, placement)
-                tracks = _rebase_positions(
-                    tracks, provisional, _head_depth(mp, placement)
-                )
-                await enqueue(tracks, prefetch=False)
+    # The same sum -queue shows for these tracks: the lengths on the items, added
+    # as whole seconds, so the two totals cannot drift apart.
+    runtime = queue_runtime(tracks)
+    # Rebased before the lock: at 5,000 tracks the pass is milliseconds of
+    # event-loop time every sibling -play would wait out (_rebase_positions), and
+    # the depths the resolve minted are the ask's, not this head's.
+    provisional = _head_depth(mp, placement)
+    tracks = _rebase_positions(tracks, analytics.queue_position, provisional)
+    async with cog._plays.place(req) as verdict:
+        if verdict.placed:
+            ahead = _songs_ahead(mp, placement)
+            tracks = _rebase_positions(tracks, provisional, _head_depth(mp, placement))
+            await enqueue(tracks, prefetch=False)
     if not verdict.placed:
         await cog._report_dropped(req, verdict)
         return
@@ -702,12 +701,10 @@ async def enqueue_playlist(
             f"Queued {noun} — {count} {pluralize(count, 'song')}{next_suffix}",
             description,
             discord.Color.blue(),
-            thumbnail=(
-                qobj.thumbnail if isinstance(qobj, ResolvedSpotifyPlaylist) else None
-            ),
+            thumbnail=qobj.thumbnail,
         )
     ]
-    if isinstance(qobj, ResolvedSpotifyPlaylist) and qobj.short:
+    if qobj.short:
         embeds.insert(0, short_walk_notice(noun))
     if qobj.unavailable:
         n = qobj.unavailable
@@ -734,7 +731,7 @@ async def enqueue_single(
     placement: Placement = Placement.TAIL,
     note: str = "",
     warning: Optional[str] = None,
-    follow_on: Sequence[QueueItem] = (),
+    follow_on: Sequence[QueueObject] = (),
     release_hold: Callable[[], Awaitable[None]] = _nothing_to_release,
     cog: MusicBot,
 ) -> None:
@@ -851,10 +848,10 @@ async def _resolve_interjection_source(
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
     start_offset: Optional[int] = None,
     cog: MusicBot,
-) -> tuple[QueueObject, list[QueueItem]]:
+) -> tuple[QueueObject, list[QueueObject]]:
     """Resolve an interjection's input into (head, everything behind it). The
-    head must be a resolved QueueObject to interrupt with; the tail may hold
-    lazy YTSources. The interrupted song returns after the whole playlist, and
+    head must be resolved to interrupt with; the tail may hold items that are
+    still searches. The interrupted song returns after the whole playlist, and
     one `-remove <the link>` takes it all back out. `origin` is the raw command
     argument — for a playlist the link, not the generated titles."""
     # Ask-time analytics: the snowflake time, depth 0 for the head. Tracks behind
@@ -866,26 +863,26 @@ async def _resolve_interjection_source(
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
         if playlist.short:
             await ctx.send(embed=short_walk_notice(collection_noun(source)))
-        yts = await _searches_for(
+        tracks = await _searches_for(
             playlist.titles,
+            requester=ctx.author,
             analytics=analytics,
             origin=origin,
-            requester_id=ctx.author.id,
             rows=playlist.tracks,
         )
         # The head takes the full path — it has to be playable to interrupt
-        # with. The rest stay lazy searches, resolved at dequeue.
+        # with. The rest stay searches, resolved at dequeue.
         head = await YTDL.yt_source(
             ctx.author,
-            yts[0].ytsearch or "",
+            tracks[0].search,
             redis=cog.redis,
-            query_source=query_source_of(yts[0]),
+            query_source=tracks[0].query_source,
             analytics=analytics,
             user_input=origin,
             pool_slot=pool_slot,
         )
-        return head, list(yts[1:])
-    if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
+        return head, list(tracks[1:])
+    if isinstance(source, YTSource) and source.type is YTType.PLAYLIST:
         playlist = await YTDL.yt_playlist(
             source.playlist_url,
             ctx.author,

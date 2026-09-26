@@ -17,7 +17,7 @@ import discord
 from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
-from src.guild_queue import GuildQueue, QueueItem
+from src.guild_queue import GuildQueue
 from src.guild_state import Analytics, GuildConfig
 from src.redis_client import GuildRedisStore, iter_guild_configs
 from src.settings import GuildSettings
@@ -175,7 +175,7 @@ def bind_loopback_only(container: Any, port: int) -> None:
     container.ports[port] = ("127.0.0.1", None)
 
 
-def seed_queue(gq: GuildQueue, *items: QueueItem) -> None:
+def seed_queue(gq: GuildQueue, *items: QueueObject) -> None:
     """Queue items without touching Redis — `put()` minus the mirror.
 
     Synchronous, so the sync tests (embeds, ETA) can use it too. Nothing here
@@ -313,6 +313,20 @@ ASK_FIELDS: tuple[str, ...] = tuple(
     for f in dataclasses.fields(QueueObject)
     if isinstance(getattr(YTDL, f.name, None), property)
 )
+
+
+def unresolved(term: str, requester: Any = None, **fields: Any) -> QueueObject:
+    """A queue item still waiting to resolve, the way a Spotify collection track is
+    queued by a walk that named no display row: `search` holds the term and the
+    display fields arrive with the resolve. A caller wanting the row a walk DOES
+    supply sets `title` (and the rest) on the item it gets back."""
+    return QueueObject(
+        "",
+        fields.pop("title", ""),
+        requester if requester is not None else stub_requester(),
+        search=f"ytsearch:{term}",
+        **fields,
+    )
 
 
 def stub_requester(user_id: int = 4242, name: str = "Loop User") -> MagicMock:

@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from tests.helpers import stub_requester, unresolved
 from src.queue_rows import (
     eta_at,
     fmt_total_duration,
@@ -23,7 +24,6 @@ from src.queue_rows import (
     queue_runtime,
     remaining_secs,
 )
-from src.sources import YTSource
 from src.util import EMBED_DESCRIPTION_LIMIT
 from src.youtube import QueueObject
 
@@ -77,12 +77,12 @@ class TestTheWalk:
         assert fmt_eta(_NOW, walk.uncertain).startswith("~")
 
     def test_an_unresolved_search_is_an_unknown_length(self) -> None:
-        assert advance_walk(_START, YTSource(ytsearch="ytsearch:x")).uncertain
+        assert advance_walk(_START, unresolved("x")).uncertain
 
     def test_the_runtime_is_partial_over_an_unknown_length(
         self, mock_author: MagicMock
     ) -> None:
-        items = [_song(mock_author), YTSource(ytsearch="ytsearch:x")]
+        items = [_song(mock_author), unresolved("x")]
         assert queue_runtime(items) == (60, True)
 
 
@@ -123,24 +123,28 @@ class TestQueueRow:
         assert "](https://yt.com/v=1)" in line
 
     def test_an_unresolved_search_is_sanitized_too(self) -> None:
-        item = YTSource(ytsearch="ytsearch:[click](https://evil.example)", process=True)
+        item = unresolved("[click](https://evil.example)")
         line = queue_row(item, 1, now=_NOW, walk=_START)
         assert "[" not in line and "](" not in line
         assert line.endswith("*resolving...*")
 
 
-def _track(**kwargs: Any) -> YTSource:
+def _track(**kwargs: Any) -> QueueObject:
     """An unresolved Spotify track, with the display fields it is queued with."""
     fields: dict[str, Any] = {
-        "ytsearch": "ytsearch:DNA. Kendrick Lamar",
-        "requester_id": 4242,
+        "search": "ytsearch:DNA. Kendrick Lamar",
         "title": "DNA.",
         "uploader": "Kendrick Lamar",
         "duration": 185,
         "webpage_url": "https://open.spotify.com/track/abc",
         **kwargs,
     }
-    return YTSource(**fields)
+    return QueueObject(
+        fields.pop("webpage_url"),
+        fields.pop("title"),
+        fields.pop("requester", stub_requester()),
+        **fields,
+    )
 
 
 class TestAnUnresolvedTrackRow:
@@ -162,13 +166,13 @@ class TestAnUnresolvedTrackRow:
 
     def test_missing_pieces_have_placeholders(self) -> None:
         row = queue_row(
-            _track(uploader=None, duration=None, requester_id=None),
+            _track(uploader=None, duration=None),
             1,
             now=_NOW,
             walk=_START,
         )
         assert "`?:??`" in row
-        assert row.endswith("Unknown artist · Unknown")
+        assert "Unknown artist · " in row
 
     def test_a_track_queued_without_display_fields_is_its_search_text(self) -> None:
         row = queue_row(_track(title=None), 1, now=_NOW, walk=_START)

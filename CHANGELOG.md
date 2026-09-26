@@ -17,6 +17,17 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.2 — 2026-09-26
+
+**A queue holds one kind of item.** Nothing changes in chat. A collection's tracks used to
+wait as a different type from an ordinary queued song, and the two carried the same fields
+side by side; now there is one, resolved or not.
+
+- **Deploy and roll back freely, for one release.** A track still waiting to resolve is
+  written to Redis in the old shape, so a build before this one reads the queue normally.
+  That shape goes one release after this, and rolling back past this version once it has
+  is what loses those entries.
+
 ## 2.53.0 — 2026-09-24
 
 **The bot comes back about 1.5 seconds sooner, and container logs can no longer

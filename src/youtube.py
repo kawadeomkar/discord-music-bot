@@ -1215,9 +1215,16 @@ class NpHostRef:
     dedicated: bool
 
 
-@dataclass
+# slots: a 10,000-track Spotify playlist holds one of these per track while its
+# searches wait to resolve (201 B each, against 257 B with a __dict__). Keep the
+# class free of __dict__ readers (asdict/vars) and off any pickle path.
+@dataclass(slots=True)
 class QueueObject:
-    """Song metadata in a queue before it's processed by YTDL"""
+    """One queued song, resolved or not. A track queued from a Spotify playlist
+    arrives as a search — `search` set, `webpage_url` empty — and the resolve at
+    dequeue fills in what yt-dlp found. Everything else about the ask is the same
+    either way, which is why there is one type: see
+    docs/ARCHITECTURE.md#one-queue-item."""
 
     webpage_url: str
     title: str
@@ -1265,6 +1272,16 @@ class QueueObject:
     np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
     np_dedicated: bool = False  # a pure NP message (deletable) vs a response
     np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
+    # The `ytsearch:` term an unresolved item still has to resolve, cleared by
+    # the resolve at dequeue. `title` stands in as the term's own text meanwhile,
+    # so the queue card and -remove read the same field for every item.
+    search: str = ""
+
+    @property
+    def unresolved(self) -> bool:
+        """True while this item is a search: nothing may stream it, and its Redis
+        entry is a `"ytsource"` one."""
+        return bool(self.search)
 
 
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:

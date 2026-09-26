@@ -4,13 +4,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, item_label
+from src.guild_queue import RemoveMode, RemoveOutcome, item_label
 from src.musicbot import MusicBot
 from src.commands._common import echo
-from src.sources import YTSource
 from src.util import EMBED_FIELD_LIMIT
 from src.youtube import QueueObject
-from tests.helpers import command_callback, mocked
+from tests.helpers import command_callback, mocked, unresolved
 
 
 def _removed_song(n: int, query_source: str = "") -> QueueObject:
@@ -87,7 +86,7 @@ async def _run_remove(
     music_bot: MusicBot,
     mock_ctx: MagicMock,
     *,
-    removed: list[QueueItem],
+    removed: list[QueueObject],
     positions: list[int],
 ) -> None:
     """Drive -remove through the cog wrapper over a stubbed removal outcome."""
@@ -114,12 +113,9 @@ class TestTheSongsFieldNamesItemsAsClearDoes:
     async def test_a_queued_spotify_track_is_named_by_its_title(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        track = YTSource(
-            ytsearch="ytsearch:DNA. Kendrick Lamar",
-            process=True,
-            title="DNA.",
-            uploader="Kendrick Lamar",
-        )
+        track = unresolved("DNA. Kendrick Lamar")
+        track.title = "DNA."
+        track.uploader = "Kendrick Lamar"
         await _run_remove(music_bot, mock_ctx, removed=[track], positions=[3])
         songs = _songs_field(mock_ctx)
         assert item_label(track) == "DNA."
@@ -129,7 +125,8 @@ class TestTheSongsFieldNamesItemsAsClearDoes:
     async def test_a_search_with_no_title_still_falls_back_to_its_term(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
+        item = unresolved("Artist - Song")
+        item.title = ""
         await _run_remove(music_bot, mock_ctx, removed=[item], positions=[1])
         assert item_label(item) == "Artist - Song"
         assert _songs_field(mock_ctx) == "1: Artist - Song"
@@ -153,7 +150,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         music_bot: MusicBot,
         mock_ctx: MagicMock,
         *,
-        removed: list[QueueItem],
+        removed: list[QueueObject],
         positions: list[int],
     ) -> None:
         mp = MagicMock()
@@ -174,7 +171,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
     ) -> None:
         """99 characters is INSIDE YouTube's own 100-char title limit, so ten
         ordinary songs overflow the 1024-char field with no crafted content."""
-        songs: list[QueueItem] = [
+        songs: list[QueueObject] = [
             QueueObject(f"https://yt.com/v={i}", "A" * 99, MagicMock())
             for i in range(10)
         ]
@@ -189,7 +186,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
     ) -> None:
         """Escaping roughly doubles a title of pure markdown characters, which is
         the shape a hostile uploader picks."""
-        songs: list[QueueItem] = [
+        songs: list[QueueObject] = [
             QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
             for i in range(10)
         ]
@@ -206,7 +203,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """queue_message marks a cut only when handed more rows than it renders."""
-        songs: list[QueueItem] = [_removed_song(i) for i in range(25)]
+        songs: list[QueueObject] = [_removed_song(i) for i in range(25)]
         await self._run(
             music_bot, mock_ctx, removed=songs, positions=list(range(1, 26))
         )
@@ -217,7 +214,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
     async def test_ten_songs_are_listed_without_the_mark(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        songs: list[QueueItem] = [_removed_song(i) for i in range(10)]
+        songs: list[QueueObject] = [_removed_song(i) for i in range(10)]
         await self._run(
             music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
         )
@@ -229,7 +226,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         """One `-remove <playlist link>` drops every track the link added. A raw
         join passes 1024 characters at 227 positions — well inside what a real
         playlist holds."""
-        songs: list[QueueItem] = [_removed_song(i) for i in range(240)]
+        songs: list[QueueObject] = [_removed_song(i) for i in range(240)]
         await self._run(
             music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
         )
@@ -244,7 +241,7 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
     ) -> None:
         """Discord caps an embed at 6000 characters across every part, so three
         fields each legal on their own can still fail together."""
-        songs: list[QueueItem] = [
+        songs: list[QueueObject] = [
             QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
             for i in range(240)
         ]
@@ -385,7 +382,7 @@ class TestRemoveCommand:
         """One argument removing eight songs needs a reason on screen, or it reads
         as the bot having removed more than it was asked to."""
         album = "https://open.spotify.com/album/abc123"
-        removed: list[QueueItem] = [_removed_song(i, "spotify.com") for i in range(8)]
+        removed: list[QueueObject] = [_removed_song(i, "spotify.com") for i in range(8)]
         mp = MagicMock()
         mp.queue_remove = AsyncMock(
             return_value=RemoveOutcome(
@@ -513,9 +510,7 @@ class TestRemoveCommand:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(
             return_value=RemoveOutcome(
-                removed=[
-                    YTSource(ytsearch=f"ytsearch:Track {i} Artist") for i in range(3)
-                ],
+                removed=[unresolved(f"Track {i} Artist") for i in range(3)],
                 positions=[1, 2, 3],
                 mode=RemoveMode.ORIGIN,
             )

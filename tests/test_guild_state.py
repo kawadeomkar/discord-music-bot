@@ -16,9 +16,8 @@ from unittest.mock import MagicMock
 from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
-from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
-from tests.helpers import give_queue_object
+from tests.helpers import give_queue_object, stub_requester, unresolved
 from src.guild_state import (
     Analytics,
     CONFIG_DOMAIN,
@@ -709,22 +708,20 @@ class TestSearchQueueEntryWire:
         assert b'"duration":0' in raw
 
     def test_the_requester_round_trips_through_the_lazy_resolve(self) -> None:
-        source = YTSource(ytsearch="ytsearch:x", requester_id=424242424242424242)
-        parsed = parse_queue_entry(SearchQueueEntry.from_ytsource(source).to_redis())
+        item = unresolved("x", stub_requester(424242424242424242))
+        parsed = parse_queue_entry(SearchQueueEntry.from_queue_object(item).to_redis())
         assert isinstance(parsed, SearchQueueEntry)
         assert parsed.requester_id == 424242424242424242
 
     def test_the_display_fields_round_trip(self) -> None:
         """What -queue shows for an unresolved Spotify track has to survive a
         restart, or a restored queue reads "resolving..." again."""
-        source = YTSource(
-            ytsearch="ytsearch:DNA. Kendrick Lamar",
-            title="DNA.",
-            uploader="Kendrick Lamar",
-            duration=185,
-            webpage_url="https://open.spotify.com/track/abc",
-        )
-        parsed = parse_queue_entry(SearchQueueEntry.from_ytsource(source).to_redis())
+        item = unresolved("DNA. Kendrick Lamar")
+        item.title = "DNA."
+        item.uploader = "Kendrick Lamar"
+        item.duration = 185
+        item.webpage_url = "https://open.spotify.com/track/abc"
+        parsed = parse_queue_entry(SearchQueueEntry.from_queue_object(item).to_redis())
         assert isinstance(parsed, SearchQueueEntry)
         assert (parsed.title, parsed.uploader, parsed.duration, parsed.webpage_url) == (
             "DNA.",
@@ -753,7 +750,7 @@ class TestSearchQueueEntryWire:
     def test_an_unknown_requester_writes_no_key(self) -> None:
         """An entry queued before searches carried a requester must serialize to the
         bytes already on the list, or removing it misses LREM and rebuilds."""
-        entry = SearchQueueEntry.from_ytsource(YTSource(ytsearch="ytsearch:x"))
+        entry = SearchQueueEntry(ytsearch="ytsearch:x")
         assert entry.requester_id is None
         assert b"requester_id" not in entry.to_redis()
 
@@ -789,10 +786,13 @@ class TestSearchQueueEntryWire:
         entry = SearchQueueEntry(url="https://yt.com/v=9", ts=10)
         assert parse_queue_entry(entry.to_redis()) == entry
 
-    def test_from_ytsource(self) -> None:
-        source = YTSource(ytsearch="ytsearch:x", url=None, process=True, ts=None)
-        entry = SearchQueueEntry.from_ytsource(source)
-        assert entry == SearchQueueEntry(ytsearch="ytsearch:x", process=True)
+    def test_from_queue_object(self) -> None:
+        """Every entry written now carries its requester: the item holds a real
+        one, so there is no unknown left to write."""
+        item = unresolved("x", stub_requester(222222222222222222))
+        assert SearchQueueEntry.from_queue_object(item) == SearchQueueEntry(
+            ytsearch="ytsearch:x", process=True, requester_id=222222222222222222
+        )
 
     def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
         # Searches written before the enqueue stamps existed must still parse.
@@ -805,20 +805,19 @@ class TestSearchQueueEntryWire:
         # The leg that makes a Spotify playlist track archive as Spotify: these
         # entries sit in Redis unresolved and become YouTube URLs at dequeue, so
         # nothing downstream could recover the classification.
-        source = YTSource(
-            ytsearch="ytsearch:x", process=True, query_source="spotify.com"
+        entry = SearchQueueEntry.from_queue_object(
+            unresolved("x", query_source="spotify.com")
         )
-        entry = SearchQueueEntry.from_ytsource(source)
         parsed = parse_queue_entry(entry.to_redis())
         assert isinstance(parsed, SearchQueueEntry)
         assert parsed.query_source == "spotify.com"
 
     def test_enqueue_stamps_round_trip(self) -> None:
-        source = YTSource(
-            ytsearch="ytsearch:x",
-            analytics=Analytics(queued_at=1752530000.5, queue_position=7),
+        entry = SearchQueueEntry.from_queue_object(
+            unresolved(
+                "x", analytics=Analytics(queued_at=1752530000.5, queue_position=7)
+            )
         )
-        entry = SearchQueueEntry.from_ytsource(source)
         parsed = parse_queue_entry(entry.to_redis())
         assert parsed == entry
         assert isinstance(parsed, SearchQueueEntry)

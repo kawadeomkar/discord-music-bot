@@ -13,7 +13,6 @@ from typing import Optional, Union
 
 import discord
 
-from src.guild_queue import QueueItem
 from src.util import fmt_duration, safe_label
 from src.youtube import QueueObject
 
@@ -105,24 +104,24 @@ def remaining_secs(item: QueueObject) -> Optional[int]:
     return item.duration
 
 
-def advance_walk(walk: EtaWalk, item: QueueItem) -> EtaWalk:
+def advance_walk(walk: EtaWalk, item: QueueObject) -> EtaWalk:
     """The walk after `item` has played. An unresolved search counts the length it
     carries, which is Spotify's and not the YouTube match's, as an estimate."""
-    if isinstance(item, QueueObject):
+    if not item.unresolved:
         return walk.advance(remaining_secs(item))
     if item.duration is not None:
         return walk.advance_estimate(item.duration)
     return walk.advance(None)
 
 
-def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
+def queue_runtime(items: Sequence[QueueObject]) -> tuple[int, bool]:
     """Total remaining playtime of queued items, and whether the total is
     approximate — set when a duration is unknown, and when one is Spotify's
     estimate rather than the played track's. Either way it renders with a "~"."""
     total_secs = 0
     partial = False
     for item in items:
-        if isinstance(item, QueueObject):
+        if not item.unresolved:
             remaining = remaining_secs(item)
         else:
             # A search's length is an estimate: it counts, and the total says so.
@@ -136,7 +135,7 @@ def queue_runtime(items: Sequence[QueueItem]) -> tuple[int, bool]:
 
 
 def queue_row(
-    item: QueueItem,
+    item: QueueObject,
     index: int,
     *,
     now: datetime.datetime,
@@ -149,7 +148,7 @@ def queue_row(
     the same row from its display fields (the artists stand in for the channel),
     and one that carries none is its search text and "resolving..."."""
     eta = fmt_eta(eta_at(now, walk.cumulative_secs), walk.uncertain)
-    if isinstance(item, QueueObject):
+    if not item.unresolved:
         if item.is_resume and item.ts:
             note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
         elif item.ts:
@@ -160,13 +159,11 @@ def queue_row(
         by = "Unknown channel"
     elif item.title:
         note = ""
-        who = f"<@{item.requester_id}>" if item.requester_id else "Unknown"
+        who = requester_mention(item.requester)
         by = "Unknown artist"
     else:
-        search = safe_label(
-            (item.ytsearch or item.url or "?").removeprefix("ytsearch:"), ROW_TITLE_MAX
-        )
-        return f"`{index}` {search} · *resolving...*"
+        search = safe_label(item.search.removeprefix("ytsearch:"), ROW_TITLE_MAX)
+        return f"`{index}` {search or '?'} · *resolving...*"
     # Capped and sanitized: a "]" in a masked link's label would close it early.
     title = safe_label(item.title or "", ROW_TITLE_MAX) or "Unknown"
     linked = (
@@ -180,7 +177,7 @@ def queue_row(
 
 
 def queue_rows(
-    items: Sequence[QueueItem],
+    items: Sequence[QueueObject],
     *,
     first_index: int,
     now: datetime.datetime,

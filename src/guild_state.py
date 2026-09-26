@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Final, Literal, Self, TypeIs, Union, get_args
 import orjson
 
 if TYPE_CHECKING:
-    from src.sources import YTSource
     from src.youtube import QueueObject, YTDL
 
 log = logging.getLogger(__name__)
@@ -34,7 +33,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Analytics:
-    """Values carried on live queue objects (QueueObject, YTSource, YTDL) for
+    """Values carried on live queue objects (QueueObject, YTDL) for
     storage alone — read only to serialize or to carry onto the next object; a
     field anything branches on or renders belongs elsewhere. In-memory shape
     only: wire entries and play_history columns stay FLAT. Frozen, because carry
@@ -814,9 +813,10 @@ class SongQueueEntry:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SearchQueueEntry:
-    """An unresolved search at rest ("ytsource" on the wire) — e.g. a Spotify
-    playlist track awaiting yt-dlp resolution. Holds exactly the YTSource fields
-    the wire persists; the rest default on rehydration."""
+    """An unresolved search at rest ("ytsource" on the wire) — a Spotify playlist
+    track awaiting yt-dlp resolution. Holds exactly the fields that shape persists;
+    the rest default on rehydration. Still written, and read, while a rollback to
+    a build that knows only this shape is possible."""
 
     ytsearch: str | None = None
     url: str | None = None
@@ -841,21 +841,25 @@ class SearchQueueEntry:
     webpage_url: str | None = None
 
     @classmethod
-    def from_ytsource(cls, source: YTSource) -> Self:
+    def from_queue_object(cls, item: QueueObject) -> Self:
+        """The at-rest form of an item that is still a search. `process` is the
+        True every search entry has been written with: these bytes have to match
+        what is already on the list, or an LREM misses the entry."""
         return cls(
-            ytsearch=source.ytsearch,
-            url=source.url,
-            process=source.process,
-            ts=source.ts,
-            user_input=source.user_input,
-            queued_at=source.analytics.queued_at,
-            queue_position=source.analytics.queue_position,
-            query_source=source.query_source,
-            requester_id=source.requester_id,
-            title=source.title,
-            uploader=source.uploader,
-            duration=source.duration,
-            webpage_url=source.webpage_url,
+            ytsearch=item.search,
+            process=True,
+            ts=item.ts,
+            user_input=item.user_input,
+            queued_at=item.analytics.queued_at,
+            queue_position=item.analytics.queue_position,
+            query_source=item.query_source,
+            requester_id=item.requester.id,
+            # What a listing shows until the search resolves, off the same item
+            # the row is rendered from.
+            title=item.title or None,
+            uploader=item.uploader,
+            duration=item.duration,
+            webpage_url=item.webpage_url or None,
         )
 
     def to_redis(self) -> bytes:
