@@ -322,6 +322,11 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         kind=_ConfigKind.VALUE,
         fallback=str(config.YTDLP_POOL_WORKERS),
     ),
+    _ConfigVar(
+        name="GUILD_READY_TIMEOUT_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.GUILD_READY_TIMEOUT_SECS),
+    ),
     # Every settable knob, in the order the -settings bot card lists them.
     *(
         _ConfigVar(name=spec.knob.env, kind=_ConfigKind.VALUE, knob=spec.knob)

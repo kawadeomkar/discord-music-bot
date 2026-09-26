@@ -17,6 +17,28 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.0 — 2026-09-24
+
+**The bot comes back about 1.5 seconds sooner, and container logs can no longer
+fill the disk.** Nothing to configure and no data touched; rolling back is only a
+redeploy. Both changes are deployment-level — no command behaves differently.
+
+- **Restarts are ~1.5s faster.** Every start used to spend a flat two seconds
+  waiting to see whether another server would arrive, whether or not one ever did:
+  the library waits that long after the last server for one more, and the wait only
+  ever ends by expiring. It is now half a second, which measured 1.9× more headroom
+  than the whole server list needed here. A server that arrives late is still picked
+  up, so nothing is lost by not waiting. If a server is ever missing from the bot's
+  list at startup, raise `GUILD_READY_TIMEOUT_SECS` — it is the new setting behind
+  this, accepts 0.1 to 10 seconds, and refuses startup outside that.
+- **Every container caps its own log at 30 MB.** Previously they were unbounded. A
+  container that is crash-looping writes to the same disk that is usually the reason
+  it is crashing — Postgres in particular PANICs when it cannot write, restarts, and
+  logs the cycle — so the log could fill the host it was reporting from. Each service
+  now keeps at most 3 files of 10 MB. **Existing logs are not truncated:** the cap
+  applies to containers created after the redeploy, so run `docker compose up -d` (or
+  `just up <sha>`) to recreate them, and delete any oversized log left behind.
+
 ## 2.52.0 — 2026-09-23
 
 **An enabled history archive that cannot reach Postgres now says so at startup.** Only

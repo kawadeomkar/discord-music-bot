@@ -1,6 +1,18 @@
 ---
+# Caps each container's json-file log at 30 MB (10 MB x 3). A crash-looping
+# container writes to the same disk that is usually why it is crashing —
+# Postgres's checkpointer PANICs when it cannot write, restarts, and logs the
+# cycle — so an uncapped log wedges the host it is reporting from.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   discord-music-bot:
+    <<: *logging
     container_name: discord-music-bot
     build:
       context: .
@@ -116,6 +128,7 @@ services:
       # is untouched).
 
   redis:
+    <<: *logging
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
@@ -172,6 +185,7 @@ services:
       retries: 5
 
   postgres:
+    <<: *logging
     # Durable home of play history. OPT-IN: this service is in the model only
     # while the `archive` profile is active, and build_common.sh's
     # resolve_archive_profile derives that from HISTORY_ARCHIVE_ENABLED on every
@@ -220,6 +234,7 @@ services:
       retries: 5
 
   db-migrate:
+    <<: *logging
     # One-shot schema migration for the opt-in archive — `archive` profile,
     # same as postgres above: no archive, no schema to migrate.
     #
@@ -266,6 +281,7 @@ services:
         condition: service_healthy
 
   db-backfill:
+    <<: *logging
     # One-shot migration of pre-archive Redis history into Postgres, run BY HAND:
     #
     #   just db-backfill-docker --dry-run
@@ -337,6 +353,7 @@ services:
         condition: service_started
 
   bgutil-pot-provider:
+    <<: *logging
     # Mints GVS Proof-of-Origin tokens so yt-dlp's fallback client can serve audio
     # client. Version must match the
     # bgutil-ytdlp-pot-provider pin in pyproject.toml — plugin and server are
@@ -358,6 +375,7 @@ services:
       retries: 3
 
   otel-lgtm:
+    <<: *logging
     # Pinned (was :latest): the two grafana/ bind mounts below reach into
     # image-internal paths (/otel-lgtm/grafana/conf/provisioning/...), so an
     # unwatched image bump could move them out from under us. On every bump,
@@ -420,6 +438,7 @@ services:
       retries: 5
 
   otelcol-metrics:
+    <<: *logging
     # Metrics sidecar: docker_stats (per-container CPU/mem/net/IO) + redis
     # server metrics, pushed as OTLP into otel-lgtm's collector — the bot
     # itself exports traces and logs only, and otel-lgtm's embedded collector
