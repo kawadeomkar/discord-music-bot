@@ -693,8 +693,10 @@ class QueueEntryField:
     NP_MESSAGE_ID: Final[str] = "np_message_id"
     NP_CHANNEL_ID: Final[str] = "np_channel_id"
     NP_DEDICATED: Final[str] = "np_dedicated"
-    # "ytsource" entries
+    # The term an unresolved item still owes yt-dlp: on every "ytsource" entry,
+    # and on a "qobj" entry only while non-empty.
     YTSEARCH: Final[str] = "ytsearch"
+    # "ytsource" entries
     URL: Final[str] = "url"
     PROCESS: Final[str] = "process"
 
@@ -709,10 +711,11 @@ _ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongQueueEntry:
-    """A resolved song at rest ("qobj" on the wire), the pure-data twin of
-    src.youtube.QueueObject. requester is an ID (a live discord.Member cannot
-    exist at rest; GuildQueue rehydrates it), None only for the crashed-head
-    entry. Snowflakes stay exact end-to-end: orjson native ints, never floats."""
+    """A queued item at rest ("qobj" on the wire), the pure-data twin of
+    src.youtube.QueueObject — resolved, or still a search when `search` is
+    non-empty. requester is an ID (a live discord.Member cannot exist at rest;
+    GuildQueue rehydrates it), None only for the crashed-head entry. Snowflakes
+    stay exact end-to-end: orjson native ints, never floats."""
 
     webpage_url: str
     title: str
@@ -741,6 +744,9 @@ class SongQueueEntry:
     np_message_id: int = 0
     np_channel_id: int = 0
     np_dedicated: bool = False
+    # The `ytsearch:` term an unresolved item resolves through, "" once resolved.
+    # Written only when non-empty, so a resolved entry's bytes never move.
+    search: str = ""
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
@@ -765,6 +771,7 @@ class SongQueueEntry:
             np_message_id=item.np_message_id,
             np_channel_id=item.np_channel_id,
             np_dedicated=item.np_dedicated,
+            search=item.search,
         )
 
     @classmethod
@@ -810,30 +817,33 @@ class SongQueueEntry:
     def to_redis(self) -> bytes:
         """Serialize to the wire format; the table pins the schema to
         QueueEntryField, not to attribute names."""
-        return orjson.dumps(
-            {
-                QueueEntryField.TYPE: _ENTRY_TYPE_SONG,
-                QueueEntryField.WEBPAGE_URL: self.webpage_url,
-                QueueEntryField.TITLE: self.title,
-                QueueEntryField.REQUESTER_ID: self.requester_id,
-                QueueEntryField.TS: self.ts,
-                QueueEntryField.USER_INPUT: self.user_input,
-                QueueEntryField.DURATION: self.duration,
-                QueueEntryField.UPLOADER: self.uploader,
-                QueueEntryField.THUMBNAIL: self.thumbnail,
-                QueueEntryField.PERSISTED: self.persisted,
-                QueueEntryField.INTERJECTED: self.interjected,
-                QueueEntryField.IS_RESUME: self.is_resume,
-                QueueEntryField.START_PAUSED: self.start_paused,
-                QueueEntryField.QUEUED_AT: self.queued_at,
-                QueueEntryField.QUEUE_POSITION: self.queue_position,
-                QueueEntryField.QUERY_SOURCE: self.query_source,
-                QueueEntryField.PLAYED_AT: self.played_at,
-                QueueEntryField.NP_MESSAGE_ID: self.np_message_id,
-                QueueEntryField.NP_CHANNEL_ID: self.np_channel_id,
-                QueueEntryField.NP_DEDICATED: self.np_dedicated,
-            }
-        )
+        fields = {
+            QueueEntryField.TYPE: _ENTRY_TYPE_SONG,
+            QueueEntryField.WEBPAGE_URL: self.webpage_url,
+            QueueEntryField.TITLE: self.title,
+            QueueEntryField.REQUESTER_ID: self.requester_id,
+            QueueEntryField.TS: self.ts,
+            QueueEntryField.USER_INPUT: self.user_input,
+            QueueEntryField.DURATION: self.duration,
+            QueueEntryField.UPLOADER: self.uploader,
+            QueueEntryField.THUMBNAIL: self.thumbnail,
+            QueueEntryField.PERSISTED: self.persisted,
+            QueueEntryField.INTERJECTED: self.interjected,
+            QueueEntryField.IS_RESUME: self.is_resume,
+            QueueEntryField.START_PAUSED: self.start_paused,
+            QueueEntryField.QUEUED_AT: self.queued_at,
+            QueueEntryField.QUEUE_POSITION: self.queue_position,
+            QueueEntryField.QUERY_SOURCE: self.query_source,
+            QueueEntryField.PLAYED_AT: self.played_at,
+            QueueEntryField.NP_MESSAGE_ID: self.np_message_id,
+            QueueEntryField.NP_CHANNEL_ID: self.np_channel_id,
+            QueueEntryField.NP_DEDICATED: self.np_dedicated,
+        }
+        # Only while unresolved: an entry already on the list must serialize to
+        # the bytes it was written with, or its LREM misses and rebuilds.
+        if self.search:
+            fields[QueueEntryField.YTSEARCH] = self.search
+        return orjson.dumps(fields)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -967,6 +977,7 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
             np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),
             np_dedicated=d.get(QueueEntryField.NP_DEDICATED, False),
+            search=d.get(QueueEntryField.YTSEARCH, ""),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt queue entry dropped: {e}")

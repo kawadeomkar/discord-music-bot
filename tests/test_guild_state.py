@@ -515,6 +515,31 @@ _FULL_ENTRY = SongQueueEntry(
     thumbnail="https://img.yt/1.jpg",
 )
 
+# A "qobj" entry for an item that has not resolved: the song fields as a resolved
+# entry writes them, then the term. The key is absent once the item resolves, so
+# the four fixtures above hold their bytes.
+_GOLDEN_QOBJ_SEARCH = (
+    b'{"type":"qobj","webpage_url":"https://open.spotify.com/track/abc","title":"DNA.","requester_id":424242424242424242,"ts":null,"user_input":null,"duration":185,"uploader":"Kendrick Lamar","thumbnail":null,"persisted":true,'
+    + _INTERJECTION_FLAGS_FALSE
+    + b","
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
+    + b","
+    + _PLAYED_AT_UNPLAYED
+    + b","
+    + _NP_HOST_NONE
+    + b',"ytsearch":"ytsearch:DNA. Kendrick Lamar"}'
+)
+_SEARCH_ENTRY = SongQueueEntry(
+    webpage_url="https://open.spotify.com/track/abc",
+    title="DNA.",
+    requester_id=424242424242424242,
+    duration=185,
+    uploader="Kendrick Lamar",
+    search="ytsearch:DNA. Kendrick Lamar",
+)
+
 
 class TestSongQueueEntryWire:
     def test_writer_matches_golden_bytes(self) -> None:
@@ -691,6 +716,36 @@ class TestSongQueueEntryWire:
         entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
         assert isinstance(entry, SongQueueEntry)
         assert entry.query_source == ""
+
+    def test_a_search_writes_its_term_after_the_song_fields(self) -> None:
+        """Pins the KEY ORDER, as the other goldens do: LREM matches exact bytes."""
+        assert _SEARCH_ENTRY.to_redis() == _GOLDEN_QOBJ_SEARCH
+
+    def test_reader_parses_a_search_entry(self) -> None:
+        assert parse_queue_entry(_GOLDEN_QOBJ_SEARCH) == _SEARCH_ENTRY
+
+    def test_a_resolved_entry_writes_no_term(self) -> None:
+        # The when-known rule: an empty search adds no key, so every entry already
+        # on a list keeps the bytes its LREM is matched against.
+        assert _FULL_ENTRY.search == ""
+        assert b"ytsearch" not in _FULL_ENTRY.to_redis()
+        assert _FULL_ENTRY.to_redis() == _GOLDEN_QOBJ_FULL
+
+    def test_reader_defaults_search_on_a_pre_feature_entry(self) -> None:
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_INTERJECTION)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.search == ""
+
+    def test_from_queue_object_carries_the_search(self) -> None:
+        item = QueueObject(
+            webpage_url="https://open.spotify.com/track/abc",
+            title="DNA.",
+            requester=_requester_stub(424242424242424242),
+            duration=185,
+            uploader="Kendrick Lamar",
+            search="ytsearch:DNA. Kendrick Lamar",
+        )
+        assert SongQueueEntry.from_queue_object(item) == _SEARCH_ENTRY
 
 
 class TestSearchQueueEntryWire:

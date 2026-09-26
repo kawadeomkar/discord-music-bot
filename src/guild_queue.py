@@ -822,4 +822,7 @@ class GuildQueue:
             np_message_id=entry.np_message_id,
             np_channel_id=entry.np_channel_id,
             np_dedicated=entry.np_dedicated,
+            # Non-empty for an item that had not resolved: without it the item
+            # comes back looking resolved with nothing to stream.
+            search=entry.search,
         )
