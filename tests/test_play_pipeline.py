@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import dataclasses
 import pathlib
 import contextlib
 import inspect
@@ -3021,6 +3022,67 @@ def _album_walk(**overrides: Any) -> SpotifyPlaylist:
         ],
     )
     return SpotifyPlaylist(**fields)
+
+
+def _declared_default(f: dataclasses.Field[Any]) -> Any:
+    """What a ResolvedPlaylist field holds when nobody fills it, the factory
+    called for the mutable ones. `tracks` has no default, so it reads MISSING."""
+    if f.default_factory is not dataclasses.MISSING:
+        return f.default_factory()
+    return f.default
+
+
+class TestTheSpotifyCollectionResult:
+    """`ResolvedPlaylist.from_spotify` is the one place a walk and the items minted
+    from it become what the enqueue takes."""
+
+    _LINK = "https://open.spotify.com/album/aid123"
+
+    def test_the_walk_and_the_link_arrive_field_for_field(self) -> None:
+        walk = _album_walk(unavailable=2, short=True)
+        items = [unresolved("One More Time"), unresolved("Aerodynamic")]
+
+        result = ResolvedPlaylist.from_spotify(walk, items, link=self._LINK)
+
+        assert result == ResolvedPlaylist(
+            tracks=items,
+            title="Discovery",
+            link=self._LINK,
+            unavailable=2,
+            artists=["Daft Punk"],
+            thumbnail="https://i.scdn.co/cover",
+            short=True,
+        )
+
+    def test_no_field_the_walk_filled_is_left_at_its_default(self) -> None:
+        """Walks `ResolvedPlaylist`'s fields against a walk that sets every one a
+        Spotify collection can set, so a mapping dropped from the classmethod
+        fails here rather than rendering as an absent value on the card."""
+        # `skipped` counts what a YouTube link's `index=` dropped; a Spotify walk
+        # has no such thing, and `tracks` is the caller's list, not the walk's.
+        not_spotifys = {"skipped", "tracks"}
+        result = ResolvedPlaylist.from_spotify(
+            _album_walk(unavailable=2, short=True),
+            [unresolved("One More Time"), unresolved("Aerodynamic")],
+            link=self._LINK,
+        )
+
+        left_behind = [
+            f.name
+            for f in dataclasses.fields(ResolvedPlaylist)
+            if f.name not in not_spotifys
+            and getattr(result, f.name) == _declared_default(f)
+        ]
+        assert left_behind == [], f"from_spotify never filled {left_behind}"
+
+    def test_the_minted_items_are_the_ones_handed_in(self) -> None:
+        """Not `playlist.tracks`: those are the walk's display rows, and the two
+        are adjacent list arguments."""
+        items = [unresolved("One More Time"), unresolved("Aerodynamic")]
+
+        result = ResolvedPlaylist.from_spotify(_album_walk(), items, link=self._LINK)
+
+        assert result.tracks is items
 
 
 class TestSpotifyAlbum:

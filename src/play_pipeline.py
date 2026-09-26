@@ -152,6 +152,29 @@ class ResolvedPlaylist:
     thumbnail: Optional[str] = None
     short: bool = False
 
+    @classmethod
+    def from_spotify(
+        cls, playlist: SpotifyPlaylist, tracks: list[QueueObject], *, link: str
+    ) -> ResolvedPlaylist:
+        """A walked Spotify collection as the enqueue takes it. `tracks` are the
+        items minted from `playlist.titles`, not `playlist.tracks` — those are
+        the walk's display rows — and `link` is the pasted collection URL, which
+        the walk itself does not carry.
+
+        Rows and titles are paired twice, under two policies that stay apart:
+        `SpotifyPlaylist.__post_init__` raises `SpotifyRowMismatchError` for a
+        walk whose rows do not pair with its titles, and `_searches_for` warns
+        and queues without rows for the rows handed to it directly."""
+        return cls(
+            tracks=tracks,
+            title=playlist.name,
+            link=link,
+            unavailable=playlist.unavailable,
+            artists=playlist.artists,
+            thumbnail=playlist.thumbnail,
+            short=playlist.short,
+        )
+
 
 def _apply_playlist_index(
     tracks: list[QueueObject],
@@ -553,24 +576,17 @@ async def queue_source(
     reach the song by one route."""
     if _is_spotify_collection(source):
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
-        return ResolvedPlaylist(
-            # Items that are still searches: a collection nobody plays to the end
-            # never resolves its tail, and the ask depth they are minted against
-            # is rebased onto the head's at the insert.
-            tracks=await _searches_for(
-                playlist.titles,
-                requester=ctx.author,
-                analytics=analytics,
-                origin=origin,
-                rows=playlist.tracks,
-            ),
-            title=playlist.name,
-            link=source.url,
-            unavailable=playlist.unavailable,
-            artists=playlist.artists,
-            thumbnail=playlist.thumbnail,
-            short=playlist.short,
+        # Items that are still searches: a collection nobody plays to the end
+        # never resolves its tail, and the ask depth they are minted against is
+        # rebased onto the head's at the insert.
+        searches = await _searches_for(
+            playlist.titles,
+            requester=ctx.author,
+            analytics=analytics,
+            origin=origin,
+            rows=playlist.tracks,
         )
+        return ResolvedPlaylist.from_spotify(playlist, searches, link=source.url)
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
             raise ValueError("YTSource with type=PLAYLIST must have list_id set")
