@@ -31,6 +31,7 @@ from src.guild_state import (
     HeatCell,
     HistoryEntry,
     SourceCompletion,
+    TopListener,
     serialize_history_entry,
 )
 from src.history_archive import (
@@ -44,7 +45,6 @@ from src.history_archive import (
     HistoryOutboxDrainer,
     Leaderboard,
     PostgresHistoryArchive,
-    RequesterLeader,
     SchemaVersionError,
     SongLeader,
     _entry_to_row,
@@ -722,7 +722,7 @@ class TestLeaderboardQuery:
             board = await archive.leaderboard(42, 10)
         assert board == Leaderboard(
             requesters=(
-                RequesterLeader(
+                TopListener(
                     requester_id=7, requester_name="Omkar", plays=3, played_secs=900
                 ),
             ),
@@ -739,9 +739,7 @@ class TestLeaderboardQuery:
         )
 
     def test_rows_are_frozen_and_keyword_only(self) -> None:
-        row = RequesterLeader(
-            requester_id=1, requester_name="x", plays=1, played_secs=1
-        )
+        row = TopListener(requester_id=1, requester_name="x", plays=1, played_secs=1)
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(row, "plays", 2)
         with pytest.raises(TypeError):

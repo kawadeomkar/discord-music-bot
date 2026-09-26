@@ -514,17 +514,6 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class RequesterLeader:
-    """One row of the -leaderboard listeners board. requester_name is the most
-    recent one recorded for that id, so a rename shows the current name."""
-
-    requester_id: int
-    requester_name: str
-    plays: int
-    played_secs: int
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class SongLeader:
     """One row of the -leaderboard songs board, grouped by webpage_url. title,
     duration_secs and query_source are the values of that URL's newest play."""
@@ -540,7 +529,7 @@ class SongLeader:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Leaderboard:
     # Tuples: frozen=True over a list would leave the rows mutable.
-    requesters: tuple[RequesterLeader, ...]
+    requesters: tuple[TopListener, ...]
     songs: tuple[SongLeader, ...]
 
 
@@ -814,7 +803,7 @@ class PostgresHistoryArchive:
                 song_rows = await conn.fetch(_TOP_SONGS_SQL, guild_id, limit, cutoff)
         return Leaderboard(
             requesters=tuple(
-                RequesterLeader(
+                TopListener(
                     requester_id=r["requester_id"],
                     requester_name=r["requester_name"],
                     plays=r["plays"],

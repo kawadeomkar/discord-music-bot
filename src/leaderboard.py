@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 
 import discord
 
-from src.history_archive import Leaderboard, RequesterLeader, SongLeader
+from src.guild_state import TopListener
+from src.history_archive import Leaderboard, SongLeader
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     QUERY_SOURCE_SOUNDCLOUD,
@@ -97,7 +98,7 @@ def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
     try:
         return Leaderboard(
             requesters=tuple(
-                RequesterLeader(
+                TopListener(
                     requester_id=int(r["requester_id"]),
                     requester_name=str(r.get("requester_name", "")),
                     plays=int(r["plays"]),
@@ -142,9 +143,7 @@ def _link_host(url: str) -> str:
     return host.removeprefix("www.")[:_HOST_MAX]
 
 
-def _line_requester(
-    rank: int, r: RequesterLeader, guild: Optional[discord.Guild]
-) -> str:
+def _line_requester(rank: int, r: TopListener, guild: Optional[discord.Guild]) -> str:
     """A mention while the requester is still in the guild, their archived name
     once they leave — Discord renders a mention for a non-member as a raw id."""
     who = f"<@{r.requester_id}>"

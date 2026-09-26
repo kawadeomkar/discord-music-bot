@@ -13,9 +13,9 @@ import pytest
 from redis.asyncio import Redis
 
 from src import leaderboard
+from src.guild_state import TopListener
 from src.history_archive import (
     Leaderboard,
-    RequesterLeader,
     SchemaVersionError,
     SongLeader,
 )
@@ -36,14 +36,14 @@ def _lb_key(guild_id: int, days: int) -> str:
 
 
 def _board(
-    requesters: list[RequesterLeader] | None = None,
+    requesters: list[TopListener] | None = None,
     songs: list[SongLeader] | None = None,
 ) -> Leaderboard:
     return Leaderboard(requesters=tuple(requesters or ()), songs=tuple(songs or ()))
 
 
-def _requester(n: int, *, plays: int = 2, played_secs: int = 3600) -> RequesterLeader:
-    return RequesterLeader(
+def _requester(n: int, *, plays: int = 2, played_secs: int = 3600) -> TopListener:
+    return TopListener(
         requester_id=n, requester_name=f"user{n}", plays=plays, played_secs=played_secs
     )
 
@@ -239,7 +239,7 @@ class TestLeaderboardCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.get_member = MagicMock(return_value=None)
-        leader = RequesterLeader(
+        leader = TopListener(
             requester_id=1,
             requester_name="**boss**\nfake line",
             plays=1,

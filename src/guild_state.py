@@ -1360,14 +1360,15 @@ class SourceCompletion:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopListener:
-    """One row of the embed's listeners section. Distinct from history_archive's
-    RequesterLeader: this one must not live in a module the render worker would
-    have to import."""
+    """One row of a listeners board, -analytics' and -leaderboard's alike.
+    requester_name is the most recent one recorded for that id, so a rename
+    shows the current name. Here rather than beside the SQL because the chart
+    render worker imports guild_state and must not pull in asyncpg."""
 
-    requester_id: int = 0
-    requester_name: str = ""
-    plays: int = 0
-    played_secs: int = 0
+    requester_id: int
+    requester_name: str
+    plays: int
+    played_secs: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

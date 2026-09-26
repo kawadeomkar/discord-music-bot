@@ -394,7 +394,12 @@ class TestEmbedSafety:
         embed = analytics_card.build_embed(
             _metrics(
                 top_listeners=(
-                    TopListener(requester_id=7, requester_name="**bold**", plays=1),
+                    TopListener(
+                        requester_id=7,
+                        requester_name="**bold**",
+                        plays=1,
+                        played_secs=10,
+                    ),
                 )
             ),
             guild=guild,
@@ -438,7 +443,12 @@ class TestEmbedSafety:
         embed = analytics_card.build_embed(
             _metrics(
                 top_listeners=tuple(
-                    TopListener(requester_id=0, requester_name=long, plays=999_999)
+                    TopListener(
+                        requester_id=0,
+                        requester_name=long,
+                        plays=999_999,
+                        played_secs=999_999,
+                    )
                     for _ in range(TOP_N)
                 ),
                 top_artists=tuple(

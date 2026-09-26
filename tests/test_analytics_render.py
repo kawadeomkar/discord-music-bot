@@ -109,7 +109,11 @@ def _metrics(**over: Any) -> AnalyticsMetrics:
             ),
         ),
         wait_pcts=(1.0, 3.2, 38.0, 192.0, 414.0),
-        top_listeners=(TopListener(requester_id=7, requester_name="Ann", plays=133),),
+        top_listeners=(
+            TopListener(
+                requester_id=7, requester_name="Ann", plays=133, played_secs=20_000
+            ),
+        ),
         top_artists=(TopArtist(uploader="Lofi Girl", plays=11),),
         top_songs=(TopSong(title="Know My Name", webpage_url="https://y/1", plays=3),),
     )
