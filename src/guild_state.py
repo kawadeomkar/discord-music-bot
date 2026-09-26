@@ -1118,9 +1118,9 @@ class HistoryEntry:
         """A played song recorded as it LEAVES the queue — the -clear/-remove
         counterpart to from_song, for an interjection-interrupted entry destroyed
         before its tail could play. played_secs comes from `ts`, the ABSOLUTE
-        resume offset, capped at duration. The host ids come off the tail's
-        np_* fields: the cleanup that deletes that card fires only when a tail
-        STARTS, and a flushed tail never does."""
+        resume offset, capped at duration. The host ids come off the tail's np_*
+        fields: provenance, not a live link — every exit that flushes a tail also
+        disposes of that card."""
         played = item.ts or 0
         duration = item.duration or 0
         if duration:

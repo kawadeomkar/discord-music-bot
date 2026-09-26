@@ -1153,12 +1153,15 @@ class MusicPlayer:
     async def _retire_failed_dequeue(
         self, item: Optional[QueueItem], *, context: str
     ) -> None:
-        """Retire a dequeue that will never play, and record it if a listener already
-        heard part of it. For a resume TAIL the flush is the only writer left: the
-        interrupted fragment declined to record itself."""
+        """Retire a dequeue that will never play — the third queue exit, owed the
+        same pair as -clear and -remove. For a resume TAIL the flush is the only
+        writer left: the interrupted fragment declined to record itself. The
+        disposal is owed too — the tail holds the ONLY pointer to the card that
+        fragment left frozen, and disposal otherwise fires when the tail STARTS."""
         await self.queue.finish_failed_dequeue(item, context=context)
         if item is not None:
             await self._flush_played([item])
+            await self._dispose_orphaned_cards([item])
 
     async def queue_clear(self) -> list[str]:
         await self._cancel_prefetch()  # before the drain — see _cancel_prefetch

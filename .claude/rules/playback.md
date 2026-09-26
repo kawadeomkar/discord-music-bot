@@ -391,7 +391,9 @@ be a false record). Pause updates are debounced 0.5s.
 An interjected fragment's frozen bar is the one case release-don't-retire leaves behind,
 and a stack leaves one per interjection — so its resume tail carries a pointer to that
 card (`np_message_id`/`np_channel_id`/`np_dedicated` on the wire, plus a runtime-only
-`np_host_ref`) and disposes of it when the tail starts, **after** its own card is up.
+`np_host_ref`) and disposes of it when the tail starts, **after** its own card is up. A
+tail destroyed first disposes at the exit that takes it — `-clear`, `-remove` and a
+failed dequeue all flush the play and dispose of the card.
 Never a re-adopt (`_adopt_np_host` refuses older ids by design — the bar belongs at the
 channel bottom); the channel id comes from `message.channel.id`, never the persisted
 home channel; and capture is late-bound to the fragment's iteration end, because an id

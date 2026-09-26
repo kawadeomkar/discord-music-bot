@@ -17,6 +17,21 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.1 — 2026-09-26
+
+**A `-play --now` whose interrupted song later fails to come back no longer leaves a
+dead progress bar in the channel.** Interrupting a song freezes its bar where it
+stopped; the queued remainder of that song carries a pointer to it and deletes it when
+it resumes, so exactly one live bar is in the channel at a time. If that remainder was
+destroyed before it could play the bar stayed behind forever — `-clear` and `-remove`
+already cleaned it up, but a remainder that simply failed to load did not, and every
+level of a stack of interruptions could leave one of its own.
+
+The play itself was always recorded, so `-history` and the archive are unaffected and
+nothing needs backfilling. Nothing to configure and no data touched; rolling back is
+only a redeploy, and bars stranded before the upgrade are not cleaned up retroactively
+— delete those by hand if any are still sitting in a channel.
+
 ## 2.53.0 — 2026-09-24
 
 **The bot comes back about 1.5 seconds sooner, and container logs can no longer
