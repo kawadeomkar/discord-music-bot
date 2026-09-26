@@ -18,6 +18,7 @@ from src import config, guild_state
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
+from tests.helpers import give_queue_object
 from src.guild_state import (
     Analytics,
     CONFIG_DOMAIN,
@@ -1234,20 +1235,33 @@ def test_orjson_refuses_what_post_init_cannot_clamp() -> None:
 
 
 def _history_song_stub(**overrides: Any) -> YTDL:
-    fields: dict = dict(
+    """A finished song, split the way a real one is: the yt-dlp payload on the
+    source, the ask on the queue object it holds."""
+    ask: dict = dict(
+        requester=SimpleNamespace(id=333, display_name="Omkar"),
+        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
+        query_source="youtube.com",
+        played_at=1752530000.0,
+    )
+    payload: dict = dict(
         title="Test Song",
         webpage_url="https://youtu.be/abc",
         uploader="Test Channel",
         duration_secs=242,
         position_secs=225.0,
         thumbnail="https://img/x.jpg",
-        requester=SimpleNamespace(id=333, display_name="Omkar"),
-        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
-        query_source="youtube.com",
-        played_at=1752530000.0,
     )
-    fields.update(overrides)
-    return cast(YTDL, SimpleNamespace(**fields))
+    for name, value in overrides.items():
+        (ask if name in ask else payload)[name] = value
+    # The entry keeps real strings whatever the payload holds: QueueObject's url
+    # and title are `str`, and it is the yt-dlp payload that can answer None.
+    queued = QueueObject(
+        "https://youtu.be/abc",
+        "Test Song",
+        cast(Any, ask.pop("requester")),
+        **ask,
+    )
+    return cast(YTDL, SimpleNamespace(queued=queued, **payload))
 
 
 class TestHistoryEntryFromSong:
@@ -1526,6 +1540,9 @@ class TestCrashedSongRoundTrip:
         song = MagicMock()
         song.webpage_url = "https://yt.com/v=tail"
         song.title = "Interrupted Song"
+        # The ask reads through the queue object, as it does on a real source, so
+        # the values set below reach from_song's from_queue_object leg.
+        give_queue_object(song, QueueObject(song.webpage_url, song.title, MagicMock()))
         song.requester = MagicMock()
         song.requester.id = 7
         song.duration_secs = 200

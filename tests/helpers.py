@@ -6,17 +6,19 @@ import them directly, without routing through pytest's plugin machinery.
 
 import asyncio
 import contextlib
+import dataclasses
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
-from src.guild_state import ANALYTICS_ZERO, Analytics, GuildConfig
+from src.guild_state import Analytics, GuildConfig
 from src.redis_client import GuildRedisStore, iter_guild_configs
 from src.settings import GuildSettings
 from src.play_placement import PlayMode, PlayRequest
@@ -303,6 +305,49 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     return mp
 
 
+# The ask fields, taken from the source itself: a real YTDL answers each of these
+# off the queue object it holds, so a double must too. Reflective, so a field
+# added to QueueObject and exposed on YTDL is wired below without an edit here.
+ASK_FIELDS: tuple[str, ...] = tuple(
+    f.name
+    for f in dataclasses.fields(QueueObject)
+    if isinstance(getattr(YTDL, f.name, None), property)
+)
+
+
+def stub_requester(user_id: int = 4242, name: str = "Loop User") -> MagicMock:
+    """A user stand-in carrying the real values a play's ask serializes: the
+    queue mirror HSETs the id and play_history stores the display name, and a
+    MagicMock attribute is neither HSET-able nor clampable."""
+    who = MagicMock()
+    who.id = user_id
+    who.display_name = name
+    who.mention = f"<@{user_id}>"
+    return who
+
+
+def give_queue_object(song: Any, queued: QueueObject) -> QueueObject:
+    """Give a YTDL double the queue object a real source holds, with the ask
+    fields wired through it as YTDL's properties are.
+
+    A test that assigns one (`song.played_at = 1.0`) moves it on the entry, so a
+    rebuild reading `song.queued` sees what the test set — the divergence that
+    otherwise hides a rebuild dropping a field. PropertyMock goes on the type
+    because mock stores attributes on the instance; every Mock has a type of its
+    own, so this reaches no other double."""
+    song.queued = queued
+    for name in ASK_FIELDS:
+
+        def access(*value: Any, _name: str = name) -> Any:
+            if value:
+                song.queued = replace(song.queued, **{_name: value[0]})
+                return None
+            return getattr(song.queued, _name)
+
+        setattr(type(song), name, PropertyMock(side_effect=access))
+    return queued
+
+
 # What -replay mints at dispatch: the command message's snowflake time, and
 # depth 0 — the replay plays immediately.
 REPLAY_ASK = Analytics(queued_at=1752530500.5, queue_position=0)
@@ -323,22 +368,11 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     song.abr = None
     song.asr = None
     song.acodec = ""
-    song.requester = None
     song.start_offset = 0
     song.position_secs = position
     song.produced_audio = True
-    song.interjected = False
-    song.is_resume = False
-    song.is_replay = False
-    song.start_paused = False
-    song.analytics = ANALYTICS_ZERO
-    song.user_input = None
-    song.query_source = ""
-    song.played_at = 0.0
-    song.persisted = True
-    song.stream_attempts = 0
-    song.failed_format_ids = frozenset()
     song.data = {}
+    give_queue_object(song, QueueObject(url, title, stub_requester()))
     return song
 
 

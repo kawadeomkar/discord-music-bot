@@ -2,7 +2,7 @@
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional, Union
 
@@ -102,22 +102,37 @@ async def replay_current(
     span = trace.get_current_span()
     span.set_attribute("discord.guild_id", str(mp.guild_id))
 
-    replay = QueueObject(
-        current.webpage_url,
-        current.title or "",
-        requester,
+    # The same song asked for again: the origin comes along off current.queued —
+    # query_source, which webpage_url cannot rebuild (a Spotify link, a search and
+    # a pasted link all archive as youtube.com), and user_input, what -remove
+    # matches on — while everything the interrupted play accumulated is dropped.
+    replay = replace(
+        current.queued,
+        webpage_url=current.webpage_url,
+        title=current.title or "",
+        requester=requester,
         duration=current.duration_secs or None,
         uploader=current.uploader,
         thumbnail=current.thumbnail,
         analytics=analytics,
-        # Classifies how the song was found, which a replay does not change,
-        # and webpage_url cannot rebuild it — a Spotify link, a search and a
-        # pasted link all archive as youtube.com.
-        query_source=current.query_source,
-        user_input=current.user_input,  # -remove matches on this
         # Renders the queue card as a replay for the window before the loop
         # dequeues it.
         is_replay=True,
+        # A fresh play, from the top: no offset, no interjection flags, no start
+        # stamp, none of the card ids the fragment it copies is holding, and the
+        # full retry budget — the attempts the live play spent are its own.
+        ts=None,
+        persisted=True,
+        interjected=False,
+        is_resume=False,
+        start_paused=False,
+        played_at=0.0,
+        stream_attempts=0,
+        failed_format_ids=frozenset(),
+        np_message_id=0,
+        np_channel_id=0,
+        np_dedicated=False,
+        np_host_ref=None,
     )
     # A completed prefetch bypasses the queue and would play instead of the
     # front-inserted replay — take it off the board first.

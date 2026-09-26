@@ -15,7 +15,7 @@ import math
 import re
 from zoneinfo import ZoneInfo, available_timezones
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, Self, TypeIs, Union, get_args
@@ -729,23 +729,17 @@ class SongQueueEntry:
         """The queue-entry view of a now-playing song, write-side twin of
         from_crashed_state(): from_song → HSET state → crash →
         from_crashed_state → re-queue."""
-        return cls(
+        # The ask comes off the queue object this song was built from, so the
+        # fields that round-trip through the state hash cannot be dropped here: a
+        # resume tail would return as a fresh song, a paused stack would return
+        # playing, and -remove would lose the origin. Only what the resolve
+        # learned is written over it.
+        return replace(
+            cls.from_queue_object(song.queued),
             webpage_url=song.webpage_url or "",
             title=song.title or "",
-            requester_id=song.requester.id if song.requester else None,
             duration=song.duration_secs or None,
             uploader=song.uploader,
-            interjected=song.interjected,
-            # These round-trip through the state hash, so a default here is a
-            # loss visible only after a crash: a resume tail returns as a fresh
-            # song, a paused stack returns playing, -remove loses the origin.
-            is_resume=song.is_resume,
-            start_paused=song.start_paused,
-            user_input=song.user_input,
-            queued_at=song.analytics.queued_at,
-            queue_position=song.analytics.queue_position,
-            query_source=song.query_source,
-            played_at=song.played_at,
         )
 
     @classmethod
@@ -1095,22 +1089,18 @@ class HistoryEntry:
         duration = song.duration_secs or 0
         if duration:
             played = min(played, duration)
-        return cls(
-            guild_id=guild_id,
+        # The ask half is the queue object's; the payload, the position this play
+        # reached and the host ids the caller resolved are written over it.
+        return replace(
+            cls.from_queue_object(song.queued, guild_id=guild_id),
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             duration_secs=duration,
             played_secs=played,
-            requester_id=song.requester.id if song.requester else 0,
-            requester_name=song.requester.display_name if song.requester else "",
             thumbnail=song.thumbnail or "",
             uploader=song.uploader or "",
-            played_at=song.played_at,
             message_id=message_id,
             channel_id=channel_id,
-            queued_at=song.analytics.queued_at,
-            queue_position=song.analytics.queue_position,
-            query_source=song.query_source,
         )
 
     @classmethod

@@ -26,6 +26,7 @@ from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     REPLAY_ASK,
     command_callback,
+    give_queue_object,
     queue_object,
     replayed_song,
 )
@@ -580,8 +581,12 @@ async def _claim_the_head(mp: MusicPlayer) -> Optional[MagicMock]:
     stream, leaving the claim for the loop to settle."""
     if mp.queue.empty():
         return None
-    mp.queue.get_nowait()
-    return MagicMock(spec=YTDL)
+    claimed = mp.queue.get_nowait()
+    song = MagicMock(spec=YTDL)
+    # Over the item it claimed, as the real prefetch is: a neutralize rebuilds the
+    # queue entry from it.
+    give_queue_object(song, queue_object(claimed))
+    return song
 
 
 class TestReplayCurrent:
@@ -675,6 +680,39 @@ class TestReplayCurrent:
         assert outcome.title == live_song.title
         assert outcome.position == 42
         assert outcome.position_str == "0:42"
+
+    async def test_the_replay_starts_with_a_full_retry_budget(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        mock_author: MagicMock,
+        replayer: MagicMock,
+    ) -> None:
+        """A song that opened on its third attempt has spent two of its three plays.
+        The copy is a new play and gets them all back — inherited, one failure
+        would skip it where the original had retried."""
+        live_song.elapsed_secs = 42.0
+        give_queue_object(
+            live_song,
+            QueueObject(
+                live_song.webpage_url,
+                live_song.title,
+                mock_author,
+                stream_attempts=2,
+                failed_format_ids=frozenset({"251"}),
+            ),
+        )
+        music_player.current_song = live_song
+
+        await replay_cmd.replay_current(
+            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+        )
+
+        replay = music_player.queue.display_items()[0]
+        assert isinstance(replay, QueueObject)
+        assert replay.stream_attempts == 0
+        assert replay.failed_format_ids == frozenset()
 
     async def test_the_replay_is_unstamped_even_though_the_live_song_is_not(
         self,

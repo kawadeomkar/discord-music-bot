@@ -461,26 +461,27 @@ the formatter a new type. See `docs/ARCHITECTURE.md#queue-rows`.
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
-parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
-instance assignment, and the `cls(...)` call in `yt_stream` in `src/youtube.py`** —
-miss these three and the field is
-silently dropped the moment the queue object becomes a playing song, which is where every
-read of it happens → then **BOTH places a playing song is turned back into a
-QueueObject**: `MusicPlayer._requeued_form` (the rebuild `_neutralize_prefetch` and
-the stream retry share — carry it) and `MusicPlayer.interject()`'s resume tail (a
-different entry by construction — decide, don't copy: it resets `stream_attempts` and
-`failed_format_ids`, which `_requeued_form` inherits, and both are runtime-only).
-`YTDL.volume` is the one keyword that is never carried: it is the level baked into that
-source, and a requeued song is rebuilt at the level current then. **Not gated on "playback-relevant"** —
-`user_input` and `persisted` are neither, and both were lost through exactly that gap.
-They fail differently: a `YTDL` missing the attribute outright *raises* there and strands
-the prefetch's claim (which is what `persisted` did to every `--now`/`--next` over a
-completed prefetch), while one that merely defaults reappears wrong. Both rebuild sites
-are invisible to pyright unless `_prefetch_task` stays parameterized as
-`asyncio.Task[Optional[YTDL]]`, and invisible to the tests while their song fixtures are
-bare `MagicMock()` — drive the rebuild off a real `YTDL` (the `ytdl_instance` fixture
-takes carried fields as kwargs) so a missing attribute raises in the suite rather than in
-a guild. If it is a DURABLE property of the play rather than of the queue slot, it also
+parse) → `QueueObject` + `GuildQueue._rehydrate` → **a read-only property on `YTDL`
+returning `self.queued.<field>`, if a playing song reads it**. A playing song HOLDS the
+entry it was built from (`YTDL.queued`), so the field crosses into playback with no
+keyword and comes back through the `replace(song.queued, …)` rebuilds — the requeue a
+completed prefetch and the volume rebuild share, `interject()`'s resume tail, and
+`commands/replay.py` — without being named at any of them. What each rebuild still
+names is what it deliberately does NOT carry: the fields the resolve learned, and the
+play state a new entry must not inherit — the resume tail resets `stream_attempts` and
+`failed_format_ids` because it is producing audio, where `_requeued_form` inherits the
+live budget of a song that has not played. `YTDL.volume` is never carried either: it is
+the level baked into that source, and a requeued song is rebuilt at the level current
+then. **Not gated on "playback-relevant"** —
+`user_input` and `persisted` are neither, and both were lost when the rebuilds copied
+field by field. The only ask field a playing song WRITES is `played_at`, whose setter
+writes through to the entry; a second write-through owes the same argument the first
+one makes (`docs/ARCHITECTURE.md#the-ask-a-playing-song-holds`), since a prefetched
+song's entry is still queued while it resolves. The rebuilds are
+invisible to the tests while their song fixtures are bare `MagicMock()` — drive one off
+a real `YTDL` (the `ytdl_instance` fixture takes carried fields as kwargs) or off a
+double wired with `give_queue_object`, so a dropped field fails the suite rather than a
+guild. If it is a DURABLE property of the play rather than of the queue slot, it also
 needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
 `_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song` / `from_crashed_state`**, or a
 crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came

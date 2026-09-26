@@ -1902,30 +1902,36 @@ class MusicPlayer:
                     max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS),
                 )
             if not near_end:
-                # The tail is the same play, so it keeps the interrupted song's
-                # flags and stamps: interjected (read at every stack level by the
-                # span attribute below), played_at (files the whole play under its
-                # first fragment's start), query_source (the tail writes the ONLY
-                # row for this play, and the classification is not recoverable from
+                # The tail is the same play, so the interrupted song's whole ask
+                # comes along: interjected (read at every stack level by the span
+                # attribute below), played_at (files the whole play under its first
+                # fragment's start), query_source (the tail writes the ONLY row for
+                # this play, and the classification is not recoverable from
                 # webpage_url) and user_input (what -remove matches on).
-                resume = QueueObject(
-                    current.webpage_url,
-                    current.title or "",
-                    current.requester or self._require_requester(),
+                resume = replace(
+                    current.queued,
+                    webpage_url=current.webpage_url,
+                    title=current.title or "",
                     ts=position,
                     duration=current.duration_secs or None,
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
-                    interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
-                    analytics=current.analytics,
-                    played_at=current.played_at,
-                    query_source=current.query_source,
-                    user_input=current.user_input,
-                    # stream_attempts/failed_format_ids reset here, unlike
-                    # _requeued_form's inherit: this song is producing audio,
-                    # which ends its retry chain.
+                    # The tail is its own queue entry: it is put_front'd onto the
+                    # Redis list, and the card ids below are set on it afterwards,
+                    # so it takes neither a restored head's unlisted state nor the
+                    # frozen card of the fragment being interrupted.
+                    persisted=True,
+                    is_replay=False,
+                    np_message_id=0,
+                    np_channel_id=0,
+                    np_dedicated=False,
+                    np_host_ref=None,
+                    # Reset where the rest is inherited: this song is producing
+                    # audio, which ends its retry chain.
+                    stream_attempts=0,
+                    failed_format_ids=frozenset(),
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
@@ -2016,36 +2022,21 @@ class MusicPlayer:
         self._spawn_background(asyncio.to_thread(song.cleanup))
 
     def _requeued_form(self, song: YTDL) -> QueueObject:
-        """The QueueObject a built source came from, with every field it carries:
-        what a completed prefetch goes back on the queue as, and what a volume
-        rebuild is built from."""
-        # Dropping a field here restarts a neutralized resume entry from 0:00,
-        # loses a ?t= offset, or zeroes the ask this play was queued against.
-        return QueueObject(
-            song.webpage_url or "",
-            song.title or "",
-            song.requester or self._require_requester(),
+        """The QueueObject a built source came from: what a completed prefetch
+        goes back on the queue as, and what a volume rebuild is built from."""
+        # The ask comes back whole off song.queued — the live retry budget with it,
+        # so a dead song cannot loop past the cap — and only what the resolve
+        # learned is written over it. Dropping one of these restarts a neutralized
+        # resume entry from 0:00 or loses a ?t= offset.
+        return replace(
+            song.queued,
+            webpage_url=song.webpage_url or "",
+            title=song.title or "",
             ts=song.start_offset or None,
             user_input=song.user_input,
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
-            persisted=song.persisted,
-            interjected=song.interjected,
-            is_resume=song.is_resume,
-            start_paused=song.start_paused,
-            analytics=song.analytics,
-            query_source=song.query_source,
-            played_at=song.played_at,
-            np_message_id=song.np_message_id,
-            np_channel_id=song.np_channel_id,
-            np_dedicated=song.np_dedicated,
-            np_host_ref=song.np_host_ref,
-            is_replay=song.is_replay,
-            # Inherited, not reset: a prefetched song has not played, so its retry
-            # chain is live. A fresh budget here would loop a dead song past the cap.
-            stream_attempts=song.stream_attempts,
-            failed_format_ids=song.failed_format_ids,
         )
 
     async def _announce_start_offset(self, song: YTDL) -> None:

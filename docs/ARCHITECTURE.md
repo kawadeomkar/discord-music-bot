@@ -277,7 +277,7 @@ graph TD
 | Type | Module | Description |
 |---|---|---|
 | `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song) |
-| `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
+| `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; holds the `QueueObject` it plays (`queued`) and answers the ask off it ([the ask a playing song holds](#the-ask-a-playing-song-holds)); counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
 | `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — an unresolved YouTube item |
 | `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
@@ -2329,6 +2329,35 @@ prefetch's claim is still open there. `put_front` must then rebuild the Redis mi
 rather than LPUSH, because the in-flight item's entry is still at the list head
 awaiting a commit-time LPOP. Delete the branch as "unreachable" and that path silently
 eats the new head.
+
+### The ask a playing song holds
+
+`YTDL` holds the `QueueObject` it was built from (`song.queued`) rather than copying its
+fields. Read-only properties alias the ask — `requester`, `user_input`, `persisted`, the
+interjection flags, `analytics`, `query_source`, the NP-card ids — so a playing song's ask
+is spelled the way a queued item's is.
+
+Three sites turn a playing song back into a queue entry, each a `replace(song.queued, …)`:
+`MusicPlayer._requeued_form` (a completed prefetch going back on the queue),
+`interject()`'s resume tail, and `commands/replay.py`'s copy. What they name is what they
+deliberately do not carry: the fields the resolve learned (`webpage_url`, `title`,
+`duration`, `uploader`, `thumbnail`, and `ts` under its boundary name `start_offset`), and,
+for an entry that is new rather than the same play continuing, the state it must not
+inherit — a resume tail and a replay are both put on the list in their own right and host
+their own card, and a replay starts from the top. A field added to `QueueObject` crosses
+into playback and back with no edit at any of the three.
+
+`played_at` is the one ask field a playing song writes: the loop stamps it at `vc.play()`
+and the setter writes through to the entry. That is safe because the stamp runs after
+`commit_dequeue()` has taken the item off the deque. A prefetched song's entry is still
+queued while it resolves, so a write before that commit would reach an item `-remove` and
+the queue mirror still see; a second write-through owes the same argument.
+
+Two reflective tests pin this, both against `dataclasses.fields(QueueObject)` so a new
+field fails them rather than being noticed: `test_no_queueobject_field_is_silently_left_behind`
+(test_youtube.py) fails when a playing song cannot answer a field, and
+`test_no_field_is_lost_when_a_prefetched_song_is_requeued` (test_musicplayer.py) fails when
+a requeue drops one.
 
 ### Now Playing host invariants
 

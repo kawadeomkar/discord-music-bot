@@ -183,7 +183,12 @@ class TestYTDLDuration:
         data = _fake_ytdl_data()
         del data["duration"]
         with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
-            song = YTDL(mock_channel, data["url"], data=data)
+            song = YTDL(
+                mock_channel,
+                data["url"],
+                data=data,
+                queued=QueueObject(data["webpage_url"], "Test Song", MagicMock()),
+            )
         assert song.duration_secs == 0
 
 
@@ -313,33 +318,44 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
         assert (await self._played(qobj)).user_input == album
 
-    def test_no_queueobject_field_is_silently_left_behind(self) -> None:
-        """Reflective, so a field added to QueueObject tomorrow fails HERE rather
-        than at playback. Anything genuinely not meant to cross gets named in the
-        allow-list, with the reason."""
-        import inspect
+    def test_the_start_stamp_reaches_the_entry(
+        self, ytdl_instance: Callable[..., Any], mock_ctx: MagicMock
+    ) -> None:
+        """The one ask field a playing song WRITES, asserted on a real source: the
+        doubles re-implement this setter on their own type, so every loop test
+        that stamps the start passes whether or not youtube.py's setter does."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+        )
+        song = ytdl_instance(queued=qobj)
 
-        carried = _carried_queueobject_fields()
-        params = set(inspect.signature(YTDL.__init__).parameters)
-        missing = sorted(carried - params)
-        assert not missing, (
-            f"QueueObject fields with no YTDL.__init__ keyword: {missing}. "
-            "Add them there, assign them, and pass them from yt_stream — or list "
-            "them in not_carried with a reason."
+        song.played_at = 5.0
+
+        assert qobj.played_at == 5.0
+        assert song.played_at == 5.0
+
+    async def test_no_queueobject_field_is_silently_left_behind(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Reflective, so a field added to QueueObject tomorrow fails HERE rather
+        than at playback, where every read of it happens. The source HOLDS its
+        entry rather than copying it, so a new field crosses by construction; the
+        guard below proves each one reads back, and anything the resolve is what
+        learns gets named in the allow-list, with the reason."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=45
         )
 
-    async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
-        """A field added to QueueObject and forgotten here dies at playback, where
-        every read of it happens. The guard above reads YTDL.__init__'s signature,
-        which is not the leg a field goes missing on, so this compares values across
-        the hop — and asserts each was given a non-default value, or a field the
-        constructor forgets arrives at its default and compares equal to itself."""
-        import dataclasses
+        song = await self._played(qobj)
 
+        assert song.queued is qobj
+        # The one field renamed at the boundary.
+        assert song.start_offset == 45
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
             mock_ctx.author,
+            ts=45,
             user_input="typed",
             query_source="search",
             interjected=True,
@@ -358,6 +374,8 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
         )
+        import dataclasses
+
         carried = _carried_queueobject_fields()
         defaults = {
             f.name: f.default

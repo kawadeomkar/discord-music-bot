@@ -1629,26 +1629,10 @@ class YTDL(discord.FFmpegOpusAudio):
         url: str,
         *,
         data: YTDLVideoInfo,
-        requester: Optional[Union[discord.User, discord.Member]] = None,
-        start_offset: int = 0,
+        queued: QueueObject,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
         codec: Optional[str] = None,
-        stream_attempts: int = 0,
-        failed_format_ids: frozenset[str] = frozenset(),
-        interjected: bool = False,
-        is_resume: bool = False,
-        start_paused: bool = False,
-        analytics: Analytics = ANALYTICS_ZERO,
-        query_source: str = "",
-        user_input: Optional[str] = None,
-        persisted: bool = True,
-        played_at: float = 0.0,
-        np_message_id: int = 0,
-        np_channel_id: int = 0,
-        np_dedicated: bool = False,
-        np_host_ref: Optional[NpHostRef] = None,
-        is_replay: bool = False,
     ) -> None:
         # codec=None keeps discord.py's `-c:a libopus` default; "copy" remuxes.
         super().__init__(
@@ -1659,29 +1643,14 @@ class YTDL(discord.FFmpegOpusAudio):
             codec=codec,
         )
 
-        self.requester = requester
+        # The ask this source plays, held rather than copied field by field. Every
+        # rebuild of a QueueObject from a playing song is replace() off this one,
+        # so a field added to the queue entry crosses into playback and back with
+        # no keyword here. The properties below are the reads.
+        self.queued = queued
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
-        self.start_offset: int = start_offset
-        # Retry state carried from the QueueObject.
-        self.stream_attempts: int = stream_attempts
-        self.failed_format_ids: frozenset[str] = failed_format_ids
-        # Interjection flags carried from the QueueObject (see its field
-        # comments). A resume tail and _neutralize_prefetch rebuild a QueueObject
-        # from these, so every field the queue entry has must survive here.
-        self.interjected: bool = interjected
-        self.is_resume: bool = is_resume
-        self.start_paused: bool = start_paused
-        self.analytics: Analytics = analytics
-        self.query_source: str = query_source
-        self.user_input: Optional[str] = user_input
-        self.persisted: bool = persisted
-        self.played_at: float = played_at
-        self.np_message_id: int = np_message_id
-        self.np_channel_id: int = np_channel_id
-        self.np_dedicated: bool = np_dedicated
-        self.np_host_ref: Optional[NpHostRef] = np_host_ref
-        self.is_replay: bool = is_replay
+        self.start_offset: int = queued.ts or 0
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -1708,6 +1677,82 @@ class YTDL(discord.FFmpegOpusAudio):
 
         self._frames_read: int = 0
         self._packets_read: int = 0
+
+    # ── the ask, read off the queue object this source was built from ──
+    # Aliases, so every reader spells a playing song's ask the way it always has.
+    # Read-only on purpose: the item is still on the deque while a prefetch holds
+    # it, so a write here would reach the queue. played_at is the exception below.
+
+    @property
+    def requester(self) -> Union[discord.User, discord.Member]:
+        return self.queued.requester
+
+    @property
+    def user_input(self) -> Optional[str]:
+        return self.queued.user_input
+
+    @property
+    def persisted(self) -> bool:
+        return self.queued.persisted
+
+    @property
+    def interjected(self) -> bool:
+        return self.queued.interjected
+
+    @property
+    def is_resume(self) -> bool:
+        return self.queued.is_resume
+
+    @property
+    def start_paused(self) -> bool:
+        return self.queued.start_paused
+
+    @property
+    def is_replay(self) -> bool:
+        return self.queued.is_replay
+
+    @property
+    def stream_attempts(self) -> int:
+        return self.queued.stream_attempts
+
+    @property
+    def failed_format_ids(self) -> frozenset[str]:
+        return self.queued.failed_format_ids
+
+    @property
+    def analytics(self) -> Analytics:
+        return self.queued.analytics
+
+    @property
+    def query_source(self) -> str:
+        return self.queued.query_source
+
+    @property
+    def np_message_id(self) -> int:
+        return self.queued.np_message_id
+
+    @property
+    def np_channel_id(self) -> int:
+        return self.queued.np_channel_id
+
+    @property
+    def np_dedicated(self) -> bool:
+        return self.queued.np_dedicated
+
+    @property
+    def np_host_ref(self) -> Optional[NpHostRef]:
+        return self.queued.np_host_ref
+
+    @property
+    def played_at(self) -> float:
+        return self.queued.played_at
+
+    @played_at.setter
+    def played_at(self, epoch: float) -> None:
+        """The loop's start stamp, the one ask field a playing song writes. It runs
+        after commit_dequeue has taken the item off the deque, so the write reaches
+        an object nothing else holds."""
+        self.queued.played_at = epoch
 
     def __getitem__(self, item: str) -> Any:
         return self.__getattribute__(item)
@@ -2058,26 +2103,10 @@ class YTDL(discord.FFmpegOpusAudio):
             channel,
             data["url"],
             data=data,
-            requester=qo.requester,
-            start_offset=qo.ts or 0,
+            queued=qo,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
             codec=codec,
-            stream_attempts=qo.stream_attempts,
-            failed_format_ids=qo.failed_format_ids,
-            interjected=qo.interjected,
-            is_resume=qo.is_resume,
-            start_paused=qo.start_paused,
-            analytics=qo.analytics,
-            query_source=qo.query_source,
-            user_input=qo.user_input,
-            persisted=qo.persisted,
-            played_at=qo.played_at,
-            np_message_id=qo.np_message_id,
-            np_channel_id=qo.np_channel_id,
-            np_dedicated=qo.np_dedicated,
-            np_host_ref=qo.np_host_ref,
-            is_replay=qo.is_replay,
         )
 
     @classmethod

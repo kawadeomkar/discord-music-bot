@@ -65,8 +65,10 @@ from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import (
     REPLAY_ASK,
     described,
+    give_queue_object,
     loop_song,
     mocked,
+    stub_requester,
     queue_object,
     replayed_song,
     seed_queue,
@@ -116,39 +118,16 @@ def _loop_song() -> MagicMock:
     song.abr = None
     song.asr = None
     song.acodec = ""
-    song.requester = None
     song.start_offset = 0
     # Real number: loop()'s history step feeds this through
     # HistoryEntry.from_song, and round(MagicMock) raises.
     song.position_secs = 195.0
-    # -playnow flags a real YTDL always carries — truthy MagicMock
-    # attributes would trip the loop's start_paused/is_resume gates.
-    song.interjected = False
-    song.is_resume = False
-    song.start_paused = False
-    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-    # clamps its fields into the play_history column domain — query_source
-    # too, which the slug clamp regex-matches.
-    song.analytics = ANALYTICS_ZERO
-    song.query_source = ""
-    # Unstamped: the loop's or-stamp writes the real clock here, and the
-    # epoch clamp in HistoryEntry raises on a MagicMock.
-    song.played_at = 0.0
-    # Retry state, as real values: the loop's retry guard compares
-    # stream_attempts to an int, and the rebuild copies the rest verbatim
-    # onto a QueueObject.
-    song.user_input = None
-    song.persisted = True
-    song.stream_attempts = 0
-    song.failed_format_ids = frozenset()
     song.data = {"format_id": "251"}
-    # The NP-card pointer, zeroed like a song that interrupted nothing. Bare
-    # MagicMocks here reach SongQueueEntry through any rebuild and are not
-    # JSON-serializable, so the Redis mirror write fails with only a warning.
-    song.np_message_id = 0
-    song.np_channel_id = 0
-    song.np_dedicated = False
-    song.np_host_ref = None
+    # The ask, off a real queue object as a real source reads it: the retry and
+    # requeue rebuilds replace() off it, truthy MagicMock flags would trip the
+    # loop's start_paused/is_resume gates, and the analytics, query_source,
+    # played_at and retry-budget reads all raise on a MagicMock.
+    give_queue_object(song, QueueObject(song.webpage_url, song.title, stub_requester()))
     return song
 
 
@@ -4094,6 +4073,9 @@ class TestEnqueueDepth:
         current = MagicMock()
         current.webpage_url = "https://yt.com/v=parked"
         current.title = "Parked"
+        give_queue_object(
+            current, QueueObject(current.webpage_url, current.title, mock_author)
+        )
         current.requester = mock_author
         current.position_secs = 40.0
         current.duration_secs = 300
@@ -4116,6 +4098,49 @@ class TestEnqueueDepth:
             if isinstance(i, QueueObject) and i.is_resume
         ]
         assert [t.user_input for t in tails] == [album]
+
+    async def test_a_resume_tail_hosts_its_own_card_and_is_not_a_replay(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_vc: MagicMock
+    ) -> None:
+        """The tail is a new queue entry, so the play state of the fragment it
+        parks does not come along: the loop hands the frozen card over to it after
+        the interjection, and a replay's tail is an ordinary song. A tail of a
+        tail is where inherited ids would point at a card two fragments back."""
+        current = MagicMock()
+        current.webpage_url = "https://yt.com/v=parked"
+        current.title = "Parked"
+        give_queue_object(
+            current,
+            QueueObject(
+                current.webpage_url,
+                current.title,
+                mock_author,
+                is_replay=True,
+                np_message_id=777,
+                np_channel_id=888,
+                np_dedicated=True,
+            ),
+        )
+        current.position_secs = 40.0
+        current.duration_secs = 300
+        music_player.current_song = current
+
+        await music_player.interject(
+            QueueObject("https://yt.com/v=urgent", "Urgent", mock_author), mock_vc
+        )
+
+        tail = next(
+            i
+            for i in music_player.queue.display_items()
+            if isinstance(i, QueueObject) and i.is_resume
+        )
+        assert (
+            tail.np_message_id,
+            tail.np_channel_id,
+            tail.np_dedicated,
+            tail.is_replay,
+            tail.persisted,
+        ) == (0, 0, False, False, True)
 
     async def test_the_under_by_one_window_for_a_repeated_url_is_unchanged(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -8097,8 +8122,9 @@ class TestLoop:
         # reads — loop() now serializes the song into the Redis start
         # transaction, and MagicMock attribute values are not HSET-able.
         song = MagicMock()
-        song.title = "Loop Test Song"
-        song.webpage_url = "https://yt.com/v=loop1"
+        url, title = "https://yt.com/v=loop1", "Loop Test Song"
+        song.title = title
+        song.webpage_url = url
         song.duration_secs = 210
         song.duration = "0:03:30"
         song.uploader = "Loop Channel"
@@ -8108,30 +8134,15 @@ class TestLoop:
         song.abr = None
         song.asr = None
         song.acodec = ""
-        song.requester = None
         song.start_offset = 0
         # Real number: loop()'s history step feeds this through
         # HistoryEntry.from_song, and round(MagicMock) raises.
         song.position_secs = 195.0
-        # Interjection flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.is_replay = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.user_input = None
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
-        # Retry state, as real values: the loop's retry guard compares
-        # stream_attempts to an int.
-        song.stream_attempts = 0
-        song.failed_format_ids = frozenset()
+        # The ask, off a real queue object as a real source reads it: truthy
+        # MagicMock flags would trip the loop's start_paused/is_resume gates, and
+        # the analytics, query_source and played_at clamps in HistoryEntry raise
+        # on a MagicMock.
+        give_queue_object(song, QueueObject(url, title, stub_requester()))
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -10284,26 +10295,15 @@ class TestLoopAdditional:
         song.abr = None
         song.asr = None
         song.acodec = ""
-        song.requester = None
         song.start_offset = 0
         # Real number: loop()'s history step feeds this through
         # HistoryEntry.from_song, and round(MagicMock) raises.
         song.position_secs = 195.0
-        # Interjection flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.is_replay = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.user_input = None
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
+        # The ask, off a real queue object as a real source reads it: truthy
+        # MagicMock flags would trip the loop's start_paused/is_resume gates, and
+        # the analytics, query_source and played_at clamps in HistoryEntry raise
+        # on a MagicMock.
+        give_queue_object(song, QueueObject(url, title, stub_requester()))
         song.persisted = True
         song.stream_attempts = 0
         song.failed_format_ids = frozenset()
@@ -11956,6 +11956,47 @@ class TestDirectDequeueRespectsPersistence:
 
 
 class TestNeutralizePrefetch:
+    def test_no_field_is_lost_when_a_prefetched_song_is_requeued(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        ytdl_instance: Callable[..., Any],
+    ) -> None:
+        """Reflective, against the entry that was queued rather than against the
+        rebuild's own spelling: `persisted` and `user_input` were each lost at a
+        rebuild that named its fields by hand, and this fails if one does again."""
+        queued = QueueObject(
+            "https://yt.com/v=prefetched",
+            "Prefetched",
+            mock_author,
+            ts=45,
+            user_input="typed",
+            query_source="search",
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            persisted=False,
+            played_at=12.5,
+            is_replay=True,
+            analytics=Analytics(queued_at=99.0, queue_position=3),
+            np_message_id=11,
+            np_channel_id=12,
+            np_dedicated=True,
+        )
+
+        rebuilt = music_player._requeued_form(ytdl_instance(queued=queued))
+
+        # Written over with what the resolve learned; ts comes back through the
+        # -ss offset it became, which is the same number.
+        from_payload = {"webpage_url", "title", "duration", "uploader", "thumbnail"}
+        lost = sorted(
+            f.name
+            for f in dataclasses.fields(QueueObject)
+            if f.name not in from_payload
+            and getattr(rebuilt, f.name) != getattr(queued, f.name)
+        )
+        assert not lost, f"fields lost requeueing a prefetched song: {lost}"
+
     async def test_no_task_is_noop(self, music_player: MusicPlayer) -> None:
         music_player._prefetch_task = None
         await music_player._neutralize_prefetch()  # must not raise
