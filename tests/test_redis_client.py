@@ -1,6 +1,7 @@
 """Tests for src/redis_client.py — connection lifecycle, cache helpers, and GuildRedisStore."""
 
 import ast
+import asyncio
 import inspect
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,11 +17,15 @@ from redis.asyncio.client import Pipeline
 from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
+from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.exceptions import WatchError
 
 import src.redis_client as redis_client
+from src import config
 from src.guild_state import (
+    CONFIG_WRITER_FIELD,
+    ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -29,13 +34,18 @@ from src.guild_state import (
     NowPlayingData,
     SongQueueEntry,
 )
-from tests.helpers import mocked
+from tests.helpers import mocked, read_all_configs, stored_config
 from src.redis_client import (
+    analytics_png_get,
+    analytics_png_set,
+    BOT_CONFIG_KEY,
+    GUILD_CONFIG_KEY,
     GUILD_TTL,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
+    BotConfigStore,
     GuildRedisStore,
     _PLAYBACK_POSITION_FIELDS,
     _prev_stream_id,
@@ -656,33 +666,39 @@ async def _stream_ids(fake_redis: Redis) -> list[bytes]:
 
 
 class TestOperatorRecipeMatchesTheSchema:
-    """`just outbox` hardcodes the key and group names — a shell recipe cannot
-    import them. Drift fails open: rename either constant and the recipe keeps
+    """`just outbox` and `just bot-settings` hardcode key names — a shell recipe
+    cannot import them. Drift fails open: rename a constant and the recipe keeps
     working against a key nothing writes, reporting "nothing buffered, nothing to
-    do" during the incident it exists for.
+    do" (or "no stored bot settings") during the incident it exists for.
     """
 
     @staticmethod
-    def _recipe() -> str:
+    def _recipe(header: str) -> set[str]:
+        """The recipe's lines, stripped. Whole lines, not `in`: the substring form
+        passes for `key=history:outbox_old`, which is precisely the drift guarded."""
         text = (Path(__file__).resolve().parent.parent / "justfile").read_text()
-        start = text.index("\noutbox IDLE_MS=")
+        start = text.index(f"\n{header}")
         # Recipes end at the first line that is neither blank nor indented.
         body: list[str] = []
         for line in text[start + 1 :].splitlines()[1:]:
             if line and not line.startswith((" ", "\t")):
                 break
-            body.append(line)
-        return "\n".join(body)
+            body.append(line.strip())
+        return set(body)
 
     def test_the_recipe_targets_the_key_the_producer_writes(self) -> None:
-        # Whole assignment lines, not `in`: the substring form passes for
-        # `key=history:outbox_old`, which is precisely the drift being guarded.
-        assigned = {ln.strip() for ln in self._recipe().splitlines()}
-        assert f"key={HISTORY_OUTBOX_KEY}" in assigned
+        assert f"key={HISTORY_OUTBOX_KEY}" in self._recipe("outbox IDLE_MS=")
 
     def test_the_recipe_targets_the_group_the_drainer_reads(self) -> None:
-        assigned = {ln.strip() for ln in self._recipe().splitlines()}
-        assert f"group={HISTORY_OUTBOX_GROUP}" in assigned
+        assert f"group={HISTORY_OUTBOX_GROUP}" in self._recipe("outbox IDLE_MS=")
+
+    def test_bot_settings_lists_the_key_the_store_writes(self) -> None:
+        pattern = BOT_CONFIG_KEY.format(application_id="*")
+        assert f"pattern={pattern}" in self._recipe("bot-settings *ARGS:")
+
+    def test_bot_settings_resets_the_key_the_store_writes(self) -> None:
+        key = BOT_CONFIG_KEY.format(application_id="${id}")
+        assert f'key="{key}"' in self._recipe("bot-settings *ARGS:")
 
 
 class TestEnsureOutboxGroup:
@@ -1533,8 +1549,16 @@ class TestGetHistory:
         assert await other.get_history() == []
 
 
-class TestGuildOpDefaults:
-    """Structural guard over every @_guild_op default in GuildRedisStore.
+# Each store with the decorator that carries its never-raise contract, and a
+# floor on how many decorated methods the walk must find.
+_STORE_OPS = [
+    pytest.param("GuildRedisStore", "_guild_op", 24, id="guild"),
+    pytest.param("BotConfigStore", "_bot_op", 3, id="bot"),
+]
+
+
+class TestStoreOpDefaults:
+    """Structural guard over every @_guild_op and @_bot_op default.
 
     The fallback is a decorator argument, which makes two mistakes cheap and
     invisible: a mutable literal (shared across guilds for the process lifetime)
@@ -1543,25 +1567,30 @@ class TestGuildOpDefaults:
     """
 
     @staticmethod
-    def _decorated() -> list[tuple[str, ast.Call, Optional[str]]]:
-        """(method name, the _guild_op call node, return annotation) per method."""
+    def _class(cls_name: str) -> ast.ClassDef:
         import src.redis_client as rc_module
 
         tree = ast.parse(inspect.getsource(rc_module))
-        cls = next(
+        return next(
             n
             for n in ast.walk(tree)
-            if isinstance(n, ast.ClassDef) and n.name == "GuildRedisStore"
+            if isinstance(n, ast.ClassDef) and n.name == cls_name
         )
+
+    @classmethod
+    def _decorated(
+        cls, cls_name: str, decorator: str
+    ) -> list[tuple[str, ast.Call, Optional[str]]]:
+        """(method name, the decorator call node, return annotation) per method."""
         out: list[tuple[str, ast.Call, Optional[str]]] = []
-        for node in cls.body:
+        for node in cls._class(cls_name).body:
             if not isinstance(node, ast.AsyncFunctionDef):
                 continue
             for dec in node.decorator_list:
                 if (
                     isinstance(dec, ast.Call)
                     and isinstance(dec.func, ast.Name)
-                    and dec.func.id == "_guild_op"
+                    and dec.func.id == decorator
                 ):
                     returns = (
                         ast.unparse(node.returns) if node.returns is not None else None
@@ -1569,28 +1598,53 @@ class TestGuildOpDefaults:
                     out.append((node.name, dec, returns))
         return out
 
-    def test_finds_every_decorated_method(self) -> None:
+    @pytest.mark.parametrize(("cls_name", "decorator", "floor"), _STORE_OPS)
+    def test_finds_every_decorated_method(
+        self, cls_name: str, decorator: str, floor: int
+    ) -> None:
         """Guard against the guard silently matching nothing."""
-        assert len(self._decorated()) >= 24
+        assert len(self._decorated(cls_name, decorator)) >= floor
 
-    def test_mutable_defaults_use_a_factory(self) -> None:
+    def test_every_public_bot_store_coroutine_carries_its_decorator(self) -> None:
+        """A BotConfigStore method without @_bot_op raises out of the store."""
+        bare = [
+            node.name
+            for node in self._class("BotConfigStore").body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and not node.name.startswith("_")
+            and not any(
+                isinstance(dec, ast.Call)
+                and isinstance(dec.func, ast.Name)
+                and dec.func.id == "_bot_op"
+                for dec in node.decorator_list
+            )
+        ]
+        assert not bare
+
+    @pytest.mark.parametrize(("cls_name", "decorator", "floor"), _STORE_OPS)
+    def test_mutable_defaults_use_a_factory(
+        self, cls_name: str, decorator: str, floor: int
+    ) -> None:
         """No `default=` may be a mutable literal — those need default_factory."""
         offenders = []
-        for name, call, _ in self._decorated():
+        for name, call, _ in self._decorated(cls_name, decorator):
             for kw in call.keywords:
                 if kw.arg == "default" and isinstance(
                     kw.value, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp)
                 ):
                     offenders.append(f"{name}: default={ast.unparse(kw.value)}")
         assert not offenders, (
-            "mutable @_guild_op default(s) shared across every guild for the "
-            f"process lifetime: {offenders}. Use default_factory=... instead."
+            f"mutable @{decorator} default(s) shared for the process lifetime: "
+            f"{offenders}. Use default_factory=... instead."
         )
 
-    def test_every_default_matches_its_return_type(self) -> None:
+    @pytest.mark.parametrize(("cls_name", "decorator", "floor"), _STORE_OPS)
+    def test_every_default_matches_its_return_type(
+        self, cls_name: str, decorator: str, floor: int
+    ) -> None:
         """A fallback that contradicts the annotation is a silent type lie."""
         mismatches = []
-        for name, call, returns in self._decorated():
+        for name, call, returns in self._decorated(cls_name, decorator):
             kwargs = {kw.arg: kw.value for kw in call.keywords}
             factory = kwargs.get("default_factory")
             default = kwargs.get("default")
@@ -1661,13 +1715,28 @@ class TestSetVolume:
         await store.set_volume(0.5)
         assert await fake_redis.ttl(store.state_key()) > 0
 
+    @pytest.mark.parametrize("volume", [1.5, -0.01, float("nan")])
+    async def test_an_out_of_domain_volume_is_refused_with_nothing_sent(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        volume: float,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The next read would turn it back into unset. The WARNING is what says
+        why: without the check the empty encoding still fails, as an HSET error."""
+        assert await store.set_volume(volume) is False
+        assert await store.migrate_volume(volume) is False
+        assert await fake_redis.exists(store.config_key(), store.state_key()) == 0
+        assert caplog.text.count("refusing out-of-domain volume") == 2
+
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         assert await broken_store.set_volume(0.5) is False  # must not raise
 
 
 class TestSetTimezone:
-    """Write half of the planned `-options timezone`. No command calls it yet, so
-    these are the only thing holding its contract."""
+    """Write half of `-settings timezone`, which reaches it through
+    GuildSettings.write."""
 
     async def test_a_real_zone_is_stored(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -1731,21 +1800,68 @@ class TestConfigWritesUseTheSchemaEncoder:
         await store.set_volume(0.25)
         await store.set_timezone("Europe/London")
 
-        config = await store.get_config()
+        config = await stored_config(store)
 
         # False, not None: an explicit opt-out must survive the round trip.
         assert config.debug_mode is False
         assert config.volume == 0.25
         assert config.timezone == "Europe/London"
 
+    @pytest.mark.parametrize(
+        "change",
+        [
+            GuildConfig(idle_timeout_secs=900.0),
+            GuildConfig(alone_timeout_secs=120.0),
+            GuildConfig(np_refresh_secs=1.5),
+            GuildConfig(slow_notice_secs=0.0),
+            GuildConfig(queue_progress_delay_secs=45.0),
+        ],
+        ids=lambda c: next(iter(c.to_redis())),
+    )
+    async def test_update_config_round_trips_through_from_redis(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis, change: GuildConfig
+    ) -> None:
+        assert await store.update_config(change) is True
+        assert await store.read_config() == change
+        # Only its own field: without writer= there is no stamp either.
+        assert set(await fake_redis.hgetall(store.config_key())) == {
+            field.encode() for field in change.to_redis()
+        }
+
     async def test_a_setter_writes_only_its_own_field(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         """to_redis omits unset fields, which is what makes per-field setters safe:
-        a setter that wrote a whole config would clobber the other two with the
+        a setter that wrote a whole config would clobber the other fields with the
         defaults of whatever it happened to construct."""
         await store.set_debug_mode(True)
         assert set(await fake_redis.hgetall(store.config_key())) == {b"debug_mode"}
+
+    async def test_a_writer_adds_exactly_the_stamp(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.set_debug_mode(True, writer=1234)
+        assert await fake_redis.hgetall(store.config_key()) == {
+            b"debug_mode": b"1",
+            CONFIG_WRITER_FIELD.encode(): b"1234",
+        }
+
+    async def test_the_bot_store_round_trips_through_from_redis(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, application_id=1234)
+        change = {"play_inflight_max": 4, "heartbeat_interval_secs": 5.0}
+        assert await bot_store.update_config(change) is True
+        assert await bot_store.read_config() == change
+
+    async def test_the_bot_store_writes_only_the_fields_it_is_given(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, application_id=1234)
+        await bot_store.update_config({"ping_tick_secs": 2.0})
+        assert set(await fake_redis.hgetall(bot_store.config_key())) == {
+            b"ping_tick_secs"
+        }
 
 
 class TestReadGuildConfigs:
@@ -1758,12 +1874,12 @@ class TestReadGuildConfigs:
         """A plain per-guild fan-out silently failed every guild past the pool's
         connection cap, so this batches. The batch loop's boundaries are the part
         that can drop a guild."""
-        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        monkeypatch.setattr(redis_client, "CONFIG_READ_BATCH", 2)
         ids = list(range(1, 8))  # 7 guilds over batches of 2 — last batch partial
         for guild_id in ids:
             await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
 
-        configs = await redis_client.read_guild_configs(fake_redis, ids)
+        configs = await read_all_configs(fake_redis, ids)
 
         assert sorted(configs) == ids
         assert all(c.debug_mode is True for c in configs.values())
@@ -1777,17 +1893,17 @@ class TestReadGuildConfigs:
         its connections are in use, so a per-guild fan-out fails every guild past
         the cap. tests/test_redis_integration.py proves that against a real server.
         """
-        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        monkeypatch.setattr(redis_client, "CONFIG_READ_BATCH", 2)
         real = fake_redis.pipeline
         with patch.object(fake_redis, "pipeline", side_effect=real) as pipe:
-            await redis_client.read_guild_configs(fake_redis, list(range(5)))
+            await read_all_configs(fake_redis, list(range(5)))
         assert pipe.call_count == 3  # ceil(5 / 2)
 
     async def test_a_guild_with_nothing_stored_is_present_and_all_unset(
         self, fake_redis: aioredis.Redis
     ) -> None:
         """Present-but-unset is a real answer: "this guild never chose"."""
-        configs = await redis_client.read_guild_configs(fake_redis, [99])
+        configs = await read_all_configs(fake_redis, [99])
         assert configs[99] == GuildConfig()
 
     async def test_a_failed_read_is_reported_by_OMISSION_not_a_zero_value(
@@ -1797,13 +1913,13 @@ class TestReadGuildConfigs:
         GuildConfig would be indistinguishable from "never chose", and the caller
         caches that — which is how a Redis blink came to DELETE stored settings."""
         with patch.object(fake_redis, "pipeline", side_effect=RuntimeError("down")):
-            configs = await redis_client.read_guild_configs(fake_redis, [1, 2])
+            configs = await read_all_configs(fake_redis, [1, 2])
         assert configs == {}
 
     async def test_one_failed_batch_does_not_lose_the_others(
         self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        monkeypatch.setattr(redis_client, "CONFIG_READ_BATCH", 2)
         for guild_id in (1, 2, 3, 4):
             await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
         real = fake_redis.pipeline
@@ -1816,15 +1932,68 @@ class TestReadGuildConfigs:
             return real(*args, **kwargs)  # pyright: ignore[reportArgumentType]
 
         with patch.object(fake_redis, "pipeline", side_effect=flaky):
-            configs = await redis_client.read_guild_configs(fake_redis, [1, 2, 3, 4])
+            configs = await read_all_configs(fake_redis, [1, 2, 3, 4])
 
         assert sorted(configs) == [3, 4]
+
+    async def test_a_key_that_is_not_a_hash_reads_as_unset_and_spares_its_batch(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """No read can change a wrong-type key, so one that failed its batch would
+        have the startup retry re-read that batch for the life of the process."""
+        await GuildRedisStore(fake_redis, 1).set_debug_mode(True)
+        await fake_redis.set(GUILD_CONFIG_KEY.format(guild_id=2), b"not a hash")
+        await GuildRedisStore(fake_redis, 3).set_debug_mode(False, writer=77)
+
+        configs = await read_all_configs(fake_redis, [1, 2, 3])
+        writers = await redis_client.read_config_writers(
+            fake_redis, [1, 2, 3], batch_timeout=1.0
+        )
+
+        assert configs == {
+            1: GuildConfig(debug_mode=True),
+            2: GuildConfig(),
+            3: GuildConfig(debug_mode=False),
+        }
+        assert writers == {3: 77}
+
+    async def test_wrong_type_keys_log_once_per_batch(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for guild_id in (2, 3):
+            await fake_redis.set(GUILD_CONFIG_KEY.format(guild_id=guild_id), b"x")
+        configs = await read_all_configs(fake_redis, [1, 2, 3])
+        assert configs == {1: GuildConfig(), 2: GuildConfig(), 3: GuildConfig()}
+        assert caplog.text.count("not a hash") == 1
+        assert "[guild:2] and 1 more: config key is not a hash" in caplog.text
+
+    async def test_an_error_every_guild_shares_logs_once_per_batch(
+        self, fake_redis: aioredis.Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An ACL without read access errs per guild, and the startup retry re-reads
+        those guilds every minute: a line per guild would be a line per guild per
+        minute."""
+        real = fake_redis.pipeline
+
+        def refusing(*args: Any, **kwargs: Any) -> Any:
+            pipe = real(*args, **kwargs)
+
+            async def execute(**_kwargs: Any) -> list[ResponseError]:
+                return [ResponseError("NOPERM no access")] * len(pipe.command_stack)
+
+            mocked(pipe).execute = execute
+            return pipe
+
+        with patch.object(fake_redis, "pipeline", side_effect=refusing):
+            assert await read_all_configs(fake_redis, [1, 2, 3]) == {}
+        assert caplog.text.count("config read failed") == 1
+        assert "[guild:1] and 2 more: config read failed" in caplog.text
 
     async def test_no_guilds_issues_no_commands(
         self, fake_redis: aioredis.Redis
     ) -> None:
         with patch.object(fake_redis, "pipeline", side_effect=AssertionError) as pipe:
-            assert await redis_client.read_guild_configs(fake_redis, []) == {}
+            assert await read_all_configs(fake_redis, []) == {}
         pipe.assert_not_called()
 
 
@@ -1858,6 +2027,377 @@ class TestMigrateVolume:
         assert await broken_store.migrate_volume(0.5) is False  # must not raise
 
 
+class TestReadConfig:
+    """The None-on-failure reader: a caller that caches the answer needs a guild
+    that never chose apart from a read that failed."""
+
+    async def test_a_stored_config_is_read(self, store: GuildRedisStore) -> None:
+        await store.update_config(GuildConfig(alone_timeout_secs=30.0))
+        assert await store.read_config() == GuildConfig(alone_timeout_secs=30.0)
+
+    async def test_nothing_stored_is_an_all_unset_config_not_none(
+        self, store: GuildRedisStore
+    ) -> None:
+        assert await store.read_config() == GuildConfig()
+
+    async def test_a_failed_read_is_none(self, broken_store: GuildRedisStore) -> None:
+        assert await broken_store.read_config() is None
+
+    async def test_the_writer_stamp_is_not_a_setting(
+        self, store: GuildRedisStore
+    ) -> None:
+        await store.set_timezone("Europe/London", writer=1234)
+        assert await store.read_config() == GuildConfig(timezone="Europe/London")
+
+
+class TestUpdateConfig:
+    """The generic writer for the fields with no writer of their own."""
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            GuildConfig(volume=0.5, idle_timeout_secs=900.0),
+            GuildConfig(timezone="Europe/London"),
+            GuildConfig(debug_mode=True),
+            GuildConfig(),
+            # Out of domain: __post_init__ has already unset it.
+            GuildConfig(idle_timeout_secs=5.0),
+        ],
+        ids=["volume", "timezone", "debug_mode", "empty", "out-of-domain"],
+    )
+    async def test_a_dedicated_or_empty_config_is_refused_with_nothing_sent(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        change: GuildConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """volume would skip set_volume's legacy copy and timezone
+        set_timezone's validation, so they are refused rather than written."""
+        assert await store.update_config(change) is False
+        assert await fake_redis.exists(store.config_key()) == 0
+        assert "update_config refused" in caplog.text
+
+    async def test_the_write_clears_an_expiry_it_finds(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Seeded with a TTL first: on a key nothing expires, `ttl == -1` passes
+        whether or not the PERSIST is there."""
+        await fake_redis.hset(store.config_key(), "debug_mode", "1")
+        await fake_redis.expire(store.config_key(), 60)
+        assert await store.update_config(GuildConfig(np_refresh_secs=10.0)) is True
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        change = GuildConfig(np_refresh_secs=10.0)
+        assert await broken_store.update_config(change) is False
+
+
+_STAMPING_WRITES: list[Any] = [
+    pytest.param(lambda s, w: s.set_volume(0.5, writer=w), id="set_volume"),
+    pytest.param(lambda s, w: s.migrate_volume(0.5, writer=w), id="migrate_volume"),
+    pytest.param(lambda s, w: s.set_debug_mode(True, writer=w), id="set_debug_mode"),
+    pytest.param(
+        lambda s, w: s.set_timezone("Europe/London", writer=w), id="set_timezone"
+    ),
+    pytest.param(
+        lambda s, w: s.update_config(GuildConfig(idle_timeout_secs=600.0), writer=w),
+        id="update_config",
+    ),
+]
+
+
+class TestConfigWriterStamp:
+    """writer_app_id: the application that last wrote a setting, which is the
+    only proof a config key belongs to this bot."""
+
+    @pytest.mark.parametrize("write", _STAMPING_WRITES)
+    async def test_every_setter_stamps_the_writer_it_is_given(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis, write: Any
+    ) -> None:
+        assert await write(store, 1234) is True
+        stamp = await fake_redis.hget(store.config_key(), CONFIG_WRITER_FIELD)
+        assert stamp == b"1234"
+
+    @pytest.mark.parametrize("write", _STAMPING_WRITES)
+    async def test_no_writer_leaves_no_stamp(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis, write: Any
+    ) -> None:
+        assert await write(store, None) is True
+        assert not await fake_redis.hexists(store.config_key(), CONFIG_WRITER_FIELD)
+
+    async def test_resets_leave_the_stamp_alone(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.set_volume(0.5, writer=1)
+        await store.update_config(GuildConfig(idle_timeout_secs=600.0), writer=1)
+        await store.reset_volume()
+        await store.reset_config_fields(ConfigField.IDLE_TIMEOUT)
+        stamp = await fake_redis.hget(store.config_key(), CONFIG_WRITER_FIELD)
+        assert stamp == b"1"
+
+
+class TestResetConfigFields:
+    async def test_deletes_only_the_named_fields(self, store: GuildRedisStore) -> None:
+        await store.set_debug_mode(True)
+        await store.update_config(GuildConfig(idle_timeout_secs=600.0))
+        await store.update_config(GuildConfig(alone_timeout_secs=30.0))
+
+        assert await store.reset_config_fields(
+            ConfigField.DEBUG_MODE, ConfigField.IDLE_TIMEOUT
+        )
+
+        assert await store.read_config() == GuildConfig(alone_timeout_secs=30.0)
+
+    async def test_volume_is_refused_with_nothing_sent(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """reset_volume also clears the legacy :state copy, which restore would
+        otherwise read back at the next restart."""
+        await store.set_volume(0.5)
+        refused = await store.reset_config_fields("volume")  # pyright: ignore[reportArgumentType]
+        assert refused is False
+        assert (await store.read_config()) == GuildConfig(volume=0.5)
+
+    async def test_no_fields_is_refused(self, store: GuildRedisStore) -> None:
+        assert await store.reset_config_fields() is False
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        assert await broken_store.reset_config_fields(ConfigField.TIMEZONE) is False
+
+
+class TestResetVolume:
+    async def test_clears_the_config_and_the_legacy_copy(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.set_volume(0.5)
+        await store.set_debug_mode(True)
+
+        assert await store.reset_volume() is True
+
+        assert not await fake_redis.hexists(store.config_key(), "volume")
+        assert not await fake_redis.hexists(store.state_key(), "volume")
+        assert (await store.read_config()) == GuildConfig(debug_mode=True)
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        assert await broken_store.reset_volume() is False
+
+
+class TestScanGuildConfigIds:
+    """Lists the config keys for the orphan sweep."""
+
+    async def test_lists_every_config_key_and_nothing_else(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        for guild_id in (11, 22):
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
+        for other in (
+            "guild:abc:config",
+            "guild:007:config",
+            "guild:1:2:config",
+            "guild:33:state",
+            "bot:44:config",
+        ):
+            await fake_redis.hset(other, "debug_mode", "1")
+
+        ids = await redis_client.scan_guild_config_ids(fake_redis, timeout=1.0)
+
+        assert sorted(ids or []) == [11, 22]
+
+    async def test_follows_the_cursor_and_drops_duplicates(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """SCAN may return a key twice. fakeredis answers in one page, so the
+        pages are scripted; test_redis_integration.py walks a real cursor."""
+        pages = [(7, [b"guild:1:config"]), (0, [b"guild:2:config", b"guild:1:config"])]
+        with patch.object(
+            fake_redis, "scan", new_callable=AsyncMock, side_effect=pages
+        ) as scan:
+            ids = await redis_client.scan_guild_config_ids(fake_redis, timeout=1.0)
+        assert ids == [1, 2]
+        assert [c.args[0] for c in scan.call_args_list] == [0, 7]
+
+    async def test_no_keys_is_an_empty_list(self, fake_redis: aioredis.Redis) -> None:
+        assert await redis_client.scan_guild_config_ids(fake_redis, timeout=1.0) == []
+
+    async def test_a_call_that_outlives_the_timeout_is_none(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        async def stalled(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        with patch.object(fake_redis, "scan", side_effect=stalled):
+            ids = await redis_client.scan_guild_config_ids(fake_redis, timeout=0.01)
+        assert ids is None
+
+    async def test_a_failed_call_is_none(self, fake_redis: aioredis.Redis) -> None:
+        with patch.object(fake_redis, "scan", side_effect=RuntimeError("down")):
+            ids = await redis_client.scan_guild_config_ids(fake_redis, timeout=1.0)
+        assert ids is None
+
+
+class TestReadConfigWriters:
+    """iter_guild_configs' omission contract, over the writer stamp."""
+
+    async def test_reads_each_stamp_and_omits_the_unstamped(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        await GuildRedisStore(fake_redis, 1).set_debug_mode(True, writer=1234)
+        await GuildRedisStore(fake_redis, 2).set_debug_mode(True, writer=5678)
+        await GuildRedisStore(fake_redis, 3).set_debug_mode(True)
+        await fake_redis.hset("guild:4:config", CONFIG_WRITER_FIELD, "garbage")
+
+        writers = await redis_client.read_config_writers(
+            fake_redis, [1, 2, 3, 4, 5], batch_timeout=1.0
+        )
+
+        assert writers == {1: 1234, 2: 5678}
+
+    async def test_a_failed_batch_is_omitted(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(redis_client, "CONFIG_READ_BATCH", 2)
+        for guild_id in (1, 2, 3):
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True, writer=9)
+        real = fake_redis.pipeline
+        calls = {"n": 0}
+
+        def flaky(*args: object, **kwargs: object) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("down")
+            return real(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        with patch.object(fake_redis, "pipeline", side_effect=flaky):
+            writers = await redis_client.read_config_writers(
+                fake_redis, [1, 2, 3], batch_timeout=1.0
+            )
+
+        assert writers == {3: 9}
+
+    async def test_a_timed_out_batch_is_omitted(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(redis_client, "CONFIG_READ_BATCH", 2)
+        for guild_id in (1, 2, 3):
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True, writer=9)
+        real_execute = Pipeline.execute
+        calls = {"n": 0}
+
+        async def stalls_once(self: Any, *a: Any, **k: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await asyncio.Event().wait()
+            return await real_execute(self, *a, **k)
+
+        monkeypatch.setattr(Pipeline, "execute", stalls_once)
+        writers = await redis_client.read_config_writers(
+            fake_redis, [1, 2, 3], batch_timeout=0.05
+        )
+
+        assert writers == {3: 9}
+
+
+class TestBotConfigStore:
+    """bot:{application_id}:config, the operator's overrides of the bot-wide
+    knobs."""
+
+    def test_the_key_names_the_application(self, fake_redis: aioredis.Redis) -> None:
+        bot_store = BotConfigStore(fake_redis, application_id=1234)
+        assert bot_store.config_key() == BOT_CONFIG_KEY.format(application_id=1234)
+        assert bot_store.config_key() == "bot:1234:config"
+
+    async def test_a_key_that_is_not_a_hash_reads_as_unset(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, application_id=1234)
+        await fake_redis.set(bot_store.config_key(), b"not a hash")
+        assert await bot_store.read_config() == {}
+
+    async def test_two_applications_on_one_redis_do_not_share_overrides(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """A dev bot run against the compose Redis must not retune prod."""
+        dev = BotConfigStore(fake_redis, application_id=1)
+        prod = BotConfigStore(fake_redis, application_id=2)
+        await dev.update_config({"play_inflight_max": 1})
+        assert await prod.read_config() == {}
+
+    async def test_nothing_stored_is_an_all_unset_config_not_none(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        assert await BotConfigStore(fake_redis, 1).read_config() == {}
+
+    async def test_the_write_clears_an_expiry_it_finds(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, 1)
+        await fake_redis.hset(bot_store.config_key(), "ping_tick_secs", "2.0")
+        await fake_redis.expire(bot_store.config_key(), 60)
+        assert await bot_store.update_config({"debug_tick_secs": 2.0}) is True
+        assert await fake_redis.ttl(bot_store.config_key()) == -1
+
+    async def test_an_empty_config_is_refused_with_nothing_sent(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, 1)
+        assert await bot_store.update_config({}) is False
+        assert await fake_redis.exists(bot_store.config_key()) == 0
+
+    async def test_reset_deletes_only_the_named_fields(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, 1)
+        await bot_store.update_config(
+            {"play_inflight_max": 4, "heartbeat_interval_secs": 5.0}
+        )
+        assert await bot_store.reset_config_fields("play_inflight_max") is True
+        assert await bot_store.read_config() == {"heartbeat_interval_secs": 5.0}
+
+    @pytest.mark.parametrize("field", sorted(config.KNOBS))
+    async def test_every_knob_round_trips_under_its_field(
+        self, field: str, fake_redis: aioredis.Redis
+    ) -> None:
+        """The hash field is the knob's variable in lower case, holding str(value):
+        what a build before the knobs were handles wrote, and reads back."""
+        knob = config.KNOBS[field]
+        value = 2 if knob.kind is int else 2.5
+        bot_store = BotConfigStore(fake_redis, 1)
+        assert await bot_store.update_config({field: value}) is True
+        raw = await fake_redis.hgetall(bot_store.config_key())
+        assert raw == {knob.env.lower().encode(): str(value).encode()}
+        stored = await bot_store.read_config()
+        assert stored == {field: value}
+        assert stored is not None and type(stored[field]) is knob.kind
+
+    async def test_update_refuses_a_field_no_knob_has(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, 1)
+        assert await bot_store.update_config({"volume": 0.5}) is False
+        assert await bot_store.update_config({"ping_tick_secs": 2.0, "x": 1}) is False
+        assert await fake_redis.exists(bot_store.config_key()) == 0
+
+    async def test_reset_refuses_no_fields_and_unknown_ones(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        bot_store = BotConfigStore(fake_redis, 1)
+        await bot_store.update_config({"play_inflight_max": 4})
+        assert await bot_store.reset_config_fields() is False
+        refused = await bot_store.reset_config_fields("volume")
+        assert refused is False
+        assert await bot_store.read_config() == {"play_inflight_max": 4}
+
+    async def test_every_method_swallows_redis_errors(
+        self, broken_store: GuildRedisStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bot_store = BotConfigStore(broken_store.redis, application_id=1234)
+        assert await bot_store.read_config() is None
+        assert await bot_store.update_config({"ping_tick_secs": 2.0}) is False
+        assert await bot_store.reset_config_fields("ping_tick_secs") is False
+        assert "[bot:1234] read_config failed" in caplog.text
+
+
 class TestGetGuildState:
     async def test_returns_typed_snapshot(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -1884,6 +2424,32 @@ class TestGetGuildState:
 
 
 class TestGetPlaybackSnapshot:
+    async def test_a_config_key_that_is_not_a_hash_reads_as_unset(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """No read can change it, so read as a failure it would abort every restore
+        of this guild's queue."""
+        await fake_redis.rpush(store.queue_key(), _entry(1).to_redis())
+        await fake_redis.set(store.config_key(), b"not a hash")
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert (snap.queue, snap.config) == ((_entry(1),), GuildConfig())
+
+    async def test_any_other_wrong_type_key_still_fails_the_snapshot(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Failed with the server's own error, not with whatever parsing an error
+        reply as a list raises, and naming the leg, since nothing retried can
+        clear it and the operator has to know WHICH key to look at."""
+        await fake_redis.set(store.config_key(), b"not a hash")
+        await fake_redis.set(store.queue_key(), b"not a list")
+        assert await store.get_playback_snapshot() is None
+        assert "WRONGTYPE" in caplog.text
+        assert store.queue_key() in caplog.text
+
     async def test_returns_state_and_queue_together(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -1968,9 +2534,9 @@ class TestGetPlaybackSnapshot:
             pipe = real_pipeline(*args, **kwargs)
             original_execute = pipe.execute
 
-            async def counted_execute() -> Any:
+            async def counted_execute(**kwargs: Any) -> Any:
                 execute_counts.append(1)
-                return await original_execute()
+                return await original_execute(**kwargs)
 
             mocked(pipe).execute = counted_execute
             return pipe
@@ -2050,9 +2616,9 @@ class TestGetRecoveryGate:
             pipe = real_pipeline(*args, **kwargs)
             original_execute = pipe.execute
 
-            async def counted_execute() -> Any:
+            async def counted_execute(**kwargs: Any) -> Any:
                 execute_counts.append(1)
-                return await original_execute()
+                return await original_execute(**kwargs)
 
             mocked(pipe).execute = counted_execute
             return pipe
@@ -2422,6 +2988,28 @@ def _current(url: str = "url", title: str = "title", **kwargs: Any) -> SongQueue
 
 
 class TestPopQueueAndStartSong:
+    async def test_re_arms_the_queue_keys_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A guild playing one long queue writes nothing else to the queue key. Left
+        to its enqueue-time TTL, the list expires while the heartbeat keeps the state
+        key alive, and a crash then recovers the playing song and nothing behind it."""
+        await fake_redis.rpush(store.queue_key(), b"first", b"second")
+        await fake_redis.expire(store.queue_key(), 600)
+
+        await store.pop_queue_and_start_song(_current(), 1000.0)
+
+        assert await fake_redis.ttl(store.queue_key()) == GUILD_TTL
+
+    async def test_a_start_that_empties_the_list_leaves_no_key(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), b"only")
+
+        await store.pop_queue_and_start_song(_current(), 1000.0)
+
+        assert await fake_redis.exists(store.queue_key()) == 0
+
     async def test_lpop_removes_first_item_only(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -2548,6 +3136,22 @@ class TestPopQueueAndStartSong:
         restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
         assert restored.current_song_query_source == "spotify.com"
 
+    async def test_parks_the_user_input(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The playing song's queue entry is LPOPed by this very transaction, so
+        # from here on the hash is the only copy of what the user typed — and
+        # -remove <collection link> is the advertised undo for a flagged -play.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(user_input="https://open.spotify.com/playlist/abc"), 1000.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert (
+            restored.current_song_user_input == "https://open.spotify.com/playlist/abc"
+        )
+
     async def test_parks_the_played_at(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -2647,6 +3251,16 @@ class TestSetCurrentSongState:
         await store.set_current_song_state(_current(), 1000.0)
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"untouched"]
+
+    async def test_re_arms_the_queue_keys_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), b"behind the recovered song")
+        await fake_redis.expire(store.queue_key(), 600)
+
+        await store.set_current_song_state(_current(), 1000.0)
+
+        assert await fake_redis.ttl(store.queue_key()) == GUILD_TTL
 
     async def test_clears_pause_epoch(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -2982,14 +3596,23 @@ class TestGuildConfigStore:
     async def test_a_stored_choice_survives_a_round_trip(self, fake_redis: Any) -> None:
         store = GuildRedisStore(fake_redis, 42)
         assert await store.set_debug_mode(True) is True
-        assert (await store.get_config()).debug_mode is True
+        assert (await stored_config(store)).debug_mode is True
         assert await store.set_debug_mode(False) is True
-        assert (await store.get_config()).debug_mode is False
+        assert (await stored_config(store)).debug_mode is False
+
+    async def test_a_key_that_is_not_a_hash_reads_as_unset(
+        self, fake_redis: Any
+    ) -> None:
+        """Not a failed read: read_config's None would have -settings report the
+        store unreadable on every run."""
+        store = GuildRedisStore(fake_redis, 42)
+        await fake_redis.set(store.config_key(), b"not a hash")
+        assert await store.read_config() == GuildConfig()
 
     async def test_a_guild_that_never_chose_reads_unset(self, fake_redis: Any) -> None:
         """Not False. Unset means "follow the host default", which is what lets
         DEBUG_MODE still move a guild that has no opinion."""
-        assert (await GuildRedisStore(fake_redis, 7).get_config()).debug_mode is None
+        assert (await stored_config(GuildRedisStore(fake_redis, 7))).debug_mode is None
 
     async def test_the_config_key_carries_no_ttl(self, fake_redis: Any) -> None:
         """Under volatile-lru only TTL-bearing keys are eviction candidates, so an
@@ -2998,15 +3621,18 @@ class TestGuildConfigStore:
         await store.set_debug_mode(True)
         assert await fake_redis.ttl(store.config_key()) == -1
 
-    async def test_a_ttl_refresh_does_not_reach_the_config_key(
+    async def test_a_ttl_refresh_reaches_neither_config_key(
         self, fake_redis: Any
     ) -> None:
         """refresh_ttl sweeps the runtime keys. Config must not be swept in with
         them — that is the whole reason it is not a field on guild:{id}:state."""
         store = GuildRedisStore(fake_redis, 42)
+        bot_store = BotConfigStore(fake_redis, application_id=42)
         await store.set_debug_mode(True)
+        await bot_store.update_config({"ping_tick_secs": 2.0})
         await store.refresh_ttl()
         assert await fake_redis.ttl(store.config_key()) == -1
+        assert await fake_redis.ttl(bot_store.config_key()) == -1
 
     async def test_a_write_failure_is_reported_rather_than_swallowed(
         self, fake_redis: Any
@@ -3019,18 +3645,10 @@ class TestGuildConfigStore:
         ):
             assert await store.set_debug_mode(True) is False
 
-    async def test_an_unreachable_redis_reads_as_unset(self, fake_redis: Any) -> None:
-        """Degrades to the host default rather than to an arbitrary one."""
-        store = GuildRedisStore(fake_redis, 42)
-        with patch.object(
-            fake_redis, "hgetall", side_effect=RuntimeError("redis down")
-        ):
-            assert (await store.get_config()).debug_mode is None
-
     async def test_a_timezone_round_trips(self, fake_redis: Any) -> None:
         store = GuildRedisStore(fake_redis, 42)
         assert await store.set_timezone("Europe/London") is True
-        config = await store.get_config()
+        config = await stored_config(store)
         assert config.timezone == "Europe/London"
         assert config.tzinfo() == ZoneInfo("Europe/London")
 
@@ -3040,19 +3658,63 @@ class TestGuildConfigStore:
         assert await fake_redis.ttl(store.config_key()) == -1
 
     async def test_settings_do_not_clobber_each_other(self, fake_redis: Any) -> None:
-        """Three fields, one hash: each write is an HSET of its own field, so
-        setting a timezone must not drop the guild's debug choice or volume."""
+        """One hash: each write is an HSET of the fields it sets, so setting a
+        timezone must not drop the guild's debug choice or volume."""
         store = GuildRedisStore(fake_redis, 42)
         await store.set_debug_mode(True)
         await store.set_volume(0.4)
         await store.set_timezone("Europe/London")
-        config = await store.get_config()
+        await store.update_config(GuildConfig(idle_timeout_secs=600.0))
+        config = await stored_config(store)
         assert config.debug_mode is True
         assert config.volume == 0.4
         assert config.timezone == "Europe/London"
+        assert config.idle_timeout_secs == 600.0
 
     async def test_clearing_removes_the_key(self, fake_redis: Any) -> None:
         store = GuildRedisStore(fake_redis, 42)
         await store.set_debug_mode(True)
         assert await store.clear_config() is True
         assert await fake_redis.exists(store.config_key()) == 0
+
+
+class TestAnalyticsPngCache:
+    """Raw bytes in and out. Deliberately not cache_get/cache_set: those
+    orjson-encode, which would base64 a PNG for a 33% penalty."""
+
+    async def test_round_trip_preserves_the_bytes_exactly(
+        self, fake_redis: Redis
+    ) -> None:
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:abc", png, 60)
+        assert await analytics_png_get(fake_redis, "analytics:png:v1:1:30:abc") == png
+
+    async def test_a_miss_is_none_not_an_error(self, fake_redis: Redis) -> None:
+        assert await analytics_png_get(fake_redis, "analytics:png:v1:1:30:nope") is None
+
+    async def test_a_non_positive_ttl_writes_nothing(self, fake_redis: Redis) -> None:
+        """A non-positive TTL means the aggregate straddled a midnight, so it does
+        not cover the day it would be served for. Writing it with no expiry at all
+        would also put an unbounded key in a volatile-lru store."""
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:stale", b"x", 0)
+        assert (
+            await analytics_png_get(fake_redis, "analytics:png:v1:1:30:stale") is None
+        )
+
+    async def test_the_entry_carries_a_ttl(self, fake_redis: Redis) -> None:
+        """It must stay an eviction CANDIDATE — golden rule 12's non-evictable keys
+        are the outbox, the history lists and the per-guild and bot config hashes,
+        and a persistent chart blob has no business joining them."""
+        await analytics_png_set(fake_redis, "analytics:png:v1:1:30:ttl", b"x", 120)
+        assert 0 < await fake_redis.ttl("analytics:png:v1:1:30:ttl") <= 120
+
+    async def test_neither_helper_raises_when_redis_is_none(self) -> None:
+        await analytics_png_set(None, "k", b"x", 60)
+        assert await analytics_png_get(None, "k") is None
+
+    async def test_neither_helper_raises_when_redis_fails(self) -> None:
+        broken = MagicMock()
+        broken.set = AsyncMock(side_effect=ConnectionError("down"))
+        broken.get = AsyncMock(side_effect=ConnectionError("down"))
+        await analytics_png_set(broken, "k", b"x", 60)
+        assert await analytics_png_get(broken, "k") is None

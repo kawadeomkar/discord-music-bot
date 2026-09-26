@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.32.2"
+version = "2.53.1"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -11,7 +11,7 @@ bot = "src.main:main"
 
 [tool.poetry.dependencies]
 requests = "^2.31.0"
-ujson = "^5.13.0"
+ujson = "^6.0.0"
 pynacl = "1.6.2"
 davey = "^0.1.5"
 # `default` brings yt-dlp-ejs (JS challenge solver scripts, exact-pinned by yt-dlp);
@@ -27,7 +27,7 @@ davey = "^0.1.5"
 yt-dlp = { version = "2026.8.18.122307.dev0", extras = ["default", "deno"], allow-prereleases = true }
 # Exact pin: the pip plugin and the bgutil-pot-provider sidecar image in
 # docker-compose.yml are released in lockstep — bump both together.
-bgutil-ytdlp-pot-provider = "1.3.1"
+bgutil-ytdlp-pot-provider = "2.0.0"
 async-timeout = "^5.0.1"
 discord-py = "2.7.1"
 redis = ">=8.1.0"
@@ -57,7 +57,7 @@ matplotlib = { version = "^3.11", optional = true }
 #
 # `--only=` is unaffected by this flag — it selects groups explicitly — so the
 # Dockerfile stages and CI's composite action keep resolving exactly as before.
-tzdata = "^2026.3"
+tzdata = "^2026.4"
 
 # One extra, named by every install path that wants charts. The runtime image is
 # published in both shapes (`:<tag>` with, `:<tag>-slim` without); the test image and
@@ -78,8 +78,12 @@ pytest-asyncio = ">=0.25"
 # path the unit tier exists to cover. Below this floor the shape is wrong and the
 # guard tests pass against a fiction. The lock has resolved above it for a while;
 # the declared floor had not moved, so a fresh resolve could have gone under it.
-fakeredis = ">=2.37.1"
+fakeredis = ">=2.38.0"
 pytest-cov = "^7.1.0"
+# Parallel runs, OPT-IN: no -n in addopts, so `just test` and `just check` are
+# unchanged. `just test-fast` is the inner loop and carries the measurements for
+# why it pins -n 8 and drops coverage.
+pytest-xdist = "^3.8.0"
 # A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
 # several guards here are asyncio.timeout() calls, and a regression that removes
 # one makes the test HANG rather than fail — three such mutations were measured
@@ -88,7 +92,7 @@ pytest-cov = "^7.1.0"
 pytest-timeout = "^2.3"
 # For the opt-in real-Postgres tier (marker `pg`), which arrives with the archive
 # code; needs Docker.
-testcontainers = ">=4.8"
+testcontainers = ">=4.15.0"
 
 [tool.poetry.group.lint]
 optional = true
@@ -110,13 +114,13 @@ optional = true
 # Dependabot bump inside a caret range turns an untouched PR red at the `types` step
 # while everyone who has not re-run `just install` still passes locally. The range
 # had already drifted once: the floor read ^1.1.409 while the lock resolved 1.1.411.
-pyright = { version = "1.1.411", extras = ["nodejs"] }
+pyright = { version = "1.1.414", extras = ["nodejs"] }
 # Exact-pinned, like yt-dlp and discord-py, because a second file has to agree
 # with it: .pre-commit-config.yaml pins the ruff hook by `rev`, and the hook runs
 # ruff from its own isolated environment. Under a caret range any `poetry update`
 # moved this side silently and the hook then formatted to a different version
 # than `just lint` and CI checked. Bump both in the same commit.
-ruff = "0.15.21"
+ruff = "0.16.8"
 pre-commit = "^4.6.2"
 
 [tool.poetry.group.dev]
@@ -184,11 +188,15 @@ exclude = ["docs", "**/node_modules", "**/__pycache__", "**/.*"]
 
 [tool.ruff]
 target-version = "py314"
-# Default lint rules (pyflakes F + a pycodestyle E subset) already cover unused
-# imports, undefined names, and import placement. ruff format is black-compatible
-# and replaces black as the formatter.
+# The lint rules (named in [tool.ruff.lint] below) cover unused imports, undefined
+# names, and import placement. ruff format is black-compatible and replaces black
+# as the formatter.
 
 [tool.ruff.lint]
+# Named rather than inherited: ruff's DEFAULT set expanded in 0.16, so riding the
+# default makes a version bump a repo-wide rewrite — 1,086 findings on a tree
+# 0.15.21 called clean. This is 0.15's default; adding a family is its own change.
+select = ["E4", "E7", "E9", "F"]
 # Return-annotation enforcement lives here, not in [tool.pyright]. This section
 # replaces a `reportMissingReturnType = "error"` key that pyright never
 # implemented: pyright reports unrecognized settings on stderr without changing
@@ -215,7 +223,7 @@ ignore = ["ANN401"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-addopts = "--cov=src --cov-report=term-missing"
+addopts = "--cov=src --cov=tests.mock_spec_cache --cov-report=term-missing"
 # Per-test deadline. Generous relative to the whole suite (~50s for 1400+ tests)
 # because it exists to convert HANGS into failures, not to police slow tests —
 # and it has to leave room for the pg tier's container startup. See the
@@ -228,6 +236,11 @@ markers = [
     # lock in both directions, and a rejected payload holding a NUL byte that
     # jsonb and text both refuse) — see tests/test_pg_integration.py.
     "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
+    # Integration tier against the REAL ffmpeg binary, excluded from the default
+    # run: `stream_failed` is computed from ffmpeg's exit code and discord.py's
+    # stored error, and the default suite injects both rather than observing them
+    # — see tests/test_ffmpeg_integration.py.
+    "ffmpeg: real-ffmpeg integration test (needs ffmpeg on PATH)",
     # Integration tier against a real Redis, excluded from the default run:
     # redis:7-alpine via testcontainers locally, a service container in CI.
     # fakeredis executes every stream command the outbox uses but gets five of
@@ -252,7 +265,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 branch = true
-source = ["src"]
+source = ["src", "scripts", "tests/mock_spec_cache.py"]
 
 [tool.coverage.report]
 fail_under = 80
