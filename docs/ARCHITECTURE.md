@@ -18,6 +18,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [-play Command Pipeline](#-play-command-pipeline)
    - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
+   - [The parked song](#the-parked-song)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
@@ -48,6 +49,8 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
+    - [One queue item](#one-queue-item)
+    - [The ask a playing song holds](#the-ask-a-playing-song-holds)
     - [Now Playing host invariants](#now-playing-host-invariants)
     - [Debug footer seams](#debug-footer-seams)
     - [Analytics rendering](#analytics-rendering)
@@ -276,13 +279,13 @@ graph TD
 
 | Type | Module | Description |
 |---|---|---|
-| `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song) |
+| `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song), `search` (the `ytsearch:` term while the item is unresolved — [one queue item](#one-queue-item)) |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; holds the `QueueObject` it plays (`queued`) and answers the ask off it ([the ask a playing song holds](#the-ask-a-playing-song-holds)); counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
-| `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — an unresolved YouTube item |
+| `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — a parse result, never a queue item |
 | `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; every live item is a `QueueObject`, resolved or not ([one queue item](#one-queue-item)) |
-| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the interjection fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the ask-time analytics `queued_at` / `queue_position` (flat on the wire; grouped as `Analytics` in memory), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the playlist link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither. A `SearchQueueEntry` also carries `requester_id`, written only when known: the track resolves at dequeue, when `_last_author` is whoever ran a command most recently, so `MusicPlayer._resolve_requester` looks the stored ID up (member, else user cache) and falls back to `_last_author` only for an entry queued before the field existed |
+| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the interjection fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the ask-time analytics `queued_at` / `queue_position` (flat on the wire; grouped as `Analytics` in memory), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the playlist link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither. A `SearchQueueEntry` also carries `requester_id`, written only when known; `GuildQueue._rehydrate` makes a user of it at restore — this guild's member, else the bot's user cache (a member who left keeps their plays), else the caller's fallback requester, else `guild.owner`, else the entry is dropped |
 | `Analytics` | `guild_state.py` | The pure-analytics values a live queue object carries — `queued_at` / `queue_position`, zero reads outside serialize/carry. Frozen, so carry sites can alias one instance. **In-memory only**: every wire shape and Postgres column stays flat, exploded and rebuilt at this module's serialization boundary. Its membership *is* the pure-analytics class, and the admission rule (nothing may branch on or render a member) lives on its docstring — `query_source`, `played_at` and the `np_*` trio all look eligible and are not |
 | `GuildStateData` / `NowPlayingData` / `GuildPlaybackSnapshot` | `guild_state.py` | Typed snapshots of the state hash, now-playing hash, and the full restore read |
 | `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`, `message_id`, `channel_id`, `queued_at`, `queue_position`, `query_source`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
@@ -717,35 +720,37 @@ they go.
 
 `GuildStateData.current_song` is the one attribute readers use, built by `_parked_song`:
 
-- **The blob wins, but only when its `webpage_url` AND its `played_at` match the prefixed
-  fields.** That check is the feature. An older build HDELs only the fields it knows, so a
-  blob written before a rollback survives every song that build then plays; read unguarded,
-  recovery re-queues a song whose list entry was LPOPed releases ago and loses the real one.
-  The url alone does not settle it: a rolled-back build replays one song constantly — a
-  fragment and its own resume tail share a url — and an earlier play's blob would then be
-  waved through, bringing back its `is_resume`, its `start_paused` and its archive stamps.
-  `played_at` is the start epoch of one play, written from the same object as the blob in
-  the same HSET, so agreement is exact by construction. It is the same
-  rollback-then-roll-forward window `_heartbeat_predates_song` guards on the position, and
-  it is tested the same way.
-- **Otherwise the prefixed fields answer**, so a hash written before this build, or by an
-  older one during a rollback, recovers exactly as it did.
+- **The prefixed fields win on everything they carry; a matching blob adds the rest.**
+  Every build writes the thirteen for the fragment playing now, so a blob whose
+  `webpage_url` AND `played_at` both match them is overlaid with all thirteen and
+  contributes only what they never carried: the `thumbnail` and the `np_*` card ids. A blob
+  failing either test describes another song or an earlier play — it is ignored with a
+  warning and the fields answer alone. An older build HDELs only the fields it knows, so a
+  blob written before a rollback survives every song that build then plays, and read
+  unguarded it re-queues a song whose list entry was LPOPed releases ago and loses the real
+  one. The gate cannot settle a fragment against its own resume tail — one play, so they
+  agree on both — which is why the overlay, not the match, is what keeps the other
+  fragment's flags off this one.
+- **With no blob the prefixed fields are the whole entry**, so a hash written before this
+  build, or by an older one during a rollback, recovers exactly as it did.
 - **No url, no parked song**: `current_song is None`, and `has_crashed_song` reads that.
-- **The dual write costs 1.3 KB per playing guild, and gets it back.** Measured on
-  `redis:7-alpine` with `MEMORY USAGE` over a realistic entry (a 664-byte blob): the state
-  hash goes **968 B → 2,241 B** while both are written, and the encoding flips
-  listpack → hashtable, since 664 is past `hash-max-listpack-value` (64). Dropping the
-  thirteen next release takes it to **918 B** — below where it started, hashtable encoding
-  included. So the release after this one is where the saving lands; until then it is ~1.3 KB
-  per actively-playing guild on a key that carries a 24 h TTL and is a legitimate eviction
-  candidate. Never predict this arithmetically — see the stream-entry note below for how
-  badly that misranks.
+- **The dual write costs a few hundred bytes per playing guild, and the `hashtable` it
+  forces never comes back.** `MEMORY USAGE`/`OBJECT ENCODING` on `redis:7-alpine` at the
+  default `hash-max-listpack-value=64`: a fully populated entry parks a 531 B blob and takes
+  the hash 104 B `listpack` idle → 3,408 B `hashtable` at play → 512 B once
+  `clear_song_end_state` HDELs it, so ~400 B over idle outlives every song. On a hash the
+  prefixed fields already promoted — any title or `user_input` past 64 B, so every Spotify
+  `?si=` link — the blob adds **+67 B**; on one still in a `listpack`, 824 B → 1,907 B.
+  Never predict this arithmetically: see the stream-entry note below, and
+  `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the missing
+  demotion and prints the sizes under `just test-redis -s`.
 
 `from_crashed_state` is then `replace(state.current_song, ts=position, persisted=False)` —
-the entry, at the resume offset, with the LPOP already committed. What the blob adds over
-the fields is what they never carried: the `thumbnail`, so a recovered head's queue row
-has a cover again, and the `np_*` card ids. The ids reach two places a crash-recovered
-head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
+the entry, at the resume offset, with the LPOP already committed. `ts` is set there
+unconditionally, so a blob's own offset never reaches playback; the recovered position
+does. What the blob adds over the fields is what they never carried: the `thumbnail`, so a
+recovered head's queue row has a cover again, and the `np_*` card ids. The ids reach two
+places a crash-recovered head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
 `play_history.message_id`/`channel_id` when `_flush_played` archives a head a removal
 destroys. The delete is gated on `np_dedicated` and a same-guild channel, and the card it
 names was already gone when the tail started, so it is a wasted DELETE at worst.
@@ -2369,10 +2374,14 @@ eats the new head.
 ### One queue item
 
 Every item in a `GuildQueue` is a `QueueObject`, whether or not it has resolved. A track
-queued from a Spotify playlist arrives with `search` set to its `ytsearch:` term, an
-empty `webpage_url`, and its title standing in as the term's own text; `MusicPlayer._resolve_source`
-writes what yt-dlp found onto that same item and clears `search`, which is what makes it
-playable. `QueueObject.unresolved` is the one test for "not yet playable", and the
+queued from a Spotify playlist arrives with `search` set to its `ytsearch:` term,
+`webpage_url` the track's own Spotify page and `title` the walk row's name — both empty
+when the walk sent no rows, and every renderer then falls back to the term.
+`MusicPlayer._resolve_source` returns that item with what yt-dlp found written over its
+display fields and `search` cleared, which is what makes it playable; the queued original
+stays the deque's claimed head, and `_prefetched_head` pairs it with the copy so the cards
+can show the resolved song.
+`QueueObject.unresolved` is the one test for "not yet playable", and the
 places that care are few: the resolve, the stream warm, the queue card's
 *resolving…* row, and `_to_entry`.
 
@@ -2389,10 +2398,12 @@ rolled-back build reading a `"qobj"` entry with an empty `webpage_url` would try
 stream it. `SearchQueueEntry` can go one release after this one, and with it the branch
 in `_to_entry`.
 
-`slots=True` on `QueueObject` is what makes the merge free: 201 B per item against the
-257 B a `__dict__` costs, so a 10,000-track playlist waiting to resolve holds 0.56 MB
-more than the old `YTSource` did rather than 1.12 MB. Keep the class off `asdict`/`vars`
-and off any pickle path.
+`slots=True` is what keeps the merge cheap rather than free. By `sys.getsizeof` on this
+interpreter a 23-field `QueueObject` is **216 B**, against **344 B** for the same instance
+carrying a `__dict__`; the separate 18-field lazy source it replaces was 176 B. So a
+waiting item costs about **40 B more** than it did under two types — ~0.4 MB across a
+10,000-track collection, where without slots it would be ~1.7 MB. Keep the class off
+`asdict`/`vars` and off any pickle path.
 
 ### The ask a playing song holds
 

@@ -508,11 +508,10 @@ class GuildQueue:
         """Re-queue persisted entries after a restart, in order, in memory only
         (they are already on the Redis list). Returns the number restored.
 
-        An entry nobody can be found for is dropped and counted in a warning: the
-        Redis list still holds it, so the next mutation that rebuilds the mirror
-        writes the shorter queue back for good. `requester_fallback` is the
-        caller's last resort, ahead of the guild owner, for entries persisted
-        before searches carried a requester id."""
+        An entry nobody can be found for is dropped and counted in a warning, and
+        the mirror is marked stale so the shorter queue is written back for good.
+        `requester_fallback` is the caller's last resort, ahead of the guild
+        owner, for entries persisted before searches carried a requester id."""
         count = 0
         dropped = 0
         for entry in entries:
@@ -523,6 +522,10 @@ class GuildQueue:
             self._items.append(item)
             count += 1
         if dropped:
+            # The list keeps a dropped entry at its position and memory does not,
+            # so a commit-time LPOP would retire its neighbour. The flag routes
+            # the next enqueue and the next song start through a rebuild instead.
+            self._mirror_dirty = True
             log.warning(
                 f"dropped {dropped} restored queue "
                 f"{'entry' if dropped == 1 else 'entries'} with no resolvable "

@@ -1,14 +1,10 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Final, Literal, Optional, Union
+from typing import Final, Literal, Optional, Union
 from urllib.parse import parse_qs, urlsplit
 
 from src.util import get_logger, safe_label
-
-if TYPE_CHECKING:
-    # Annotation only: parsing stays free of the Spotify client.
-    pass
 
 log = get_logger(__name__)
 

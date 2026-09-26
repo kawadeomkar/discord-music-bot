@@ -91,7 +91,7 @@ def _spotify_playlist(
         item.duration = row.duration_secs if row else None
         item.webpage_url = (row.url or "") if row else ""
         items.append(item)
-    return ResolvedPlaylist(items, **fields)
+    return ResolvedPlaylist(tracks=items, **fields)
 
 
 class TestQueueSource:
@@ -163,6 +163,36 @@ class TestQueueSource:
             122,
             "https://sp/a",
         )
+
+    async def test_every_item_of_a_spotify_collection_carries_the_pasted_link(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """`-remove <collection link>` matches on `user_input`, and these items
+        resolve to YouTube URLs at dequeue — so the link the user pasted is the
+        only thing that still names the collection they came from. The resolve is
+        the last place that knows it."""
+        link = "https://open.spotify.com/album/aid456"
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid456")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(
+            return_value=SpotifyPlaylist(
+                name="Discovery",
+                titles=["Song A", "Song B", "Song C"],
+                duration_secs=0,
+                duration_partial=False,
+                unavailable=0,
+            )
+        )
+        result = await play_pipeline.queue_source(
+            mock_ctx,
+            source,
+            analytics=_ANALYTICS,
+            origin=link,
+            mode=ResolveMode.FLAT_OK,
+            cog=music_bot,
+        )
+        assert isinstance(result, ResolvedPlaylist)
+        assert [t.user_input for t in result.tracks] == [link] * 3
 
     async def test_spotify_track_calls_yt_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -458,8 +488,10 @@ class TestStartOffsetRefusals:
     def test_a_collection_the_offset_never_reached_is_not_measured(self) -> None:
         """A Spotify collection's items are searches the stamp never reaches, so
         their `ts` never matches the offset and nothing is measured."""
-        assert past_end_refusal(ResolvedPlaylist([unresolved("A")]), 9000) is None
-        assert past_end_refusal(ResolvedPlaylist([]), 9000) is None
+        assert (
+            past_end_refusal(ResolvedPlaylist(tracks=[unresolved("A")]), 9000) is None
+        )
+        assert past_end_refusal(ResolvedPlaylist(tracks=[]), 9000) is None
 
     def test_a_playlist_head_the_offset_landed_on_is_measured(
         self, mock_ctx: MagicMock
@@ -470,9 +502,9 @@ class TestStartOffsetRefusals:
         head = QueueObject(
             "https://yt.com/v=v4", "S4", mock_ctx.author, duration=210, ts=9000
         )
-        playlist = ResolvedPlaylist([head])
+        playlist = ResolvedPlaylist(tracks=[head])
         assert past_end_refusal(playlist, 9000) is not None
-        assert past_end_refusal(ResolvedPlaylist([head]), 60) is None
+        assert past_end_refusal(ResolvedPlaylist(tracks=[head]), 60) is None
 
     def test_it_names_both_clocks(self, mock_ctx: MagicMock) -> None:
         qobj = QueueObject(
@@ -1172,7 +1204,7 @@ class TestEnqueuePlaylist:
             play_pipeline.enqueue_playlist(
                 mock_ctx,
                 source,
-                ResolvedPlaylist(tracks),
+                ResolvedPlaylist(tracks=tracks),
                 mp,
                 admit(music_bot, mock_ctx, mp),
                 analytics=_ANALYTICS,
@@ -2418,9 +2450,9 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
 
     async def test_the_rebase_is_skipped_when_the_head_has_not_moved(self) -> None:
         """The O(N) pass is one dataclass copy per track — milliseconds of
-        synchronous event-loop time at 5,000 of them, and under the place lock
-        every sibling -play waits it out. Minting before the lock and re-basing
-        under it makes the common case free."""
+        event-loop time at 5,000 of them, and under the place lock every sibling
+        -play waits it out. Minting before the lock and re-basing under it makes
+        the common case free."""
         tracks = [
             QueueObject(
                 f"https://yt.com/v={n}", f"T{n}", MagicMock(), analytics=_ANALYTICS
@@ -2428,11 +2460,44 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
             for n in range(3)
         ]
 
-        assert _rebase_positions(tracks, 7, 7) is tracks  # same list, no copies
+        same = await _rebase_positions(tracks, 7, 7)
+        assert same is tracks  # same list, no copies
 
-        moved = _rebase_positions(tracks, 7, 9)
+        moved = await _rebase_positions(tracks, 7, 9)
         assert moved is not tracks
         assert [q.analytics.queue_position for q in moved] == [9, 10, 11]
+
+    async def test_the_rebase_yields_a_chunk_at_a_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 10,000-track collection is rebased whenever the queue is not empty,
+        because the resolve mints every collection against depth 0. Unchunked that
+        is one slice of the event loop nothing else in the process runs during."""
+        monkeypatch.setattr(play_pipeline, "_REBASE_CHUNK", 2)
+        tracks = [
+            QueueObject(
+                f"https://yt.com/v={n}", f"T{n}", MagicMock(), analytics=_ANALYTICS
+            )
+            for n in range(5)
+        ]
+        ticks = 0
+
+        async def _tick() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(_tick())
+        await asyncio.sleep(0)
+        started = ticks
+        try:
+            moved = await _rebase_positions(tracks, 0, 4)
+        finally:
+            ticker.cancel()
+
+        assert [q.analytics.queue_position for q in moved] == [4, 5, 6, 7, 8]
+        assert ticks - started >= 2
 
 
 class TestResolveModeThreading:
@@ -2759,6 +2824,47 @@ class TestSearchesForAPlaylist:
         )
         assert track.search == "ytsearch:One More Time Daft Punk"
         assert track.unresolved
+
+    async def test_without_rows_a_search_has_nothing_to_show(self) -> None:
+        """A walk that named no rows leaves every display field empty, so a listing
+        has only the term to render and the resolve fills the rest in."""
+        (track,) = await self._built(["a"])
+        assert (track.title, track.webpage_url, track.uploader, track.duration) == (
+            "",
+            "",
+            None,
+            None,
+        )
+
+    async def test_one_artist_tuple_yields_one_shared_byline(self) -> None:
+        """A collection is usually one artist, and the joined byline is the only
+        string this pass keeps for the life of the queue — a fresh join per track
+        is ~800 KiB over 10,000 of them. Two names, because joining one returns
+        that name itself and every row would share it with no cache at all."""
+        rows = [
+            SpotifyTrack(
+                name=f"T{n}",
+                artists=["Daft Punk", "Romanthony"],
+                duration_secs=180,
+                url=None,
+            )
+            for n in range(50)
+        ]
+        built = await self._built([f"T{n} Daft Punk" for n in range(50)], rows=rows)
+        assert {t.uploader for t in built} == {"Daft Punk, Romanthony"}
+        assert len({id(t.uploader) for t in built}) == 1
+
+    async def test_a_different_artist_tuple_gets_its_own_byline(self) -> None:
+        """The cache is keyed by the artist tuple, so a track with its own lineup
+        gets its own byline; a row Spotify sent no artists for gets None, which is
+        what renders as no byline rather than as an empty one."""
+        rows = [
+            SpotifyTrack(name="A", artists=["X"], duration_secs=1, url=None),
+            SpotifyTrack(name="B", artists=["X", "Y"], duration_secs=1, url=None),
+            SpotifyTrack(name="C", artists=[], duration_secs=1, url=None),
+        ]
+        built = await self._built(["A X", "B X Y", "C"], rows=rows)
+        assert [t.uploader for t in built] == ["X", "X, Y", None]
 
     async def test_no_titles_builds_nothing(self) -> None:
         assert await self._built([]) == []

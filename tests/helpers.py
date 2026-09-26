@@ -318,10 +318,10 @@ ASK_FIELDS: tuple[str, ...] = tuple(
 def unresolved(term: str, requester: Any = None, **fields: Any) -> QueueObject:
     """A queue item still waiting to resolve, the way a Spotify collection track is
     queued by a walk that named no display row: `search` holds the term and the
-    display fields arrive with the resolve. A caller wanting the row a walk DOES
-    supply sets `title` (and the rest) on the item it gets back."""
+    display fields arrive with the resolve. `title` and `webpage_url` are the two
+    a walk DOES supply rows for, so both are keywords here and both default empty."""
     return QueueObject(
-        "",
+        fields.pop("webpage_url", ""),
         fields.pop("title", ""),
         requester if requester is not None else stub_requester(),
         search=f"ytsearch:{term}",
@@ -348,7 +348,11 @@ def give_queue_object(song: Any, queued: QueueObject) -> QueueObject:
     rebuild reading `song.queued` sees what the test set — the divergence that
     otherwise hides a rebuild dropping a field. PropertyMock goes on the type
     because mock stores attributes on the instance; every Mock has a type of its
-    own, so this reaches no other double."""
+    own, so this reaches no other double.
+
+    The write is a `replace()`, so `song.queued` is a new object afterwards where
+    the real setter mutates the entry it holds; that contract is pinned on a real
+    source by test_youtube.py's test_the_start_stamp_reaches_the_entry."""
     song.queued = queued
     for name in ASK_FIELDS:
 
@@ -391,14 +395,12 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
 
 
 def replayed_song(source: QueueObject) -> MagicMock:
+    """The source a -replay's copy resolves to, HOLDING the entry that was
+    queued rather than a copy of a few of its fields — so a test can put state
+    on `source` and see what the play reads back off it, including the fields
+    _neutralize_prefetch's rebuild carries."""
     song = loop_song(source.webpage_url, source.title, position=42.0)
-    # Read by _neutralize_prefetch's rebuild, which the -replay runs.
-    song.np_message_id, song.np_channel_id = 0, 0
-    song.np_dedicated, song.np_host_ref = False, None
-    song.is_replay = source.is_replay
-    song.analytics = source.analytics
-    song.persisted = source.persisted
-    song.requester = source.requester
+    give_queue_object(song, source)
     return song
 
 

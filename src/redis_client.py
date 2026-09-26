@@ -922,7 +922,8 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
             # The whole entry, beside the prefixed copies above: one release of
             # dual writes, so a rollback still recovers from the fields it knows.
-            # CURRENT_SONG_URL is what tells a reader this blob is this song's.
+            # A reader takes only thumbnail and the np_* ids from the blob, and
+            # only when CURRENT_SONG_URL and CURRENT_SONG_PLAYED_AT match its own.
             StateField.CURRENT_SONG: current.to_redis().decode(),
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),

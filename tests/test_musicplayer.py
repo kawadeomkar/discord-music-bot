@@ -4950,19 +4950,56 @@ class TestResolveUsesTheItemsRequester:
     async def test_the_resolve_attributes_the_track_to_whoever_queued_it(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
+        """The resolve returns the QUEUED item with what yt-dlp found written over
+        it, so the ask survives: yt-dlp's own object is built against the fallback
+        requester and carries nothing of how the track was asked for. Handing that
+        object back instead re-attributes the track and loses the Spotify token
+        every later read of it depends on."""
         queuer = MagicMock(spec=discord.Member)
         queuer.id = 424242424242424242
         music_player._last_author = mock_author
-        yt_source = AsyncMock(
-            return_value=QueueObject("https://yt.com/v=1", "Resolved", queuer)
+        resolved = QueueObject(
+            "https://yt.com/v=1",
+            "Resolved",
+            mock_author,
+            duration=213,
+            uploader="Some Channel",
+            thumbnail="https://yt.com/t.jpg",
         )
+        source = unresolved(
+            "test",
+            queuer,
+            user_input="https://open.spotify.com/track/abc",
+            query_source="spotify.com",
+        )
+        yt_source = AsyncMock(return_value=resolved)
 
         with patch("src.musicplayer.YTDL.yt_source", new=yt_source):
-            out = await music_player._resolve_source(unresolved("test", queuer))
+            out = await music_player._resolve_source(source)
 
         assert yt_source.await_args is not None
         assert yt_source.await_args.args[0] is queuer
+        assert out is not resolved
         assert out.requester is queuer
+        assert out.user_input == "https://open.spotify.com/track/abc"
+        assert out.query_source == "spotify.com"
+        # What the resolve does write over, and the cleared search that makes the
+        # item playable.
+        assert (
+            out.webpage_url,
+            out.title,
+            out.duration,
+            out.uploader,
+            out.thumbnail,
+            out.search,
+        ) == (
+            "https://yt.com/v=1",
+            "Resolved",
+            213,
+            "Some Channel",
+            "https://yt.com/t.jpg",
+            "",
+        )
 
 
 # ── StreamSource ──────────────────────────────────────────────────────────────
@@ -11898,6 +11935,26 @@ class TestDirectDequeueRespectsPersistence:
         lpop_spy.assert_awaited_once()
 
 
+# Written over with what the resolve learned; every other field rides the entry
+# through _requeued_form. Not yt_stream's not-carried set: `ts` and `search` cross
+# this rebuild and do not cross into a playing song.
+_REQUEUE_FROM_PAYLOAD = {"webpage_url", "title", "duration", "uploader", "thumbnail"}
+
+
+def _requeue_carried_bools() -> dict[str, bool]:
+    """Every bool the rebuild must carry, with its default. A bool has one
+    non-default value, so the reflective guard cannot vary these against each
+    other — setting them all reads back clean when two are crossed."""
+    return {
+        f.name: f.default
+        for f in dataclasses.fields(QueueObject)
+        if f.name not in _REQUEUE_FROM_PAYLOAD and isinstance(f.default, bool)
+    }
+
+
+_REQUEUE_CARRIED_BOOLS = _requeue_carried_bools()
+
+
 class TestNeutralizePrefetch:
     def test_no_field_is_lost_when_a_prefetched_song_is_requeued(
         self,
@@ -11929,16 +11986,37 @@ class TestNeutralizePrefetch:
 
         rebuilt = music_player._requeued_form(ytdl_instance(queued=queued))
 
-        # Written over with what the resolve learned; ts comes back through the
-        # -ss offset it became, which is the same number.
-        from_payload = {"webpage_url", "title", "duration", "uploader", "thumbnail"}
+        # ts comes back through the -ss offset it became, which is the same number.
         lost = sorted(
             f.name
             for f in dataclasses.fields(QueueObject)
-            if f.name not in from_payload
+            if f.name not in _REQUEUE_FROM_PAYLOAD
             and getattr(rebuilt, f.name) != getattr(queued, f.name)
         )
         assert not lost, f"fields lost requeueing a prefetched song: {lost}"
+
+    @pytest.mark.parametrize("flipped", sorted(_REQUEUE_CARRIED_BOOLS))
+    def test_each_bool_comes_back_on_the_field_it_went_out_on(
+        self,
+        flipped: str,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        ytdl_instance: Callable[..., Any],
+    ) -> None:
+        """One bool off its default while the rest hold theirs. The guard above
+        sets all six at once, and five of them share the value True — so a
+        keyword added here naming a neighbour's flag reads back clean there and
+        fails here."""
+        queued = dataclasses.replace(
+            QueueObject("https://yt.com/v=prefetched", "Prefetched", mock_author),
+            **{flipped: not _REQUEUE_CARRIED_BOOLS[flipped]},
+        )
+
+        rebuilt = music_player._requeued_form(ytdl_instance(queued=queued))
+
+        assert {name: getattr(rebuilt, name) for name in _REQUEUE_CARRIED_BOOLS} == {
+            name: getattr(queued, name) for name in _REQUEUE_CARRIED_BOOLS
+        }
 
     async def test_no_task_is_noop(self, music_player: MusicPlayer) -> None:
         music_player._prefetch_task = None

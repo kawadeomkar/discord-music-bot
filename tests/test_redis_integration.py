@@ -51,7 +51,13 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import GuildConfig, HistoryEntry, SongQueueEntry
+from src.guild_state import (
+    GuildConfig,
+    GuildStateData,
+    HistoryEntry,
+    SongQueueEntry,
+    StateField,
+)
 from src.redis_client import (
     GUILD_CONFIG_KEY,
     GUILD_STATE_KEY,
@@ -1151,3 +1157,97 @@ class TestRecoveryLockCompareAndDelete:
             assert await redis.get(key) == b"the-next-attempts-token"
         finally:
             await thief.aclose()
+
+
+class TestTheParkedSongBlob:
+    """`guild:{id}:state`'s `current_song` — the playing song parked as one
+    SongQueueEntry blob by the start transaction.
+
+    fakeredis answers HSET and HDEL, so the unit tier owns the logic. The wire is
+    what only a server settles: the blob back byte for byte through a real
+    connection, and the encoding its length forces on the hash. Both store
+    methods here swallow their errors and report through a return value (golden
+    rule 5), so each return is asserted before the hash is read — against
+    fakeredis a dead transaction and a live one read the same way round.
+    """
+
+    @staticmethod
+    def _current(n: int = 1) -> SongQueueEntry:
+        """A fully populated parked entry: everything the thirteen prefixed
+        fields carry, plus the thumbnail that lives only in the blob."""
+        return SongQueueEntry(
+            webpage_url=f"https://yt.com/v={n}",
+            title=f"Song {n}",
+            requester_id=222222222222222222,
+            user_input=f"https://youtu.be/{n}",
+            duration=200,
+            uploader="Some Channel",
+            thumbnail=f"https://img/{n}.jpg",
+            queued_at=1000.0,
+            queue_position=3,
+            query_source="link",
+            played_at=1000.5,
+        )
+
+    @staticmethod
+    async def _shape(redis: aioredis.Redis, key: str) -> tuple[str, int]:
+        """OBJECT ENCODING and MEMORY USAGE for one key — neither exists on
+        fakeredis, so this pair is measurable only here."""
+        encoding = cast(bytes, await redis.object("encoding", key))
+        return encoding.decode(), cast(int, await redis.memory_usage(key))
+
+    async def test_the_parked_entry_survives_a_real_round_trip(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The blob is written, read back and parsed as the same entry, and the
+        song's end HDELs it — `_TRANSIENT_SONG_FIELDS` names it, so absent stays
+        the one representation of "no song"."""
+        store = GuildRedisStore(redis, guild_id=11)
+        current = self._current()
+        await redis.rpush(store.queue_key(), current.to_redis())
+
+        assert await store.pop_queue_and_start_song(current, 1000.5) is True
+
+        raw = cast(dict[bytes, bytes], await redis.hgetall(store.state_key()))
+        assert raw[StateField.CURRENT_SONG.encode()] == current.to_redis()
+        assert GuildStateData.from_redis(raw).current_song == current
+        assert await redis.llen(store.queue_key()) == 0  # the LPOP rode along
+
+        await store.clear_song_end_state()
+
+        cleared = cast(dict[bytes, bytes], await redis.hgetall(store.state_key()))
+        assert StateField.CURRENT_SONG.encode() not in cleared
+        assert GuildStateData.from_redis(cleared).current_song is None
+
+    async def test_the_blob_promotes_the_hash_and_the_encoding_never_demotes(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """A parked blob is longer than `hash-max-listpack-value`, so the first
+        song start converts the state hash to `hashtable`. Redis does not convert
+        back: the song's end HDELs the blob and the encoding stays, so the cost
+        outlives the song. The server's own limit is read rather than assumed, so
+        a tuned server explains a changed measurement instead of just failing.
+
+        The sizes are printed, not asserted — MEMORY USAGE tracks the title and
+        URL lengths this fixture happens to use. `just test-redis -s` shows them.
+        """
+        limits = cast(dict[str, str], await redis.config_get("hash-max-listpack-value"))
+        assert limits["hash-max-listpack-value"] == "64"
+
+        store = GuildRedisStore(redis, guild_id=12)
+        current = self._current()
+        assert len(current.to_redis()) > 64
+
+        await store.set_connection(111, 222)
+        idle = await self._shape(redis, store.state_key())
+        assert idle[0] == "listpack"
+
+        assert await store.pop_queue_and_start_song(current, 1000.5) is True
+        playing = await self._shape(redis, store.state_key())
+        assert playing[0] == "hashtable"
+
+        await store.clear_song_end_state()
+        ended = await self._shape(redis, store.state_key())
+        assert ended[0] == "hashtable"
+
+        print(f"\n{store.state_key()}: idle={idle} playing={playing} ended={ended}")

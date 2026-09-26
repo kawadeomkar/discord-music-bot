@@ -92,9 +92,9 @@ class StateField:
     # crash-recovered head.
     CURRENT_SONG_USER_INPUT: Final[str] = "current_song_user_input"
     # The parked song as one SongQueueEntry blob, the shape its queue entry had.
-    # The prefixed fields below are dual-written beside it for one release, and a
-    # blob is trusted only when its webpage_url equals CURRENT_SONG_URL — which
-    # every build writes (docs/ARCHITECTURE.md#the-parked-song).
+    # The prefixed fields below are dual-written beside it for one release and win
+    # on everything they carry; the blob supplies the rest, and only when its
+    # webpage_url and played_at match theirs (docs/ARCHITECTURE.md#the-parked-song).
     CURRENT_SONG: Final[str] = "current_song"
     # When the audio started. Not PLAY_START_EPOCH (backdated by -ss) and not
     # derivable from this run's clock: a resume tail inherits an earlier
@@ -207,34 +207,29 @@ def parse_number_fields(
     return numbers
 
 
-def _parked_song(raw: dict[bytes, bytes]) -> SongQueueEntry | None:
-    """The song that was playing, as its queue entry: the blob when it describes
-    the PLAY the prefixed fields describe, else those fields, which every build
-    writes. None when no song is parked.
+# The entry fields the thirteen prefixed keys carry. A matching blob is overlaid
+# with these, so it contributes only what they never did: `thumbnail` and the
+# np_* ids.
+_PARKED_FIELDS: Final[tuple[str, ...]] = (
+    "webpage_url",
+    "title",
+    "duration",
+    "uploader",
+    "requester_id",
+    "interjected",
+    "is_resume",
+    "start_paused",
+    "queued_at",
+    "queue_position",
+    "query_source",
+    "user_input",
+    "played_at",
+)
 
-    The guard is not a formality. An older build HDELs only the fields it knows, so
-    a blob written before a rollback outlives every song that build then plays;
-    trusted unguarded, recovery would re-queue a song whose list entry was LPOPed
-    releases ago. The url alone does not settle it — a rolled-back build replays
-    the same song constantly, a fragment and its own resume tail among them — so
-    `played_at` is compared too: the start epoch is per play, and both builds write
-    it from the same object as the blob, so agreement is exact by construction.
-    Same rollback-then-roll-forward window `_heartbeat_predates_song` guards on the
-    position."""
-    url = _b_str(raw, StateField.CURRENT_SONG_URL)
-    if not url:
-        return None
-    blob = _b_str(raw, StateField.CURRENT_SONG)
-    if blob:
-        entry = parse_queue_entry(blob)
-        played_at = _b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0
-        if (
-            isinstance(entry, SongQueueEntry)
-            and entry.webpage_url == url
-            and entry.played_at == played_at
-        ):
-            return entry
-        log.warning("guild_state: parked blob does not describe the parked play")
+
+def _parked_fields(raw: dict[bytes, bytes], url: str) -> SongQueueEntry:
+    """The parked song as the prefixed keys spell it — every build's write, and
+    the whole entry for one that stored no blob."""
     return SongQueueEntry(
         webpage_url=url,
         title=_b_str(raw, StateField.CURRENT_SONG_TITLE),
@@ -251,6 +246,35 @@ def _parked_song(raw: dict[bytes, bytes]) -> SongQueueEntry | None:
         user_input=_b_str(raw, StateField.CURRENT_SONG_USER_INPUT) or None,
         played_at=_b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0,
     )
+
+
+def _parked_song(raw: dict[bytes, bytes]) -> SongQueueEntry | None:
+    """The song that was playing, as its queue entry; None when none is parked.
+    The prefixed fields win on everything they carry, and a blob describing the
+    same play adds `thumbnail` and the np_* ids; the url and start-epoch gate
+    keeps out a blob an older build left behind
+    (docs/ARCHITECTURE.md#the-parked-song)."""
+    url = _b_str(raw, StateField.CURRENT_SONG_URL)
+    if not url:
+        return None
+    fields = _parked_fields(raw, url)
+    blob = _b_str(raw, StateField.CURRENT_SONG)
+    if not blob:
+        return fields
+    entry = parse_queue_entry(blob)
+    if (
+        isinstance(entry, SongQueueEntry)
+        and entry.webpage_url == url
+        and entry.played_at == fields.played_at
+    ):
+        # The gate alone cannot settle it: a fragment and its own resume tail are
+        # one play, so they agree on both. Overlaying is what keeps the other
+        # fragment's flags off this one.
+        return replace(
+            entry, **{name: getattr(fields, name) for name in _PARKED_FIELDS}
+        )
+    log.warning("guild_state: parked blob does not describe the parked play")
+    return fields
 
 
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
@@ -757,6 +781,7 @@ class SongQueueEntry:
             title=song.title or "",
             duration=song.duration_secs or None,
             uploader=song.uploader,
+            thumbnail=song.thumbnail,
         )
 
     @staticmethod
@@ -842,7 +867,11 @@ class SearchQueueEntry:
     def from_queue_object(cls, item: QueueObject) -> Self:
         """The at-rest form of an item that is still a search. `process` is the
         True every search entry has been written with: these bytes have to match
-        what is already on the list, or an LREM misses the entry."""
+        what is already on the list, or an LREM misses the entry.
+
+        A live item has no "absent": it always names a requester, and an empty
+        display value is the same value as none. An entry rewritten from one
+        therefore settles on the bytes this writer gives it and holds them."""
         return cls(
             ytsearch=item.search,
             process=True,
@@ -853,7 +882,8 @@ class SearchQueueEntry:
             query_source=item.query_source,
             requester_id=item.requester.id,
             # What a listing shows until the search resolves, off the same item
-            # the row is rendered from.
+            # the row is rendered from. Empty writes as no key — the bytes a walk
+            # that named no display row writes for the same track.
             title=item.title or None,
             uploader=item.uploader,
             duration=item.duration,

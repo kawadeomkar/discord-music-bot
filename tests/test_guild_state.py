@@ -712,9 +712,10 @@ class TestSearchQueueEntryWire:
         assert entry.to_redis() == _GOLDEN_YTSOURCE_FULL
 
     def test_a_falsy_display_value_is_written_not_skipped(self) -> None:
-        """The guard is `is not None`, not truthiness: a Spotify track can carry a
-        zero duration, and skipping the key would read back as unknown and render
-        `?:??` — and make the entry's bytes differ from a re-serialization."""
+        """The writer's guard is `is not None`, not truthiness: a Spotify track
+        can carry a zero duration, and skipping the key would read back as
+        unknown and render `?:??`. This is the writer's own contract — a live
+        item reaches it with empty already mapped to absent."""
         entry = SearchQueueEntry(
             ytsearch="ytsearch:x", process=True, title="", duration=0
         )
@@ -1541,6 +1542,20 @@ class TestSongQueueEntryFromSong:
             1752530111.0,
         )
 
+    def test_the_payload_thumbnail_is_written_over_the_queued_one(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
+        """The cover the resolve found, the one HistoryEntry.from_song archives.
+        The queued item holds whatever the enqueue-time extraction saw."""
+        song = ytdl_instance(
+            {"thumbnail": "https://img.yt.com/resolved.jpg"},
+            thumbnail="https://img.yt.com/queued.jpg",
+        )
+
+        entry = SongQueueEntry.from_song(song)
+
+        assert entry.thumbnail == "https://img.yt.com/resolved.jpg"
+
 
 class TestCrashedSongRoundTrip:
     """from_song -> the state hash -> from_crashed_state is a closed loop, and a
@@ -1561,6 +1576,7 @@ class TestCrashedSongRoundTrip:
         song.requester.id = 7
         song.duration_secs = 200
         song.uploader = "Chan"
+        song.thumbnail = "https://img.yt.com/tail.jpg"
         song.interjected = False
         song.is_resume = True
         song.start_paused = True
@@ -1603,10 +1619,11 @@ class TestCrashedSongRoundTrip:
 
 class TestTheParkedSongSurvivesACrash:
     """The playing song is parked as one blob beside the prefixed fields a build
-    before it reads. The url is the guard: an older build HDELs only the fields it
-    knows, so a blob can outlive the song it describes — the
-    rollback-then-roll-forward window `_heartbeat_predates_song` guards on the
-    position."""
+    before it reads. Those fields win on everything they carry; the blob adds the
+    thumbnail and the np_* ids, and only when its url and start epoch match them —
+    an older build HDELs only the fields it knows, so a blob can outlive the song
+    it describes, the rollback-then-roll-forward window `_heartbeat_predates_song`
+    guards on the position."""
 
     @staticmethod
     def _entry(url: str, **fields: Any) -> SongQueueEntry:
@@ -1719,6 +1736,100 @@ class TestTheParkedSongSurvivesACrash:
         assert state.current_song.is_resume is False
         assert state.current_song.start_paused is False
         assert "does not describe" in caplog.text
+
+    def test_an_earlier_plays_card_does_not_reach_the_recovered_song(self) -> None:
+        """The other half of the gate's consequence, at the surface recovery
+        reads: the prefixed fields win on what they carry either way, so what an
+        earlier play's blob actually lends is the thumbnail and the NP card it
+        already posted — and the recovered song would edit and delete a message
+        belonging to a play that ended."""
+        stale = self._entry(
+            "https://yt.com/v=1",
+            played_at=1000.0,
+            thumbnail="https://img/old.jpg",
+            np_message_id=11,
+            np_channel_id=22,
+            np_dedicated=True,
+        )
+        state = GuildStateData.from_redis(
+            self._hash("https://yt.com/v=1", stale, played_at=2000.0)
+        )
+
+        recovered = SongQueueEntry.from_crashed_state(state, position=42)
+
+        assert recovered is not None
+        assert recovered.thumbnail is None
+        assert (recovered.np_message_id, recovered.np_channel_id) == (0, 0)
+        assert recovered.np_dedicated is False
+
+    def test_a_blob_from_the_other_fragment_of_one_play_loses_to_the_fields(
+        self,
+    ) -> None:
+        """A resume tail INHERITS its fragment's start epoch, so url and
+        `played_at` cannot tell the two apart and a rolled-back build's blob for
+        one passes the gate on the other. The prefixed fields describe the play
+        THIS build parked, so they win on everything they carry; the blob is read
+        for the thumbnail and the np_* ids alone.
+
+        Built off the writer's own mapping against a blob that disagrees on every
+        field of it, so a field the overlay forgets fails here."""
+        tail = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Tail",
+            duration=321,
+            uploader="A Channel",
+            requester_id=7,
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            queued_at=900.5,
+            queue_position=4,
+            query_source="spotify.com",
+            user_input="https://open.spotify.com/playlist/abc",
+            played_at=1000.5,
+        )
+        fragment = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Fragment",
+            duration=999,
+            uploader="Another Channel",
+            requester_id=8,
+            interjected=False,
+            is_resume=False,
+            start_paused=False,
+            queued_at=1.5,
+            queue_position=0,
+            query_source="youtube.com",
+            user_input="https://yt.com/v=1",
+            played_at=1000.5,  # inherited by the tail — the one field they share
+            thumbnail="https://img/1.jpg",
+            np_message_id=11,
+            np_channel_id=22,
+            np_dedicated=True,
+        )
+        written = GuildRedisStore._now_playing_state_mapping(
+            cast(GuildRedisStore, None), tail, 1000.5
+        )
+        raw = {key.encode(): value.encode() for key, value in written.items()}
+        raw[StateField.CURRENT_SONG.encode()] = fragment.to_redis()
+
+        parked = GuildStateData.from_redis(raw).current_song
+
+        assert parked == dataclasses.replace(
+            tail,
+            thumbnail="https://img/1.jpg",
+            np_message_id=11,
+            np_channel_id=22,
+            np_dedicated=True,
+        )
+
+    def test_a_blob_with_no_parked_url_is_no_parked_song(self) -> None:
+        """An older build HDELs the fields it knows and leaves the blob. Nothing
+        was playing when this build stopped, so nothing is recovered."""
+        raw = self._hash("https://yt.com/v=1", self._entry("https://yt.com/v=1"))
+        del raw[StateField.CURRENT_SONG_URL.encode()]
+
+        assert GuildStateData.from_redis(raw).current_song is None
 
     @pytest.mark.parametrize("stored", [b"not json", b'"a string"', b"[]", b"{}"])
     def test_a_malformed_blob_falls_back_to_the_fields(self, stored: bytes) -> None:

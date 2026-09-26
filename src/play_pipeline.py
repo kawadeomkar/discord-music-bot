@@ -70,6 +70,11 @@ log = get_logger(__name__)
 # thousand, which is how long each chunk holds the event loop.
 _SEARCH_BUILD_CHUNK = 1000
 
+# Items re-minted per event-loop turn by _rebase_positions. Measured 0.43 ms a
+# thousand, so 2,000 is the chunk that holds the event loop for about a
+# millisecond: 10,000 tracks pay five of those instead of one slice of 4.3 ms.
+_REBASE_CHUNK = 2000
+
 # Blank lines and the "... and N more" tail the rows add around themselves.
 _DESCRIPTION_MARGIN = 64
 _tracer = get_tracer(__name__)
@@ -124,7 +129,10 @@ class EmptyPlaylistError(PlaylistInputError):
         )
 
 
-@dataclass
+# kw_only: `title` and `link` are adjacent Optional[str]s that transpose silently.
+# frozen: nothing writes a field back; the enqueue re-mints the ITEMS in place
+# (with_queue_position) and rebinds its own local for the list.
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ResolvedPlaylist:
     """A collection resolved to queue items. A Spotify collection's items are
     still searches, resolved at dequeue; a YouTube walk's are playable already —
@@ -391,21 +399,25 @@ async def _searches_for(
     return tracks
 
 
-def _rebase_positions(
+async def _rebase_positions(
     tracks: Sequence[QueueObject], minted_from: int, base: int
 ) -> Sequence[QueueObject]:
     """Move a resolved collection's `queue_position`s from one head depth to
-    another, returning `tracks` unchanged when the head has not moved.
+    another, returning `tracks` unchanged when the head has not moved and yielding
+    the loop every chunk otherwise.
 
     Called twice per collection enqueue. The first is unconditional: the resolve
-    mints depths against the ASK, which is 0 for every collection, so the copy
-    (milliseconds at 5,000 tracks) is what buys one minting rule for both
-    collection kinds — and it runs before the place lock, where no sibling `-play`
-    waits it out. The second, under the lock, moves only when another request
-    placed in between."""
+    mints depths against the ASK, which is 0 for every collection, so the pass is
+    what buys one minting rule for both collection kinds. The second, under the
+    lock, moves only when another request placed in between."""
     if base == minted_from:
         return tracks
-    return [with_queue_position(t, base + offset) for offset, t in enumerate(tracks)]
+    rebased: list[QueueObject] = []
+    for offset, track in enumerate(tracks):
+        if offset and offset % _REBASE_CHUNK == 0:
+            await asyncio.sleep(0)
+        rebased.append(with_queue_position(track, base + offset))
+    return rebased
 
 
 def _head_depth(mp: MusicPlayer, placement: Placement) -> int:
@@ -540,14 +552,12 @@ async def queue_source(
     `start_offset` is `--timestamp`, applied here so a link's `t=` and the flag
     reach the song by one route."""
     if _is_spotify_collection(source):
-        # Titles, not QueueObjects — enqueue_playlist mints the YTSources
-        # they become, carrying this command's analytics.
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
         return ResolvedPlaylist(
             # Items that are still searches: a collection nobody plays to the end
             # never resolves its tail, and the ask depth they are minted against
             # is rebased onto the head's at the insert.
-            await _searches_for(
+            tracks=await _searches_for(
                 playlist.titles,
                 requester=ctx.author,
                 analytics=analytics,
@@ -579,7 +589,7 @@ async def queue_source(
             tracks, source, effective_start_offset(source, start_offset)
         )
         return ResolvedPlaylist(
-            tracks,
+            tracks=tracks,
             title=playlist.title,
             link=source.playlist_url,
             skipped=skipped,
@@ -661,15 +671,17 @@ async def enqueue_playlist(
     # The same sum -queue shows for these tracks: the lengths on the items, added
     # as whole seconds, so the two totals cannot drift apart.
     runtime = queue_runtime(tracks)
-    # Rebased before the lock: at 5,000 tracks the pass is milliseconds of
-    # event-loop time every sibling -play would wait out (_rebase_positions), and
-    # the depths the resolve minted are the ask's, not this head's.
+    # Rebased before the lock: the depths the resolve minted are the ask's, not
+    # this head's, and off the lock no sibling -play spends its place bound on the
+    # pass. The one under the lock moves only when a sibling placed in between.
     provisional = _head_depth(mp, placement)
-    tracks = _rebase_positions(tracks, analytics.queue_position, provisional)
+    tracks = await _rebase_positions(tracks, analytics.queue_position, provisional)
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             ahead = _songs_ahead(mp, placement)
-            tracks = _rebase_positions(tracks, provisional, _head_depth(mp, placement))
+            tracks = await _rebase_positions(
+                tracks, provisional, _head_depth(mp, placement)
+            )
             await enqueue(tracks, prefetch=False)
     if not verdict.placed:
         await cog._report_dropped(req, verdict)
@@ -807,10 +819,8 @@ async def enqueue_single(
                 # and its tail together or neither. The tail is re-minted from the
                 # head's depth: play_history keeps whatever number is on it. Only
                 # interject_flow passes follow_on, and it already warmed the head.
-                await mp.queue_put(
-                    [qobj, *_rebase_positions(follow_on, provisional, depth + 1)],
-                    prefetch=False,
-                )
+                rebased = await _rebase_positions(follow_on, provisional, depth + 1)
+                await mp.queue_put([qobj, *rebased], prefetch=False)
             else:
                 await mp.queue_put(qobj)
             log.info(f"play ({placement.value}) qsize: {mp.queue.qsize()}")

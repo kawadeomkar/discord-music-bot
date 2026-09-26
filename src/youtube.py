@@ -1216,15 +1216,20 @@ class NpHostRef:
 
 
 # slots: a 10,000-track Spotify playlist holds one of these per track while its
-# searches wait to resolve (201 B each, against 257 B with a __dict__). Keep the
-# class free of __dict__ readers (asdict/vars) and off any pickle path.
+# searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
+# against 344 B for the same instance carrying a __dict__. Keep the class free of
+# __dict__ readers (asdict/vars) and off any pickle path.
 @dataclass(slots=True)
 class QueueObject:
     """One queued song, resolved or not. A track queued from a Spotify playlist
-    arrives as a search — `search` set, `webpage_url` empty — and the resolve at
-    dequeue fills in what yt-dlp found. Everything else about the ask is the same
-    either way, which is why there is one type: see
-    docs/ARCHITECTURE.md#one-queue-item."""
+    arrives as a search: `search` set, `webpage_url` its own Spotify page or empty.
+    The resolve at dequeue returns it with what yt-dlp found over its display fields
+    and `search` cleared, leaving the queued original on the deque. Everything else
+    about the ask is the same either way, which is why there is one type — see
+    docs/ARCHITECTURE.md#one-queue-item.
+
+    Neither `frozen` nor `kw_only`: `_enrich_queueobject`, the `played_at` stamp and
+    a resume tail's NP ids all write attributes on a live item."""
 
     webpage_url: str
     title: str
@@ -1272,9 +1277,9 @@ class QueueObject:
     np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
     np_dedicated: bool = False  # a pure NP message (deletable) vs a response
     np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
-    # The `ytsearch:` term an unresolved item still has to resolve, cleared by
-    # the resolve at dequeue. `title` stands in as the term's own text meanwhile,
-    # so the queue card and -remove read the same field for every item.
+    # The `ytsearch:` term an unresolved item still has to resolve, cleared by the
+    # resolve at dequeue. `title` meanwhile is the walk's row name, or empty when
+    # the walk had none — every renderer falls back to this term.
     search: str = ""
 
     @property
@@ -1696,7 +1701,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self._packets_read: int = 0
 
     # ── the ask, read off the queue object this source was built from ──
-    # Aliases, so every reader spells a playing song's ask the way it always has.
+    # Aliases, so a playing song's ask is spelled the way a queued item's is.
     # Read-only on purpose: the item is still on the deque while a prefetch holds
     # it, so a write here would reach the queue. played_at is the exception below.
 

@@ -1629,6 +1629,17 @@ class TestRemoveMatcher:
         assert remove_matcher("||https://youtu.be/AbCdEfGhIjK||")(item) is None
         assert remove_matcher("https://youtu.be/aBcDeFgHiJk")(item) is not None
 
+    def test_an_unresolved_item_matches_on_the_page_the_walk_named(self) -> None:
+        """A Spotify walk names the track's own page before the search resolves,
+        and that is the link the queue card shows — so the resolved leg has to
+        accept it, ahead of the collection link the item also carries."""
+        item = unresolved("Track One", user_input="https://open.spotify.com/album/xyz")
+        item.webpage_url = "https://open.spotify.com/track/abc"
+        assert (
+            remove_matcher("https://open.spotify.com/track/abc")(item)
+            is RemoveMode.RESOLVED
+        )
+
     def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
         only thing it can be matched by, and the only place that link is."""
@@ -1728,6 +1739,28 @@ class TestRemove:
         assert outcome.positions == [1]
         assert outcome.removed == [src]
         assert len(gq.display_items()) == 1
+
+    async def test_matches_an_unresolved_item_by_its_own_track_page(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """Pasting back the link the card shows takes out that one track, while
+        its siblings — same origin, no page of their own — stay queued."""
+        walked = unresolved("Track One", mock_author, user_input="https://sp/p")
+        walked.webpage_url = "https://open.spotify.com/track/abc"
+        sibling = unresolved("Track Two", mock_author, user_input="https://sp/p")
+        await gq.put([walked, sibling])
+
+        outcome = await gq.remove(remove_matcher("https://open.spotify.com/track/abc"))
+
+        assert outcome.positions == [1]
+        assert outcome.removed == [walked]
+        assert outcome.mode is RemoveMode.RESOLVED
+        assert gq.display_items() == [sibling]
+        await _assert_mirror_matches(gq, fake_redis, store)
 
 
 class TestResumeTailDepth:
@@ -1925,8 +1958,10 @@ class TestRestoreEntries:
         ]
         assert queue_object(items[0]).requester is mock_author
         assert queue_object(items[0]).duration == 101
-        # In-memory only: the entries were already on the Redis list.
+        # In-memory only: the entries were already on the Redis list, and a
+        # restore that keeps every one of them leaves that list correct.
         assert await fake_redis.exists(store.queue_key()) == 0
+        assert not gq.mirror_dirty
 
     async def test_a_restored_search_keeps_what_the_listing_shows(
         self, gq: GuildQueue
@@ -1961,9 +1996,10 @@ class TestRestoreEntries:
     async def test_a_departed_member_still_resolves_through_the_user_cache(
         self, mock_guild: MagicMock, store: GuildRedisStore
     ) -> None:
-        """MusicPlayer._resolve_requester reads the user cache for the lazy searches,
-        so without this leg one restored snapshot archives the same person's songs
-        and searches under two requesters."""
+        """_rehydrate's second leg: an id no longer a member of this guild still
+        resolves through the bot's user cache. Without it the whole restored
+        snapshot lands on the fallback, archiving one person's plays under
+        another's name."""
         departed = MagicMock()
         departed.id = 4242
         mock_guild.get_member = MagicMock(return_value=None)
@@ -1997,6 +2033,53 @@ class TestRestoreEntries:
         count = await gq.restore_entries([self._entry(1, 12345)])
         assert count == 0
         assert gq.qsize() == 0
+
+    async def test_a_dropped_entry_marks_the_mirror_stale(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """The list keeps the dropped entry at its position and the deque does
+        not, so the next LPOP — positional — would retire its neighbour and leave
+        the last song on the list to replay after the next restart."""
+        mock_guild.owner = None
+        mock_guild.get_member = MagicMock(
+            side_effect=lambda uid: mock_author if uid == mock_author.id else None
+        )
+        nobodys = SongQueueEntry(
+            webpage_url="https://yt.com/v=2", title="Song 2", requester_id=None
+        )
+        entries = [
+            self._entry(1, mock_author.id),
+            nobodys,
+            self._entry(3, mock_author.id),
+        ]
+        for entry in entries:
+            await store.push_queue(entry)
+
+        assert await gq.restore_entries(entries) == 2
+        assert gq.mirror_dirty
+        assert await fake_redis.llen(store.queue_key()) == 3
+
+        # Two song starts settled the way the playback loop settles them: a stale
+        # mirror is REPLACED from memory, a clean one LPOPed.
+        for _ in range(2):
+            item = await gq.get()
+            stale = gq.mirror_dirty
+            async with gq.commit_dequeue(gq.generation) as ok:
+                assert ok
+                if stale:
+                    landed = await store.rebuild_queue(gq.mirror_entries())
+                else:
+                    await gq.redis_pop_for(item)
+                    landed = True
+                gq.note_mirror_write(landed=landed, retired=not stale)
+
+        assert gq.display_items() == []
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
 
     async def test_interjection_flags_rehydrate(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
@@ -2099,6 +2182,90 @@ class TestRestoreEntries:
             "",
             "",
         )
+
+
+class TestARestoredSearchReSerializesToItself:
+    """Every LREM and every mirror rebuild re-serializes a restored item, and a
+    byte that differs there misses the entry the list holds. A live item carries
+    no "absent": two shapes an older build could have written settle on other
+    bytes the first time this one rewrites them, and on those bytes after."""
+
+    @staticmethod
+    async def _settle(gq: GuildQueue, written: bytes) -> tuple[bytes, bytes]:
+        """`written` restored and re-serialized, twice over, so the second pass
+        reads back what the first pass wrote."""
+        passes: list[bytes] = []
+        for _ in range(2):
+            entry = parse_queue_entry(written)
+            assert entry is not None
+            assert await gq.restore_entries([entry]) == 1
+            written = _to_entry(gq.display_items()[-1]).to_redis()
+            passes.append(written)
+        return passes[0], passes[1]
+
+    async def test_an_empty_display_value_settles_as_no_key(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """A Spotify row whose name or url is empty was written as the key with
+        an empty value; the item it rehydrates into cannot tell that from no row
+        at all, so it writes back what a no-row walk writes."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        written = SearchQueueEntry(
+            ytsearch="ytsearch:x",
+            process=True,
+            requester_id=mock_author.id,
+            title="",
+            webpage_url="",
+        ).to_redis()
+
+        first, second = await self._settle(gq, written)
+
+        assert b'"title"' not in first
+        assert b'"webpage_url"' not in first
+        assert first != written
+        assert second == first
+
+    async def test_an_entry_with_no_requester_settles_with_one(
+        self, gq: GuildQueue, mock_guild: MagicMock
+    ) -> None:
+        """An entry written before searches carried a requester restores against
+        the owner, and that id is on the bytes from then on — which is only
+        settled because the second restore resolves the id it just wrote."""
+        owner = mock_guild.owner
+        mock_guild.get_member = MagicMock(
+            side_effect=lambda uid: owner if uid == owner.id else None
+        )
+        written = SearchQueueEntry(ytsearch="ytsearch:x", process=True).to_redis()
+
+        first, second = await self._settle(gq, written)
+
+        assert b'"requester_id"' not in written
+        assert f'"requester_id":{owner.id}'.encode() in first
+        assert second == first
+
+    async def test_what_a_walk_writes_today_survives_untouched(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The entries the two above are the edges of: neither a named row nor an
+        unnamed one moves a byte, so a restart costs no LREM its match."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        for entry in (
+            SearchQueueEntry(
+                ytsearch="ytsearch:x", process=True, requester_id=mock_author.id
+            ),
+            SearchQueueEntry(
+                ytsearch="ytsearch:DNA. Kendrick Lamar",
+                process=True,
+                requester_id=mock_author.id,
+                title="DNA.",
+                uploader="Kendrick Lamar",
+                duration=185,
+                webpage_url="https://open.spotify.com/track/abc",
+            ),
+        ):
+            written = entry.to_redis()
+            first, second = await self._settle(gq, written)
+            assert (first, second) == (written, written)
 
 
 class TestRestoreCrashed:
@@ -3372,6 +3539,23 @@ class TestItemLabelNamesEveryItem:
         self, mock_author: MagicMock
     ) -> None:
         assert item_label(QueueObject("https://yt.com/v=2", "", mock_author)) == "?"
+
+    async def test_an_unresolved_link_falls_back_to_the_url(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """A `"ytsource"` entry holding a url and no ytsearch — what a link queued
+        before it resolved rests as. Its search is that url, with no `ytsearch:`
+        to strip, so the -remove reply names the link rather than `?`."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        entry = parse_queue_entry(
+            SearchQueueEntry(
+                url="https://yt.com/v=2", process=True, requester_id=mock_author.id
+            ).to_redis()
+        )
+        assert entry is not None
+        assert await gq.restore_entries([entry]) == 1
+
+        assert item_label(gq.display_items()[0]) == "https://yt.com/v=2"
 
 
 class TestASwallowedAppendMarksTheMirrorStale:

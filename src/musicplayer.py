@@ -1991,7 +1991,7 @@ class MusicPlayer:
 
     def _requeued_form(self, song: YTDL) -> QueueObject:
         """The QueueObject a built source came from: what a completed prefetch
-        goes back on the queue as, and what a volume rebuild is built from."""
+        goes back on the queue as, and what a stream retry re-mints from."""
         # The ask comes back whole off song.queued — the live retry budget with it,
         # so a dead song cannot loop past the cap — and only what the resolve
         # learned is written over it. Dropping one of these restarts a neutralized
@@ -2001,7 +2001,6 @@ class MusicPlayer:
             webpage_url=song.webpage_url or "",
             title=song.title or "",
             ts=song.start_offset or None,
-            user_input=song.user_input,
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
@@ -2630,9 +2629,9 @@ class MusicPlayer:
                             async with async_timeout.timeout(idle_secs) as idle:
                                 source = await self.queue_get()
                                 claim_outstanding = True
-                                # Safe before the resolve: an item that is still
-                                # a search is persisted, and the resolve writes
-                                # onto it without touching that.
+                                # Safe before the resolve: `persisted` is not
+                                # one of the display fields the resolve's copy
+                                # writes over, so it reads the same either side.
                                 claim_persisted = is_persisted(source)
                                 # Re-read: a clear() during the blocking get
                                 # belongs to the queue this item came from.

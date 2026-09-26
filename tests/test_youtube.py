@@ -274,8 +274,8 @@ class TestYTDLPositionSecs:
 
 def _carried_queueobject_fields() -> set[str]:
     """QueueObject fields that must reach the playing YTDL, by name. Derived from
-    the dataclass, so a field added tomorrow is covered by both guards below
-    without either being edited. Anything not meant to cross is named here."""
+    the dataclass, so a field added tomorrow is covered by the guards below
+    without any of them being edited. Anything not meant to cross is named here."""
     import dataclasses
 
     not_carried = {
@@ -291,6 +291,23 @@ def _carried_queueobject_fields() -> set[str]:
         "search",
     }
     return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+
+
+def _carried_bool_defaults() -> dict[str, bool]:
+    """Every carried bool field with its default. A bool field has exactly one
+    non-default value, so the reflective guard below cannot vary the bools
+    against each other; the flip test does it one field at a time."""
+    import dataclasses
+
+    carried = _carried_queueobject_fields()
+    return {
+        f.name: f.default
+        for f in dataclasses.fields(QueueObject)
+        if f.name in carried and isinstance(f.default, bool)
+    }
+
+
+_CARRIED_BOOLS = _carried_bool_defaults()
 
 
 class TestYtStreamCarriesTheQueueObjectsFields:
@@ -339,11 +356,10 @@ class TestYtStreamCarriesTheQueueObjectsFields:
     async def test_no_queueobject_field_is_silently_left_behind(
         self, mock_ctx: MagicMock
     ) -> None:
-        """Reflective, so a field added to QueueObject tomorrow fails HERE rather
-        than at playback, where every read of it happens. The source HOLDS its
-        entry rather than copying it, so a new field crosses by construction; the
-        guard below proves each one reads back, and anything the resolve is what
-        learns gets named in the allow-list, with the reason."""
+        """The source HOLDS the entry it was queued from rather than copying it,
+        so a field added to QueueObject tomorrow crosses by construction — the
+        identity below is what that claim rests on. `ts` is the one field renamed
+        at the boundary, so it is the one asserted by hand."""
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=45
         )
@@ -408,6 +424,27 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             if getattr(song, name, "<<absent>>") != getattr(qobj, name)
         }
         assert not mismatched, f"dropped between QueueObject and YTDL: {mismatched}"
+
+    @pytest.mark.parametrize("flipped", sorted(_CARRIED_BOOLS))
+    async def test_each_bool_arrives_on_the_property_of_its_own_field(
+        self, flipped: str, mock_ctx: MagicMock
+    ) -> None:
+        """One bool off its default while the rest hold theirs: a property
+        reading a NEIGHBOUR's field then reads that field's default and the
+        mismatch surfaces. The guard above sets every bool at once, where a
+        crossed pair holding the same value reads back clean."""
+        qobj = replace(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+            ),
+            **{flipped: not _CARRIED_BOOLS[flipped]},
+        )
+
+        song = await self._played(qobj)
+
+        assert {name: getattr(song, name) for name in _CARRIED_BOOLS} == {
+            name: getattr(qobj, name) for name in _CARRIED_BOOLS
+        }
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a

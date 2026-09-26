@@ -93,9 +93,9 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   behind it is a network round trip. Everything that reads that cache joins the
   same job through `_stream_cache_get`, so nothing extracts the URL twice.
   See docs/ARCHITECTURE.md#resolve-mode and #warming-the-stream-cache.
-  Spotify track → title search; Spotify album/playlist → titles → YTSource ytsearch
-  entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
-  QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
+  Spotify track → title search; Spotify album/playlist → titles → QueueObjects
+  carrying their ytsearch term, resolved at dequeue; YouTube playlist → flat
+  extraction to QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
   playlists, so a 10,000-track paste yields to the event loop between chunks).
   A COLLECTION that outlives its server's queue-progress-delay gets a live card here
   (src/queue_progress.py), deleted when the enqueue lands. TWO entry points, since
@@ -116,9 +116,8 @@ PHASE 2 — PREFETCH (background):
     cached, stamped `probed_at` so the play seconds later skips a second probe
   ▼
 PHASE 3 — STREAM (playback loop, usually zero extraction):
-  loop(): gate open → dequeue → resolve (if YTSource) → yt_stream (cache hit →
-  no yt-dlp call) → rebuild if the volume changed → vc.play(YTDL) → atomic Redis
-  start transaction →
+  loop(): gate open → dequeue → resolve (if item.unresolved) → yt_stream (cache
+  hit → no yt-dlp call) → vc.play(YTDL) → atomic Redis start transaction →
   NP embed + 3s progress updater → spawn prefetch for next → play_next.wait()
   → history add, clear transient state, next iteration
 ```
@@ -343,7 +342,7 @@ interjecting would stop the song the user chose to keep.
 rest between it and the resume entry, so the interrupted song returns after the WHOLE
 playlist — deliberate, stated in the confirmation, and undone by one `-remove <the
 link>` (which matches on `user_input`, carried by every track). Only the head is
-resolved and stream-warmed; a Spotify collection's tail stays lazy `YTSource`s.
+resolved and stream-warmed; a Spotify collection's tail stays unresolved `QueueObject`s.
 
 `--next` front-inserts without interrupting, via `MusicPlayer.queue_put_next` —
 `_neutralize_prefetch()` then `put_front`, because `loop()`'s prefetch holds a claim
@@ -455,7 +454,7 @@ can spend the whole placement budget before the insert begins.
 next" and "Queued song" cards are a separate renderer reading the same fields, so a
 change to the row format is not automatically a change to them. A new surface that lists
 queue items calls `queue_rows`, never its own format; an unresolved search renders from
-`YTSource`'s display fields, so a new kind of lazy entry sets those rather than teaching
+the item's own display fields, so a new kind of lazy entry sets those rather than teaching
 the formatter a new type. See `docs/ARCHITECTURE.md#queue-rows`.
 
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
@@ -464,10 +463,9 @@ default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable �
 parse) → `QueueObject` + `GuildQueue._rehydrate` → **a read-only property on `YTDL`
 returning `self.queued.<field>`, if a playing song reads it**. A playing song HOLDS the
 entry it was built from (`YTDL.queued`), so the field crosses into playback with no
-keyword and comes back through the `replace(song.queued, …)` rebuilds — the requeue a
-completed prefetch and the volume rebuild share, `interject()`'s resume tail, and
-`commands/replay.py` — without being named at any of them. What each rebuild still
-names is what it deliberately does NOT carry: the fields the resolve learned, and the
+keyword and comes back through the `replace(song.queued, …)` rebuilds — the requeue of a
+completed prefetch, `interject()`'s resume tail, and `commands/replay.py` — without being
+named at any of them. What each rebuild still names is what it deliberately does NOT carry: the fields the resolve learned, and the
 play state a new entry must not inherit — the resume tail resets `stream_attempts` and
 `failed_format_ids` because it is producing audio, where `_requeued_form` inherits the
 live budget of a song that has not played. `YTDL.volume` is never carried either: it is

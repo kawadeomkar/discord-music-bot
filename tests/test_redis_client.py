@@ -3177,6 +3177,23 @@ class TestPopQueueAndStartSong:
         assert prefixed == written & prefixed
         assert StateField.CURRENT_SONG in written
 
+    async def test_a_song_end_leaves_no_current_song_field_in_the_hash(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The subset above compares two constants; this drives the clear path
+        over a hash a real start wrote. A field the start parks and the clear
+        does not name outlives its song, and the next song reads the hash beside
+        it — which is invisible until something starts trusting that field."""
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(url="https://yt.com/v=1", thumbnail="https://img/1.jpg"), 1000.0
+        )
+
+        await store.clear_song_end_state()
+
+        state = cast(dict[bytes, bytes], await fake_redis.hgetall(store.state_key()))
+        assert [key for key in state if key.startswith(b"current_song")] == []
+
     async def test_parks_the_query_source(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
