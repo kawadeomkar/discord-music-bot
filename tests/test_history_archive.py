@@ -32,6 +32,7 @@ from src.guild_state import (
     HistoryEntry,
     SourceCompletion,
     TopListener,
+    TopSong,
     serialize_history_entry,
 )
 from src.history_archive import (
@@ -46,7 +47,6 @@ from src.history_archive import (
     Leaderboard,
     PostgresHistoryArchive,
     SchemaVersionError,
-    SongLeader,
     _entry_to_row,
     _row_to_entry,
 )
@@ -727,7 +727,7 @@ class TestLeaderboardQuery:
                 ),
             ),
             songs=(
-                SongLeader(
+                TopSong(
                     title="Song",
                     webpage_url="https://yt.com/v=1",
                     duration_secs=210,
@@ -743,7 +743,7 @@ class TestLeaderboardQuery:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(row, "plays", 2)
         with pytest.raises(TypeError):
-            SongLeader("t", "u", 1, 1, 1)  # pyright: ignore[reportCallIssue]
+            TopSong("t", "u", 1, 1)  # pyright: ignore[reportCallIssue]
 
 
 class TestPostgresArchiveClosedGuard:

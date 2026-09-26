@@ -514,23 +514,10 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class SongLeader:
-    """One row of the -leaderboard songs board, grouped by webpage_url. title,
-    duration_secs and query_source are the values of that URL's newest play."""
-
-    title: str
-    webpage_url: str
-    duration_secs: int
-    query_source: str = ""
-    plays: int
-    played_secs: int
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class Leaderboard:
     # Tuples: frozen=True over a list would leave the rows mutable.
     requesters: tuple[TopListener, ...]
-    songs: tuple[SongLeader, ...]
+    songs: tuple[TopSong, ...]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -812,7 +799,7 @@ class PostgresHistoryArchive:
                 for r in requester_rows
             ),
             songs=tuple(
-                SongLeader(
+                TopSong(
                     title=r["title"],
                     webpage_url=r["webpage_url"],
                     duration_secs=r["duration_secs"],

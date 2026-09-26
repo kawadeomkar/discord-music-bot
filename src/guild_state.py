@@ -1380,11 +1380,17 @@ class TopArtist:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopSong:
-    title: str = ""
-    webpage_url: str = ""
+    """One row of a songs board, -analytics' and -leaderboard's alike. Rows group
+    by webpage_url, so title, query_source and duration_secs are the values of
+    that URL's newest play. Only -leaderboard selects and renders duration_secs,
+    which is why that one is defaulted."""
+
+    title: str
+    webpage_url: str
+    plays: int
+    played_secs: int
+    duration_secs: int = 0
     query_source: str = ""
-    plays: int = 0
-    played_secs: int = 0
 
 
 # "No usable queue-wait data in this window". Negative because 0 is a legitimate

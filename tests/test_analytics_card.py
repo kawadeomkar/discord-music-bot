@@ -239,6 +239,21 @@ class TestCacheCodec:
         blob["daily"] = [{"date": "2026-08-27", "plays": 1, "listen_secs": 1}]
         assert analytics_card.from_cache(blob) is None
 
+    def test_the_song_rows_wire_tuple_is_pinned(self) -> None:
+        """TopSong carries duration_secs for -leaderboard, which this card never
+        renders, so the tuple deliberately leaves it out. Pinned here because
+        widening it changes the cached shape, and _CACHE_VERSION would have to
+        move with it."""
+        cls, fields = analytics_card._WIRE["top_songs"]
+        assert cls is TopSong
+        assert fields == (
+            "title",
+            "webpage_url",
+            "query_source",
+            "plays",
+            "played_secs",
+        )
+
     def test_every_metrics_field_is_carried(self) -> None:
         """A new field that to_cache forgets survives a round trip as its DEFAULT,
         so the cached card silently differs from the fresh one. Compares against the
@@ -360,6 +375,25 @@ class TestEmbed:
         assert "0s" not in desc
 
 
+class TestSongLine:
+    """The whole song row, pinned byte for byte. -leaderboard renders its own line
+    from the same TopSong; this one carries no host chip, no query source and no
+    track length, so duration_secs never reaches it."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        song = TopSong(
+            title="Know My Name",
+            webpage_url="https://yt.com/v=1",
+            query_source="search",
+            plays=3,
+            played_secs=600,
+            duration_secs=210,
+        )
+        assert analytics_card._line_song(1, song) == (
+            "**1.** [Know My Name](https://yt.com/v=1) — 10:00 · 3 plays"
+        )
+
+
 class TestEmbedSafety:
     """Every string on this card comes from the archive, where title, uploader and
     requester_name are bare `text` columns with no CHECK and HistoryEntry strips only
@@ -382,6 +416,7 @@ class TestEmbedSafety:
                         title="a](https://evil.example)[b",
                         webpage_url="https://yt.com/v=1",
                         plays=1,
+                        played_secs=10,
                     ),
                 )
             )
@@ -422,7 +457,11 @@ class TestEmbedSafety:
         no CHECK either. A paren, whitespace or control character ends the markdown
         early and leaks the rest of the line."""
         embed = analytics_card.build_embed(
-            _metrics(top_songs=(TopSong(title="T", webpage_url=url, plays=1),))
+            _metrics(
+                top_songs=(
+                    TopSong(title="T", webpage_url=url, plays=1, played_secs=10),
+                )
+            )
         )
         assert "[T](" not in (embed.description or "")
 
@@ -430,7 +469,13 @@ class TestEmbedSafety:
         """A blank title is a real archived value, and an empty masked-link label
         renders as an invisible link."""
         embed = analytics_card.build_embed(
-            _metrics(top_songs=(TopSong(title="", webpage_url="https://y/1", plays=1),))
+            _metrics(
+                top_songs=(
+                    TopSong(
+                        title="", webpage_url="https://y/1", plays=1, played_secs=10
+                    ),
+                )
+            )
         )
         assert "[Unknown](https://y/1)" in (embed.description or "")
 

@@ -115,7 +115,14 @@ def _metrics(**over: Any) -> AnalyticsMetrics:
             ),
         ),
         top_artists=(TopArtist(uploader="Lofi Girl", plays=11),),
-        top_songs=(TopSong(title="Know My Name", webpage_url="https://y/1", plays=3),),
+        top_songs=(
+            TopSong(
+                title="Know My Name",
+                webpage_url="https://y/1",
+                plays=3,
+                played_secs=600,
+            ),
+        ),
     )
     return AnalyticsMetrics(**(base | over))
 

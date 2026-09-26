@@ -12,8 +12,8 @@ from urllib.parse import urlsplit
 
 import discord
 
-from src.guild_state import TopListener
-from src.history_archive import Leaderboard, SongLeader
+from src.guild_state import TopListener, TopSong
+from src.history_archive import Leaderboard
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     QUERY_SOURCE_SOUNDCLOUD,
@@ -30,7 +30,7 @@ CACHE_TTL_SECS: Final[int] = 60
 # Bumped on any change to the cached shape: the codec defaults missing fields,
 # so a rolling deploy would otherwise decode an old entry into a valid-looking
 # board with wrong values.
-_CACHE_VERSION: Final[int] = 2
+_CACHE_VERSION: Final[int] = 3
 # Masked-link label budget. escape_markdown can double it, so 50 holds all
 # twenty lines under 3 KB — inside the 6000 characters Discord counts across
 # EVERY embed in the message, shared with the Now Playing block
@@ -107,7 +107,7 @@ def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
                 for r in raw.get("requesters", [])[:top_n]
             ),
             songs=tuple(
-                SongLeader(
+                TopSong(
                     title=str(s.get("title", "")),
                     webpage_url=str(s.get("webpage_url", "")),
                     duration_secs=int(s.get("duration_secs", 0)),
@@ -156,7 +156,7 @@ def _line_requester(rank: int, r: TopListener, guild: Optional[discord.Guild]) -
     )
 
 
-def _line_song(rank: int, s: SongLeader) -> str:
+def _line_song(rank: int, s: TopSong) -> str:
     # A blank title is a real archived value, and an empty masked-link label
     # renders as an invisible link.
     title = _sanitize_label(s.title) or "Unknown"

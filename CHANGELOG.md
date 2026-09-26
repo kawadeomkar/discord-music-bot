@@ -17,6 +17,19 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.5 — 2026-09-26
+
+**`-leaderboard` rebuilds its board from Postgres once after you deploy.** The board's
+Redis cache key moved, so the first `-leaderboard` per server and window after the
+restart misses the cache and runs the aggregate; every call in the next 60 seconds is
+served from the new entry as before. Nothing else changes — the board looks the same,
+and `-analytics` is untouched.
+
+- **Nothing to do.** The old entries carry the same 60-second TTL as the new ones and
+  expire on their own.
+- **Roll back freely.** The older build goes back to its own key and pays the same
+  one-time re-render.
+
 ## 2.53.4 — 2026-09-26
 
 **Crash recovery keeps the flags of the song that was actually playing.** The parked entry's
