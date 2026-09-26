@@ -910,11 +910,10 @@ class TestQueueClearFlushesPlayedSongs:
     async def test_a_failed_tail_dequeue_also_disposes_its_frozen_card(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """The other half this exit owes, and the half that drifted. The tail holds
-        the ONLY pointer to the card its fragment left frozen, and disposal normally
-        fires when the tail STARTS — so a tail that fails to resolve or stream
-        strands that card exactly as -clear would, reached through the failure the
-        tail path is most likely to hit (a stack deeper than ytdl:stream:*'s 30m)."""
+        """The other half this exit owes. The tail holds the ONLY pointer to the
+        card its fragment left frozen, and disposal otherwise fires when the tail
+        STARTS — so a tail that fails to resolve or stream strands that card
+        exactly as -clear would."""
         tail = QueueObject(
             "https://yt.com/v=heard",
             "Heard",

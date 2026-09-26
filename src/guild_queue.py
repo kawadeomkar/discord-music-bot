@@ -135,7 +135,9 @@ def remove_matcher(needle: str) -> RemoveMatcher:
 class RemoveOutcome:
     """What remove() took out. The positions are what the command reports; the
     items are returned because a removed entry may be a played song whose only
-    remaining record is the queue object (MusicPlayer._flush_played)."""
+    remaining record is the queue object, and a resume tail among them holds the only
+    pointer to its fragment's frozen card (MusicPlayer._flush_played and
+    _dispose_orphaned_cards)."""
 
     removed: list[QueueItem]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
@@ -398,13 +400,14 @@ class GuildQueue:
 
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything on it — claimed prefix included,
-        because the caller records these (MusicPlayer._flush_played) and a parked
-        resume tail is among them. Bumps the generation and resets the cursor
-        under the mutex: a claim the loop took before this captured the old value
-        and is refused by commit_dequeue(); a prefetch's claim commits under the
-        current value and is refused because nothing is claimed at cursor 0. The
-        DEL is inside the mutex too, or a concurrent put()'s pushes land between
-        the drain and the DEL and are wiped."""
+        because the caller records these and disposes of a parked resume tail's
+        frozen card (MusicPlayer._flush_played / _dispose_orphaned_cards). Bumps
+        the generation and resets the cursor under the mutex: a claim the loop
+        took before this captured the old value and is refused by
+        commit_dequeue(); a prefetch's claim commits under the current value and
+        is refused because nothing is claimed at cursor 0. The DEL is inside the
+        mutex too, or a concurrent put()'s pushes land between the drain and the
+        DEL and are wiped."""
         async with self._mutex:
             self._generation += 1
             cleared_items = list(self._items)
