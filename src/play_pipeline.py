@@ -58,7 +58,7 @@ from src.util import (
     truncate_embed_title,
     verbatim_code,
 )
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports this module).
@@ -173,6 +173,27 @@ class ResolvedPlaylist:
             artists=playlist.artists,
             thumbnail=playlist.thumbnail,
             short=playlist.short,
+        )
+
+    @classmethod
+    def from_youtube(
+        cls,
+        playlist: YoutubePlaylist,
+        tracks: list[QueueObject],
+        *,
+        link: str,
+        skipped: int,
+    ) -> ResolvedPlaylist:
+        """A walked YouTube playlist as the enqueue takes it. `tracks` is what is
+        left of `playlist.tracks` after the link's `index=` dropped `skipped`
+        leading ones, and `link` is the canonical playlist URL, which the walk
+        itself does not carry."""
+        return cls(
+            tracks=tracks,
+            title=playlist.title,
+            link=link,
+            skipped=skipped,
+            unavailable=playlist.unavailable,
         )
 
 
@@ -604,12 +625,8 @@ async def queue_source(
         _apply_playlist_timestamp(
             tracks, source, effective_start_offset(source, start_offset)
         )
-        return ResolvedPlaylist(
-            tracks=tracks,
-            title=playlist.title,
-            link=source.playlist_url,
-            skipped=skipped,
-            unavailable=playlist.unavailable,
+        return ResolvedPlaylist.from_youtube(
+            playlist, tracks, link=source.playlist_url, skipped=skipped
         )
     ts = effective_start_offset(source, start_offset)
     search: str

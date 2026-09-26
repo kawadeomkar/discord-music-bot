@@ -50,7 +50,7 @@ from src.sources import (
     timestamp_warning,
 )
 from src.spotify import SpotifyPlaylist, SpotifyTrack
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 from tests.helpers import (
     admit,
     command_callback,
@@ -3083,6 +3083,157 @@ class TestTheSpotifyCollectionResult:
         result = ResolvedPlaylist.from_spotify(_album_walk(), items, link=self._LINK)
 
         assert result.tracks is items
+
+
+class TestTheYoutubeCollectionResult:
+    """`ResolvedPlaylist.from_youtube` is the one place a walked playlist and what
+    its `index=` left become what the enqueue takes."""
+
+    _LINK = "https://www.youtube.com/playlist?list=PLtest123"
+
+    @staticmethod
+    def _walk() -> YoutubePlaylist:
+        return YoutubePlaylist(
+            title="Road Trip",
+            tracks=[
+                QueueObject(f"https://yt.com/watch?v={n}", f"T{n}", stub_requester())
+                for n in range(3)
+            ],
+            unavailable=3,
+        )
+
+    def test_the_walk_the_link_and_the_slice_arrive_field_for_field(self) -> None:
+        walk = self._walk()
+        kept = walk.tracks[1:]
+
+        result = ResolvedPlaylist.from_youtube(walk, kept, link=self._LINK, skipped=1)
+
+        assert result == ResolvedPlaylist(
+            tracks=kept,
+            title="Road Trip",
+            link=self._LINK,
+            skipped=1,
+            unavailable=3,
+        )
+
+    def test_no_field_the_walk_filled_is_left_at_its_default(self) -> None:
+        """Walks `ResolvedPlaylist`'s fields against a walk and a slice that set
+        every one a YouTube playlist can set, so a mapping dropped from the
+        classmethod fails here rather than rendering as an absent value."""
+        # `artists`, `thumbnail` and `short` are a Spotify album's; a YouTube walk
+        # carries none of them, and `tracks` is the caller's slice, not the walk's.
+        not_youtubes = {"artists", "thumbnail", "short", "tracks"}
+        walk = self._walk()
+
+        result = ResolvedPlaylist.from_youtube(
+            walk, walk.tracks[1:], link=self._LINK, skipped=1
+        )
+
+        left_behind = [
+            f.name
+            for f in dataclasses.fields(ResolvedPlaylist)
+            if f.name not in not_youtubes
+            and getattr(result, f.name) == _declared_default(f)
+        ]
+        assert left_behind == [], f"from_youtube never filled {left_behind}"
+
+    def test_the_kept_tracks_are_the_ones_handed_in(self) -> None:
+        """Not `playlist.tracks`: the index slice already dropped the leading
+        ones, and queueing the walk whole would put them back."""
+        walk = self._walk()
+        kept = walk.tracks[1:]
+
+        result = ResolvedPlaylist.from_youtube(walk, kept, link=self._LINK, skipped=1)
+
+        assert result.tracks is kept
+
+
+class TestBothCollectionsReachTheEnqueueAsTheReWrapBuiltThem:
+    """Each arm of `queue_source` is its own classmethod, and the enqueue reads the
+    same fields off either result."""
+
+    @staticmethod
+    async def _place(
+        music_bot: MusicBot, mock_ctx: MagicMock, source: Any, resolved: Any
+    ) -> MagicMock:
+        mp = _enqueue_mp(mock_ctx)
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            resolved,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+        return mp
+
+    async def test_a_spotify_album_arrives_as_from_spotify_built_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        walk = _album_walk(unavailable=2)
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(return_value=walk)
+
+        resolved = await play_pipeline.queue_source(
+            mock_ctx,
+            source,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            mode=ResolveMode.FLAT_OK,
+            cog=music_bot,
+        )
+
+        assert isinstance(resolved, ResolvedPlaylist)
+        assert resolved == ResolvedPlaylist.from_spotify(
+            walk, resolved.tracks, link=source.url
+        )
+        mp = await self._place(music_bot, mock_ctx, source, resolved)
+        mp.queue_put.assert_awaited_once()
+        assert mp.queue_put.await_args.args[0] == resolved.tracks
+        notice, card = mock_ctx.send.await_args.kwargs["embeds"]
+        assert notice.description == (
+            "Skipped **2** unavailable songs from this album."
+        )
+        assert f"[**Discovery**]({source.url})" in card.description
+
+    async def test_a_youtube_playlist_arrives_as_from_youtube_built_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest123",
+            type=YTType.PLAYLIST,
+            list_id="PLtest123",
+        )
+        stub = stub_yt_playlist(
+            [QueueObject("https://yt.com/watch?v=1", "T1", mock_ctx.author)],
+            title="Road Trip",
+            unavailable=2,
+        )
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub):
+            resolved = await play_pipeline.queue_source(
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                cog=music_bot,
+            )
+
+        assert isinstance(resolved, ResolvedPlaylist)
+        assert resolved == ResolvedPlaylist.from_youtube(
+            stub.return_value, resolved.tracks, link=source.playlist_url, skipped=0
+        )
+        mp = await self._place(music_bot, mock_ctx, source, resolved)
+        mp.queue_put.assert_awaited_once()
+        assert mp.queue_put.await_args.args[0] == resolved.tracks
+        notice, card = mock_ctx.send.await_args.kwargs["embeds"]
+        assert notice.description == (
+            "Skipped **2** unavailable songs from this playlist."
+        )
+        assert f"[**Road Trip**]({source.playlist_url})" in card.description
 
 
 class TestSpotifyAlbum:
