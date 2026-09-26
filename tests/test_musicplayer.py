@@ -2508,7 +2508,8 @@ class TestReparkCrashedHead:
         state = await music_player.store.get_guild_state()
         assert state is not None
         assert state.has_crashed_song
-        assert state.current_song_title == "Interrupted Song"
+        assert state.current_song is not None
+        assert state.current_song.title == "Interrupted Song"
 
     async def test_position_survives_the_round_trip(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -2558,7 +2559,8 @@ class TestReparkCrashedHead:
         assert music_player.store is not None
         state = await music_player.store.get_guild_state()
         assert state is not None
-        assert state.current_song_played_at == 1752530000.5
+        assert state.current_song is not None
+        assert state.current_song.played_at == 1752530000.5
         recovered = SongQueueEntry.from_crashed_state(state, position=45)
         assert recovered is not None and recovered.played_at == 1752530000.5
 
@@ -12558,9 +12560,12 @@ class TestStartOffsetAnnounce:
         """
         entry = SongQueueEntry.from_crashed_state(
             GuildStateData(
-                current_song_url="https://yt.com/v=crash",
-                current_song_title="Interrupted",
-                current_song_duration=210,
+                current_song=SongQueueEntry(
+                    webpage_url="https://yt.com/v=crash",
+                    title="Interrupted",
+                    requester_id=None,
+                    duration=210,
+                ),
             ),
             position=137,
         )

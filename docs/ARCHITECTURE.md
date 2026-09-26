@@ -707,11 +707,48 @@ What counts as a link:
 because YouTube ids are case-sensitive, and for `-remove`'s fold. Neither can call a token
 a link that `-play` searched for, or the reverse.
 
-Spotify sources are converted to YouTube searches before any audio work:
-- **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
-- **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` → `play_pipeline._searches_for()` wraps each as a `QueueObject` whose `search` is the term
-- **Album**: `Spotify.album(id)` → the same `SpotifyPlaylist`, plus its artists and cover → the playlist's path from there
----
+#### The parked song
+
+`guild:{id}:state` holds the song that is playing as **one `SongQueueEntry` blob** under
+`current_song` — the shape its queue entry had before the start transaction LPOPed it. The
+thirteen `current_song_*` fields that used to carry it are **dual-written beside it for one
+release**, the pattern `volume` and the wall-clock position fields already used, and then
+they go.
+
+`GuildStateData.current_song` is the one attribute readers use, built by `_parked_song`:
+
+- **The blob wins, but only when its `webpage_url` AND its `played_at` match the prefixed
+  fields.** That check is the feature. An older build HDELs only the fields it knows, so a
+  blob written before a rollback survives every song that build then plays; read unguarded,
+  recovery re-queues a song whose list entry was LPOPed releases ago and loses the real one.
+  The url alone does not settle it: a rolled-back build replays one song constantly — a
+  fragment and its own resume tail share a url — and an earlier play's blob would then be
+  waved through, bringing back its `is_resume`, its `start_paused` and its archive stamps.
+  `played_at` is the start epoch of one play, written from the same object as the blob in
+  the same HSET, so agreement is exact by construction. It is the same
+  rollback-then-roll-forward window `_heartbeat_predates_song` guards on the position, and
+  it is tested the same way.
+- **Otherwise the prefixed fields answer**, so a hash written before this build, or by an
+  older one during a rollback, recovers exactly as it did.
+- **No url, no parked song**: `current_song is None`, and `has_crashed_song` reads that.
+- **The dual write costs 1.3 KB per playing guild, and gets it back.** Measured on
+  `redis:7-alpine` with `MEMORY USAGE` over a realistic entry (a 664-byte blob): the state
+  hash goes **968 B → 2,241 B** while both are written, and the encoding flips
+  listpack → hashtable, since 664 is past `hash-max-listpack-value` (64). Dropping the
+  thirteen next release takes it to **918 B** — below where it started, hashtable encoding
+  included. So the release after this one is where the saving lands; until then it is ~1.3 KB
+  per actively-playing guild on a key that carries a 24 h TTL and is a legitimate eviction
+  candidate. Never predict this arithmetically — see the stream-entry note below for how
+  badly that misranks.
+
+`from_crashed_state` is then `replace(state.current_song, ts=position, persisted=False)` —
+the entry, at the resume offset, with the LPOP already committed. What the blob adds over
+the fields is what they never carried: the `thumbnail`, so a recovered head's queue row
+has a cover again, and the `np_*` card ids. The ids reach two places a crash-recovered
+head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
+`play_history.message_id`/`channel_id` when `_flush_played` archives a head a removal
+destroys. The delete is gated on `np_dedicated` and a same-guild channel, and the card it
+names was already gone when the tail started, so it is a wasted DELETE at worst.
 
 ### yt-dlp Pipeline
 
@@ -1208,7 +1245,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|
-| `guild:{id}:state` | Hash | 20 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
+| `guild:{id}:state` | Hash | 22 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song` (the parked `SongQueueEntry` whole — [The parked song](#the-parked-song)) beside the thirteen prefixed copies an older build reads, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_user_input/_played_at`, then `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and, each only when known, `requester_id` and the display fields `title`, `uploader`, `duration`, `webpage_url`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |

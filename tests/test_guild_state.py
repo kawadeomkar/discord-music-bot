@@ -36,6 +36,7 @@ from src.guild_state import (
     NowPlayingData,
     SearchQueueEntry,
     SongQueueEntry,
+    StateField,
     parse_history_entry,
     parse_queue_entry,
     serialize_history_entry,
@@ -43,6 +44,17 @@ from src.guild_state import (
     parse_number_fields,
 )
 from tests.helpers import members
+
+
+_PARKED_URL = b"https://youtu.be/abc"
+
+
+def _parked(raw: dict[bytes, bytes]) -> SongQueueEntry:
+    """The parked song a raw hash describes. Every case here parks one, so the
+    url that proves it is added when the case does not name its own."""
+    data = GuildStateData.from_redis({b"current_song_url": _PARKED_URL} | raw)
+    assert data.current_song is not None
+    return data.current_song
 
 
 def _full_state_hash() -> dict[bytes, bytes]:
@@ -64,14 +76,16 @@ def _full_state_hash() -> dict[bytes, bytes]:
 class TestGuildStateDataFromRedis:
     def test_full_hash_parses_all_fields(self) -> None:
         data = GuildStateData.from_redis(_full_state_hash())
+        song = data.current_song
+        assert song is not None
         assert data.volume == 0.5
         assert data.voice_channel_id == 111
         assert data.text_channel_id == 222
-        assert data.current_song_url == "https://youtu.be/abc"
-        assert data.current_song_title == "Test Song"
-        assert data.current_song_duration == 240
-        assert data.current_song_uploader == "Test Channel"
-        assert data.current_song_requester_id == 333
+        assert song.webpage_url == "https://youtu.be/abc"
+        assert song.title == "Test Song"
+        assert song.duration == 240
+        assert song.uploader == "Test Channel"
+        assert song.requester_id == 333
         assert data.play_start_epoch == 1000.5
         assert data.total_pause_seconds == 12.5
         assert data.pause_start_epoch == 1100.0
@@ -83,7 +97,8 @@ class TestGuildStateDataFromRedis:
         data = GuildStateData.from_redis({b"volume": b"0.8"})
         assert data.volume == 0.8
         assert data.voice_channel_id is None
-        assert data.current_song_url == ""
+        # No url: nothing was playing, so there is no parked song to read.
+        assert data.current_song is None
         assert data.total_pause_seconds == 0.0
 
     def test_malformed_float_yields_none_and_warns(
@@ -98,8 +113,8 @@ class TestGuildStateDataFromRedis:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            data = GuildStateData.from_redis({b"current_song_requester_id": b"abc"})
-        assert data.current_song_requester_id is None
+            song = _parked({b"current_song_requester_id": b"abc"})
+        assert song.requester_id is None
         assert "current_song_requester_id" in caplog.text
 
     def test_float_formatted_int_parses(self) -> None:
@@ -109,10 +124,8 @@ class TestGuildStateDataFromRedis:
     def test_snowflake_id_precision_preserved(self) -> None:
         # Discord snowflakes exceed float's 53-bit integer precision; parsing
         # via float() would corrupt 222222222222222222 to ...208.
-        data = GuildStateData.from_redis(
-            {b"current_song_requester_id": b"222222222222222222"}
-        )
-        assert data.current_song_requester_id == 222222222222222222
+        song = _parked({b"current_song_requester_id": b"222222222222222222"})
+        assert song.requester_id == 222222222222222222
 
     def test_zero_volume_is_preserved(self) -> None:
         # Falsy-zero trap: coalescing with `or` would elevate a stored 0.0.
@@ -148,74 +161,72 @@ class TestGuildStateDataFromRedis:
     ) -> None:
         # int(float(b"inf")) raises OverflowError, not ValueError.
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            data = GuildStateData.from_redis({b"current_song_duration": b"inf"})
-        assert data.current_song_duration is None
+            song = _parked({b"current_song_duration": b"inf"})
+        assert song.duration is None
 
     def test_non_utf8_bytes_degrade_instead_of_raising(self) -> None:
         # A corrupt byte in one field must not make from_redis raise — that
         # would turn get_guild_state() into None ("Redis unavailable") and
         # block recovery entirely.
-        data = GuildStateData.from_redis({b"current_song_title": b"Song \xff\xfe"})
-        assert data.current_song_title.startswith("Song ")
+        song = _parked({b"current_song_title": b"Song \xff\xfe"})
+        assert song.title.startswith("Song ")
 
     def test_empty_uploader_coerces_to_none(self) -> None:
-        data = GuildStateData.from_redis({b"current_song_uploader": b""})
-        assert data.current_song_uploader is None
+        song = _parked({b"current_song_uploader": b""})
+        assert song.uploader is None
 
     def test_empty_bytes_ids_coerce_to_none(self) -> None:
-        data = GuildStateData.from_redis(
+        song = _parked(
             {b"current_song_duration": b"", b"current_song_requester_id": b""}
         )
-        assert data.current_song_duration is None
-        assert data.current_song_requester_id is None
+        assert song.duration is None
+        assert song.requester_id is None
 
     def test_interjected_parses_one_as_true(self) -> None:
-        data = GuildStateData.from_redis({b"current_song_interjected": b"1"})
-        assert data.current_song_interjected is True
+        song = _parked({b"current_song_interjected": b"1"})
+        assert song.interjected is True
 
     @pytest.mark.parametrize("raw", [b"", b"0", b"true"])
     def test_interjected_anything_but_one_is_false(self, raw: Any) -> None:
         # The write path stores exactly "1" or "" — anything else (including
         # a missing field on pre-interjection state hashes) reads as False.
-        data = GuildStateData.from_redis({b"current_song_interjected": raw})
-        assert data.current_song_interjected is False
+        song = _parked({b"current_song_interjected": raw})
+        assert song.interjected is False
 
     def test_interjected_missing_is_false(self) -> None:
-        assert GuildStateData.from_redis({}).current_song_interjected is False
+        assert GuildStateData.from_redis({}).current_song is None
 
     def test_enqueue_stamps_parse(self) -> None:
-        data = GuildStateData.from_redis(
+        song = _parked(
             {
                 b"current_song_queued_at": b"1752530000.5",
                 b"current_song_queue_position": b"3",
             }
         )
-        assert data.current_song_queued_at == 1752530000.5
-        assert data.current_song_queue_position == 3
+        assert song.queued_at == 1752530000.5
+        assert song.queue_position == 3
 
     def test_enqueue_stamps_missing_are_zero(self) -> None:
         # Pre-feature state hashes carry neither field.
-        data = GuildStateData.from_redis({})
-        assert data.current_song_queued_at == 0.0
-        assert data.current_song_queue_position == 0
+        song = _parked({})
+        assert song.queued_at == 0.0
+        assert song.queue_position == 0
 
     def test_query_source_parses(self) -> None:
-        data = GuildStateData.from_redis(
-            {b"current_song_query_source": b"soundcloud.com"}
-        )
-        assert data.current_song_query_source == "soundcloud.com"
+        song = _parked({b"current_song_query_source": b"soundcloud.com"})
+        assert song.query_source == "soundcloud.com"
 
     def test_played_at_parses(self) -> None:
-        data = GuildStateData.from_redis({b"current_song_played_at": b"1752530000.5"})
-        assert data.current_song_played_at == 1752530000.5
+        song = _parked({b"current_song_played_at": b"1752530000.5"})
+        assert song.played_at == 1752530000.5
 
     def test_played_at_missing_is_zero(self) -> None:
         # Pre-feature state hashes carry no such field; 0.0 is the wire's
         # "unknown", never a stand-in clock.
-        assert GuildStateData.from_redis({}).current_song_played_at == 0.0
+        assert _parked({}).played_at == 0.0
 
     def test_query_source_missing_is_unknown(self) -> None:
-        assert GuildStateData.from_redis({}).current_song_query_source == ""
+        assert _parked({}).query_source == ""
 
 
 class TestGuildStateDataProperties:
@@ -235,7 +246,11 @@ class TestGuildStateDataProperties:
         assert not GuildStateData(**kwargs).has_active_connection
 
     def test_has_crashed_song(self) -> None:
-        assert GuildStateData(current_song_url="https://x").has_crashed_song
+        assert GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=1
+            )
+        ).has_crashed_song
         assert not GuildStateData().has_crashed_song
 
     def test_was_paused_at_crash(self) -> None:
@@ -1586,17 +1601,180 @@ class TestCrashedSongRoundTrip:
         assert recovered.persisted is False  # its LPOP committed in the crashed run
 
 
+class TestTheParkedSongSurvivesACrash:
+    """The playing song is parked as one blob beside the prefixed fields a build
+    before it reads. The url is the guard: an older build HDELs only the fields it
+    knows, so a blob can outlive the song it describes — the
+    rollback-then-roll-forward window `_heartbeat_predates_song` guards on the
+    position."""
+
+    @staticmethod
+    def _entry(url: str, **fields: Any) -> SongQueueEntry:
+        return SongQueueEntry(
+            webpage_url=url, title="Crashed", requester_id=7, **fields
+        )
+
+    @classmethod
+    def _hash(
+        cls,
+        url: str,
+        blob: SongQueueEntry | bytes | None,
+        *,
+        played_at: float = 0.0,
+    ) -> dict[bytes, bytes]:
+        """A state hash parking `url`, started at `played_at`, with whatever `blob`
+        the field holds: the prefixed fields are what an older build wrote and
+        still reads."""
+        raw = {
+            StateField.CURRENT_SONG_URL.encode(): url.encode(),
+            StateField.CURRENT_SONG_TITLE.encode(): b"Crashed",
+            StateField.CURRENT_SONG_REQUESTER_ID.encode(): b"7",
+            StateField.CURRENT_SONG_PLAYED_AT.encode(): str(played_at).encode(),
+        }
+        if blob is not None:
+            raw[StateField.CURRENT_SONG.encode()] = (
+                blob.to_redis() if isinstance(blob, SongQueueEntry) else blob
+            )
+        return raw
+
+    def test_the_prefixed_fields_alone_recover_every_field_they_carry(self) -> None:
+        """The leg the dual write exists for: a build before this one wrote no
+        blob, and an older build during a rollback writes none either. Every
+        prefixed field the mapping still writes has to come back from it —
+        `is_resume` and `start_paused` decide whether the song announces itself as
+        resuming and whether it comes back paused, and `user_input` is what
+        `-remove <collection link>` matches on, so losing them here is BEHAVIOUR,
+        not attribution.
+
+        Built from the writer's own mapping, minus the blob, so a field added to
+        the mapping without a parse reaching it fails here."""
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Crashed",
+            duration=321,
+            uploader="A Channel",
+            requester_id=7,
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            queued_at=900.5,
+            queue_position=4,
+            query_source="spotify.com",
+            user_input="https://open.spotify.com/playlist/abc",
+            played_at=1000.5,
+        )
+        written = GuildRedisStore._now_playing_state_mapping(
+            cast(GuildRedisStore, None), entry, 1000.5
+        )
+        raw = {
+            key.encode(): value.encode()
+            for key, value in written.items()
+            if key != StateField.CURRENT_SONG
+        }
+
+        parked = GuildStateData.from_redis(raw).current_song
+
+        assert parked == entry
+
+    def test_the_blob_of_the_song_it_describes_is_read(self) -> None:
+        """Everything the prefixed fields never carried — the thumbnail here —
+        comes back only from the blob."""
+        parked = self._entry("https://yt.com/v=1", thumbnail="https://img/1.jpg")
+        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", parked))
+        assert state.current_song == parked
+
+    def test_a_blob_naming_another_song_is_ignored(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """What a rollback leaves behind: the blob describes a song that ended
+        releases ago, and its list entry is long LPOPed. The prefixed fields name
+        the song actually parked."""
+        stale = self._entry("https://yt.com/v=1", thumbnail="https://img/1.jpg")
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            state = GuildStateData.from_redis(self._hash("https://yt.com/v=2", stale))
+        assert state.current_song is not None
+        assert state.current_song.webpage_url == "https://yt.com/v=2"
+        assert state.current_song.thumbnail is None
+        assert "does not describe" in caplog.text
+
+    def test_a_blob_from_an_earlier_play_of_the_same_song_is_ignored(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The url alone does not identify a play. A rolled-back build replays one
+        song constantly — a fragment and its own resume tail share a url — and the
+        blob it left behind carries that earlier play's flags: the song would come
+        back paused, announced as resuming, and archived under the wrong start."""
+        stale = self._entry(
+            "https://yt.com/v=1",
+            played_at=1000.0,
+            is_resume=True,
+            start_paused=True,
+        )
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            state = GuildStateData.from_redis(
+                self._hash("https://yt.com/v=1", stale, played_at=2000.0)
+            )
+        assert state.current_song is not None
+        assert state.current_song.played_at == 2000.0
+        assert state.current_song.is_resume is False
+        assert state.current_song.start_paused is False
+        assert "does not describe" in caplog.text
+
+    @pytest.mark.parametrize("stored", [b"not json", b'"a string"', b"[]", b"{}"])
+    def test_a_malformed_blob_falls_back_to_the_fields(self, stored: bytes) -> None:
+        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", stored))
+        assert state.current_song is not None
+        assert state.current_song.title == "Crashed"
+
+    def test_a_hash_with_no_blob_still_recovers(self) -> None:
+        """Every entry parked before this build, and every one an older build
+        parks during a rollback."""
+        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", None))
+        assert state.current_song == self._entry("https://yt.com/v=1")
+
+    def test_a_rollback_then_roll_forward_recovers_the_right_song(self) -> None:
+        """The sequence that makes the guard load-bearing: this build parks A,
+        an older build rolls back and parks B in the fields it knows (leaving A's
+        blob untouched), then this build reads the hash."""
+        raw = self._hash(
+            "https://yt.com/v=A",
+            self._entry("https://yt.com/v=A", thumbnail="https://img/a.jpg"),
+        )
+        raw[StateField.CURRENT_SONG_URL.encode()] = b"https://yt.com/v=B"
+        raw[StateField.CURRENT_SONG_TITLE.encode()] = b"Older build's song"
+
+        state = GuildStateData.from_redis(raw)
+
+        assert state.current_song is not None
+        assert state.current_song.webpage_url == "https://yt.com/v=B"
+        assert state.current_song.title == "Older build's song"
+
+    def test_the_recovered_entry_carries_the_thumbnail(self) -> None:
+        """A crash-recovered head is re-queued, so its queue row has a cover
+        again — the prefixed fields never carried one."""
+        parked = self._entry("https://yt.com/v=1", thumbnail="https://img/1.jpg")
+        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", parked))
+
+        entry = SongQueueEntry.from_crashed_state(state, position=95)
+
+        assert entry is not None
+        assert entry.thumbnail == "https://img/1.jpg"
+        assert (entry.ts, entry.persisted) == (95, False)
+
+
 class TestFromCrashedState:
     def test_none_when_no_crashed_song(self) -> None:
         assert SongQueueEntry.from_crashed_state(GuildStateData(), position=10) is None
 
     def test_maps_crashed_fields(self) -> None:
         state = GuildStateData(
-            current_song_url="https://yt.com/v=crash",
-            current_song_title="Crashed",
-            current_song_duration=180,
-            current_song_uploader="Chan",
-            current_song_requester_id=42,
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=crash",
+                title="Crashed",
+                duration=180,
+                uploader="Chan",
+                requester_id=42,
+            )
         )
         entry = SongQueueEntry.from_crashed_state(state, position=95)
         assert entry == SongQueueEntry(
@@ -1610,7 +1788,11 @@ class TestFromCrashedState:
         )
 
     def test_persisted_false_and_position_none_passthrough(self) -> None:
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        state = GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=None
+            )
+        )
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.persisted is False
@@ -1623,10 +1805,13 @@ class TestFromCrashedState:
         duration billed by _remaining_secs, the NP-card cleanup skipped, and a stack
         parked while paused coming back playing."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=tail",
-            current_song_title="Tail",
-            current_song_is_resume=True,
-            current_song_start_paused=True,
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=tail",
+                title="Tail",
+                is_resume=True,
+                start_paused=True,
+                requester_id=None,
+            )
         )
 
         entry = SongQueueEntry.from_crashed_state(state, position=137)
@@ -1638,7 +1823,11 @@ class TestFromCrashedState:
     def test_a_fresh_song_stays_fresh_after_a_crash(self) -> None:
         # The other half: recovery must not INVENT the flag. Synthesizing it from
         # ts > 0 is the open FIXME, and it moves user-visible wording.
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        state = GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=None
+            )
+        )
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
         assert (entry.is_resume, entry.start_paused) == (False, False)
@@ -1648,16 +1837,20 @@ class TestFromCrashedState:
         # only since stacking replaced replace semantics — it is what tells you the
         # song was queued by an interjection, and nothing branches on it.
         state = GuildStateData(
-            current_song_url="https://x",
-            current_song_title="T",
-            current_song_interjected=True,
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", interjected=True, requester_id=None
+            )
         )
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
         assert entry.interjected is True
 
     def test_interjected_defaults_false(self) -> None:
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        state = GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=None
+            )
+        )
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.interjected is False
@@ -1666,17 +1859,24 @@ class TestFromCrashedState:
         # Recovery re-queues the song but does not re-queue the play: it keeps
         # the position it was originally given, so the archive stays truthful.
         state = GuildStateData(
-            current_song_url="https://x",
-            current_song_title="T",
-            current_song_queued_at=1752530000.5,
-            current_song_queue_position=3,
+            current_song=SongQueueEntry(
+                webpage_url="https://x",
+                title="T",
+                queued_at=1752530000.5,
+                queue_position=3,
+                requester_id=None,
+            )
         )
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
         assert (entry.queued_at, entry.queue_position) == (1752530000.5, 3)
 
     def test_enqueue_stamps_default_to_unknown(self) -> None:
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        state = GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=None
+            )
+        )
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert (entry.queued_at, entry.queue_position) == (0.0, 0)
@@ -1686,9 +1886,12 @@ class TestFromCrashedState:
         # place it can be lost — and it would be lost silently, and only for
         # crashed plays.
         state = GuildStateData(
-            current_song_url="https://x",
-            current_song_title="T",
-            current_song_query_source="spotify.com",
+            current_song=SongQueueEntry(
+                webpage_url="https://x",
+                title="T",
+                query_source="spotify.com",
+                requester_id=None,
+            )
         )
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
@@ -1700,9 +1903,12 @@ class TestFromCrashedState:
         # play to the recovery wall clock — and a post-recovery -clear then files
         # it under a moment nobody was listening.
         state = GuildStateData(
-            current_song_url="https://x",
-            current_song_title="T",
-            current_song_played_at=1752530000.5,
+            current_song=SongQueueEntry(
+                webpage_url="https://x",
+                title="T",
+                played_at=1752530000.5,
+                requester_id=None,
+            )
         )
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
@@ -1710,7 +1916,11 @@ class TestFromCrashedState:
 
     def test_played_at_defaults_to_unknown(self) -> None:
         # A hash written by a build that predates the field: unknown, not "now".
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        state = GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=None
+            )
+        )
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.played_at == 0.0
@@ -1721,9 +1931,12 @@ class TestFromCrashedState:
         # <collection link>` taking out every track of the collection EXCEPT the
         # one that was playing — the undo the -play flags advertise, minus a song.
         state = GuildStateData(
-            current_song_url="https://x",
-            current_song_title="T",
-            current_song_user_input="https://open.spotify.com/playlist/abc",
+            current_song=SongQueueEntry(
+                webpage_url="https://x",
+                title="T",
+                user_input="https://open.spotify.com/playlist/abc",
+                requester_id=None,
+            )
         )
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
@@ -1732,7 +1945,11 @@ class TestFromCrashedState:
     def test_user_input_absent_is_none_not_empty(self) -> None:
         # A hash written by a build that predates the field. None means "unknown";
         # "" would be a needle that remove_matcher could compare against.
-        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        state = GuildStateData(
+            current_song=SongQueueEntry(
+                webpage_url="https://x", title="T", requester_id=None
+            )
+        )
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.user_input is None
@@ -1751,7 +1968,13 @@ class TestGuildPlaybackSnapshot:
     def test_has_restorable_playback_truth_table(
         self, queue: Any, crashed: Any, expected: Any
     ) -> None:
-        state = GuildStateData(current_song_url="https://x" if crashed else "")
+        state = GuildStateData(
+            current_song=(
+                SongQueueEntry(webpage_url="https://x", title="T", requester_id=None)
+                if crashed
+                else None
+            )
+        )
         entries = tuple(
             SongQueueEntry(webpage_url="https://q", title="Q", requester_id=1)
             for _ in queue
@@ -1790,7 +2013,13 @@ class TestGuildRecoveryGate:
     ) -> None:
         """Mirrors GuildPlaybackSnapshot's gate, over the queue length instead
         of the queue tuple."""
-        state = GuildStateData(current_song_url="https://x" if crashed else "")
+        state = GuildStateData(
+            current_song=(
+                SongQueueEntry(webpage_url="https://x", title="T", requester_id=None)
+                if crashed
+                else None
+            )
+        )
         gate = GuildRecoveryGate(state=state, pending_count=pending_count)
         assert gate.has_restorable_playback is expected
 
@@ -1819,7 +2048,9 @@ class TestCrashedPositionUsesTheHeartbeat:
         landing the caller's EOF cap and resuming near the END of the song
         instead of where it stopped."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1",
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
             play_start_epoch=1000.0,
             last_position_secs=30.0,
         )
@@ -1830,14 +2061,19 @@ class TestCrashedPositionUsesTheHeartbeat:
         """No clock is read on this path, so clock skew between restarts — and
         any downtime at all — cannot move the answer."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1", last_position_secs=77.0
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
+            last_position_secs=77.0,
         )
         assert state.crashed_position_at(0.0) == state.crashed_position_at(1e9) == 77
 
     def test_zero_position_is_preserved(self) -> None:
         """0.0 is a real position (song just started), not a missing value."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1",
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
             play_start_epoch=1000.0,
             last_position_secs=0.0,
         )
@@ -1852,7 +2088,9 @@ class TestCrashedPositionUsesTheHeartbeat:
         so one song's position is left parked on a later song's hash. Taking it would
         resume the new song minutes in."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=2",
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=2", title="T", requester_id=None
+            ),
             play_start_epoch=5000.0,
             last_position_secs=200.0,
             last_heartbeat_epoch=1200.0,
@@ -1865,7 +2103,9 @@ class TestCrashedPositionUsesTheHeartbeat:
         """The seed writes play_start_epoch + start_offset, so a legitimate heartbeat
         is never older than the start it belongs to."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1",
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
             play_start_epoch=1000.0,
             last_position_secs=30.0,
             last_heartbeat_epoch=1030.0,
@@ -1876,7 +2116,10 @@ class TestCrashedPositionUsesTheHeartbeat:
         """Only positive evidence of staleness rejects the position — a corrupt epoch
         parses to None, and dropping the position for it would cost a real recovery."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1", last_position_secs=42.0
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
+            last_position_secs=42.0,
         )
         assert state.crashed_position_at(9999.0) == 42
 
@@ -1884,7 +2127,10 @@ class TestCrashedPositionUsesTheHeartbeat:
         """The documented bias: replaying is imperceptible, skipping is not. Rounding
         59.7 up to 60 skips 0.3s of audio."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1", last_position_secs=59.7
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
+            last_position_secs=59.7,
         )
         assert state.crashed_position_at(0.0) == 59
 
@@ -1892,7 +2138,9 @@ class TestCrashedPositionUsesTheHeartbeat:
         """Release 1 of 2: a hash written by the previous build has no
         last_position_secs. Recovering it badly beats not recovering it."""
         state = GuildStateData(
-            current_song_url="https://yt.com/v=1",
+            current_song=SongQueueEntry(
+                webpage_url="https://yt.com/v=1", title="T", requester_id=None
+            ),
             play_start_epoch=1000.0,
             total_pause_seconds=5.0,
         )

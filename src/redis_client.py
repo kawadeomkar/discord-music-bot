@@ -113,6 +113,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
     StateField.CURRENT_SONG_USER_INPUT,
+    StateField.CURRENT_SONG,
     StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
@@ -899,9 +900,9 @@ class GuildRedisStore:
         play_start_epoch: float,
         start_offset: float = 0.0,
     ) -> dict[str, str]:
-        """The current_song_* state fields ARE a parked queue entry — the one
-        signature enforcing the identity SongQueueEntry.from_song()/
-        from_crashed_state() rely on for crash recovery."""
+        """The parked queue entry, written as one blob and as the prefixed fields
+        a build before it reads. One signature, so the identity
+        SongQueueEntry.from_song()/from_crashed_state() rely on cannot drift."""
         return {
             StateField.CURRENT_SONG_URL: current.webpage_url,
             StateField.CURRENT_SONG_TITLE: current.title,
@@ -919,6 +920,10 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
             StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
+            # The whole entry, beside the prefixed copies above: one release of
+            # dual writes, so a rollback still recovers from the fields it knows.
+            # CURRENT_SONG_URL is what tells a reader this blob is this song's.
+            StateField.CURRENT_SONG: current.to_redis().decode(),
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",

@@ -18,7 +18,15 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, Self, TypeIs, Union, get_args
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    Literal,
+    Self,
+    TypeIs,
+    Union,
+    get_args,
+)
 
 import orjson
 
@@ -83,6 +91,11 @@ class StateField:
     # What the user typed, so -remove <collection link> can take out a
     # crash-recovered head.
     CURRENT_SONG_USER_INPUT: Final[str] = "current_song_user_input"
+    # The parked song as one SongQueueEntry blob, the shape its queue entry had.
+    # The prefixed fields below are dual-written beside it for one release, and a
+    # blob is trusted only when its webpage_url equals CURRENT_SONG_URL — which
+    # every build writes (docs/ARCHITECTURE.md#the-parked-song).
+    CURRENT_SONG: Final[str] = "current_song"
     # When the audio started. Not PLAY_START_EPOCH (backdated by -ss) and not
     # derivable from this run's clock: a resume tail inherits an earlier
     # fragment's value.
@@ -192,6 +205,52 @@ def parse_number_fields(
             if (value := parse(raw, field)) is not None:
                 numbers[field] = value
     return numbers
+
+
+def _parked_song(raw: dict[bytes, bytes]) -> SongQueueEntry | None:
+    """The song that was playing, as its queue entry: the blob when it describes
+    the PLAY the prefixed fields describe, else those fields, which every build
+    writes. None when no song is parked.
+
+    The guard is not a formality. An older build HDELs only the fields it knows, so
+    a blob written before a rollback outlives every song that build then plays;
+    trusted unguarded, recovery would re-queue a song whose list entry was LPOPed
+    releases ago. The url alone does not settle it — a rolled-back build replays
+    the same song constantly, a fragment and its own resume tail among them — so
+    `played_at` is compared too: the start epoch is per play, and both builds write
+    it from the same object as the blob, so agreement is exact by construction.
+    Same rollback-then-roll-forward window `_heartbeat_predates_song` guards on the
+    position."""
+    url = _b_str(raw, StateField.CURRENT_SONG_URL)
+    if not url:
+        return None
+    blob = _b_str(raw, StateField.CURRENT_SONG)
+    if blob:
+        entry = parse_queue_entry(blob)
+        played_at = _b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0
+        if (
+            isinstance(entry, SongQueueEntry)
+            and entry.webpage_url == url
+            and entry.played_at == played_at
+        ):
+            return entry
+        log.warning("guild_state: parked blob does not describe the parked play")
+    return SongQueueEntry(
+        webpage_url=url,
+        title=_b_str(raw, StateField.CURRENT_SONG_TITLE),
+        duration=_b_opt_int(raw, StateField.CURRENT_SONG_DURATION),
+        uploader=_b_str(raw, StateField.CURRENT_SONG_UPLOADER) or None,
+        requester_id=_b_opt_int(raw, StateField.CURRENT_SONG_REQUESTER_ID),
+        interjected=_b_str(raw, StateField.CURRENT_SONG_INTERJECTED) == "1",
+        is_resume=_b_str(raw, StateField.CURRENT_SONG_IS_RESUME) == "1",
+        start_paused=_b_str(raw, StateField.CURRENT_SONG_START_PAUSED) == "1",
+        # `or` coalescing is safe on these: the zero value IS the default.
+        queued_at=_b_float(raw, StateField.CURRENT_SONG_QUEUED_AT) or 0.0,
+        queue_position=_b_opt_int(raw, StateField.CURRENT_SONG_QUEUE_POSITION) or 0,
+        query_source=_b_str(raw, StateField.CURRENT_SONG_QUERY_SOURCE),
+        user_input=_b_str(raw, StateField.CURRENT_SONG_USER_INPUT) or None,
+        played_at=_b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0,
+    )
 
 
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
@@ -415,21 +474,9 @@ class GuildStateData:
     volume: float | None = None
     voice_channel_id: int | None = None
     text_channel_id: int | None = None
-    current_song_url: str = ""
-    current_song_title: str = ""
-    current_song_duration: int | None = None
-    current_song_uploader: str | None = None
-    current_song_requester_id: int | None = None
-    current_song_interjected: bool = False
-    current_song_is_resume: bool = False
-    current_song_start_paused: bool = False
-    current_song_queued_at: float = 0.0
-    current_song_queue_position: int = 0
-    current_song_query_source: str = ""
-    # None, not "": absent means a pre-migration entry, and an empty needle must
-    # never be what -remove matches on. parse_queue_entry draws the same line.
-    current_song_user_input: str | None = None
-    current_song_played_at: float = 0.0
+    # The song that was playing, as the queue entry it was LPOPed from — the blob
+    # when the hash carries one, else the prefixed fields (_parked_song).
+    current_song: SongQueueEntry | None = None
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
     pause_start_epoch: float | None = None
@@ -444,7 +491,7 @@ class GuildStateData:
     @property
     def has_crashed_song(self) -> bool:
         """True when a song was playing when the bot last stopped."""
-        return bool(self.current_song_url)
+        return self.current_song is not None
 
     @property
     def was_paused_at_crash(self) -> bool:
@@ -497,36 +544,7 @@ class GuildStateData:
             volume=_admitted(ConfigField.VOLUME, _b_float(raw, StateField.VOLUME)),
             voice_channel_id=_b_opt_int(raw, StateField.VOICE_CHANNEL_ID),
             text_channel_id=_b_opt_int(raw, StateField.TEXT_CHANNEL_ID),
-            current_song_url=_b_str(raw, StateField.CURRENT_SONG_URL),
-            current_song_title=_b_str(raw, StateField.CURRENT_SONG_TITLE),
-            current_song_duration=_b_opt_int(raw, StateField.CURRENT_SONG_DURATION),
-            current_song_uploader=_b_str(raw, StateField.CURRENT_SONG_UPLOADER) or None,
-            current_song_requester_id=_b_opt_int(
-                raw, StateField.CURRENT_SONG_REQUESTER_ID
-            ),
-            current_song_interjected=(
-                _b_str(raw, StateField.CURRENT_SONG_INTERJECTED) == "1"
-            ),
-            current_song_is_resume=(
-                _b_str(raw, StateField.CURRENT_SONG_IS_RESUME) == "1"
-            ),
-            current_song_start_paused=(
-                _b_str(raw, StateField.CURRENT_SONG_START_PAUSED) == "1"
-            ),
-            # `or` coalescing is safe on these: the zero value IS the default.
-            current_song_queued_at=(
-                _b_float(raw, StateField.CURRENT_SONG_QUEUED_AT) or 0.0
-            ),
-            current_song_queue_position=(
-                _b_opt_int(raw, StateField.CURRENT_SONG_QUEUE_POSITION) or 0
-            ),
-            current_song_query_source=_b_str(raw, StateField.CURRENT_SONG_QUERY_SOURCE),
-            current_song_user_input=(
-                _b_str(raw, StateField.CURRENT_SONG_USER_INPUT) or None
-            ),
-            current_song_played_at=(
-                _b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0
-            ),
+            current_song=_parked_song(raw),
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
             pause_start_epoch=_b_float(raw, StateField.PAUSE_START_EPOCH),
@@ -741,15 +759,15 @@ class SongQueueEntry:
             uploader=song.uploader,
         )
 
-    @classmethod
+    @staticmethod
     def from_crashed_state(
-        cls, state: GuildStateData, *, position: int | None
-    ) -> Self | None:
-        """The crashed "current song" as a queue entry — the inverse of
-        pop_queue_and_start_song(), whose current_song_* fields ARE the entry it
-        LPOPed. None when no crashed song is recorded. persisted=False: that
-        LPOP already committed, so the loop must not LPOP again. `position` is
-        the caller-computed resume offset.
+        state: GuildStateData, *, position: int | None
+    ) -> SongQueueEntry | None:
+        """The crashed "current song" at its resume offset — the inverse of
+        pop_queue_and_start_song(), whose parked entry IS what it LPOPed. None
+        when no song is parked. persisted=False: that LPOP already committed, so
+        the loop must not LPOP again. `position` is the caller-computed resume
+        offset.
 
         FIXME: A song interrupted mid-play by the crash is a resume in everything
         but the flag — `ts` holds the interrupt position while is_resume stays
@@ -757,30 +775,10 @@ class SongQueueEntry:
         Synthesizing the flag from `ts > 0` would also move the queue display and
         the interjection wording, so it wants its own change.
         """
-        if not state.has_crashed_song:
+        if state.current_song is None:
             return None
-        return cls(
-            webpage_url=state.current_song_url,
-            title=state.current_song_title,
-            requester_id=state.current_song_requester_id,
-            ts=position,
-            duration=state.current_song_duration,
-            uploader=state.current_song_uploader,
-            persisted=False,
-            interjected=state.current_song_interjected,
-            # Losing these reclassifies a resume tail as a fresh song on every
-            # restart, and brings a paused stack back playing.
-            is_resume=state.current_song_is_resume,
-            start_paused=state.current_song_start_paused,
-            queued_at=state.current_song_queued_at,
-            queue_position=state.current_song_queue_position,
-            query_source=state.current_song_query_source,
-            # This hash is the only place the origin link survives a restart.
-            user_input=state.current_song_user_input,
-            # The only at-rest copy of a playing song's start (its queue entry
-            # was LPOPed), read back rather than restamped. Absent = 0.0.
-            played_at=state.current_song_played_at,
-        )
+        # persisted=False: that LPOP already committed.
+        return replace(state.current_song, ts=position, persisted=False)
 
     def to_redis(self) -> bytes:
         """Serialize to the wire format; the table pins the schema to

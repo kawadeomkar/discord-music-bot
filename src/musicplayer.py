@@ -893,27 +893,27 @@ class MusicPlayer:
                             snapshot.now_playing
                         )
 
-                    # Re-queue the song that was playing at the crash: current_song_url
-                    # is set atomically with the LPOP, so a non-empty value means the
-                    # bot died between that transaction and the song's end.
-                    if guild_state.has_crashed_song:
+                    # Re-queue the song that was playing at the crash: the parked
+                    # entry is written atomically with the LPOP, so one being there
+                    # means the bot died between that transaction and the song's end.
+                    parked = guild_state.current_song
+                    if parked is not None:
                         # The recorded position, straight off the snapshot — no
                         # clock, no IO, so downtime is never credited.
                         position = guild_state.crashed_position_at(time.time())
                         if position is not None:
                             # Cap at duration − 10s so FFmpeg cannot seek past EOF.
                             # Falsy covers both unknown and a livestream's 0: no cap.
-                            duration = guild_state.current_song_duration
+                            duration = parked.duration
                             if duration:
                                 position = min(position, max(0, duration - 10))
                             log.info(
                                 f"Computed recovery position {position}s for "
-                                f"'{guild_state.current_song_title}'"
+                                f"'{parked.title}'"
                             )
 
-                        # The crashed current_song_* fields ARE the queue entry the
-                        # start transaction LPOPed; rebuild it through the same
-                        # rehydration path as everything else.
+                        # That entry IS what the start transaction LPOPed; it goes
+                        # through the same rehydration path as everything else.
                         crashed_entry = SongQueueEntry.from_crashed_state(
                             guild_state, position=position
                         )
@@ -926,9 +926,9 @@ class MusicPlayer:
                         ):
                             log.info(
                                 f"Re-queued crashed song "
-                                f"'{guild_state.current_song_title}' for guild {self._guild.id}"
+                                f"'{parked.title}' for guild {self._guild.id}"
                             )
-                        # Always clear, re-queued or not: leaving current_song_url
+                        # Always clear, re-queued or not: leaving the parked song
                         # set makes every later restart re-enter this block.
                         await self.store.clear_song_end_state()
 
@@ -977,7 +977,8 @@ class MusicPlayer:
             # Already on the Redis list: parking it would re-queue a second copy.
             return False
         # Backdated by the resume offset as the loop does at vc.play, and seeded as
-        # the recorded position: the hash carries no `ts`.
+        # the recorded position, which is what recovery reads back: the blob's own
+        # `ts` is overwritten by from_crashed_state.
         await self.store.set_current_song_state(
             SongQueueEntry.from_queue_object(head),
             time.time() - (head.ts or 0),

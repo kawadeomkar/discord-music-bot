@@ -17,6 +17,21 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.3 — 2026-09-26
+
+**The playing song is parked in Redis as one queue entry.** Nothing changes in chat. The
+state hash `guild:{id}:state` gains a `current_song` field holding the whole entry, written
+beside the thirteen `current_song_*` fields it stands in for. Both are written for one
+release, so a crash recovers the playing song on this build or on the one before it.
+
+- **Deploy and roll back freely.** This build reads the prefixed fields when no blob is
+  there, and a build before it reads the fields this one still writes. A blob is trusted
+  only when it describes the same play those fields do.
+- **A crash-recovered song keeps its thumbnail again**, which the thirteen fields never
+  carried.
+- **The thirteen fields stay for one more release.** Dropping them earlier would leave a
+  rollback with no song to recover.
+
 ## 2.53.2 — 2026-09-26
 
 **A queue holds one kind of item.** Nothing changes in chat. A collection's tracks used to
