@@ -509,6 +509,16 @@ class TestLeaderboardQuerySourceRendering:
         assert "a*b_c`d" not in embed.description
 
 
+class TestListenerLine:
+    """The whole listener row, pinned byte for byte. -analytics renders its own
+    line from the same TopListener; only this one labels the clock, because a song
+    row here carries the track's own length beside the time spent on it."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        line = leaderboard._line_requester(1, _requester(1), None)
+        assert line == "**1.** <@1> — 1:00:00 listened · 2 songs"
+
+
 class TestSongLine:
     """The whole song row, pinned byte for byte. -analytics renders its own line
     from the same TopSong and the two differ by design: only this one carries the

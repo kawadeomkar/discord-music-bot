@@ -384,6 +384,20 @@ class TestEmbed:
         assert "0s" not in desc
 
 
+class TestListenerLine:
+    """The whole listener row, pinned byte for byte. -leaderboard renders its own
+    line from the same TopListener and labels its clock "listened"; no row on this
+    card carries a second clock, so the bare duration reads unambiguously here."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        listener = TopListener(
+            requester_id=7, requester_name="Ann", plays=133, played_secs=20_000
+        )
+        assert analytics_card._line_listener(1, listener, None) == (
+            "**1.** <@7> — 5:33:20 · 133 songs"
+        )
+
+
 class TestSongLine:
     """The whole song row, pinned byte for byte. -leaderboard renders its own line
     from the same TopSong; this one carries no host chip, no query source and no
