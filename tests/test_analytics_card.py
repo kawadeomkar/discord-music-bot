@@ -8,6 +8,7 @@ test_leaderboard.py and test_debug.py already make.
 
 import asyncio
 import contextlib
+import dataclasses
 import time
 from concurrent.futures.process import BrokenProcessPool
 from collections.abc import AsyncIterator
@@ -241,9 +242,10 @@ class TestCacheCodec:
 
     def test_the_song_rows_wire_tuple_is_pinned(self) -> None:
         """TopSong carries duration_secs for -leaderboard, which this card never
-        renders, so the tuple deliberately leaves it out. Pinned here because
-        widening it changes the cached shape, and _CACHE_VERSION would have to
-        move with it."""
+        renders, so the tuple deliberately leaves it out. query_source has no
+        renderer here either, and rides the wire because the row requires it.
+        Pinned because widening the tuple changes the cached shape, and
+        _CACHE_VERSION would have to move with it."""
         cls, fields = analytics_card._WIRE["top_songs"]
         assert cls is TopSong
         assert fields == (
@@ -266,11 +268,20 @@ class TestCacheCodec:
     def test_every_row_field_is_carried_or_named_as_dropped(self) -> None:
         """The same comparison one level down. TopListener and TopSong are also
         -leaderboard's rows, so a field added there for that board would otherwise
-        round trip as its default here and digest the same as the fresh card."""
+        round trip as its default here and digest the same as the fresh card. A
+        dropped field has to be a DEFAULTED one: from_cache builds the row from
+        the tuple alone, so dropping a required field is a TypeError it swallows
+        into a permanent miss."""
         dropped = {"top_songs": {"duration_secs"}}
         for key, (cls, fields) in analytics_card._WIRE.items():
             carried = set(fields) | dropped.get(key, set())
             assert carried == set(cls.__dataclass_fields__), key
+            defaulted = {
+                f.name
+                for f in dataclasses.fields(cls)
+                if f.default is not dataclasses.MISSING
+            }
+            assert dropped.get(key, set()) <= defaulted, key
 
 
 class TestEmbed:
