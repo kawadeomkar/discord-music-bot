@@ -2578,6 +2578,26 @@ class TestReparkCrashedHead:
         assert state is not None
         assert not state.has_crashed_song
 
+    async def test_leaves_an_unresolved_head_alone(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The parked slot is keyed by a page to resume. A search carries the
+        Spotify track the walk named, so parking one would hand recovery a
+        resolved song pointing at a page nothing can stream. Unreachable while
+        only from_crashed_state mints a persisted=False item — and this is the
+        only thing standing between that and the slot now that one type serves
+        both."""
+        head = unresolved("a song", mock_author, webpage_url="https://sp/a")
+        head.persisted = False
+        seed_queue(music_player.queue, head)
+
+        assert await music_player.repark_crashed_head() is False
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        assert not state.has_crashed_song
+
     async def test_no_head_writes_nothing(self, music_player: MusicPlayer) -> None:
         assert await music_player.repark_crashed_head() is False
 

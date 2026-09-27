@@ -973,7 +973,10 @@ class MusicPlayer:
         soon as it re-queues that song, so this player's memory is its only copy.
         Call AFTER cleanup(): its clear_connection() HDELs these same fields."""
         head = self.queue.peek_next()
-        if self.store is None or head is None:
+        if self.store is None or head is None or head.unresolved:
+            # An unresolved head has no page to park under: its webpage_url is
+            # the Spotify track the walk named, or nothing, and the slot would
+            # come back as a resolved song pointing at either.
             return False
         if is_persisted(head):
             # Already on the Redis list: parking it would re-queue a second copy.
