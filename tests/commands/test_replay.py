@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 from collections.abc import Generator, Iterator
 from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,7 +23,7 @@ from src.guild_state import SongQueueEntry, parse_queue_entry
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.util import cancel_task
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, NpHostRef, QueueObject
 from tests.helpers import (
     REPLAY_ASK,
     command_callback,
@@ -589,6 +590,26 @@ async def _claim_the_head(mp: MusicPlayer) -> Optional[MagicMock]:
     return song
 
 
+# Every field replay_current's replace() sets back to its default: the offset,
+# the interjection flags, the start stamp, the retry budget and the card ids.
+_REPLAY_RESETS = frozenset(
+    {
+        "ts",
+        "persisted",
+        "interjected",
+        "is_resume",
+        "start_paused",
+        "played_at",
+        "stream_attempts",
+        "failed_format_ids",
+        "np_message_id",
+        "np_channel_id",
+        "np_dedicated",
+        "np_host_ref",
+    }
+)
+
+
 class TestReplayCurrent:
     @pytest.fixture(autouse=True)
     def _stub_replay_resolve(self, music_player: MusicPlayer) -> Generator[AsyncMock]:
@@ -713,6 +734,53 @@ class TestReplayCurrent:
         assert isinstance(replay, QueueObject)
         assert replay.stream_attempts == 0
         assert replay.failed_format_ids == frozenset()
+
+    async def test_the_copy_resets_everything_the_interrupted_play_accumulated(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        mock_vc: MagicMock,
+        mock_author: MagicMock,
+        replayer: MagicMock,
+    ) -> None:
+        """Reflective, against the entry the live song carries: every field the
+        copy resets sits off its default there, so a reset dropped from the
+        replace() inherits a value this test can see. A fixture that leaves the
+        field at its default reads the inherited value as the reset."""
+        live_song.elapsed_secs = 42.0
+        accumulated = QueueObject(
+            live_song.webpage_url,
+            live_song.title,
+            mock_author,
+            ts=120,
+            persisted=False,
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            played_at=1752530000.0,
+            stream_attempts=2,
+            failed_format_ids=frozenset({"251"}),
+            np_message_id=777,
+            np_channel_id=888,
+            np_dedicated=True,
+            np_host_ref=NpHostRef(message=MagicMock(), own_embeds=[], dedicated=True),
+        )
+        defaults = {f.name: f.default for f in dataclasses.fields(QueueObject)}
+        assert all(
+            getattr(accumulated, name) != defaults[name] for name in _REPLAY_RESETS
+        ), "the fixture must set every reset field off its default"
+        give_queue_object(live_song, accumulated)
+        music_player.current_song = live_song
+
+        await replay_cmd.replay_current(
+            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+        )
+
+        replay = music_player.queue.display_items()[0]
+        assert isinstance(replay, QueueObject)
+        assert {name: getattr(replay, name) for name in _REPLAY_RESETS} == {
+            name: defaults[name] for name in _REPLAY_RESETS
+        }
 
     async def test_the_replay_is_unstamped_even_though_the_live_song_is_not(
         self,

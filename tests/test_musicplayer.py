@@ -4108,6 +4108,7 @@ class TestEnqueueDepth:
         current = MagicMock()
         current.webpage_url = "https://yt.com/v=parked"
         current.title = "Parked"
+        # A crash-recovered head carries persisted=False; the tail must not.
         give_queue_object(
             current,
             QueueObject(
@@ -4115,6 +4116,7 @@ class TestEnqueueDepth:
                 current.title,
                 mock_author,
                 is_replay=True,
+                persisted=False,
                 np_message_id=777,
                 np_channel_id=888,
                 np_dedicated=True,
