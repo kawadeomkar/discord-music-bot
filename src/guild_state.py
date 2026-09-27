@@ -1388,10 +1388,10 @@ class TopSong:
 
     title: str
     webpage_url: str
+    query_source: str
     plays: int
     played_secs: int
     duration_secs: int = 0
-    query_source: str = ""
 
 
 # "No usable queue-wait data in this window". Negative because 0 is a legitimate

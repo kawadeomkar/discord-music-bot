@@ -119,6 +119,7 @@ def _metrics(**over: Any) -> AnalyticsMetrics:
             TopSong(
                 title="Know My Name",
                 webpage_url="https://y/1",
+                query_source="search",
                 plays=3,
                 played_secs=600,
             ),

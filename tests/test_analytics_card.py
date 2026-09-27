@@ -438,6 +438,7 @@ class TestEmbedSafety:
                     TopSong(
                         title="a](https://evil.example)[b",
                         webpage_url="https://yt.com/v=1",
+                        query_source="search",
                         plays=1,
                         played_secs=10,
                     ),
@@ -482,7 +483,13 @@ class TestEmbedSafety:
         embed = analytics_card.build_embed(
             _metrics(
                 top_songs=(
-                    TopSong(title="T", webpage_url=url, plays=1, played_secs=10),
+                    TopSong(
+                        title="T",
+                        webpage_url=url,
+                        query_source="search",
+                        plays=1,
+                        played_secs=10,
+                    ),
                 )
             )
         )
@@ -495,7 +502,11 @@ class TestEmbedSafety:
             _metrics(
                 top_songs=(
                     TopSong(
-                        title="", webpage_url="https://y/1", plays=1, played_secs=10
+                        title="",
+                        webpage_url="https://y/1",
+                        query_source="search",
+                        plays=1,
+                        played_secs=10,
                     ),
                 )
             )
@@ -527,6 +538,7 @@ class TestEmbedSafety:
                     TopSong(
                         title=long,
                         webpage_url="https://yt.com/" + "u" * 130,
+                        query_source="search",
                         plays=999_999,
                         played_secs=999_999,
                     )

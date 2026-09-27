@@ -752,7 +752,7 @@ class TestRowDeclarations:
     mapper has to be a TypeError there, not a board row that renders 0:00
     listened, which is what makes the fields required rather than defaulted."""
 
-    def test_only_the_two_named_row_fields_carry_defaults(self) -> None:
+    def test_duration_secs_is_the_only_row_field_with_a_default(self) -> None:
         listener = {
             f.name
             for f in dataclasses.fields(TopListener)
@@ -764,7 +764,7 @@ class TestRowDeclarations:
             if f.default is not dataclasses.MISSING
         }
         assert listener == set()
-        assert song == {"duration_secs", "query_source"}
+        assert song == {"duration_secs"}
 
 
 class TestPostgresArchiveClosedGuard:
