@@ -11,7 +11,15 @@ because nothing outside this pipeline constructs them.
 import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Optional, TypeGuard, Union, assert_never
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Optional,
+    Self,
+    TypeGuard,
+    Union,
+    assert_never,
+)
 from collections.abc import Awaitable, Callable, Sequence
 
 import discord
@@ -155,7 +163,7 @@ class ResolvedPlaylist:
     @classmethod
     def from_spotify(
         cls, playlist: SpotifyPlaylist, tracks: list[QueueObject], *, link: str
-    ) -> ResolvedPlaylist:
+    ) -> Self:
         """A walked Spotify collection as the enqueue takes it. `tracks` are the
         items minted from `playlist.titles`, not `playlist.tracks` — those are
         the walk's display rows — and `link` is the canonical collection URL the
@@ -178,7 +186,7 @@ class ResolvedPlaylist:
         *,
         link: str,
         skipped: int,
-    ) -> ResolvedPlaylist:
+    ) -> Self:
         """A walked YouTube playlist as the enqueue takes it. `tracks` is what is
         left of `playlist.tracks` after the link's `index=` dropped `skipped`
         leading ones, and `link` is the canonical playlist URL, which the walk
