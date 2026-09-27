@@ -551,6 +551,37 @@ class TestEnqueuePlaylist:
 
     # ── Facts shared by both paths ────────────────────────────────────────────
 
+    async def test_the_track_count_line_names_the_provider(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The noun alone calls both a "playlist", and the provider is what says
+        whether those tracks are pages or searches still to resolve."""
+        # Parsed, not hand-built: the token the line prints is the one parse_url
+        # stamps on a pasted collection link.
+        yt = parse_url("https://www.youtube.com/playlist?list=PLtest")
+        assert isinstance(yt, YTSource)
+        with caplog.at_level("INFO"):
+            await self._enqueue(
+                music_bot,
+                mock_ctx,
+                _enqueue_mp(mock_ctx),
+                SpotifySource(type=SpotifyType.PLAYLIST, id="pid123"),
+                _spotify_playlist(["T"]),
+            )
+            await self._enqueue(
+                music_bot,
+                mock_ctx,
+                _enqueue_mp(mock_ctx),
+                yt,
+                ResolvedPlaylist(
+                    tracks=[QueueObject("https://yt.com/v=1", "T", mock_ctx.author)],
+                    link=yt.url,
+                ),
+            )
+
+        assert "spotify.com playlist track count: 1" in caplog.text
+        assert "youtube.com playlist track count: 1" in caplog.text
+
     async def test_spotify_links_the_playlist_name_and_passes_its_length(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

@@ -658,7 +658,12 @@ async def enqueue_playlist(
     tracks: Sequence[QueueObject] = qobj.tracks
     count = len(tracks)
     ahead = 0
-    log.info(f"{collection_noun(source)} track count: {count}")
+    # The provider leads the noun: a 10,000-track Spotify paste enqueues
+    # searches still to resolve, a YouTube one enqueues pages, and this line is
+    # where an operator tells the two apart.
+    log.info(
+        f"{query_source_of(source)} {collection_noun(source)} track count: {count}"
+    )
     heading = [_playlist_heading(qobj.title, qobj.link)]
     if qobj.artists:
         heading.append(f"by {safe_label(', '.join(qobj.artists), ECHO_ROW_MAX)}")
