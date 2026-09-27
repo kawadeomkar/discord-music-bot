@@ -98,8 +98,8 @@ def described(embed: discord.Embed) -> str:
 def queue_object(item: object) -> QueueObject:
     """A queue entry narrowed to `QueueObject`.
 
-    `display_items()` yields `QueueObject | YTSource` (an unresolved Spotify track
-    has no title/requester/duration), so reading those fields asserts resolved."""
+    `display_items()` is typed `list[QueueObject]`, so this only narrows the
+    `object` a test holds; it is the assertion that the narrowing is true."""
     assert isinstance(item, QueueObject)
     return item
 
