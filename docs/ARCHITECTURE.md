@@ -734,16 +734,21 @@ they go.
 - **With no blob the prefixed fields are the whole entry**, so a hash written before this
   build, or by an older one during a rollback, recovers exactly as it did.
 - **No url, no parked song**: `current_song is None`, and `has_crashed_song` reads that.
-- **The dual write costs a few hundred bytes per playing guild, and the `hashtable` it
-  forces never comes back.** `MEMORY USAGE`/`OBJECT ENCODING` on `redis:7-alpine` at the
-  default `hash-max-listpack-value=64`: a fully populated entry parks a 531 B blob and takes
-  the hash 104 B `listpack` idle → 3,408 B `hashtable` at play → 512 B once
-  `clear_song_end_state` HDELs it, so ~400 B over idle outlives every song. On a hash the
-  prefixed fields already promoted — any title or `user_input` past 64 B, so every Spotify
-  `?si=` link — the blob adds **+67 B**; on one still in a `listpack`, 824 B → 1,907 B.
-  Never predict this arithmetically: see the stream-entry note below, and
-  `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the missing
-  demotion and prints the sizes under `just test-redis -s`.
+- **The dual write takes the state hash from ~700 B to ~2.1 KB while a song plays, and
+  the `hashtable` it forces never comes back.** `OBJECT ENCODING` and
+  `MEMORY USAGE … SAMPLES 0` on `redis:7-alpine` at the default
+  `hash-max-listpack-value=64`, over `TestTheParkedSongBlob`'s fully populated entry (a
+  430 B blob): 104 B `listpack` idle → 2,152 B `hashtable` at play → 512 B once
+  `clear_song_end_state` HDELs it — still a `hashtable`, so ~400 B over idle outlives
+  every song, and the shrink Redis does lazily takes it no lower than 256 B. The blob is
+  what promotes the encoding — the thirteen prefixed fields alone leave that entry a
+  696 B `listpack` — so on a hash they had already promoted (any title or `user_input`
+  past 64 B, which every Spotify `?si=` link is) the blob adds ~680 B instead. Never
+  predict this arithmetically, and always ask for `SAMPLES 0`: by default `MEMORY USAGE`
+  estimates a `hashtable` from five sampled fields, which moved the at-play figure
+  between 1,680 B and 3,472 B over five runs of the same test. See the stream-entry note
+  below, and `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the
+  missing demotion and prints these sizes under `just test-redis -s`.
 
 `from_crashed_state` is then `replace(state.current_song, ts=position, persisted=False)` —
 the entry, at the resume offset, with the LPOP already committed. `ts` is set there

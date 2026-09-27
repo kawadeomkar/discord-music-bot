@@ -1192,9 +1192,11 @@ class TestTheParkedSongBlob:
     @staticmethod
     async def _shape(redis: aioredis.Redis, key: str) -> tuple[str, int]:
         """OBJECT ENCODING and MEMORY USAGE for one key — neither exists on
-        fakeredis, so this pair is measurable only here."""
+        fakeredis, so this pair is measurable only here. SAMPLES 0 reads every
+        field: the default estimates a hashtable from five of them, which moved
+        the at-play figure between 1,680 B and 3,472 B over five runs here."""
         encoding = cast(bytes, await redis.object("encoding", key))
-        return encoding.decode(), cast(int, await redis.memory_usage(key))
+        return encoding.decode(), cast(int, await redis.memory_usage(key, samples=0))
 
     async def test_the_parked_entry_survives_a_real_round_trip(
         self, redis: aioredis.Redis
