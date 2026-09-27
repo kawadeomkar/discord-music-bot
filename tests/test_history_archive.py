@@ -747,6 +747,26 @@ class TestLeaderboardQuery:
             TopSong("t", "u", 1, 1)  # pyright: ignore[reportCallIssue]
 
 
+class TestRowDeclarations:
+    """The two rows both boards share. A column that goes missing from either
+    mapper has to be a TypeError there, not a board row that renders 0:00
+    listened, which is what makes the fields required rather than defaulted."""
+
+    def test_only_the_two_named_row_fields_carry_defaults(self) -> None:
+        listener = {
+            f.name
+            for f in dataclasses.fields(TopListener)
+            if f.default is not dataclasses.MISSING
+        }
+        song = {
+            f.name
+            for f in dataclasses.fields(TopSong)
+            if f.default is not dataclasses.MISSING
+        }
+        assert listener == set()
+        assert song == {"duration_secs", "query_source"}
+
+
 class TestPostgresArchiveClosedGuard:
     """close() nulls _pool without holding the init lock, so a later _ensure()
     would build a pool nothing is left to close. Reachable because health_check()
