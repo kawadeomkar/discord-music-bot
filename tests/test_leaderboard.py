@@ -676,7 +676,7 @@ class TestLeaderboardCache:
         # valid-looking board — the codec defaults missing fields rather than
         # rejecting them.
         key = leaderboard.cache_key(7, 30, 10)
-        assert key == "leaderboard:v3:7:30:10"
+        assert key == "leaderboard:v2:7:30:10"
         assert leaderboard.cache_key(7, 30, 25) != key
 
     def test_codec_caps_an_oversized_cached_board(self) -> None:

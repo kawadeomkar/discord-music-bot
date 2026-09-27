@@ -30,7 +30,7 @@ CACHE_TTL_SECS: Final[int] = 60
 # Bumped on any change to the cached shape: the codec defaults missing fields,
 # so a rolling deploy would otherwise decode an old entry into a valid-looking
 # board with wrong values.
-_CACHE_VERSION: Final[int] = 3
+_CACHE_VERSION: Final[int] = 2
 # Masked-link label budget. escape_markdown can double it, so 50 holds all
 # twenty lines under 3 KB — inside the 6000 characters Discord counts across
 # EVERY embed in the message, shared with the Now Playing block
