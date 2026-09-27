@@ -3159,7 +3159,10 @@ class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
 
     @staticmethod
     async def _place(
-        music_bot: MusicBot, mock_ctx: MagicMock, source: Any, resolved: Any
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        source: SpotifySource | YTSource | SoundcloudSource,
+        resolved: ResolvedPlaylist,
     ) -> MagicMock:
         mp = _enqueue_mp(mock_ctx)
         await play_pipeline.enqueue_playlist(
