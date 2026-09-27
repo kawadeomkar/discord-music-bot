@@ -977,7 +977,10 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
             np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),
             np_dedicated=d.get(QueueEntryField.NP_DEDICATED, False),
-            search=d.get(QueueEntryField.YTSEARCH, ""),
+            # Coalesced, not defaulted: a stored null would otherwise arrive as
+            # None, which reads as resolved with no URL to stream and raises
+            # where item_label strips the term's prefix.
+            search=d.get(QueueEntryField.YTSEARCH) or "",
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt queue entry dropped: {e}")

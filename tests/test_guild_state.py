@@ -736,6 +736,17 @@ class TestSongQueueEntryWire:
         assert isinstance(entry, SongQueueEntry)
         assert entry.search == ""
 
+    def test_reader_reads_a_null_term_as_no_term(self) -> None:
+        """A present key holding null is not an absent key — the default never
+        applies — and an entry carrying that None reads as resolved with nothing
+        to stream, then raises where the term's prefix is stripped."""
+        written = _GOLDEN_QOBJ_SEARCH.replace(
+            b'"ytsearch":"ytsearch:DNA. Kendrick Lamar"', b'"ytsearch":null'
+        )
+        entry = parse_queue_entry(written)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.search == ""
+
     def test_from_queue_object_carries_the_search(self) -> None:
         item = QueueObject(
             webpage_url="https://open.spotify.com/track/abc",
