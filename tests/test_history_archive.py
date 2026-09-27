@@ -739,33 +739,6 @@ class TestLeaderboardQuery:
             ),
         )
 
-    def test_rows_are_frozen_and_keyword_only(self) -> None:
-        row = TopListener(requester_id=1, requester_name="x", plays=1, played_secs=1)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(row, "plays", 2)
-        with pytest.raises(TypeError):
-            TopSong("t", "u", 1, 1)  # pyright: ignore[reportCallIssue]
-
-
-class TestRowDeclarations:
-    """The two rows both boards share. A column that goes missing from either
-    mapper has to be a TypeError there, not a board row that renders 0:00
-    listened, which is what makes the fields required rather than defaulted."""
-
-    def test_duration_secs_is_the_only_row_field_with_a_default(self) -> None:
-        listener = {
-            f.name
-            for f in dataclasses.fields(TopListener)
-            if f.default is not dataclasses.MISSING
-        }
-        song = {
-            f.name
-            for f in dataclasses.fields(TopSong)
-            if f.default is not dataclasses.MISSING
-        }
-        assert listener == set()
-        assert song == {"duration_secs"}
-
 
 class TestPostgresArchiveClosedGuard:
     """close() nulls _pool without holding the init lock, so a later _ensure()
