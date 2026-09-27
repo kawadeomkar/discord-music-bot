@@ -4,7 +4,7 @@ interjection — put the interrupted song back where it was.
 Three stages in the order they run: `queue_source` turns a parsed source into
 something enqueueable; `enqueue_playlist` / `enqueue_single` place it and send
 the confirmation; `interject_flow` is the `--now` path, shared with `-play` on
-a paused song. The playlist errors and the two Resolved* shapes live here
+a paused song. The playlist errors and the collection result live here
 because nothing outside this pipeline constructs them.
 """
 
@@ -158,13 +158,8 @@ class ResolvedPlaylist:
     ) -> ResolvedPlaylist:
         """A walked Spotify collection as the enqueue takes it. `tracks` are the
         items minted from `playlist.titles`, not `playlist.tracks` — those are
-        the walk's display rows — and `link` is the pasted collection URL, which
-        the walk itself does not carry.
-
-        Rows and titles are paired twice, under two policies that stay apart:
-        `SpotifyPlaylist.__post_init__` raises `SpotifyRowMismatchError` for a
-        walk whose rows do not pair with its titles, and `_searches_for` warns
-        and queues without rows for the rows handed to it directly."""
+        the walk's display rows — and `link` is the canonical collection URL the
+        source rebuilds; the pasted spelling travels separately, as `origin`."""
         return cls(
             tracks=tracks,
             title=playlist.name,
