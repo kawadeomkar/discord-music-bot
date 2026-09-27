@@ -1361,9 +1361,10 @@ class SourceCompletion:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopListener:
     """One row of a listeners board, -analytics' and -leaderboard's alike.
-    requester_name is the most recent one recorded for that id, so a rename
-    shows the current name. Here rather than beside the SQL because the chart
-    render worker imports guild_state and must not pull in asyncpg."""
+    requester_name is the newest one recorded for that id inside the board's own
+    window, and -analytics' ends at the last complete UTC day, so a rename made
+    today shows on -leaderboard alone. Here rather than beside the SQL because
+    the chart render worker imports guild_state and must not pull in asyncpg."""
 
     requester_id: int
     requester_name: str
@@ -1381,9 +1382,9 @@ class TopArtist:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopSong:
     """One row of a songs board, -analytics' and -leaderboard's alike. Rows group
-    by webpage_url, so title, query_source and duration_secs are the values of
-    that URL's newest play. Only -leaderboard selects and renders duration_secs,
-    which is why that one is defaulted."""
+    by webpage_url, so title and query_source are that URL's newest play inside
+    the board's own window. duration_secs is -leaderboard's: the -analytics SQL
+    does not select it, so an -analytics row carries the default 0."""
 
     title: str
     webpage_url: str
