@@ -2309,8 +2309,9 @@ class TestRestoreEntries:
 class TestARestoredSearchReSerializesToItself:
     """Every LREM and every mirror rebuild re-serializes a restored item, and a
     byte that differs there misses the entry the list holds. A live item carries
-    no "absent": two shapes an older build could have written settle on other
-    bytes the first time this one rewrites them, and on those bytes after."""
+    no "absent" and no "qobj" for an unresolved track: two shapes an older build
+    could have written and one a later build writes settle on other bytes the
+    first time this one rewrites them, and on those bytes after."""
 
     @staticmethod
     async def _settle(gq: GuildQueue, written: bytes) -> tuple[bytes, bytes]:
@@ -2363,6 +2364,30 @@ class TestARestoredSearchReSerializesToItself:
 
         assert b'"requester_id"' not in written
         assert f'"requester_id":{owner.id}'.encode() in first
+        assert second == first
+
+    async def test_a_song_entry_carrying_a_term_settles_as_a_search(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The one restored shape that does not re-serialize to itself: a track
+        a later build queued as "qobj" with its term. This build rewrites it as
+        the "ytsource" it writes for an unresolved track, so the first LREM
+        touching one misses and the list is rebuilt — once, because the second
+        pass holds the bytes the first settled on."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        written = SongQueueEntry(
+            webpage_url="https://open.spotify.com/track/abc",
+            title="DNA.",
+            requester_id=mock_author.id,
+            duration=185,
+            uploader="Kendrick Lamar",
+            search="ytsearch:DNA. Kendrick Lamar",
+        ).to_redis()
+
+        first, second = await self._settle(gq, written)
+
+        assert written.startswith(b'{"type":"qobj"')
+        assert first.startswith(b'{"type":"ytsource"')
         assert second == first
 
     async def test_what_a_walk_writes_today_survives_untouched(
