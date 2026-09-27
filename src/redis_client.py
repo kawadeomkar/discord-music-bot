@@ -1300,6 +1300,7 @@ class GuildRedisStore:
         return GuildPlaybackSnapshot(
             state=GuildStateData.from_redis(raw_state),
             queue=entries,
+            queue_unreadable=len(raw_queue) - len(entries),
             now_playing=NowPlayingData.from_redis(raw_np),
             history=history,
             config=GuildConfig.from_redis(raw_config),

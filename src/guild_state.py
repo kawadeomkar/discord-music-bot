@@ -1238,6 +1238,10 @@ class GuildPlaybackSnapshot:
 
     state: GuildStateData
     queue: tuple[QueueEntry, ...] = ()
+    # List entries parse_queue_entry could not read. They stay on the Redis list
+    # at their positions while `queue` skips them, so the restore marks the
+    # mirror stale when this is non-zero.
+    queue_unreadable: int = 0
     # None when no song was playing (empty hash == no song).
     now_playing: NowPlayingData | None = None
     # Newest-first, as stored (GuildHistory.restore() reverses).

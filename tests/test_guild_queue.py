@@ -1951,6 +1951,7 @@ class TestRestoreEntries:
             [self._entry(1, mock_author.id), self._entry(2, mock_author.id)]
         )
         assert count == 2
+        assert not gq.mirror_dirty
         items = gq.display_items()
         assert [queue_object(i).webpage_url for i in items] == [
             "https://yt.com/v=1",
@@ -2080,6 +2081,39 @@ class TestRestoreEntries:
 
         assert gq.display_items() == []
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+    async def test_an_unreadable_entry_marks_the_mirror_stale(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """An entry the snapshot could not parse never reaches restore_entries,
+        but it still sits on the list at its position, so the restore has to
+        learn the count and mark the mirror stale the same way it does for an
+        entry it dropped itself."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        readable = [self._entry(1, mock_author.id), self._entry(3, mock_author.id)]
+        await store.push_queue(readable[0])
+        await fake_redis.rpush(store.queue_key(), b"not json")
+        await store.push_queue(readable[1])
+
+        assert await gq.restore_entries(readable, unreadable=1) == 2
+        assert gq.mirror_dirty
+        assert await fake_redis.llen(store.queue_key()) == 3
+
+        item = await gq.get()
+        async with gq.commit_dequeue(gq.generation) as ok:
+            assert ok
+            landed = await store.rebuild_queue(gq.mirror_entries())
+            gq.note_mirror_write(landed=landed, retired=False)
+        assert not gq.mirror_dirty
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == [
+            readable[1].to_redis()
+        ]
+        assert queue_object(item).webpage_url == "https://yt.com/v=1"
 
     async def test_interjection_flags_rehydrate(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock

@@ -934,7 +934,9 @@ class MusicPlayer:
 
                     # After the crashed head, so the interrupted song plays first.
                     count = await self.queue.restore_entries(
-                        snapshot.queue, requester_fallback=self._last_author
+                        snapshot.queue,
+                        requester_fallback=self._last_author,
+                        unreadable=snapshot.queue_unreadable,
                     )
                     if count:
                         log.info(

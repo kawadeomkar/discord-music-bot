@@ -4244,6 +4244,30 @@ class TestStateRestore:
         assert isinstance(music_player.queue._items[0], QueueObject)
         assert music_player.queue._items[0].title == "Restored Song"
 
+    async def test_restore_marks_the_mirror_stale_past_an_unreadable_entry(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The snapshot drops what it cannot parse, but the blob stays on the
+        list, so the restored queue must rebuild rather than LPOP on its next
+        start or the LPOP retires the wrong entry."""
+        assert music_player.store is not None
+        readable = SongQueueEntry(
+            webpage_url="https://yt.com/v=abc",
+            title="Restored Song",
+            requester_id=mock_author.id,
+        )
+        await fake_redis.rpush(
+            music_player.store.queue_key(), b"not json", readable.to_redis()
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+
+        await music_player._restore_state()
+        assert music_player.queue.qsize() == 1
+        assert music_player.queue.mirror_dirty
+
     async def test_restore_sets_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:

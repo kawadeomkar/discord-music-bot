@@ -2490,6 +2490,9 @@ class TestGetPlaybackSnapshot:
         snap = await store.get_playback_snapshot()
         assert snap is not None
         assert snap.queue == (_entry(1),)
+        # Both unreadable blobs stay on the list; the count is what lets the
+        # restore mark the mirror stale for them.
+        assert snap.queue_unreadable == 2
 
     async def test_includes_now_playing_and_history(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

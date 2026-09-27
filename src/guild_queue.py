@@ -504,12 +504,15 @@ class GuildQueue:
         entries: Sequence[QueueEntry],
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
+        unreadable: int = 0,
     ) -> int:
         """Re-queue persisted entries after a restart, in order, in memory only
         (they are already on the Redis list). Returns the number restored.
 
-        An entry nobody can be found for is dropped and counted in a warning, and
-        the mirror is marked stale so the shorter queue is written back for good.
+        An entry nobody can be found for is dropped and counted in a warning.
+        `unreadable` is how many list entries the snapshot could not parse; they
+        were dropped before reaching here. Either kind of drop marks the mirror
+        stale so the shorter queue is written back for good.
         `requester_fallback` is the caller's last resort, ahead of the guild
         owner, for entries persisted before searches carried a requester id."""
         count = 0
@@ -521,11 +524,12 @@ class GuildQueue:
                 continue
             self._items.append(item)
             count += 1
-        if dropped:
+        if dropped or unreadable:
             # The list keeps a dropped entry at its position and memory does not,
             # so a commit-time LPOP would retire its neighbour. The flag routes
             # the next enqueue and the next song start through a rebuild instead.
             self._mirror_dirty = True
+        if dropped:
             log.warning(
                 f"dropped {dropped} restored queue "
                 f"{'entry' if dropped == 1 else 'entries'} with no resolvable "
