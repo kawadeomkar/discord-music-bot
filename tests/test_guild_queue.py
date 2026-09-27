@@ -1903,8 +1903,9 @@ class TestRestoreEntries:
     ) -> None:
         """The restore hands the player's last author down. Without it an entry
         with no requester id rests entirely on `guild.owner`, which is uncached
-        exactly when a restart is still filling its caches."""
-        mock_guild.owner = None
+        exactly when a restart is still filling its caches. Both are available
+        here: an owner nulled out would pass whichever way the two are ordered."""
+        assert mock_guild.owner is not mock_author and mock_guild.owner is not None
         count = await gq.restore_entries(
             [SearchQueueEntry(ytsearch="y")], requester_fallback=mock_author
         )
