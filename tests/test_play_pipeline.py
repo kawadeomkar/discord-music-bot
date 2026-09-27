@@ -3153,7 +3153,7 @@ class TestTheYoutubeCollectionResult:
         assert result.tracks is kept
 
 
-class TestBothCollectionsReachTheEnqueueAsTheReWrapBuiltThem:
+class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
     """Each arm of `queue_source` is its own classmethod, and the enqueue reads the
     same fields off either result."""
 
