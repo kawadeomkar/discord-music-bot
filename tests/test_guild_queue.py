@@ -1986,6 +1986,37 @@ class TestRestoreEntries:
             "https://open.spotify.com/track/abc",
         )
 
+    async def test_a_restored_search_round_trips_to_the_entry_it_came_from(
+        self, gq: GuildQueue, mock_guild: MagicMock
+    ) -> None:
+        """_rehydrate's search leg is the one field list built keyword by
+        keyword: the resolved leg's neighbours are replace() copies of an item
+        that already holds every field. Comparing entries rather than naming
+        fields covers all thirteen at once — dropping `query_source` archives
+        every restored Spotify-collection track as youtube.com, and only the
+        write side of that field has a test."""
+        requester = stub_requester(424242424242424242)
+        mock_guild.get_member = MagicMock(return_value=requester)
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:DNA. Kendrick Lamar",
+            process=True,
+            ts=17,
+            user_input="https://open.spotify.com/playlist/abc",
+            queued_at=1000.0,
+            queue_position=4,
+            query_source="spotify.com",
+            requester_id=424242424242424242,
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/xyz",
+        )
+
+        assert await gq.restore_entries([entry]) == 1
+
+        (item,) = gq.display_items()
+        assert SearchQueueEntry.from_queue_object(item) == entry
+
     async def test_departed_member_falls_back_to_owner(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
