@@ -823,6 +823,7 @@ class GuildQueue:
             np_channel_id=entry.np_channel_id,
             np_dedicated=entry.np_dedicated,
             # Non-empty for an item that had not resolved: without it the item
-            # comes back looking resolved with nothing to stream.
+            # comes back looking resolved, pointed at the page the walk named,
+            # and the stream attempt fails on it.
             search=entry.search,
         )

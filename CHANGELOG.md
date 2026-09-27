@@ -30,10 +30,11 @@ earlier builds read.
   build that can still play every queued track.
 - **Coming back down to this build rewrites a queue list once.** Every track the newer
   build queued still plays, but this build writes those tracks in the old shape again,
-  so the first `-remove` or `-clear` in a server holding one rewrites that server's
-  whole queue list instead of deleting out of it; on a big removal you will see
-  `queue mirror diverged from memory in guild …` at WARNING when it does. Once per
-  server, nothing is lost, and there is nothing to do about it.
+  so the first `-remove` in a server holding one rewrites that server's whole queue
+  list instead of deleting out of it, and logs `queue mirror diverged from memory in
+  guild …` at WARNING when it does — expected here, not damage. (`-clear` deletes the
+  list outright, so it never matches bytes and never pays this.) Once per server,
+  nothing is lost, and there is nothing to do about it.
 - **Roll back freely.** No entry this build writes is new to the build before it.
 
 ## 2.53.4 — 2026-09-26
