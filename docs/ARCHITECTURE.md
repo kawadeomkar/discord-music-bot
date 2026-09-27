@@ -2762,12 +2762,13 @@ an operator who opts out of the default build ever sees.
 imports its defining module, which rules out `history_archive` (asyncpg) and
 `analytics_card` (discord); it does not uniquely select `guild_state`, and a dedicated
 stdlib-only module would satisfy the same constraint. `TopListener` and `TopSong` are
-`-leaderboard`'s board rows too, which is what lets one class serve both commands. They
-are the only types there whose wire format lives elsewhere (`analytics_card._WIRE`, plus
-`leaderboard.to_cache` for those two), so that file now hosts two conventions. Two
-coverage tests are the mitigation: one holds `_WIRE ∪ _SCALARS` to `AnalyticsMetrics`,
-the other holds each `_WIRE` tuple to its own row class, with `TopSong.duration_secs`
-named as the one field the card deliberately drops.
+`-leaderboard`'s board rows as well. They are the only types there whose wire format
+lives elsewhere (`analytics_card._WIRE`, plus `leaderboard.to_cache` for those two), so
+that file now hosts two conventions. Two coverage tests are the mitigation: one holds
+`_WIRE ∪ _SCALARS` to `AnalyticsMetrics`, the other holds each `_WIRE` tuple to its own
+row class, with `TopSong.duration_secs` named as the one field the card deliberately
+drops — only a defaulted field may be dropped, since `from_cache` rebuilds a row from
+the tuple alone.
 
 **Under multi-process sharding every shard would hold its own chart worker** (~141 MB),
 warmed at `setup_hook` whether or not any guild it owns runs the command. The
