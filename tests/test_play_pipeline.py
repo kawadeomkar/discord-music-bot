@@ -3026,7 +3026,12 @@ def _album_walk(**overrides: Any) -> SpotifyPlaylist:
 
 def _declared_default(f: dataclasses.Field[Any]) -> Any:
     """What a ResolvedPlaylist field holds when nobody fills it, the factory
-    called for the mutable ones. `tracks` has no default, so it reads MISSING."""
+    called for the mutable ones. `tracks` has no default, so it reads MISSING.
+
+    Calling the factory is what keeps `artists` in the reflective walks:
+    against the bare `default` the comparison reads `[...] == MISSING`, never
+    equal. `artists=[]` in `from_spotify` fails three tests, the Spotify walk
+    among them; with the factory call gone it fails only the other two."""
     if f.default_factory is not dataclasses.MISSING:
         return f.default_factory()
     return f.default
