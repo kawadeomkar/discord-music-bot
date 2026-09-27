@@ -18,7 +18,6 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [-play Command Pipeline](#-play-command-pipeline)
    - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
-   - [The parked song](#the-parked-song)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
@@ -28,6 +27,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Pause / Resume](#pause--resume)
    - [Auto-Disconnect](#auto-disconnect)
    - [Crash Recovery](#crash-recovery)
+     - [The parked song](#the-parked-song)
    - [Graceful Shutdown](#graceful-shutdown)
 8. [Data Model](#data-model)
 9. [Concurrency Model](#concurrency-model)
@@ -710,55 +710,16 @@ What counts as a link:
 because YouTube ids are case-sensitive, and for `-remove`'s fold. Neither can call a token
 a link that `-play` searched for, or the reverse.
 
-#### The parked song
+Spotify sources are converted to YouTube searches before any audio work:
 
-`guild:{id}:state` holds the song that is playing as **one `SongQueueEntry` blob** under
-`current_song` — the shape its queue entry had before the start transaction LPOPed it. The
-thirteen `current_song_*` fields that used to carry it are **dual-written beside it for one
-release**, the pattern `volume` and the wall-clock position fields already used, and then
-they go.
+- **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTDL.yt_source()`, which resolves
+  that string as a search, flat when the placement allows one
+- **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` →
+  `play_pipeline._searches_for()` wraps each as a `QueueObject` whose `search` is the term
+- **Album**: `Spotify.album(id)` → the same `SpotifyPlaylist`, plus its artists and cover
+  → the playlist's path from there
 
-`GuildStateData.current_song` is the one attribute readers use, built by `_parked_song`:
-
-- **The prefixed fields win on everything they carry; a matching blob adds the rest.**
-  Every build writes the thirteen for the fragment playing now, so a blob whose
-  `webpage_url` AND `played_at` both match them is overlaid with all thirteen and
-  contributes only what they never carried: the `thumbnail` and the `np_*` card ids. A blob
-  failing either test describes another song or an earlier play — it is ignored with a
-  warning and the fields answer alone. An older build HDELs only the fields it knows, so a
-  blob written before a rollback survives every song that build then plays, and read
-  unguarded it re-queues a song whose list entry was LPOPed releases ago and loses the real
-  one. The gate cannot settle a fragment against its own resume tail — one play, so they
-  agree on both — which is why the overlay, not the match, is what keeps the other
-  fragment's flags off this one.
-- **With no blob the prefixed fields are the whole entry**, so a hash written before this
-  build, or by an older one during a rollback, recovers exactly as it did.
-- **No url, no parked song**: `current_song is None`, and `has_crashed_song` reads that.
-- **The dual write takes the state hash from ~700 B to ~2.1 KB while a song plays, and
-  the `hashtable` it forces never comes back.** `OBJECT ENCODING` and
-  `MEMORY USAGE … SAMPLES 0` on `redis:7-alpine` at the default
-  `hash-max-listpack-value=64`, over `TestTheParkedSongBlob`'s fully populated entry (a
-  430 B blob): 104 B `listpack` idle → 2,152 B `hashtable` at play → 512 B once
-  `clear_song_end_state` HDELs it — still a `hashtable`, so ~400 B over idle outlives
-  every song, and the shrink Redis does lazily takes it no lower than 256 B. The blob is
-  what promotes the encoding — the thirteen prefixed fields alone leave that entry a
-  696 B `listpack` — so on a hash they had already promoted (any title or `user_input`
-  past 64 B, which every Spotify `?si=` link is) the blob adds ~680 B instead. Never
-  predict this arithmetically, and always ask for `SAMPLES 0`: by default `MEMORY USAGE`
-  estimates a `hashtable` from five sampled fields, which moved the at-play figure
-  between 1,680 B and 3,472 B over five runs of the same test. See the stream-entry note
-  below, and `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the
-  missing demotion and prints these sizes under `just test-redis -s`.
-
-`from_crashed_state` is then `replace(state.current_song, ts=position, persisted=False)` —
-the entry, at the resume offset, with the LPOP already committed. `ts` is set there
-unconditionally, so a blob's own offset never reaches playback; the recovered position
-does. What the blob adds over the fields is what they never carried: the `thumbnail`, so a
-recovered head's queue row has a cover again, and the `np_*` card ids. The ids reach two
-places a crash-recovered head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
-`play_history.message_id`/`channel_id` when `_flush_played` archives a head a removal
-destroys. The delete is gated on `np_dedicated` and a same-guild channel, and the card it
-names was already gone when the tail started, so it is a wasted DELETE at worst.
+---
 
 ### yt-dlp Pipeline
 
@@ -1191,6 +1152,56 @@ Key properties:
 - **At-most-once crashed song**: `current_song_url` is written when a song starts and cleared on normal end. On recovery the crashed song is rebuilt, injected in-memory only (`persisted=False` — it was never on the Redis queue list), and `current_song_url` is cleared immediately, even when the requester is unresolvable.
 - **Failure isolation**: a failed snapshot read aborts the whole restore rather than fabricating partial state; the lock's 60 s TTL auto-expires if the holder crashes, and release compare-and-deletes so an expired holder cannot delete its successor's lock.
 - **Intentional stop vs crash**: `cleanup()` calls `clear_connection()`, which empties the channel-ID fields — `on_ready` then skips that guild.
+
+#### The parked song
+
+`guild:{id}:state` holds the song that is playing as **one `SongQueueEntry` blob** under
+`current_song` — the shape its queue entry had before the start transaction LPOPed it. The
+thirteen `current_song_*` fields that used to carry it are **dual-written beside it for one
+release**, the pattern `volume` and the wall-clock position fields already used, and then
+they go.
+
+`GuildStateData.current_song` is the one attribute readers use, built by `_parked_song`:
+
+- **The prefixed fields win on everything they carry; a matching blob adds the rest.**
+  Every build writes the thirteen for the fragment playing now, so a blob whose
+  `webpage_url` AND `played_at` both match them is overlaid with all thirteen and
+  contributes only what they never carried: the `thumbnail` and the `np_*` card ids. A blob
+  failing either test describes another song or an earlier play — it is ignored with a
+  warning and the fields answer alone. An older build HDELs only the fields it knows, so a
+  blob written before a rollback survives every song that build then plays, and read
+  unguarded it re-queues a song whose list entry was LPOPed releases ago and loses the real
+  one. The gate cannot settle a fragment against its own resume tail — one play, so they
+  agree on both — which is why the overlay, not the match, is what keeps the other
+  fragment's flags off this one.
+- **With no blob the prefixed fields are the whole entry**, so a hash written before this
+  build, or by an older one during a rollback, recovers exactly as it did.
+- **No url, no parked song**: `current_song is None`, and `has_crashed_song` reads that.
+- **The dual write takes the state hash from ~700 B to ~2.1 KB while a song plays, and
+  the `hashtable` it forces never comes back.** `OBJECT ENCODING` and
+  `MEMORY USAGE … SAMPLES 0` on `redis:7-alpine` at the default
+  `hash-max-listpack-value=64`, over `TestTheParkedSongBlob`'s fully populated entry (a
+  430 B blob): 104 B `listpack` idle → 2,152 B `hashtable` at play → 512 B once
+  `clear_song_end_state` HDELs it — still a `hashtable`, so ~400 B over idle outlives
+  every song, and the shrink Redis does lazily takes it no lower than 256 B. The blob is
+  what promotes the encoding — the thirteen prefixed fields alone leave that entry a
+  696 B `listpack` — so on a hash they had already promoted (any title or `user_input`
+  past 64 B, which every Spotify `?si=` link is) the blob adds ~680 B instead. Never
+  predict this arithmetically, and always ask for `SAMPLES 0`: by default `MEMORY USAGE`
+  estimates a `hashtable` from five sampled fields, which moved the at-play figure
+  between 1,680 B and 3,472 B over five runs of the same test. See the stream-entry note
+  below, and `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the
+  missing demotion and prints these sizes under `just test-redis -s`.
+
+`from_crashed_state` is then `replace(state.current_song, ts=position, persisted=False)` —
+the entry, at the resume offset, with the LPOP already committed. `ts` is set there
+unconditionally, so a blob's own offset never reaches playback; the recovered position
+does. What the blob adds over the fields is what they never carried: the `thumbnail`, so a
+recovered head's queue row has a cover again, and the `np_*` card ids. The ids reach two
+places a crash-recovered head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
+`play_history.message_id`/`channel_id` when `_flush_played` archives a head a removal
+destroys. The delete is gated on `np_dedicated` and a same-guild channel, and the card it
+names was already gone when the tail started, so it is a wasted DELETE at worst.
 
 ---
 
@@ -2434,10 +2445,18 @@ queued while it resolves, so a write before that commit would reach an item `-re
 the queue mirror still see; a second write-through owes the same argument.
 
 Two reflective tests pin this, both against `dataclasses.fields(QueueObject)` so a new
-field fails them rather than being noticed: `test_no_queueobject_field_is_silently_left_behind`
-(test_youtube.py) fails when a playing song cannot answer a field, and
+field fails them rather than being noticed: `test_every_carried_field_arrives`
+(test_youtube.py) fails when a playing song cannot answer a carried field, and
 `test_no_field_is_lost_when_a_prefetched_song_is_requeued` (test_musicplayer.py) fails when
-a requeue drops one.
+a requeue drops one. Each names only its own exclusions — the fields the resolve learns,
+and at the playback boundary `ts` and `search` besides — so a field added later is
+covered without either being edited. A per-bool parametrization sits beside each
+(`test_each_bool_arrives_on_the_property_of_its_own_field`,
+`test_each_bool_comes_back_on_the_field_it_went_out_on`): a bool has one non-default
+value, so setting them all together reads back clean when two are crossed, and flipping
+one at a time is what catches a property reading its neighbour's field.
+`test_no_queueobject_field_is_silently_left_behind` is the identity pin under "crosses by
+construction" — `song.queued is qobj`, plus the one field renamed at the boundary.
 
 ### Now Playing host invariants
 
