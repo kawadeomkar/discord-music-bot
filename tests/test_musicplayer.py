@@ -4270,6 +4270,38 @@ class TestStateRestore:
         assert music_player.queue.qsize() == 1
         assert music_player.queue.mirror_dirty
 
+    async def test_an_unresolvable_requester_lands_on_the_players_last_author(
+        self,
+        music_player: MusicPlayer,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """A saved song whose requester left the guild is attributed rather than
+        dropped, and the player is what says to whom: without the fallback the
+        entry rests on `guild.owner`, which is uncached exactly when a restart is
+        still filling its caches. The value reaches -queue's byline and
+        play_history.requester_id, so it is a choice, not a detail."""
+        assert music_player.store is not None
+        owner = MagicMock(spec=discord.Member)
+        owner.id = 333333333333333333
+        mock_guild.owner = owner
+        mock_guild.get_member = MagicMock(return_value=None)
+        mock_bot.get_user.return_value = None
+        music_player._last_author = mock_author
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=abc",
+            title="Restored Song",
+            requester_id=424242424242424242,
+        )
+        await fake_redis.rpush(music_player.store.queue_key(), entry.to_redis())
+
+        await music_player._restore_state()
+
+        (item,) = music_player.queue.display_items()
+        assert item.requester is mock_author
+
     async def test_restore_sets_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:

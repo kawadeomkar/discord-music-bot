@@ -766,7 +766,9 @@ class GuildQueue:
         persisted ID as a member of this guild, else that ID's cached user (a
         member who left keeps their plays and their searches under one
         requester), else requester_fallback, else guild.owner, else the entry is
-        dropped."""
+        dropped. The player passes `_last_author` there, which is the bot member
+        on a cold start and the author of whichever command ran most recently
+        once one has — an attribution, not a claim about who queued the song."""
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
             requester = self._guild.get_member(entry.requester_id)

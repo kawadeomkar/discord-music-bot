@@ -52,10 +52,16 @@ release, so a crash recovers the playing song on this build or on the one before
 
 ## 2.53.2 — 2026-09-26
 
-**A queue holds one kind of item.** Nothing changes in chat. A collection's tracks used to
-wait as a different type from an ordinary queued song, and the two carried the same fields
-side by side; now there is one, resolved or not.
+**A queue holds one kind of item.** Nothing changes in chat but the one case below. A
+collection's tracks used to wait as a different type from an ordinary queued song, and the
+two carried the same fields side by side; now there is one, resolved or not.
 
+- **A saved song nobody can be matched to is credited to the bot.** A restart resolves
+  every saved song's requester up front now, the same way for a collection track still
+  waiting to resolve as for an ordinary queued song. One whose requester has left the
+  server, and who the bot has not seen anywhere else, keeps its place in the queue and is
+  shown and archived under the bot itself — or under whoever ran the command that brought
+  the bot back, if one did. It used to name the server owner. Nothing to do.
 - **Deploying and rolling back are both just a redeploy.** A track still waiting to
   resolve is written to Redis in the shape earlier builds already read, so no build reads
   the queue any differently for this change. That shape goes in a later release, which
