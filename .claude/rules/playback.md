@@ -486,11 +486,13 @@ crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, whic
 back `None` on the one song that was playing).
 
 **An UNRESOLVED item takes the same checklist**, with one step of its own: a collection's
-tracks wait as `QueueObject`s with `search` set and `webpage_url` empty. `SongQueueEntry`
-carries `search` (as `ytsearch`, written only when non-empty) and `_rehydrate` restores
-it, but `_to_entry` still serializes these items as `"ytsource"` entries so a rollback
-can read the list. So a field that an unresolved item must carry needs the
-`SearchQueueEntry` leg of `to_redis` too, written **only when the value is not None**,
+tracks wait as `QueueObject`s with `search` set, carrying whatever the walk named them
+(`webpage_url` the track's own page, `title` the row's name — both empty only when the
+walk sent no rows). `SongQueueEntry` carries `search` (as `ytsearch`, written only when
+non-empty) and `_rehydrate` restores it, but `_to_entry` still serializes these items
+as `"ytsource"` entries so a rollback can read the list. So a field that an unresolved
+item must carry needs the `SearchQueueEntry` leg of `to_redis` too, written **only when
+the value is not None**,
 never as a flat table entry.
 That when-known write keeps an entry queued by the previous build byte-identical, and
 LREM matches these entries by their exact bytes: write the key unconditionally and every
