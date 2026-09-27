@@ -3176,6 +3176,10 @@ class TestBothCollectionsReachTheEnqueueAsTheReWrapBuiltThem:
         walk = _album_walk(unavailable=2)
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.album = AsyncMock(return_value=walk)
+        # Derived from the walk, not from the result: a `tracks` the arm
+        # shortened or reordered compares against the titles rather than against
+        # itself, leaving the equality below to assert the other six fields.
+        searched_for = [f"ytsearch:{t}" for t in walk.titles]
 
         resolved = await play_pipeline.queue_source(
             mock_ctx,
@@ -3187,12 +3191,13 @@ class TestBothCollectionsReachTheEnqueueAsTheReWrapBuiltThem:
         )
 
         assert isinstance(resolved, ResolvedPlaylist)
+        assert [t.search for t in resolved.tracks] == searched_for
         assert resolved == ResolvedPlaylist.from_spotify(
             walk, resolved.tracks, link=source.url
         )
         mp = await self._place(music_bot, mock_ctx, source, resolved)
         mp.queue_put.assert_awaited_once()
-        assert mp.queue_put.await_args.args[0] == resolved.tracks
+        assert [t.search for t in mp.queue_put.await_args.args[0]] == searched_for
         notice, card = mock_ctx.send.await_args.kwargs["embeds"]
         assert notice.description == (
             "Skipped **2** unavailable songs from this album."
@@ -3202,16 +3207,22 @@ class TestBothCollectionsReachTheEnqueueAsTheReWrapBuiltThem:
     async def test_a_youtube_playlist_arrives_as_from_youtube_built_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
+        # A watch link carrying `&list=`: `playlist_url` is the pasted spelling
+        # here and the rebuilt `playlist?list=` one differs, so the assertions
+        # below pin which of the two the arm hands over as the heading's link.
         source = YTSource(
-            url="https://www.youtube.com/playlist?list=PLtest123",
+            url="https://www.youtube.com/watch?v=0&list=PLtest123",
             type=YTType.PLAYLIST,
             list_id="PLtest123",
+            video_id="0",
         )
-        stub = stub_yt_playlist(
-            [QueueObject("https://yt.com/watch?v=1", "T1", mock_ctx.author)],
-            title="Road Trip",
-            unavailable=2,
-        )
+        # Three tracks, so an arm that queued a prefix of the walk shows up as a
+        # shorter list than the one the stub returned.
+        walked = [
+            QueueObject(f"https://yt.com/watch?v={n}", f"T{n}", mock_ctx.author)
+            for n in range(3)
+        ]
+        stub = stub_yt_playlist(walked, title="Road Trip", unavailable=2)
         with patch("src.play_pipeline.YTDL.yt_playlist", new=stub):
             resolved = await play_pipeline.queue_source(
                 mock_ctx,
@@ -3223,12 +3234,13 @@ class TestBothCollectionsReachTheEnqueueAsTheReWrapBuiltThem:
             )
 
         assert isinstance(resolved, ResolvedPlaylist)
+        assert resolved.tracks == walked
         assert resolved == ResolvedPlaylist.from_youtube(
             stub.return_value, resolved.tracks, link=source.playlist_url, skipped=0
         )
         mp = await self._place(music_bot, mock_ctx, source, resolved)
         mp.queue_put.assert_awaited_once()
-        assert mp.queue_put.await_args.args[0] == resolved.tracks
+        assert mp.queue_put.await_args.args[0] == walked
         notice, card = mock_ctx.send.await_args.kwargs["embeds"]
         assert notice.description == (
             "Skipped **2** unavailable songs from this playlist."
