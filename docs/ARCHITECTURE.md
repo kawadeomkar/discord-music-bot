@@ -924,7 +924,7 @@ flowchart TD
     UsePF["current_song = prefetched_song\n(its claim becomes ours)"]
     GetQueue["queue_get() — the server's idle timeout"]
     Timeout["TimeoutError → stop()"]
-    Resolve["_resolve_source()\nYTSource → QueueObject\n(its own 300s bound)"]
+    Resolve["_resolve_source()\nunresolved item → resolved copy\n(its own 300s bound)"]
     Stream["_stream_source() → YTDL"]
     Failed{"YTDL is None?"}
     FailPop["queue.finish_failed_dequeue()\nsend 'Failed…' via send_with_np"]
@@ -1069,7 +1069,7 @@ channel · @requester                                   (with a byline)
 
 `queue_rows` numbers rows from a `first_index`, chains the `EtaWalk` from the state its caller seeds (the playing song's remaining time, then every item ahead), and ends in `*... and N more*`. It is bounded twice: `ROW_LIMIT` rows, and `ROWS_BUDGET` characters, because ten rows at both caps pass an embed description's 4,096 on their own. Two-line rows are set apart by a blank line and one-line rows are not. An unknown length marks the walk uncertain, and every later time renders with a `~`.
 
-**An unresolved search renders the same row.** A Spotify track is queued as a `YTSource` search and only becomes a song when it is about to play, so the row cannot wait for yt-dlp. `YTSource` carries four display fields under the names a resolved song uses — `title`, `uploader` (the artists), `duration` and `webpage_url` (the Spotify track page) — and the formatter reads one set of attributes off either item. They persist on `SearchQueueEntry`, written only when present, so an entry queued before they existed keeps its bytes and renders as its search text and `resolving...`. The length is Spotify's and not the YouTube match's: `EtaWalk.advance_estimate` counts it and marks everything after it approximate, and `queue_runtime` adds it while keeping the total's `~`.
+**An unresolved search renders the same row.** A Spotify track is queued as a `QueueObject` with `search` set and becomes a resolved copy only when it is about to play, so the row cannot wait for yt-dlp. The unresolved item carries the four display fields a resolved song uses — `title`, `uploader` (the artists), `duration` and `webpage_url` (the Spotify track page) — and the formatter reads one set of attributes off every item. They persist on `SearchQueueEntry`, written only when present, so an entry queued before they existed keeps its bytes and renders as its search text and `resolving...`. The length is Spotify's and not the YouTube match's: `EtaWalk.advance_estimate` counts it and marks everything after it approximate, and `queue_runtime` adds it while keeping the total's `~`.
 
 **What the rows cost.** The four display fields are stored per queued track, so a `ytsource` entry on `guild:{id}:queue` grows to ~400 bytes (measured; serializing one `_PUT_CHUNK` of 1,000 is ~1.5ms). The cached walk under `spotify:playlist:v4:{id}` / `spotify:album_tracks:v2:{id}` carries a `tracks` array beside `titles`, one `[name, artists, duration_secs, url]` row per title — which is what the key versions were bumped for, and roughly triples that value. A 10,000-track collection therefore holds ~2 MB of cache plus ~4 MB of queue mirror, against the 256 MB the bundled Redis is given; both keys carry a TTL, so they stay eviction candidates under `volatile-lru` (see the eviction rules). On a cache HIT the rows are rebuilt `_CACHE_ROWS_CHUNK` at a time with a loop yield between chunks: the rebuild is ~6ms for 10,000 rows and a hit takes neither the walk slot nor the single flight, so without the yield every caller paid it on one tick.
 
@@ -1736,7 +1736,7 @@ stateDiagram-v2
 
     WaitingForSong --> ResolvingSource : song enqueued\n(queue.get() returns)
 
-    ResolvingSource --> Streaming : _resolve_source() complete\n(YTSource → QueueObject)
+    ResolvingSource --> Streaming : _resolve_source() complete\n(unresolved item → resolved copy)
 
     Streaming --> Playing : commit_dequeue() ok\nvc.play(YTDL)
 
@@ -3087,9 +3087,9 @@ Every persisted byte is defined in `guild_state.py` as frozen value objects with
 
 `-play --now` interrupts the current song and hands it back afterward without any new task, timer, or side channel: the parked song becomes an ordinary `is_resume` `SongQueueEntry` LPUSHed to the front of the queue (`put_front`), carrying its `position_secs` as `ts` and its paused state as `start_paused`. The loop replays it through the same `-ss`/seek path any `?t=` song uses, so resume fidelity and crash recovery come for free. The only extra state is `_skip_history_for` (so a parked song is logged to history once, at its resume tail, not twice). Interjections **stack**: an interjection on top of an interjection parks that song too, and the queue unwinds LIFO. One `_skip_history_for` slot is still enough at any depth — each interjection stops exactly one song, and that song's loop iteration consumes the marker before the next can finish resolving.
 
-### Persisted `YTSource` entries
+### Persisted unresolved entries
 
-Spotify playlist tracks are enqueued as unresolved `YTSource(ytsearch=...)` items to keep `-play` fast for large playlists (metadata comes from Spotify's cached API, not N yt-dlp calls). They are **not** prefetched at enqueue time (no stable `webpage_url`; would saturate the extraction pool), but they **are** persisted to the Redis queue as `"ytsource"` wire entries and survive restarts.
+Spotify playlist tracks are enqueued as unresolved `QueueObject`s (`search` set, `webpage_url` the Spotify track page) to keep `-play` fast for large playlists (metadata comes from Spotify's cached API, not N yt-dlp calls). They are **not** prefetched at enqueue time (no YouTube URL yet; N searches would saturate the extraction pool), but they **are** persisted to the Redis queue as `"ytsource"` wire entries and survive restarts.
 
 ### Now Playing block attached at send time
 
