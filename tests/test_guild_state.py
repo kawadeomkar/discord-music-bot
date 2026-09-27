@@ -540,6 +540,28 @@ _SEARCH_ENTRY = SongQueueEntry(
     search="ytsearch:DNA. Kendrick Lamar",
 )
 
+# The same shape for a track the walk named no row for: the term is the only
+# thing known about it, and every display field is the empty value.
+_GOLDEN_QOBJ_SEARCH_ONLY = (
+    b'{"type":"qobj","webpage_url":"","title":"","requester_id":424242424242424242,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true,'
+    + _INTERJECTION_FLAGS_FALSE
+    + b","
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
+    + b","
+    + _PLAYED_AT_UNPLAYED
+    + b","
+    + _NP_HOST_NONE
+    + b',"ytsearch":"ytsearch:mystery track"}'
+)
+_SEARCH_ONLY_ENTRY = SongQueueEntry(
+    webpage_url="",
+    title="",
+    requester_id=424242424242424242,
+    search="ytsearch:mystery track",
+)
+
 
 class TestSongQueueEntryWire:
     def test_writer_matches_golden_bytes(self) -> None:
@@ -723,6 +745,13 @@ class TestSongQueueEntryWire:
 
     def test_reader_parses_a_search_entry(self) -> None:
         assert parse_queue_entry(_GOLDEN_QOBJ_SEARCH) == _SEARCH_ENTRY
+
+    def test_a_term_only_entry_round_trips(self) -> None:
+        """The track a walk named no row for: the term is all there is, so the
+        empty display values are written and read as themselves rather than
+        standing in for an absent key."""
+        assert _SEARCH_ONLY_ENTRY.to_redis() == _GOLDEN_QOBJ_SEARCH_ONLY
+        assert parse_queue_entry(_GOLDEN_QOBJ_SEARCH_ONLY) == _SEARCH_ONLY_ENTRY
 
     def test_a_resolved_entry_writes_no_term(self) -> None:
         # The when-known rule: an empty search adds no key, so every entry already

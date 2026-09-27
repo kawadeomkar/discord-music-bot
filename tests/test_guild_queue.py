@@ -2278,6 +2278,33 @@ class TestRestoreEntries:
         )
         assert isinstance(_to_entry(item), SearchQueueEntry)
 
+    async def test_a_term_only_song_entry_comes_back_labelled_by_its_term(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The other shape the term can arrive in: a track the walk named no row
+        for, so the display fields are empty and the term is all there is. It
+        proves the paths that read an unresolved item off this entry —
+        `unresolved`, item_label's term leg, and _to_entry's "ytsource" shape.
+
+        It does not reach the fields only a "qobj" entry can carry alongside a
+        term — thumbnail, the interjection flags, played_at and the np_* trio.
+        Nothing sets those on an item that has not resolved.
+        """
+        mock_guild.get_member.return_value = mock_author
+        written = SongQueueEntry(
+            webpage_url="",
+            title="",
+            requester_id=mock_author.id,
+            search="ytsearch:mystery track",
+        ).to_redis()
+        entry = parse_queue_entry(written)
+        assert isinstance(entry, SongQueueEntry)
+        assert await gq.restore_entries([entry]) == 1
+        item = gq.display_items()[0]
+        assert item.unresolved
+        assert item_label(item) == "mystery track"
+        assert isinstance(_to_entry(item), SearchQueueEntry)
+
 
 class TestARestoredSearchReSerializesToItself:
     """Every LREM and every mirror rebuild re-serializes a restored item, and a
