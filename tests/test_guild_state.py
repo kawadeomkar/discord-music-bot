@@ -1610,6 +1610,17 @@ class TestSongQueueEntryFromSong:
             1752530111.0,
         )
 
+    def test_the_parked_song_owes_no_search_term(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
+        """A playing song is resolved, and its blob is what from_crashed_state
+        re-queues. A term carried off the queue object would survive the
+        prefixed-field overlay — none of the thirteen spells it — and bring the
+        recovered song back unresolved, re-searching at its resume offset."""
+        song = ytdl_instance(None, search="ytsearch:some other song")
+
+        assert SongQueueEntry.from_song(song).search == ""
+
     def test_the_payload_thumbnail_is_written_over_the_queued_one(
         self, ytdl_instance: Callable[..., Any]
     ) -> None:

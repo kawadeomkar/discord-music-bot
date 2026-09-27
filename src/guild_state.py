@@ -791,6 +791,10 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
+            # A playing song is resolved, so the parked blob owes no term. One
+            # riding into guild:{id}:state would come back out of
+            # from_crashed_state unresolved and re-search at the recovered ts.
+            search="",
         )
 
     @staticmethod
