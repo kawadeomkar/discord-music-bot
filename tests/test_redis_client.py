@@ -2421,6 +2421,31 @@ class TestGetGuildState:
         state = await store.get_guild_state()
         assert state == GuildStateData()
 
+    async def test_a_refused_blob_names_the_guild_it_belongs_to(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A stale blob is a rollback artifact in ONE guild's hash, and the warning
+        is the only signal it is there — the store is the layer that knows which
+        guild the parse ran for."""
+        stale = SongQueueEntry(webpage_url="https://x", title="Old", requester_id=7)
+        await fake_redis.hset(
+            store.state_key(),
+            mapping={
+                b"current_song_url": b"https://y",
+                StateField.CURRENT_SONG.encode(): stale.to_redis(),
+            },
+        )
+
+        with caplog.at_level("WARNING", logger="src.guild_state"):
+            state = await store.get_guild_state()
+
+        assert state is not None and state.current_song is not None
+        assert state.current_song.webpage_url == "https://y"
+        assert "[guild:123456789] parked blob does not describe" in caplog.text
+
     async def test_returns_none_on_error_not_defaults(
         self, broken_store: GuildRedisStore
     ) -> None:

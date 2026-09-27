@@ -248,12 +248,13 @@ def _parked_fields(raw: dict[bytes, bytes], url: str) -> SongQueueEntry:
     )
 
 
-def _parked_song(raw: dict[bytes, bytes]) -> SongQueueEntry | None:
+def _parked_song(raw: dict[bytes, bytes], owner: str) -> SongQueueEntry | None:
     """The song that was playing, as its queue entry; None when none is parked.
     The prefixed fields win on everything they carry, and a blob describing the
     same play adds `thumbnail` and the np_* ids; the url and start-epoch gate
     keeps out a blob an older build left behind
-    (docs/ARCHITECTURE.md#the-parked-song)."""
+    (docs/ARCHITECTURE.md#the-parked-song). `owner` labels the refusal below,
+    which is about one guild's hash and is the only signal it happened."""
     url = _b_str(raw, StateField.CURRENT_SONG_URL)
     if not url:
         return None
@@ -273,7 +274,7 @@ def _parked_song(raw: dict[bytes, bytes]) -> SongQueueEntry | None:
         return replace(
             entry, **{name: getattr(fields, name) for name in _PARKED_FIELDS}
         )
-    log.warning("guild_state: parked blob does not describe the parked play")
+    log.warning(f"{owner} parked blob does not describe the parked play")
     return fields
 
 
@@ -557,9 +558,10 @@ class GuildStateData:
         return max(0, int(elapsed - total_pause))
 
     @classmethod
-    def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
+    def from_redis(cls, raw: dict[bytes, bytes], *, owner: str = "[guild:?]") -> Self:
         """Deserialize raw HGETALL output; an empty dict yields the zero-value
-        snapshot."""
+        snapshot. `owner` is the "[guild:{id}]" label the store reads this under,
+        for the one warning the parse can emit."""
         # No `_b_float(...) or 0.0` on total_pause: 0.0 is falsy and a stored
         # 0.0 would be elevated to the default.
         total_pause = _b_float(raw, StateField.TOTAL_PAUSE_SECONDS)
@@ -568,7 +570,7 @@ class GuildStateData:
             volume=_admitted(ConfigField.VOLUME, _b_float(raw, StateField.VOLUME)),
             voice_channel_id=_b_opt_int(raw, StateField.VOICE_CHANNEL_ID),
             text_channel_id=_b_opt_int(raw, StateField.TEXT_CHANNEL_ID),
-            current_song=_parked_song(raw),
+            current_song=_parked_song(raw, owner),
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
             pause_start_epoch=_b_float(raw, StateField.PAUSE_START_EPOCH),

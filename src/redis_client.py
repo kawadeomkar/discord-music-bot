@@ -1245,7 +1245,7 @@ class GuildRedisStore:
         refresh_ttl() at the end of _restore_state() covers the recovery window."""
         # Same decode_responses=False invariant as get_now_playing() above.
         raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.state_key()))
-        return GuildStateData.from_redis(raw)
+        return GuildStateData.from_redis(raw, owner=f"[guild:{self.guild_id}]")
 
     @_guild_op(default=None)
     async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
@@ -1258,7 +1258,9 @@ class GuildRedisStore:
         pipe.llen(self.queue_key())
         raw_state, queue_len = await pipe.execute()
         return GuildRecoveryGate(
-            state=GuildStateData.from_redis(raw_state),
+            state=GuildStateData.from_redis(
+                raw_state, owner=f"[guild:{self.guild_id}]"
+            ),
             pending_count=int(queue_len),
         )
 
@@ -1298,7 +1300,9 @@ class GuildRedisStore:
             if entry is not None
         )
         return GuildPlaybackSnapshot(
-            state=GuildStateData.from_redis(raw_state),
+            state=GuildStateData.from_redis(
+                raw_state, owner=f"[guild:{self.guild_id}]"
+            ),
             queue=entries,
             queue_unreadable=len(raw_queue) - len(entries),
             now_playing=NowPlayingData.from_redis(raw_np),
