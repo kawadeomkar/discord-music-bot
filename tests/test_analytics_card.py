@@ -263,6 +263,15 @@ class TestCacheCodec:
         )
         assert carried == set(AnalyticsMetrics.__dataclass_fields__)
 
+    def test_every_row_field_is_carried_or_named_as_dropped(self) -> None:
+        """The same comparison one level down. TopListener and TopSong are also
+        -leaderboard's rows, so a field added there for that board would otherwise
+        round trip as its default here and digest the same as the fresh card."""
+        dropped = {"top_songs": {"duration_secs"}}
+        for key, (cls, fields) in analytics_card._WIRE.items():
+            carried = set(fields) | dropped.get(key, set())
+            assert carried == set(cls.__dataclass_fields__), key
+
 
 class TestEmbed:
     def test_the_title_names_the_requested_window(self) -> None:

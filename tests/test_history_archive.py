@@ -31,6 +31,7 @@ from src.guild_state import (
     HeatCell,
     HistoryEntry,
     SourceCompletion,
+    TopArtist,
     TopListener,
     TopSong,
     serialize_history_entry,
@@ -2758,9 +2759,23 @@ class TestAnalyticsQuery:
         assert m.wait_pcts == (1.0, 2.0, 3.5, 9.0, 40.0)
         assert m.wait_p50_secs == 3.5
         assert m.livestream_plays == 1
-        assert m.top_listeners[0].requester_name == "Ann"
-        assert m.top_artists[0].uploader == "Lofi Girl"
-        assert m.top_songs[0].title == "Song"
+        assert m.top_listeners == (
+            TopListener(requester_id=7, requester_name="Ann", plays=2, played_secs=400),
+        )
+        assert m.top_artists == (
+            TopArtist(uploader="Lofi Girl", plays=1, played_secs=200),
+        )
+        # Whole rows, so duration_secs stays pinned at 0: the -analytics SQL does
+        # not select it, and analytics_card._WIRE drops it on that promise.
+        assert m.top_songs == (
+            TopSong(
+                title="Song",
+                webpage_url="https://y/1",
+                query_source="search",
+                plays=2,
+                played_secs=400,
+            ),
+        )
 
     async def test_a_null_jsonb_branch_does_not_raise(self) -> None:
         """Every branch is coalesce(..., '[]') in SQL precisely so this cannot
