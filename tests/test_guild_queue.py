@@ -3072,6 +3072,105 @@ class TestReplaceItem:
             assert committed
         assert gq._listed == {}
 
+    async def test_a_swap_during_a_rebuild_keeps_its_record(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """A rebuild serializes before its await and drops the records after it,
+        so a swap landing in between is answered by no write: the list holds the
+        bytes it replaced and the record has to survive to name them."""
+        item = _qobj(1, mock_author)
+        keeps = [_qobj(n, mock_author) for n in range(10, 17)]
+        await gq.put([item, *keeps])
+        new = replace(item, duration=180, uploader="Channel")
+        assert _to_entry(new).to_redis() != _to_entry(item).to_redis()
+        real_rebuild = store.rebuild_queue
+
+        async def swap_then_rebuild(entries: Any) -> bool:
+            gq.replace_item(item, new)  # the enrich lands inside the await
+            return await real_rebuild(entries)
+
+        with patch.object(store, "rebuild_queue", side_effect=swap_then_rebuild):
+            assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
+
+        assert gq._mirror_entry(new) == _to_entry(item)
+        calls = _spy_mirror_calls(store)
+
+        outcome = await gq.remove(remove_matcher(new.webpage_url))
+
+        assert outcome.removed == [new]
+        assert calls == ["remove_queue_entries"], "the LREM missed and rebuilt"
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_swap_after_mirror_entries_keeps_its_record(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The song start's rebuild has the same window: mirror_entries()
+        serializes, the MULTI writes those entries, and note_mirror_write reports
+        once it lands. A swap in between keeps its record."""
+        item = _qobj(1, mock_author)
+        keeps = [_qobj(n, mock_author) for n in range(10, 17)]
+        await gq.put([item, *keeps])
+        gq.note_mirror_write(landed=False, retired=True)  # the next start rebuilds
+        new = replace(item, duration=180, uploader="Channel")
+
+        entries = gq.mirror_entries()
+        gq.replace_item(item, new)  # the enrich lands inside the transaction
+        assert await store.rebuild_queue(entries)
+        gq.note_mirror_write(landed=True, retired=True)
+
+        assert not gq.mirror_dirty
+        assert gq._mirror_entry(new) == _to_entry(item)
+        calls = _spy_mirror_calls(store)
+
+        await gq.remove(remove_matcher(new.webpage_url))
+
+        assert calls == ["remove_queue_entries"], "the LREM missed and rebuilt"
+        await _assert_mirror_matches(gq, fake_redis, store)
+
+    async def test_a_swap_during_a_rebuild_still_guards_its_twin(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """One video listed twice gives two byte-identical entries. A rebuild that
+        lands around the enrich of the CLAIMED copy wrote that copy's pre-swap
+        bytes, so the claimed-entry guard must still see them: an LREM of the
+        pending twin takes the head-most match, the claimed copy's entry, and the
+        song start's LPOP then retires the next song's."""
+        first, second = _qobj(1, mock_author), _qobj(1, mock_author)
+        other = _qobj(2, mock_author)
+        pads = [_qobj(n, mock_author) for n in range(10, 16)]
+        await gq.put([first, other, second, *pads])
+        assert gq.get_nowait() is first
+        enriched = _restyled(first)
+        real_rebuild = store.rebuild_queue
+
+        async def swap_then_rebuild(entries: Any) -> bool:
+            gq.replace_item(first, enriched)  # the enrich lands inside the await
+            return await real_rebuild(entries)
+
+        with patch.object(store, "rebuild_queue", side_effect=swap_then_rebuild):
+            assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
+        calls = _spy_mirror_calls(store)
+
+        outcome = await gq.remove(remove_matcher(second.webpage_url))
+
+        assert outcome.removed == [second]
+        assert calls == ["rebuild_queue"], "the LREM ate the claimed head's entry"
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored[0] == _to_entry(enriched).to_redis()
+        await _assert_mirror_matches(gq, fake_redis, store)
+
 
 # ── bulk mutations vs in-flight dequeue ───────────────────────────────────────
 
