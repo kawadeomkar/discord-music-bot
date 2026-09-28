@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
-from src.queue_item import QueueObject
+from src.queue_item import NpCard, QueueObject
 from src.youtube import YTDL
 from tests.helpers import give_queue_object
 from src.guild_state import (
@@ -1475,16 +1475,18 @@ class TestHistoryEntryFromQueueObject:
             == 0
         )
 
-    def test_host_ids_come_from_the_tails_np_fields(self) -> None:
+    def test_host_ids_come_from_the_tails_card(self) -> None:
         """The tail names the card its interrupted fragment left frozen — the last
         message that hosted this play, which is what the column means. Still
         resolvable here: the cleanup that deletes it fires only when a tail STARTS,
         and a flushed tail never does."""
         entry = HistoryEntry.from_queue_object(
             _played_tail(
-                np_message_id=777777777777777777,
-                np_channel_id=888888888888888888,
-                np_dedicated=True,
+                np_card=NpCard(
+                    message_id=777777777777777777,
+                    channel_id=888888888888888888,
+                    dedicated=True,
+                ),
             ),
             guild_id=111,
         )

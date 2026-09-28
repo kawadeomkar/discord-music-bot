@@ -121,8 +121,8 @@ async def replay_current(
         # dequeues it.
         is_replay=True,
         # A fresh play, from the top: no offset, no interjection flags, no start
-        # stamp, none of the card ids the fragment it copies is holding, and the
-        # full retry budget — the attempts the live play spent are its own.
+        # stamp, not the card the fragment it copies is holding, and the full
+        # retry budget — the attempts the live play spent are its own.
         ts=None,
         persisted=True,
         interjected=False,
@@ -131,10 +131,7 @@ async def replay_current(
         played_at=0.0,
         stream_attempts=0,
         failed_format_ids=frozenset(),
-        np_message_id=0,
-        np_channel_id=0,
-        np_dedicated=False,
-        np_host_ref=None,
+        np_card=None,
     )
     # A completed prefetch bypasses the queue and would play instead of the
     # front-inserted replay — take it off the board first.

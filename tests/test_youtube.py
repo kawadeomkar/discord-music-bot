@@ -30,7 +30,7 @@ from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
-from src.queue_item import NpHostRef, QueueObject
+from src.queue_item import NpCard, NpHostRef, QueueObject
 from src import youtube
 from src.play_placement import ResolveWaitExpired
 from src.youtube import (
@@ -401,11 +401,13 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             is_replay=True,
             queued_at=99.5,
             queue_position=7,
-            np_message_id=555,
-            np_channel_id=666,
-            np_dedicated=True,
-            np_host_ref=NpHostRef(
-                message=MagicMock(spec=discord.Message), own_embeds=[], dedicated=True
+            np_card=NpCard(
+                message_id=555,
+                channel_id=666,
+                dedicated=True,
+                host_ref=NpHostRef(
+                    message=MagicMock(spec=discord.Message), own_embeds=[]
+                ),
             ),
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),

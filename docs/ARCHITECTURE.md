@@ -258,7 +258,7 @@ graph TD
 | `db_migrate.py` | The SQL migration runner (`python -m src.db_migrate`, also `just db-migrate`). Forward-only `NNNN_description.sql` files in `migrations/`, ordered numerically, recorded in the `schema_migrations` ledger, each applied in its own transaction under `pg_advisory_xact_lock` (so a migration must be idempotent-safe on retry). Holds `EXPECTED_SCHEMA_VERSION`; the app verifies that version and never applies DDL itself. Every deploy runs it before recreating the bot and aborts on failure; a database ahead of the build exits 0 with a note, matching the archive's own tolerance, so rollbacks deploy. `POSTGRES_MIGRATE_URL` lets migrations run as a higher-privilege role. |
 | `history_archive.py` | Postgres archive + drainer: `HistoryArchive` protocol (writes), `ArchiveReader` protocol (the read surface MusicBot holds: `-ping`'s liveness probe and `-leaderboard`'s aggregate), `PostgresHistoryArchive` (lazy asyncpg pool, `HistoryEntry`↔row mapping, schema-version check, `leaderboard()`), `HistoryOutboxDrainer` (one supervised task per process: replay this consumer's pending IDs → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL` by ID; at-least-once, deduped by `play_history_dedup`). The outbox is a **stream with a `drainers` consumer group**, so two live drainers are safe by construction. Present only when `HISTORY_ARCHIVE_ENABLED` is true. |
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
-| `queue_item.py` | The live queue item: `QueueObject`, one type for a resolved song and a search still to resolve ([one queue item](#one-queue-item)), the ask-time analytics it carries as two fields, and `NpHostRef`, the runtime half of the card a resume tail disposes of. Pure data with no project imports; `GuildQueue` owns the items and `guild_state.py` their bytes at rest. |
+| `queue_item.py` | The live queue item: `QueueObject`, one type for a resolved song and a search still to resolve ([one queue item](#one-queue-item)), the ask-time analytics it carries as two fields, and `NpCard`, the card a resume tail disposes of, with `NpHostRef` as its runtime half. Pure data with no project imports; `GuildQueue` owns the items and `guild_state.py` their bytes at rest. |
 | `youtube.py` | yt-dlp integration. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
 | `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track, playlist or album), or `SoundcloudSource`; a Spotify link of any other type, or with no id, raises `UnsupportedSpotifyLinkError`. `is_link` is the one link-or-text verdict every other caller asks. |
@@ -284,6 +284,7 @@ graph TD
 | Type | Module | Description |
 |---|---|---|
 | `QueueObject` | `queue_item.py` | Frozen, slotted, keyword-only dataclass, compared and hashed by identity (`eq=False`): `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song), `search` (the `ytsearch:` term while the item is unresolved — [one queue item](#one-queue-item)) |
+| `NpCard` | `queue_item.py` | Frozen, slotted, keyword-only dataclass: `message_id`, `channel_id` (from `message.channel.id`, never the home channel), `dedicated` — the authorization for the by-id delete — and a runtime-only `host_ref` (`NpHostRef`: the `Message` and its own embeds, the only thing that can strip-edit a response host). None on an item with nothing to clean up |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; holds the `QueueObject` it plays (`queued`) and answers the ask off it ([the ask a playing song holds](#the-ask-a-playing-song-holds)); counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
 | `YTSource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — a parse result, never a queue item |
 | `SpotifySource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
@@ -1200,10 +1201,10 @@ they go.
 the entry, at the resume offset, with the LPOP already committed. `ts` is set there
 unconditionally, so a blob's own offset never reaches playback; the recovered position
 does. What the blob adds over the fields is what they never carried: the `thumbnail`, so a
-recovered head's queue row has a cover again, and the `np_*` card ids. The ids reach two
+recovered head's queue row has a cover again, and the card's ids. The ids reach two
 places a crash-recovered head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
 `play_history.message_id`/`channel_id` when `_flush_played` archives a head a removal
-destroys. The delete is gated on `np_dedicated` and a same-guild channel, and the card it
+destroys. The delete is gated on the card's `dedicated` and a same-guild channel, and the card it
 names was already gone when the tail started, so it is a wasted DELETE at worst.
 
 ---
@@ -2427,20 +2428,20 @@ reports them once, naming the guild, the count and the distinct shapes it met, a
 warn-per-entry wrapper the parked-song blob reads through, where there is only one.
 
 `slots=True` is what keeps the merge cheap rather than free. By `sys.getsizeof` on this
-interpreter a 24-field `QueueObject` is **224 B**, against **336 B** for the same instance
-carrying a `__dict__` (the object plus its dict). The two ask-time analytics fields sit on
-the item itself: over 10,000 unresolved collection tracks built with distinct titles,
-terms and positions, an item is **507 B resident** (`tracemalloc`), where the same items
-each holding a two-field analytics object beside them measured 547 B. Keep the class off
-`asdict`/`vars` and off any pickle path.
+interpreter a 21-field `QueueObject` is **200 B**, against **344 B** for the same instance
+carrying a `__dict__` (the object plus its dict). Over 10,000 unresolved collection tracks
+built with distinct titles, terms and positions, an item is **about 0.5 KB resident**
+(`tracemalloc`; 464–483 B measured, the swing being the lengths of the title and the
+term). The ask-time analytics are two fields of the item; the card a resume
+tail carries is one `NpCard` slot, a 64 B object that exists only on a tail. Keep the
+class off `asdict`/`vars` and off any pickle path.
 
 ### The ask a playing song holds
 
 `YTDL` holds the `QueueObject` it was built from (`song.queued`) rather than copying its
 fields. Read-only properties alias the ask — `requester`, `user_input`, `persisted`, the
-interjection flags, `queued_at`/`queue_position`, `query_source`, the NP-card ids — so a
-playing song's ask
-is spelled the way a queued item's is.
+interjection flags, `queued_at`/`queue_position`, `query_source`, `np_card` — so a
+playing song's ask is spelled the way a queued item's is.
 
 Three sites turn a playing song back into a queue entry, each a `replace(song.queued, …)`:
 `MusicPlayer._requeued_form` (a completed prefetch going back on the queue),
@@ -2511,8 +2512,8 @@ completed bar would be a false record.
 **Interrupted fragments clean up after themselves.** Releasing rather than retiring is
 right for a song that ended, but an interrupted fragment leaves a bar frozen
 at its interrupt position — and a stack leaves one per interjection. So the resume tail
-inherits a pointer to that card (`np_message_id` / `np_channel_id` / `np_dedicated` on
-the wire, plus a runtime-only `np_host_ref`) and disposes of it when the tail starts,
+inherits that card as `np_card` — its ids, which are what the wire carries, plus a
+runtime-only host ref — and disposes of it when the tail starts,
 strictly *after* its own card is up. Three constraints shape this:
 
 - **Never a re-adopt.** `_adopt_np_host` refuses a message older than the current host

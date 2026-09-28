@@ -711,8 +711,8 @@ class SongQueueEntry:
     # interrupted by an interjection or recovered from a crash records the start
     # of the play, not of its last fragment.
     played_at: float = 0.0
-    # The interrupted fragment's frozen NP card. The live np_host_ref cannot be
-    # serialized, so a rehydrated tail can only DELETE a dedicated card.
+    # The interrupted fragment's frozen NP card, flat. The live host ref cannot
+    # be serialized, so a rehydrated tail can only DELETE a dedicated card.
     np_message_id: int = 0
     np_channel_id: int = 0
     np_dedicated: bool = False
@@ -722,7 +722,9 @@ class SongQueueEntry:
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
-        """Snapshot a live queue item for persistence."""
+        """Snapshot a live queue item for persistence. The card flattens to its
+        three wire fields; no card is 0/0/False."""
+        card = item.np_card
         return cls(
             webpage_url=item.webpage_url,
             title=item.title,
@@ -740,9 +742,9 @@ class SongQueueEntry:
             queue_position=item.queue_position,
             query_source=item.query_source,
             played_at=item.played_at,
-            np_message_id=item.np_message_id,
-            np_channel_id=item.np_channel_id,
-            np_dedicated=item.np_dedicated,
+            np_message_id=card.message_id if card is not None else 0,
+            np_channel_id=card.channel_id if card is not None else 0,
+            np_dedicated=card.dedicated if card is not None else False,
             search=item.search,
         )
 
@@ -1048,8 +1050,9 @@ class HistoryEntry:
         counterpart to from_song, for an interjection-interrupted entry destroyed
         before its tail could play. played_secs comes from `ts`, the ABSOLUTE
         resume offset, capped at duration. The host ids come off the tail's
-        np_* fields: the cleanup that deletes that card fires only when a tail
-        STARTS, and a flushed tail never does."""
+        card: the cleanup that deletes that card fires only when a tail STARTS,
+        and a flushed tail never does."""
+        card = item.np_card
         played = item.ts or 0
         duration = item.duration or 0
         if duration:
@@ -1065,8 +1068,8 @@ class HistoryEntry:
             thumbnail=item.thumbnail or "",
             uploader=item.uploader or "",
             played_at=item.played_at,
-            message_id=item.np_message_id,
-            channel_id=item.np_channel_id,
+            message_id=card.message_id if card is not None else 0,
+            channel_id=card.channel_id if card is not None else 0,
             queued_at=item.queued_at,
             queue_position=item.queue_position,
             query_source=item.query_source,
