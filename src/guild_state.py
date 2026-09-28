@@ -30,34 +30,10 @@ from typing import (
 import orjson
 
 if TYPE_CHECKING:
-    from src.youtube import QueueObject, YTDL
+    from src.queue_item import QueueObject
+    from src.youtube import YTDL
 
 log = logging.getLogger(__name__)
-
-
-# ── Pure-analytics values, grouped ───────────────────────────────────────────
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Analytics:
-    """Values carried on live queue objects (QueueObject, YTDL) for
-    storage alone — read only to serialize or to carry onto the next object; a
-    field anything branches on or renders belongs elsewhere. In-memory shape
-    only: wire entries and play_history columns stay FLAT. Frozen, because carry
-    sites alias one instance across a resume tail and its source."""
-
-    # Unix epoch when the user ASKED: the command message's snowflake time
-    # (Discord's clock, so played_at - queued_at can go slightly negative).
-    # 0.0 = unknown (pre-feature wire entries).
-    queued_at: float
-    # Songs ahead at ask time, counting the one playing (0 = played immediately).
-    # Read once at dispatch, so it is approximate against the insert.
-    queue_position: int
-
-
-# What a pre-feature wire entry rehydrates as, and the default on live objects
-# whose construction site cannot know the values yet.
-ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
 
 # ── guild:{id}:state hash — field name constants ─────────────────────────────
@@ -708,7 +684,7 @@ _ENTRY_TYPE_SONG: Final[str] = "qobj"
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongQueueEntry:
     """A queued item at rest ("qobj" on the wire), the pure-data twin of
-    src.youtube.QueueObject — resolved, or still a search when `search` is
+    src.queue_item.QueueObject — resolved, or still a search when `search` is
     non-empty. requester is an ID (a live discord.Member cannot exist at rest;
     GuildQueue rehydrates it), None only for the crashed-head entry. Snowflakes
     stay exact end-to-end: orjson native ints, never floats."""

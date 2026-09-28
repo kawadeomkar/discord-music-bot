@@ -13,7 +13,8 @@ import pytest
 import redis.asyncio as aioredis
 
 from src import config, play_pipeline
-from src.guild_state import OFF_SECS, Analytics, GuildConfig
+from src.guild_state import OFF_SECS, GuildConfig
+from src.queue_item import Analytics, QueueObject
 from src.help import CATEGORY_COMMANDS
 from src.musicbot import MusicBot
 from src.play_placement import ResolveWaitExpired
@@ -46,7 +47,7 @@ from src.sources import (
 )
 from src.queue_progress import EnqueueProgress
 from src.spotify import SpotifyPlaylist
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 from tests.helpers import (
     MOCK_QUEUED_ROWS,
     admit,

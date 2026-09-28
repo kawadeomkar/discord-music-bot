@@ -14,7 +14,7 @@ import discord
 import pytest
 
 from src import play_pipeline
-from src.guild_state import Analytics
+from src.queue_item import Analytics, QueueObject
 from src.config import SpotifyStatus
 from src.musicbot import MusicBot, SpotifyDisabledError
 from src.musicplayer import MusicPlayer
@@ -50,7 +50,7 @@ from src.sources import (
     timestamp_warning,
 )
 from src.spotify import SpotifyPlaylist, SpotifyTrack
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 from tests.helpers import (
     admit,
     command_callback,

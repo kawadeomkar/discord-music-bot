@@ -12,7 +12,7 @@ from opentelemetry import trace
 
 from src.commands._common import NOTHING_PLAYING
 from src.guild_queue import is_replay_of
-from src.guild_state import Analytics
+from src.queue_item import Analytics, QueueObject
 from src.musicplayer import MusicPlayer
 from src.telemetry import get_tracer
 from src.util import (
@@ -23,7 +23,7 @@ from src.util import (
     refund_cooldown,
     safe_label,
 )
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL
 
 _tracer = get_tracer(__name__)
 

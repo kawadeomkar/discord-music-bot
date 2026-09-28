@@ -75,11 +75,10 @@ from src.queue_rows import (
     queue_runtime,
     requester_mention,
 )
+from src.queue_item import NpHostRef, QueueObject
 from src.youtube import (
     YTDL,
     ExtractionError,
-    NpHostRef,
-    QueueObject,
     invalidate_stream_cache,
     prefetch_warm_slot,
 )

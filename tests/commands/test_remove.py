@@ -8,7 +8,7 @@ from src.guild_queue import RemoveMode, RemoveOutcome, item_label
 from src.musicbot import MusicBot
 from src.commands._common import echo
 from src.util import EMBED_FIELD_LIMIT
-from src.youtube import QueueObject
+from src.queue_item import QueueObject
 from tests.helpers import command_callback, mocked, unresolved
 
 

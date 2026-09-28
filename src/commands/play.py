@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
-from src.guild_state import Analytics
+from src.queue_item import Analytics, QueueObject
 from src.musicplayer import MusicPlayer
 from src.play_placement import (
     PlaceStalled,
@@ -41,7 +41,6 @@ from src.util import (
 )
 from src.commands._common import echo
 from src.queue_progress import EnqueueProgress, enqueue_progress, is_collection
-from src.youtube import QueueObject
 
 # Stage functions resolve through the module per call: the test seam is the name
 # on play_pipeline, which a from-import would bind here at import time.
