@@ -14,7 +14,7 @@ import redis.asyncio as aioredis
 
 from src import config, play_pipeline
 from src.guild_state import OFF_SECS, GuildConfig
-from src.queue_item import Analytics, QueueObject
+from src.queue_item import QueueObject
 from src.help import CATEGORY_COMMANDS
 from src.musicbot import MusicBot
 from src.play_placement import ResolveWaitExpired
@@ -49,6 +49,7 @@ from src.queue_progress import EnqueueProgress
 from src.spotify import SpotifyPlaylist
 from src.youtube import YTDL, YoutubePlaylist
 from tests.helpers import (
+    Ask,
     MOCK_QUEUED_ROWS,
     admit,
     command_callback,
@@ -100,7 +101,7 @@ def _sent_descriptions(mock_ctx: MagicMock) -> list[str]:
 _REAL_ENQUEUE_SINGLE = play_pipeline.enqueue_single
 
 
-_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=0)
+_ANALYTICS: Ask = {"queued_at": 1752530000.5, "queue_position": 0}
 
 
 _ORIGIN = "https://yt.com/v=origin"
@@ -337,7 +338,7 @@ class TestPlayCommand:
 
 
 class TestPlayAnalytics:
-    """The ask-time Analytics -play mints and hands to queue_source.
+    """The ask-time analytics -play mints and hands to queue_source.
 
     Asserted on the call rather than on a returned object: queue_source is what
     carries the value into every construction site, and nothing downstream
@@ -379,9 +380,9 @@ class TestPlayAnalytics:
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
-        analytics = spy.await_args.kwargs["analytics"]
-        assert analytics.queued_at == mock_ctx.message.created_at.timestamp()
-        assert analytics.queue_position == 0
+        ask = spy.await_args.kwargs
+        assert ask["queued_at"] == mock_ctx.message.created_at.timestamp()
+        assert ask["queue_position"] == 0
         mp.enqueue_depth.assert_not_called()
 
     async def test_warm_path_reads_the_depth_after_the_restore_lands(
@@ -416,7 +417,7 @@ class TestPlayAnalytics:
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         queued = mp.queue_put.await_args.args[0]
-        assert queued.analytics.queue_position == 12
+        assert queued.queue_position == 12
 
     async def test_warm_path_carries_the_ask_time_and_mints_the_depth_at_the_insert(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -438,15 +439,15 @@ class TestPlayAnalytics:
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
-        analytics = spy.await_args.kwargs["analytics"]
+        ask = spy.await_args.kwargs
         # The message snowflake, NOT time.time(): gateway delivery lag is real
         # time the user waited, and so is the 1-4s resolve that follows.
-        assert analytics.queued_at == mock_ctx.message.created_at.timestamp()
+        assert ask["queued_at"] == mock_ctx.message.created_at.timestamp()
         # Not read at the ask — two requests resolving together would both read
         # the same depth. The insert reads it.
-        assert analytics.queue_position == 0
+        assert ask["queue_position"] == 0
         queued = mp.queue_put.await_args.args[0]
-        assert queued.analytics.queue_position == 7
+        assert queued.queue_position == 7
 
 
 class TestPlayWhilePaused:
@@ -614,7 +615,7 @@ class TestPlayWhilePaused:
         assert queued.interjected is False  # must not trigger replace semantics later
         # Re-minted for the append: the 0 minted for an interjection would claim
         # this song played immediately when it waited behind the whole queue.
-        assert queued.analytics.queue_position == 9
+        assert queued.queue_position == 9
 
     async def test_resolution_failure_leaves_paused_song_untouched(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1029,7 +1030,7 @@ class TestPlayFrontInsertion:
             mp,
             admit(music_bot, mock_ctx, mp),
             placement=Placement.COLD_FRONT,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1349,7 +1350,7 @@ class TestNowFlagRouting:
             )
 
         queued = seams.mp.queue_put_next.await_args.args[0]
-        assert queued.analytics.queue_position == 1
+        assert queued.queue_position == 1
         seams.mp.enqueue_depth.assert_not_called()
 
     @pytest.mark.parametrize("flag", ["", "--now "])
@@ -1802,7 +1803,7 @@ class TestNowFlag:
         # interject() also returns None when the loop moved on to a DIFFERENT
         # song, which this insert waits behind: one, not the 0 an interjection
         # would have had, and not the queue depth — it goes to the front.
-        assert queued.analytics.queue_position == 1
+        assert queued.queue_position == 1
         # The interjection marker must not leak onto a normally queued song —
         # a later interjection would otherwise "replace" it without a resume entry.
         assert queued.interjected is False
@@ -2481,7 +2482,8 @@ class TestPlacementInsertsAndConfirmations:
                 webpage_url=f"https://yt.com/v={i}",
                 title=f"Track {i}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1.0, queue_position=i),
+                queued_at=1.0,
+                queue_position=i,
             )
             for i in range(3)
         ]
@@ -2507,7 +2509,7 @@ class TestPlacementInsertsAndConfirmations:
         assert [item.webpage_url for item in call.args[0]] == [
             t.webpage_url for t in tracks
         ]
-        assert [item.analytics.queue_position for item in call.args[0]] == [20, 21, 22]
+        assert [item.queue_position for item in call.args[0]] == [20, 21, 22]
 
     async def test_playlist_interjects_head_first_and_queues_the_rest(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2630,7 +2632,7 @@ class TestPlacementInsertsAndConfirmations:
             mp,
             admit(music_bot, mock_ctx, mp),
             placement=Placement.NEXT,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -2678,7 +2680,7 @@ class TestPlacementInsertsAndConfirmations:
                 mp,
                 admit(music_bot, mock_ctx, mp),
                 placement=Placement.NEXT,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 cog=music_bot,
             )
@@ -2717,7 +2719,7 @@ class TestPlacementInsertsAndConfirmations:
                 mp,
                 admit(music_bot, mock_ctx, mp),
                 placement=Placement.NEXT,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 cog=music_bot,
             )
@@ -2765,7 +2767,7 @@ class TestPlacementInsertsAndConfirmations:
                 mp,
                 admit(music_bot, mock_ctx, mp),
                 placement=placement,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 cog=music_bot,
             )
@@ -2831,7 +2833,7 @@ class TestPlacementInsertsAndConfirmations:
 
         (queued,) = mp.queue_put_next.await_args.args
         assert queued.webpage_url == qobj.webpage_url
-        assert queued.analytics.queue_position == 1
+        assert queued.queue_position == 1
         mp.queue_put.assert_not_awaited()
         mp.queue_put_front.assert_not_awaited()
         mp.build_queued_song_embed.assert_not_called()
@@ -3405,7 +3407,7 @@ class TestResolveThenPlace:
             gate.set()
             await asyncio.gather(*tasks)
 
-        assert [q.analytics.queue_position for q in placed] == [4, 5]
+        assert [q.queue_position for q in placed] == [4, 5]
 
     async def test_now_interjects_without_waiting_for_a_collection(
         self, music_bot: MusicBot, mock_ctx: MagicMock

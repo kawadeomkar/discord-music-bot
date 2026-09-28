@@ -7,8 +7,8 @@ Every human-authored string renders HERE, never in the chart image: the runtime
 image ships no system fonts and matplotlib's bundled face covers no CJK, Thai or
 emoji. See docs/ARCHITECTURE.md#analytics-rendering.
 
-Named `analytics_card` because `queue_item.Analytics` (a per-song enqueue stamp)
-already exists.
+Named `analytics_card` beside `commands/analytics.py`, which holds only the
+command's entry point.
 """
 
 import asyncio

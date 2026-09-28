@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
-from src.queue_item import Analytics, QueueObject
+from src.queue_item import QueueObject
 from src.musicplayer import MusicPlayer
 from src.play_placement import (
     PlaceStalled,
@@ -294,9 +294,7 @@ async def _resolve_and_place(
             placement = Placement.TAIL
         # The message's snowflake time, so the wait covers gateway delivery.
         # The depth is minted at the insert, under the place lock.
-        analytics = Analytics(
-            queued_at=ctx.message.created_at.timestamp(), queue_position=0
-        )
+        queued_at = ctx.message.created_at.timestamp()
         resolve_started = time.monotonic()
         if cold_start:
             # Held across the join, which opens the gate the moment the
@@ -314,7 +312,8 @@ async def _resolve_and_place(
                 qobj = await play_pipeline.queue_source(
                     ctx,
                     source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=0,
                     origin=url,
                     mode=resolve_mode_for(placement),
                     on_progress=progress.update if progress else None,
@@ -366,7 +365,8 @@ async def _resolve_and_place(
             qobj = await play_pipeline.queue_source(
                 ctx,
                 source,
-                analytics=analytics,
+                queued_at=queued_at,
+                queue_position=0,
                 origin=url,
                 mode=resolve_mode_for(placement),
                 on_progress=progress.update if progress else None,
@@ -431,7 +431,8 @@ async def _resolve_and_place(
                     mp,
                     req,
                     placement=placement,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=0,
                     origin=url,
                     release_hold=hold.aclose,
                     cog=cog,

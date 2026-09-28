@@ -2068,7 +2068,8 @@ class MusicPlayer:
             source.search,
             redis=self.store.redis if self.store is not None else None,
             query_source=source.query_source,
-            analytics=source.analytics,
+            queued_at=source.queued_at,
+            queue_position=source.queue_position,
             user_input=source.user_input,
         )
         return replace(

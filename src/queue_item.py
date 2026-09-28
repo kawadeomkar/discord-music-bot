@@ -7,34 +7,9 @@ youtube.py builds them from what yt-dlp finds.
 """
 
 from dataclasses import dataclass, field
-from typing import Final, Optional, Union
+from typing import Optional, Union
 
 import discord
-
-
-# ── Pure-analytics values, grouped ───────────────────────────────────────────
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Analytics:
-    """Values carried on live queue objects (QueueObject, YTDL) for
-    storage alone — read only to serialize or to carry onto the next object; a
-    field anything branches on or renders belongs elsewhere. In-memory shape
-    only: wire entries and play_history columns stay FLAT. Frozen, because carry
-    sites alias one instance across a resume tail and its source."""
-
-    # Unix epoch when the user ASKED: the command message's snowflake time
-    # (Discord's clock, so played_at - queued_at can go slightly negative).
-    # 0.0 = unknown (pre-feature wire entries).
-    queued_at: float
-    # Songs ahead at ask time, counting the one playing (0 = played immediately).
-    # Read once at dispatch, so it is approximate against the insert.
-    queue_position: int
-
-
-# What a pre-feature wire entry rehydrates as, and the default on live objects
-# whose construction site cannot know the values yet.
-ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -93,9 +68,16 @@ class QueueObject:
     # an ordinary queued song. YTDL carries it so _neutralize_prefetch's rebuild
     # keeps it; an interjection's resume tail never sets it.
     is_replay: bool = field(default=False, repr=False)
-    # Ask-time analytics. yt_source/yt_playlist REQUIRE it; the default exists
-    # for rehydration and the carry sites, which always pass a real value.
-    analytics: Analytics = ANALYTICS_ZERO
+    # ── ask-time analytics ──
+    # Stored and carried, never branched on or rendered; the wire entry and the
+    # play_history row hold both under these names. yt_source/yt_playlist
+    # REQUIRE them; the defaults are what a pre-feature wire entry rehydrates as.
+    # Unix epoch when the user ASKED: the command message's snowflake time
+    # (Discord's clock, so played_at - queued_at can go slightly negative).
+    queued_at: float = 0.0
+    # Songs ahead at ask time, counting the one playing (0 = played immediately).
+    # Read once at dispatch, so it is approximate against the insert.
+    queue_position: int = 0
     # "search", or the host of the pasted link; "" = unknown (src.sources).
     query_source: str = ""
     # Epoch when the audio started, stamped by the loop at vc.play(). A resume

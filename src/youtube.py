@@ -22,7 +22,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
-from src.queue_item import Analytics, NpHostRef, QueueObject
+from src.queue_item import NpHostRef, QueueObject
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_link, is_mix
 from src.telemetry import get_tracer
@@ -1268,7 +1268,8 @@ def _queue_object_from_flat_entry(
     requester: Union[discord.User, discord.Member],
     *,
     query_source: str,
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     user_input: Optional[str],
     ts: Optional[int] = None,
 ) -> Optional[QueueObject]:
@@ -1281,7 +1282,8 @@ def _queue_object_from_flat_entry(
         identity,
         requester,
         query_source=query_source,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
         user_input=user_input,
         ts=ts,
     )
@@ -1292,7 +1294,8 @@ def _queue_object_from_identity(
     requester: Union[discord.User, discord.Member],
     *,
     query_source: str,
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     user_input: Optional[str],
     ts: Optional[int] = None,
 ) -> QueueObject:
@@ -1308,7 +1311,8 @@ def _queue_object_from_identity(
         uploader=identity.uploader,
         thumbnail=identity.thumbnail,
         query_source=query_source,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
     )
 
 
@@ -1660,8 +1664,12 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.queued.failed_format_ids
 
     @property
-    def analytics(self) -> Analytics:
-        return self.queued.analytics
+    def queued_at(self) -> float:
+        return self.queued.queued_at
+
+    @property
+    def queue_position(self) -> int:
+        return self.queued.queue_position
 
     @property
     def query_source(self) -> str:
@@ -2057,7 +2065,8 @@ class YTDL(discord.FFmpegOpusAudio):
         search: str,
         *,
         query_source: str,
-        analytics: Analytics,
+        queued_at: float,
+        queue_position: int,
         user_input: Optional[str],
         download: bool = False,
         ts: Optional[int] = None,
@@ -2069,11 +2078,12 @@ class YTDL(discord.FFmpegOpusAudio):
         when present. flat=True answers a SEARCH from one search POST when the
         first result is a plain video with a duration — no watch page, no player
         call, and no stream URL, which the prefetch fills later; anything else
-        takes the full extraction. query_source, analytics and user_input are
-        REQUIRED so the QueueObject leaves complete — a default would let a call
-        site write a plausible zero. user_input None falls back to `search`, which
-        is what the user typed only for a direct -play of one song; for an expanded
-        collection `search` is a generated title, not the link -remove matches."""
+        takes the full extraction. query_source, queued_at, queue_position and
+        user_input are REQUIRED so the QueueObject leaves complete — a default
+        would let a call site write a plausible zero. user_input None falls back
+        to `search`, which is what the user typed only for a direct -play of one
+        song; for an expanded collection `search` is a generated title, not the
+        link -remove matches."""
         origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
         # ts is excluded — a per-request playback offset, not part of the identity.
@@ -2106,7 +2116,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     ),
                     requester,
                     query_source=query_source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=queue_position,
                     user_input=origin,
                     ts=ts,
                 )
@@ -2131,7 +2142,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     flat_entry,
                     requester,
                     query_source=query_source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=queue_position,
                     user_input=origin,
                     ts=ts,
                 )
@@ -2239,7 +2251,8 @@ class YTDL(discord.FFmpegOpusAudio):
             identity,
             requester,
             query_source=query_source,
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=queue_position,
             user_input=origin,
             ts=ts,
         )
@@ -2251,7 +2264,8 @@ class YTDL(discord.FFmpegOpusAudio):
         requester: Union[discord.User, discord.Member],
         *,
         query_source: str,
-        analytics: Analytics,
+        queued_at: float,
+        queue_position: int,
         user_input: str,
         redis: Optional[aioredis.Redis] = None,
         on_progress: Optional[ProgressFn] = None,
@@ -2260,10 +2274,10 @@ class YTDL(discord.FFmpegOpusAudio):
         """Fetch flat entry metadata for every video in a YouTube playlist, with the
         playlist's title and the count of entries dropped as unavailable.
 
-        query_source, analytics and user_input are REQUIRED (see yt_source).
-        `analytics` is the head's — track positions are derived per kept track
-        below. `user_input` is the playlist link the user pasted, carried onto every
-        track so -remove can match it.
+        query_source, queued_at, queue_position and user_input are REQUIRED (see
+        yt_source). `queue_position` is the head's — track positions are derived
+        per kept track below. `user_input` is the playlist link the user pasted,
+        carried onto every track so -remove can match it.
 
         Cached and single-flighted: this is the most expensive resolve in the system
         (99s at 5,547 entries), and two users pasting one collection used to run two
@@ -2321,7 +2335,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
         span.set_attribute("ytdl.playlist_size", len(tracks))
         # Positions derive from the KEPT tracks, so the entries _playlist_tracks
-        # dropped leave no gaps. replace() so a field added to Analytics is carried.
+        # dropped leave no gaps.
         return YoutubePlaylist(
             title=title,
             tracks=[
@@ -2329,9 +2343,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     track,
                     requester,
                     query_source=query_source,
-                    analytics=replace(
-                        analytics, queue_position=analytics.queue_position + offset
-                    ),
+                    queued_at=queued_at,
+                    queue_position=queue_position + offset,
                     user_input=user_input,
                 )
                 for offset, track in enumerate(tracks)

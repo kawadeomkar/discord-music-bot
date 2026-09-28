@@ -14,20 +14,20 @@ from discord.ext import commands
 import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_state import HistoryEntry
-from src.queue_item import Analytics
 from src.recovery import _Countdown
 from src.musicbot import MusicBot, SpotifyDisabledError
 from src.play_placement import check_voice_permissions, play_takes_the_queue
 from src.sources import UnsupportedSpotifyLinkError
 from src.spotify import SpotifyAuthError
 from tests.helpers import (
+    Ask,
     described,
     make_mock_task,
 )
 
 # Ask-time analytics for direct queue_source/_enqueue_playlist calls — the real
 # command paths mint this at dispatch from ctx.message.created_at + enqueue_depth.
-_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=0)
+_ANALYTICS: Ask = {"queued_at": 1752530000.5, "queue_position": 0}
 _ORIGIN = "https://yt.com/v=origin"
 
 
