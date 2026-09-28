@@ -3022,7 +3022,11 @@ class MusicPlayer:
                         )
                     if skip_history and pending_tail is not None:
                         stamps["np_host_ref"] = (
-                            NpHostRef(finished_host, finished_own, finished_dedicated)
+                            NpHostRef(
+                                message=finished_host,
+                                own_embeds=finished_own,
+                                dedicated=finished_dedicated,
+                            )
                             if finished_host is not None
                             else None
                         )
