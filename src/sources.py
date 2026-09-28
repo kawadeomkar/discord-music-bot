@@ -202,7 +202,7 @@ class YTSource:
         return self.url or f"https://www.youtube.com/playlist?list={self.list_id}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SoundcloudSource:
     # TODO: SoundCloud timestamp links are ignored, so the track always starts at 0:00.
     # parse_url() reads `t`/`ts` for youtube.com only, so `ts` is never populated;
@@ -366,7 +366,7 @@ def _parse_link(
     if host in _SPOTIFY_HOSTS:
         return _spotify_source(*_spotify_path(parts.path))
     if host == "soundcloud.com":
-        return SoundcloudSource(link, process=True)
+        return SoundcloudSource(url=link, process=True)
     # A host that is not special-cased goes to yt-dlp, which rejects an
     # unsupported site itself (YTDL.yt_source). Routed like a bare YouTube watch
     # URL; the host is what the archive records.

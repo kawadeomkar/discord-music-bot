@@ -1410,3 +1410,11 @@ class TestParseResultsMeetTheDataclassConvention:
         assert not hasattr(source, "__dict__")
         with pytest.raises(TypeError):
             SpotifySource(SpotifyType.TRACK, "x")  # pyright: ignore[reportCallIssue]
+
+    def test_a_soundcloud_parse_is_frozen_slotted_and_keyword_only(self) -> None:
+        source = SoundcloudSource(url="https://soundcloud.com/a/b")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(source, "ts", 5)
+        assert not hasattr(source, "__dict__")
+        with pytest.raises(TypeError):
+            SoundcloudSource("https://soundcloud.com/a/b")  # pyright: ignore[reportCallIssue]
