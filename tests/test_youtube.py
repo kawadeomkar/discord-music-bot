@@ -346,7 +346,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
     ) -> None:
         """The one ask field a playing song WRITES, asserted on a real source: the
         doubles re-implement this setter on their own type, so every loop test
-        that stamps the start passes whether or not youtube.py's setter does."""
+        that stamps the start passes whether or not youtube.py's setter does.
+        The stamp lands on the entry the source holds, not on the object the
+        song was built from."""
         qobj = QueueObject(
             webpage_url="https://www.youtube.com/watch?v=test",
             title="Test Song",
@@ -356,8 +358,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
         song.played_at = 5.0
 
-        assert qobj.played_at == 5.0
+        assert song.queued.played_at == 5.0
         assert song.played_at == 5.0
+        assert qobj.played_at == 0.0
 
     async def test_no_queueobject_field_is_silently_left_behind(
         self, mock_ctx: MagicMock

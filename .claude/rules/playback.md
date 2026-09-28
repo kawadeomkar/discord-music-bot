@@ -476,9 +476,10 @@ the level baked into that source, and a requeued song is rebuilt at the level cu
 then. **Not gated on "playback-relevant"** —
 `user_input` and `persisted` are neither, and both were lost when the rebuilds copied
 field by field. The only ask field a playing song WRITES is `played_at`, whose setter
-writes through to the entry; a second write-through owes the same argument the first
-one makes (`docs/ARCHITECTURE.md#the-ask-a-playing-song-holds`), since a prefetched
-song's entry is still queued while it resolves. The rebuilds are
+replaces the entry the source holds (`song.queued`) with a stamped copy — the object the
+song was built from is never written, so a prefetched song's still-queued entry cannot
+be changed by it (`docs/ARCHITECTURE.md#the-ask-a-playing-song-holds`); a second stamp
+takes the same form. The rebuilds are
 invisible to the tests while their song fixtures are bare `MagicMock()` — drive one off
 a real `YTDL` (the `ytdl_instance` fixture takes carried fields as kwargs) or off a
 double wired with `give_queue_object`, so a dropped field fails the suite rather than a

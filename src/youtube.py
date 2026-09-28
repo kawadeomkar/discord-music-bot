@@ -1771,10 +1771,10 @@ class YTDL(discord.FFmpegOpusAudio):
 
     @played_at.setter
     def played_at(self, epoch: float) -> None:
-        """The loop's start stamp, the one ask field a playing song writes. It runs
-        after commit_dequeue has taken the item off the deque, so the write reaches
-        an object nothing else holds."""
-        self.queued.played_at = epoch
+        """The loop's start stamp, the one ask field a playing song writes. The
+        source holds the stamped entry from here on; the object it was built from
+        is not written, so nothing else holding that object sees the stamp."""
+        self.queued = replace(self.queued, played_at=epoch)
 
     def __getitem__(self, item: str) -> Any:
         return self.__getattribute__(item)

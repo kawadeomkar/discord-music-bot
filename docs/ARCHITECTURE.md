@@ -2444,10 +2444,11 @@ their own card, and a replay starts from the top. A field added to `QueueObject`
 into playback and back with no edit at any of the three.
 
 `played_at` is the one ask field a playing song writes: the loop stamps it at `vc.play()`
-and the setter writes through to the entry. That is safe because the stamp runs after
-`commit_dequeue()` has taken the item off the deque. A prefetched song's entry is still
-queued while it resolves, so a write before that commit would reach an item `-remove` and
-the queue mirror still see; a second write-through owes the same argument.
+and the setter replaces the entry the source holds with a stamped copy. The object the
+song was built from is not written, so a prefetched song's entry — still queued while it
+resolves, and what `-remove` and the queue mirror see — cannot be changed by the stamp;
+every reader after the commit (the state hash, history, a resume tail, a requeue) takes
+`song.queued`, which is the stamped entry.
 
 Three reflective tests pin this, all against `dataclasses.fields(QueueObject)`. A new
 field fails two of them rather than being noticed: `test_every_carried_field_arrives`
