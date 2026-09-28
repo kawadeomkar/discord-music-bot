@@ -279,7 +279,7 @@ graph TD
 
 | Type | Module | Description |
 |---|---|---|
-| `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song), `search` (the `ytsearch:` term while the item is unresolved — [one queue item](#one-queue-item)) |
+| `QueueObject` | `youtube.py` | Slotted, keyword-only dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song), `search` (the `ytsearch:` term while the item is unresolved — [one queue item](#one-queue-item)) |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; holds the `QueueObject` it plays (`queued`) and answers the ask off it ([the ask a playing song holds](#the-ask-a-playing-song-holds)); counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
 | `YTSource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — a parse result, never a queue item |
 | `SpotifySource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
@@ -350,9 +350,9 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | YouTube playlist URL | `.../playlist?list=...`, or any `watch?v=…&list=…` | `YTSource(type=PLAYLIST, list_id=...)` → `YTDL.yt_playlist` (flat extraction) → N `QueueObject`s. `_YTDL_PLAYLIST_OPTS` uses `extract_flat="in_playlist"`, not `True`: a watch URL resolves to a `url_result` pointing at the playlist, and `True` stops at it with no entries |
 | …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link — or a `--timestamp` beside it — applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
 | YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` → `yt_source(flat=True)` for an ordinary placement: one search POST for identity, the stream URL extracted later by the enqueue prefetch |
-| Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
-| Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist()` → N queue items carrying their `search` ([one queue item](#one-queue-item)) |
-| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(ALBUM)` → `Spotify.album()` → N queue items carrying their `search` ([one queue item](#one-queue-item)) |
+| Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(type=TRACK)` → `Spotify.track()` → YouTube search |
+| Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(type=PLAYLIST)` → `Spotify.playlist()` → N queue items carrying their `search` ([one queue item](#one-queue-item)) |
+| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(type=ALBUM)` → `Spotify.album()` → N queue items carrying their `search` ([one queue item](#one-queue-item)) |
 | Any other Spotify link | `https://open.spotify.com/artist/...`, a type with no id, an id that is not base62 | `UnsupportedSpotifyLinkError` — never a `ValueError`, which `parse_input` would turn into a YouTube search for the link. A leading `/intl-xx/` locale segment is dropped first |
 | SoundCloud URL | `https://soundcloud.com/...` | `SoundcloudSource` → yt-dlp directly |
 
@@ -667,14 +667,14 @@ flowchart TD
     IsLink -->|Yes| Host
     Host -->|"youtube.com, youtu.be"| IsPL
     IsPL -->|Yes| YTPL["YTSource(type=PLAYLIST, list_id=...)"]
-    IsPL -->|"No (?t= honored)"| YTS["YTSource(url, ts?, process=False)"]
+    IsPL -->|"No (?t= honored)"| YTS["YTSource(url=..., ts=..., process=False)"]
     Host -->|"open. / play. / spotify.com"| SPKind
-    SPKind -->|track| SPS_T["SpotifySource(TRACK, id)"]
-    SPKind -->|playlist| SPS_P["SpotifySource(PLAYLIST, id)"]
-    SPKind -->|album| SPS_A["SpotifySource(ALBUM, id)"]
+    SPKind -->|track| SPS_T["SpotifySource(type=TRACK, id=...)"]
+    SPKind -->|playlist| SPS_P["SpotifySource(type=PLAYLIST, id=...)"]
+    SPKind -->|album| SPS_A["SpotifySource(type=ALBUM, id=...)"]
     SPKind -->|No| Refuse["UnsupportedSpotifyLinkError"]
-    Host -->|soundcloud.com| SC["SoundcloudSource(url)"]
-    Host -->|any other| OTHER["YTSource(url, stype=OTHER), for yt-dlp"]
+    Host -->|soundcloud.com| SC["SoundcloudSource(url=...)"]
+    Host -->|any other| OTHER["YTSource(url=..., stype=OTHER), for yt-dlp"]
 ```
 
 **The link test runs in linear time.** `re` holds the GIL for a whole match, so one slow
@@ -2449,19 +2449,22 @@ and the setter writes through to the entry. That is safe because the stamp runs 
 queued while it resolves, so a write before that commit would reach an item `-remove` and
 the queue mirror still see; a second write-through owes the same argument.
 
-Two reflective tests pin this, both against `dataclasses.fields(QueueObject)` so a new
-field fails them rather than being noticed: `test_every_carried_field_arrives`
+Three reflective tests pin this, all against `dataclasses.fields(QueueObject)`. A new
+field fails two of them rather than being noticed: `test_every_carried_field_arrives`
 (test_youtube.py) fails when a playing song cannot answer a carried field, and
-`test_no_field_is_lost_when_a_prefetched_song_is_requeued` (test_musicplayer.py) fails when
-a requeue drops one. Each names only its own exclusions — the fields the resolve learns,
-and at the playback boundary `ts` and `search` besides — so a field added later is
-covered without either being edited. A per-bool parametrization sits beside each
+`test_no_field_is_lost_when_a_prefetched_song_is_requeued` (test_musicplayer.py) fails
+when a requeue drops one. Each names only its own exclusions — the fields the resolve
+learns, and at the playback boundary `ts` and `search` besides — so a field added later
+is covered without either being edited. The third,
+`test_every_field_takes_part_in_replace` (test_youtube.py), fails on a field declared
+`init=False` instead: `replace()` skips one silently, so every rebuild would reset it to
+its default. A per-bool parametrization sits beside the first two
 (`test_each_bool_arrives_on_the_property_of_its_own_field`,
 `test_each_bool_comes_back_on_the_field_it_went_out_on`): a bool has one non-default
 value, so setting them all together reads back clean when two are crossed, and flipping
 one at a time is what catches a property reading its neighbour's field.
-`test_no_queueobject_field_is_silently_left_behind` is the identity pin under "crosses by
-construction" — `song.queued is qobj`, plus the one field renamed at the boundary.
+`test_no_queueobject_field_is_silently_left_behind` is the identity pin under "crosses
+by construction" — `song.queued is qobj`, plus the one field renamed at the boundary.
 
 ### Now Playing host invariants
 
