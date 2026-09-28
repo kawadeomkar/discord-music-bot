@@ -272,7 +272,9 @@ class TestDebugInputs:
             for spec, shown in inputs.settings
             if shown.source != settings_card.DEFAULT
         }
-        assert changed == {"volume": settings_card.Shown(50, settings_card.SET_HERE)}
+        assert changed == {
+            "volume": settings_card.Shown(value=50, source=settings_card.SET_HERE)
+        }
         assert inputs.settings_read is True
 
     async def test_unread_bot_settings_reach_the_inputs(
@@ -299,7 +301,7 @@ class TestDebugInputs:
         inputs = await debug_cmd.build_inputs(mock_ctx, cog=music_bot)
         shown = {spec.key: shown for spec, shown in inputs.settings}
         assert shown["alone-timeout"] == settings_card.Shown(
-            30.0, settings_card.NOT_SAVED
+            value=30.0, source=settings_card.NOT_SAVED
         )
         assert inputs.settings_read is False
 
