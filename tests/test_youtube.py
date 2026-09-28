@@ -183,7 +183,12 @@ class TestYTDLDuration:
         data = _fake_ytdl_data()
         del data["duration"]
         with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
-            song = YTDL(mock_channel, data["url"], data=data)
+            song = YTDL(
+                mock_channel,
+                data["url"],
+                data=data,
+                queued=QueueObject(data["webpage_url"], "Test Song", MagicMock()),
+            )
         assert song.duration_secs == 0
 
 
@@ -269,8 +274,8 @@ class TestYTDLPositionSecs:
 
 def _carried_queueobject_fields() -> set[str]:
     """QueueObject fields that must reach the playing YTDL, by name. Derived from
-    the dataclass, so a field added tomorrow is covered by both guards below
-    without either being edited. Anything not meant to cross is named here."""
+    the dataclass, so a field added tomorrow is covered by the guards below
+    without any of them being edited. Anything not meant to cross is named here."""
     import dataclasses
 
     not_carried = {
@@ -282,8 +287,27 @@ def _carried_queueobject_fields() -> set[str]:
         "thumbnail",
         # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
         "ts",
+        # Empty by the time anything can stream the item: the resolve clears it.
+        "search",
     }
     return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+
+
+def _carried_bool_defaults() -> dict[str, bool]:
+    """Every carried bool field with its default. A bool field has exactly one
+    non-default value, so the reflective guard below cannot vary the bools
+    against each other; the flip test does it one field at a time."""
+    import dataclasses
+
+    carried = _carried_queueobject_fields()
+    return {
+        f.name: f.default
+        for f in dataclasses.fields(QueueObject)
+        if f.name in carried and isinstance(f.default, bool)
+    }
+
+
+_CARRIED_BOOLS = _carried_bool_defaults()
 
 
 class TestYtStreamCarriesTheQueueObjectsFields:
@@ -313,33 +337,50 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
         assert (await self._played(qobj)).user_input == album
 
-    def test_no_queueobject_field_is_silently_left_behind(self) -> None:
-        """Reflective, so a field added to QueueObject tomorrow fails HERE rather
-        than at playback. Anything genuinely not meant to cross gets named in the
-        allow-list, with the reason."""
-        import inspect
+    def test_the_start_stamp_reaches_the_entry(
+        self, ytdl_instance: Callable[..., Any], mock_ctx: MagicMock
+    ) -> None:
+        """The one ask field a playing song WRITES, asserted on a real source: the
+        doubles re-implement this setter on their own type, so every loop test
+        that stamps the start passes whether or not youtube.py's setter does."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+        )
+        song = ytdl_instance(queued=qobj)
 
-        carried = _carried_queueobject_fields()
-        params = set(inspect.signature(YTDL.__init__).parameters)
-        missing = sorted(carried - params)
-        assert not missing, (
-            f"QueueObject fields with no YTDL.__init__ keyword: {missing}. "
-            "Add them there, assign them, and pass them from yt_stream — or list "
-            "them in not_carried with a reason."
+        song.played_at = 5.0
+
+        assert qobj.played_at == 5.0
+        assert song.played_at == 5.0
+
+    async def test_no_queueobject_field_is_silently_left_behind(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The source HOLDS the entry it was queued from rather than copying it,
+        so a field added to QueueObject tomorrow crosses by construction — the
+        identity below is what that claim rests on. `ts` is the one field renamed
+        at the boundary, so it is the one asserted by hand."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=45
         )
 
+        song = await self._played(qobj)
+
+        assert song.queued is qobj
+        # The one field renamed at the boundary.
+        assert song.start_offset == 45
+
     async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
-        """A field added to QueueObject and forgotten here dies at playback, where
-        every read of it happens. The guard above reads YTDL.__init__'s signature,
-        which is not the leg a field goes missing on, so this compares values across
-        the hop — and asserts each was given a non-default value, or a field the
-        constructor forgets arrives at its default and compares equal to itself."""
+        """A field added to QueueObject and forgotten dies at playback, where every
+        read of it happens. Compares values across the hop, and fails when one is
+        left at its default — a field this test cannot see dropped is no guard."""
         import dataclasses
 
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
             mock_ctx.author,
+            ts=45,
             user_input="typed",
             query_source="search",
             interjected=True,
@@ -358,6 +399,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
         )
+
         carried = _carried_queueobject_fields()
         defaults = {
             f.name: f.default
@@ -382,6 +424,27 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             if getattr(song, name, "<<absent>>") != getattr(qobj, name)
         }
         assert not mismatched, f"dropped between QueueObject and YTDL: {mismatched}"
+
+    @pytest.mark.parametrize("flipped", sorted(_CARRIED_BOOLS))
+    async def test_each_bool_arrives_on_the_property_of_its_own_field(
+        self, flipped: str, mock_ctx: MagicMock
+    ) -> None:
+        """One bool off its default while the rest hold theirs: a property
+        reading a NEIGHBOUR's field then reads that field's default and the
+        mismatch surfaces. The guard above sets every bool at once, where a
+        crossed pair holding the same value reads back clean."""
+        qobj = replace(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+            ),
+            **{flipped: not _CARRIED_BOOLS[flipped]},
+        )
+
+        song = await self._played(qobj)
+
+        assert {name: getattr(song, name) for name in _CARRIED_BOOLS} == {
+            name: getattr(qobj, name) for name in _CARRIED_BOOLS
+        }
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         """`_neutralize_prefetch` reads `persisted` off the playing song to rebuild a

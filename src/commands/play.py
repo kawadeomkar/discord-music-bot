@@ -47,8 +47,7 @@ from src.youtube import QueueObject
 # on play_pipeline, which a from-import would bind here at import time.
 from src import play_pipeline
 from src.play_pipeline import (
-    ResolvedSpotifyPlaylist,
-    ResolvedYoutubePlaylist,
+    ResolvedPlaylist,
     past_end_refusal,
     start_offset_refusal,
 )
@@ -246,7 +245,7 @@ async def _resolve_and_place(
     request that did not insert, or None. Returned rather than sent: on the cold
     path a teardown decision (abandon_cold_start reads the hold count) must not
     be followed by an await before the gate hold is released."""
-    qobj: Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]
+    qobj: Union[QueueObject, ResolvedPlaylist]
     async with contextlib.AsyncExitStack() as stack:
         # Entered before the gate hold so it unwinds AFTER it: taking either of
         # these back awaits a Discord call, and an await between the teardown

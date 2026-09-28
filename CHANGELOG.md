@@ -17,6 +17,56 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.4 — 2026-09-26
+
+**Crash recovery keeps the flags of the song that was actually playing.** The parked entry's
+own fields now win over the stored blob whenever both describe the same play; the blob
+contributes only the thumbnail and the card ids the fields never carried. Before this, a
+rollback to 2.53.2 and back could bring a paused song back playing.
+
+- **A restart that cannot place every saved entry rewrites the queue.** When a saved entry
+  names a requester nobody can resolve, it is dropped with a warning and the queue in Redis
+  is rebuilt to match, so the next song played is the next song shown.
+- **`-replay` gets its full retry budget.** A replayed song no longer inherits the stream
+  attempts the original spent.
+- **A crash-recovered song shows the cover it was playing with**, not the one it was queued
+  with.
+- **The state hash costs a few hundred bytes more per guild that has ever played**, and the
+  encoding it moves to never comes back on its own — measured, not predicted, in
+  `docs/ARCHITECTURE.md#the-parked-song`. Nothing to do; noted so the number is not a surprise.
+
+## 2.53.3 — 2026-09-26
+
+**The playing song is parked in Redis as one queue entry.** Nothing changes in chat. The
+state hash `guild:{id}:state` gains a `current_song` field holding the whole entry, written
+beside the thirteen `current_song_*` fields it stands in for. Both are written for one
+release, so a crash recovers the playing song on this build or on the one before it.
+
+- **Deploy and roll back freely.** This build reads the prefixed fields when no blob is
+  there, and a build before it reads the fields this one still writes. A blob is trusted
+  only when it describes the same play those fields do.
+- **A crash-recovered song keeps its thumbnail again**, which the thirteen fields never
+  carried.
+- **The thirteen fields stay for one more release.** Dropping them earlier would leave a
+  rollback with no song to recover.
+
+## 2.53.2 — 2026-09-26
+
+**A queue holds one kind of item.** Nothing changes in chat but the one case below. A
+collection's tracks used to wait as a different type from an ordinary queued song, and the
+two carried the same fields side by side; now there is one, resolved or not.
+
+- **A saved song nobody can be matched to is credited to the bot.** A restart resolves
+  every saved song's requester up front now, the same way for a collection track still
+  waiting to resolve as for an ordinary queued song. One whose requester has left the
+  server, and who the bot has not seen anywhere else, keeps its place in the queue and is
+  shown and archived under the bot itself — or under whoever ran the command that brought
+  the bot back, if one did. It used to name the server owner. Nothing to do.
+- **Deploying and rolling back are both just a redeploy.** A track still waiting to
+  resolve is written to Redis in the shape earlier builds already read, so no build reads
+  the queue any differently for this change. That shape goes in a later release, which
+  will carry its own note about what a rollback past it costs.
+
 ## 2.53.0 — 2026-09-24
 
 **The bot comes back about 1.5 seconds sooner, and container logs can no longer

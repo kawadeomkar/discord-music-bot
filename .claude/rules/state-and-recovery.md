@@ -34,7 +34,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 
 | Key | Type | TTL | Contents |
 |---|---|---|---|
-| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `last_position_secs` + `last_heartbeat_epoch` (the recorded playback position — what recovery reads), and the legacy `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` it replaced, **dual-written for one release** so a rollback still recovers. Still *parses* a legacy `volume` field — see `:config` |
+| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song` (the parked queue entry as one blob, with the thirteen `current_song_*` fields dual-written beside it for one release — the prefixed fields win on everything they carry and the blob adds `thumbnail` and the np_* ids, only when its url and start epoch match `current_song_url`/`current_song_played_at`, see `docs/ARCHITECTURE.md#the-parked-song`), `last_position_secs` + `last_heartbeat_epoch` (the recorded playback position — what recovery reads), and the legacy `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` it replaced, **dual-written for one release** so a rollback still recovers. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h, re-armed by every queue write and every song start | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks). Both carry `user_input`, what the user typed, and the requester (`requester_id`, on a search only when known); a search also carries, each only when known, the display fields a listing shows until it resolves (`title`, `uploader`, `duration`, `webpage_url`); on a search entry it is the ONLY surviving record of the collection link, since its `ytsearch` is a generated title. Mirror writes all go through `GuildQueue._write_mirror` — rebuild, DELETE, or LREM |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
@@ -138,9 +138,11 @@ on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is
 ```
 
 The closed loop that makes this work: `SongQueueEntry.from_song → HSET state (start
-transaction) → crash → from_crashed_state → re-queue`. The `current_song_*` state fields
-ARE a parked queue entry; `_now_playing_state_mapping` is the single signature enforcing
-that identity.
+transaction) → crash → from_crashed_state → re-queue`. The state hash holds that entry as
+one blob (`current_song`), with the prefixed fields dual-written for a release;
+`_now_playing_state_mapping` is the single signature enforcing the identity, and
+`_parked_song` is the single reader — those fields, overlaid onto a blob that matches
+them on url and start epoch for the `thumbnail` and np_* ids they never carried.
 
 **Clearing that state hands the only copy to memory**, which is why
 `MusicPlayer.repark_crashed_head()` exists. `_restore_state` HDELs `current_song_*` the

@@ -25,7 +25,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_history import GuildHistory
 
-from src.guild_queue import GuildQueue, QueueItem, RemoveMode
+from src.guild_queue import GuildQueue, RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
@@ -54,7 +54,6 @@ from src.musicplayer import (
     _fmt_finish_time,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
-from src.sources import YTSource
 from src.util import (
     cancel_task,
     current_traceparent,
@@ -65,13 +64,16 @@ from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import (
     REPLAY_ASK,
     described,
+    give_queue_object,
     loop_song,
     mocked,
+    stub_requester,
     queue_object,
     replayed_song,
     seed_queue,
     stalled_config_reads,
     stub_create_task,
+    unresolved,
 )
 
 
@@ -116,39 +118,16 @@ def _loop_song() -> MagicMock:
     song.abr = None
     song.asr = None
     song.acodec = ""
-    song.requester = None
     song.start_offset = 0
     # Real number: loop()'s history step feeds this through
     # HistoryEntry.from_song, and round(MagicMock) raises.
     song.position_secs = 195.0
-    # -playnow flags a real YTDL always carries — truthy MagicMock
-    # attributes would trip the loop's start_paused/is_resume gates.
-    song.interjected = False
-    song.is_resume = False
-    song.start_paused = False
-    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-    # clamps its fields into the play_history column domain — query_source
-    # too, which the slug clamp regex-matches.
-    song.analytics = ANALYTICS_ZERO
-    song.query_source = ""
-    # Unstamped: the loop's or-stamp writes the real clock here, and the
-    # epoch clamp in HistoryEntry raises on a MagicMock.
-    song.played_at = 0.0
-    # Retry state, as real values: the loop's retry guard compares
-    # stream_attempts to an int, and the rebuild copies the rest verbatim
-    # onto a QueueObject.
-    song.user_input = None
-    song.persisted = True
-    song.stream_attempts = 0
-    song.failed_format_ids = frozenset()
     song.data = {"format_id": "251"}
-    # The NP-card pointer, zeroed like a song that interrupted nothing. Bare
-    # MagicMocks here reach SongQueueEntry through any rebuild and are not
-    # JSON-serializable, so the Redis mirror write fails with only a warning.
-    song.np_message_id = 0
-    song.np_channel_id = 0
-    song.np_dedicated = False
-    song.np_host_ref = None
+    # The ask, off a real queue object as a real source reads it: the retry and
+    # requeue rebuilds replace() off it, truthy MagicMock flags would trip the
+    # loop's start_paused/is_resume gates, and the analytics, query_source,
+    # played_at and retry-budget reads all raise on a MagicMock.
+    give_queue_object(song, QueueObject(song.webpage_url, song.title, stub_requester()))
     return song
 
 
@@ -292,9 +271,9 @@ class TestQueuePut:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         sources = [
-            YTSource(ytsearch="ytsearch:song one", process=True),
-            YTSource(ytsearch="ytsearch:song two", process=True),
-            YTSource(ytsearch="ytsearch:song three", process=True),
+            unresolved("song one"),
+            unresolved("song two"),
+            unresolved("song three"),
         ]
         await music_player.queue_put(sources)
         assert music_player.queue.qsize() == 3
@@ -324,11 +303,11 @@ class TestQueuePut:
         assert data["title"] == queue_obj.title
         assert data["webpage_url"] == queue_obj.webpage_url
 
-    async def test_put_mirrors_yt_source_to_redis(
+    async def test_put_mirrors_an_unresolved_item_to_redis(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         assert music_player.store is not None
-        src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True)
+        src = unresolved("Never Gonna Give You Up")
         await music_player.queue_put(src)
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
@@ -336,7 +315,7 @@ class TestQueuePut:
         assert data["type"] == "ytsource"
         assert data["ytsearch"] == "ytsearch:Never Gonna Give You Up"
 
-    async def test_put_yt_source_does_not_spawn_prefetch(
+    async def test_put_does_not_warm_an_unresolved_item(
         self,
         music_player: MusicPlayer,
         fake_redis: aioredis.Redis,
@@ -345,7 +324,7 @@ class TestQueuePut:
         assert music_player.store is not None
         from unittest.mock import patch, AsyncMock
 
-        src = YTSource(ytsearch="ytsearch:test", process=True)
+        src = unresolved("test")
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
         ) as mock_pf:
@@ -377,10 +356,10 @@ class TestQueuePut:
         mock_pf.assert_awaited_once()
         assert mock_pf.call_args[0][0] == queue_obj
 
-    async def test_put_does_not_spawn_prefetch_for_yt_source(
+    async def test_put_front_does_not_warm_an_unresolved_item(
         self, music_player: MusicPlayer
     ) -> None:
-        source = YTSource(ytsearch="ytsearch:test song", process=True)
+        source = unresolved("test song")
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
         ) as mock_pf:
@@ -700,7 +679,7 @@ class TestQueueClearFlushesPlayedSongs:
         await music_player.queue_put(
             QueueObject("https://yt.com/v=never", "Never Played", mock_author)
         )
-        await music_player.queue_put(YTSource(ytsearch="ytsearch:some song"))
+        await music_player.queue_put(unresolved("some song"))
 
         cleared = await music_player.queue_clear()
 
@@ -717,7 +696,7 @@ class TestQueueClearFlushesPlayedSongs:
         await music_player.queue_put(
             QueueObject("https://yt.com/v=queued", "Queued", mock_author)
         )
-        await music_player.queue_put(YTSource(url="https://yt.com/v=lazy"))
+        await music_player.queue_put(unresolved("lazy song", mock_author))
 
         await music_player.queue_clear()
 
@@ -1640,7 +1619,7 @@ class TestQueueRemoveWithAPrefetch:
         swaps back in serialized differently from its list entry, and the removal
         still takes one LREM."""
         head: Any = (
-            YTSource(ytsearch="ytsearch:artist song", user_input="https://sp/p")
+            unresolved("artist song", user_input="https://sp/p")
             if kind == "lazy"
             else QueueObject("https://yt.com/v=head", "Head", mock_author)
         )
@@ -1684,11 +1663,7 @@ class TestQueueRemoveWithAPrefetch:
         assert store is not None
         await music_player.queue.put(
             [
-                YTSource(
-                    ytsearch="ytsearch:artist song",
-                    process=True,
-                    user_input="https://sp/p",
-                ),
+                unresolved("artist song", user_input="https://sp/p"),
                 *(
                     QueueObject(f"https://yt.com/v={n}", f"S{n}", mock_author)
                     for n in range(7)
@@ -1834,16 +1809,14 @@ class TestGetQueue:
         embed = music_player.queue_embed()
         assert "~" in described(embed)
 
-    def test_total_duration_partial_with_ytsource(
+    def test_total_duration_partial_with_an_unresolved_item(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         seed_queue(
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
         )
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:unresolved", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("unresolved"))
         embed = music_player.queue_embed()
         assert "~" in described(embed)
 
@@ -1953,10 +1926,10 @@ class TestGetQueue:
         embed = music_player.queue_embed()
         assert "... and 5 more" in described(embed)
 
-    def test_ytsource_shows_resolving(self, music_player: MusicPlayer) -> None:
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
-        )
+    def test_an_unresolved_item_shows_resolving(
+        self, music_player: MusicPlayer
+    ) -> None:
+        seed_queue(music_player.queue, unresolved("some song"))
         embed = music_player.queue_embed()
         assert "resolving..." in described(embed)
 
@@ -2140,9 +2113,7 @@ class TestResumeNoticeEmbed:
             music_player.queue,
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
         )
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:unresolved", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("unresolved"))
 
         embed = music_player.build_resume_notice_embed(started)
 
@@ -2537,7 +2508,8 @@ class TestReparkCrashedHead:
         state = await music_player.store.get_guild_state()
         assert state is not None
         assert state.has_crashed_song
-        assert state.current_song_title == "Interrupted Song"
+        assert state.current_song is not None
+        assert state.current_song.title == "Interrupted Song"
 
     async def test_position_survives_the_round_trip(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -2587,7 +2559,8 @@ class TestReparkCrashedHead:
         assert music_player.store is not None
         state = await music_player.store.get_guild_state()
         assert state is not None
-        assert state.current_song_played_at == 1752530000.5
+        assert state.current_song is not None
+        assert state.current_song.played_at == 1752530000.5
         recovered = SongQueueEntry.from_crashed_state(state, position=45)
         assert recovered is not None and recovered.played_at == 1752530000.5
 
@@ -2597,6 +2570,26 @@ class TestReparkCrashedHead:
         """An ordinary queued song is still on the Redis list. Parking it in
         current_song_* would restore a second copy alongside that list entry."""
         seed_queue(music_player.queue, queue_obj)
+
+        assert await music_player.repark_crashed_head() is False
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        assert not state.has_crashed_song
+
+    async def test_leaves_an_unresolved_head_alone(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The parked slot is keyed by a page to resume. A search carries the
+        Spotify track the walk named, so parking one would hand recovery a
+        resolved song pointing at a page nothing can stream. Unreachable while
+        only from_crashed_state mints a persisted=False item — and this is the
+        only thing standing between that and the slot now that one type serves
+        both."""
+        head = unresolved("a song", mock_author, webpage_url="https://sp/a")
+        head.persisted = False
+        seed_queue(music_player.queue, head)
 
         assert await music_player.repark_crashed_head() is False
 
@@ -2760,7 +2753,7 @@ class TestPlaylistFacts:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        seed_queue(music_player.queue, YTSource(ytsearch="ytsearch:lazy song"))
+        seed_queue(music_player.queue, unresolved("lazy song"))
         facts = music_player.playlist_facts(ahead=1, runtime=(600, False))
         assert "Est. playing at ~**" in facts
 
@@ -2782,18 +2775,25 @@ class TestPlaylistFacts:
         assert facts == "Total Duration: **~10m**"
 
 
-def _album_track(n: int, secs: int) -> YTSource:
-    return YTSource(
-        ytsearch=f"ytsearch:Track {n} Artist",
-        requester_id=4242,
-        title=f"Track {n}",
+# One requester for every album-track stand-in, so two items built from the same
+# track compare EQUAL — which is what the identity lookup has to see past.
+_ALBUM_ASKER = stub_requester()
+
+
+def _album_track(n: int, secs: int) -> QueueObject:
+    """One album track as the walk queues it: a search, with the display fields
+    its row is rendered from."""
+    return QueueObject(
+        f"https://open.spotify.com/track/{n}",
+        f"Track {n}",
+        _ALBUM_ASKER,
+        search=f"ytsearch:Track {n} Artist",
         uploader="Artist",
         duration=secs,
-        webpage_url=f"https://open.spotify.com/track/{n}",
     )
 
 
-def _card_rows(mp: MusicPlayer, tracks: Sequence[QueueItem], *, ahead: int) -> str:
+def _card_rows(mp: MusicPlayer, tracks: Sequence[QueueObject], *, ahead: int) -> str:
     """What enqueue_playlist builds: ONE slot read, then the rows from it. The
     card's "Songs ahead" is derived from the same read."""
     return mp.queued_rows(tracks, first=mp.queued_slot(tracks, ahead=ahead))
@@ -2862,7 +2862,7 @@ class TestQueuedRows:
     def test_the_slot_is_found_by_identity_not_by_equality(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """A playlist holding the same track twice queues two EQUAL YTSources. An
+        """A collection holding the same track twice queues two EQUAL items. An
         equality lookup returns the first one's slot for both, so the second block
         of rows would be numbered from the first block's position."""
         first, second = _album_track(1, 100), _album_track(1, 100)
@@ -3986,7 +3986,7 @@ class TestQueuePutFront:
 
         mock_prefetch.assert_not_awaited()
 
-    async def test_ytsource_items_are_not_prefetched(
+    async def test_unresolved_items_are_not_prefetched(
         self, music_player: MusicPlayer
     ) -> None:
         """YTSource has no stable webpage_url at enqueue time — same rule
@@ -3996,9 +3996,7 @@ class TestQueuePutFront:
         with patch.object(
             youtube.YTDL, "prefetch_stream", new=AsyncMock()
         ) as mock_prefetch:
-            await music_player.queue_put_front(
-                [YTSource(ytsearch="ytsearch:a song", process=True)]
-            )
+            await music_player.queue_put_front([unresolved("a song")])
             await asyncio.sleep(0)
 
         mock_prefetch.assert_not_awaited()
@@ -4094,6 +4092,9 @@ class TestEnqueueDepth:
         current = MagicMock()
         current.webpage_url = "https://yt.com/v=parked"
         current.title = "Parked"
+        give_queue_object(
+            current, QueueObject(current.webpage_url, current.title, mock_author)
+        )
         current.requester = mock_author
         current.position_secs = 40.0
         current.duration_secs = 300
@@ -4116,6 +4117,51 @@ class TestEnqueueDepth:
             if isinstance(i, QueueObject) and i.is_resume
         ]
         assert [t.user_input for t in tails] == [album]
+
+    async def test_a_resume_tail_hosts_its_own_card_and_is_not_a_replay(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_vc: MagicMock
+    ) -> None:
+        """The tail is a new queue entry, so the play state of the fragment it
+        parks does not come along: the loop hands the frozen card over to it after
+        the interjection, and a replay's tail is an ordinary song. A tail of a
+        tail is where inherited ids would point at a card two fragments back."""
+        current = MagicMock()
+        current.webpage_url = "https://yt.com/v=parked"
+        current.title = "Parked"
+        # A crash-recovered head carries persisted=False; the tail must not.
+        give_queue_object(
+            current,
+            QueueObject(
+                current.webpage_url,
+                current.title,
+                mock_author,
+                is_replay=True,
+                persisted=False,
+                np_message_id=777,
+                np_channel_id=888,
+                np_dedicated=True,
+            ),
+        )
+        current.position_secs = 40.0
+        current.duration_secs = 300
+        music_player.current_song = current
+
+        await music_player.interject(
+            QueueObject("https://yt.com/v=urgent", "Urgent", mock_author), mock_vc
+        )
+
+        tail = next(
+            i
+            for i in music_player.queue.display_items()
+            if isinstance(i, QueueObject) and i.is_resume
+        )
+        assert (
+            tail.np_message_id,
+            tail.np_channel_id,
+            tail.np_dedicated,
+            tail.is_replay,
+            tail.persisted,
+        ) == (0, 0, False, False, True)
 
     async def test_the_under_by_one_window_for_a_repeated_url_is_unchanged(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -4142,15 +4188,22 @@ class TestEnqueueDepth:
         # A Spotify playlist track sat in the queue as a search; _resolve_source
         # threads its ask-time analytics into yt_source, which is REQUIRED to
         # take it — there is no post-copy left to forget.
-        source = YTSource(
-            ytsearch="ytsearch:a song",
-            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+        source = unresolved(
+            "a song", analytics=Analytics(queued_at=1752530000.5, queue_position=4)
         )
-        resolved = QueueObject("https://yt.com/v=1", "One", mock_author)
+        resolved = QueueObject("https://yt.com/v=1", "One", mock_author, duration=61)
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
             out = await music_player._resolve_source(source)
-        assert out is resolved
+        # What yt-dlp found, written onto the item that was queued: the ask it
+        # carries is the one the resolve was given, not the resolve's own.
+        assert (out.webpage_url, out.title, out.duration, out.search) == (
+            "https://yt.com/v=1",
+            "One",
+            61,
+            "",
+        )
+        assert out.analytics == source.analytics
         assert spy.await_args is not None
         assert spy.await_args.kwargs["analytics"] == source.analytics
 
@@ -4159,7 +4212,7 @@ class TestEnqueueDepth:
     ) -> None:
         # A Spotify playlist track resolves to a YouTube URL here, so this hop is
         # the only thing keeping the archive from recording it as YouTube.
-        source = YTSource(ytsearch="ytsearch:a song", query_source="spotify.com")
+        source = unresolved("a song", query_source="spotify.com")
         resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
@@ -4177,7 +4230,7 @@ class TestEnqueueDepth:
         SongQueueEntry.from_song parks it in current_song_user_input, so a
         recovered head stays removable by the collection link."""
         album = "https://open.spotify.com/album/xyz"
-        source = YTSource(ytsearch="ytsearch:Artist - Title", user_input=album)
+        source = unresolved("Artist - Title", user_input=album)
         resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
@@ -4212,6 +4265,62 @@ class TestStateRestore:
         assert music_player.queue.qsize() == 1
         assert isinstance(music_player.queue._items[0], QueueObject)
         assert music_player.queue._items[0].title == "Restored Song"
+
+    async def test_restore_marks_the_mirror_stale_past_an_unreadable_entry(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The snapshot drops what it cannot parse, but the blob stays on the
+        list, so the restored queue must rebuild rather than LPOP on its next
+        start or the LPOP retires the wrong entry."""
+        assert music_player.store is not None
+        readable = SongQueueEntry(
+            webpage_url="https://yt.com/v=abc",
+            title="Restored Song",
+            requester_id=mock_author.id,
+        )
+        await fake_redis.rpush(
+            music_player.store.queue_key(), b"not json", readable.to_redis()
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+
+        await music_player._restore_state()
+        assert music_player.queue.qsize() == 1
+        assert music_player.queue.mirror_dirty
+
+    async def test_an_unresolvable_requester_lands_on_the_players_last_author(
+        self,
+        music_player: MusicPlayer,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """A saved song whose requester left the guild is attributed rather than
+        dropped, and the player is what says to whom: without the fallback the
+        entry rests on `guild.owner`, which is uncached exactly when a restart is
+        still filling its caches. The value reaches -queue's byline and
+        play_history.requester_id, so it is a choice, not a detail."""
+        assert music_player.store is not None
+        owner = MagicMock(spec=discord.Member)
+        owner.id = 333333333333333333
+        mock_guild.owner = owner
+        mock_guild.get_member = MagicMock(return_value=None)
+        mock_bot.get_user.return_value = None
+        music_player._last_author = mock_author
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=abc",
+            title="Restored Song",
+            requester_id=424242424242424242,
+        )
+        await fake_redis.rpush(music_player.store.queue_key(), entry.to_redis())
+
+        await music_player._restore_state()
+
+        (item,) = music_player.queue.display_items()
+        assert item.requester is mock_author
 
     async def test_restore_sets_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
@@ -4904,61 +5013,71 @@ class TestResolveSource:
         with patch(
             "src.musicplayer.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
-            result = await music_player._resolve_source(
-                YTSource(ytsearch="ytsearch:test", process=True)
-            )
+            result = await music_player._resolve_source(unresolved("test"))
         assert isinstance(result, QueueObject)
         assert result.title == "Resolved"
 
 
-class TestResolveRequester:
-    """A playlist's lazy tracks resolve minutes to an hour after the command that
-    queued them returned, when _last_author is whoever typed most recently."""
+class TestResolveUsesTheItemsRequester:
+    """A playlist's tracks resolve minutes to an hour after the command that
+    queued them returned, when _last_author is whoever typed most recently. The
+    item carries the requester it was queued by, so the resolve asks nobody:
+    restoring an entry is where an id becomes a user
+    (docs/ARCHITECTURE.md#one-queue-item)."""
 
-    async def test_the_stored_requester_beats_the_last_author(
+    async def test_the_resolve_attributes_the_track_to_whoever_queued_it(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
+        """The resolve returns the QUEUED item with what yt-dlp found written over
+        it, so the ask survives: yt-dlp's own object is built against the fallback
+        requester and carries nothing of how the track was asked for. Handing that
+        object back instead re-attributes the track and loses the Spotify token
+        every later read of it depends on."""
         queuer = MagicMock(spec=discord.Member)
         queuer.id = 424242424242424242
-        music_player._guild.get_member = MagicMock(return_value=queuer)
         music_player._last_author = mock_author
-        yt_source = AsyncMock(
-            return_value=QueueObject("https://yt.com/v=1", "Resolved", queuer)
+        resolved = QueueObject(
+            "https://yt.com/v=1",
+            "Resolved",
+            mock_author,
+            duration=213,
+            uploader="Some Channel",
+            thumbnail="https://yt.com/t.jpg",
         )
+        source = unresolved(
+            "test",
+            queuer,
+            user_input="https://open.spotify.com/track/abc",
+            query_source="spotify.com",
+        )
+        yt_source = AsyncMock(return_value=resolved)
 
         with patch("src.musicplayer.YTDL.yt_source", new=yt_source):
-            await music_player._resolve_source(
-                YTSource(ytsearch="ytsearch:test", requester_id=424242424242424242)
-            )
+            out = await music_player._resolve_source(source)
 
         assert yt_source.await_args is not None
         assert yt_source.await_args.args[0] is queuer
-
-    def test_no_stored_id_falls_back_to_the_last_author(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        music_player._last_author = mock_author
-        assert music_player._resolve_requester(None) is mock_author
-
-    def test_a_member_who_left_resolves_through_the_user_cache(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        gone = MagicMock(spec=discord.User)
-        gone.id = 424242424242424242
-        music_player._guild.get_member = MagicMock(return_value=None)
-        mocked(music_player.bot).get_user = MagicMock(return_value=gone)
-        music_player._last_author = mock_author
-
-        assert music_player._resolve_requester(424242424242424242) is gone
-
-    def test_an_id_nobody_answers_to_falls_back(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        music_player._guild.get_member = MagicMock(return_value=None)
-        mocked(music_player.bot).get_user = MagicMock(return_value=None)
-        music_player._last_author = mock_author
-
-        assert music_player._resolve_requester(424242424242424242) is mock_author
+        assert out is not resolved
+        assert out.requester is queuer
+        assert out.user_input == "https://open.spotify.com/track/abc"
+        assert out.query_source == "spotify.com"
+        # What the resolve does write over, and the cleared search that makes the
+        # item playable.
+        assert (
+            out.webpage_url,
+            out.title,
+            out.duration,
+            out.uploader,
+            out.thumbnail,
+            out.search,
+        ) == (
+            "https://yt.com/v=1",
+            "Resolved",
+            213,
+            "Some Channel",
+            "https://yt.com/t.jpg",
+            "",
+        )
 
 
 # ── StreamSource ──────────────────────────────────────────────────────────────
@@ -5105,29 +5224,6 @@ class TestSetContext:
         mock_ctx.author = new_author
         music_player.set_context(mock_ctx)
         assert music_player._last_author is new_author
-
-
-# ── RequireRequester ──────────────────────────────────────────────────────────
-
-
-class TestRequireRequester:
-    def test_returns_last_author(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        music_player._last_author = mock_author
-        assert music_player._require_requester() is mock_author
-
-    def test_raises_when_no_author_resolved(self, music_player: MusicPlayer) -> None:
-        """Reached only when guild.me AND guild.owner were both uncached at
-        construction and no command has run since — QueueObject.requester is
-        non-optional, so this must fail here rather than as an AttributeError
-        on None inside serialization."""
-        music_player._last_author = None
-        with pytest.raises(RuntimeError, match="No requester available"):
-            music_player._require_requester()
-
-
-# ── Stop ──────────────────────────────────────────────────────────────────────
 
 
 class TestStop:
@@ -7152,12 +7248,10 @@ class TestBuildNextUpEmbed:
         assert "`1:30`" in described(embed)
         assert mock_author.mention in embed.description
 
-    def test_shows_resolving_for_unresolved_ytsource(
+    def test_shows_resolving_for_an_unresolved_item(
         self, music_player: MusicPlayer
     ) -> None:
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("some song"))
         embed = music_player._build_next_up_embed()
         assert embed is not None
         assert "resolving..." in described(embed)
@@ -7232,8 +7326,8 @@ class TestPrefetchedHeadIsShownResolved:
     for a Spotify track until it started. The cards show what it resolved to."""
 
     @staticmethod
-    def _lazy() -> YTSource:
-        return YTSource(ytsearch="ytsearch:changes ayris", process=True)
+    def _lazy() -> QueueObject:
+        return unresolved("changes ayris")
 
     @staticmethod
     def _resolved(author: MagicMock) -> QueueObject:
@@ -7312,9 +7406,7 @@ class TestPrefetchedHeadIsShownResolved:
         """Matched by identity: a -clear, -shuffle or failed stream moves the entry,
         and the next head must not borrow its title."""
         stale = self._lazy()
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:other", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("other"))
         music_player._prefetched_head = (stale, self._resolved(mock_author))
 
         embed = music_player._build_next_up_embed()
@@ -7454,18 +7546,12 @@ class TestQueueEntryCard:
     def test_an_unresolved_track_renders_the_fields_it_was_queued_with(
         self, music_player: MusicPlayer
     ) -> None:
-        seed_queue(
-            music_player.queue,
-            YTSource(
-                ytsearch="ytsearch:DNA. Kendrick Lamar",
-                process=True,
-                requester_id=4242,
-                title="DNA.",
-                uploader="Kendrick Lamar",
-                duration=185,
-                webpage_url="https://open.spotify.com/track/abc",
-            ),
-        )
+        item = unresolved("DNA. Kendrick Lamar")
+        item.title = "DNA."
+        item.uploader = "Kendrick Lamar"
+        item.duration = 185
+        item.webpage_url = "https://open.spotify.com/track/abc"
+        seed_queue(music_player.queue, item)
 
         lines = self._next_up_body(music_player).split("\n")
         assert lines[0] == "Requested by: [<@4242>]"
@@ -7479,7 +7565,6 @@ class TestQueueEntryCard:
             ("webpage_url", "**DNA.**"),
             ("uploader", "Artist: Unknown  ·  Duration: `3:05`"),
             ("duration", "Artist: Kendrick Lamar  ·  Duration: `?:??`"),
-            ("requester_id", "Requested by: [Unknown]"),
         ],
     )
     def test_an_unresolved_track_falls_back_field_by_field(
@@ -7489,17 +7574,17 @@ class TestQueueEntryCard:
         one too, and the row is built from whatever the walk got. Each field falls
         back on its own; the happy path above covers none of them."""
         fields: dict[str, object] = {
-            "requester_id": 4242,
             "title": "DNA.",
             "uploader": "Kendrick Lamar",
             "duration": 185,
             "webpage_url": "https://open.spotify.com/track/abc",
         }
-        fields[missing] = None
-        seed_queue(
-            music_player.queue,
-            YTSource(ytsearch="ytsearch:DNA. Kendrick Lamar", process=True, **fields),  # pyright: ignore[reportArgumentType]
-        )
+        # webpage_url is a `str`, so "no link" is empty rather than None.
+        fields[missing] = "" if missing == "webpage_url" else None
+        item = unresolved("DNA. Kendrick Lamar")
+        for name, value in fields.items():
+            setattr(item, name, value)
+        seed_queue(music_player.queue, item)
 
         body = self._next_up_body(music_player)
         assert expected in body
@@ -7507,14 +7592,12 @@ class TestQueueEntryCard:
         assert "DNA." in body and "Est. playing at " in body
         assert "resolving..." not in body
 
-    def test_unresolved_ytsource_renders_resolving(
+    def test_an_unresolved_item_renders_resolving(
         self, music_player: MusicPlayer
     ) -> None:
         """A lazy Spotify-playlist entry has no title, URL, duration or requester
         yet, so the search term and its state are the whole body."""
-        seed_queue(
-            music_player.queue, YTSource(ytsearch="ytsearch:some song", process=True)
-        )
+        seed_queue(music_player.queue, unresolved("some song"))
 
         body = self._next_up_body(music_player)
         assert body == "some song\n*resolving...*"
@@ -8097,8 +8180,9 @@ class TestLoop:
         # reads — loop() now serializes the song into the Redis start
         # transaction, and MagicMock attribute values are not HSET-able.
         song = MagicMock()
-        song.title = "Loop Test Song"
-        song.webpage_url = "https://yt.com/v=loop1"
+        url, title = "https://yt.com/v=loop1", "Loop Test Song"
+        song.title = title
+        song.webpage_url = url
         song.duration_secs = 210
         song.duration = "0:03:30"
         song.uploader = "Loop Channel"
@@ -8108,30 +8192,15 @@ class TestLoop:
         song.abr = None
         song.asr = None
         song.acodec = ""
-        song.requester = None
         song.start_offset = 0
         # Real number: loop()'s history step feeds this through
         # HistoryEntry.from_song, and round(MagicMock) raises.
         song.position_secs = 195.0
-        # Interjection flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.is_replay = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.user_input = None
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
-        # Retry state, as real values: the loop's retry guard compares
-        # stream_attempts to an int.
-        song.stream_attempts = 0
-        song.failed_format_ids = frozenset()
+        # The ask, off a real queue object as a real source reads it: truthy
+        # MagicMock flags would trip the loop's start_paused/is_resume gates, and
+        # the analytics, query_source and played_at clamps in HistoryEntry raise
+        # on a MagicMock.
+        give_queue_object(song, QueueObject(url, title, stub_requester()))
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -10284,26 +10353,15 @@ class TestLoopAdditional:
         song.abr = None
         song.asr = None
         song.acodec = ""
-        song.requester = None
         song.start_offset = 0
         # Real number: loop()'s history step feeds this through
         # HistoryEntry.from_song, and round(MagicMock) raises.
         song.position_secs = 195.0
-        # Interjection flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.is_replay = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.user_input = None
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
+        # The ask, off a real queue object as a real source reads it: truthy
+        # MagicMock flags would trip the loop's start_paused/is_resume gates, and
+        # the analytics, query_source and played_at clamps in HistoryEntry raise
+        # on a MagicMock.
+        give_queue_object(song, QueueObject(url, title, stub_requester()))
         song.persisted = True
         song.stream_attempts = 0
         song.failed_format_ids = frozenset()
@@ -11955,7 +12013,89 @@ class TestDirectDequeueRespectsPersistence:
         lpop_spy.assert_awaited_once()
 
 
+# Written over with what the resolve learned; every other field rides the entry
+# through _requeued_form. Not yt_stream's not-carried set: `ts` and `search` cross
+# this rebuild and do not cross into a playing song.
+_REQUEUE_FROM_PAYLOAD = {"webpage_url", "title", "duration", "uploader", "thumbnail"}
+
+
+def _requeue_carried_bools() -> dict[str, bool]:
+    """Every bool the rebuild must carry, with its default. A bool has one
+    non-default value, so the reflective guard cannot vary these against each
+    other — setting them all reads back clean when two are crossed."""
+    return {
+        f.name: f.default
+        for f in dataclasses.fields(QueueObject)
+        if f.name not in _REQUEUE_FROM_PAYLOAD and isinstance(f.default, bool)
+    }
+
+
+_REQUEUE_CARRIED_BOOLS = _requeue_carried_bools()
+
+
 class TestNeutralizePrefetch:
+    def test_no_field_is_lost_when_a_prefetched_song_is_requeued(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        ytdl_instance: Callable[..., Any],
+    ) -> None:
+        """Reflective, against the entry that was queued rather than against the
+        rebuild's own spelling: `persisted` and `user_input` were each lost at a
+        rebuild that named its fields by hand, and this fails if one does again."""
+        queued = QueueObject(
+            "https://yt.com/v=prefetched",
+            "Prefetched",
+            mock_author,
+            ts=45,
+            user_input="typed",
+            query_source="search",
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            persisted=False,
+            played_at=12.5,
+            is_replay=True,
+            analytics=Analytics(queued_at=99.0, queue_position=3),
+            np_message_id=11,
+            np_channel_id=12,
+            np_dedicated=True,
+        )
+
+        rebuilt = music_player._requeued_form(ytdl_instance(queued=queued))
+
+        # ts comes back through the -ss offset it became, which is the same number.
+        lost = sorted(
+            f.name
+            for f in dataclasses.fields(QueueObject)
+            if f.name not in _REQUEUE_FROM_PAYLOAD
+            and getattr(rebuilt, f.name) != getattr(queued, f.name)
+        )
+        assert not lost, f"fields lost requeueing a prefetched song: {lost}"
+
+    @pytest.mark.parametrize("flipped", sorted(_REQUEUE_CARRIED_BOOLS))
+    def test_each_bool_comes_back_on_the_field_it_went_out_on(
+        self,
+        flipped: str,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        ytdl_instance: Callable[..., Any],
+    ) -> None:
+        """One bool off its default while the rest hold theirs. The guard above
+        sets all six at once, and five of them share the value True — so a
+        keyword added here naming a neighbour's flag reads back clean there and
+        fails here."""
+        queued = dataclasses.replace(
+            QueueObject("https://yt.com/v=prefetched", "Prefetched", mock_author),
+            **{flipped: not _REQUEUE_CARRIED_BOOLS[flipped]},
+        )
+
+        rebuilt = music_player._requeued_form(ytdl_instance(queued=queued))
+
+        assert {name: getattr(rebuilt, name) for name in _REQUEUE_CARRIED_BOOLS} == {
+            name: getattr(queued, name) for name in _REQUEUE_CARRIED_BOOLS
+        }
+
     async def test_no_task_is_noop(self, music_player: MusicPlayer) -> None:
         music_player._prefetch_task = None
         await music_player._neutralize_prefetch()  # must not raise
@@ -12576,9 +12716,12 @@ class TestStartOffsetAnnounce:
         """
         entry = SongQueueEntry.from_crashed_state(
             GuildStateData(
-                current_song_url="https://yt.com/v=crash",
-                current_song_title="Interrupted",
-                current_song_duration=210,
+                current_song=SongQueueEntry(
+                    webpage_url="https://yt.com/v=crash",
+                    title="Interrupted",
+                    requester_id=None,
+                    duration=210,
+                ),
             ),
             position=137,
         )

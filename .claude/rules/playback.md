@@ -93,9 +93,9 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   behind it is a network round trip. Everything that reads that cache joins the
   same job through `_stream_cache_get`, so nothing extracts the URL twice.
   See docs/ARCHITECTURE.md#resolve-mode and #warming-the-stream-cache.
-  Spotify track → title search; Spotify album/playlist → titles → YTSource ytsearch
-  entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
-  QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
+  Spotify track → title search; Spotify album/playlist → titles → QueueObjects
+  carrying their ytsearch term, resolved at dequeue; YouTube playlist → flat
+  extraction to QueueObjects. Enqueue via GuildQueue.put (batch = one round trip per `_PUT_CHUNK` entries for
   playlists, so a 10,000-track paste yields to the event loop between chunks).
   A COLLECTION that outlives its server's queue-progress-delay gets a live card here
   (src/queue_progress.py), deleted when the enqueue lands. TWO entry points, since
@@ -116,9 +116,8 @@ PHASE 2 — PREFETCH (background):
     cached, stamped `probed_at` so the play seconds later skips a second probe
   ▼
 PHASE 3 — STREAM (playback loop, usually zero extraction):
-  loop(): gate open → dequeue → resolve (if YTSource) → yt_stream (cache hit →
-  no yt-dlp call) → rebuild if the volume changed → vc.play(YTDL) → atomic Redis
-  start transaction →
+  loop(): gate open → dequeue → resolve (if item.unresolved) → yt_stream (cache
+  hit → no yt-dlp call) → vc.play(YTDL) → atomic Redis start transaction →
   NP embed + 3s progress updater → spawn prefetch for next → play_next.wait()
   → history add, clear transient state, next iteration
 ```
@@ -343,7 +342,7 @@ interjecting would stop the song the user chose to keep.
 rest between it and the resume entry, so the interrupted song returns after the WHOLE
 playlist — deliberate, stated in the confirmation, and undone by one `-remove <the
 link>` (which matches on `user_input`, carried by every track). Only the head is
-resolved and stream-warmed; a Spotify collection's tail stays lazy `YTSource`s.
+resolved and stream-warmed; a Spotify collection's tail stays unresolved `QueueObject`s.
 
 `--next` front-inserts without interrupting, via `MusicPlayer.queue_put_next` —
 `_neutralize_prefetch()` then `put_front`, because `loop()`'s prefetch holds a claim
@@ -455,48 +454,47 @@ can spend the whole placement budget before the insert begins.
 next" and "Queued song" cards are a separate renderer reading the same fields, so a
 change to the row format is not automatically a change to them. A new surface that lists
 queue items calls `queue_rows`, never its own format; an unresolved search renders from
-`YTSource`'s display fields, so a new kind of lazy entry sets those rather than teaching
+the item's own display fields, so a new kind of lazy entry sets those rather than teaching
 the formatter a new type. See `docs/ARCHITECTURE.md#queue-rows`.
 
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
-parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
-instance assignment, and the `cls(...)` call in `yt_stream` in `src/youtube.py`** —
-miss these three and the field is
-silently dropped the moment the queue object becomes a playing song, which is where every
-read of it happens → then **BOTH places a playing song is turned back into a
-QueueObject**: `MusicPlayer._requeued_form` (the rebuild `_neutralize_prefetch` and
-the stream retry share — carry it) and `MusicPlayer.interject()`'s resume tail (a
-different entry by construction — decide, don't copy: it resets `stream_attempts` and
-`failed_format_ids`, which `_requeued_form` inherits, and both are runtime-only).
-`YTDL.volume` is the one keyword that is never carried: it is the level baked into that
-source, and a requeued song is rebuilt at the level current then. **Not gated on "playback-relevant"** —
-`user_input` and `persisted` are neither, and both were lost through exactly that gap.
-They fail differently: a `YTDL` missing the attribute outright *raises* there and strands
-the prefetch's claim (which is what `persisted` did to every `--now`/`--next` over a
-completed prefetch), while one that merely defaults reappears wrong. Both rebuild sites
-are invisible to pyright unless `_prefetch_task` stays parameterized as
-`asyncio.Task[Optional[YTDL]]`, and invisible to the tests while their song fixtures are
-bare `MagicMock()` — drive the rebuild off a real `YTDL` (the `ytdl_instance` fixture
-takes carried fields as kwargs) so a missing attribute raises in the suite rather than in
-a guild. If it is a DURABLE property of the play rather than of the queue slot, it also
+parse) → `QueueObject` + `GuildQueue._rehydrate` → **a read-only property on `YTDL`
+returning `self.queued.<field>`, if a playing song reads it**. A playing song HOLDS the
+entry it was built from (`YTDL.queued`), so the field crosses into playback with no
+keyword and comes back through the `replace(song.queued, …)` rebuilds — the requeue of a
+completed prefetch, `interject()`'s resume tail, and `commands/replay.py` — without being
+named at any of them. What each rebuild still names is what it deliberately does NOT carry: the fields the resolve learned, and the
+play state a new entry must not inherit — the resume tail resets `stream_attempts` and
+`failed_format_ids` because it is producing audio, where `_requeued_form` inherits the
+live budget of a song that has not played. `YTDL.volume` is never carried either: it is
+the level baked into that source, and a requeued song is rebuilt at the level current
+then. **Not gated on "playback-relevant"** —
+`user_input` and `persisted` are neither, and both were lost when the rebuilds copied
+field by field. The only ask field a playing song WRITES is `played_at`, whose setter
+writes through to the entry; a second write-through owes the same argument the first
+one makes (`docs/ARCHITECTURE.md#the-ask-a-playing-song-holds`), since a prefetched
+song's entry is still queued while it resolves. The rebuilds are
+invisible to the tests while their song fixtures are bare `MagicMock()` — drive one off
+a real `YTDL` (the `ytdl_instance` fixture takes carried fields as kwargs) or off a
+double wired with `give_queue_object`, so a dropped field fails the suite rather than a
+guild. If it is a DURABLE property of the play rather than of the queue slot, it also
 needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
 `_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song` / `from_crashed_state`**, or a
 crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
 back `None` on the one song that was playing).
 
-**Add a SEARCH-entry field** (a field on an unresolved `YTSource`, e.g. a listing's display
-fields) — a different checklist, and the step that differs is the one upgrades depend on:
-`YTSource` field with an `Optional` default → `SearchQueueEntry` field with the same
-default → `SearchQueueEntry.from_ytsource` → `to_redis`, written **only when the value is
-not None**, never as a flat table entry → `parse_queue_entry` with `.get` →
-`GuildQueue._rehydrate` → a golden-bytes test beside `_GOLDEN_YTSOURCE`. The when-known
-write is what keeps an entry queued by the previous build byte-identical, and LREM matches
-these entries by their exact bytes: write the key unconditionally and every `-remove` and
-`-clear` misses on every entry already in Redis, each one then rewriting the whole list
-under the bulk mutex. Nothing here goes near `YTDL`: a search has no playing-song form
-until it resolves, and resolution builds a fresh `QueueObject`.
+**An UNRESOLVED item takes the same checklist**, with one step of its own: a collection's
+tracks wait as `QueueObject`s with `search` set and `webpage_url` empty, and they
+serialize as `"ytsource"` entries for one release so a rollback can still read the list.
+So a field that an unresolved item must carry needs the `SearchQueueEntry` leg of
+`to_redis` too, written **only when the value is not None**, never as a flat table entry.
+That when-known write keeps an entry queued by the previous build byte-identical, and
+LREM matches these entries by their exact bytes: write the key unconditionally and every
+`-remove` and `-clear` misses on every entry already in Redis, each one then rewriting the
+whole list under the bulk mutex. Pin it with a golden-bytes test beside `_GOLDEN_YTSOURCE`.
+The leg goes when `SearchQueueEntry` does, one release after the shape landed.
 
 **Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
 the loop() bookkeeping comments first; every claim, release, and Redis

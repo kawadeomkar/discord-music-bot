@@ -46,7 +46,6 @@ from src.guild_state import (
 )
 from src.redis_client import GuildRedisStore
 from src.settings import WriteMode
-from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -92,10 +91,6 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
-
-# A resolved QueueObject, or an unresolved YTSource (e.g. a Spotify playlist
-# track awaiting YouTube search).
-QueueItem = Union[QueueObject, YTSource]
 
 
 # TODO: ETAs render in one zone per guild, never per viewer: queue_embed()'s
@@ -359,7 +354,7 @@ class MusicPlayer:
     # this task's result, and a bare Task makes result() Any — so a field YTDL
     # does not carry would raise at runtime with pyright reporting nothing.
     _prefetch_task: Optional[asyncio.Task[Optional[YTDL]]]
-    _prefetched_head: Optional[tuple[QueueItem, QueueObject]]
+    _prefetched_head: Optional[tuple[QueueObject, QueueObject]]
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
@@ -404,7 +399,8 @@ class MusicPlayer:
         # Nullable: guild.me is None until the member cache fills and guild.owner
         # can be uncached; discord.py's stub declares Guild.me as Member and hides
         # that. from_context()/set_context() overwrite it before any command path
-        # reads it; _require_requester() covers the rest.
+        # reads it, and the restore hands it to the queue as its last resort for
+        # an entry whose own requester id resolves to nobody.
         self._last_author: Optional[Union[discord.User, discord.Member]] = (
             guild.me or guild.owner
         )
@@ -445,7 +441,7 @@ class MusicPlayer:
         self._prefetch_task: Optional[asyncio.Task[Optional[YTDL]]] = None
         # (the entry the prefetch claimed, what it resolved to): the queue keeps the
         # claimed lazy entry until loop() settles it. See _displayed().
-        self._prefetched_head: Optional[tuple[QueueItem, QueueObject]] = None
+        self._prefetched_head: Optional[tuple[QueueObject, QueueObject]] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._progress_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -608,32 +604,6 @@ class MusicPlayer:
         self._channel = ctx.channel
         self._last_author = ctx.author
 
-    def _require_requester(self) -> Union[discord.User, discord.Member]:
-        """The fallback requester, for paths that must have one (QueueObject.requester
-        is non-optional because persistence reads `requester.id`). Unset only on a
-        player whose guild has both bot member AND owner uncached, and never after a
-        command has run."""
-        if self._last_author is None:
-            raise RuntimeError(
-                f"No requester available for guild {self._guild.id}: neither the "
-                "bot member nor the guild owner is cached"
-            )
-        return self._last_author
-
-    def _resolve_requester(
-        self, requester_id: Optional[int]
-    ) -> Union[discord.User, discord.Member]:
-        """Who queued a lazy search: the guild member, else the cached user (a
-        member who left keeps their plays), else the fallback requester, which is
-        what an entry queued before searches carried an ID has always resolved to."""
-        if requester_id is not None:
-            who = self._guild.get_member(requester_id) or self.bot.get_user(
-                requester_id
-            )
-            if who is not None:
-                return who
-        return self._require_requester()
-
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs: (now_pst, walk).
         cumulative_secs starts at the current song's total duration as a proxy for
@@ -659,7 +629,7 @@ class MusicPlayer:
             walk = advance_walk(walk, earlier)
         return now_pst, walk
 
-    def _displayed(self, item: QueueItem) -> QueueItem:
+    def _displayed(self, item: QueueObject) -> QueueObject:
         """`item` as the cards show it: the song the prefetch resolved it to while
         it is still the queue's head, else itself. A lazy Spotify entry otherwise
         reads "resolving..." until the song starts."""
@@ -668,7 +638,7 @@ class MusicPlayer:
             return head[1]
         return item
 
-    def _displayed_items(self) -> list[QueueItem]:
+    def _displayed_items(self) -> list[QueueObject]:
         """display_items() with its head as the cards show it (_displayed)."""
         items = self.queue.display_items()
         if items:
@@ -710,7 +680,7 @@ class MusicPlayer:
         ran to its END — hence "Last played", not a claim about where playback
         stopped."""
         head = self.queue.peek_next()
-        if isinstance(head, QueueObject) and not is_persisted(head) and head.title:
+        if head is not None and not is_persisted(head) and head.title:
             value = f"**{safe_label(head.title, EMBED_TITLE_LIMIT)}**"
             if head.ts:
                 value += f"\n`{fmt_duration(head.ts)}`"
@@ -787,7 +757,9 @@ class MusicPlayer:
         self._add_resume_fields(embed, items)
         return embed
 
-    def _add_resume_fields(self, embed: discord.Embed, items: list[QueueItem]) -> None:
+    def _add_resume_fields(
+        self, embed: discord.Embed, items: list[QueueObject]
+    ) -> None:
         """The "what the restore found" fields both resume notices carry: where the
         previous session got to, how much queue came back, and how long it runs."""
         left_off = self._resume_left_off_field()
@@ -921,27 +893,27 @@ class MusicPlayer:
                             snapshot.now_playing
                         )
 
-                    # Re-queue the song that was playing at the crash: current_song_url
-                    # is set atomically with the LPOP, so a non-empty value means the
-                    # bot died between that transaction and the song's end.
-                    if guild_state.has_crashed_song:
+                    # Re-queue the song that was playing at the crash: the parked
+                    # entry is written atomically with the LPOP, so one being there
+                    # means the bot died between that transaction and the song's end.
+                    parked = guild_state.current_song
+                    if parked is not None:
                         # The recorded position, straight off the snapshot — no
                         # clock, no IO, so downtime is never credited.
                         position = guild_state.crashed_position_at(time.time())
                         if position is not None:
                             # Cap at duration − 10s so FFmpeg cannot seek past EOF.
                             # Falsy covers both unknown and a livestream's 0: no cap.
-                            duration = guild_state.current_song_duration
+                            duration = parked.duration
                             if duration:
                                 position = min(position, max(0, duration - 10))
                             log.info(
                                 f"Computed recovery position {position}s for "
-                                f"'{guild_state.current_song_title}'"
+                                f"'{parked.title}'"
                             )
 
-                        # The crashed current_song_* fields ARE the queue entry the
-                        # start transaction LPOPed; rebuild it through the same
-                        # rehydration path as everything else.
+                        # That entry IS what the start transaction LPOPed; it goes
+                        # through the same rehydration path as everything else.
                         crashed_entry = SongQueueEntry.from_crashed_state(
                             guild_state, position=position
                         )
@@ -954,14 +926,18 @@ class MusicPlayer:
                         ):
                             log.info(
                                 f"Re-queued crashed song "
-                                f"'{guild_state.current_song_title}' for guild {self._guild.id}"
+                                f"'{parked.title}' for guild {self._guild.id}"
                             )
-                        # Always clear, re-queued or not: leaving current_song_url
+                        # Always clear, re-queued or not: leaving the parked song
                         # set makes every later restart re-enter this block.
                         await self.store.clear_song_end_state()
 
                     # After the crashed head, so the interrupted song plays first.
-                    count = await self.queue.restore_entries(snapshot.queue)
+                    count = await self.queue.restore_entries(
+                        snapshot.queue,
+                        requester_fallback=self._last_author,
+                        unreadable=snapshot.queue_unreadable,
+                    )
                     if count:
                         log.info(
                             f"Restored {count} queued songs for guild {self._guild.id}"
@@ -997,13 +973,17 @@ class MusicPlayer:
         soon as it re-queues that song, so this player's memory is its only copy.
         Call AFTER cleanup(): its clear_connection() HDELs these same fields."""
         head = self.queue.peek_next()
-        if self.store is None or not isinstance(head, QueueObject):
+        if self.store is None or head is None or head.unresolved:
+            # An unresolved head has no page to park under: its webpage_url is
+            # the Spotify track the walk named, or nothing, and the slot would
+            # come back as a resolved song pointing at either.
             return False
         if is_persisted(head):
             # Already on the Redis list: parking it would re-queue a second copy.
             return False
         # Backdated by the resume offset as the loop does at vc.play, and seeded as
-        # the recorded position: the hash carries no `ts`.
+        # the recorded position, which is what recovery reads back: the blob's own
+        # `ts` is overwritten by from_crashed_state.
         await self.store.set_current_song_state(
             SongQueueEntry.from_queue_object(head),
             time.time() - (head.ts or 0),
@@ -1027,7 +1007,7 @@ class MusicPlayer:
 
     async def queue_put(
         self,
-        obj: Union[QueueItem, Sequence[QueueItem]],
+        obj: Union[QueueObject, Sequence[QueueObject]],
         *,
         prefetch: bool = True,
     ) -> None:
@@ -1035,13 +1015,11 @@ class MusicPlayer:
         playlist enqueues: one batch round-trip, and no per-item tasks — N
         concurrent prefetches mint stream URLs that expire before playback reaches
         them. _prefetch_next_song covers one-ahead prefetch as songs play."""
-        items: list[QueueItem] = (
-            [obj] if isinstance(obj, (QueueObject, YTSource)) else list(obj)
-        )
+        items: list[QueueObject] = [obj] if isinstance(obj, QueueObject) else list(obj)
         items = await self.queue.put(items, batch=not prefetch)
         if prefetch and self.store is not None:
             for item in items:
-                if isinstance(item, QueueObject):
+                if not item.unresolved:
                     self._spawn_background(self._warm_stream(item))
 
     async def _warm_stream(self, item: QueueObject) -> None:
@@ -1056,7 +1034,7 @@ class MusicPlayer:
 
     async def queue_put_front(
         self,
-        obj: Union[QueueItem, Sequence[QueueItem]],
+        obj: Union[QueueObject, Sequence[QueueObject]],
         *,
         prefetch: bool = True,
     ) -> None:
@@ -1064,18 +1042,16 @@ class MusicPlayer:
         as queue_put(); used when -play runs on a disconnected bot with a persisted
         queue, so the requested song plays now and the persisted entries resume
         behind it."""
-        items: list[QueueItem] = (
-            [obj] if isinstance(obj, (QueueObject, YTSource)) else list(obj)
-        )
+        items: list[QueueObject] = [obj] if isinstance(obj, QueueObject) else list(obj)
         items = await self.queue.put_front(items)
         if prefetch and self.store is not None:
             for item in items:
-                if isinstance(item, QueueObject):
+                if not item.unresolved:
                     self._spawn_background(self._warm_stream(item))
 
     async def queue_put_next(
         self,
-        obj: Union[QueueItem, Sequence[QueueItem]],
+        obj: Union[QueueObject, Sequence[QueueObject]],
         *,
         prefetch: bool = True,
     ) -> None:
@@ -1093,7 +1069,7 @@ class MusicPlayer:
             await self._neutralize_prefetch()
         await self.queue_put_front(obj, prefetch=prefetch)
 
-    async def queue_get(self) -> QueueItem:
+    async def queue_get(self) -> QueueObject:
         return await self.queue.get()
 
     async def _cancel_prefetch(self) -> None:
@@ -1105,7 +1081,7 @@ class MusicPlayer:
         the worker exits."""
         await cancel_task(self._prefetch_task)
 
-    async def _flush_played(self, items: Sequence[QueueItem]) -> None:
+    async def _flush_played(self, items: Sequence[QueueObject]) -> None:
         """Record every item that already played and is now leaving the queue for
         good: interjection resume tails, whose remaining tail -clear/-remove
         discards, so nothing else records them. `played_at > 0.0` is the whole
@@ -1116,8 +1092,7 @@ class MusicPlayer:
         played = [
             item
             for item in items
-            if isinstance(item, QueueObject)
-            and isinstance(item.played_at, (int, float))
+            if isinstance(item.played_at, (int, float))
             and not isinstance(item.played_at, bool)
             and item.played_at > 0.0
         ]
@@ -1141,17 +1116,17 @@ class MusicPlayer:
         # Concurrently: each write is an independent MULTI plus an outbox push.
         await asyncio.gather(*(self.history.add(entry) for entry in entries))
 
-    async def _dispose_orphaned_cards(self, items: Sequence[QueueItem]) -> None:
+    async def _dispose_orphaned_cards(self, items: Sequence[QueueObject]) -> None:
         """Retire the frozen NP card of every played tail leaving the queue. A tail
         disposes of its fragment's card when it STARTS, so one destroyed before it
         plays takes the only pointer with it. Fire-and-forget per item: rate-limited
         Discord calls the command must not wait on."""
         for item in items:
-            if isinstance(item, QueueObject) and item.is_resume:
+            if item.is_resume:
                 self._spawn_background(self._dispose_previous_np_card(item))
 
     async def _retire_failed_dequeue(
-        self, item: Optional[QueueItem], *, context: str
+        self, item: Optional[QueueObject], *, context: str
     ) -> None:
         """Retire a dequeue that will never play, and record it if a listener already
         heard part of it. For a resume TAIL the flush is the only writer left: the
@@ -1358,19 +1333,18 @@ class MusicPlayer:
             thumbnail=data.thumbnail,
         )
 
-    def _queue_entry_description(self, item: QueueItem, index: int) -> str:
+    def _queue_entry_description(self, item: QueueObject, index: int) -> str:
         """The body both single-entry cards render: one labelled fact per line,
         ending with the ETA position `index` earns."""
         now_pst, walk = self._eta_walk_to(index)
         eta = fmt_eta(eta_at(now_pst, walk.cumulative_secs), walk.uncertain)
-        if not isinstance(item, QueueObject):
+        if item.unresolved:
             if not item.title:
                 # A search with no display fields: only its term exists yet.
                 search = safe_label(
-                    (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
-                    _NEXT_UP_TITLE_MAX,
+                    item.search.removeprefix("ytsearch:"), _NEXT_UP_TITLE_MAX
                 )
-                return f"{search}\n*resolving...*"
+                return f"{search or '?'}\n*resolving...*"
             # An unresolved Spotify track, from the fields it was queued with.
             title = safe_label(item.title, _NEXT_UP_TITLE_MAX)
             linked = (
@@ -1382,10 +1356,9 @@ class MusicPlayer:
             length = (
                 fmt_duration(item.duration) if item.duration is not None else "?:??"
             )
-            who = f"<@{item.requester_id}>" if item.requester_id else "Unknown"
             return "\n".join(
                 [
-                    f"Requested by: [{who}]",
+                    f"Requested by: [{requester_mention(item.requester)}]",
                     linked,
                     f"Artist: {artist}  ·  Duration: `{length}`",
                     f"Est. playing at {eta}",
@@ -1397,7 +1370,7 @@ class MusicPlayer:
         channel = safe_label(item.uploader or "", _FIELD_VALUE_MAX) or "Unknown channel"
         duration = fmt_duration(item.duration) if item.duration is not None else "?:??"
         detail = [f"Channel: {channel}", f"Duration: `{duration}`"]
-        if isinstance(item, QueueObject) and item.is_replay:
+        if item.is_replay:
             detail.append("🔁 Replays from `0:00`")
         elif item.is_resume and item.ts:
             detail.append(f"⏮ Resumes at `{fmt_duration(item.ts)}`")
@@ -1414,7 +1387,7 @@ class MusicPlayer:
 
     def _build_queue_entry_embed(
         self,
-        item: QueueItem,
+        item: QueueObject,
         *,
         index: int,
         title: str,
@@ -1429,12 +1402,12 @@ class MusicPlayer:
         embed = discord.Embed(
             title=title, description=description, color=discord.Color.blue()
         )
-        if isinstance(item, QueueObject) and item.thumbnail:
+        if item.thumbnail:
             embed.set_thumbnail(url=item.thumbnail)
         return embed
 
     def build_queued_song_embed(
-        self, item: QueueItem, *, note: str = "", warning: Optional[str] = None
+        self, item: QueueObject, *, note: str = "", warning: Optional[str] = None
     ) -> discord.Embed:
         """The -play confirmation. `item` is located by identity, so the ETA is the
         one its real position earns; an entry a concurrent -clear removed renders at
@@ -1448,7 +1421,7 @@ class MusicPlayer:
             warning=warning,
         )
 
-    def queued_slot(self, tracks: Sequence[QueueItem], *, ahead: int) -> int:
+    def queued_slot(self, tracks: Sequence[QueueObject], *, ahead: int) -> int:
         """The 1-based slot a collection just queued actually took. By IDENTITY —
         a collection may hold the same track twice, and equality would return the
         first one's slot for both. One a concurrent -clear already took is not
@@ -1458,7 +1431,7 @@ class MusicPlayer:
         return self.queue.display_index(tracks[0]) or ahead + 1
 
     def queued_rows(
-        self, tracks: Sequence[QueueItem], *, first: int, budget: int = ROWS_BUDGET
+        self, tracks: Sequence[QueueObject], *, first: int, budget: int = ROWS_BUDGET
     ) -> str:
         """The rows of a collection just queued, as -queue lists them: numbered
         from the slot it took and timed by the walk to it. Read after the insert.
@@ -1845,7 +1818,7 @@ class MusicPlayer:
         vc: discord.VoiceClient,
         *,
         resume_paused: bool = True,
-        follow_on: Sequence[QueueItem] = (),
+        follow_on: Sequence[QueueObject] = (),
     ) -> Optional[InterjectOutcome]:
         """Play `qobj` immediately; the interrupted song returns afterwards.
         `follow_on` is the rest of a playlist `qobj` heads: it goes between the
@@ -1902,36 +1875,42 @@ class MusicPlayer:
                     max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS),
                 )
             if not near_end:
-                # The tail is the same play, so it keeps the interrupted song's
-                # flags and stamps: interjected (read at every stack level by the
-                # span attribute below), played_at (files the whole play under its
-                # first fragment's start), query_source (the tail writes the ONLY
-                # row for this play, and the classification is not recoverable from
+                # The tail is the same play, so the interrupted song's whole ask
+                # comes along: interjected (read at every stack level by the span
+                # attribute below), played_at (files the whole play under its first
+                # fragment's start), query_source (the tail writes the ONLY row for
+                # this play, and the classification is not recoverable from
                 # webpage_url) and user_input (what -remove matches on).
-                resume = QueueObject(
-                    current.webpage_url,
-                    current.title or "",
-                    current.requester or self._require_requester(),
+                resume = replace(
+                    current.queued,
+                    webpage_url=current.webpage_url,
+                    title=current.title or "",
                     ts=position,
                     duration=current.duration_secs or None,
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
-                    interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
-                    analytics=current.analytics,
-                    played_at=current.played_at,
-                    query_source=current.query_source,
-                    user_input=current.user_input,
-                    # stream_attempts/failed_format_ids reset here, unlike
-                    # _requeued_form's inherit: this song is producing audio,
-                    # which ends its retry chain.
+                    # The tail is its own queue entry: it is put_front'd onto the
+                    # Redis list, and the card ids below are set on it afterwards,
+                    # so it takes neither a restored head's unlisted state nor the
+                    # frozen card of the fragment being interrupted.
+                    persisted=True,
+                    is_replay=False,
+                    np_message_id=0,
+                    np_channel_id=0,
+                    np_dedicated=False,
+                    np_host_ref=None,
+                    # Reset where the rest is inherited: this song is producing
+                    # audio, which ends its retry chain.
+                    stream_attempts=0,
+                    failed_format_ids=frozenset(),
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
         # — it plays immediately by definition — while the tail keeps the
         # interrupted song's analytics, unknown ones included.
-        items: list[QueueItem] = [qobj, *follow_on]
+        items: list[QueueObject] = [qobj, *follow_on]
         if resume is not None:
             items.append(resume)
             # The song returns, so it is recorded once — when its tail finishes. A
@@ -2016,36 +1995,20 @@ class MusicPlayer:
         self._spawn_background(asyncio.to_thread(song.cleanup))
 
     def _requeued_form(self, song: YTDL) -> QueueObject:
-        """The QueueObject a built source came from, with every field it carries:
-        what a completed prefetch goes back on the queue as, and what a volume
-        rebuild is built from."""
-        # Dropping a field here restarts a neutralized resume entry from 0:00,
-        # loses a ?t= offset, or zeroes the ask this play was queued against.
-        return QueueObject(
-            song.webpage_url or "",
-            song.title or "",
-            song.requester or self._require_requester(),
+        """The QueueObject a built source came from: what a completed prefetch
+        goes back on the queue as, and what a stream retry re-mints from."""
+        # The ask comes back whole off song.queued — the live retry budget with it,
+        # so a dead song cannot loop past the cap — and only what the resolve
+        # learned is written over it. Dropping one of these restarts a neutralized
+        # resume entry from 0:00 or loses a ?t= offset.
+        return replace(
+            song.queued,
+            webpage_url=song.webpage_url or "",
+            title=song.title or "",
             ts=song.start_offset or None,
-            user_input=song.user_input,
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
-            persisted=song.persisted,
-            interjected=song.interjected,
-            is_resume=song.is_resume,
-            start_paused=song.start_paused,
-            analytics=song.analytics,
-            query_source=song.query_source,
-            played_at=song.played_at,
-            np_message_id=song.np_message_id,
-            np_channel_id=song.np_channel_id,
-            np_dedicated=song.np_dedicated,
-            np_host_ref=song.np_host_ref,
-            is_replay=song.is_replay,
-            # Inherited, not reset: a prefetched song has not played, so its retry
-            # chain is live. A fresh budget here would loop a dead song past the cap.
-            stream_attempts=song.stream_attempts,
-            failed_format_ids=song.failed_format_ids,
         )
 
     async def _announce_start_offset(self, song: YTDL) -> None:
@@ -2090,19 +2053,31 @@ class MusicPlayer:
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
-    async def _resolve_source(self, source: QueueItem) -> QueueObject:
-        # Full resolve (yt_source's default): a lazy entry resolving here is about to
+    async def _resolve_source(self, source: QueueObject) -> QueueObject:
+        """The item, with a search resolved to the song it names. Everything the
+        ask carries stays on the item — only what yt-dlp learned is written over
+        it, and `search` clears, which is what makes it playable."""
+        if not source.unresolved:
+            return source
+        # Full resolve (yt_source's default): an item resolving here is about to
         # play, so the stream URL this extraction yields is wanted immediately.
-        if isinstance(source, YTSource):
-            return await YTDL.yt_source(
-                self._resolve_requester(source.requester_id),
-                source.ytsearch or "",
-                redis=self.store.redis if self.store is not None else None,
-                query_source=source.query_source,
-                analytics=source.analytics,
-                user_input=source.user_input,
-            )
-        return source
+        resolved = await YTDL.yt_source(
+            source.requester,
+            source.search,
+            redis=self.store.redis if self.store is not None else None,
+            query_source=source.query_source,
+            analytics=source.analytics,
+            user_input=source.user_input,
+        )
+        return replace(
+            source,
+            webpage_url=resolved.webpage_url,
+            title=resolved.title,
+            duration=resolved.duration,
+            uploader=resolved.uploader,
+            thumbnail=resolved.thumbnail,
+            search="",
+        )
 
     async def _stream_source(
         self, source: QueueObject, *, allow_reextract: bool = True
@@ -2647,7 +2622,7 @@ class MusicPlayer:
                         # crash-recovered head). Popping for one that was never on
                         # the list deletes the next real entry.
                         claim_persisted = self.current_song.persisted
-                        # `source` stays None because a YTDL is not a QueueItem.
+                        # `source` stays None because a YTDL is not a QueueObject.
                         should_pop_queue = claim_persisted
                         source = None
                     else:
@@ -2659,9 +2634,9 @@ class MusicPlayer:
                             async with async_timeout.timeout(idle_secs) as idle:
                                 source = await self.queue_get()
                                 claim_outstanding = True
-                                # Safe before the resolve: a YTSource is persisted
-                                # and yt_source() builds a QueueObject that
-                                # defaults the same way.
+                                # Safe before the resolve: `persisted` is not
+                                # one of the display fields the resolve's copy
+                                # writes over, so it reads the same either side.
                                 claim_persisted = is_persisted(source)
                                 # Re-read: a clear() during the blocking get
                                 # belongs to the queue this item came from.

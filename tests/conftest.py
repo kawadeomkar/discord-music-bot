@@ -24,16 +24,16 @@ import src.spotify as spotify_mod
 import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
-from src.guild_state import ANALYTICS_ZERO
 from src.musicbot import MusicBot
 from src.play_placement import PlayRegistry
 from src.recovery import VoiceWatchdog
 from src.settings import GuildSettings
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from src.youtube import close_probe_session
+from src.youtube import QueueObject, close_probe_session
 from tests.helpers import (
     add_settings_state,
+    give_queue_object,
     noop_ffmpeg_init,
     stub_create_task,
     tier_enabled,
@@ -545,10 +545,10 @@ def mock_song() -> MagicMock:
     """A mock YTDL-like song object with all metadata attributes."""
     song = MagicMock()
     song.title = "Test Song Title"
-    song.requester = MagicMock()
-    song.requester.mention = "<@123456>"
-    song.requester.id = 123456
-    song.requester.display_name = "TestUser"
+    requester = MagicMock()
+    requester.mention = "<@123456>"
+    requester.id = 123456
+    requester.display_name = "TestUser"
     song.webpage_url = "https://www.youtube.com/watch?v=testid"
     song.duration = "0:03:30"
     song.uploader = "Test Channel"
@@ -562,27 +562,14 @@ def mock_song() -> MagicMock:
     song.abr = 128
     song.asr = 44100
     song.acodec = "opus"
-    # Interjection flags a real YTDL always carries — as bare MagicMock attributes
-    # they'd read truthy and trip the loop's start_paused/is_resume gates.
-    song.interjected = False
-    song.is_resume = False
-    song.start_paused = False
-    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-    # clamps its fields into the play_history column domain. query_source likewise
-    # a real string — the slug clamp regex-matches it and a MagicMock raises
-    # TypeError there, exactly as a MagicMock title would.
-    song.analytics = ANALYTICS_ZERO
-    song.query_source = ""
-    # Same reason: the resume tail an interjection builds carries it, and it is
-    # serialized straight to the queue mirror.
-    song.user_input = None
-    # Unstamped, like a song the loop has not started yet: the loop's or-stamp
-    # writes the real clock here, and the epoch clamp raises on a MagicMock.
-    song.played_at = 0.0
-    # Retry state a real YTDL always has, as real values: the loop's retry guard
-    # compares stream_attempts to an int.
-    song.stream_attempts = 0
-    song.failed_format_ids = frozenset()
+    # The ask, held as the queue object a real source holds and read through it,
+    # so the interjection flags read False rather than a truthy MagicMock (which
+    # trips the loop's start_paused/is_resume gates), the analytics and
+    # query_source survive HistoryEntry's play_history clamps, which raise on a
+    # MagicMock, and played_at starts unstamped for the loop's or-stamp to fill.
+    # A test assigning any of them moves it on the entry, so a rebuild reading
+    # song.queued sees what the test set.
+    give_queue_object(song, QueueObject(song.webpage_url, song.title, requester))
     # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
     # reads `traceparent` off it to link this song's trace to the extraction that
     # minted its URL, and a MagicMock there would be a str where a str is parsed.
@@ -605,14 +592,9 @@ def mock_vc() -> MagicMock:
 
 @pytest.fixture
 def live_song(mock_song: MagicMock) -> MagicMock:
-    """mock_song with the interjection flags a real YTDL carries — bare MagicMock
-    attributes would read truthy and trip the loop's is_resume/start_paused
-    gates."""
-    mock_song.interjected = False
-    mock_song.is_resume = False
-    mock_song.start_paused = False
-    # Real values: a bare MagicMock reads truthy for both, and would hide a rebuild
-    # that drops either.
+    """mock_song with an ask worth carrying: a real origin link and persistence,
+    so a rebuild that drops either fails a test instead of reading a truthy
+    MagicMock."""
     mock_song.user_input = "https://open.spotify.com/playlist/live"
     mock_song.persisted = True
     return mock_song
@@ -709,7 +691,7 @@ def ytdl_instance(
     """Factory that creates a YTDL instance with FFmpegOpusAudio.__init__ patched out."""
     from unittest.mock import patch
     import discord as d
-    from src.youtube import YTDL, YTDLVideoInfo
+    from src.youtube import YTDL, QueueObject, YTDLVideoInfo
 
     def _make(data: Optional[dict] = None, **carried: Any) -> Any:
         default_data = {
@@ -732,6 +714,18 @@ def ytdl_instance(
         }
         if data:
             default_data.update(data)
+        # Carried fields name the queue object the source plays, so a test can
+        # drive the paths that read them back off a REAL YTDL rather than a mock
+        # that invents whatever attribute it is asked for. `start_offset` is
+        # spelled `ts` on the entry, as it is everywhere but the -ss boundary.
+        if "start_offset" in carried:
+            carried["ts"] = carried.pop("start_offset")
+        queued = carried.pop("queued", None) or QueueObject(
+            str(default_data["webpage_url"]),
+            str(default_data["title"]),
+            carried.pop("requester", mock_author),
+            **carried,
+        )
         with patch.object(d.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
             return YTDL(
                 mock_channel,
@@ -739,11 +733,7 @@ def ytdl_instance(
                 # Per-test overrides merge in above, so this is a plain dict by
                 # construction; the cast is the info-dict shape assertion.
                 data=cast(YTDLVideoInfo, default_data),
-                requester=mock_author,
-                # Carried QueueObject fields, so a test can drive the paths that
-                # read them back off a REAL YTDL rather than a mock that invents
-                # whatever attribute it is asked for.
-                **carried,
+                queued=queued,
             )
 
     return _make

@@ -113,6 +113,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
     StateField.CURRENT_SONG_USER_INPUT,
+    StateField.CURRENT_SONG,
     StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
@@ -899,9 +900,9 @@ class GuildRedisStore:
         play_start_epoch: float,
         start_offset: float = 0.0,
     ) -> dict[str, str]:
-        """The current_song_* state fields ARE a parked queue entry — the one
-        signature enforcing the identity SongQueueEntry.from_song()/
-        from_crashed_state() rely on for crash recovery."""
+        """The parked queue entry, written as one blob and as the prefixed fields
+        a build before it reads. One signature, so the identity
+        SongQueueEntry.from_song()/from_crashed_state() rely on cannot drift."""
         return {
             StateField.CURRENT_SONG_URL: current.webpage_url,
             StateField.CURRENT_SONG_TITLE: current.title,
@@ -919,6 +920,11 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
             StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
+            # The whole entry, beside the prefixed copies above: one release of
+            # dual writes, so a rollback still recovers from the fields it knows.
+            # A reader takes only thumbnail and the np_* ids from the blob, and
+            # only when CURRENT_SONG_URL and CURRENT_SONG_PLAYED_AT match its own.
+            StateField.CURRENT_SONG: current.to_redis().decode(),
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
@@ -1239,7 +1245,7 @@ class GuildRedisStore:
         refresh_ttl() at the end of _restore_state() covers the recovery window."""
         # Same decode_responses=False invariant as get_now_playing() above.
         raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.state_key()))
-        return GuildStateData.from_redis(raw)
+        return GuildStateData.from_redis(raw, owner=f"[guild:{self.guild_id}]")
 
     @_guild_op(default=None)
     async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
@@ -1252,7 +1258,9 @@ class GuildRedisStore:
         pipe.llen(self.queue_key())
         raw_state, queue_len = await pipe.execute()
         return GuildRecoveryGate(
-            state=GuildStateData.from_redis(raw_state),
+            state=GuildStateData.from_redis(
+                raw_state, owner=f"[guild:{self.guild_id}]"
+            ),
             pending_count=int(queue_len),
         )
 
@@ -1292,8 +1300,11 @@ class GuildRedisStore:
             if entry is not None
         )
         return GuildPlaybackSnapshot(
-            state=GuildStateData.from_redis(raw_state),
+            state=GuildStateData.from_redis(
+                raw_state, owner=f"[guild:{self.guild_id}]"
+            ),
             queue=entries,
+            queue_unreadable=len(raw_queue) - len(entries),
             now_playing=NowPlayingData.from_redis(raw_np),
             history=history,
             config=GuildConfig.from_redis(raw_config),

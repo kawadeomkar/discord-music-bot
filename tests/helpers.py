@@ -6,17 +6,19 @@ import them directly, without routing through pytest's plugin machinery.
 
 import asyncio
 import contextlib
+import dataclasses
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
-from src.guild_queue import GuildQueue, QueueItem
-from src.guild_state import ANALYTICS_ZERO, Analytics, GuildConfig
+from src.guild_queue import GuildQueue
+from src.guild_state import Analytics, GuildConfig
 from src.redis_client import GuildRedisStore, iter_guild_configs
 from src.settings import GuildSettings
 from src.play_placement import PlayMode, PlayRequest
@@ -96,8 +98,8 @@ def described(embed: discord.Embed) -> str:
 def queue_object(item: object) -> QueueObject:
     """A queue entry narrowed to `QueueObject`.
 
-    `display_items()` yields `QueueObject | YTSource` (an unresolved Spotify track
-    has no title/requester/duration), so reading those fields asserts resolved."""
+    `display_items()` is typed `list[QueueObject]`, so this only narrows the
+    `object` a test holds; it is the assertion that the narrowing is true."""
     assert isinstance(item, QueueObject)
     return item
 
@@ -173,7 +175,7 @@ def bind_loopback_only(container: Any, port: int) -> None:
     container.ports[port] = ("127.0.0.1", None)
 
 
-def seed_queue(gq: GuildQueue, *items: QueueItem) -> None:
+def seed_queue(gq: GuildQueue, *items: QueueObject) -> None:
     """Queue items without touching Redis — `put()` minus the mirror.
 
     Synchronous, so the sync tests (embeds, ETA) can use it too. Nothing here
@@ -303,6 +305,67 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     return mp
 
 
+# The ask fields, taken from the source itself: a real YTDL answers each of these
+# off the queue object it holds, so a double must too. Reflective, so a field
+# added to QueueObject and exposed on YTDL is wired below without an edit here.
+ASK_FIELDS: tuple[str, ...] = tuple(
+    f.name
+    for f in dataclasses.fields(QueueObject)
+    if isinstance(getattr(YTDL, f.name, None), property)
+)
+
+
+def unresolved(term: str, requester: Any = None, **fields: Any) -> QueueObject:
+    """A queue item still waiting to resolve, the way a Spotify collection track is
+    queued by a walk that named no display row: `search` holds the term and the
+    display fields arrive with the resolve. `title` and `webpage_url` are the two
+    a walk DOES supply rows for, so both are keywords here and both default empty."""
+    return QueueObject(
+        fields.pop("webpage_url", ""),
+        fields.pop("title", ""),
+        requester if requester is not None else stub_requester(),
+        search=f"ytsearch:{term}",
+        **fields,
+    )
+
+
+def stub_requester(user_id: int = 4242, name: str = "Loop User") -> MagicMock:
+    """A user stand-in carrying the real values a play's ask serializes: the
+    queue mirror HSETs the id and play_history stores the display name, and a
+    MagicMock attribute is neither HSET-able nor clampable."""
+    who = MagicMock()
+    who.id = user_id
+    who.display_name = name
+    who.mention = f"<@{user_id}>"
+    return who
+
+
+def give_queue_object(song: Any, queued: QueueObject) -> QueueObject:
+    """Give a YTDL double the queue object a real source holds, with the ask
+    fields wired through it as YTDL's properties are.
+
+    A test that assigns one (`song.played_at = 1.0`) moves it on the entry, so a
+    rebuild reading `song.queued` sees what the test set — the divergence that
+    otherwise hides a rebuild dropping a field. PropertyMock goes on the type
+    because mock stores attributes on the instance; every Mock has a type of its
+    own, so this reaches no other double.
+
+    The write is a `replace()`, so `song.queued` is a new object afterwards where
+    the real setter mutates the entry it holds; that contract is pinned on a real
+    source by test_youtube.py's test_the_start_stamp_reaches_the_entry."""
+    song.queued = queued
+    for name in ASK_FIELDS:
+
+        def access(*value: Any, _name: str = name) -> Any:
+            if value:
+                song.queued = replace(song.queued, **{_name: value[0]})
+                return None
+            return getattr(song.queued, _name)
+
+        setattr(type(song), name, PropertyMock(side_effect=access))
+    return queued
+
+
 # What -replay mints at dispatch: the command message's snowflake time, and
 # depth 0 — the replay plays immediately.
 REPLAY_ASK = Analytics(queued_at=1752530500.5, queue_position=0)
@@ -323,34 +386,21 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     song.abr = None
     song.asr = None
     song.acodec = ""
-    song.requester = None
     song.start_offset = 0
     song.position_secs = position
     song.produced_audio = True
-    song.interjected = False
-    song.is_resume = False
-    song.is_replay = False
-    song.start_paused = False
-    song.analytics = ANALYTICS_ZERO
-    song.user_input = None
-    song.query_source = ""
-    song.played_at = 0.0
-    song.persisted = True
-    song.stream_attempts = 0
-    song.failed_format_ids = frozenset()
     song.data = {}
+    give_queue_object(song, QueueObject(url, title, stub_requester()))
     return song
 
 
 def replayed_song(source: QueueObject) -> MagicMock:
+    """The source a -replay's copy resolves to, HOLDING the entry that was
+    queued rather than a copy of a few of its fields — so a test can put state
+    on `source` and see what the play reads back off it, including the fields
+    _neutralize_prefetch's rebuild carries."""
     song = loop_song(source.webpage_url, source.title, position=42.0)
-    # Read by _neutralize_prefetch's rebuild, which the -replay runs.
-    song.np_message_id, song.np_channel_id = 0, 0
-    song.np_dedicated, song.np_host_ref = False, None
-    song.is_replay = source.is_replay
-    song.analytics = source.analytics
-    song.persisted = source.persisted
-    song.requester = source.requester
+    give_queue_object(song, source)
     return song
 
 

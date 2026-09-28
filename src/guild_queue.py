@@ -38,14 +38,12 @@ import discord
 
 from src.guild_state import Analytics, QueueEntry, SearchQueueEntry, SongQueueEntry
 from src.redis_client import GuildRedisStore
-from src.sources import YTSource, is_link, unwrap
+from src.sources import is_link, unwrap
 from src.util import get_logger
 from src.youtube import QueueObject
 
 log = get_logger(__name__)
 
-# What the deque holds; the at-rest twin is guild_state.QueueEntry.
-QueueItem = Union[QueueObject, YTSource]
 
 # Where pipelined LREMs cost more than rewriting the list. `LREM key 1 <blob>` is
 # O(position), so N of them cost O(N x depth) against a rebuild's O(depth): the
@@ -76,7 +74,7 @@ class RemoveMode(StrEnum):
 
 # One queue item → the mode it matched under, or None. Built by remove_matcher();
 # remove() only applies it.
-RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
+RemoveMatcher = Callable[[QueueObject], Optional[RemoveMode]]
 
 
 def _normalize(s: str) -> str:
@@ -109,19 +107,14 @@ def remove_matcher(needle: str) -> RemoveMatcher:
     needle = needle.strip().strip("<>")
     folded = _normalize(needle)
 
-    def match(item: QueueItem) -> Optional[RemoveMode]:
+    def match(item: QueueObject) -> Optional[RemoveMode]:
         if not needle:
-            # An unresolved search may carry neither URL, which an empty needle would
-            # match as "" and take out every Spotify collection track.
+            # An unresolved search may carry no URL at all, which an empty needle
+            # would match as "" and take out every Spotify collection track.
             return None
-        # A search gains webpage_url once a Spotify walk has named its track, and that
-        # is the link -queue shows for it, so -remove accepts it too.
-        resolved = (
-            item.webpage_url
-            if isinstance(item, QueueObject)
-            else (item.url or item.webpage_url or "")
-        )
-        if resolved == needle:
+        # A search gains its webpage_url once a Spotify walk has named its track,
+        # and that is the link -queue shows for it, so -remove accepts it too.
+        if item.webpage_url == needle:
             return RemoveMode.RESOLVED
         origin = item.user_input
         if origin is not None and _normalize(origin) == folded:
@@ -137,41 +130,39 @@ class RemoveOutcome:
     items are returned because a removed entry may be a played song whose only
     remaining record is the queue object (MusicPlayer._flush_played)."""
 
-    removed: list[QueueItem]
+    removed: list[QueueObject]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
     # ORIGIN when anything matched on what the user typed; None when nothing did.
     mode: Optional[RemoveMode] = None
 
 
-def _to_entry(item: QueueItem) -> QueueEntry:
-    """Live queue item → at-rest entry for the Redis mirror."""
-    if isinstance(item, QueueObject):
-        return SongQueueEntry.from_queue_object(item)
-    return SearchQueueEntry.from_ytsource(item)
+def _to_entry(item: QueueObject) -> QueueEntry:
+    """Live queue item → at-rest entry for the Redis mirror. An item still
+    waiting to resolve keeps the `"ytsource"` shape it has always had on the
+    wire, so a rollback can still read the list."""
+    if item.unresolved:
+        return SearchQueueEntry.from_queue_object(item)
+    return SongQueueEntry.from_queue_object(item)
 
 
-def item_label(item: QueueItem) -> str:
-    """What to call a queued item in a reply. An unresolved search that carries no
-    title of its own is called by its term, `ytsearch:` prefix off."""
-    if item.title:
-        return item.title
-    if isinstance(item, QueueObject):
-        return "?"
-    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+def item_label(item: QueueObject) -> str:
+    """What to call a queued item in a reply: its title, or — for a search the
+    walk gave no name for — the term it resolves through."""
+    return item.title or item.search.removeprefix("ytsearch:") or "?"
 
 
-def is_persisted(item: Optional[QueueItem]) -> bool:
+def is_persisted(item: Optional[QueueObject]) -> bool:
     """True when the item has a matching entry on the Redis list — its dequeue
     must be mirrored with an LPOP, and rebuilds may write it back. Only the
     crash-recovered "current song" is persisted=False (its LPOP committed in the
     run that crashed). None counts as persisted — see redis_pop_for."""
-    return item.persisted if isinstance(item, QueueObject) else True
+    return item.persisted if item is not None else True
 
 
-def is_replay_of(item: Optional[QueueItem], webpage_url: str) -> bool:
+def is_replay_of(item: Optional[QueueObject], webpage_url: str) -> bool:
     """Whether `item` is a -replay copy of the song at `webpage_url`."""
     return (
-        isinstance(item, QueueObject)
+        item is not None
         and item.is_replay
         and bool(webpage_url)
         and item.webpage_url == webpage_url
@@ -205,10 +196,12 @@ class GuildQueue:
     ) -> None:
         self._guild = guild
         self._store = store
-        # Bot.get_user: the second leg _rehydrate resolves a requester through.
+        # Bot.get_user: the second leg _rehydrate resolves a requester through, so
+        # a restored entry queued by someone who has left this guild keeps their
+        # name. None for a queue built without a bot to ask.
         self._user_lookup = user_lookup
         # _items[:_cursor] claimed but unsettled, _items[_cursor:] pending.
-        self._items: deque[QueueItem] = deque()
+        self._items: deque[QueueObject] = deque()
         self._cursor = 0
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
@@ -220,7 +213,7 @@ class GuildQueue:
         # The entry the list holds for an item requeue_front() swapped in, which
         # serializes as its resolved or rebuilt form. Keyed by id() and holding the
         # item, so the id cannot be reused while the record lives.
-        self._listed: dict[int, tuple[QueueItem, QueueEntry]] = {}
+        self._listed: dict[int, tuple[QueueObject, QueueEntry]] = {}
 
     @contextlib.contextmanager
     def _mirror_write(self) -> Iterator[None]:
@@ -247,7 +240,7 @@ class GuildQueue:
 
     # ── Consumption (playback loop + prefetch task) ───────────────────────────
 
-    async def get(self) -> QueueItem:
+    async def get(self) -> QueueObject:
         """Claim the next pending item, waiting for one if the queue is drained.
         `while`, never `if`: Event.wait() wakes EVERY waiter and the prefetch's
         get_nowait() is a second consumer. No await between claim and return."""
@@ -258,7 +251,7 @@ class GuildQueue:
         self._sync_wake()
         return item
 
-    def get_nowait(self) -> QueueItem:
+    def get_nowait(self) -> QueueObject:
         """Raises asyncio.QueueEmpty — the prefetch task relies on that."""
         if self._cursor >= len(self._items):
             raise asyncio.QueueEmpty
@@ -267,7 +260,7 @@ class GuildQueue:
         self._sync_wake()
         return item
 
-    def requeue_front(self, item: QueueItem) -> None:
+    def requeue_front(self, item: QueueObject) -> None:
         """Give a claim back: the cursor steps back and the item is pending again;
         the mirror never moved. `item` may be the RESOLVED form of what was
         claimed and replaces it, keeping the claimed item's entry as its own mirror
@@ -315,10 +308,10 @@ class GuildQueue:
 
     async def put(
         self,
-        items: Sequence[QueueItem],
+        items: Sequence[QueueObject],
         *,
         batch: bool = False,
-    ) -> list[QueueItem]:
+    ) -> list[QueueObject]:
         """Enqueue on the deque, then the mirror, under the bulk-mutation mutex:
         a clear()/shuffle() interleaving while the pushes suspend would rebuild
         the mirror before they land, leaving ghosts the next dequeue LPOPs.
@@ -361,7 +354,7 @@ class GuildQueue:
             self._mirror_dirty = not landed
             return queued
 
-    async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
+    async def put_front(self, items: Sequence[QueueObject]) -> list[QueueObject]:
         """Insert items at the front — the interjection path. An in-flight head
         (dequeued but uncommitted) stays AHEAD of them and forces the rebuild
         path: its Redis entry still sits at the list head awaiting a commit-time
@@ -396,7 +389,7 @@ class GuildQueue:
     # must land before the drain, or the item is stranded. A COMPLETED prefetch is
     # an in-flight head.
 
-    async def clear(self) -> list[QueueItem]:
+    async def clear(self) -> list[QueueObject]:
         """Empty the queue, returning everything on it — claimed prefix included,
         because the caller records these (MusicPlayer._flush_played) and a parked
         resume tail is among them. Bumps the generation and resets the cursor
@@ -446,8 +439,8 @@ class GuildQueue:
         dequeue is never removed (stopping it is -skip's job) but still occupies a
         display position."""
         removed_positions: list[int] = []
-        removed_items: list[QueueItem] = []
-        kept: list[QueueItem] = []
+        removed_items: list[QueueObject] = []
+        kept: list[QueueObject] = []
         modes: list[RemoveMode] = []
 
         async with self._mutex:
@@ -506,26 +499,53 @@ class GuildQueue:
         self._sync_wake()
         return True
 
-    async def restore_entries(self, entries: Sequence[QueueEntry]) -> int:
+    async def restore_entries(
+        self,
+        entries: Sequence[QueueEntry],
+        *,
+        requester_fallback: Union[discord.Member, discord.User, None] = None,
+        unreadable: int = 0,
+    ) -> int:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Entries whose requester cannot be
-        resolved are dropped. Returns the number restored."""
+        (they are already on the Redis list). Returns the number restored.
+
+        An entry nobody can be found for is dropped and counted in a warning.
+        `unreadable` is how many list entries the snapshot could not parse; they
+        were dropped before reaching here. Either kind of drop marks the mirror
+        stale so the shorter queue is written back for good.
+        `requester_fallback` is the caller's last resort, ahead of the guild
+        owner, for entries persisted before searches carried a requester id."""
         count = 0
+        dropped = 0
         for entry in entries:
-            item = self._rehydrate(entry)
-            if item is not None:
-                self._items.append(item)
-                count += 1
+            item = self._rehydrate(entry, requester_fallback=requester_fallback)
+            if item is None:
+                dropped += 1
+                continue
+            self._items.append(item)
+            count += 1
+        if dropped or unreadable:
+            # The list keeps a dropped entry at its position and memory does not,
+            # so a commit-time LPOP would retire its neighbour. The flag routes
+            # the next enqueue and the next song start through a rebuild instead.
+            self._mirror_dirty = True
+        if dropped:
+            log.warning(
+                f"dropped {dropped} restored queue "
+                f"{'entry' if dropped == 1 else 'entries'} with no resolvable "
+                f"requester in guild {self._guild.id}; the Redis list still holds "
+                "them until the next mirror rebuild"
+            )
         self._sync_wake()
         return count
 
     # ── Display data (embed/ETA builders live in MusicPlayer) ─────────────────
 
-    def display_items(self) -> list[QueueItem]:
+    def display_items(self) -> list[QueueObject]:
         """Snapshot of the queued items in display order."""
         return list(self._items)
 
-    def display_index(self, item: QueueItem) -> Optional[int]:
+    def display_index(self, item: QueueObject) -> Optional[int]:
         """The 1-based display position of `item`, by IDENTITY, or None when it is
         no longer queued. Scans the deque rather than a copy of it."""
         for index, queued in enumerate(self._items, 1):
@@ -533,11 +553,11 @@ class GuildQueue:
                 return index
         return None
 
-    def claimed_head(self) -> Optional[QueueItem]:
+    def claimed_head(self) -> Optional[QueueObject]:
         """The item a consumer holds at the head, or None when nothing is claimed."""
         return self._items[0] if self._cursor else None
 
-    def peek_next(self) -> Optional[QueueItem]:
+    def peek_next(self) -> Optional[QueueObject]:
         return self._items[0] if self._items else None
 
     def has_resume_tail(self, webpage_url: str) -> bool:
@@ -547,10 +567,7 @@ class GuildQueue:
         EARLIER play of the same song answers True too; its one caller
         (MusicPlayer.enqueue_depth) accepts the under-count."""
         return any(
-            isinstance(item, QueueObject)
-            and item.is_resume
-            and item.webpage_url == webpage_url
-            for item in self._items
+            item.is_resume and item.webpage_url == webpage_url for item in self._items
         )
 
     def resume_tail_depth(self) -> int:
@@ -559,9 +576,7 @@ class GuildQueue:
         prefix (`--now` takes a whole playlist, so tails are not adjacent) — plays,
         not fragments. O(len(_items)), once per interjection."""
         return sum(
-            1
-            for item in islice(self._items, self._cursor + 1, None)
-            if isinstance(item, QueueObject) and item.is_resume
+            1 for item in islice(self._items, self._cursor + 1, None) if item.is_resume
         )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
@@ -586,7 +601,7 @@ class GuildQueue:
 
     async def finish_failed_dequeue(
         self,
-        item: Optional[QueueItem],
+        item: Optional[QueueObject],
         *,
         context: str = "dequeue",
         persisted: Optional[bool] = None,
@@ -645,7 +660,7 @@ class GuildQueue:
         return [self._mirror_entry(s) for s in self._items if is_persisted(s)]
 
     async def redis_pop_for(
-        self, item: Optional[QueueItem], *, persisted: Optional[bool] = None
+        self, item: Optional[QueueObject], *, persisted: Optional[bool] = None
     ) -> None:
         """Mirror one in-memory dequeue to Redis via LPOP — unless the entry was
         never on the list (persisted=False), where an LPOP would delete an
@@ -661,7 +676,7 @@ class GuildQueue:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     async def _write_mirror(
-        self, items: Sequence[QueueItem], *, removed: Sequence[QueueItem] = ()
+        self, items: Sequence[QueueObject], *, removed: Sequence[QueueObject] = ()
     ) -> None:
         """Bring the Redis mirror in line with `items` (the persisted subset, in
         order) by DELETE, LREM or rebuild. Empty means DELETE, not skip, or the
@@ -712,13 +727,13 @@ class GuildQueue:
         # leaves it as unknown as before, and the next enqueue tries again.
         self._mirror_dirty = not landed
 
-    def holds(self, item: QueueItem) -> bool:
+    def holds(self, item: QueueObject) -> bool:
         """Whether this exact object is on the deque, claimed prefix included.
         Identity, not equality: the caller is asking about the object it just
         inserted, and two entries for one song compare equal."""
         return any(held is item for held in self._items)
 
-    def _mirror_entry(self, item: QueueItem) -> QueueEntry:
+    def _mirror_entry(self, item: QueueObject) -> QueueEntry:
         """The entry the list holds for `item`: its own serialization, or, for an
         item requeue_front() swapped in, the entry of what it replaced. Every
         write that must match the list byte for byte (a rebuild, an LREM, the
@@ -745,31 +760,15 @@ class GuildQueue:
         entry: QueueEntry,
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
-    ) -> Optional[QueueItem]:
+    ) -> Optional[QueueObject]:
         """At-rest entry → live queue item, the one construction path for
-        everything coming back from Redis. A SongQueueEntry needs a requester:
-        the persisted ID as a guild member, else through the user cache, else
-        requester_fallback, else guild.owner, else dropped. The two caches are
-        MusicPlayer._resolve_requester's, so a member who left keeps their songs
-        and their lazy searches under one requester."""
-        if isinstance(entry, SearchQueueEntry):
-            return YTSource(
-                ytsearch=entry.ytsearch,
-                url=entry.url,
-                process=entry.process,
-                ts=entry.ts,
-                analytics=Analytics(
-                    queued_at=entry.queued_at,
-                    queue_position=entry.queue_position,
-                ),
-                user_input=entry.user_input,
-                query_source=entry.query_source,
-                requester_id=entry.requester_id,
-                title=entry.title,
-                uploader=entry.uploader,
-                duration=entry.duration,
-                webpage_url=entry.webpage_url,
-            )
+        everything coming back from Redis. Every item needs a requester: the
+        persisted ID as a member of this guild, else that ID's cached user (a
+        member who left keeps their plays and their searches under one
+        requester), else requester_fallback, else guild.owner, else the entry is
+        dropped. The player passes `_last_author` there, which is the bot member
+        on a cold start and the author of whichever command ran most recently
+        once one has — an attribution, not a claim about who queued the song."""
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
             requester = self._guild.get_member(entry.requester_id)
@@ -783,6 +782,25 @@ class GuildQueue:
             )
         if requester is None:
             return None
+        analytics = Analytics(
+            queued_at=entry.queued_at, queue_position=entry.queue_position
+        )
+        if isinstance(entry, SearchQueueEntry):
+            return QueueObject(
+                # What a listing shows for it until the resolve lands, as the walk
+                # named them: dropping these reads "resolving..." again after a
+                # restart, for a track the queue could already describe.
+                entry.webpage_url or "",
+                entry.title or "",
+                requester,
+                ts=entry.ts,
+                user_input=entry.user_input,
+                duration=entry.duration,
+                uploader=entry.uploader,
+                analytics=analytics,
+                query_source=entry.query_source,
+                search=entry.ytsearch or entry.url or "",
+            )
         return QueueObject(
             entry.webpage_url,
             entry.title,
@@ -796,10 +814,7 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
-            analytics=Analytics(
-                queued_at=entry.queued_at,
-                queue_position=entry.queue_position,
-            ),
+            analytics=analytics,
             query_source=entry.query_source,
             played_at=entry.played_at,
             # No np_host_ref: a live Message cannot survive a restart, so a

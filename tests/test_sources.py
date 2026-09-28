@@ -7,7 +7,6 @@ from typing import NamedTuple, Optional
 
 import pytest
 
-from src.guild_state import Analytics
 from src.sources import (
     LINK_MAX_CHARS,
     is_link,
@@ -32,10 +31,8 @@ from src.sources import (
     parse_timestamp,
     parse_url,
     query_source_of,
-    spotify_playlist_to_ytsearch,
     timestamp_warning,
 )
-from src.spotify import SpotifyTrack
 from src.youtube import _source_cache_key
 
 
@@ -610,151 +607,6 @@ class TestParseInput:
         assert result.url == url
 
 
-_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=3)
-_ORIGIN = "https://open.spotify.com/album/abc123"
-_REQUESTER = 424242424242424242
-
-
-class TestSpotifyPlaylistToYTSearch:
-    def test_converts_titles_to_ytsearch(self) -> None:
-        titles = ["Never Gonna Give You Up Rick Astley", "Bohemian Rhapsody Queen"]
-        result = spotify_playlist_to_ytsearch(
-            titles, analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
-        )
-
-        assert len(result) == 2
-        assert all(isinstance(r, YTSource) for r in result)
-        assert result[0].ytsearch == "ytsearch:Never Gonna Give You Up Rick Astley"
-        assert result[1].ytsearch == "ytsearch:Bohemian Rhapsody Queen"
-
-    def test_all_results_have_process_true(self) -> None:
-        titles = ["Song A", "Song B", "Song C"]
-        result = spotify_playlist_to_ytsearch(
-            titles, analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
-        )
-        assert all(r.process is True for r in result)
-
-    def test_empty_list_returns_empty(self) -> None:
-        assert (
-            spotify_playlist_to_ytsearch(
-                [], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
-            )
-            == []
-        )
-
-    def test_single_title(self) -> None:
-        result = spotify_playlist_to_ytsearch(
-            ["Only Song Artist"],
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            requester_id=_REQUESTER,
-        )
-        assert len(result) == 1
-        assert result[0].ytsearch == "ytsearch:Only Song Artist"
-
-    def test_url_field_is_none(self) -> None:
-        result = spotify_playlist_to_ytsearch(
-            ["Song"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
-        )
-        assert result[0].url is None
-
-    def test_per_track_positions_derive_from_the_head(self) -> None:
-        # The head's analytics fans out: same ask-time queued_at on every track,
-        # positions incrementing from the head's — a playlist behind 3 songs
-        # waits at 3, 4, 5.
-        result = spotify_playlist_to_ytsearch(
-            ["a", "b", "c"],
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            requester_id=_REQUESTER,
-        )
-        assert [r.analytics.queue_position for r in result] == [3, 4, 5]
-        assert all(r.analytics.queued_at == 1752530000.5 for r in result)
-
-    def test_every_track_carries_the_requester(self) -> None:
-        """These resolve at dequeue, minutes to an hour after the command returned.
-        Without the ID the resolve attributes each track to whoever ran a command
-        most recently."""
-        result = spotify_playlist_to_ytsearch(
-            ["a", "b"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=_REQUESTER
-        )
-        assert [r.requester_id for r in result] == [_REQUESTER] * 2
-
-    def test_the_requester_has_no_default(self) -> None:
-        with pytest.raises(TypeError, match="requester_id"):
-            spotify_playlist_to_ytsearch(["a"], analytics=_ANALYTICS, origin=_ORIGIN)  # pyright: ignore[reportCallIssue]
-
-    def test_a_track_row_becomes_the_searchs_display_fields(self) -> None:
-        rows = [
-            SpotifyTrack(
-                name="LOYALTY.",
-                artists=["Kendrick Lamar", "Rihanna"],
-                duration_secs=227,
-                url="https://open.spotify.com/track/abc",
-            )
-        ]
-        (source,) = spotify_playlist_to_ytsearch(
-            ["LOYALTY. Kendrick Lamar Rihanna"],
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            requester_id=7,
-            tracks=rows,
-        )
-        assert source.ytsearch == "ytsearch:LOYALTY. Kendrick Lamar Rihanna"
-        assert (source.title, source.uploader, source.duration, source.webpage_url) == (
-            "LOYALTY.",
-            "Kendrick Lamar, Rihanna",
-            227,
-            "https://open.spotify.com/track/abc",
-        )
-
-    def test_one_artist_tuple_yields_one_shared_byline(self) -> None:
-        """An album is usually one artist, and the joined byline is the only string
-        this pass keeps for the life of the queue — a fresh join per track was
-        ~800 KiB over 10,000 of them."""
-        rows = [
-            SpotifyTrack(
-                name=f"T{i}", artists=["Daft Punk"], duration_secs=180, url=None
-            )
-            for i in range(50)
-        ]
-        built = spotify_playlist_to_ytsearch(
-            [f"T{i} Daft Punk" for i in range(50)],
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            requester_id=7,
-            tracks=rows,
-        )
-        assert {s.uploader for s in built} == {"Daft Punk"}
-        assert len({id(s.uploader) for s in built}) == 1
-
-    def test_a_different_artist_tuple_gets_its_own_byline(self) -> None:
-        rows = [
-            SpotifyTrack(name="A", artists=["X"], duration_secs=1, url=None),
-            SpotifyTrack(name="B", artists=["X", "Y"], duration_secs=1, url=None),
-            SpotifyTrack(name="C", artists=[], duration_secs=1, url=None),
-        ]
-        built = spotify_playlist_to_ytsearch(
-            ["A X", "B X Y", "C"],
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            requester_id=7,
-            tracks=rows,
-        )
-        assert [s.uploader for s in built] == ["X", "X, Y", None]
-
-    def test_without_rows_a_search_has_nothing_to_show(self) -> None:
-        (source,) = spotify_playlist_to_ytsearch(
-            ["a"], analytics=_ANALYTICS, origin=_ORIGIN, requester_id=7
-        )
-        assert (source.title, source.uploader, source.duration, source.webpage_url) == (
-            None,
-            None,
-            None,
-            None,
-        )
-
-
 class TestYTSourcePlaylistUrl:
     """`YTSource.playlist_url` — the single spelling of the
     `url or ".../playlist?list={list_id}"` fallback that the enqueue, interject
@@ -1007,17 +859,6 @@ class TestQuerySource:
         assert result.stype == URLSource.OTHER
         assert query_source_of(result) == expected
 
-    def test_spotify_playlist_tracks_are_stamped_spotify(self) -> None:
-        """The whole reason the token is captured at parse time: these resolve to
-        YouTube URLs at dequeue, so nothing downstream could recover it."""
-        sources = spotify_playlist_to_ytsearch(
-            ["song one", "song two"],
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-            requester_id=_REQUESTER,
-        )
-        assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
-
     def test_an_uppercase_host_routes_like_the_lowercase_one(self) -> None:
         """Hosts are case-insensitive, and yt-dlp's extractors are not: the link
         handed on has its host lowercased and keeps its path's case."""
@@ -1027,7 +868,7 @@ class TestQuerySource:
         assert result.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         assert query_source_of(result) == QUERY_SOURCE_YOUTUBE
 
-    def test_unstamped_ytsource_is_unknown(self) -> None:
+    def test_an_unstamped_source_is_unknown(self) -> None:
         """A hand-built source (crash recovery, tests, a future call site) reports
         the unknown sentinel rather than guessing."""
         assert query_source_of(YTSource(ytsearch="ytsearch:x")) == ""
