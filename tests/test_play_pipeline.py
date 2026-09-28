@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import dataclasses
 import pathlib
 import contextlib
 import inspect
@@ -49,7 +50,7 @@ from src.sources import (
     timestamp_warning,
 )
 from src.spotify import SpotifyPlaylist, SpotifyTrack
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 from tests.helpers import (
     admit,
     command_callback,
@@ -3021,6 +3022,238 @@ def _album_walk(**overrides: Any) -> SpotifyPlaylist:
         ],
     )
     return SpotifyPlaylist(**fields)
+
+
+def _declared_default(f: dataclasses.Field[Any]) -> Any:
+    """What a ResolvedPlaylist field holds when nobody fills it, the factory
+    called for the mutable ones. `tracks` has no default, so it reads MISSING.
+
+    Calling the factory is what keeps `artists` in the reflective walks:
+    against the bare `default` the comparison reads `[...] == MISSING`, never
+    equal. `artists=[]` in `from_spotify` fails three tests, the Spotify walk
+    among them; with the factory call gone it fails only the other two."""
+    if f.default_factory is not dataclasses.MISSING:
+        return f.default_factory()
+    return f.default
+
+
+class TestTheSpotifyCollectionResult:
+    """`ResolvedPlaylist.from_spotify` is the one place a walk and the items minted
+    from it become what the enqueue takes."""
+
+    _LINK = "https://open.spotify.com/album/aid123"
+
+    def test_the_walk_and_the_link_arrive_field_for_field(self) -> None:
+        walk = _album_walk(unavailable=2, short=True)
+        items = [unresolved("One More Time"), unresolved("Aerodynamic")]
+
+        result = ResolvedPlaylist.from_spotify(walk, items, link=self._LINK)
+
+        assert result == ResolvedPlaylist(
+            tracks=items,
+            title="Discovery",
+            link=self._LINK,
+            unavailable=2,
+            artists=["Daft Punk"],
+            thumbnail="https://i.scdn.co/cover",
+            short=True,
+        )
+
+    def test_no_field_the_walk_filled_is_left_at_its_default(self) -> None:
+        """Walks `ResolvedPlaylist`'s fields against a walk that sets every one a
+        Spotify collection can set, so a mapping dropped from the classmethod
+        fails here rather than rendering as an absent value on the card."""
+        # `skipped` counts what a YouTube link's `index=` dropped; a Spotify walk
+        # has no such thing, and `tracks` is the caller's list, not the walk's.
+        not_spotifys = {"skipped", "tracks"}
+        result = ResolvedPlaylist.from_spotify(
+            _album_walk(unavailable=2, short=True),
+            [unresolved("One More Time"), unresolved("Aerodynamic")],
+            link=self._LINK,
+        )
+
+        left_behind = [
+            f.name
+            for f in dataclasses.fields(ResolvedPlaylist)
+            if f.name not in not_spotifys
+            and getattr(result, f.name) == _declared_default(f)
+        ]
+        assert left_behind == [], f"from_spotify never filled {left_behind}"
+
+    def test_the_minted_items_are_the_ones_handed_in(self) -> None:
+        """Not `playlist.tracks`: those are the walk's display rows, and the two
+        are adjacent list arguments."""
+        items = [unresolved("One More Time"), unresolved("Aerodynamic")]
+
+        result = ResolvedPlaylist.from_spotify(_album_walk(), items, link=self._LINK)
+
+        assert result.tracks is items
+
+
+class TestTheYoutubeCollectionResult:
+    """`ResolvedPlaylist.from_youtube` is the one place a walked playlist and what
+    its `index=` left become what the enqueue takes."""
+
+    _LINK = "https://www.youtube.com/playlist?list=PLtest123"
+
+    @staticmethod
+    def _walk() -> YoutubePlaylist:
+        return YoutubePlaylist(
+            title="Road Trip",
+            tracks=[
+                QueueObject(f"https://yt.com/watch?v={n}", f"T{n}", stub_requester())
+                for n in range(3)
+            ],
+            unavailable=3,
+        )
+
+    def test_the_walk_the_link_and_the_slice_arrive_field_for_field(self) -> None:
+        walk = self._walk()
+        kept = walk.tracks[1:]
+
+        result = ResolvedPlaylist.from_youtube(walk, kept, link=self._LINK, skipped=1)
+
+        assert result == ResolvedPlaylist(
+            tracks=kept,
+            title="Road Trip",
+            link=self._LINK,
+            skipped=1,
+            unavailable=3,
+        )
+
+    def test_no_field_the_walk_filled_is_left_at_its_default(self) -> None:
+        """Walks `ResolvedPlaylist`'s fields against a walk and a slice that set
+        every one a YouTube playlist can set, so a mapping dropped from the
+        classmethod fails here rather than rendering as an absent value."""
+        # `artists`, `thumbnail` and `short` are a Spotify album's; a YouTube walk
+        # carries none of them, and `tracks` is the caller's slice, not the walk's.
+        not_youtubes = {"artists", "thumbnail", "short", "tracks"}
+        walk = self._walk()
+
+        result = ResolvedPlaylist.from_youtube(
+            walk, walk.tracks[1:], link=self._LINK, skipped=1
+        )
+
+        left_behind = [
+            f.name
+            for f in dataclasses.fields(ResolvedPlaylist)
+            if f.name not in not_youtubes
+            and getattr(result, f.name) == _declared_default(f)
+        ]
+        assert left_behind == [], f"from_youtube never filled {left_behind}"
+
+    def test_the_kept_tracks_are_the_ones_handed_in(self) -> None:
+        """Not `playlist.tracks`: the index slice already dropped the leading
+        ones, and queueing the walk whole would put them back."""
+        walk = self._walk()
+        kept = walk.tracks[1:]
+
+        result = ResolvedPlaylist.from_youtube(walk, kept, link=self._LINK, skipped=1)
+
+        assert result.tracks is kept
+
+
+class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
+    """Each arm of `queue_source` is its own classmethod, and the enqueue reads the
+    same fields off either result."""
+
+    @staticmethod
+    async def _place(
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        source: SpotifySource | YTSource | SoundcloudSource,
+        resolved: ResolvedPlaylist,
+    ) -> MagicMock:
+        mp = _enqueue_mp(mock_ctx)
+        await play_pipeline.enqueue_playlist(
+            mock_ctx,
+            source,
+            resolved,
+            mp,
+            admit(music_bot, mock_ctx, mp),
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            cog=music_bot,
+        )
+        return mp
+
+    async def test_a_spotify_album_arrives_as_from_spotify_built_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        walk = _album_walk(unavailable=2)
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album = AsyncMock(return_value=walk)
+        # Derived from the walk, not from the result: a `tracks` the arm
+        # shortened or reordered compares against the titles rather than against
+        # itself, leaving the equality below to assert the other six fields.
+        searched_for = [f"ytsearch:{t}" for t in walk.titles]
+
+        resolved = await play_pipeline.queue_source(
+            mock_ctx,
+            source,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            mode=ResolveMode.FLAT_OK,
+            cog=music_bot,
+        )
+
+        assert isinstance(resolved, ResolvedPlaylist)
+        assert [t.search for t in resolved.tracks] == searched_for
+        assert resolved == ResolvedPlaylist.from_spotify(
+            walk, resolved.tracks, link=source.url
+        )
+        mp = await self._place(music_bot, mock_ctx, source, resolved)
+        mp.queue_put.assert_awaited_once()
+        assert [t.search for t in mp.queue_put.await_args.args[0]] == searched_for
+        notice, card = mock_ctx.send.await_args.kwargs["embeds"]
+        assert notice.description == (
+            "Skipped **2** unavailable songs from this album."
+        )
+        assert f"[**Discovery**]({source.url})" in card.description
+
+    async def test_a_youtube_playlist_arrives_as_from_youtube_built_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # A watch link carrying `&list=`: `playlist_url` is the pasted spelling
+        # here and the rebuilt `playlist?list=` one differs, so the assertions
+        # below pin which of the two the arm hands over as the heading's link.
+        source = YTSource(
+            url="https://www.youtube.com/watch?v=0&list=PLtest123",
+            type=YTType.PLAYLIST,
+            list_id="PLtest123",
+            video_id="0",
+        )
+        # Three tracks, so an arm that queued a prefix of the walk shows up as a
+        # shorter list than the one the stub returned.
+        walked = [
+            QueueObject(f"https://yt.com/watch?v={n}", f"T{n}", mock_ctx.author)
+            for n in range(3)
+        ]
+        stub = stub_yt_playlist(walked, title="Road Trip", unavailable=2)
+        with patch("src.play_pipeline.YTDL.yt_playlist", new=stub):
+            resolved = await play_pipeline.queue_source(
+                mock_ctx,
+                source,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                cog=music_bot,
+            )
+
+        assert isinstance(resolved, ResolvedPlaylist)
+        assert resolved.tracks == walked
+        assert resolved == ResolvedPlaylist.from_youtube(
+            stub.return_value, resolved.tracks, link=source.playlist_url, skipped=0
+        )
+        mp = await self._place(music_bot, mock_ctx, source, resolved)
+        mp.queue_put.assert_awaited_once()
+        assert mp.queue_put.await_args.args[0] == walked
+        notice, card = mock_ctx.send.await_args.kwargs["embeds"]
+        assert notice.description == (
+            "Skipped **2** unavailable songs from this playlist."
+        )
+        assert f"[**Road Trip**]({source.playlist_url})" in card.description
 
 
 class TestSpotifyAlbum:

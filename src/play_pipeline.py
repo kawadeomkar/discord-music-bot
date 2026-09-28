@@ -4,14 +4,22 @@ interjection — put the interrupted song back where it was.
 Three stages in the order they run: `queue_source` turns a parsed source into
 something enqueueable; `enqueue_playlist` / `enqueue_single` place it and send
 the confirmation; `interject_flow` is the `--now` path, shared with `-play` on
-a paused song. The playlist errors and the two Resolved* shapes live here
+a paused song. The playlist errors and the collection result live here
 because nothing outside this pipeline constructs them.
 """
 
 import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Optional, TypeGuard, Union, assert_never
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Optional,
+    Self,
+    TypeGuard,
+    Union,
+    assert_never,
+)
 from collections.abc import Awaitable, Callable, Sequence
 
 import discord
@@ -58,7 +66,7 @@ from src.util import (
     truncate_embed_title,
     verbatim_code,
 )
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, QueueObject, YoutubePlaylist
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports this module).
@@ -151,6 +159,45 @@ class ResolvedPlaylist:
     artists: list[str] = field(default_factory=list)
     thumbnail: Optional[str] = None
     short: bool = False
+
+    @classmethod
+    def from_spotify(
+        cls, playlist: SpotifyPlaylist, tracks: list[QueueObject], *, link: str
+    ) -> Self:
+        """A walked Spotify collection as the enqueue takes it. `tracks` are the
+        items minted from `playlist.titles`, not `playlist.tracks` — those are
+        the walk's display rows — and `link` is the canonical collection URL the
+        source rebuilds; the pasted spelling travels separately, as `origin`."""
+        return cls(
+            tracks=tracks,
+            title=playlist.name,
+            link=link,
+            unavailable=playlist.unavailable,
+            artists=playlist.artists,
+            thumbnail=playlist.thumbnail,
+            short=playlist.short,
+        )
+
+    @classmethod
+    def from_youtube(
+        cls,
+        playlist: YoutubePlaylist,
+        tracks: list[QueueObject],
+        *,
+        link: str,
+        skipped: int,
+    ) -> Self:
+        """A walked YouTube playlist as the enqueue takes it. `tracks` is what is
+        left of `playlist.tracks` after the link's `index=` dropped `skipped`
+        leading ones, and `link` is the canonical playlist URL, which the walk
+        itself does not carry."""
+        return cls(
+            tracks=tracks,
+            title=playlist.title,
+            link=link,
+            skipped=skipped,
+            unavailable=playlist.unavailable,
+        )
 
 
 def _apply_playlist_index(
@@ -553,24 +600,17 @@ async def queue_source(
     reach the song by one route."""
     if _is_spotify_collection(source):
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
-        return ResolvedPlaylist(
-            # Items that are still searches: a collection nobody plays to the end
-            # never resolves its tail, and the ask depth they are minted against
-            # is rebased onto the head's at the insert.
-            tracks=await _searches_for(
-                playlist.titles,
-                requester=ctx.author,
-                analytics=analytics,
-                origin=origin,
-                rows=playlist.tracks,
-            ),
-            title=playlist.name,
-            link=source.url,
-            unavailable=playlist.unavailable,
-            artists=playlist.artists,
-            thumbnail=playlist.thumbnail,
-            short=playlist.short,
+        # Items that are still searches: a collection nobody plays to the end
+        # never resolves its tail, and the ask depth they are minted against is
+        # rebased onto the head's at the insert.
+        searches = await _searches_for(
+            playlist.titles,
+            requester=ctx.author,
+            analytics=analytics,
+            origin=origin,
+            rows=playlist.tracks,
         )
+        return ResolvedPlaylist.from_spotify(playlist, searches, link=source.url)
     if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
         if source.list_id is None:
             raise ValueError("YTSource with type=PLAYLIST must have list_id set")
@@ -588,12 +628,8 @@ async def queue_source(
         _apply_playlist_timestamp(
             tracks, source, effective_start_offset(source, start_offset)
         )
-        return ResolvedPlaylist(
-            tracks=tracks,
-            title=playlist.title,
-            link=source.playlist_url,
-            skipped=skipped,
-            unavailable=playlist.unavailable,
+        return ResolvedPlaylist.from_youtube(
+            playlist, tracks, link=source.playlist_url, skipped=skipped
         )
     ts = effective_start_offset(source, start_offset)
     search: str
