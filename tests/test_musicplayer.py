@@ -852,10 +852,10 @@ class TestQueueClearFlushesPlayedSongs:
             ts=95,
             is_resume=True,
             played_at=1752530001.0,
+            np_message_id=777777777777777777,
+            np_channel_id=888888888888888888,
+            np_dedicated=True,
         )
-        tail.np_message_id = 777777777777777777
-        tail.np_channel_id = 888888888888888888
-        tail.np_dedicated = True
 
         entry = SongQueueEntry.from_queue_object(tail)
         wire = entry.to_redis()
@@ -933,7 +933,7 @@ class TestQueueClearFlushesPlayedSongs:
             ts=30,
             played_at=2.0,
         )
-        bad.np_message_id = {"nested": "object"}  # pyright: ignore[reportAttributeAccessIssue]
+        bad = dataclasses.replace(bad, np_message_id={"nested": "object"})
 
         await music_player._flush_played([good, bad])
 
@@ -948,7 +948,7 @@ class TestQueueClearFlushesPlayedSongs:
         item = QueueObject(
             webpage_url="https://yt.com/v=x", title="X", requester=mock_author, ts=30
         )
-        item.played_at = None  # pyright: ignore[reportAttributeAccessIssue]
+        item = dataclasses.replace(item, played_at=None)
 
         await music_player._flush_played([item])
 
@@ -2851,8 +2851,7 @@ class TestReparkCrashedHead:
         path and must still carry the start of the play it belongs to. Free —
         _now_playing_state_mapping is the single signature both writers use — but
         only while the head carries the field, which is what this pins."""
-        head = _crashed(mock_author)
-        head.played_at = 1752530000.5
+        head = dataclasses.replace(_crashed(mock_author), played_at=1752530000.5)
         seed_queue(music_player.queue, head)
 
         await music_player.repark_crashed_head()
@@ -2888,8 +2887,9 @@ class TestReparkCrashedHead:
         only from_crashed_state mints a persisted=False item — and this is the
         only thing standing between that and the slot now that one type serves
         both."""
-        head = unresolved("a song", mock_author, webpage_url="https://sp/a")
-        head.persisted = False
+        head = unresolved(
+            "a song", mock_author, webpage_url="https://sp/a", persisted=False
+        )
         seed_queue(music_player.queue, head)
 
         assert await music_player.repark_crashed_head() is False
@@ -8023,8 +8023,8 @@ class TestQueueEntryCard:
             requester=mock_author,
             duration=300,
             ts=83,
+            is_resume=True,
         )
-        item.is_resume = True
         seed_queue(music_player.queue, item)
 
         assert "⏮ Resumes at `1:23`" in self._next_up_body(music_player)
@@ -8081,11 +8081,13 @@ class TestQueueEntryCard:
     def test_an_unresolved_track_renders_the_fields_it_was_queued_with(
         self, music_player: MusicPlayer
     ) -> None:
-        item = unresolved("DNA. Kendrick Lamar")
-        item.title = "DNA."
-        item.uploader = "Kendrick Lamar"
-        item.duration = 185
-        item.webpage_url = "https://open.spotify.com/track/abc"
+        item = unresolved(
+            "DNA. Kendrick Lamar",
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
         seed_queue(music_player.queue, item)
 
         lines = self._next_up_body(music_player).split("\n")
@@ -8116,9 +8118,7 @@ class TestQueueEntryCard:
         }
         # webpage_url is a `str`, so "no link" is empty rather than None.
         fields[missing] = "" if missing == "webpage_url" else None
-        item = unresolved("DNA. Kendrick Lamar")
-        for name, value in fields.items():
-            setattr(item, name, value)
+        item = unresolved("DNA. Kendrick Lamar", **fields)
         seed_queue(music_player.queue, item)
 
         body = self._next_up_body(music_player)
@@ -11798,7 +11798,9 @@ class TestInterject:
         # interject() no longer stamps anything: the interruption arrives already
         # carrying the depth-0 analytics the command minted at dispatch, and the tail
         # is the same play, so it keeps the interrupted song's.
-        interject_obj.analytics = Analytics(queued_at=1752530500.5, queue_position=0)
+        interject_obj = dataclasses.replace(
+            interject_obj, analytics=Analytics(queued_at=1752530500.5, queue_position=0)
+        )
         live_song.elapsed_secs = 42.0
         live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=5)
         music_player.current_song = live_song

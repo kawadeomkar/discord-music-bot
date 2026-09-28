@@ -86,13 +86,18 @@ def _spotify_playlist(
     fields.setdefault("link", "https://open.spotify.com/playlist/pid123")
     items = []
     for offset, title in enumerate(titles):
-        item = unresolved(title, who, user_input=_ORIGIN)
         row = rows[offset] if rows else None
-        item.title = row.name if row else ""
-        item.uploader = (", ".join(row.artists) or None) if row else None
-        item.duration = row.duration_secs if row else None
-        item.webpage_url = (row.url or "") if row else ""
-        items.append(item)
+        items.append(
+            unresolved(
+                title,
+                who,
+                user_input=_ORIGIN,
+                title=row.name if row else "",
+                uploader=(", ".join(row.artists) or None) if row else None,
+                duration=row.duration_secs if row else None,
+                webpage_url=(row.url or "") if row else "",
+            )
+        )
     return ResolvedPlaylist(tracks=items, **fields)
 
 

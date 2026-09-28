@@ -546,6 +546,28 @@ class TestQueueObject:
         )
         assert q1 != q2
 
+    def test_a_queued_item_is_frozen(self, mock_author: MagicMock) -> None:
+        item = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        with pytest.raises(FrozenInstanceError):
+            setattr(item, "title", "Retitled")
+
+    def test_the_value_hash_is_not_what_the_queue_keys_on(
+        self, mock_author: MagicMock
+    ) -> None:
+        """Pins the class comment: frozen generates __hash__ over the fields, so
+        two distinct asks for one song are one element in a set, while the queue
+        tells them apart by identity (holds, display_index, _listed)."""
+        first = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        assert first is not second
+        assert {first, second} == {first}
+
     def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
         # webpage_url and title are both str: positional, either order type-checks.
         with pytest.raises(TypeError):

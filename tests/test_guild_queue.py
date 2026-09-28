@@ -589,31 +589,9 @@ def test_the_lrem_share_keeps_shallow_queues_on_the_rebuild() -> None:
 
 
 class TestLremFallsBackWhenItCannotBeTrusted:
-    """LREM matches on exact serialized bytes, which the rest of the codebase does
-    not promise: a resume tail gaining np_* ids, an enriched duration and a
-    substituted requester all mutate a queued object after its mirror entry was
-    written, so the recomputed blob misses and the mirror leads memory forever."""
-
-    async def test_a_mutated_item_falls_back_to_a_rebuild(
-        self,
-        gq: GuildQueue,
-        store: GuildRedisStore,
-        fake_redis: aioredis.Redis,
-        mock_author: MagicMock,
-    ) -> None:
-        """The C2 case, as production reaches it: musicplayer stamps np_message_id
-        onto a queued resume tail in memory only."""
-        tail = _qobj(1, mock_author)
-        keep = _qobj(2, mock_author)
-        await gq.put([tail, keep])
-        tail.np_message_id = 1234  # mirrored entry now says 0
-
-        outcome = await gq.remove(remove_matcher(tail.webpage_url))
-
-        assert outcome.positions == [1]
-        # The mirror agrees with memory — the LREM missed and the rebuild ran.
-        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert stored == [SongQueueEntry.from_queue_object(keep).to_redis()]
+    """LREM matches on exact serialized bytes and takes the head-most match, so the
+    shortcut is refused where the bytes could name the wrong entry — a claimed
+    copy's byte-identical twin — and capped where a rebuild is cheaper anyway."""
 
     async def test_a_claimed_items_twin_is_never_lremed(
         self,
@@ -1655,8 +1633,11 @@ class TestRemoveMatcher:
         """A Spotify walk names the track's own page before the search resolves,
         and that is the link the queue card shows — so the resolved leg has to
         accept it, ahead of the collection link the item also carries."""
-        item = unresolved("Track One", user_input="https://open.spotify.com/album/xyz")
-        item.webpage_url = "https://open.spotify.com/track/abc"
+        item = unresolved(
+            "Track One",
+            user_input="https://open.spotify.com/album/xyz",
+            webpage_url="https://open.spotify.com/track/abc",
+        )
         assert (
             remove_matcher("https://open.spotify.com/track/abc")(item)
             is RemoveMode.RESOLVED
@@ -1775,8 +1756,12 @@ class TestRemove:
     ) -> None:
         """Pasting back the link the card shows takes out that one track, while
         its siblings — same origin, no page of their own — stay queued."""
-        walked = unresolved("Track One", mock_author, user_input="https://sp/p")
-        walked.webpage_url = "https://open.spotify.com/track/abc"
+        walked = unresolved(
+            "Track One",
+            mock_author,
+            user_input="https://sp/p",
+            webpage_url="https://open.spotify.com/track/abc",
+        )
         sibling = unresolved("Track Two", mock_author, user_input="https://sp/p")
         await gq.put([walked, sibling])
 
@@ -3923,8 +3908,7 @@ class TestItemLabelNamesEveryItem:
         assert item_label(unresolved("Artist - Song")) == "Artist - Song"
 
     def test_an_unresolved_track_that_carries_a_title_uses_it(self) -> None:
-        item = unresolved("DNA. Kendrick Lamar")
-        item.title = "DNA."
+        item = unresolved("DNA. Kendrick Lamar", title="DNA.")
         assert item_label(item) == "DNA."
 
     def test_an_item_with_no_title_at_all_is_named(

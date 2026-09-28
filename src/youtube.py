@@ -1219,7 +1219,11 @@ class NpHostRef:
 # searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
 # against 344 B for the same instance carrying a __dict__. Keep the class off
 # asdict (it deep-copies requester), vars (it raises) and any pickle path.
-@dataclass(slots=True, kw_only=True)
+# frozen hashes it BY VALUE, while the queue keys on identity (holds,
+# display_index, _listed): two asks for one song are one element in a set, and a
+# resume tail carrying np_host_ref cannot be hashed at all (own_embeds is a
+# list). Keep the class out of sets and dict keys.
+@dataclass(frozen=True, slots=True, kw_only=True)
 class QueueObject:
     """One queued song, resolved or not. A track queued from a Spotify playlist
     arrives as a search: `search` set, `webpage_url` its own Spotify page or empty.
