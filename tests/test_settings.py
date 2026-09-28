@@ -2807,7 +2807,7 @@ _WORKER_ENTRIES: dict[str, tuple[str, ...]] = {
 }
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class _KnobReads:
     baseline: list[str]  # G1
     definition_time: list[str]  # G2
@@ -2836,7 +2836,13 @@ def _scan_knob_reads(
     """One pass per module. Identifiers are matched by name, so an aliased import
     (`import src.config as c; c.ping_tick_secs.baseline`) is caught without
     tracking it. A handle imported by name is no read: it reads when called."""
-    reads = _KnobReads([], [], [], [], set())
+    reads = _KnobReads(
+        baseline=[],
+        definition_time=[],
+        writers=[],
+        in_workers=[],
+        worker_entries=set(),
+    )
 
     def at(node: ast.AST) -> str:
         return f"{where}:{getattr(node, 'lineno', 0)}"
@@ -2923,7 +2929,13 @@ def knob_reads() -> _KnobReads:
     import src
 
     root = Path(src.__file__).parent
-    total = _KnobReads([], [], [], [], set())
+    total = _KnobReads(
+        baseline=[],
+        definition_time=[],
+        writers=[],
+        in_workers=[],
+        worker_entries=set(),
+    )
     for path in sorted(root.rglob("*.py")):
         where = path.relative_to(root.parent).as_posix()
         reads = _scan_knob_reads(
