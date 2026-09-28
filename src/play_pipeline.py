@@ -214,15 +214,19 @@ def _apply_playlist_index(
         return tracks, 0
     if index > len(tracks):
         raise PlaylistIndexError(index, len(tracks))
-    kept = tracks[index - 1 :]
     dropped = index - 1
     # Positions were assigned before this slice; the dropped tracks never
     # enqueue, so rebase or every kept track records N-1 too deep.
-    for track in kept:
-        track.analytics = replace(
-            track.analytics,
-            queue_position=track.analytics.queue_position - dropped,
+    kept = [
+        replace(
+            track,
+            analytics=replace(
+                track.analytics,
+                queue_position=track.analytics.queue_position - dropped,
+            ),
         )
+        for track in tracks[index - 1 :]
+    ]
     return kept, dropped
 
 
@@ -238,7 +242,7 @@ def _apply_playlist_timestamp(
     # Substring, not equality: yt_playlist takes the entry's own `url` when it
     # has one, so the shape is not guaranteed.
     if source.video_id in tracks[0].webpage_url:
-        tracks[0].ts = ts
+        tracks[0] = replace(tracks[0], ts=ts)
 
 
 def effective_start_offset(
@@ -322,9 +326,8 @@ def plays_after_note(
 
 
 def with_queue_position(item: QueueObject, position: int) -> QueueObject:
-    """Re-mint one item's `queue_position`, in place."""
-    item.analytics = replace(item.analytics, queue_position=position)
-    return item
+    """`item` with its `queue_position` re-minted."""
+    return replace(item, analytics=replace(item.analytics, queue_position=position))
 
 
 def _is_spotify_collection(
@@ -850,7 +853,9 @@ async def enqueue_single(
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             depth = _head_depth(mp, placement)
-            qobj.analytics = replace(qobj.analytics, queue_position=depth)
+            qobj = replace(
+                qobj, analytics=replace(qobj.analytics, queue_position=depth)
+            )
             if placement is Placement.COLD_FRONT:
                 await mp.queue_put_front(qobj)
             elif placement is Placement.NEXT:
@@ -1088,8 +1093,11 @@ async def interject_flow(
                     qobj.interjected = False
                     # interject() also returns None when the loop moved on to a
                     # DIFFERENT song, which this insert waits behind: depth 1.
-                    qobj.analytics = replace(
-                        qobj.analytics, queue_position=front_insert_depth(mp)
+                    qobj = replace(
+                        qobj,
+                        analytics=replace(
+                            qobj.analytics, queue_position=front_insert_depth(mp)
+                        ),
                     )
                     # queue_put_next, for the claim the loop's prefetch holds.
                     # prefetch=False — the stream URL was warmed above.

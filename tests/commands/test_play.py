@@ -604,11 +604,12 @@ class TestPlayWhilePaused:
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
-        mp.queue_put.assert_awaited_once_with(qobj)
-        assert qobj.interjected is False  # must not trigger replace semantics later
+        (queued,) = mp.queue_put.await_args.args
+        assert queued.webpage_url == qobj.webpage_url
+        assert queued.interjected is False  # must not trigger replace semantics later
         # Re-minted for the append: the 0 minted for an interjection would claim
         # this song played immediately when it waited behind the whole queue.
-        assert qobj.analytics.queue_position == 9
+        assert queued.analytics.queue_position == 9
 
     async def test_resolution_failure_leaves_paused_song_untouched(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1775,14 +1776,17 @@ class TestNowFlag:
         # queue_put_next, not queue_put_front: the embed promises "play next", and
         # the loop's prefetch holds a claim a bare front-insert lands behind.
         # prefetch=False — the stream was warmed, so it must not warm again.
-        live_mp.queue_put_next.assert_awaited_once_with([qobj], prefetch=False)
+        live_mp.queue_put_next.assert_awaited_once()
+        (queued,) = live_mp.queue_put_next.await_args.args[0]
+        assert live_mp.queue_put_next.await_args.kwargs == {"prefetch": False}
+        assert queued.webpage_url == qobj.webpage_url
         # interject() also returns None when the loop moved on to a DIFFERENT
         # song, which this insert waits behind: one, not the 0 an interjection
         # would have had, and not the queue depth — it goes to the front.
-        assert qobj.analytics.queue_position == 1
+        assert queued.analytics.queue_position == 1
         # The interjection marker must not leak onto a normally queued song —
         # a later interjection would otherwise "replace" it without a resume entry.
-        assert qobj.interjected is False
+        assert queued.interjected is False
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Playing next" in embed.title
         assert "already ended" in embed.description
@@ -1869,7 +1873,10 @@ class TestNowFlag:
                 music_bot, mock_ctx, url=f"--now {url}"
             )
 
-        live_mp.queue_put_next.assert_awaited_once_with(tracks, prefetch=False)
+        live_mp.queue_put_next.assert_awaited_once()
+        queued = live_mp.queue_put_next.await_args.args[0]
+        assert [t.webpage_url for t in queued] == [t.webpage_url for t in tracks]
+        assert live_mp.queue_put_next.await_args.kwargs == {"prefetch": False}
         description = mock_ctx.send.call_args.kwargs["embed"].description
         assert "**3** songs" in description
         assert "-remove" in description
@@ -2275,6 +2282,13 @@ class TestPlacementInsertsAndConfirmations:
             return_value=head if head is not None else MagicMock()
         )
         mp.queue_put = AsyncMock()
+        if head is not None:
+            # The depth stamp re-mints the item, so the head the put lands is what
+            # the put was given, not the caller's object.
+            async def _land(item: QueueObject, **_: Any) -> None:
+                mp.queue.peek_next = MagicMock(return_value=item)
+
+            mp.queue_put = AsyncMock(side_effect=_land)
         mp.repin_now_playing = AsyncMock(return_value=True)
         return mp
 
@@ -2435,9 +2449,10 @@ class TestPlacementInsertsAndConfirmations:
             )
 
         (call,) = mp.queue_put.await_args_list
-        assert call.args[0][0] is tracks[0]
-        assert tracks[0].analytics.queue_position == 20
-        assert [item.analytics.queue_position for item in call.args[0][1:]] == [21, 22]
+        assert [item.webpage_url for item in call.args[0]] == [
+            t.webpage_url for t in tracks
+        ]
+        assert [item.analytics.queue_position for item in call.args[0]] == [20, 21, 22]
 
     async def test_playlist_interjects_head_first_and_queues_the_rest(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2564,7 +2579,10 @@ class TestPlacementInsertsAndConfirmations:
             cog=music_bot,
         )
 
-        mp.queue_put_next.assert_awaited_once_with(tracks, prefetch=False)
+        mp.queue_put_next.assert_awaited_once()
+        queued = mp.queue_put_next.await_args.args[0]
+        assert [t.webpage_url for t in queued] == [t.webpage_url for t in tracks]
+        assert mp.queue_put_next.await_args.kwargs == {"prefetch": False}
         mp.queue_put.assert_not_awaited()
         mp.queue_put_front.assert_not_awaited()
         # Said, not implied: "Queued playlist" alone reads as "at the back".
@@ -2618,7 +2636,7 @@ class TestPlacementInsertsAndConfirmations:
         if warmed:
             warmed_call = warm.await_args
             assert warmed_call is not None
-            assert warmed_call.args[0] is tracks[0]
+            assert warmed_call.args[0].webpage_url == tracks[0].webpage_url
 
     @pytest.mark.parametrize("placement", list(Placement))
     async def test_only_a_cold_front_builds_a_resume_notice(
@@ -2673,7 +2691,9 @@ class TestPlacementInsertsAndConfirmations:
             cog=music_bot,
         )
 
-        mp.queue_put_next.assert_awaited_once_with(qobj)
+        (queued,) = mp.queue_put_next.await_args.args
+        assert queued.webpage_url == qobj.webpage_url
+        assert queued.analytics.queue_position == 1
         mp.queue_put.assert_not_awaited()
         mp.queue_put_front.assert_not_awaited()
         mp.build_queued_song_embed.assert_not_called()
@@ -2921,11 +2941,14 @@ class TestResolveThenPlace:
             )
             await settle()
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="fast")
-            assert mp.queue_put.await_args.args[0] is fast
+            assert mp.queue_put.await_args.args[0].webpage_url == fast.webpage_url
             slow_gate.set()
             await first
 
-        assert [c.args[0] for c in mp.queue_put.await_args_list] == [fast, slow]
+        assert [c.args[0].webpage_url for c in mp.queue_put.await_args_list] == [
+            fast.webpage_url,
+            slow.webpage_url,
+        ]
 
     async def test_the_reply_is_sent_outside_the_lock(
         self, music_bot: MusicBot, mock_ctx: MagicMock

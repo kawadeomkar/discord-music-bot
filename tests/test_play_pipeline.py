@@ -1444,12 +1444,20 @@ class TestEnqueueSingle:
     @staticmethod
     def _playing_mp(head: Any = None) -> MagicMock:
         """A player with a song live and `head` at the queue front. The default
-        head is a fresh Mock, i.e. NOT the song being queued."""
+        head is a fresh Mock, i.e. NOT the song being queued; passing the song
+        means the put lands it at the head — the depth stamp re-mints the item,
+        so the head is what the put was given, not the caller's object."""
         mp = mock_mp(qsize=0)
         mp.queue.peek_next = MagicMock(
             return_value=head if head is not None else MagicMock()
         )
         mp.queue_put = AsyncMock()
+        if head is not None:
+
+            async def _land(item: QueueObject, **_: Any) -> None:
+                mp.queue.peek_next = MagicMock(return_value=item)
+
+            mp.queue_put = AsyncMock(side_effect=_land)
         mp.repin_now_playing = AsyncMock(return_value=True)
         return mp
 
@@ -1614,8 +1622,10 @@ class TestEnqueueSingle:
         mp = self._playing_mp(head=None)
         mp.queue.peek_next = MagicMock(return_value=None)
 
-        async def _put(_: Any) -> None:
-            mp.queue.peek_next = MagicMock(return_value=qobj)
+        async def _put(item: QueueObject) -> None:
+            # What the put lands is what the head reads back — the depth stamp
+            # re-mints the item, so it is not the object the caller passed in.
+            mp.queue.peek_next = MagicMock(return_value=item)
 
         mp.queue_put = AsyncMock(side_effect=_put)
 
@@ -2217,11 +2227,13 @@ class TestQuerySourceClassification:
             )
 
         head, follow_on = kept
-        assert head is tracks[3]
+        assert head.webpage_url == tracks[3].webpage_url
         assert head.analytics.queue_position == 0
-        # Rebased kept-relative, so the tail reads 1, 2 rather than 4, 5.
-        assert follow_on == tracks[4:]
+        # Rebased kept-relative, so the tail reads 1, 2 rather than 4, 5; the
+        # re-mint returns new items, so the walk's own are untouched.
+        assert [t.webpage_url for t in follow_on] == [t.webpage_url for t in tracks[4:]]
         assert [t.analytics.queue_position for t in follow_on] == [1, 2]
+        assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
 
     async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2603,7 +2615,7 @@ class TestInterjectionCollectionHandling:
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
 
-        assert head is tracks[3]
+        assert head.webpage_url == tracks[3].webpage_url
         assert head.analytics.queue_position == 0
         assert [queue_object(item).analytics.queue_position for item in rest] == [1, 2]
 
