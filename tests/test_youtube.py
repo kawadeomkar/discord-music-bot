@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import pathlib
+import re
 import contextlib
 import logging
 import redis.asyncio as aioredis
@@ -514,6 +515,32 @@ class TestQueueObject:
         q1 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
         q2 = QueueObject("https://yt.com/watch?v=2", "Song", mock_author)
         assert q1 != q2
+
+    def test_every_field_takes_part_in_replace(self) -> None:
+        """replace() carries the whole ask across the three rebuilds and the
+        crash restore, and it silently skips a field declared init=False — such a
+        field would be reset to its default at every rebuild."""
+        import dataclasses
+
+        assert [f.name for f in dataclasses.fields(QueueObject) if not f.init] == []
+
+    def test_no_dict_reader_reaches_a_slotted_item(
+        self, mock_author: MagicMock
+    ) -> None:
+        """A slotted item has no __dict__, so asdict()/vars() on one is either a
+        TypeError or an empty view; the wire tables spell every field out instead.
+        Pins the comment above the class against the whole of src/."""
+        item = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
+        assert not hasattr(item, "__dict__")
+        src = pathlib.Path(__file__).resolve().parents[1] / "src"
+        reader = re.compile(r"(?<![\w.])(?:asdict|vars)\(\s*\w")
+        hits = [
+            f"{path.relative_to(src.parent)}:{n}"
+            for path in sorted(src.rglob("*.py"))
+            for n, line in enumerate(path.read_text().splitlines(), 1)
+            if reader.search(line) and not line.lstrip().startswith("#")
+        ]
+        assert hits == []
 
 
 class TestEnrichQueueObject:
