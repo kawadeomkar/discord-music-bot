@@ -22,7 +22,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
-from src.queue_item import NpHostRef, QueueObject
+from src.queue_item import NpCard, QueueObject
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_link, is_mix
 from src.telemetry import get_tracer
@@ -1676,20 +1676,8 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.queued.query_source
 
     @property
-    def np_message_id(self) -> int:
-        return self.queued.np_message_id
-
-    @property
-    def np_channel_id(self) -> int:
-        return self.queued.np_channel_id
-
-    @property
-    def np_dedicated(self) -> bool:
-        return self.queued.np_dedicated
-
-    @property
-    def np_host_ref(self) -> Optional[NpHostRef]:
-        return self.queued.np_host_ref
+    def np_card(self) -> Optional[NpCard]:
+        return self.queued.np_card
 
     @property
     def played_at(self) -> float:

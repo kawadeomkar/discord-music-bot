@@ -58,7 +58,7 @@ from src.util import (
     fmt_duration,
     trace_id_of,
 )
-from src.queue_item import NpHostRef, QueueObject
+from src.queue_item import NpCard, NpHostRef, QueueObject
 from src.youtube import YTDL
 from tests.helpers import (
     ask_of,
@@ -706,7 +706,7 @@ class TestQueueClearFlushesPlayedSongs:
     async def test_flushed_row_points_at_the_card_that_hosted_the_play(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """End of the chain: the tail's np_* fields become the row's host pair, so
+        """End of the chain: the tail's card becomes the row's host pair, so
         a play destroyed before its tail could finish is still traceable back to
         the message that carried its bar."""
         tail = QueueObject(
@@ -716,9 +716,11 @@ class TestQueueClearFlushesPlayedSongs:
             ts=95,
             is_resume=True,
             played_at=1752530000.0,
-            np_message_id=777777777777777777,
-            np_channel_id=888888888888888888,
-            np_dedicated=True,
+            np_card=NpCard(
+                message_id=777777777777777777,
+                channel_id=888888888888888888,
+                dedicated=True,
+            ),
         )
         await music_player.queue_put(tail)
 
@@ -853,9 +855,11 @@ class TestQueueClearFlushesPlayedSongs:
             ts=95,
             is_resume=True,
             played_at=1752530001.0,
-            np_message_id=777777777777777777,
-            np_channel_id=888888888888888888,
-            np_dedicated=True,
+            np_card=NpCard(
+                message_id=777777777777777777,
+                channel_id=888888888888888888,
+                dedicated=True,
+            ),
         )
 
         entry = SongQueueEntry.from_queue_object(tail)
@@ -865,11 +869,10 @@ class TestQueueClearFlushesPlayedSongs:
         rebuilt = music_player.queue._rehydrate(parsed)
 
         assert isinstance(rebuilt, QueueObject)
-        assert rebuilt.np_message_id == 777777777777777777
-        assert rebuilt.np_channel_id == 888888888888888888
-        assert rebuilt.np_dedicated is True
-        # And a rebuilt tail with a live ref gone takes the by-id branch.
-        assert rebuilt.np_host_ref is None
+        # The ids alone: a rebuilt tail with its live ref gone takes the by-id branch.
+        assert rebuilt.np_card == NpCard(
+            message_id=777777777777777777, channel_id=888888888888888888, dedicated=True
+        )
 
     async def test_clear_disposes_the_cards_of_the_tails_it_destroys(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -934,7 +937,12 @@ class TestQueueClearFlushesPlayedSongs:
             ts=30,
             played_at=2.0,
         )
-        bad = dataclasses.replace(bad, np_message_id={"nested": "object"})
+        bad = dataclasses.replace(
+            bad,
+            np_card=NpCard(
+                message_id=cast(int, {"nested": "object"}), channel_id=8, dedicated=True
+            ),
+        )
 
         await music_player._flush_played([good, bad])
 
@@ -1119,10 +1127,7 @@ class TestQueueShuffle:
         prefetch keeps its claim through -shuffle: the song it holds stays pinned
         to the front of the very reorder the user asked for, its FFmpeg process
         is never reaped, and the guard counts one short."""
-        live_song.np_message_id = None
-        live_song.np_channel_id = None
-        live_song.np_dedicated = False
-        live_song.np_host_ref = None
+        live_song.np_card = None
         for i in range(4):
             await music_player.queue_put(
                 QueueObject(
@@ -4559,9 +4564,7 @@ class TestEnqueueDepth:
                 requester=mock_author,
                 is_replay=True,
                 persisted=False,
-                np_message_id=777,
-                np_channel_id=888,
-                np_dedicated=True,
+                np_card=NpCard(message_id=777, channel_id=888, dedicated=True),
             ),
         )
         current.position_secs = 40.0
@@ -4582,13 +4585,7 @@ class TestEnqueueDepth:
             for i in music_player.queue.display_items()
             if isinstance(i, QueueObject) and i.is_resume
         )
-        assert (
-            tail.np_message_id,
-            tail.np_channel_id,
-            tail.np_dedicated,
-            tail.is_replay,
-            tail.persisted,
-        ) == (0, 0, False, False, True)
+        assert (tail.np_card, tail.is_replay, tail.persisted) == (None, False, True)
 
     async def test_the_under_by_one_window_for_a_repeated_url_is_unchanged(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -10542,17 +10539,14 @@ class TestStreamRetry:
         it: that song never started, so the disposal is still owed."""
         mock_song.is_resume = True
         mock_song.start_offset = 95
-        mock_song.np_message_id = 777777777777777777
-        mock_song.np_channel_id = 888888888888888888
-        mock_song.np_dedicated = True
+        mock_song.np_card = NpCard(
+            message_id=777777777777777777, channel_id=888888888888888888, dedicated=True
+        )
 
         await self._run_failed_iteration(music_player, queue_obj, mock_song)
 
         retry = self._front(music_player)
-        assert retry.np_message_id == 0
-        assert retry.np_channel_id == 0
-        assert retry.np_dedicated is False
-        assert retry.np_host_ref is None
+        assert retry.np_card is None
 
     async def test_a_retry_never_comes_back_paused(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -12157,11 +12151,7 @@ class TestInterject:
         assert music_player._skip_history_for is live_song
         # Still unstamped: nothing is known about the card yet.
         assert isinstance(tail, QueueObject)
-        assert (tail.np_message_id, tail.np_channel_id, tail.np_host_ref) == (
-            0,
-            0,
-            None,
-        )
+        assert tail.np_card is None
 
     async def test_no_resume_entry_parks_no_tail(
         self,
@@ -12797,9 +12787,7 @@ class TestNeutralizePrefetch:
             is_replay=True,
             queued_at=99.0,
             queue_position=3,
-            np_message_id=11,
-            np_channel_id=12,
-            np_dedicated=True,
+            np_card=NpCard(message_id=11, channel_id=12, dedicated=True),
         )
 
         rebuilt = music_player._requeued_form(ytdl_instance(queued=queued))
@@ -12916,9 +12904,7 @@ class TestNeutralizePrefetch:
             start_paused=True,
             query_source="spotify.com",
             played_at=1234.5,
-            np_message_id=77,
-            np_channel_id=88,
-            np_dedicated=True,
+            np_card=NpCard(message_id=77, channel_id=88, dedicated=True),
             is_replay=True,
         )
         song.cleanup = MagicMock()
@@ -12944,9 +12930,7 @@ class TestNeutralizePrefetch:
             rebuilt.start_paused,
             rebuilt.query_source,
             rebuilt.played_at,
-            rebuilt.np_message_id,
-            rebuilt.np_channel_id,
-            rebuilt.np_dedicated,
+            rebuilt.np_card,
             rebuilt.is_replay,
         ) == (
             "https://open.spotify.com/playlist/abc",
@@ -12956,9 +12940,7 @@ class TestNeutralizePrefetch:
             True,
             "spotify.com",
             1234.5,
-            77,
-            88,
-            True,
+            NpCard(message_id=77, channel_id=88, dedicated=True),
             True,
         )
 
@@ -13047,29 +13029,31 @@ class TestNeutralizePrefetch:
         # strands the previous fragment's frozen card with nothing left that knows
         # to delete it. The runtime ref rides along too — it is what allows a
         # strip-edit, which the ids alone cannot do.
-        ref = NpHostRef(
-            message=AsyncMock(spec=discord.Message), own_embeds=[], dedicated=True
-        )
+        ref = NpHostRef(message=AsyncMock(spec=discord.Message), own_embeds=[])
         original = QueueObject(
             webpage_url="https://yt.com/v=orig",
             title="Interrupted Song",
             requester=mock_author,
             ts=151,
             is_resume=True,
-            np_message_id=777777777777777777,
-            np_channel_id=888888888888888888,
-            np_dedicated=True,
-            np_host_ref=ref,
+            np_card=NpCard(
+                message_id=777777777777777777,
+                channel_id=888888888888888888,
+                dedicated=True,
+                host_ref=ref,
+            ),
         )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
 
         live_song.start_offset = 151
         live_song.is_resume = True
-        live_song.np_message_id = 777777777777777777
-        live_song.np_channel_id = 888888888888888888
-        live_song.np_dedicated = True
-        live_song.np_host_ref = ref
+        live_song.np_card = NpCard(
+            message_id=777777777777777777,
+            channel_id=888888888888888888,
+            dedicated=True,
+            host_ref=ref,
+        )
         live_song.cleanup = MagicMock()
 
         async def _done() -> MagicMock:
@@ -13083,12 +13067,13 @@ class TestNeutralizePrefetch:
 
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
-        assert (rebuilt.np_message_id, rebuilt.np_channel_id, rebuilt.np_dedicated) == (
-            777777777777777777,
-            888888888888888888,
-            True,
-        )
-        assert rebuilt.np_host_ref is ref
+        assert rebuilt.np_card is not None
+        assert (
+            rebuilt.np_card.message_id,
+            rebuilt.np_card.channel_id,
+            rebuilt.np_card.dedicated,
+        ) == (777777777777777777, 888888888888888888, True)
+        assert rebuilt.np_card.host_ref is ref
 
     async def test_completed_task_rebuild_keeps_played_at(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
@@ -13668,15 +13653,16 @@ class TestHistorySkipMarker:
         # The stamped tail is what the queue now holds in the tail's slot.
         (stamped,) = music_player.queue.display_items()
         assert stamped.webpage_url == tail.webpage_url
-        assert (stamped.np_message_id, stamped.np_channel_id) == (
+        assert stamped.np_card is not None
+        assert (stamped.np_card.message_id, stamped.np_card.channel_id) == (
             777777777777777777,
             888888888888888888,
         )
-        assert stamped.np_dedicated is dedicated
-        assert stamped.np_host_ref is not None
-        assert stamped.np_host_ref.message is host
-        assert stamped.np_host_ref.own_embeds == [own]
-        assert stamped.np_host_ref.dedicated is dedicated
+        assert stamped.np_card.dedicated is dedicated
+        assert (
+            stamped.np_card.host_ref is not None
+            and stamped.np_card.host_ref.message is host
+        )
         assert music_player._pending_resume_tail is None
 
     async def test_a_stale_tail_is_not_stamped_by_a_later_fragment(
@@ -13705,8 +13691,7 @@ class TestHistorySkipMarker:
 
         # Untouched: the queue still holds the very object, with no ids on it.
         assert music_player.queue.display_items()[-1] is tail
-        assert (tail.np_message_id, tail.np_channel_id) == (0, 0)
-        assert tail.np_host_ref is None
+        assert tail.np_card is None
         assert music_player._pending_resume_tail is None  # cleared either way
 
     async def test_a_song_is_claimable_across_the_post_song_prefetch_await(
@@ -13805,7 +13790,7 @@ class TestHistorySkipMarker:
         assert music_player._pending_resume_tail is None
         # Untouched: the tail's slot still holds the very object, with no ids.
         assert music_player.queue.display_items()[-1] is tail
-        assert (tail.np_message_id, tail.np_channel_id) == (0, 0)
+        assert tail.np_card is None
 
     async def test_one_marker_suffices_at_depth(
         self,
@@ -13860,20 +13845,27 @@ class TestDisposePreviousNpCard:
     An interjection stack accumulates one dead partial bar each: song end
     RELEASES the host rather than retiring it, by design."""
 
-    def _song(self, **attrs: Any) -> MagicMock:
+    def _song(self, **card: Any) -> MagicMock:
+        """A song double carrying a card built from whatever the test names — the
+        wire values untyped, since the guard under test treats them as hostile —
+        or no card at all when nothing is named."""
         song = MagicMock()
-        song.np_message_id = 0
-        song.np_channel_id = 0
-        song.np_dedicated = False
-        song.np_host_ref = None
-        for name, value in attrs.items():
-            setattr(song, name, value)
+        song.np_card = (
+            NpCard(
+                message_id=card.get("np_message_id", 0),
+                channel_id=card.get("np_channel_id", 0),
+                dedicated=card.get("np_dedicated", False),
+                host_ref=card.get("np_host_ref"),
+            )
+            if card
+            else None
+        )
         return song
 
     async def test_dedicated_ref_is_deleted(self, music_player: MusicPlayer) -> None:
         message = AsyncMock(spec=discord.Message)
         song = self._song(
-            np_host_ref=NpHostRef(message=message, own_embeds=[], dedicated=True)
+            np_host_ref=NpHostRef(message=message, own_embeds=[]), np_dedicated=True
         )
 
         await music_player._dispose_previous_np_card(song)
@@ -13940,9 +13932,11 @@ class TestDisposePreviousNpCard:
         ):
             message = AsyncMock(spec=discord.Message)
             message.delete = AsyncMock(side_effect=exc)
-            song = self._song(np_host_ref=None, np_dedicated=True)
-            song.np_message_id = 777777777777777777
-            song.np_channel_id = 888888888888888888
+            song = self._song(
+                np_dedicated=True,
+                np_message_id=777777777777777777,
+                np_channel_id=888888888888888888,
+            )
             music_player.bot.get_partial_messageable = MagicMock(
                 return_value=MagicMock(
                     get_partial_message=MagicMock(return_value=message)
@@ -13954,7 +13948,7 @@ class TestDisposePreviousNpCard:
     async def test_a_truthy_non_bool_dedicated_flag_never_authorizes_a_delete(
         self, music_player: MusicPlayer
     ) -> None:
-        """np_dedicated is the AUTHORIZATION, not a target — the only thing
+        """The card's `dedicated` is the AUTHORIZATION, not a target — the only thing
         between deleting the bot's own card and deleting a user's command reply.
         parse_queue_entry coerces nothing, so a wire "false" arrives as a truthy
         string; truthiness would read that as permission to delete."""
@@ -13978,7 +13972,7 @@ class TestDisposePreviousNpCard:
         message = AsyncMock(spec=discord.Message)
         own = [discord.Embed(title="the reply's own embed")]
         song = self._song(
-            np_host_ref=NpHostRef(message=message, own_embeds=own, dedicated=False)
+            np_host_ref=NpHostRef(message=message, own_embeds=own), np_dedicated=False
         )
 
         await music_player._dispose_previous_np_card(song)
@@ -14067,7 +14061,7 @@ class TestDisposePreviousNpCard:
         message = AsyncMock(spec=discord.Message)
         music_player.bot.get_partial_messageable = MagicMock()
         song = self._song(
-            np_host_ref=NpHostRef(message=message, own_embeds=[], dedicated=True),
+            np_host_ref=NpHostRef(message=message, own_embeds=[]),
             np_message_id=7,
             np_channel_id=8,
             np_dedicated=True,
@@ -14794,8 +14788,11 @@ class TestInterjectLoopStart:
         order: list[str] = []
         mock_song.is_resume = True
         mock_song.start_offset = 42
-        mock_song.np_host_ref = NpHostRef(
-            message=AsyncMock(spec=discord.Message), own_embeds=[], dedicated=True
+        mock_song.np_card = NpCard(
+            message_id=7,
+            channel_id=8,
+            dedicated=True,
+            host_ref=NpHostRef(message=AsyncMock(spec=discord.Message), own_embeds=[]),
         )
 
         async def track_send(self_inner: Any, _song: object) -> None:

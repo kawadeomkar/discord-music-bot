@@ -391,9 +391,9 @@ released, one final edit completes the bar — only if the song truly reached it
 a stream that never produced audio gets its block retired instead (a completed bar would
 be a false record). Pause updates are debounced 0.5s.
 An interjected fragment's frozen bar is the one case release-don't-retire leaves behind,
-and a stack leaves one per interjection — so its resume tail carries a pointer to that
-card (`np_message_id`/`np_channel_id`/`np_dedicated` on the wire, plus a runtime-only
-`np_host_ref`) and disposes of it when the tail starts, **after** its own card is up.
+and a stack leaves one per interjection — so its resume tail carries that card as
+`np_card` (its ids, which are what the wire carries, plus a runtime-only host ref) and
+disposes of it when the tail starts, **after** its own card is up.
 Never a re-adopt (`_adopt_np_host` refuses older ids by design — the bar belongs at the
 channel bottom); the channel id comes from `message.channel.id`, never the persisted
 home channel; and capture is late-bound to the fragment's iteration end, because an id

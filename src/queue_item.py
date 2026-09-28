@@ -14,18 +14,30 @@ import discord
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class NpHostRef:
-    """The live Now Playing host an interrupted fragment left behind, for its
-    resume tail to dispose of. Runtime only: a Message cannot be serialized and
-    own_embeds cannot be rebuilt from ids, so the wire fields alone can never
+    """The live Now Playing host an interrupted fragment left behind, and the
+    embeds that are its own. Runtime only: a Message cannot be serialized and
+    own_embeds cannot be rebuilt from ids, so the card's ids alone can never
     strip-edit a retirement (MusicPlayer._retire_np_host)."""
 
     message: discord.Message
     own_embeds: list[discord.Embed]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NpCard:
+    """The Now Playing card an interrupted fragment left frozen, for its resume
+    tail to dispose of when it starts. The ids survive a restart and can delete
+    a DEDICATED card (a pure NP message, as against a command response); the
+    live ref is what allows a strip-edit, and does not survive one."""
+
+    message_id: int
+    channel_id: int  # from message.channel.id — NEVER the home channel
     dedicated: bool
+    host_ref: Optional[NpHostRef] = field(default=None, repr=False)
 
 
 # slots: a 10,000-track Spotify playlist holds one of these per track while its
-# searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
+# searches wait to resolve — 200 B each by sys.getsizeof on this interpreter,
 # against 344 B for the same instance carrying a __dict__. Keep the class off
 # asdict (it deep-copies requester), vars (it raises) and any pickle path.
 # eq=False: an item is one ask, so it compares and hashes by identity — two asks
@@ -89,14 +101,10 @@ class QueueObject:
     # A crash resets both. See MusicPlayer._retry_failed_stream.
     stream_attempts: int = 0
     failed_format_ids: frozenset[str] = frozenset()
-    # The NP card the interrupted fragment left frozen, set on a resume tail at
-    # the fragment's iteration end and consumed when the tail starts. The ids
-    # survive a restart, the ref does not, and only the ref can strip-edit a
-    # response host. 0/0/False = nothing to clean up.
-    np_message_id: int = 0
-    np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
-    np_dedicated: bool = False  # a pure NP message (deletable) vs a response
-    np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
+    # The card the interrupted fragment left frozen, set on a resume tail at the
+    # fragment's iteration end and consumed when the tail starts. None = nothing
+    # to clean up.
+    np_card: Optional[NpCard] = None
     # The `ytsearch:` term an unresolved item still has to resolve, cleared by the
     # resolve at dequeue. `title` meanwhile is the walk's row name, or empty when
     # the walk had none — every renderer falls back to this term.

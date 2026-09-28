@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.queue_item import NpHostRef, QueueObject
+from src.queue_item import NpCard, NpHostRef, QueueObject
 
 
 class TestQueueObject:
@@ -83,7 +83,7 @@ class TestQueueObject:
     def test_an_item_hashes_by_identity(self, mock_author: MagicMock) -> None:
         """Pins the class comment: a set tells two asks for one song apart the way
         the queue does (holds, display_index, _listed), and a resume tail carrying
-        np_host_ref hashes too, its own_embeds list notwithstanding."""
+        a card with a live host ref hashes too, its own_embeds list notwithstanding."""
         first = QueueObject(
             webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
         )
@@ -94,7 +94,12 @@ class TestQueueObject:
         assert len({first, second}) == 2
         tail = replace(
             first,
-            np_host_ref=NpHostRef(message=MagicMock(), own_embeds=[], dedicated=True),
+            np_card=NpCard(
+                message_id=1,
+                channel_id=2,
+                dedicated=True,
+                host_ref=NpHostRef(message=MagicMock(), own_embeds=[]),
+            ),
         )
         assert hash(tail) == hash(tail)
 
