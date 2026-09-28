@@ -351,7 +351,7 @@ class PlaceVerdict(Enum):
     VOICE = "voice"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PlaceResult:
     """What the lock decided. `refusal` accompanies VOICE and only VOICE, and is
     the message that verdict is reported with."""
@@ -730,19 +730,19 @@ class PlayRegistry:
                 if req.mp.retired:
                     span.set_attribute("play.verdict", PlaceVerdict.SESSION_ENDED.value)
                     span.set_attribute("play.dropped_by", req.dropped_by or "session")
-                    yield PlaceResult(PlaceVerdict.SESSION_ENDED)
+                    yield PlaceResult(verdict=PlaceVerdict.SESSION_ENDED)
                     return
                 if req.mp.queue.generation != req.generation:
                     span.set_attribute("play.verdict", PlaceVerdict.CLEARED.value)
                     span.set_attribute("play.dropped_by", req.dropped_by or "clear")
-                    yield PlaceResult(PlaceVerdict.CLEARED)
+                    yield PlaceResult(verdict=PlaceVerdict.CLEARED)
                     return
                 if req.dropped_by:
                     # Stamped by a command that had nothing to retire or bump (-stop
                     # before the join lands), so the stamp has to BE an invalidation.
                     span.set_attribute("play.verdict", PlaceVerdict.SESSION_ENDED.value)
                     span.set_attribute("play.dropped_by", req.dropped_by)
-                    yield PlaceResult(PlaceVerdict.SESSION_ENDED)
+                    yield PlaceResult(verdict=PlaceVerdict.SESSION_ENDED)
                     return
                 # The dispatch-time reading, carried on the request: this answers
                 # exactly what play_takes_the_queue answered when it was admitted.
@@ -751,7 +751,7 @@ class PlayRegistry:
                     # dropped_by names a COMMAND, and no command did this — the
                     # verdict is what a "did not place" query has to read.
                     span.set_attribute("play.verdict", PlaceVerdict.VOICE.value)
-                    yield PlaceResult(PlaceVerdict.VOICE, refusal)
+                    yield PlaceResult(verdict=PlaceVerdict.VOICE, refusal=refusal)
                     return
                 span.set_attribute("play.verdict", PlaceVerdict.PLACE.value)
                 # Before the put: a command arriving while it runs waits on the queue
@@ -760,7 +760,7 @@ class PlayRegistry:
                 # cut short gives the request back.
                 req.placed = True
                 try:
-                    yield PlaceResult(PlaceVerdict.PLACE)
+                    yield PlaceResult(verdict=PlaceVerdict.PLACE)
                 except BaseException:
                     req.placed = False
                     raise
