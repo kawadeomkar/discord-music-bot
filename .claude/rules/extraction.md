@@ -110,7 +110,8 @@ song after next — the prefetch has already built the next one at the old level
 rebuilding it would re-request a signed URL that may since have been revoked).
 **Opus passthrough**: `codec="copy"` remuxes instead of re-encoding. `_passthrough_codec`
 is the gate and all four clauses are required, because `-c:a copy` also discards the
-`-ac 2 -ar 48000 -b:a 128k` discord.py always emits: `acodec` opus; no filter (ffmpeg
+`-ac 2 -ar 48000 -b:a 128k -fec -packet_loss` discord.py always emits (the last two are
+overridden on the encode path — ARCHITECTURE.md#encoder-mode): `acodec` opus; no filter (ffmpeg
 refuses copy alongside a filtergraph — exit 234, zero bytes — so `yt_stream` asks
 `_audio_filters` what it produced rather than re-testing volume); `audio_channels` in
 (1, 2) (a 5.1 serve reaches Discord as multistream and clients decode only the front

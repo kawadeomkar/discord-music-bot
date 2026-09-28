@@ -17,6 +17,14 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.10 — 2026-09-28
+
+**Songs the bot re-encodes sound right.** Anything that is not bit-copied from YouTube —
+every SoundCloud track, every song played at a volume other than 100 %, every video whose
+only audio is AAC — was leaving the encoder in Opus's speech mode. It now stays in the
+music mode, which is also cheaper to encode. Nothing to do; each such song sends about
+7 % more voice traffic. Rolling back restores the old sound and nothing else.
+
 ## 2.53.7 — 2026-09-26
 
 **This build can read a queue entry the next one writes.** Nothing changes in chat, and

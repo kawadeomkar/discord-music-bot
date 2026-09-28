@@ -790,6 +790,13 @@ class TestYTDLFfmpegOpts:
     def test_options_strips_video(self) -> None:
         assert "-vn" in YTDL.FFMPEG_OPTS["options"]
 
+    def test_options_override_discord_py_fec_pair(self) -> None:
+        """discord.py's own `-fec true -packet_loss 15` precede `options` in the
+        argv and ffmpeg keeps the last value, so both must trail, with these values."""
+        options = YTDL.FFMPEG_OPTS["options"].split()
+        assert options[options.index("-fec") + 1] == "false"
+        assert options[options.index("-packet_loss") + 1] == "0"
+
 
 class TestYTSource:
     async def test_yt_source_returns_queue_object(self, mock_ctx: MagicMock) -> None:
@@ -1839,6 +1846,7 @@ class TestYTStream:
             await YTDL.yt_stream(qobj, channel, volume=0.5)
 
         assert "volume=0.5" in captured_options["options"]
+        assert "-fec false" in captured_options["options"]
 
     async def test_yt_stream_seeks_on_both_sides_when_ts_is_set(
         self, mock_ctx: MagicMock
@@ -1884,6 +1892,7 @@ class TestYTStream:
         assert "-ss 90" not in captured_options["options"]
         assert "volume=0.5" in captured_options["options"]
         assert "volume" not in captured_options["before_options"]
+        assert "-fec false" in captured_options["options"]
 
     async def test_a_zero_timestamp_is_not_a_seek(self, mock_ctx: MagicMock) -> None:
         """`?t=0` is a real input (sources.py int()s it), and "start at the start" is

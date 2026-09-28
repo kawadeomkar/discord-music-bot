@@ -20,6 +20,13 @@ purpose, and pins the two numbers the decision is built on:
   same evidence would eat a real history entry), and is pinned here so the choice
   stays a choice rather than an accident of ffmpeg's exit codes.
 
+A third fact lives here for the same reason: which Opus mode the encode path
+leaves libopus in. discord.py asks for in-band FEC on every spawn, which libopus
+answers by abandoning CELT, and nothing but the bitstream shows it — the argv is
+accepted, the exit code is 0, and the audio plays. `YTDL.FFMPEG_OPTS` overrides
+the pair; the control test reads the TOC bytes under discord.py's bare defaults
+so the override's reason stays measurable. See docs/ARCHITECTURE.md#encoder-mode.
+
 The two-pass `-ss` is deliberately NOT tested here. Whether ffmpeg turns an input
 seek into an offset Range request depends on the file being large enough to be
 worth one — a 29 KB sample is fetched whole either way — and a sample big enough
@@ -49,7 +56,7 @@ from typing import Any, Optional
 import discord
 import pytest
 
-from src.youtube import _OGG_HEADER_PACKETS
+from src.youtube import YTDL, _OGG_HEADER_PACKETS
 from tests.helpers import tier_enabled
 
 pytestmark = [
@@ -238,3 +245,43 @@ class TestWhatFFmpegReportsForAFailedStream:
             f"a stream that delivered no audio yielded {header_only} packets, but "
             f"_OGG_HEADER_PACKETS is {_OGG_HEADER_PACKETS}"
         )
+
+
+# RFC 6716 §3.1: TOC configs 0-11 are SILK, 12-15 hybrid, 16-31 CELT.
+_CELT_CONFIG_FLOOR = 16
+# Enough to see a mode hold rather than a first-frame choice; ~1s of the 3s sample.
+_MODE_SAMPLE_PACKETS = 50
+
+
+def _audio_tocs(url: str, options: str) -> list[int]:
+    """The TOC config of the first _MODE_SAMPLE_PACKETS audio packets, read the
+    way the player reads them, past the two Ogg header packets."""
+    source = discord.FFmpegOpusAudio(url, options=options)
+    process = source._process
+    try:
+        for _ in range(_OGG_HEADER_PACKETS):
+            source.read()
+        return [source.read()[0] >> 3 for _ in range(_MODE_SAMPLE_PACKETS)]
+    finally:
+        source.cleanup()
+        for pipe in (process.stdout, process.stderr, process.stdin):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+class TestEncoderMode:
+    """Which Opus mode the re-encode path leaves libopus in, measured rather than
+    assumed. See docs/ARCHITECTURE.md#encoder-mode."""
+
+    def test_the_shipped_options_hold_celt(self, server: type[_FailingHandler]) -> None:
+        tocs = _audio_tocs(server.url, YTDL.FFMPEG_OPTS["options"])  # type: ignore[attr-defined]
+        assert all(t >= _CELT_CONFIG_FLOOR for t in tocs), tocs
+
+    def test_discord_py_defaults_alone_leave_celt(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The control. When this starts seeing CELT, the override no longer
+        earns its place and the encoder-mode section can shrink."""
+        tocs = _audio_tocs(server.url, "-vn")  # type: ignore[attr-defined]
+        assert all(t < _CELT_CONFIG_FLOOR for t in tocs), tocs

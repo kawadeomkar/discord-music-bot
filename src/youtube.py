@@ -1650,7 +1650,11 @@ async def _revalidate_source(
 class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        "options": "-vn",
+        # discord.py emits `-fec true -packet_loss 15` on every spawn, and libopus
+        # answers in-band FEC above 8 % expected loss by leaving CELT for SILK/hybrid
+        # on every frame. These trail its arguments, so they win; `-c:a copy` has no
+        # encoder to read them. See docs/ARCHITECTURE.md#encoder-mode.
+        "options": "-vn -fec false -packet_loss 0",
     }
 
     def __init__(
