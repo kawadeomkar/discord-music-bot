@@ -2004,19 +2004,18 @@ class TestRestoreEntries:
             '1 of 1 entries were in the retired "ytsource" shape'
         ) in caplog.text
 
-    async def test_an_empty_restore_still_reports_zero(
+    async def test_an_empty_restore_reports_itself_without_a_tally(
         self, gq: GuildQueue, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A restore with nothing to say still says it: a guild that logs no line
         is a guild whose queues were never looked at, which is not the same
-        measurement as a zero."""
+        measurement as a zero. The tally stays off it — "0 of 0" is the one zero
+        that measures nothing, and it is the bulk of the lines a restart writes."""
         with caplog.at_level(logging.INFO):
             outcome = await gq.restore_entries([])
         assert (outcome.restored, outcome.old_shape) == (0, 0)
-        assert (
-            f"Restored 0 queued songs for guild {gq._guild.id}; "
-            '0 of 0 entries were in the retired "ytsource" shape'
-        ) in caplog.text
+        assert f"Restored 0 queued songs for guild {gq._guild.id}" in caplog.text
+        assert "ytsource" not in caplog.text
 
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:
         return SongQueueEntry(

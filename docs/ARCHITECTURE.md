@@ -2419,8 +2419,10 @@ wrote — so entries already on a list still restore. Such an entry rewrites onc
 it rehydrates into re-serializes as `"qobj"`, and because LREM matches exact bytes, the
 first `-remove` or `-clear` touching it misses and rebuilds the list. The read leg stays
 until no restore still meets one, which `restore_entries` measures: it logs the restored
-count and the `"ytsource"` tally on one INFO line per guild, every restore, zero included,
-and returns both as a `RestoreOutcome` so `_restore_state` stamps the tally as
+count on one INFO line per guild, every restore, and the `"ytsource"` tally beside it
+whenever the list held anything — so every zero on that line is a list that was read and
+held none, and a guild missing from the log was never measured at all. It returns both as
+a `RestoreOutcome` so `_restore_state` stamps the tally as
 `restore.old_shape_entries` beside `restore.queue_count` on the `player.state_restore`
 span. The measurement covers the guilds a start actually restored: `restore_guild` returns
 before building a player when the state hash records no channels, when they no longer

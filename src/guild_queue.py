@@ -538,8 +538,9 @@ class GuildQueue:
     ) -> RestoreOutcome:
         """Re-queue persisted entries after a restart, in order, in memory only
         (they are already on the Redis list). Returns the number restored and
-        how many entries were still in the "ytsource" shape, and logs both on
-        one INFO line, unconditionally.
+        how many entries were still in the "ytsource" shape, and logs the
+        restored count on one INFO line for every guild, the tally beside it
+        whenever the list held anything.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
@@ -574,13 +575,17 @@ class GuildQueue:
                 f"requester in guild {self._guild.id}; the Redis list still holds "
                 "them until the next mirror rebuild"
             )
-        # Unconditional, an empty restore included: a zero is the number being
-        # watched for, and a missing line is not one.
-        log.info(
-            f"Restored {count} queued songs for guild {self._guild.id}; "
-            f"{old_shape} of {len(entries)} entries were in the retired "
-            '"ytsource" shape'
-        )
+        # Unconditional, an empty restore included: a guild that logs no line is
+        # one nothing measured, and that is not a zero. The tally rides it only
+        # when the list held something, so the zeros on the line are the ones
+        # being watched for rather than a fraction of no entries.
+        line = f"Restored {count} queued songs for guild {self._guild.id}"
+        if entries:
+            line += (
+                f"; {old_shape} of {len(entries)} entries were in the retired "
+                '"ytsource" shape'
+            )
+        log.info(line)
         self._sync_wake()
         return RestoreOutcome(restored=count, old_shape=old_shape)
 
