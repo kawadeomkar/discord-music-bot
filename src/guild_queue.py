@@ -278,6 +278,22 @@ class GuildQueue:
             self._items[0] = item
         self._sync_wake()
 
+    def replace_item(self, item: QueueObject, new: QueueObject) -> bool:
+        """Swap `new` into the slot `item` holds, pending or claimed, and carry the
+        slot's mirror record with it: the list keeps the bytes it holds for `item`
+        until the next rebuild, so an LREM and the claimed-entry guard keep
+        matching through the record while the live object differs. False when
+        `item` is no longer held, and nothing moves."""
+        for index, held in enumerate(self._items):
+            if held is item:
+                if new is not item:
+                    entry = self._mirror_entry(item)
+                    self._listed.pop(id(item), None)
+                    self._listed[id(new)] = (new, entry)
+                    self._items[index] = new
+                return True
+        return False
+
     def empty(self) -> bool:
         return self._cursor >= len(self._items)
 
@@ -648,16 +664,21 @@ class GuildQueue:
     def note_mirror_write(self, *, landed: bool, retired: bool) -> None:
         """Record the start transaction's outcome, from inside commit_dequeue's
         hold. A write that landed leaves the list correct; one that did not,
-        while memory dropped an entry, leaves the list one ahead."""
+        while memory dropped an entry, leaves the list one ahead. The start
+        rebuilds exactly when the mirror is stale, so a landed write over a stale
+        mirror is a rebuild, after which the list holds every live object's own
+        serialization and the swap records have nothing left to stand in for."""
         if landed:
+            if self._mirror_dirty:
+                self._listed.clear()
             self._mirror_dirty = False
         elif retired:
             self._mirror_dirty = True
 
     def mirror_entries(self) -> list[QueueEntry]:
         """The persisted subset of the deque, claimed prefix included, in order —
-        what a rebuild writes."""
-        return [self._mirror_entry(s) for s in self._items if is_persisted(s)]
+        what a rebuild writes: each live object's own serialization."""
+        return [_to_entry(s) for s in self._items if is_persisted(s)]
 
     async def redis_pop_for(
         self, item: Optional[QueueObject], *, persisted: Optional[bool] = None
@@ -689,8 +710,9 @@ class GuildQueue:
         (_LREM_MAX_ENTRIES) and guarded twice more because LREM matches exact
         bytes: skipped when a removed blob equals a claimed item's (LREM takes the
         head-most copy — the entry awaiting its commit-time LPOP), and falling
-        through to the rebuild on a short count. Every item is serialized as the
-        list holds it (_mirror_entry)."""
+        through to the rebuild on a short count. An LREM names each entry as the
+        list holds it (_mirror_entry); a rebuild writes every live object's own
+        serialization and drops the swap records once it lands."""
         if self._store is None:
             return
         survivors = sum(1 for s in items if is_persisted(s))
@@ -721,11 +743,13 @@ class GuildQueue:
                 )
         with self._mirror_write():
             landed = await self._store.rebuild_queue(
-                [self._mirror_entry(s) for s in items if is_persisted(s)]
+                [_to_entry(s) for s in items if is_persisted(s)]
             )
         # Only a rebuild that landed answers for the whole list; one that did not
         # leaves it as unknown as before, and the next enqueue tries again.
         self._mirror_dirty = not landed
+        if landed:
+            self._listed.clear()
 
     def holds(self, item: QueueObject) -> bool:
         """Whether this exact object is on the deque, claimed prefix included.
@@ -735,9 +759,10 @@ class GuildQueue:
 
     def _mirror_entry(self, item: QueueObject) -> QueueEntry:
         """The entry the list holds for `item`: its own serialization, or, for an
-        item requeue_front() swapped in, the entry of what it replaced. Every
-        write that must match the list byte for byte (a rebuild, an LREM, the
-        claimed-entry guard) serializes through here."""
+        item requeue_front() or replace_item() swapped in, the entry of what it
+        replaced. Every write that must match the list byte for byte (an LREM, the
+        claimed-entry guard) serializes through here; a rebuild writes the live
+        objects instead and clears the records."""
         listed = self._listed.get(id(item))
         if listed is not None and listed[0] is item:
             return listed[1]
