@@ -1360,14 +1360,16 @@ class SourceCompletion:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopListener:
-    """One row of the embed's listeners section. Distinct from history_archive's
-    RequesterLeader: this one must not live in a module the render worker would
-    have to import."""
+    """One row of a listeners board, -analytics' and -leaderboard's alike.
+    requester_name is the newest one recorded for that id inside the board's own
+    window, and -analytics' ends at the last complete UTC day, so a rename made
+    today shows on -leaderboard alone. Here rather than beside the SQL because
+    the chart render worker imports guild_state and must not pull in asyncpg."""
 
-    requester_id: int = 0
-    requester_name: str = ""
-    plays: int = 0
-    played_secs: int = 0
+    requester_id: int
+    requester_name: str
+    plays: int
+    played_secs: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1379,11 +1381,17 @@ class TopArtist:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TopSong:
-    title: str = ""
-    webpage_url: str = ""
-    query_source: str = ""
-    plays: int = 0
-    played_secs: int = 0
+    """One row of a songs board, -analytics' and -leaderboard's alike. Rows group
+    by webpage_url, so title and query_source are that URL's newest play inside
+    the board's own window. duration_secs is -leaderboard's: the -analytics SQL
+    does not select it, so an -analytics row carries the default 0."""
+
+    title: str
+    webpage_url: str
+    query_source: str
+    plays: int
+    played_secs: int
+    duration_secs: int = 0
 
 
 # "No usable queue-wait data in this window". Negative because 0 is a legitimate

@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 
 import discord
 
-from src.history_archive import Leaderboard, RequesterLeader, SongLeader
+from src.guild_state import TopListener, TopSong
+from src.history_archive import Leaderboard
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     QUERY_SOURCE_SOUNDCLOUD,
@@ -97,7 +98,7 @@ def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
     try:
         return Leaderboard(
             requesters=tuple(
-                RequesterLeader(
+                TopListener(
                     requester_id=int(r["requester_id"]),
                     requester_name=str(r.get("requester_name", "")),
                     plays=int(r["plays"]),
@@ -106,7 +107,7 @@ def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
                 for r in raw.get("requesters", [])[:top_n]
             ),
             songs=tuple(
-                SongLeader(
+                TopSong(
                     title=str(s.get("title", "")),
                     webpage_url=str(s.get("webpage_url", "")),
                     duration_secs=int(s.get("duration_secs", 0)),
@@ -142,9 +143,7 @@ def _link_host(url: str) -> str:
     return host.removeprefix("www.")[:_HOST_MAX]
 
 
-def _line_requester(
-    rank: int, r: RequesterLeader, guild: Optional[discord.Guild]
-) -> str:
+def _line_requester(rank: int, r: TopListener, guild: Optional[discord.Guild]) -> str:
     """A mention while the requester is still in the guild, their archived name
     once they leave — Discord renders a mention for a non-member as a raw id."""
     who = f"<@{r.requester_id}>"
@@ -157,7 +156,7 @@ def _line_requester(
     )
 
 
-def _line_song(rank: int, s: SongLeader) -> str:
+def _line_song(rank: int, s: TopSong) -> str:
     # A blank title is a real archived value, and an empty masked-link label
     # renders as an invisible link.
     title = _sanitize_label(s.title) or "Unknown"

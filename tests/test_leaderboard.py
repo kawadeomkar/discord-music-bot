@@ -13,12 +13,8 @@ import pytest
 from redis.asyncio import Redis
 
 from src import leaderboard
-from src.history_archive import (
-    Leaderboard,
-    RequesterLeader,
-    SchemaVersionError,
-    SongLeader,
-)
+from src.guild_state import TopListener, TopSong
+from src.history_archive import Leaderboard, SchemaVersionError
 from src.commands.leaderboard import LeaderboardFlags
 from src.musicbot import MusicBot
 from tests.helpers import command_callback, mocked
@@ -36,14 +32,14 @@ def _lb_key(guild_id: int, days: int) -> str:
 
 
 def _board(
-    requesters: list[RequesterLeader] | None = None,
-    songs: list[SongLeader] | None = None,
+    requesters: list[TopListener] | None = None,
+    songs: list[TopSong] | None = None,
 ) -> Leaderboard:
     return Leaderboard(requesters=tuple(requesters or ()), songs=tuple(songs or ()))
 
 
-def _requester(n: int, *, plays: int = 2, played_secs: int = 3600) -> RequesterLeader:
-    return RequesterLeader(
+def _requester(n: int, *, plays: int = 2, played_secs: int = 3600) -> TopListener:
+    return TopListener(
         requester_id=n, requester_name=f"user{n}", plays=plays, played_secs=played_secs
     )
 
@@ -55,8 +51,8 @@ def _song(
     url: str | None = None,
     plays: int = 2,
     query_source: str = "",
-) -> SongLeader:
-    return SongLeader(
+) -> TopSong:
+    return TopSong(
         title=f"Song {n}" if title is None else title,
         webpage_url=f"https://yt.com/v={n}" if url is None else url,
         duration_secs=210,
@@ -239,7 +235,7 @@ class TestLeaderboardCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.guild.get_member = MagicMock(return_value=None)
-        leader = RequesterLeader(
+        leader = TopListener(
             requester_id=1,
             requester_name="**boss**\nfake line",
             plays=1,
@@ -511,6 +507,29 @@ class TestLeaderboardQuerySourceRendering:
         )
         assert embed is not None and embed.description is not None
         assert "a*b_c`d" not in embed.description
+
+
+class TestListenerLine:
+    """The whole listener row, pinned byte for byte. -analytics renders its own
+    line from the same TopListener; only this one labels the clock, because a song
+    row here carries the track's own length beside the time spent on it."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        line = leaderboard._line_requester(1, _requester(1), None)
+        assert line == "**1.** <@1> — 1:00:00 listened · 2 songs"
+
+
+class TestSongLine:
+    """The whole song row, pinned byte for byte. -analytics renders its own line
+    from the same TopSong and the two differ by design: only this one carries the
+    host chip, the track's own length and the query-source tail."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        line = leaderboard._line_song(1, _song(1, query_source="spotify.com"))
+        assert line == (
+            "**1.** [Song 1](https://yt.com/v=1) `yt.com` — 6:40 listened · "
+            "2 plays · track 3:30 · via Spotify"
+        )
 
 
 class TestLinkHost:

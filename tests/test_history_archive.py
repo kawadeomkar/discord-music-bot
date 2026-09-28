@@ -31,6 +31,9 @@ from src.guild_state import (
     HeatCell,
     HistoryEntry,
     SourceCompletion,
+    TopArtist,
+    TopListener,
+    TopSong,
     serialize_history_entry,
 )
 from src.history_archive import (
@@ -44,9 +47,7 @@ from src.history_archive import (
     HistoryOutboxDrainer,
     Leaderboard,
     PostgresHistoryArchive,
-    RequesterLeader,
     SchemaVersionError,
-    SongLeader,
     _entry_to_row,
     _row_to_entry,
 )
@@ -722,12 +723,12 @@ class TestLeaderboardQuery:
             board = await archive.leaderboard(42, 10)
         assert board == Leaderboard(
             requesters=(
-                RequesterLeader(
+                TopListener(
                     requester_id=7, requester_name="Omkar", plays=3, played_secs=900
                 ),
             ),
             songs=(
-                SongLeader(
+                TopSong(
                     title="Song",
                     webpage_url="https://yt.com/v=1",
                     duration_secs=210,
@@ -737,15 +738,6 @@ class TestLeaderboardQuery:
                 ),
             ),
         )
-
-    def test_rows_are_frozen_and_keyword_only(self) -> None:
-        row = RequesterLeader(
-            requester_id=1, requester_name="x", plays=1, played_secs=1
-        )
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(row, "plays", 2)
-        with pytest.raises(TypeError):
-            SongLeader("t", "u", 1, 1, 1)  # pyright: ignore[reportCallIssue]
 
 
 class TestPostgresArchiveClosedGuard:
@@ -2760,9 +2752,23 @@ class TestAnalyticsQuery:
         assert m.wait_pcts == (1.0, 2.0, 3.5, 9.0, 40.0)
         assert m.wait_p50_secs == 3.5
         assert m.livestream_plays == 1
-        assert m.top_listeners[0].requester_name == "Ann"
-        assert m.top_artists[0].uploader == "Lofi Girl"
-        assert m.top_songs[0].title == "Song"
+        assert m.top_listeners == (
+            TopListener(requester_id=7, requester_name="Ann", plays=2, played_secs=400),
+        )
+        assert m.top_artists == (
+            TopArtist(uploader="Lofi Girl", plays=1, played_secs=200),
+        )
+        # Whole rows, so duration_secs stays pinned at 0: the -analytics SQL does
+        # not select it, and analytics_card._WIRE drops it on that promise.
+        assert m.top_songs == (
+            TopSong(
+                title="Song",
+                webpage_url="https://y/1",
+                query_source="search",
+                plays=2,
+                played_secs=400,
+            ),
+        )
 
     async def test_a_null_jsonb_branch_does_not_raise(self) -> None:
         """Every branch is coalesce(..., '[]') in SQL precisely so this cannot

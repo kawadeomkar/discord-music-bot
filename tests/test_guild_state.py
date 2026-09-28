@@ -37,6 +37,8 @@ from src.guild_state import (
     SearchQueueEntry,
     SongQueueEntry,
     StateField,
+    TopListener,
+    TopSong,
     parse_history_entry,
     parse_queue_entry,
     serialize_history_entry,
@@ -2149,6 +2151,45 @@ class TestQueueEntryImmutability:
         entry = SearchQueueEntry()
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(entry, "url", "x")
+
+
+class TestSharedBoardRows:
+    """The two rows -analytics and -leaderboard share. A column that goes
+    missing from either mapper has to be a TypeError there, not a board row
+    that renders 0:00 listened, which is what makes the fields required — and
+    keyword-only, so two same-typed columns cannot transpose."""
+
+    def test_both_rows_are_frozen(self) -> None:
+        listener = TopListener(
+            requester_id=1, requester_name="x", plays=1, played_secs=1
+        )
+        song = TopSong(
+            title="t", webpage_url="u", query_source="search", plays=1, played_secs=1
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(listener, "plays", 2)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(song, "plays", 2)
+
+    def test_both_rows_are_keyword_only(self) -> None:
+        with pytest.raises(TypeError):
+            TopListener(1, "x", 1, 1)  # pyright: ignore[reportCallIssue]
+        with pytest.raises(TypeError):
+            TopSong("t", "u", "search", 1, 1)  # pyright: ignore[reportCallIssue]
+
+    def test_duration_secs_is_the_only_row_field_with_a_default(self) -> None:
+        listener = {
+            f.name
+            for f in dataclasses.fields(TopListener)
+            if f.default is not dataclasses.MISSING
+        }
+        song = {
+            f.name
+            for f in dataclasses.fields(TopSong)
+            if f.default is not dataclasses.MISSING
+        }
+        assert listener == set()
+        assert song == {"duration_secs"}
 
 
 class TestCrashedPositionUsesTheHeartbeat:

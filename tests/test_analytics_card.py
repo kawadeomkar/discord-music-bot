@@ -8,6 +8,7 @@ test_leaderboard.py and test_debug.py already make.
 
 import asyncio
 import contextlib
+import dataclasses
 import time
 from concurrent.futures.process import BrokenProcessPool
 from collections.abc import AsyncIterator
@@ -239,6 +240,22 @@ class TestCacheCodec:
         blob["daily"] = [{"date": "2026-08-27", "plays": 1, "listen_secs": 1}]
         assert analytics_card.from_cache(blob) is None
 
+    def test_the_song_rows_wire_tuple_is_pinned(self) -> None:
+        """TopSong carries duration_secs for -leaderboard, which this card never
+        renders, so the tuple deliberately leaves it out. query_source has no
+        renderer here either, and rides the wire because the row requires it.
+        Pinned because widening the tuple changes the cached shape, and
+        _CACHE_VERSION would have to move with it."""
+        cls, fields = analytics_card._WIRE["top_songs"]
+        assert cls is TopSong
+        assert fields == (
+            "title",
+            "webpage_url",
+            "query_source",
+            "plays",
+            "played_secs",
+        )
+
     def test_every_metrics_field_is_carried(self) -> None:
         """A new field that to_cache forgets survives a round trip as its DEFAULT,
         so the cached card silently differs from the fresh one. Compares against the
@@ -247,6 +264,24 @@ class TestCacheCodec:
             set(analytics_card._SCALARS) | set(analytics_card._WIRE) | {"wait_pcts"}
         )
         assert carried == set(AnalyticsMetrics.__dataclass_fields__)
+
+    def test_every_row_field_is_carried_or_named_as_dropped(self) -> None:
+        """The same comparison one level down. TopListener and TopSong are also
+        -leaderboard's rows, so a field added there for that board would otherwise
+        round trip as its default here and digest the same as the fresh card. A
+        dropped field has to be a DEFAULTED one: from_cache builds the row from
+        the tuple alone, so dropping a required field is a TypeError it swallows
+        into a permanent miss."""
+        dropped = {"top_songs": {"duration_secs"}}
+        for key, (cls, fields) in analytics_card._WIRE.items():
+            carried = set(fields) | dropped.get(key, set())
+            assert carried == set(cls.__dataclass_fields__), key
+            defaulted = {
+                f.name
+                for f in dataclasses.fields(cls)
+                if f.default is not dataclasses.MISSING
+            }
+            assert dropped.get(key, set()) <= defaulted, key
 
 
 class TestEmbed:
@@ -360,6 +395,39 @@ class TestEmbed:
         assert "0s" not in desc
 
 
+class TestListenerLine:
+    """The whole listener row, pinned byte for byte. -leaderboard renders its own
+    line from the same TopListener and labels its clock "listened"; no row on this
+    card carries a second clock, so the bare duration reads unambiguously here."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        listener = TopListener(
+            requester_id=7, requester_name="Ann", plays=133, played_secs=20_000
+        )
+        assert analytics_card._line_listener(1, listener, None) == (
+            "**1.** <@7> — 5:33:20 · 133 songs"
+        )
+
+
+class TestSongLine:
+    """The whole song row, pinned byte for byte. -leaderboard renders its own line
+    from the same TopSong; this one carries no host chip, no query source and no
+    track length, so duration_secs never reaches it."""
+
+    def test_the_rendered_row_is_exact(self) -> None:
+        song = TopSong(
+            title="Know My Name",
+            webpage_url="https://yt.com/v=1",
+            query_source="search",
+            plays=3,
+            played_secs=600,
+            duration_secs=210,
+        )
+        assert analytics_card._line_song(1, song) == (
+            "**1.** [Know My Name](https://yt.com/v=1) — 10:00 · 3 plays"
+        )
+
+
 class TestEmbedSafety:
     """Every string on this card comes from the archive, where title, uploader and
     requester_name are bare `text` columns with no CHECK and HistoryEntry strips only
@@ -381,7 +449,9 @@ class TestEmbedSafety:
                     TopSong(
                         title="a](https://evil.example)[b",
                         webpage_url="https://yt.com/v=1",
+                        query_source="search",
                         plays=1,
+                        played_secs=10,
                     ),
                 )
             )
@@ -394,7 +464,12 @@ class TestEmbedSafety:
         embed = analytics_card.build_embed(
             _metrics(
                 top_listeners=(
-                    TopListener(requester_id=7, requester_name="**bold**", plays=1),
+                    TopListener(
+                        requester_id=7,
+                        requester_name="**bold**",
+                        plays=1,
+                        played_secs=10,
+                    ),
                 )
             ),
             guild=guild,
@@ -417,7 +492,17 @@ class TestEmbedSafety:
         no CHECK either. A paren, whitespace or control character ends the markdown
         early and leaks the rest of the line."""
         embed = analytics_card.build_embed(
-            _metrics(top_songs=(TopSong(title="T", webpage_url=url, plays=1),))
+            _metrics(
+                top_songs=(
+                    TopSong(
+                        title="T",
+                        webpage_url=url,
+                        query_source="search",
+                        plays=1,
+                        played_secs=10,
+                    ),
+                )
+            )
         )
         assert "[T](" not in (embed.description or "")
 
@@ -425,7 +510,17 @@ class TestEmbedSafety:
         """A blank title is a real archived value, and an empty masked-link label
         renders as an invisible link."""
         embed = analytics_card.build_embed(
-            _metrics(top_songs=(TopSong(title="", webpage_url="https://y/1", plays=1),))
+            _metrics(
+                top_songs=(
+                    TopSong(
+                        title="",
+                        webpage_url="https://y/1",
+                        query_source="search",
+                        plays=1,
+                        played_secs=10,
+                    ),
+                )
+            )
         )
         assert "[Unknown](https://y/1)" in (embed.description or "")
 
@@ -438,7 +533,12 @@ class TestEmbedSafety:
         embed = analytics_card.build_embed(
             _metrics(
                 top_listeners=tuple(
-                    TopListener(requester_id=0, requester_name=long, plays=999_999)
+                    TopListener(
+                        requester_id=0,
+                        requester_name=long,
+                        plays=999_999,
+                        played_secs=999_999,
+                    )
                     for _ in range(TOP_N)
                 ),
                 top_artists=tuple(
@@ -449,6 +549,7 @@ class TestEmbedSafety:
                     TopSong(
                         title=long,
                         webpage_url="https://yt.com/" + "u" * 130,
+                        query_source="search",
                         plays=999_999,
                         played_secs=999_999,
                     )
