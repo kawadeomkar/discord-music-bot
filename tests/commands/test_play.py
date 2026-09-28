@@ -2678,6 +2678,46 @@ class TestPlacementInsertsAndConfirmations:
         assert queue.display_items()[0] is filled
         assert tracks[0].duration is None, "the caller's object was written"
 
+    async def test_a_front_warm_that_produced_nothing_leaves_the_slot_alone(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """prefetch_stream answers None when an extraction was attempted and
+        produced nothing — there is no back-fill to swap in. Swapping anyway puts
+        that None in the queue, where the head is what the loop plays next."""
+        tracks = [
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Track {i}",
+                requester=mock_ctx.author,
+            )
+            for i in range(2)
+        ]
+        source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
+        mp = mock_mp()
+        queue = GuildQueue(MagicMock(spec=discord.Guild), None)
+        mp.queue = queue
+        mp.queue_put_next = AsyncMock(
+            side_effect=lambda items, **_: seed_queue(queue, *items)
+        )
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=None)):
+            await play_pipeline.enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedPlaylist(tracks=tracks),
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                placement=Placement.NEXT,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                cog=music_bot,
+            )
+
+        head = queue.display_items()[0]
+        assert isinstance(head, QueueObject)
+        assert head.webpage_url == tracks[0].webpage_url
+
     @pytest.mark.parametrize(
         "placement,warmed",
         [
