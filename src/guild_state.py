@@ -658,8 +658,8 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Ask-time analytics. FLAT on the wire although they group as Analytics in
-    # memory. Absent on pre-feature entries → 0 defaults.
+    # Ask-time analytics, named as the item's fields are. Absent on pre-feature
+    # entries → 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
     # Parse-time classification (see sources.py).
@@ -702,7 +702,7 @@ class SongQueueEntry:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
-    # Ask-time analytics (0 = unknown / played immediately), see Analytics.
+    # Ask-time analytics (0 = unknown / played immediately), see QueueObject.
     queued_at: float = 0.0
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
@@ -736,8 +736,8 @@ class SongQueueEntry:
             interjected=item.interjected,
             is_resume=item.is_resume,
             start_paused=item.start_paused,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
             query_source=item.query_source,
             played_at=item.played_at,
             np_message_id=item.np_message_id,
@@ -1067,8 +1067,8 @@ class HistoryEntry:
             played_at=item.played_at,
             message_id=item.np_message_id,
             channel_id=item.np_channel_id,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
             query_source=item.query_source,
         )
 

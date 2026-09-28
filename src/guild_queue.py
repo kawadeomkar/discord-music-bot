@@ -40,7 +40,7 @@ from src.guild_state import SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import is_link, unwrap
 from src.util import get_logger
-from src.queue_item import Analytics, QueueObject
+from src.queue_item import QueueObject
 
 log = get_logger(__name__)
 
@@ -828,9 +828,6 @@ class GuildQueue:
             )
         if requester is None:
             return None
-        analytics = Analytics(
-            queued_at=entry.queued_at, queue_position=entry.queue_position
-        )
         return QueueObject(
             webpage_url=entry.webpage_url,
             title=entry.title,
@@ -844,7 +841,8 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
-            analytics=analytics,
+            queued_at=entry.queued_at,
+            queue_position=entry.queue_position,
             query_source=entry.query_source,
             played_at=entry.played_at,
             # No np_host_ref: a live Message cannot survive a restart, so a

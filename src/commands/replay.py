@@ -12,7 +12,7 @@ from opentelemetry import trace
 
 from src.commands._common import NOTHING_PLAYING
 from src.guild_queue import is_replay_of
-from src.queue_item import Analytics, QueueObject
+from src.queue_item import QueueObject
 from src.musicplayer import MusicPlayer
 from src.telemetry import get_tracer
 from src.util import (
@@ -85,13 +85,14 @@ async def replay_current(
     vc: discord.VoiceClient,
     *,
     requester: Union[discord.User, discord.Member],
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
 ) -> Optional[ReplayOutcome]:
     """Play `mp`'s live song again from `0:00`: front-insert a copy with no `ts`,
     persisted like any front insert, resolve it through the loop's prefetch, then stop
-    the song. `requester` and `analytics` are the caller's. None when nothing is live,
-    there is no URL to rebuild from, or the song stopped being live while the copy
-    resolved. See docs/ARCHITECTURE.md#-replay."""
+    the song. `requester`, `queued_at` and `queue_position` are the caller's. None
+    when nothing is live, there is no URL to rebuild from, or the song stopped being
+    live while the copy resolved. See docs/ARCHITECTURE.md#-replay."""
     current = mp.current_song
     if current is None or not current.webpage_url:
         return None
@@ -114,7 +115,8 @@ async def replay_current(
         duration=current.duration_secs or None,
         uploader=current.uploader,
         thumbnail=current.thumbnail,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
         # Renders the queue card as a replay for the window before the loop
         # dequeues it.
         is_replay=True,
@@ -309,9 +311,8 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
             # The replay is this caller's ask: the requester column and the ask-time
             # analytics both name them.
             requester=ctx.author,
-            analytics=Analytics(
-                queued_at=ctx.message.created_at.timestamp(), queue_position=0
-            ),
+            queued_at=ctx.message.created_at.timestamp(),
+            queue_position=0,
         )
         if outcome is None:
             # The song stopped being live while the replay resolved — distinct from

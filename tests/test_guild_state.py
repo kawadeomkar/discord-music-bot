@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
-from src.queue_item import Analytics, QueueObject
+from src.queue_item import QueueObject
 from src.youtube import YTDL
 from tests.helpers import give_queue_object
 from src.guild_state import (
@@ -719,7 +719,8 @@ class TestSongQueueEntryWire:
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
             requester=_requester_stub(222222222222222222),
-            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+            queued_at=1752530000.5,
+            queue_position=4,
         )
         entry = SongQueueEntry.from_queue_object(item)
         parsed = parse_queue_entry(entry.to_redis())
@@ -1252,7 +1253,8 @@ def _history_song_stub(**overrides: Any) -> YTDL:
     source, the ask on the queue object it holds."""
     ask: dict = dict(
         requester=SimpleNamespace(id=333, display_name="Omkar"),
-        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
+        queued_at=1752529000.0,
+        queue_position=2,
         query_source="youtube.com",
         played_at=1752530000.0,
     )
@@ -1407,7 +1409,8 @@ def _played_tail(**overrides: Any) -> QueueObject:
         uploader="Chan",
         thumbnail="https://img/x.jpg",
         is_resume=True,
-        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
+        queued_at=1752529000.0,
+        queue_position=2,
         query_source="youtube.com",
         played_at=1752530000.0,
     )
@@ -1518,7 +1521,8 @@ class TestSongQueueEntryFromSong:
             user_input="https://open.spotify.com/playlist/abc",
             query_source="spotify.com",
             interjected=True,
-            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+            queued_at=1752530000.5,
+            queue_position=4,
             played_at=1752530111.0,
         )
 
@@ -1597,7 +1601,8 @@ class TestCrashedSongRoundTrip:
         song.user_input = "https://open.spotify.com/playlist/xyz"
         song.query_source = "spotify.com"
         song.played_at = 1234.5
-        song.analytics = Analytics(queued_at=99.0, queue_position=3)
+        song.queued_at = 99.0
+        song.queue_position = 3
         for k, v in over.items():
             setattr(song, k, v)
         return song

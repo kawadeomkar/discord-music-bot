@@ -26,7 +26,6 @@ from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_history import GuildHistory
 
 from src.guild_queue import GuildQueue, RemoveMode
-from src.queue_item import ANALYTICS_ZERO, Analytics
 from src.guild_state import (
     DEFAULT_TIMEZONE,
     ConfigField,
@@ -62,6 +61,7 @@ from src.util import (
 from src.queue_item import NpHostRef, QueueObject
 from src.youtube import YTDL
 from tests.helpers import (
+    ask_of,
     REPLAY_ASK,
     described,
     give_queue_object,
@@ -4516,7 +4516,8 @@ class TestEnqueueDepth:
         current.duration_secs = 300
         current.user_input = album
         current.query_source = "spotify.com"
-        current.analytics = ANALYTICS_ZERO
+        current.queued_at = 0.0
+        current.queue_position = 0
         current.played_at = 1.0
         current.interjected = False
         current.is_resume = False
@@ -4618,9 +4619,7 @@ class TestEnqueueDepth:
         # A Spotify playlist track sat in the queue as a search; _resolve_source
         # threads its ask-time analytics into yt_source, which is REQUIRED to
         # take it — there is no post-copy left to forget.
-        source = unresolved(
-            "a song", analytics=Analytics(queued_at=1752530000.5, queue_position=4)
-        )
+        source = unresolved("a song", queued_at=1752530000.5, queue_position=4)
         resolved = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="One",
@@ -4638,9 +4637,9 @@ class TestEnqueueDepth:
             61,
             "",
         )
-        assert out.analytics == source.analytics
+        assert ask_of(out) == ask_of(source)
         assert spy.await_args is not None
-        assert spy.await_args.kwargs["analytics"] == source.analytics
+        assert {k: spy.await_args.kwargs[k] for k in ask_of(source)} == ask_of(source)
 
     async def test_resolved_search_passes_its_query_source_through(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -11712,7 +11711,7 @@ class TestInterject:
         assert tail.user_input == "https://open.spotify.com/playlist/abc"
         assert tail.query_source == "spotify.com"
         assert tail.played_at == 1234.5
-        assert tail.analytics == song.analytics
+        assert ask_of(tail) == ask_of(song)
         assert tail.interjected is True
         assert tail.duration == song.duration_secs
         assert tail.uploader == song.uploader
@@ -11806,20 +11805,19 @@ class TestInterject:
         # carrying the depth-0 analytics the command minted at dispatch, and the tail
         # is the same play, so it keeps the interrupted song's.
         interject_obj = dataclasses.replace(
-            interject_obj, analytics=Analytics(queued_at=1752530500.5, queue_position=0)
+            interject_obj, queued_at=1752530500.5, queue_position=0
         )
         live_song.elapsed_secs = 42.0
-        live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=5)
+        live_song.queued_at = 1752530000.5
+        live_song.queue_position = 5
         music_player.current_song = live_song
 
         await music_player.interject(interject_obj, mock_vc)
 
-        assert interject_obj.analytics == Analytics(
-            queued_at=1752530500.5, queue_position=0
-        )
+        assert ask_of(interject_obj) == {"queued_at": 1752530500.5, "queue_position": 0}
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
-        assert resume.analytics is live_song.analytics
+        assert ask_of(resume) == ask_of(live_song)
 
     async def test_resume_tail_inherits_the_query_source(
         self,
@@ -12123,7 +12121,8 @@ class TestInterject:
         live_song.is_resume = True  # this fragment is itself a resumed tail
         live_song.elapsed_secs = 95.0
         live_song.played_at = 1752530000.5
-        live_song.analytics = Analytics(queued_at=1752529000.5, queue_position=4)
+        live_song.queued_at = 1752529000.5
+        live_song.queue_position = 4
         music_player.current_song = live_song
 
         await music_player.interject(interject_obj, mock_vc)
@@ -12131,7 +12130,7 @@ class TestInterject:
         tail = music_player.queue.display_items()[1]
         assert isinstance(tail, QueueObject)
         assert tail.played_at == 1752530000.5
-        assert (tail.analytics.queued_at, tail.analytics.queue_position) == (
+        assert (tail.queued_at, tail.queue_position) == (
             1752529000.5,
             4,
         )
@@ -12796,7 +12795,8 @@ class TestNeutralizePrefetch:
             persisted=False,
             played_at=12.5,
             is_replay=True,
-            analytics=Analytics(queued_at=99.0, queue_position=3),
+            queued_at=99.0,
+            queue_position=3,
             np_message_id=11,
             np_channel_id=12,
             np_dedicated=True,
@@ -13013,12 +13013,15 @@ class TestNeutralizePrefetch:
             webpage_url="https://yt.com/v=orig",
             title="Interrupted Song",
             requester=mock_author,
-            analytics=Analytics(queued_at=1752530000.5, queue_position=6),
+            queued_at=1752530000.5,
+            queue_position=6,
         )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
 
-        live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=6)
+        live_song.queued_at = 1752530000.5
+
+        live_song.queue_position = 6
         live_song.cleanup = MagicMock()
 
         async def _done() -> MagicMock:
@@ -13032,7 +13035,7 @@ class TestNeutralizePrefetch:
 
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
-        assert (rebuilt.analytics.queued_at, rebuilt.analytics.queue_position) == (
+        assert (rebuilt.queued_at, rebuilt.queue_position) == (
             1752530000.5,
             6,
         )
@@ -14448,7 +14451,7 @@ class TestReplayLoopStart:
                     music_player,
                     vc,
                     requester=mocked(queue_obj.requester),
-                    analytics=REPLAY_ASK,
+                    **REPLAY_ASK,
                 )
 
         music_player.play_next.wait = AsyncMock(side_effect=wait_then_replay)
@@ -14653,7 +14656,7 @@ class TestReplayAgainstTheRealLoop:
                 GuildRedisStore, "push_queue_front", new=_push_while_the_song_ends
             ):
                 outcome = await replay_cmd.replay_current(
-                    music_player, vc, requester=mock_author, analytics=REPLAY_ASK
+                    music_player, vc, requester=mock_author, **REPLAY_ASK
                 )
             async with asyncio.timeout(5):
                 await loop
@@ -14690,7 +14693,7 @@ class TestReplayAgainstTheRealLoop:
                 patch("src.commands.replay._REPLAY_RESOLVE_TIMEOUT", 0.01),
             ):
                 await replay_cmd.replay_current(
-                    music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                    music_player, mock_vc, requester=replayer, **REPLAY_ASK
                 )
             assert music_player._prefetch_task is other
         finally:
