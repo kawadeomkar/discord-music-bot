@@ -672,7 +672,8 @@ class TestPlayWhilePaused:
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
         mp.interject.assert_awaited_once()
-        assert mp.interject.await_args.args[0] is tracks[0]
+        head = mp.interject.await_args.args[0]
+        assert (head.webpage_url, head.interjected) == (tracks[0].webpage_url, True)
         # The tail rides along rather than being dropped on the floor.
         assert mp.interject.await_args.kwargs["follow_on"] == tracks[1:]
 
@@ -1587,16 +1588,23 @@ class TestNowFlag:
 
         await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
-        assert qobj.interjected is True
         # The origin reaches the song through yt_source's required user_input, not
         # a post-hoc assignment — so with queue_source mocked out, assert it was
         # PASSED. A real yt_source stamps it (see test_youtube).
         origin_call = play_pipeline.queue_source.await_args
         assert origin_call is not None
         assert origin_call.kwargs["origin"] == "test"
-        live_mp.interject.assert_awaited_once_with(
-            qobj, live_vc, resume_paused=True, follow_on=[]
-        )
+        live_mp.interject.assert_awaited_once()
+        head, vc_arg = live_mp.interject.await_args.args
+        # The head interject() is handed carries the marker; the resolve's own
+        # object is left as it came.
+        assert head.webpage_url == qobj.webpage_url
+        assert head.interjected is True
+        assert vc_arg is live_vc
+        assert live_mp.interject.await_args.kwargs == {
+            "resume_paused": True,
+            "follow_on": [],
+        }
         # Confirmation embed names both songs and the resume position.
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Urgent" in embed.title
@@ -1802,8 +1810,7 @@ class TestNowFlag:
         """`interjected` means "this song cut the line": true of the head, not of the
         tracks behind it. It is attribution only (a span attribute), so marking them
         all would quietly file every track of a 500-song `--now` as an interjection."""
-        # Captured AT the call: the marker is a mutable field, and the
-        # interject-returned-None path deliberately clears the head's afterwards.
+        # Captured at the call: the marker rides the head interject() is handed.
         marks: list[list[bool]] = []
 
         async def _record(qobj: QueueObject, _vc: Any, **kw: Any) -> None:
@@ -1921,7 +1928,8 @@ class TestNowFlag:
         ys.assert_awaited_once()
         assert ys.call_args.args[1] == "ytsearch:First Song"
         live_mp.interject.assert_awaited_once()
-        assert live_mp.interject.call_args.args[0] is qobj
+        head = live_mp.interject.call_args.args[0]
+        assert (head.webpage_url, head.interjected) == (qobj.webpage_url, True)
         # Only the HEAD is resolved to a playable song: the rest stay lazy YouTube
         # searches, which is what keeps a 100-track album from paying 100 searches
         # before a note is heard.
@@ -1966,7 +1974,8 @@ class TestNowFlag:
             )
 
         live_mp.interject.assert_awaited_once()
-        assert live_mp.interject.call_args.args[0] is first
+        head = live_mp.interject.call_args.args[0]
+        assert (head.webpage_url, head.interjected) == (first.webpage_url, True)
 
     async def test_error_shows_command_error(
         self,
@@ -2022,7 +2031,10 @@ class TestNowFlag:
         with patch("src.play_pipeline.YTDL.prefetch_stream", new=prefetch):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
-        prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
+        assert prefetch.await_args is not None
+        (warmed,) = prefetch.await_args.args
+        assert (warmed.webpage_url, warmed.interjected) == (qobj.webpage_url, True)
+        assert prefetch.await_args.kwargs == {"redis": music_bot.redis}
         assert order == ["prefetch", "interject"]
 
     async def test_the_prefetch_settles_before_the_place_lock(
@@ -2346,7 +2358,11 @@ class TestPlacementInsertsAndConfirmations:
         mp.interject.assert_not_awaited()
         single_call = play_pipeline.enqueue_single.await_args
         assert single_call is not None
-        assert single_call.args[1] is tracks[0]
+        # The head reaches the append with the interjection marker taken off.
+        assert (single_call.args[1].webpage_url, single_call.args[1].interjected) == (
+            tracks[0].webpage_url,
+            False,
+        )
         # Behind the head, through the same insert, so the two land in order.
         assert list(single_call.kwargs["follow_on"]) == tracks[1:]
         # And SAID so. Queueing a playlist behind a reply that names one song is
@@ -2494,7 +2510,8 @@ class TestPlacementInsertsAndConfirmations:
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
         mp.interject.assert_awaited_once()
-        assert mp.interject.await_args.args[0] is tracks[0]
+        head = mp.interject.await_args.args[0]
+        assert (head.webpage_url, head.interjected) == (tracks[0].webpage_url, True)
         assert list(mp.interject.await_args.kwargs["follow_on"]) == tracks[1:]
         sent = mock_ctx.send.await_args_list + mock_ctx.send.call_args_list
         notices = [

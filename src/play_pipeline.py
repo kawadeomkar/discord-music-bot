@@ -1056,7 +1056,7 @@ async def interject_flow(
             await ctx.send(embed=notice_embed(refusal, discord.Color.red()))
             return
         # The head only: `interjected` is attribution, which song cut the line.
-        qobj.interjected = True
+        qobj = replace(qobj, interjected=True)
 
         # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
         # the interrupt and the new song, and the current song plays through the wait.
@@ -1090,11 +1090,11 @@ async def interject_flow(
                 if outcome is None:
                     # The song ended during the resolve, so this interrupted nothing:
                     # the marker comes off and the song front-inserts instead.
-                    qobj.interjected = False
                     # interject() also returns None when the loop moved on to a
                     # DIFFERENT song, which this insert waits behind: depth 1.
                     qobj = replace(
                         qobj,
+                        interjected=False,
                         analytics=replace(
                             qobj.analytics, queue_position=front_insert_depth(mp)
                         ),
@@ -1109,7 +1109,7 @@ async def interject_flow(
         if resumed:
             # Clear the marker: a queued song must not trigger replace semantics
             # later. The interjection's 0 is replaced at the insert.
-            qobj.interjected = False
+            qobj = replace(qobj, interjected=False)
             note = (
                 collection_note(
                     url,
