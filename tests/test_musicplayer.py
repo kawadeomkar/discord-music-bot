@@ -127,7 +127,12 @@ def _loop_song() -> MagicMock:
     # requeue rebuilds replace() off it, truthy MagicMock flags would trip the
     # loop's start_paused/is_resume gates, and the analytics, query_source,
     # played_at and retry-budget reads all raise on a MagicMock.
-    give_queue_object(song, QueueObject(song.webpage_url, song.title, stub_requester()))
+    give_queue_object(
+        song,
+        QueueObject(
+            webpage_url=song.webpage_url, title=song.title, requester=stub_requester()
+        ),
+    )
     return song
 
 
@@ -283,7 +288,11 @@ class TestQueuePut:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(4):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
         assert music_player.queue.qsize() == 4
         assert len(music_player.queue._items) == 4
@@ -416,7 +425,9 @@ class TestQueuePutNext:
         """The headline case, and the common one: a song is playing and B is
         queued, so the prefetch already owns B. Without the neutralize the new
         song plays after B rather than before it."""
-        first = QueueObject("https://yt.com/v=b", "B", mock_author)
+        first = QueueObject(
+            webpage_url="https://yt.com/v=b", title="B", requester=mock_author
+        )
         await music_player.queue.put([first])
         claimed = asyncio.Event()
 
@@ -436,7 +447,9 @@ class TestQueuePutNext:
             # The claim is real: B has left the pending region entirely.
             assert music_player.queue.qsize() == 0
 
-            newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
+            newcomer = QueueObject(
+                webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+            )
             await music_player.queue_put_next(newcomer, prefetch=False)
 
         assert self._titles(music_player) == ["X", "B"]
@@ -448,7 +461,9 @@ class TestQueuePutNext:
         """A finished prefetch bypasses the queue entirely — it would have played
         INSTEAD of the insert. Its rebuilt equivalent goes back behind the
         newcomer, and its FFmpeg subprocess is killed rather than leaked."""
-        original = QueueObject("https://yt.com/v=b", "B", mock_author)
+        original = QueueObject(
+            webpage_url="https://yt.com/v=b", title="B", requester=mock_author
+        )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
         live_song.cleanup = MagicMock()
@@ -460,7 +475,9 @@ class TestQueuePutNext:
         await task
         music_player._prefetch_task = task
 
-        newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
+        newcomer = QueueObject(
+            webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+        )
         await music_player.queue_put_next(newcomer, prefetch=False)
 
         live_song.cleanup.assert_called_once()
@@ -474,10 +491,17 @@ class TestQueuePutNext:
         start and orphan a task with a claim nothing settles; the one-song gap is
         accepted, as interject() accepts it."""
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=b", "B", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=b", title="B", requester=mock_author
+                )
+            ]
         )
         await music_player.queue_put_next(
-            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+            QueueObject(
+                webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+            ),
+            prefetch=False,
         )
         assert music_player._prefetch_task is None
 
@@ -487,11 +511,20 @@ class TestQueuePutNext:
         music_player._prefetch_task = None
         for title in ("B", "C"):
             await music_player.queue.put(
-                [QueueObject(f"https://yt.com/v={title}", title, mock_author)]
+                [
+                    QueueObject(
+                        webpage_url=f"https://yt.com/v={title}",
+                        title=title,
+                        requester=mock_author,
+                    )
+                ]
             )
 
         await music_player.queue_put_next(
-            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+            QueueObject(
+                webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+            ),
+            prefetch=False,
         )
 
         assert self._titles(music_player) == ["X", "B", "C"]
@@ -502,7 +535,10 @@ class TestQueuePutNext:
         """ "Play next" and "play" are the same request when nothing is queued —
         which is what lets --next need no special case for an idle bot."""
         await music_player.queue_put_next(
-            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+            QueueObject(
+                webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+            ),
+            prefetch=False,
         )
         assert self._titles(music_player) == ["X"]
 
@@ -514,11 +550,18 @@ class TestQueuePutNext:
         crash."""
         assert music_player.store is not None
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=b", "B", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=b", title="B", requester=mock_author
+                )
+            ]
         )
 
         await music_player.queue_put_next(
-            QueueObject("https://yt.com/v=x", "X", mock_author), prefetch=False
+            QueueObject(
+                webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+            ),
+            prefetch=False,
         )
 
         stored = [
@@ -533,7 +576,9 @@ class TestQueuePutNext:
         """The prefetch it suppresses is loop()'s queue-claiming one. This one only
         writes ytdl:stream:*, and it is what keeps the neutralize affordable: the
         song about to play is warmed even though no claim is held for it."""
-        newcomer = QueueObject("https://yt.com/v=x", "X", mock_author)
+        newcomer = QueueObject(
+            webpage_url="https://yt.com/v=x", title="X", requester=mock_author
+        )
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
         ) as mock_pf:
@@ -555,7 +600,11 @@ class TestQueueClear:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(3):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
         assert music_player.queue.qsize() == 3
 
@@ -566,7 +615,11 @@ class TestQueueClear:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(3):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
         assert len(music_player.queue._items) == 3
 
@@ -596,7 +649,11 @@ class TestQueueClear:
     ) -> None:
         """queue_clear() returns the song_queue display strings for the cleared songs."""
         qobjs = [
-            QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             for i in range(3)
         ]
         for q in qobjs:
@@ -626,9 +683,9 @@ class TestQueueClearFlushesPlayedSongs:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         tail = QueueObject(
-            "https://yt.com/v=heard",
-            "Heard Song",
-            mock_author,
+            webpage_url="https://yt.com/v=heard",
+            title="Heard Song",
+            requester=mock_author,
             ts=95,
             duration=240,
             is_resume=True,
@@ -651,9 +708,9 @@ class TestQueueClearFlushesPlayedSongs:
         a play destroyed before its tail could finish is still traceable back to
         the message that carried its bar."""
         tail = QueueObject(
-            "https://yt.com/v=heard",
-            "Heard",
-            mock_author,
+            webpage_url="https://yt.com/v=heard",
+            title="Heard",
+            requester=mock_author,
             ts=95,
             is_resume=True,
             played_at=1752530000.0,
@@ -677,7 +734,11 @@ class TestQueueClearFlushesPlayedSongs:
         # played_at stays 0.0: an ordinary queued song was never heard, and
         # recording it would invent a play out of a cancelled one.
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=never", "Never Played", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=never",
+                title="Never Played",
+                requester=mock_author,
+            )
         )
         await music_player.queue_put(unresolved("some song"))
 
@@ -690,11 +751,19 @@ class TestQueueClearFlushesPlayedSongs:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         played = QueueObject(
-            "https://yt.com/v=heard", "Heard", mock_author, ts=30, played_at=1.0
+            webpage_url="https://yt.com/v=heard",
+            title="Heard",
+            requester=mock_author,
+            ts=30,
+            played_at=1.0,
         )
         await music_player.queue_put(played)
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=queued", "Queued", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=queued",
+                title="Queued",
+                requester=mock_author,
+            )
         )
         await music_player.queue_put(unresolved("lazy song", mock_author))
 
@@ -711,7 +780,12 @@ class TestQueueClearFlushesPlayedSongs:
         error path. Swallowed, -clear would reply "queue cleared" over plays it
         dropped — and the queue is already gone by then, so nothing could retry."""
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=heard", "Heard", mock_author, played_at=1.0)
+            QueueObject(
+                webpage_url="https://yt.com/v=heard",
+                title="Heard",
+                requester=mock_author,
+                played_at=1.0,
+            )
         )
         # The class, not the instance: GuildHistory has __slots__.
         with patch.object(
@@ -731,9 +805,9 @@ class TestQueueClearFlushesPlayedSongs:
         for the one only queued. Player-level: the cog's tests mock queue_clear."""
         tails = [
             QueueObject(
-                f"https://yt.com/v={n}",
-                f"Song {n}",
-                mock_author,
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"Song {n}",
+                requester=mock_author,
                 ts=30 * n,
                 duration=240,
                 is_resume=True,
@@ -744,7 +818,11 @@ class TestQueueClearFlushesPlayedSongs:
         for tail in tails:
             await music_player.queue_put(tail)
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=next", "Never Heard", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Never Heard",
+                requester=mock_author,
+            )
         )
 
         await music_player.queue_clear()
@@ -767,9 +845,9 @@ class TestQueueClearFlushesPlayedSongs:
         -remove re-serializes the stamped object, and the restart path is then the
         only thing holding those ids."""
         tail = QueueObject(
-            "https://yt.com/v=tail",
-            "Tail",
-            mock_author,
+            webpage_url="https://yt.com/v=tail",
+            title="Tail",
+            requester=mock_author,
             ts=95,
             is_resume=True,
             played_at=1752530001.0,
@@ -800,9 +878,9 @@ class TestQueueClearFlushesPlayedSongs:
         reached through the most-used escape hatch."""
         tails = [
             QueueObject(
-                f"https://yt.com/v={n}",
-                f"Song {n}",
-                mock_author,
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"Song {n}",
+                requester=mock_author,
                 ts=30 * n,
                 is_resume=True,
                 played_at=1752530000.0 + n,
@@ -812,7 +890,11 @@ class TestQueueClearFlushesPlayedSongs:
         for tail in tails:
             await music_player.queue_put(tail)
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=plain", "Plain", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=plain",
+                title="Plain",
+                requester=mock_author,
+            )
         )
         disposed: list[str] = []
 
@@ -837,10 +919,18 @@ class TestQueueClearFlushesPlayedSongs:
         queue_clear() — AFTER clear() destroyed the mirror. The user got "Failed"
         on a queue that was cleared, and every play in the batch was lost."""
         good = QueueObject(
-            "https://yt.com/v=good", "Good", mock_author, ts=30, played_at=1.0
+            webpage_url="https://yt.com/v=good",
+            title="Good",
+            requester=mock_author,
+            ts=30,
+            played_at=1.0,
         )
         bad = QueueObject(
-            "https://yt.com/v=bad", "Bad", mock_author, ts=30, played_at=2.0
+            webpage_url="https://yt.com/v=bad",
+            title="Bad",
+            requester=mock_author,
+            ts=30,
+            played_at=2.0,
         )
         bad.np_message_id = {"nested": "object"}  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -854,7 +944,9 @@ class TestQueueClearFlushesPlayedSongs:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         # The `> 0.0` comparison is itself a raise site on a null or string.
-        item = QueueObject("https://yt.com/v=x", "X", mock_author, ts=30)
+        item = QueueObject(
+            webpage_url="https://yt.com/v=x", title="X", requester=mock_author, ts=30
+        )
         item.played_at = None  # pyright: ignore[reportAttributeAccessIssue]
 
         await music_player._flush_played([item])
@@ -869,9 +961,9 @@ class TestQueueClearFlushesPlayedSongs:
         destroyed it, and the fragment that parked it already declined to record
         itself — so this is the only writer left for 95s the listener heard."""
         tail = QueueObject(
-            "https://yt.com/v=heard",
-            "Heard",
-            mock_author,
+            webpage_url="https://yt.com/v=heard",
+            title="Heard",
+            requester=mock_author,
             ts=95,
             duration=240,
             is_resume=True,
@@ -891,7 +983,9 @@ class TestQueueClearFlushesPlayedSongs:
     ) -> None:
         """The other half of the same gate: a song that never played is not a
         play. played_at == 0.0 is the whole distinction."""
-        song = QueueObject("https://yt.com/v=new", "New", mock_author)
+        song = QueueObject(
+            webpage_url="https://yt.com/v=new", title="New", requester=mock_author
+        )
         await music_player.queue_put(song)
         assert music_player.queue.get_nowait() is song
 
@@ -907,7 +1001,11 @@ class TestQueueClearFlushesPlayedSongs:
         (commit_dequeue refuses and the song is thrown away), which is what
         makes this the ONE record rather than a duplicate of one."""
         tail = QueueObject(
-            "https://yt.com/v=heard", "Heard", mock_author, ts=95, played_at=1.0
+            webpage_url="https://yt.com/v=heard",
+            title="Heard",
+            requester=mock_author,
+            ts=95,
+            played_at=1.0,
         )
         await music_player.queue_put(tail)
         assert music_player.queue.get_nowait() is tail  # dequeued, uncommitted
@@ -929,7 +1027,11 @@ class TestQueueClearFlushesPlayedSongs:
         cleared song, and records it a SECOND time at its iteration end. The
         generation is what a refill cannot forge."""
         tail = QueueObject(
-            "https://yt.com/v=heard", "Heard", mock_author, ts=95, played_at=1.0
+            webpage_url="https://yt.com/v=heard",
+            title="Heard",
+            requester=mock_author,
+            ts=95,
+            played_at=1.0,
         )
         await music_player.queue_put(tail)
         assert music_player.queue.get_nowait() is tail
@@ -940,7 +1042,9 @@ class TestQueueClearFlushesPlayedSongs:
 
         # -play lands while the loop is still inside yt_stream.
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=new", "New", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=new", title="New", requester=mock_author
+            )
         )
 
         async with music_player.queue.commit_dequeue(generation) as committed:
@@ -958,13 +1062,17 @@ class TestQueueClearFlushesPlayedSongs:
         state only the generation can refuse — the prefetch claims the refill, so
         there IS a claim to settle, and without the check the stale commit would
         settle the new song's."""
-        first = QueueObject("https://yt.com/v=first", "First", mock_author)
+        first = QueueObject(
+            webpage_url="https://yt.com/v=first", title="First", requester=mock_author
+        )
         await music_player.queue_put(first)
         assert music_player.queue.get_nowait() is first  # the loop claims
         generation = music_player.queue.generation
 
         await music_player.queue_clear()
-        refill = QueueObject("https://yt.com/v=refill", "Refill", mock_author)
+        refill = QueueObject(
+            webpage_url="https://yt.com/v=refill", title="Refill", requester=mock_author
+        )
         await music_player.queue_put(refill)
         assert music_player.queue.get_nowait() is refill  # the prefetch claims
         assert music_player.queue._cursor == 1  # so try_release() alone would say True
@@ -989,7 +1097,11 @@ class TestQueueShuffle:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(3):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
 
         result = await music_player.queue_shuffle()
@@ -1011,7 +1123,11 @@ class TestQueueShuffle:
         live_song.np_host_ref = None
         for i in range(4):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/watch?v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
         # A prefetch that finished: it claimed the head and its task is done.
         music_player.queue.get_nowait()
@@ -1035,7 +1151,11 @@ class TestQueueShuffle:
         it, so the reorder does not cost the next transition a gap."""
         for i in range(4):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/watch?v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
         music_player.current_song = live_song
         spawned: list[str] = []
@@ -1057,7 +1177,11 @@ class TestQueueShuffle:
         the head of a queue the user may still be editing."""
         for i in range(4):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/watch?v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
         music_player.current_song = None
         assert await music_player.queue_shuffle() == "Shuffled!"
@@ -1072,7 +1196,11 @@ class TestQueueShuffle:
     ) -> None:
         for i in range(3):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/watch?v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
         song = ytdl_instance({"webpage_url": "https://yt.com/watch?v=0"})
         song.cleanup = MagicMock()
@@ -1093,7 +1221,11 @@ class TestQueueShuffle:
     ) -> None:
         for i in range(4):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/watch?v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
         music_player.current_song = live_song
         music_player.mark_retired()
@@ -1112,7 +1244,11 @@ class TestQueueShuffle:
         second task started over it leaves two claims the loop settles one of."""
         await music_player.queue.put(
             [
-                QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
                 for i in range(6)
             ]
         )
@@ -1169,7 +1305,11 @@ class TestQueueShuffle:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(5):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
 
         result = await music_player.queue_shuffle()
@@ -1179,7 +1319,11 @@ class TestQueueShuffle:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(5):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
 
         await music_player.queue_shuffle()
@@ -1194,7 +1338,11 @@ class TestQueueShuffle:
         """Redis must be rebuilt from the re-queued items, not the pre-shuffle drain."""
         assert music_player.store is not None
         for i in range(5):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
 
         await music_player.queue_shuffle()
@@ -1214,11 +1362,18 @@ class TestQueueShuffle:
         written to Redis by a shuffle — it was never RPUSHed there."""
         assert music_player.store is not None
         crashed = QueueObject(
-            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed Song",
+            requester=mock_author,
+            persisted=False,
         )
         seed_queue(music_player.queue, crashed)
         for i in range(4):
-            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/watch?v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
 
         await music_player.queue_shuffle()
@@ -1242,7 +1397,9 @@ class TestQueueRemove:
     async def test_remove_by_webpage_url(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=abc", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=abc", title="Song", requester=mock_author
+        )
         await music_player.queue_put(qobj)
 
         positions = (await music_player.queue_remove("https://yt.com/v=abc")).positions
@@ -1258,7 +1415,10 @@ class TestQueueRemove:
         front of them — before this, the only way to remove that song was to read
         the link off the Now Playing card."""
         qobj = QueueObject(
-            "https://yt.com/v=abc", "Song", mock_author, user_input="my search query"
+            webpage_url="https://yt.com/v=abc",
+            title="Song",
+            requester=mock_author,
+            user_input="my search query",
         )
         await music_player.queue_put(qobj)
 
@@ -1278,9 +1438,9 @@ class TestQueueRemove:
         await music_player.queue_put(
             [
                 QueueObject(
-                    f"https://yt.com/v={n}",
-                    f"Track {n}",
-                    mock_author,
+                    webpage_url=f"https://yt.com/v={n}",
+                    title=f"Track {n}",
+                    requester=mock_author,
                     user_input=album,
                     query_source="spotify.com",
                 )
@@ -1288,9 +1448,9 @@ class TestQueueRemove:
             ]
             + [
                 QueueObject(
-                    "https://yt.com/v=other",
-                    "Other",
-                    mock_author,
+                    webpage_url="https://yt.com/v=other",
+                    title="Other",
+                    requester=mock_author,
                     user_input="unrelated search",
                 )
             ]
@@ -1306,7 +1466,9 @@ class TestQueueRemove:
     async def test_no_match_returns_empty_list(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=abc", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=abc", title="Song", requester=mock_author
+        )
         await music_player.queue_put(qobj)
 
         positions = (await music_player.queue_remove("https://yt.com/v=xyz")).positions
@@ -1325,7 +1487,11 @@ class TestQueueRemove:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         for i in range(5):
-            qobj = QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+            qobj = QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Song {i}",
+                requester=mock_author,
+            )
             await music_player.queue_put(qobj)
 
         positions = (await music_player.queue_remove("https://yt.com/v=2")).positions
@@ -1338,9 +1504,9 @@ class TestQueueRemove:
         # the play's only chance at a row. The positions the command reports are
         # unchanged by the flush.
         tail = QueueObject(
-            "https://yt.com/v=heard",
-            "Heard",
-            mock_author,
+            webpage_url="https://yt.com/v=heard",
+            title="Heard",
+            requester=mock_author,
             ts=95,
             duration=240,
             is_resume=True,
@@ -1348,7 +1514,11 @@ class TestQueueRemove:
         )
         await music_player.queue_put(tail)
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=other", "Other", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=other",
+                title="Other",
+                requester=mock_author,
+            )
         )
 
         positions = (
@@ -1363,7 +1533,9 @@ class TestQueueRemove:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=abc", "Song", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=abc", title="Song", requester=mock_author
+            )
         )
 
         assert (await music_player.queue_remove("https://yt.com/v=abc")).positions == [
@@ -1376,7 +1548,9 @@ class TestQueueRemove:
     ) -> None:
         urls = ["https://yt.com/v=a", "https://yt.com/v=b", "https://yt.com/v=a"]
         for url in urls:
-            await music_player.queue_put(QueueObject(url, f"Song {url}", mock_author))
+            await music_player.queue_put(
+                QueueObject(webpage_url=url, title=f"Song {url}", requester=mock_author)
+            )
 
         positions = (await music_player.queue_remove("https://yt.com/v=a")).positions
         assert positions == [1, 3]
@@ -1386,7 +1560,11 @@ class TestQueueRemove:
     ) -> None:
         for i in range(3):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
 
         await music_player.queue_remove("https://yt.com/v=1")
@@ -1407,7 +1585,11 @@ class TestQueueRemove:
         assert music_player.store is not None
         for i in range(3):
             await music_player.queue_put(
-                QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                )
             )
 
         await music_player.queue_remove("https://yt.com/v=1")
@@ -1427,14 +1609,21 @@ class TestQueueRemove:
         never be written to Redis — it was never RPUSHed there."""
         assert music_player.store is not None
         crashed = QueueObject(
-            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed Song",
+            requester=mock_author,
+            persisted=False,
         )
         seed_queue(music_player.queue, crashed)
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=a", "Song A", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=a", title="Song A", requester=mock_author
+            )
         )
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=b", "Song B", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=b", title="Song B", requester=mock_author
+            )
         )
 
         positions = (await music_player.queue_remove("https://yt.com/v=a")).positions
@@ -1455,11 +1644,18 @@ class TestQueueRemove:
         should end up empty/deleted, not populated with a phantom entry."""
         assert music_player.store is not None
         crashed = QueueObject(
-            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed Song",
+            requester=mock_author,
+            persisted=False,
         )
         seed_queue(music_player.queue, crashed)
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=only", "Only Song", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=only",
+                title="Only Song",
+                requester=mock_author,
+            )
         )
 
         await music_player.queue_remove("https://yt.com/v=only")
@@ -1475,7 +1671,11 @@ class TestQueueRemove:
     ) -> None:
         assert music_player.store is not None
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=only", "Only Song", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=only",
+                title="Only Song",
+                requester=mock_author,
+            )
         )
 
         await music_player.queue_remove("https://yt.com/v=only")
@@ -1491,7 +1691,9 @@ class TestQueueRemove:
     ) -> None:
         assert music_player.store is not None
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=abc", "Song", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=abc", title="Song", requester=mock_author
+            )
         )
 
         await music_player.queue_remove("https://yt.com/v=xyz")
@@ -1543,7 +1745,11 @@ class TestQueueRemoveWithAPrefetch:
     async def _queue(self, music_player: MusicPlayer, author: MagicMock) -> None:
         await music_player.queue.put(
             [
-                QueueObject(f"https://yt.com/v={n}", f"Song {n}", author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v={n}",
+                    title=f"Song {n}",
+                    requester=author,
+                )
                 for n in range(8)
             ]
         )
@@ -1621,13 +1827,19 @@ class TestQueueRemoveWithAPrefetch:
         head: Any = (
             unresolved("artist song", user_input="https://sp/p")
             if kind == "lazy"
-            else QueueObject("https://yt.com/v=head", "Head", mock_author)
+            else QueueObject(
+                webpage_url="https://yt.com/v=head", title="Head", requester=mock_author
+            )
         )
         await music_player.queue.put(
             [
                 head,
                 *(
-                    QueueObject(f"https://yt.com/v={n}", f"S{n}", mock_author)
+                    QueueObject(
+                        webpage_url=f"https://yt.com/v={n}",
+                        title=f"S{n}",
+                        requester=mock_author,
+                    )
                     for n in range(7)
                 ),
             ]
@@ -1665,7 +1877,11 @@ class TestQueueRemoveWithAPrefetch:
             [
                 unresolved("artist song", user_input="https://sp/p"),
                 *(
-                    QueueObject(f"https://yt.com/v={n}", f"S{n}", mock_author)
+                    QueueObject(
+                        webpage_url=f"https://yt.com/v={n}",
+                        title=f"S{n}",
+                        requester=mock_author,
+                    )
                     for n in range(7)
                 ),
             ],
@@ -1774,7 +1990,10 @@ class TestGetQueue:
             seed_queue(
                 music_player.queue,
                 QueueObject(
-                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=120
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                    duration=120,
                 ),
             )
         embed = music_player.queue_embed()
@@ -1785,11 +2004,21 @@ class TestGetQueue:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="Song 2",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         embed = music_player.queue_embed()
         assert "Total Duration: **3m**" in described(embed)
@@ -1800,11 +2029,21 @@ class TestGetQueue:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=None),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="Song 2",
+                requester=mock_author,
+                duration=None,
+            ),
         )
         embed = music_player.queue_embed()
         assert "~" in described(embed)
@@ -1814,7 +2053,12 @@ class TestGetQueue:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         seed_queue(music_player.queue, unresolved("unresolved"))
         embed = music_player.queue_embed()
@@ -1862,7 +2106,10 @@ class TestGetQueue:
             seed_queue(
                 music_player.queue,
                 QueueObject(
-                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                    duration=60,
                 ),
             )
         embed = music_player.queue_embed()
@@ -1873,11 +2120,21 @@ class TestGetQueue:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=None,
+            ),
         )
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="Song 2",
+                requester=mock_author,
+                duration=60,
+            ),
         )
         embed = music_player.queue_embed()
         # First song: no preceding unknown → no ~
@@ -1895,7 +2152,12 @@ class TestGetQueue:
         music_player.current_song = mock_current
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=60,
+            ),
         )
         embed = music_player.queue_embed()
         assert "~**" in described(embed)
@@ -1907,7 +2169,10 @@ class TestGetQueue:
             seed_queue(
                 music_player.queue,
                 QueueObject(
-                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                    duration=60,
                 ),
             )
         embed = music_player.queue_embed()
@@ -1920,7 +2185,10 @@ class TestGetQueue:
             seed_queue(
                 music_player.queue,
                 QueueObject(
-                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                    duration=60,
                 ),
             )
         embed = music_player.queue_embed()
@@ -2006,9 +2274,15 @@ class TestResumeNoticeEmbed:
         cap alone lets a video titled as a masked link post one under the bot's
         name. A crashed head wins "Left off on"; its history twin is tested below."""
         hostile = "[FREE NITRO](https://evil.example)"
-        started = QueueObject("https://yt.com/v=s", hostile, mock_author)
+        started = QueueObject(
+            webpage_url="https://yt.com/v=s", title=hostile, requester=mock_author
+        )
         crashed = QueueObject(
-            "https://yt.com/v=c", hostile, mock_author, persisted=False, ts=10
+            webpage_url="https://yt.com/v=c",
+            title=hostile,
+            requester=mock_author,
+            persisted=False,
+            ts=10,
         )
         seed_queue(music_player.queue, crashed)
 
@@ -2025,9 +2299,14 @@ class TestResumeNoticeEmbed:
         """The leg reached after a -stop, where the newest history entry stands in
         for the interrupted song."""
         hostile = "[FREE NITRO](https://evil.example)"
-        started = QueueObject("https://yt.com/v=s", "Fine Title", mock_author)
+        started = QueueObject(
+            webpage_url="https://yt.com/v=s", title="Fine Title", requester=mock_author
+        )
         seed_queue(
-            music_player.queue, QueueObject("https://yt.com/v=q", "Q", mock_author)
+            music_player.queue,
+            QueueObject(
+                webpage_url="https://yt.com/v=q", title="Q", requester=mock_author
+            ),
         )
         music_player.history.restore([HistoryEntry(title=hostile, played_at=1.0)])
 
@@ -2091,7 +2370,10 @@ class TestResumeNoticeEmbed:
             seed_queue(
                 music_player.queue,
                 QueueObject(
-                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=90
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                    duration=90,
                 ),
             )
 
@@ -2111,7 +2393,12 @@ class TestResumeNoticeEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         seed_queue(music_player.queue, unresolved("unresolved"))
 
@@ -2128,7 +2415,12 @@ class TestResumeNoticeEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=None,
+            ),
         )
 
         embed = music_player.build_resume_notice_embed(started)
@@ -2144,7 +2436,12 @@ class TestResumeNoticeEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=90,
+            ),
         )
 
         embed = music_player.build_resume_notice_embed(started)
@@ -2361,7 +2658,10 @@ class TestRejoinResumeEmbed:
             seed_queue(
                 music_player.queue,
                 QueueObject(
-                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=90
+                    webpage_url=f"https://yt.com/v={i}",
+                    title=f"Song {i}",
+                    requester=mock_author,
+                    duration=90,
                 ),
             )
 
@@ -2632,7 +2932,12 @@ class TestEtaWalkTo:
     def test_index_one_is_the_bare_seed(self, music_player: MusicPlayer) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", MagicMock(), duration=600),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=MagicMock(),
+                duration=600,
+            ),
         )
         assert music_player._eta_walk_to(1)[1] == music_player._queue_eta_seed()[1]
 
@@ -2641,8 +2946,18 @@ class TestEtaWalkTo:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
-            QueueObject("https://yt.com/v=2", "B", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="A",
+                requester=mock_author,
+                duration=60,
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="B",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         _, seed = music_player._queue_eta_seed()
         _, walk = music_player._eta_walk_to(3)
@@ -2670,7 +2985,10 @@ class TestEtaWalkTo:
         seed_queue(
             music_player.queue,
             QueueObject(
-                "https://yt.com/v=1", "Song 1", mock_song.requester, duration=600
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_song.requester,
+                duration=600,
             ),
         )
         assert self._eta_at(music_player, 2) != empty_eta
@@ -2681,7 +2999,12 @@ class TestEtaWalkTo:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=None,
+            ),
         )
         assert self._eta_at(music_player, 2).startswith("~")
 
@@ -2694,12 +3017,22 @@ class TestEtaWalkTo:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
+                duration=60,
+            ),
         )
         now_pst, walk = music_player._queue_eta_seed()
         walk = advance_walk(walk, music_player.queue._items[0])
         expected_line = queue_row(
-            QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="Song 2",
+                requester=mock_author,
+                duration=60,
+            ),
             2,
             now=now_pst,
             walk=walk,
@@ -2737,8 +3070,18 @@ class TestPlaylistFacts:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
-            QueueObject("https://yt.com/v=2", "B", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="A",
+                requester=mock_author,
+                duration=60,
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="B",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         first, second = music_player.playlist_facts(
             ahead=2, runtime=(600, False)
@@ -2784,9 +3127,9 @@ def _album_track(n: int, secs: int) -> QueueObject:
     """One album track as the walk queues it: a search, with the display fields
     its row is rendered from."""
     return QueueObject(
-        f"https://open.spotify.com/track/{n}",
-        f"Track {n}",
-        _ALBUM_ASKER,
+        webpage_url=f"https://open.spotify.com/track/{n}",
+        title=f"Track {n}",
+        requester=_ALBUM_ASKER,
         search=f"ytsearch:Track {n} Artist",
         uploader="Artist",
         duration=secs,
@@ -2807,7 +3150,12 @@ class TestQueuedRows:
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        ahead = QueueObject("https://yt.com/v=1", "Ahead", mock_author, duration=60)
+        ahead = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Ahead",
+            requester=mock_author,
+            duration=60,
+        )
         tracks = [_album_track(1, 100), _album_track(2, 200)]
         seed_queue(music_player.queue, ahead, *tracks)
 
@@ -2822,7 +3170,12 @@ class TestQueuedRows:
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        ahead = QueueObject("https://yt.com/v=1", "Ahead", mock_author, duration=60)
+        ahead = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Ahead",
+            requester=mock_author,
+            duration=60,
+        )
         tracks = [_album_track(1, 100), _album_track(2, 200)]
         seed_queue(music_player.queue, ahead, *tracks)
 
@@ -2853,7 +3206,12 @@ class TestQueuedRows:
     ) -> None:
         """`ahead=0` promises the first slot, but the track landed behind an item
         -queue still lists, so the row numbers from where the track IS."""
-        claimed = QueueObject("https://yt.com/v=1", "Claimed", mock_author, duration=60)
+        claimed = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Claimed",
+            requester=mock_author,
+            duration=60,
+        )
         tracks = [_album_track(1, 100)]
         seed_queue(music_player.queue, claimed, *tracks)
 
@@ -3756,7 +4114,13 @@ class TestPlaybackGate:
         persisted queue and discards it entry by entry against no voice client."""
         music_player._playback_gate.clear()
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=1", "Persisted Song", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=1",
+                    title="Persisted Song",
+                    requester=mock_author,
+                )
+            ]
         )
 
         task = asyncio.create_task(music_player.loop())
@@ -3907,10 +4271,18 @@ class TestQueuePutFront:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         await music_player.queue_put(
-            [QueueObject("https://yt.com/v=old", "Old", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=old",
+                    title="Old",
+                    requester=mock_author,
+                )
+            ]
         )
         await music_player.queue_put_front(
-            QueueObject("https://yt.com/v=new", "New", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=new", title="New", requester=mock_author
+            )
         )
 
         assert [queue_object(i).title for i in music_player.queue.display_items()] == [
@@ -3929,10 +4301,20 @@ class TestQueuePutFront:
         this pins that, since a 3+ item front insert had no coverage."""
         assert music_player.store is not None
         await music_player.queue_put(
-            [QueueObject("https://yt.com/v=old", "Old", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=old",
+                    title="Old",
+                    requester=mock_author,
+                )
+            ]
         )
         tracks = [
-            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Track {i}",
+                requester=mock_author,
+            )
             for i in range(3)
         ]
 
@@ -3956,7 +4338,11 @@ class TestQueuePutFront:
         from src import youtube
 
         tracks = [
-            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Track {i}",
+                requester=mock_author,
+            )
             for i in range(2)
         ]
         with patch.object(
@@ -3975,7 +4361,11 @@ class TestQueuePutFront:
         from src import youtube
 
         tracks = [
-            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Track {i}",
+                requester=mock_author,
+            )
             for i in range(2)
         ]
         with patch.object(
@@ -4025,7 +4415,11 @@ class TestEnqueueDepth:
     ) -> None:
         music_player.current_song = mock_song
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=1", "One", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+                )
+            ]
         )
         assert music_player.enqueue_depth() == 2
 
@@ -4039,9 +4433,16 @@ class TestEnqueueDepth:
         music_player.current_song = mock_song
         await music_player.queue.put_front(
             [
-                QueueObject("https://yt.com/v=now", "Now", mock_author),
                 QueueObject(
-                    "https://yt.com/v=live", "Live", mock_author, is_resume=True
+                    webpage_url="https://yt.com/v=now",
+                    title="Now",
+                    requester=mock_author,
+                ),
+                QueueObject(
+                    webpage_url="https://yt.com/v=live",
+                    title="Live",
+                    requester=mock_author,
+                    is_resume=True,
                 ),
             ]
         )
@@ -4055,7 +4456,11 @@ class TestEnqueueDepth:
         # cursor but still ahead of a new arrival. qsize() reads 0 and would
         # under-report exactly when a -play lands during another song's resolve.
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=1", "One", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+                )
+            ]
         )
         music_player.queue.get_nowait()
         assert music_player.queue.qsize() == 0
@@ -4073,7 +4478,11 @@ class TestEnqueueDepth:
         song = MagicMock()
         song.webpage_url = "https://yt.com/v=1"
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=2", "Two", mock_author)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=2", title="Two", requester=mock_author
+                )
+            ]
         )
         await music_player.queue.get()  # the loop claimed it
         music_player.current_song = song  # ...and assigned it, not yet committed
@@ -4093,7 +4502,12 @@ class TestEnqueueDepth:
         current.webpage_url = "https://yt.com/v=parked"
         current.title = "Parked"
         give_queue_object(
-            current, QueueObject(current.webpage_url, current.title, mock_author)
+            current,
+            QueueObject(
+                webpage_url=current.webpage_url,
+                title=current.title,
+                requester=mock_author,
+            ),
         )
         current.requester = mock_author
         current.position_secs = 40.0
@@ -4108,7 +4522,12 @@ class TestEnqueueDepth:
         music_player.current_song = current
 
         await music_player.interject(
-            QueueObject("https://yt.com/v=urgent", "Urgent", mock_author), mock_vc
+            QueueObject(
+                webpage_url="https://yt.com/v=urgent",
+                title="Urgent",
+                requester=mock_author,
+            ),
+            mock_vc,
         )
 
         tails = [
@@ -4132,9 +4551,9 @@ class TestEnqueueDepth:
         give_queue_object(
             current,
             QueueObject(
-                current.webpage_url,
-                current.title,
-                mock_author,
+                webpage_url=current.webpage_url,
+                title=current.title,
+                requester=mock_author,
                 is_replay=True,
                 persisted=False,
                 np_message_id=777,
@@ -4147,7 +4566,12 @@ class TestEnqueueDepth:
         music_player.current_song = current
 
         await music_player.interject(
-            QueueObject("https://yt.com/v=urgent", "Urgent", mock_author), mock_vc
+            QueueObject(
+                webpage_url="https://yt.com/v=urgent",
+                title="Urgent",
+                requester=mock_author,
+            ),
+            mock_vc,
         )
 
         tail = next(
@@ -4171,7 +4595,11 @@ class TestEnqueueDepth:
         current one and the live song stops being counted. Reached by
         -play X, -p --now Y, -p --now X."""
         tail = QueueObject(
-            "https://yt.com/v=x", "X", mock_author, is_resume=True, ts=30
+            webpage_url="https://yt.com/v=x",
+            title="X",
+            requester=mock_author,
+            is_resume=True,
+            ts=30,
         )
         await music_player.queue.put([tail])
         current = MagicMock()
@@ -4191,7 +4619,12 @@ class TestEnqueueDepth:
         source = unresolved(
             "a song", analytics=Analytics(queued_at=1752530000.5, queue_position=4)
         )
-        resolved = QueueObject("https://yt.com/v=1", "One", mock_author, duration=61)
+        resolved = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="One",
+            requester=mock_author,
+            duration=61,
+        )
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
             out = await music_player._resolve_source(source)
@@ -4213,7 +4646,11 @@ class TestEnqueueDepth:
         # A Spotify playlist track resolves to a YouTube URL here, so this hop is
         # the only thing keeping the archive from recording it as YouTube.
         source = unresolved("a song", query_source="spotify.com")
-        resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
+        resolved = QueueObject(
+            webpage_url="https://youtube.com/watch?v=1",
+            title="One",
+            requester=mock_author,
+        )
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
             await music_player._resolve_source(source)
@@ -4231,7 +4668,11 @@ class TestEnqueueDepth:
         recovered head stays removable by the collection link."""
         album = "https://open.spotify.com/album/xyz"
         source = unresolved("Artist - Title", user_input=album)
-        resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
+        resolved = QueueObject(
+            webpage_url="https://youtube.com/watch?v=1",
+            title="One",
+            requester=mock_author,
+        )
         spy = AsyncMock(return_value=resolved)
         with patch.object(YTDL, "yt_source", new=spy):
             await music_player._resolve_source(source)
@@ -5009,7 +5450,9 @@ class TestResolveSource:
     async def test_resolves_ytsource_via_yt_source(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        fake_qobj = QueueObject("https://yt.com/v=1", "Resolved", mock_author)
+        fake_qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Resolved", requester=mock_author
+        )
         with patch(
             "src.musicplayer.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
@@ -5037,9 +5480,9 @@ class TestResolveUsesTheItemsRequester:
         queuer.id = 424242424242424242
         music_player._last_author = mock_author
         resolved = QueueObject(
-            "https://yt.com/v=1",
-            "Resolved",
-            mock_author,
+            webpage_url="https://yt.com/v=1",
+            title="Resolved",
+            requester=mock_author,
             duration=213,
             uploader="Some Channel",
             thumbnail="https://yt.com/t.jpg",
@@ -5330,7 +5773,12 @@ class TestSendNowPlaying:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         await music_player._send_now_playing(mock_song)
         call_kwargs = mocked(music_player._channel.send).call_args[1]
@@ -5426,7 +5874,12 @@ class TestNpEmbedBlock:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         block = music_player.np_embed_block()
         assert len(block) == 2
@@ -5445,7 +5898,12 @@ class TestNpEmbedBlock:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         vc.pause.side_effect = lambda: vc.is_paused.configure_mock(return_value=True)
         vc.resume.side_effect = lambda: vc.is_paused.configure_mock(return_value=False)
@@ -5573,7 +6031,12 @@ class TestPlayerDebugDecoration:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         block = music_player.np_embed_block()
         assert len(block) == 2
@@ -5883,8 +6346,12 @@ class TestEachSongRootsItsOwnTrace:
         self._armed(music_player, songs=2)
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "One", mock_author),
-            QueueObject("https://yt.com/v=2", "Two", mock_author),
+            QueueObject(
+                webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/v=2", title="Two", requester=mock_author
+            ),
         )
 
         with (
@@ -6490,7 +6957,12 @@ class TestPushNpEditEmbedCap:
         music_player.current_song = mock_song
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         own = [discord.Embed(title=f"e{i}") for i in range(9)]
         message = AsyncMock(spec=discord.Message)
@@ -6596,7 +7068,12 @@ class TestFinalizeNowPlaying:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         message = AsyncMock(spec=discord.Message)
         await music_player._finalize_now_playing(mock_song, message, [])
@@ -7237,7 +7714,12 @@ class TestBuildNextUpEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         embed = music_player._build_next_up_embed()
         assert embed is not None
@@ -7261,7 +7743,11 @@ class TestBuildNextUpEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+            ),
         )
         embed = music_player._build_next_up_embed()
         assert embed is not None
@@ -7272,11 +7758,21 @@ class TestBuildNextUpEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "First", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="First",
+                requester=mock_author,
+                duration=60,
+            ),
         )
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=2", "Second", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="Second",
+                requester=mock_author,
+                duration=60,
+            ),
         )
         embed = music_player._build_next_up_embed()
         assert embed is not None
@@ -7288,7 +7784,12 @@ class TestBuildNextUpEmbed:
     ) -> None:
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90),
+            QueueObject(
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_author,
+                duration=90,
+            ),
         )
         embed = music_player._build_next_up_embed()
         assert embed is not None
@@ -7304,7 +7805,10 @@ class TestBuildNextUpEmbed:
         seed_queue(
             music_player.queue,
             QueueObject(
-                "https://yt.com/v=next", "Next Song", mock_song.requester, duration=90
+                webpage_url="https://yt.com/v=next",
+                title="Next Song",
+                requester=mock_song.requester,
+                duration=90,
             ),
         )
         now_playing_embed = music_player._build_now_playing_embed(mock_song)
@@ -7332,9 +7836,9 @@ class TestPrefetchedHeadIsShownResolved:
     @staticmethod
     def _resolved(author: MagicMock) -> QueueObject:
         return QueueObject(
-            "https://yt.com/v=changes",
-            "changes",
-            author,
+            webpage_url="https://yt.com/v=changes",
+            title="changes",
+            requester=author,
             duration=91,
             uploader="AYRIS - Topic",
             thumbnail="https://img.example/changes.jpg",
@@ -7420,7 +7924,12 @@ class TestPrefetchedHeadIsShownResolved:
         """The -play confirmation's ETA walks the head through _eta_walk_to."""
         music_player.current_song = mock_song
         lazy = self._lazy()
-        behind = QueueObject("https://yt.com/v=b", "Behind", mock_author, duration=60)
+        behind = QueueObject(
+            webpage_url="https://yt.com/v=b",
+            title="Behind",
+            requester=mock_author,
+            duration=60,
+        )
         seed_queue(music_player.queue, lazy, behind)
         music_player._prefetched_head = (lazy, self._resolved(mock_author))
 
@@ -7436,7 +7945,12 @@ class TestPrefetchedHeadIsShownResolved:
         seed_queue(
             music_player.queue,
             lazy,
-            QueueObject("https://yt.com/v=b", "After", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=b",
+                title="After",
+                requester=mock_author,
+                duration=60,
+            ),
         )
         music_player._prefetched_head = (lazy, self._resolved(mock_author))
 
@@ -7464,7 +7978,11 @@ class TestQueueEntryCard:
         """The whole of the shared-format change in one assertion — and the guard
         against either card growing a line the other does not."""
         head = QueueObject(
-            "https://yt.com/v=1", "Song 1", mock_author, duration=60, uploader="Chan"
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
+            duration=60,
+            uploader="Chan",
         )
         seed_queue(music_player.queue, head)
 
@@ -7478,9 +7996,9 @@ class TestQueueEntryCard:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         item = QueueObject(
-            "https://yt.com/v=1",
-            "Song 1",
-            mock_author,
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
             duration=329,
             uploader="Massive Attack",
         )
@@ -7499,7 +8017,11 @@ class TestQueueEntryCard:
         """A parked interjection tail says where it resumes. The row carried this
         before the cards shared a format; losing it would be silent."""
         item = QueueObject(
-            "https://yt.com/v=1", "Song 1", mock_author, duration=300, ts=83
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
+            duration=300,
+            ts=83,
         )
         item.is_resume = True
         seed_queue(music_player.queue, item)
@@ -7510,7 +8032,11 @@ class TestQueueEntryCard:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         item = QueueObject(
-            "https://yt.com/v=1", "Song 1", mock_author, duration=300, ts=83
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
+            duration=300,
+            ts=83,
         )
         seed_queue(music_player.queue, item)
 
@@ -7519,7 +8045,12 @@ class TestQueueEntryCard:
     def test_placeholders_for_unknown_duration_and_uploader(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        item = QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None)
+        item = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
+            duration=None,
+        )
         seed_queue(music_player.queue, item)
 
         body = self._next_up_body(music_player)
@@ -7532,7 +8063,10 @@ class TestQueueEntryCard:
         """The masked link is what the confirmation gained over its bare URL, and
         safe_label is why it is safe to have."""
         item = QueueObject(
-            "https://yt.com/v=1", "Song [x](http://evil) 1", mock_author, duration=60
+            webpage_url="https://yt.com/v=1",
+            title="Song [x](http://evil) 1",
+            requester=mock_author,
+            duration=60,
         )
         seed_queue(music_player.queue, item)
 
@@ -7607,11 +8141,26 @@ class TestQueueEntryCard:
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        third = QueueObject("https://yt.com/v=3", "C", mock_author, duration=60)
+        third = QueueObject(
+            webpage_url="https://yt.com/v=3",
+            title="C",
+            requester=mock_author,
+            duration=60,
+        )
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "A", mock_author, duration=600),
-            QueueObject("https://yt.com/v=2", "B", mock_author, duration=600),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="A",
+                requester=mock_author,
+                duration=600,
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/v=2",
+                title="B",
+                requester=mock_author,
+                duration=600,
+            ),
             third,
         )
 
@@ -7634,9 +8183,19 @@ class TestQueueEntryCard:
         the tail is what an appended song's estimate meant before this."""
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/v=1", "A", mock_author, duration=60),
+            QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="A",
+                requester=mock_author,
+                duration=60,
+            ),
         )
-        gone = QueueObject("https://yt.com/v=9", "Gone", mock_author, duration=60)
+        gone = QueueObject(
+            webpage_url="https://yt.com/v=9",
+            title="Gone",
+            requester=mock_author,
+            duration=60,
+        )
 
         assert music_player.build_queued_song_embed(gone).title == "Queued song — #2"
 
@@ -7645,8 +8204,18 @@ class TestQueueEntryCard:
     ) -> None:
         """Two copies of one song are two queue slots. Matching on webpage_url
         would report the second at the first's position."""
-        first = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=60)
-        second = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=60)
+        first = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Song",
+            requester=mock_author,
+            duration=60,
+        )
+        second = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Song",
+            requester=mock_author,
+            duration=60,
+        )
         seed_queue(music_player.queue, first, second)
 
         assert music_player.build_queued_song_embed(second).title == "Queued song — #2"
@@ -7659,9 +8228,9 @@ class TestQueueEntryCard:
         seed_queue(
             music_player.queue,
             QueueObject(
-                "https://yt.com/v=1",
-                "Song 1",
-                mock_author,
+                webpage_url="https://yt.com/v=1",
+                title="Song 1",
+                requester=mock_author,
                 duration=60,
                 thumbnail="https://img.youtube.com/vi/1/0.jpg",
             ),
@@ -7675,12 +8244,14 @@ class TestQueueEntryCard:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         with_thumb = QueueObject(
-            "https://yt.com/v=1",
-            "Song 1",
-            mock_author,
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
             thumbnail="https://img.youtube.com/vi/1/0.jpg",
         )
-        without = QueueObject("https://yt.com/v=2", "Song 2", mock_author)
+        without = QueueObject(
+            webpage_url="https://yt.com/v=2", title="Song 2", requester=mock_author
+        )
         seed_queue(music_player.queue, with_thumb, without)
 
         assert (
@@ -7692,7 +8263,12 @@ class TestQueueEntryCard:
     def test_warning_lands_below_the_body(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        item = QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
+        item = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester=mock_author,
+            duration=60,
+        )
         seed_queue(music_player.queue, item)
 
         body = described(music_player.build_queued_song_embed(item, warning="careful"))
@@ -7902,9 +8478,15 @@ class TestLoopClaimAccounting:
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
         await music_player.queue_put(
-            QueueObject("https://yt.com/v=first", "First", mock_author)
+            QueueObject(
+                webpage_url="https://yt.com/v=first",
+                title="First",
+                requester=mock_author,
+            )
         )
-        refill = QueueObject("https://yt.com/v=refill", "Refill", mock_author)
+        refill = QueueObject(
+            webpage_url="https://yt.com/v=refill", title="Refill", requester=mock_author
+        )
         # No voice client, so a commit that wrongly SUCCEEDS falls straight into
         # the outer handler instead of hanging on play_next: this fails by
         # assertion rather than by timeout.
@@ -7948,7 +8530,11 @@ class TestLoopClaimAccounting:
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        following = QueueObject("https://yt.com/v=next", "Next", queue_obj.requester)
+        following = QueueObject(
+            webpage_url="https://yt.com/v=next",
+            title="Next",
+            requester=queue_obj.requester,
+        )
         seed_queue(music_player.queue, queue_obj, following)
 
         vc = object.__new__(discord.VoiceClient)
@@ -8200,7 +8786,9 @@ class TestLoop:
         # MagicMock flags would trip the loop's start_paused/is_resume gates, and
         # the analytics, query_source and played_at clamps in HistoryEntry raise
         # on a MagicMock.
-        give_queue_object(song, QueueObject(url, title, stub_requester()))
+        give_queue_object(
+            song, QueueObject(webpage_url=url, title=title, requester=stub_requester())
+        )
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -8346,11 +8934,18 @@ class TestLoop:
         music_player.bot.loop = asyncio.get_running_loop()
 
         crashed = QueueObject(
-            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed Song",
+            requester=mock_author,
+            persisted=False,
         )
         await music_player.store.push_queue(
             SongQueueEntry.from_queue_object(
-                QueueObject("https://yt.com/v=real", "Real Song", mock_author)
+                QueueObject(
+                    webpage_url="https://yt.com/v=real",
+                    title="Real Song",
+                    requester=mock_author,
+                )
             )
         )
         seed_queue(music_player.queue, crashed)
@@ -9030,7 +9625,9 @@ class TestLoop:
         vc.play = MagicMock()
         mocked(music_player._guild).voice_client = vc
         music_player.play_next.wait = AsyncMock()
-        queued_after = QueueObject("https://yt.com/v=after", "After", mock_author)
+        queued_after = QueueObject(
+            webpage_url="https://yt.com/v=after", title="After", requester=mock_author
+        )
 
         with (
             patch.object(
@@ -9066,9 +9663,14 @@ class TestLoop:
         restart-with-recovery, with no error and nothing in memory to notice."""
         assert music_player.store is not None
         crashed = QueueObject(
-            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed",
+            requester=mock_author,
+            persisted=False,
         )
-        queued = QueueObject("https://yt.com/v=queued", "Queued", mock_author)
+        queued = QueueObject(
+            webpage_url="https://yt.com/v=queued", title="Queued", requester=mock_author
+        )
         # The production shape restore_crashed leaves behind: the crashed head is
         # in memory only, the queued song is on both legs.
         seed_queue(music_player.queue, crashed)
@@ -9813,9 +10415,9 @@ class TestStreamRetry:
         that the (guild_id, played_at, webpage_url) dedup index cannot collapse them,
         so -leaderboard and -history both double-count the play."""
         tail = QueueObject(
-            mock_song.webpage_url,
-            mock_song.title,
-            mock_song.requester,
+            webpage_url=mock_song.webpage_url,
+            title=mock_song.title,
+            requester=mock_song.requester,
             ts=42,
             is_resume=True,
         )
@@ -9990,7 +10592,9 @@ class TestStreamRetry:
         """The loop neutralizes the prefetch when it decides to retry, but a -shuffle,
         -remove or -replay can refill the slot before the requeue. A bare put_front
         lands behind that claim, and the next song plays instead of the retry."""
-        behind = QueueObject("https://yt.com/v=behind", "Behind", mock_author)
+        behind = QueueObject(
+            webpage_url="https://yt.com/v=behind", title="Behind", requester=mock_author
+        )
         await music_player.queue.put([behind])
         assert music_player.queue.get_nowait() is behind  # the refilled slot's claim
         claimed = _loop_song()
@@ -10039,7 +10643,9 @@ class TestStreamRetry:
         prefetched.requester = mock_song.requester
         # The song the prefetch claimed, sitting behind the one about to die.
         next_obj = QueueObject(
-            "https://yt.com/v=next", "The Next Song", mock_song.requester
+            webpage_url="https://yt.com/v=next",
+            title="The Next Song",
+            requester=mock_song.requester,
         )
 
         await self._run_failed_iteration(
@@ -10361,7 +10967,9 @@ class TestLoopAdditional:
         # MagicMock flags would trip the loop's start_paused/is_resume gates, and
         # the analytics, query_source and played_at clamps in HistoryEntry raise
         # on a MagicMock.
-        give_queue_object(song, QueueObject(url, title, stub_requester()))
+        give_queue_object(
+            song, QueueObject(webpage_url=url, title=title, requester=stub_requester())
+        )
         song.persisted = True
         song.stream_attempts = 0
         song.failed_format_ids = frozenset()
@@ -10426,7 +11034,9 @@ class TestLoopAdditional:
         music_player.bot.loop = asyncio.get_running_loop()
 
         queue_obj2 = QueueObject(
-            "https://yt.com/watch?v=2", "Song 2", queue_obj.requester
+            webpage_url="https://yt.com/watch?v=2",
+            title="Song 2",
+            requester=queue_obj.requester,
         )
         seed_queue(music_player.queue, queue_obj, queue_obj2)
 
@@ -10505,7 +11115,9 @@ class TestLoopAdditional:
         music_player.bot.loop = asyncio.get_running_loop()
 
         queue_obj2 = QueueObject(
-            "https://yt.com/watch?v=2", "Song 2", queue_obj.requester
+            webpage_url="https://yt.com/watch?v=2",
+            title="Song 2",
+            requester=queue_obj.requester,
         )
 
         vc = object.__new__(discord.VoiceClient)
@@ -10621,7 +11233,11 @@ class TestLoopAdditional:
         and leaves the list alone, so a crash replays from the stale entry rather
         than losing the song.
         """
-        second = QueueObject("https://yt.com/watch?v=second", "Second", mock_author)
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=second",
+            title="Second",
+            requester=mock_author,
+        )
         assert music_player.store is not None
         key = music_player.store.queue_key()
 
@@ -10651,7 +11267,13 @@ class TestLoopAdditional:
         # The guild is free the moment the bound fires.
         async with asyncio.timeout(0.5):
             await music_player.queue.put_front(
-                [QueueObject("https://yt.com/watch?v=third", "Third", mock_author)]
+                [
+                    QueueObject(
+                        webpage_url="https://yt.com/watch?v=third",
+                        title="Third",
+                        requester=mock_author,
+                    )
+                ]
             )
 
     async def test_a_start_transaction_that_did_not_land_marks_the_mirror_stale(
@@ -10669,7 +11291,11 @@ class TestLoopAdditional:
         start would retire the wrong one. The queue is told, the list is left as
         it is (a crash replays the song from it), and nothing else is written
         under the mutex."""
-        second = QueueObject("https://yt.com/watch?v=second", "Second", mock_author)
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=second",
+            title="Second",
+            requester=mock_author,
+        )
         assert music_player.store is not None
         key = music_player.store.queue_key()
 
@@ -10703,8 +11329,16 @@ class TestLoopAdditional:
         stale head and leaves the drift in place forever. It replaces the list
         from memory in the same MULTI that parks the song, under the hold, and
         the queue reads clean again."""
-        second = QueueObject("https://yt.com/watch?v=second", "Second", mock_author)
-        third = QueueObject("https://yt.com/watch?v=third", "Third", mock_author)
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=second",
+            title="Second",
+            requester=mock_author,
+        )
+        third = QueueObject(
+            webpage_url="https://yt.com/watch?v=third",
+            title="Third",
+            requester=mock_author,
+        )
         assert music_player.store is not None
         store = music_player.store
         key = store.queue_key()
@@ -10763,7 +11397,11 @@ class TestLoopAdditional:
         """Empty means DELETE, never skip: the single-song -play is the commonest
         shape, and a stale list left standing restores and replays the song on
         the next restart."""
-        second = QueueObject("https://yt.com/watch?v=second", "Second", mock_author)
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=second",
+            title="Second",
+            requester=mock_author,
+        )
         assert music_player.store is not None
         store = music_player.store
         outcomes = iter([False])
@@ -10800,7 +11438,11 @@ class TestLoopAdditional:
         gate and the play raises with memory already popped and the LPOP never
         dispatched — a write that did not land by another route. It must be
         recorded like one, or the next start LPOPs the wrong entry."""
-        second = QueueObject("https://yt.com/watch?v=second", "Second", mock_author)
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=second",
+            title="Second",
+            requester=mock_author,
+        )
         assert music_player.store is not None
         key = music_player.store.queue_key()
 
@@ -10938,10 +11580,16 @@ class TestInterject:
         live_song.elapsed_secs = 83.0
         music_player.current_song = live_song
         other = QueueObject(
-            "https://yt.com/v=other", "Other", mock_author, is_replay=True
+            webpage_url="https://yt.com/v=other",
+            title="Other",
+            requester=mock_author,
+            is_replay=True,
         )
         copy = QueueObject(
-            live_song.webpage_url, live_song.title, mock_author, is_replay=True
+            webpage_url=live_song.webpage_url,
+            title=live_song.title,
+            requester=mock_author,
+            is_replay=True,
         )
 
         await music_player.queue.put([other])
@@ -11015,7 +11663,11 @@ class TestInterject:
         the head and the tracks would mean "play one track of this now"."""
         music_player.current_song = live_song
         rest = [
-            QueueObject(f"https://yt.com/v=t{i}", f"Track {i}", mock_author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v=t{i}",
+                title=f"Track {i}",
+                requester=mock_author,
+            )
             for i in (2, 3)
         ]
 
@@ -11050,7 +11702,9 @@ class TestInterject:
     ) -> None:
         live_song.elapsed_secs = 42.0
         music_player.current_song = live_song
-        queued = QueueObject("https://yt.com/v=b", "Queued B", mock_author)
+        queued = QueueObject(
+            webpage_url="https://yt.com/v=b", title="Queued B", requester=mock_author
+        )
         await music_player.queue.put([queued])
 
         outcome = await music_player.interject(interject_obj, mock_vc)
@@ -11336,9 +11990,9 @@ class TestInterject:
             # over once the next song is live.
             music_player._stopped_deliberately = False
             qobj = QueueObject(
-                f"https://yt.com/v=cut{n}",
-                f"Cut {n}",
-                mock_author,
+                webpage_url=f"https://yt.com/v=cut{n}",
+                title=f"Cut {n}",
+                requester=mock_author,
                 duration=120,
                 interjected=True,
             )
@@ -11900,7 +12554,13 @@ class TestDirectDequeueRespectsPersistence:
         music_player.bot.loop = asyncio.get_running_loop()
         await music_player.queue.put([head])
         await music_player.queue.put(
-            [QueueObject("https://yt.com/v=behind", "Behind", head.requester)]
+            [
+                QueueObject(
+                    webpage_url="https://yt.com/v=behind",
+                    title="Behind",
+                    requester=head.requester,
+                )
+            ]
         )
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
@@ -11941,7 +12601,10 @@ class TestDirectDequeueRespectsPersistence:
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
     ) -> None:
         head = QueueObject(
-            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed",
+            requester=mock_author,
+            persisted=False,
         )
         mirror = await self._run(music_player, head, mock_song)
         assert len(mirror) == 1 and b"v=behind" in mirror[0]
@@ -11951,7 +12614,9 @@ class TestDirectDequeueRespectsPersistence:
     ) -> None:
         """The other half: stopping the pop outright would leave the mirror
         permanently one entry ahead of memory."""
-        head = QueueObject("https://yt.com/v=1", "Queued", mock_author)
+        head = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Queued", requester=mock_author
+        )
         mirror = await self._run(music_player, head, mock_song)
         assert len(mirror) == 1 and b"v=behind" in mirror[0]
 
@@ -12000,7 +12665,10 @@ class TestDirectDequeueRespectsPersistence:
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
     ) -> None:
         head = QueueObject(
-            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed",
+            requester=mock_author,
+            persisted=False,
         )
         lpop_spy = await self._run_until_it_breaks(music_player, head, mock_song)
         lpop_spy.assert_not_awaited()
@@ -12008,7 +12676,9 @@ class TestDirectDequeueRespectsPersistence:
     async def test_a_persisted_claim_still_retires_its_entry(
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
     ) -> None:
-        head = QueueObject("https://yt.com/v=1", "Queued", mock_author)
+        head = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Queued", requester=mock_author
+        )
         lpop_spy = await self._run_until_it_breaks(music_player, head, mock_song)
         lpop_spy.assert_awaited_once()
 
@@ -12044,9 +12714,9 @@ class TestNeutralizePrefetch:
         rebuild's own spelling: `persisted` and `user_input` were each lost at a
         rebuild that named its fields by hand, and this fails if one does again."""
         queued = QueueObject(
-            "https://yt.com/v=prefetched",
-            "Prefetched",
-            mock_author,
+            webpage_url="https://yt.com/v=prefetched",
+            title="Prefetched",
+            requester=mock_author,
             ts=45,
             user_input="typed",
             query_source="search",
@@ -12086,7 +12756,11 @@ class TestNeutralizePrefetch:
         keyword added here naming a neighbour's flag reads back clean there and
         fails here."""
         queued = dataclasses.replace(
-            QueueObject("https://yt.com/v=prefetched", "Prefetched", mock_author),
+            QueueObject(
+                webpage_url="https://yt.com/v=prefetched",
+                title="Prefetched",
+                requester=mock_author,
+            ),
             **{flipped: not _REQUEUE_CARRIED_BOOLS[flipped]},
         )
 
@@ -12114,7 +12788,11 @@ class TestNeutralizePrefetch:
     ) -> None:
         # Simulate the prefetch's own dequeue: pending pops, display keeps the
         # entry (the prefetch commit was still pending).
-        original = QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        original = QueueObject(
+            webpage_url="https://yt.com/v=next",
+            title="Next Song",
+            requester=mock_author,
+        )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
 
@@ -12151,7 +12829,11 @@ class TestNeutralizePrefetch:
         reads must exist on YTDL; one that does not raises AttributeError here
         rather than in production, where the claim is already stranded. `persisted`
         reached main missing, and a mock invented it as a truthy Mock."""
-        original = QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        original = QueueObject(
+            webpage_url="https://yt.com/v=next",
+            title="Next Song",
+            requester=mock_author,
+        )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
 
@@ -12218,9 +12900,9 @@ class TestNeutralizePrefetch:
         holding a flagged, offset entry. A rebuild dropping ts/is_resume/start_paused
         restarts the interrupted song from 0:00, unpaused and unannounced."""
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Interrupted Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Interrupted Song",
+            requester=mock_author,
             ts=151,
             duration=210,
             is_resume=True,
@@ -12258,9 +12940,9 @@ class TestNeutralizePrefetch:
         # nothing re-mints it: the archive would read "queued at unknown,
         # played immediately".
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Interrupted Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Interrupted Song",
+            requester=mock_author,
             analytics=Analytics(queued_at=1752530000.5, queue_position=6),
         )
         await music_player.queue.put([original])
@@ -12294,9 +12976,9 @@ class TestNeutralizePrefetch:
         # strip-edit, which the ids alone cannot do.
         ref = NpHostRef(AsyncMock(spec=discord.Message), [], True)
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Interrupted Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Interrupted Song",
+            requester=mock_author,
             ts=151,
             is_resume=True,
             np_message_id=777777777777777777,
@@ -12340,9 +13022,9 @@ class TestNeutralizePrefetch:
         # An interjection neutralizing it is exactly when that happens. Dropped here,
         # loop's or-stamp refiles the tail under whenever it eventually resumes.
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Interrupted Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Interrupted Song",
+            requester=mock_author,
             ts=151,
             is_resume=True,
             played_at=1752530000.5,
@@ -12378,9 +13060,9 @@ class TestNeutralizePrefetch:
         past the cap. This is the inherit half of the asymmetry with interject()'s
         resume tail, which resets both (see its construction)."""
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Retrying Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Retrying Song",
+            requester=mock_author,
             stream_attempts=2,
             failed_format_ids=frozenset({"251", "140"}),
         )
@@ -12411,9 +13093,9 @@ class TestNeutralizePrefetch:
         # Nothing downstream of the rebuild can recover the classification, so
         # dropping it here would archive an interjected-over song as unknown.
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Interrupted Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Interrupted Song",
+            requester=mock_author,
             query_source="spotify.com",
         )
         await music_player.queue.put([original])
@@ -12449,7 +13131,11 @@ class TestNeutralizePrefetch:
         and returns without touching the deque. Pinned because the guard is what makes
         it safe — remove it and this is data loss again, not a no-op.
         """
-        original = QueueObject("https://yt.com/v=n", "Prefetched Song", mock_author)
+        original = QueueObject(
+            webpage_url="https://yt.com/v=n",
+            title="Prefetched Song",
+            requester=mock_author,
+        )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
         live_song.cleanup = MagicMock()
@@ -12465,7 +13151,11 @@ class TestNeutralizePrefetch:
 
         # A song queued AFTER the clear keeps its slot, and the stale prefetch is
         # discarded rather than resurrected — its FFmpeg subprocess killed with it.
-        later = QueueObject("https://yt.com/v=b", "Queued After Clear", mock_author)
+        later = QueueObject(
+            webpage_url="https://yt.com/v=b",
+            title="Queued After Clear",
+            requester=mock_author,
+        )
         await music_player.queue.put([later])
         await music_player._neutralize_prefetch()
         # cleanup() is handed to a thread, off the caller's place lock.
@@ -12488,9 +13178,9 @@ class TestNeutralizePrefetch:
         an unrelated song's entry.
         """
         original = QueueObject(
-            "https://yt.com/v=orig",
-            "Recovered Song",
-            mock_author,
+            webpage_url="https://yt.com/v=orig",
+            title="Recovered Song",
+            requester=mock_author,
             user_input="https://open.spotify.com/album/abc123",
             persisted=False,
         )
@@ -12522,7 +13212,10 @@ class TestNeutralizePrefetch:
         losing it would make a later interjection stack a resume entry for it
         instead of applying replace semantics."""
         original = QueueObject(
-            "https://yt.com/v=pn", "Interjected Song", mock_author, interjected=True
+            webpage_url="https://yt.com/v=pn",
+            title="Interjected Song",
+            requester=mock_author,
+            interjected=True,
         )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
@@ -12751,9 +13444,9 @@ class TestResumeEntryDisplay:
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         item = QueueObject(
-            "https://yt.com/v=1",
-            "Interrupted Song",
-            mock_author,
+            webpage_url="https://yt.com/v=1",
+            title="Interrupted Song",
+            requester=mock_author,
             ts=150,
             duration=210,
             is_resume=True,
@@ -12767,7 +13460,13 @@ class TestResumeEntryDisplay:
     ) -> None:
         """The same format as its is_resume twin two lines up, and as the bar,
         the presence and every other duration."""
-        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=90, duration=210)
+        item = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="T",
+            requester=mock_author,
+            ts=90,
+            duration=210,
+        )
         await music_player.queue.put([item])
         embed = music_player.queue_embed()
         assert "starts at `1:30`" in described(embed)
@@ -12865,7 +13564,12 @@ class TestHistorySkipMarker:
         music_player._np_host_own_embeds = []
         music_player._np_host_dedicated = True
 
-        tail = QueueObject("https://yt.com/v=t", "Tail", MagicMock(), is_resume=True)
+        tail = QueueObject(
+            webpage_url="https://yt.com/v=t",
+            title="Tail",
+            requester=MagicMock(),
+            is_resume=True,
+        )
         music_player._skip_history_for = mock_song
         music_player._pending_resume_tail = tail
 
@@ -12892,7 +13596,12 @@ class TestHistorySkipMarker:
         music_player._np_host_message = host
         music_player._np_host_dedicated = True
 
-        tail = QueueObject("https://yt.com/v=t", "Tail", MagicMock(), is_resume=True)
+        tail = QueueObject(
+            webpage_url="https://yt.com/v=t",
+            title="Tail",
+            requester=MagicMock(),
+            is_resume=True,
+        )
         music_player._skip_history_for = MagicMock()  # some other, ended song
         music_player._pending_resume_tail = tail
 
@@ -12957,7 +13666,12 @@ class TestHistorySkipMarker:
         slot receives a LATER fragment's card ids and deletes the wrong message —
         so the exception handler has to release it, and until now nothing asserted
         that it did."""
-        tail = QueueObject("https://yt.com/v=t", "Tail", MagicMock(), is_resume=True)
+        tail = QueueObject(
+            webpage_url="https://yt.com/v=t",
+            title="Tail",
+            requester=MagicMock(),
+            is_resume=True,
+        )
         music_player._pending_resume_tail = tail
         music_player._skip_history_for = mock_song
 
@@ -13018,7 +13732,11 @@ class TestHistorySkipMarker:
             # The loop's vc.play() between rounds: the previous stop is over.
             music_player._stopped_deliberately = False
             await music_player.interject(
-                QueueObject(f"https://yt.com/v=cut{n}", f"Cut {n}", mock_author),
+                QueueObject(
+                    webpage_url=f"https://yt.com/v=cut{n}",
+                    title=f"Cut {n}",
+                    requester=mock_author,
+                ),
                 mock_vc,
             )
             await record_marker()
@@ -13342,9 +14060,9 @@ class TestInterjectPostNeutralizeRecheck:
         completed, and dropping one loses a song a listener was promised back."""
         parked = [
             QueueObject(
-                f"https://yt.com/v={n}",
-                f"Parked {n}",
-                mock_author,
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"Parked {n}",
+                requester=mock_author,
                 ts=30 * n,
                 is_resume=True,
                 played_at=1752530000.0 + n,
@@ -13451,7 +14169,9 @@ class TestInterjectStoppedSong:
         assert music_player._stopped_deliberately  # current is stopped, not replaced
         parked = music_player.queue.display_items()
 
-        second = QueueObject("https://yt.com/v=2", "Second", mock_author)
+        second = QueueObject(
+            webpage_url="https://yt.com/v=2", title="Second", requester=mock_author
+        )
         outcome = await music_player.interject(second, mock_vc)
 
         assert outcome is None
@@ -13555,9 +14275,9 @@ class TestReplayQueueCard:
         cards, one above the other. Unmarked it reads as a duplicate queue entry
         rather than as the replay the user just asked for."""
         replay = QueueObject(
-            live_song.webpage_url,
-            live_song.title,
-            mock_author,
+            webpage_url=live_song.webpage_url,
+            title=live_song.title,
+            requester=mock_author,
             duration=210,
             is_replay=True,
         )
@@ -13575,7 +14295,10 @@ class TestReplayQueueCard:
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
         queued = QueueObject(
-            "https://yt.com/v=b", "Queued B", mock_author, duration=210
+            webpage_url="https://yt.com/v=b",
+            title="Queued B",
+            requester=mock_author,
+            duration=210,
         )
         await music_player.queue.put([queued])
         music_player.current_song = live_song
@@ -13758,7 +14481,11 @@ class TestReplayAgainstTheRealLoop:
         self, music_player: MusicPlayer, mock_author: MagicMock, latency: str
     ) -> None:
         a, b, c = (
-            QueueObject(f"https://yt.com/v={v}", f"Song {v}", mock_author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v={v}",
+                title=f"Song {v}",
+                requester=mock_author,
+            )
             for v in "abc"
         )
         await music_player.queue.put([a, b, c])
@@ -14686,7 +15413,9 @@ class TestEnqueueWarmBound:
         async def _prefetch(_item: Any, *, redis: Any) -> None:
             held.append(sem.locked())
 
-        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+        )
         with (
             patch("src.musicplayer.prefetch_warm_slot", return_value=sem),
             patch.object(YTDL, "prefetch_stream", new=_prefetch),
@@ -14701,7 +15430,9 @@ class TestEnqueueWarmBound:
     ) -> None:
         """The wiring, not the bound: queue_put spawning YTDL.prefetch_stream
         directly would leave the semaphore in place and bypassed."""
-        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+        )
         warmed: list[Any] = []
         warm = AsyncMock(side_effect=lambda item: warmed.append(item))
 
@@ -14760,7 +15491,9 @@ class TestTheSkipNoticeShowsSafeText:
             "ERROR: [youtube] abc: Sign in to confirm your age; please report this "
             "issue on https://github.com/yt-dlp/yt-dlp/issues"
         )
-        qobj = QueueObject("https://yt.com/v=1", "One", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+        )
 
         with patch.object(YTDL, "yt_stream", new=AsyncMock(side_effect=boom)):
             assert await music_player._stream_source(qobj) is None
@@ -14794,7 +15527,11 @@ class TestQueuePutNextClearsAClaimThatArrivedLate:
             patch.object(MusicPlayer, "queue_put_front", new=AsyncMock()),
         ):
             await music_player.queue_put_next(
-                QueueObject("https://yt.com/v=1", "Next", mock_author)
+                QueueObject(
+                    webpage_url="https://yt.com/v=1",
+                    title="Next",
+                    requester=mock_author,
+                )
             )
 
         assert len(calls) == 2
@@ -14816,7 +15553,11 @@ class TestQueuePutNextClearsAClaimThatArrivedLate:
             patch.object(MusicPlayer, "queue_put_front", new=AsyncMock()),
         ):
             await music_player.queue_put_next(
-                QueueObject("https://yt.com/v=1", "Next", mock_author)
+                QueueObject(
+                    webpage_url="https://yt.com/v=1",
+                    title="Next",
+                    requester=mock_author,
+                )
             )
 
         assert len(calls) == 1

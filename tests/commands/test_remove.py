@@ -16,7 +16,10 @@ def _removed_song(n: int, query_source: str = "") -> QueueObject:
     """A stand-in for what queue_remove hands back — the reply reads query_source
     off these to name how it matched."""
     return QueueObject(
-        f"https://yt.com/v={n}", f"Song {n}", MagicMock(), query_source=query_source
+        webpage_url=f"https://yt.com/v={n}",
+        title=f"Song {n}",
+        requester=MagicMock(),
+        query_source=query_source,
     )
 
 
@@ -172,7 +175,11 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         """99 characters is INSIDE YouTube's own 100-char title limit, so ten
         ordinary songs overflow the 1024-char field with no crafted content."""
         songs: list[QueueObject] = [
-            QueueObject(f"https://yt.com/v={i}", "A" * 99, MagicMock())
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title="A" * 99,
+                requester=MagicMock(),
+            )
             for i in range(10)
         ]
         await self._run(
@@ -187,7 +194,11 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         """Escaping roughly doubles a title of pure markdown characters, which is
         the shape a hostile uploader picks."""
         songs: list[QueueObject] = [
-            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title="*" * 200,
+                requester=MagicMock(),
+            )
             for i in range(10)
         ]
         await self._run(
@@ -242,7 +253,11 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
         """Discord caps an embed at 6000 characters across every part, so three
         fields each legal on their own can still fail together."""
         songs: list[QueueObject] = [
-            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title="*" * 200,
+                requester=MagicMock(),
+            )
             for i in range(240)
         ]
         await self._run(

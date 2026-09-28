@@ -790,9 +790,9 @@ class GuildQueue:
                 # What a listing shows for it until the resolve lands, as the walk
                 # named them: dropping these reads "resolving..." again after a
                 # restart, for a track the queue could already describe.
-                entry.webpage_url or "",
-                entry.title or "",
-                requester,
+                webpage_url=entry.webpage_url or "",
+                title=entry.title or "",
+                requester=requester,
                 ts=entry.ts,
                 user_input=entry.user_input,
                 duration=entry.duration,
@@ -802,9 +802,9 @@ class GuildQueue:
                 search=entry.ytsearch or entry.url or "",
             )
         return QueueObject(
-            entry.webpage_url,
-            entry.title,
-            requester,
+            webpage_url=entry.webpage_url,
+            title=entry.title,
+            requester=requester,
             ts=entry.ts,
             user_input=entry.user_input,
             duration=entry.duration,

@@ -33,7 +33,12 @@ _START = EtaWalk(cumulative_secs=180, uncertain=False)
 
 def _song(author: MagicMock, n: int = 1, **kwargs: Any) -> QueueObject:
     fields: dict[str, Any] = {"duration": 60, "uploader": f"Channel {n}", **kwargs}
-    return QueueObject(f"https://yt.com/v={n}", f"Song {n}", author, **fields)
+    return QueueObject(
+        webpage_url=f"https://yt.com/v={n}",
+        title=f"Song {n}",
+        requester=author,
+        **fields,
+    )
 
 
 class TestRemainingSecs:
@@ -140,9 +145,9 @@ def _track(**kwargs: Any) -> QueueObject:
         **kwargs,
     }
     return QueueObject(
-        fields.pop("webpage_url"),
-        fields.pop("title"),
-        fields.pop("requester", stub_requester()),
+        webpage_url=fields.pop("webpage_url"),
+        title=fields.pop("title"),
+        requester=fields.pop("requester", stub_requester()),
         **fields,
     )
 
@@ -328,9 +333,9 @@ class TestTheDefaultBudgetHoldsTheDescriptionUnder4096:
     def _maximal(author: MagicMock, n: int) -> QueueObject:
         """A row at both caps: yt-dlp bounds neither a title nor an uploader."""
         return QueueObject(
-            "https://www.youtube.com/watch?v=" + "x" * 11,
-            "T" * (ROW_TITLE_MAX + 50),
-            author,
+            webpage_url="https://www.youtube.com/watch?v=" + "x" * 11,
+            title="T" * (ROW_TITLE_MAX + 50),
+            requester=author,
             duration=215,
             uploader="U" * (ROW_BYLINE_MAX + 50),
         )

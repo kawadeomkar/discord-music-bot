@@ -154,7 +154,7 @@ class YTType(Enum):
     PLAYLIST = "playlist"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SpotifySource:
     type: SpotifyType
     id: str
@@ -170,7 +170,7 @@ class SpotifySource:
 
 # slots: one instance per parsed input, and a playlist parse is on the -play path.
 # Keep the class free of __dict__ readers (asdict/vars) and off any pickle path.
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class YTSource:
     """A YouTube track or playlist: a pasted `url` or a `ytsearch:` term, with
     an optional `ts` start offset. `list_id`, `index` (1-based start position)
@@ -202,7 +202,7 @@ class YTSource:
         return self.url or f"https://www.youtube.com/playlist?list={self.list_id}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SoundcloudSource:
     # TODO: SoundCloud timestamp links are ignored, so the track always starts at 0:00.
     # parse_url() reads `t`/`ts` for youtube.com only, so `ts` is never populated;
@@ -366,7 +366,7 @@ def _parse_link(
     if host in _SPOTIFY_HOSTS:
         return _spotify_source(*_spotify_path(parts.path))
     if host == "soundcloud.com":
-        return SoundcloudSource(link, process=True)
+        return SoundcloudSource(url=link, process=True)
     # A host that is not special-cased goes to yt-dlp, which rejects an
     # unsupported site itself (YTDL.yt_source). Routed like a bare YouTube watch
     # URL; the host is what the archive records.
@@ -399,7 +399,7 @@ def _youtube_source(
     list_id = _last(args, "list")
     if list_id is None:
         return YTSource(
-            link,
+            url=link,
             ts=ts,
             process=False,
             bad_timestamp=bad_timestamp,
@@ -409,7 +409,7 @@ def _youtube_source(
     # youtu.be carries its video in the path, where `v=` never appears.
     video_id = path[1:].split("/", 1)[0] if host == "youtu.be" else _last(args, "v")
     return YTSource(
-        link,
+        url=link,
         ts=ts,
         process=False,
         type=YTType.PLAYLIST,
@@ -464,7 +464,7 @@ def _spotify_source(kind: str, spotify_id: str) -> SpotifySource:
             "again from Spotify."
         )
     log.info(f"Spotify source ID: {spotify_id}")
-    return SpotifySource(spotify_type, spotify_id, process=True)
+    return SpotifySource(type=spotify_type, id=spotify_id, process=True)
 
 
 def unquote_argument(text: str) -> str:

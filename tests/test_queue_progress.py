@@ -343,11 +343,11 @@ class TestEnqueueProgressState:
 class TestIsCollection:
     def test_only_collections_get_a_card(self) -> None:
         assert is_collection(_yt_playlist())
-        assert is_collection(SpotifySource(SpotifyType.PLAYLIST, "pid"))
-        assert is_collection(SpotifySource(SpotifyType.ALBUM, "aid"))
-        assert not is_collection(SpotifySource(SpotifyType.TRACK, "tid"))
-        assert not is_collection(YTSource("https://yt.com/v=1", type=YTType.TRACK))
-        assert not is_collection(SoundcloudSource("https://soundcloud.com/a/b"))
+        assert is_collection(SpotifySource(type=SpotifyType.PLAYLIST, id="pid"))
+        assert is_collection(SpotifySource(type=SpotifyType.ALBUM, id="aid"))
+        assert not is_collection(SpotifySource(type=SpotifyType.TRACK, id="tid"))
+        assert not is_collection(YTSource(url="https://yt.com/v=1", type=YTType.TRACK))
+        assert not is_collection(SoundcloudSource(url="https://soundcloud.com/a/b"))
 
 
 # ── the driver ────────────────────────────────────────────────────────────────
@@ -377,7 +377,7 @@ class TestTheDelayThreshold:
 
     async def test_an_albums_card_calls_it_an_album(self, card_ctx: MagicMock) -> None:
         _fast()
-        album = SpotifySource(SpotifyType.ALBUM, "aid")
+        album = SpotifySource(type=SpotifyType.ALBUM, id="aid")
 
         async with enqueue_progress(card_ctx, album, delay=_FAST_DELAY):
             await asyncio.sleep(0.08)

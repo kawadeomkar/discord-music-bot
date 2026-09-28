@@ -1,5 +1,6 @@
 """Tests for src/sources.py — URL parsing and source type detection."""
 
+import dataclasses
 import re
 import time
 from collections.abc import Callable
@@ -411,7 +412,9 @@ class TestParseUrlSpotify:
         """Localized clients prefix `intl-<locale>`, and the embed player `embed/`.
         Real locales answer 200 on that path, so it is what users paste."""
         result = parse_url(f"https://open.spotify.com/{path}")
-        assert result == SpotifySource(SpotifyType.TRACK, "4cOdK2wGLETKBW3PvgPWqT")
+        assert result == SpotifySource(
+            type=SpotifyType.TRACK, id="4cOdK2wGLETKBW3PvgPWqT"
+        )
 
     @pytest.mark.parametrize(
         "link",
@@ -426,7 +429,9 @@ class TestParseUrlSpotify:
         self, link: str
     ) -> None:
         result = parse_input(link)
-        assert result == SpotifySource(SpotifyType.PLAYLIST, "37i9dQZF1DXcBWIGoYBM5M")
+        assert result == SpotifySource(
+            type=SpotifyType.PLAYLIST, id="37i9dQZF1DXcBWIGoYBM5M"
+        )
 
     def test_a_uri_that_is_not_a_spotify_item_stays_a_search(self) -> None:
         """Only the exact URI shape is Spotify's; anything else spelled with the
@@ -1383,3 +1388,33 @@ class TestLinkParsingIsLinear:
     def test_a_token_past_the_cap_is_searched(self) -> None:
         link = f"https://www.youtube.com/watch?v={_VIDEO}&x={'a' * LINK_MAX_CHARS}"
         assert parse_input(link).stype is URLSource.SEARCH
+
+
+class TestParseResultsMeetTheDataclassConvention:
+    """The three parse results are value objects: frozen, slotted and built by
+    keyword (CLAUDE.md, code conventions). Pinned at runtime beside the pyright
+    proof that no positional construction survives in src or tests."""
+
+    def test_a_youtube_parse_is_frozen_slotted_and_keyword_only(self) -> None:
+        source = YTSource(url="https://yt.com/watch?v=1")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(source, "ts", 5)
+        assert not hasattr(source, "__dict__")
+        with pytest.raises(TypeError):
+            YTSource("https://yt.com/watch?v=1")  # pyright: ignore[reportCallIssue]
+
+    def test_a_spotify_parse_is_frozen_slotted_and_keyword_only(self) -> None:
+        source = SpotifySource(type=SpotifyType.TRACK, id="4cOdK2wGLETKBW3PvgPWqT")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(source, "id", "x")
+        assert not hasattr(source, "__dict__")
+        with pytest.raises(TypeError):
+            SpotifySource(SpotifyType.TRACK, "x")  # pyright: ignore[reportCallIssue]
+
+    def test_a_soundcloud_parse_is_frozen_slotted_and_keyword_only(self) -> None:
+        source = SoundcloudSource(url="https://soundcloud.com/a/b")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(source, "ts", 5)
+        assert not hasattr(source, "__dict__")
+        with pytest.raises(TypeError):
+            SoundcloudSource("https://soundcloud.com/a/b")  # pyright: ignore[reportCallIssue]

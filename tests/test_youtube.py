@@ -187,7 +187,11 @@ class TestYTDLDuration:
                 mock_channel,
                 data["url"],
                 data=data,
-                queued=QueueObject(data["webpage_url"], "Test Song", MagicMock()),
+                queued=QueueObject(
+                    webpage_url=data["webpage_url"],
+                    title="Test Song",
+                    requester=MagicMock(),
+                ),
             )
         assert song.duration_secs == 0
 
@@ -329,9 +333,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
     async def test_user_input_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         album = "https://open.spotify.com/album/abc123"
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test",
-            "Test Song",
-            mock_ctx.author,
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
             user_input=album,
         )
 
@@ -344,7 +348,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         doubles re-implement this setter on their own type, so every loop test
         that stamps the start passes whether or not youtube.py's setter does."""
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
         )
         song = ytdl_instance(queued=qobj)
 
@@ -361,7 +367,10 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         identity below is what that claim rests on. `ts` is the one field renamed
         at the boundary, so it is the one asserted by hand."""
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=45
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
+            ts=45,
         )
 
         song = await self._played(qobj)
@@ -377,9 +386,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         import dataclasses
 
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test",
-            "Test Song",
-            mock_ctx.author,
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
             ts=45,
             user_input="typed",
             query_source="search",
@@ -435,7 +444,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         crossed pair holding the same value reads back clean."""
         qobj = replace(
             QueueObject(
-                "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+                webpage_url="https://www.youtube.com/watch?v=test",
+                title="Test Song",
+                requester=mock_ctx.author,
             ),
             **{flipped: not _CARRIED_BOOLS[flipped]},
         )
@@ -453,9 +464,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         the crash-recovered head is NOT on the Redis list, and a rebuild defaulting
         to True writes it into the mirror, where its dequeue never LPOPs."""
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test",
-            "Test Song",
-            mock_ctx.author,
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
             persisted=False,
         )
 
@@ -474,24 +485,33 @@ class TestQueueObject:
         assert qobj.requester is mock_author
 
     def test_ts_defaults_to_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Title", requester=mock_author
+        )
         assert qobj.ts is None
 
     def test_ts_can_be_set(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author, ts=90)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/watch?v=1",
+            title="Title",
+            requester=mock_author,
+            ts=90,
+        )
         assert qobj.ts == 90
 
     def test_optional_fields_default_to_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Title", requester=mock_author
+        )
         assert qobj.user_input is None
         assert qobj.duration is None
         assert qobj.uploader is None
 
     def test_optional_fields_can_be_set(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
-            "https://yt.com/watch?v=1",
-            "Title",
-            mock_author,
+            webpage_url="https://yt.com/watch?v=1",
+            title="Title",
+            requester=mock_author,
             user_input="search term",
             duration=180,
             uploader="My Channel",
@@ -506,48 +526,112 @@ class TestQueueObject:
         assert dataclasses.is_dataclass(QueueObject)
 
     def test_equality(self, mock_author: MagicMock) -> None:
-        q1 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
-        q2 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
+        q1 = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        q2 = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
         assert q1 == q2
 
     def test_inequality_different_url(self, mock_author: MagicMock) -> None:
-        q1 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
-        q2 = QueueObject("https://yt.com/watch?v=2", "Song", mock_author)
+        q1 = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        q2 = QueueObject(
+            webpage_url="https://yt.com/watch?v=2", title="Song", requester=mock_author
+        )
         assert q1 != q2
+
+    def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
+        # webpage_url and title are both str: positional, either order type-checks.
+        with pytest.raises(TypeError):
+            QueueObject("https://yt.com/watch?v=1", "Song", mock_author)  # pyright: ignore[reportCallIssue]
+
+    def test_every_field_takes_part_in_replace(self) -> None:
+        """replace() carries the whole ask across the three rebuilds and the
+        crash restore, and it silently skips a field declared init=False — such a
+        field would be reset to its default at every rebuild."""
+        import dataclasses
+
+        assert [f.name for f in dataclasses.fields(QueueObject) if not f.init] == []
+
+    def test_asdict_and_vars_stay_off_the_item(self, mock_author: MagicMock) -> None:
+        """vars() raises on a slotted item, but asdict() does not: it reads
+        fields() and deep-copies every value, including the Member on requester.
+        The wire tables spell the fields out instead. Pins the class comment: no
+        asdict() call anywhere in src/, qualified or not, and no vars() in a
+        module that names QueueObject (argparse's vars(args) elsewhere is fine)."""
+        import ast
+
+        item = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        assert not hasattr(item, "__dict__")
+        src = pathlib.Path(__file__).resolve().parents[1] / "src"
+        hits: list[str] = []
+        for path in sorted(src.rglob("*.py")):
+            text = path.read_text()
+            handles_item = "QueueObject" in text
+            for node in ast.walk(ast.parse(text)):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if called == "asdict" or (called == "vars" and handles_item):
+                    hits.append(f"{path.relative_to(src.parent)}:{node.lineno}")
+        assert hits == []
 
 
 class TestEnrichQueueObject:
     def test_sets_duration_when_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
+        )
         _enrich_queueobject(qobj, {"duration": 180, "uploader": "Chan"})
         assert qobj.duration == 180
 
     def test_does_not_overwrite_existing_duration(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=120)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Song",
+            requester=mock_author,
+            duration=120,
+        )
         _enrich_queueobject(qobj, {"duration": 999, "uploader": "Chan"})
         assert qobj.duration == 120
 
     def test_sets_uploader_when_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
+        )
         _enrich_queueobject(qobj, {"uploader": "My Channel"})
         assert qobj.uploader == "My Channel"
 
     def test_does_not_overwrite_existing_uploader(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
-            "https://yt.com/v=1", "Song", mock_author, uploader="Original"
+            webpage_url="https://yt.com/v=1",
+            title="Song",
+            requester=mock_author,
+            uploader="Original",
         )
         _enrich_queueobject(qobj, {"uploader": "New Channel"})
         assert qobj.uploader == "Original"
 
     def test_handles_missing_keys_gracefully(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
+        )
         _enrich_queueobject(qobj, {})
         assert qobj.duration is None
         assert qobj.uploader is None
         assert qobj.thumbnail is None
 
     def test_sets_thumbnail_when_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
+        )
         _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/x.jpg"})
         assert qobj.thumbnail == "https://img.yt.com/x.jpg"
 
@@ -555,16 +639,18 @@ class TestEnrichQueueObject:
         self, mock_author: MagicMock
     ) -> None:
         qobj = QueueObject(
-            "https://yt.com/v=1",
-            "Song",
-            mock_author,
+            webpage_url="https://yt.com/v=1",
+            title="Song",
+            requester=mock_author,
             thumbnail="https://img.yt.com/original.jpg",
         )
         _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/new.jpg"})
         assert qobj.thumbnail == "https://img.yt.com/original.jpg"
 
     def test_duration_cast_to_int(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
+        )
         _enrich_queueobject(qobj, {"duration": 180.7})
         assert qobj.duration == 180
         assert isinstance(qobj.duration, int)
@@ -1634,7 +1720,11 @@ class TestYTSourceUnifiedExtraction:
 
 class TestYTStreamRuntimeError:
     async def test_raises_when_extract_returns_none(self, mock_ctx: MagicMock) -> None:
-        qobj = QueueObject("https://yt.com/v=none", "None Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=none",
+            title="None Song",
+            requester=mock_ctx.author,
+        )
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         with patch("src.youtube._ytdlp_extract", return_value=None):
@@ -1648,7 +1738,9 @@ class TestYTStream:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
         )
 
         with (
@@ -1668,7 +1760,9 @@ class TestYTStream:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
         )
 
         captured_options = {}
@@ -1705,7 +1799,10 @@ class TestYTStream:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
+            ts=90,
         )
 
         captured_options = {}
@@ -1741,7 +1838,10 @@ class TestYTStream:
         that costs an Opus pre-skip packet for nothing, and made "no seek" and "seek
         to zero" two different code paths."""
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=0
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
+            ts=0,
         )
         captured: dict[str, str] = {}
 
@@ -1775,7 +1875,10 @@ class TestYTStream:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
+            ts=90,
         )
 
         with (
@@ -1793,7 +1896,9 @@ class TestYTStream:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
         )
 
         with (
@@ -1815,9 +1920,9 @@ class TestYTStream:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test",
-            "Test Song",
-            mock_ctx.author,
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
             analytics=Analytics(queued_at=1752529000.5, queue_position=4),
         )
 
@@ -1900,7 +2005,9 @@ class TestRevokedStreamUrl:
         # The cached URL is dead; the freshly extracted replacement plays.
         playable_urls.side_effect = [StreamProbe.DEAD, StreamProbe.PLAYABLE]
         fresh = _fake_ytdl_data(webpage_url=webpage_url, title="Fresh Song")
-        qobj = QueueObject(webpage_url, "Revoked Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Revoked Song", requester=mock_ctx.author
+        )
         channel = AsyncMock(spec=discord.TextChannel)
 
         with (
@@ -1929,7 +2036,9 @@ class TestRevokedStreamUrl:
         # Probe blocked on the cached URL; the replacement's edge answers.
         playable_urls.side_effect = [StreamProbe.UNCONFIRMED, StreamProbe.PLAYABLE]
         fresh = _fake_ytdl_data(webpage_url=webpage_url, title="Fresh Edge")
-        qobj = QueueObject(webpage_url, "Stuck Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Stuck Song", requester=mock_ctx.author
+        )
         channel = AsyncMock(spec=discord.TextChannel)
 
         with (
@@ -1953,7 +2062,9 @@ class TestRevokedStreamUrl:
         probes keep failing, which multiplies extraction load against YouTube."""
         webpage_url = "https://yt.com/v=unprobeable"
         playable_urls.return_value = StreamProbe.UNCONFIRMED
-        qobj = QueueObject(webpage_url, "Unprobeable Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Unprobeable Song", requester=mock_ctx.author
+        )
         channel = AsyncMock(spec=discord.TextChannel)
 
         with (
@@ -1981,7 +2092,9 @@ class TestRevokedStreamUrl:
         webpage_url = "https://yt.com/v=always_dead"
         await self._cache(fake_redis, webpage_url)
         playable_urls.return_value = StreamProbe.DEAD
-        qobj = QueueObject(webpage_url, "Dead Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Dead Song", requester=mock_ctx.author
+        )
         channel = AsyncMock(spec=discord.TextChannel)
 
         with (
@@ -2001,7 +2114,9 @@ class TestRevokedStreamUrl:
     ) -> None:
         """prefetch_stream must not cache a URL that is already dead."""
         webpage_url = "https://yt.com/v=prefetch_dead"
-        qobj = QueueObject(webpage_url, "Prefetch Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Prefetch Song", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2025,7 +2140,9 @@ class TestRevokedStreamUrl:
         long enough to keep the cache working through a blip, short enough that a wrong
         entry cannot hold a song down."""
         webpage_url = "https://yt.com/v=prefetch_unconfirmed"
-        qobj = QueueObject(webpage_url, "Prefetch Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Prefetch Song", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2055,7 +2172,9 @@ class TestRevokedStreamUrl:
         playable_urls.side_effect = [StreamProbe.UNCONFIRMED, StreamProbe.PLAYABLE]
         # No `expire` -> _stream_url_ttl returns None -> nothing is cached for it.
         fresh = _fake_ytdl_data(webpage_url=webpage_url, url="https://cdn/no-expiry")
-        qobj = QueueObject(webpage_url, "Drop", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Drop", requester=mock_ctx.author
+        )
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fresh),
@@ -2079,7 +2198,9 @@ class TestRevokedStreamUrl:
             StreamProbe.UNCONFIRMED,  # cached entry: free drop
             StreamProbe.PLAYABLE,  # the one real extraction still gets its chance
         ]
-        qobj = QueueObject(webpage_url, "Budget", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Budget", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2109,7 +2230,9 @@ class TestRevokedStreamUrl:
             StreamProbe.DEAD,  # unused at budget 1; keeps a raised budget failing on
             # the call-count assertion rather than on an exhausted mock
         ]
-        qobj = QueueObject(webpage_url, "Exhausted", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Exhausted", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2143,7 +2266,9 @@ class TestRevokedStreamUrl:
             StreamProbe.DEAD,  # first real extraction
             StreamProbe.PLAYABLE,  # the raised budget buys a second, and it wins
         ]
-        qobj = QueueObject(webpage_url, "Dial", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Dial", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2172,7 +2297,9 @@ class TestRevokedStreamUrl:
             await _probe_stream_url("https://anything")
         assert probe_path_looks_broken()
 
-        qobj = QueueObject(webpage_url, "Streak", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Streak", requester=mock_ctx.author
+        )
         with (
             patch("src.youtube._ytdlp_extract") as mock_extract,
             patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
@@ -2202,7 +2329,9 @@ class TestRevokedStreamUrl:
         webpage_url = "https://yt.com/v=prefetch_noreextract"
         await self._cache(fake_redis, webpage_url, title="Cached Original")
         playable_urls.return_value = StreamProbe.UNCONFIRMED
-        qobj = QueueObject(webpage_url, "Prefetch", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Prefetch", requester=mock_ctx.author
+        )
 
         with (
             patch("src.youtube._ytdlp_extract") as mock_extract,
@@ -2317,7 +2446,9 @@ class TestRevokedStreamUrl:
         can be dropped or misnamed with every behavioural test still green."""
         webpage_url = "https://yt.com/v=span_attr"
         playable_urls.return_value = StreamProbe.UNCONFIRMED
-        qobj = QueueObject(webpage_url, "Span", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Span", requester=mock_ctx.author
+        )
         attrs: dict[str, Any] = {}
         span = MagicMock()
         span.set_attribute = lambda k, v: attrs.__setitem__(k, v)
@@ -2346,7 +2477,9 @@ class TestRevokedStreamUrl:
         everything because probes are failing" is indistinguishable in a trace from
         "uncacheable, no usable expiry" and from a revoked URL."""
         webpage_url = "https://yt.com/v=span_prefetch"
-        qobj = QueueObject(webpage_url, "SpanPrefetch", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="SpanPrefetch", requester=mock_ctx.author
+        )
         attrs: dict[str, Any] = {}
         span = MagicMock()
         span.set_attribute = lambda k, v: attrs.__setitem__(k, v)
@@ -2377,7 +2510,9 @@ class TestRevokedStreamUrl:
         Dropping it on this path would silence it with no other symptom."""
         webpage_url = "https://yt.com/v=fmt_unconfirmed"
         playable_urls.return_value = StreamProbe.UNCONFIRMED
-        qobj = QueueObject(webpage_url, "Fmt", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Fmt", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2405,7 +2540,9 @@ class TestRevokedStreamUrl:
         playable_urls.return_value = cast(
             StreamProbe, SimpleNamespace(value="not-a-verdict")
         )
-        qobj = QueueObject(webpage_url, "Bogus", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Bogus", requester=mock_ctx.author
+        )
 
         with (
             patch(
@@ -2483,7 +2620,9 @@ class TestCandidateLadderWalk:
     async def _play(
         self, fake_redis: aioredis.Redis, webpage_url: str, author: Any, **kwargs: Any
     ) -> YTDL:
-        qobj = QueueObject(webpage_url, "Laddered Song", author)
+        qobj = QueueObject(
+            webpage_url=webpage_url, title="Laddered Song", requester=author
+        )
         with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
             return await YTDL.yt_stream(
                 qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis, **kwargs
@@ -2517,7 +2656,8 @@ class TestCandidateLadderWalk:
 
         with patch("src.youtube._extract_once", new=AsyncMock(return_value=shared)):
             resolved = await YTDL._resolve_playable_stream(
-                QueueObject(url, "Shared", mock_ctx.author), fake_redis
+                QueueObject(webpage_url=url, title="Shared", requester=mock_ctx.author),
+                fake_redis,
             )
 
         assert resolved.get("format_id") == "140"
@@ -2542,9 +2682,9 @@ class TestCandidateLadderWalk:
         ]  # 140, walked first, is healthy
 
         qobj = QueueObject(
-            url,
-            "Laddered Song",
-            mock_ctx.author,
+            webpage_url=url,
+            title="Laddered Song",
+            requester=mock_ctx.author,
             failed_format_ids=frozenset({"251"}),
         )
         with (
@@ -2718,7 +2858,10 @@ class TestCandidateLadderWalk:
         playable_urls.return_value = StreamProbe.PLAYABLE
 
         qobj = QueueObject(
-            url, "Retrying Song", mock_ctx.author, failed_format_ids=frozenset({"251"})
+            webpage_url=url,
+            title="Retrying Song",
+            requester=mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
         )
         with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
             song = await YTDL.yt_stream(
@@ -2738,7 +2881,10 @@ class TestCandidateLadderWalk:
         playable_urls.return_value = StreamProbe.PLAYABLE
 
         qobj = QueueObject(
-            url, "Single Format", mock_ctx.author, failed_format_ids=frozenset({"251"})
+            webpage_url=url,
+            title="Single Format",
+            requester=mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
         )
         with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
             song = await YTDL.yt_stream(
@@ -2810,7 +2956,11 @@ class TestStreamCache:
             orjson.dumps(cached_data),
             ex=3600,
         )
-        qobj = QueueObject("https://yt.com/v=cache_hit", "Cached Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=cache_hit",
+            title="Cached Song",
+            requester=mock_ctx.author,
+        )
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
 
@@ -2829,7 +2979,11 @@ class TestStreamCache:
             webpage_url="https://yt.com/v=cache_miss",
             title="Miss Song",
         )
-        qobj = QueueObject("https://yt.com/v=cache_miss", "Miss Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=cache_miss",
+            title="Miss Song",
+            requester=mock_ctx.author,
+        )
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
 
@@ -2848,7 +3002,11 @@ class TestStreamCache:
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=err")
         bad_redis = AsyncMock()
         bad_redis.get = AsyncMock(side_effect=ConnectionError("Redis down"))
-        qobj = QueueObject("https://yt.com/v=err", "Error Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=err",
+            title="Error Song",
+            requester=mock_ctx.author,
+        )
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
 
@@ -2934,7 +3092,11 @@ class TestStreamExtractionSingleflight:
             await gate.wait()
             return _fake_ytdl_data(webpage_url="https://yt.com/v=race")
 
-        qobj = QueueObject("https://yt.com/v=race", "Raced Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=race",
+            title="Raced Song",
+            requester=mock_ctx.author,
+        )
         with patch("src.youtube._run_extract", new=_slow):
             tasks = [
                 asyncio.create_task(YTDL.prefetch_stream(qobj, redis=fake_redis)),
@@ -2968,7 +3130,11 @@ class TestStreamExtractionSingleflight:
             tasks = [
                 asyncio.create_task(
                     YTDL.prefetch_stream(
-                        QueueObject(f"https://yt.com/v=s{i}", "Song", mock_ctx.author),
+                        QueueObject(
+                            webpage_url=f"https://yt.com/v=s{i}",
+                            title="Song",
+                            requester=mock_ctx.author,
+                        ),
                         redis=fake_redis,
                     )
                 )
@@ -2991,34 +3157,50 @@ class TestPrefetchStream:
     ) -> None:
         from src.youtube import ExtractionError
 
-        qobj = QueueObject("https://yt.com/v=pfg1", "Boom", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pfg1", title="Boom", requester=mock_ctx.author
+        )
         with patch("src.youtube._ytdlp_extract", side_effect=ExtractionError("nope")):
             assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
 
     async def test_an_empty_extraction_reports_not_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=pfg2", "Nothing", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pfg2",
+            title="Nothing",
+            requester=mock_ctx.author,
+        )
         with patch("src.youtube._ytdlp_extract", return_value=None):
             assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
 
     async def test_a_warmed_song_reports_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=pfg3", "Fine", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pfg3", title="Fine", requester=mock_ctx.author
+        )
         data = _fake_ytdl_data(webpage_url="https://yt.com/v=pfg3", title="Fine")
         with patch("src.youtube._ytdlp_extract", return_value=data):
             assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
 
     async def test_no_redis_reports_warmed(self, mock_ctx: MagicMock) -> None:
         """Nothing to warm and nothing provable — not a "not playable" answer."""
-        qobj = QueueObject("https://yt.com/v=pfg4", "No Redis", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pfg4",
+            title="No Redis",
+            requester=mock_ctx.author,
+        )
         assert await YTDL.prefetch_stream(qobj, redis=None) is True
 
     async def test_an_already_cached_song_reports_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=pfg5", "Cached", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pfg5",
+            title="Cached",
+            requester=mock_ctx.author,
+        )
         await fake_redis.set(
             "ytdl:stream:https://yt.com/v=pfg5",
             orjson.dumps(
@@ -3036,7 +3218,11 @@ class TestPrefetchStream:
         fake_data = _fake_ytdl_data(
             webpage_url="https://yt.com/v=pf1", title="Prefetch Song"
         )
-        qobj = QueueObject("https://yt.com/v=pf1", "Prefetch Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pf1",
+            title="Prefetch Song",
+            requester=mock_ctx.author,
+        )
 
         with patch(
             "src.youtube._ytdlp_extract", return_value=fake_data
@@ -3050,7 +3236,11 @@ class TestPrefetchStream:
 
     async def test_no_op_when_redis_none(self, mock_ctx: MagicMock) -> None:
         """prefetch_stream returns immediately when redis is None — no exception."""
-        qobj = QueueObject("https://yt.com/v=pf2", "No Redis", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pf2",
+            title="No Redis",
+            requester=mock_ctx.author,
+        )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
             await YTDL.prefetch_stream(qobj, redis=None)
         mock_extract.assert_not_called()
@@ -3065,7 +3255,11 @@ class TestPrefetchStream:
             orjson.dumps(fake_data),
             ex=3600,
         )
-        qobj = QueueObject("https://yt.com/v=pf3", "Already Cached", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pf3",
+            title="Already Cached",
+            requester=mock_ctx.author,
+        )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         mock_extract.assert_not_called()
@@ -3079,7 +3273,11 @@ class TestPrefetchStream:
         shape the code can no longer produce."""
         from src.youtube import ExtractionError
 
-        qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pf4",
+            title="Error Song",
+            requester=mock_ctx.author,
+        )
         with patch(
             "src.youtube._ytdlp_extract",
             side_effect=ExtractionError(
@@ -3102,7 +3300,11 @@ class TestPrefetchStream:
             url=f"https://r2.googlevideo.com/stream?expire={soon}",
             webpage_url="https://yt.com/v=pf5",
         )
-        qobj = QueueObject("https://yt.com/v=pf5", "Nearly Expired", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=pf5",
+            title="Nearly Expired",
+            requester=mock_ctx.author,
+        )
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf5")
@@ -3152,7 +3354,11 @@ class TestOpusPassthrough:
             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
         ):
             await YTDL.yt_stream(
-                QueueObject("https://yt.com/v=x", "Song", MagicMock()),
+                QueueObject(
+                    webpage_url="https://yt.com/v=x",
+                    title="Song",
+                    requester=MagicMock(),
+                ),
                 AsyncMock(spec=discord.TextChannel),
                 volume=volume,
             )
@@ -3259,9 +3465,9 @@ class TestYTStreamCarriedFields:
         search entry's ytsearch is a title this code generated."""
         song = await self._stream(
             QueueObject(
-                "https://www.youtube.com/watch?v=test",
-                "Test Song",
-                mock_ctx.author,
+                webpage_url="https://www.youtube.com/watch?v=test",
+                title="Test Song",
+                requester=mock_ctx.author,
                 user_input="https://open.spotify.com/album/abc",
             )
         )
@@ -3273,9 +3479,9 @@ class TestYTStreamCarriedFields:
         still-queued song — deleting it, with no error."""
         song = await self._stream(
             QueueObject(
-                "https://www.youtube.com/watch?v=test",
-                "Test Song",
-                mock_ctx.author,
+                webpage_url="https://www.youtube.com/watch?v=test",
+                title="Test Song",
+                requester=mock_ctx.author,
                 persisted=False,
             )
         )
@@ -3285,9 +3491,9 @@ class TestYTStreamCarriedFields:
         """The loop reads both off the PLAYING song to decide whether to retry."""
         song = await self._stream(
             QueueObject(
-                "https://www.youtube.com/watch?v=test",
-                "Test Song",
-                mock_ctx.author,
+                webpage_url="https://www.youtube.com/watch?v=test",
+                title="Test Song",
+                requester=mock_ctx.author,
                 stream_attempts=2,
                 failed_format_ids=frozenset({"251"}),
             )
@@ -3302,9 +3508,9 @@ class TestYTStreamInterjectionFlags:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test",
-            "Test Song",
-            mock_ctx.author,
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
             ts=90,
             is_resume=True,
             start_paused=True,
@@ -3333,9 +3539,9 @@ class TestYTStreamInterjectionFlags:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
         qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test",
-            "Test Song",
-            mock_ctx.author,
+            webpage_url="https://www.youtube.com/watch?v=test",
+            title="Test Song",
+            requester=mock_ctx.author,
             ts=151,
             is_resume=is_resume,
         )
@@ -4178,7 +4384,11 @@ class TestProbeReuse:
     async def test_a_recent_cache_hit_skips_the_play_time_probe(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=recent", "Recent", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=recent",
+            title="Recent",
+            requester=mock_ctx.author,
+        )
         cached = _fake_ytdl_data(
             webpage_url="https://yt.com/v=recent", probed_at=time.time()
         )
@@ -4196,9 +4406,9 @@ class TestProbeReuse:
         resolves. The stamp says the URL answered a probe; the play says the format
         produced no audio, and the play is what the retry is acting on."""
         qobj = QueueObject(
-            "https://yt.com/v=burned",
-            "Burned",
-            mock_ctx.author,
+            webpage_url="https://yt.com/v=burned",
+            title="Burned",
+            requester=mock_ctx.author,
             failed_format_ids=frozenset({"251"}),
         )
         cached = _fake_ytdl_data(
@@ -4215,7 +4425,9 @@ class TestProbeReuse:
     async def test_a_stale_stamp_is_probed_as_before(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
-        qobj = QueueObject("https://yt.com/v=old", "Old", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=old", title="Old", requester=mock_ctx.author
+        )
         cached = _fake_ytdl_data(
             webpage_url="https://yt.com/v=old",
             probed_at=time.time() - youtube._PROBE_REUSE_SECS - 1,
