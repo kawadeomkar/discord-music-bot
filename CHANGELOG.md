@@ -17,6 +17,18 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.0 — 2026-09-28
+
+**A lossless link now encodes at the voice channel's bitrate.** A direct FLAC, WAV, ALAC or
+AIFF URL was re-encoded at 128k like everything else, which threw away audio the source
+actually had; it now uses the channel's own ceiling, up to 384k. Measured at +2 dB on a
+256k channel.
+
+Only those sources, and only on channels above 128 kbps: everything from YouTube,
+SoundCloud or Spotify is already lossy, where raising the target buys 0.0-0.3 dB and costs
+real egress. Those songs send up to 3x the voice traffic they did. Like `-volume`, it
+applies from the song after next.
+
 ## 2.55.0 — 2026-09-28
 
 **New setting: `-settings loudness`.** Off by default, and off behaves exactly as this

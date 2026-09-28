@@ -1810,6 +1810,22 @@ Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
 
 ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
 
+**Encode bitrate.** discord.py asks for 128k and the copy path discards it unread. The one
+case where asking for more is worth anything is a source that has something left to give:
+raising the target for a ~130 kbps lossy serve buys 0.0–0.3 dB, because the encode
+saturates on what the source already threw away, while a lossless source gains 2 dB at
+256k (39.6 → 41.5 measured). So `_encode_bitrate_kbps` raises it only for one, bounded by
+the voice channel's own ceiling and capped at 384k — Discord's limit, where a 20 ms packet
+is about 1 KB, clear of UDP fragmentation.
+
+"Lossless" is read from `acodec` **and** `ext`, because yt-dlp infers `acodec` from the
+extension only for aac/opus/mp3/flac/vorbis: a direct WAV arrives with `acodec` None and
+`ext` `wav`. `m4a` is deliberately not on the list — AAC and ALAC share it, and guessing
+lossless there would triple the egress of every AAC file. `ext` is in
+`_STREAM_CACHE_FIELDS` for the same reason `audio_channels` is: a cache hit that lost it
+would silently drop those sources back to 128k. Like volume, the value is baked into the
+argv, so it applies from the song after next.
+
 #### Loudness normalization
 
 `-settings loudness` chooses how much of the level difference between songs the bot takes

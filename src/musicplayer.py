@@ -2098,6 +2098,15 @@ class MusicPlayer:
             search="",
         )
 
+    def _channel_bitrate(self) -> Optional[int]:
+        """The connected voice channel's bitrate ceiling in bits/s, or None while
+        this guild is not connected. Only a lossless source spends it; every other
+        serve is capped by what it already threw away."""
+        vc = self._guild.voice_client
+        if not isinstance(vc, discord.VoiceClient):
+            return None
+        return vc.channel.bitrate
+
     async def _stream_source(
         self, source: QueueObject, *, allow_reextract: bool = True
     ) -> Optional[YTDL]:
@@ -2108,6 +2117,7 @@ class MusicPlayer:
                 self._channel,
                 volume=self.volume,
                 loudness=self.loudness,
+                channel_bitrate=self._channel_bitrate(),
                 redis=self.store.redis if self.store is not None else None,
                 allow_reextract=allow_reextract,
             )

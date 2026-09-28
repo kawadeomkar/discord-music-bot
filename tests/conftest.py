@@ -407,6 +407,10 @@ def mock_guild() -> MagicMock:
     guild.voice_client = MagicMock(spec=discord.VoiceClient)
     guild.voice_client.is_playing.return_value = False
     guild.voice_client.is_paused.return_value = False
+    # `channel` is set in VoiceClient.__init__, so spec= alone does not carry it,
+    # and a connected client always has one. Discord's default tier.
+    guild.voice_client.channel = MagicMock(spec=discord.VoiceChannel)
+    guild.voice_client.channel.bitrate = 64000
     me = MagicMock(spec=discord.Member)
     me.id = 999999999999999999
     me.mention = "<@999999999999999999>"
