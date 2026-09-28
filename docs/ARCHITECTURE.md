@@ -1826,6 +1826,31 @@ lossless there would triple the egress of every AAC file. `ext` is in
 would silently drop those sources back to 128k. Like volume, the value is baked into the
 argv, so it applies from the song after next.
 
+#### An unknown Opus itag
+
+The passthrough allowlist names three itags, so a fourth one YouTube starts serving is
+re-encoded: a lossy generation spent on a source that could have been copied, and a step
+**down** from the 251 it replaced. Nothing about that is visible from the outside — the
+song plays, the span carries `ytdl.opus_passthrough=false`, and no error is raised — so
+`_warn_unknown_opus_itag` says so once per itag per process, for a bare numeric format id
+whose `acodec` is Opus and which the gate refused. SoundCloud's `http_opus` rungs are Opus
+and excluded too, but their ids are named rather than numeric, and their exclusion is
+correct on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3.
+
+itag 774 (Opus 256k) is the one to expect. It was absent on seven clients probed
+anonymously, including `web_music` and `ios_music`; only the `android` client carries it,
+and that client refuses cookies. When the warning names it:
+
+1. Fetch one such stream and remux it with `-c:a copy` to Ogg, then read the TOC byte of
+   every packet — the allowlist stands in for the frame duration the info-dict does not
+   report, and 60 ms framing would play at 3× speed and read a third of its true position.
+2. All 20 ms → add the itag to `_PASSTHROUGH_FORMAT_IDS` in the same commit as the line
+   recording the measurement. Anything else → leave it out and deprioritize it in the
+   fallback ladder instead.
+
+No speculative selector change: the allowlist is a claim about measured framing, and
+widening it on anything less is how the position math silently breaks.
+
 #### Mid-song reconnects
 
 A song's connection can die after it has been playing for a while, and what happens next

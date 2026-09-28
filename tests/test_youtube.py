@@ -7252,3 +7252,73 @@ class TestEncodeBitrate:
             )
 
         assert (captured["codec"], captured["bitrate"]) == ("copy", None)
+
+
+class TestUnknownOpusItagTripwire:
+    """If YouTube starts serving an Opus itag the allowlist does not name, the song
+    is re-encoded — a lossy generation for a source that could have been copied,
+    and a silent step DOWN from the 251 it replaced. Nothing else would show it:
+    the song plays, the span says `opus_passthrough=false`, and no one is looking."""
+
+    def setup_method(self) -> None:
+        youtube._UNKNOWN_OPUS_ITAG_WARNED.clear()
+
+    @staticmethod
+    def _serve(**overrides: Any) -> Any:
+        return {
+            "acodec": "opus",
+            "audio_channels": 2,
+            "format_id": "774",
+            "vcodec": "none",
+            **overrides,
+        }
+
+    def test_an_unknown_opus_itag_warns_with_its_number(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve())
+        assert "774" in caplog.text
+        assert "not in the passthrough allowlist" in caplog.text
+
+    def test_it_warns_once_per_itag_per_process(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A song every three minutes, for the life of the process."""
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                _record_serving_format(self._serve())
+        assert caplog.text.count("not in the passthrough allowlist") == 1
+
+    def test_an_allowlisted_itag_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="251"))
+        assert "allowlist" not in caplog.text
+
+    def test_soundclouds_named_opus_rung_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Opus, excluded, and correctly so — that rung is 64 kbps, below
+        SoundCloud's own mp3. A tripwire that fires for it is noise."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="http_opus_0_0"))
+        assert "allowlist" not in caplog.text
+
+    def test_an_aac_serve_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The muxed fallback rungs are already warned about by their own rule."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(acodec="mp4a.40.2", format_id="140"))
+        assert "allowlist" not in caplog.text
+
+    def test_a_multichannel_opus_serve_warns_too(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """itag 338 is 5.1 Opus, refused for a different clause and re-encoded for
+        the same cost. The message carries the channel count so the two cases are
+        distinguishable in the log."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="338", audio_channels=6))
+        assert "338" in caplog.text
+        assert "audio_channels=6" in caplog.text

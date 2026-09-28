@@ -762,6 +762,8 @@ _STREAM_CACHE_FIELDS = frozenset(
 # Once per format per process, so an outage does not warn on every song.
 # Optional[str] because an info-dict can omit format_id.
 _DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
+# Same rule, for a YouTube Opus itag the passthrough allowlist does not name.
+_UNKNOWN_OPUS_ITAG_WARNED: set[str] = set()
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -789,6 +791,33 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
             f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
             "audio-only primary is degraded and the player is on the fallback ladder"
         )
+    _warn_unknown_opus_itag(data)
+
+
+def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
+    """Say so when YouTube serves an Opus itag the allowlist does not name.
+
+    That serve is re-encoded — a lossy generation spent on a source that could have
+    been copied, and a silent step DOWN from the 251 it replaced. Only a bare
+    numeric format_id, which is what a YouTube itag is: SoundCloud's `http_opus`
+    rungs are named, are Opus, and are correctly excluded (64 kbps, below its own
+    mp3). Once per itag per process, and never for a serve the gate accepted.
+    Response: see docs/ARCHITECTURE.md#an-unknown-opus-itag.
+    """
+    format_id = str(data.get("format_id") or "")
+    if not format_id.isdigit() or format_id in _UNKNOWN_OPUS_ITAG_WARNED:
+        return
+    if not str(data.get("acodec") or "").startswith("opus"):
+        return
+    if _passthrough_codec(data, filtered=False) is not None:
+        return
+    _UNKNOWN_OPUS_ITAG_WARNED.add(format_id)
+    log.warning(
+        f"YouTube served Opus itag {format_id}, which is not in the passthrough "
+        f"allowlist ({sorted(_PASSTHROUGH_FORMAT_IDS)}), so the song was "
+        f"re-encoded instead of copied (audio_channels="
+        f"{data.get('audio_channels')}) — see ARCHITECTURE.md#an-unknown-opus-itag"
+    )
 
 
 def _source_cache_key(search: str) -> str:
