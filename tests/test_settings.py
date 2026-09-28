@@ -895,13 +895,15 @@ class TestFind:
         assert find("Debug_Footer", SettingScope.SERVER) == _spec("debug")
 
     def test_a_suggestion_comes_from_the_requested_scope_only(self) -> None:
-        assert find("volum", SettingScope.SERVER) == Suggestion("volume")
+        assert find("volum", SettingScope.SERVER) == Suggestion(name="volume")
         suggestion = find("heartbeet", SettingScope.SERVER)
         assert isinstance(suggestion, Suggestion)
         assert suggestion.name != "heartbeat"
 
     def test_a_server_suggestion_is_the_name_the_card_prints(self) -> None:
-        assert find("leave-idle", SettingScope.SERVER) == Suggestion("leave-when-idle")
+        assert find("leave-idle", SettingScope.SERVER) == Suggestion(
+            name="leave-when-idle"
+        )
 
     @pytest.mark.parametrize(
         "env", ["NOW_PLAYING_UPDATE_INTERVAL_SECS", "ping_tick_secs"]
@@ -912,8 +914,8 @@ class TestFind:
         spec = next(
             s for s in SETTINGS if s.scope is SettingScope.BOT and s.env == env.upper()
         )
-        assert find(env, SettingScope.BOT) == Suggestion(spec.key)
-        assert find(env, SettingScope.SERVER) != Suggestion(spec.key)
+        assert find(env, SettingScope.BOT) == Suggestion(name=spec.key)
+        assert find(env, SettingScope.SERVER) != Suggestion(name=spec.key)
 
 
 class TestParseSettingsArgs:
