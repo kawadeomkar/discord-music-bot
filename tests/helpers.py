@@ -397,7 +397,7 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     song.title = title
     song.webpage_url = url
     song.duration_secs = 210
-    song.duration = "0:03:30"
+    song.duration_label = "0:03:30"
     song.uploader = "Loop Channel"
     song.thumbnail = ""
     song.views = None

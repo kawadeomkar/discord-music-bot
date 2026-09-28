@@ -609,7 +609,7 @@ class NowPlayingData:
             uploader=song.uploader or "",
             # Empty for unknown duration (livestream) rather than "0:00": the
             # recovered embed keys its Duration line off this being truthy.
-            duration=song.duration if song.duration_secs > 0 else "",
+            duration=song.duration_label if song.duration_secs > 0 else "",
             thumbnail=song.thumbnail or "",
             view_count=str(song.views) if song.views is not None else "",
             like_count=str(song.likes) if song.likes is not None else "",

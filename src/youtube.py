@@ -1692,8 +1692,9 @@ class YTDL(discord.FFmpegOpusAudio):
         # `or 0`, not a dict default: yt-dlp sets "duration" to None (not absent)
         # for livestreams, and int(None) raises.
         self.duration_secs: int = int(data.get("duration") or 0)
-        # fmt_duration everywhere, so the embeds and the bar agree on "3:30".
-        self.duration = fmt_duration(self.duration_secs)
+        # fmt_duration everywhere, so the embeds and the bar agree on "3:30". A
+        # label, named apart from the item's `duration`, which is the seconds.
+        self.duration_label = fmt_duration(self.duration_secs)
         self.tags = data.get("tags")
         self.webpage_url = data.get("webpage_url")
         self.views = data.get("view_count")

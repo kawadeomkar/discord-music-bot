@@ -111,7 +111,7 @@ def _loop_song() -> MagicMock:
     song.title = "Loop Test Song"
     song.webpage_url = "https://yt.com/v=loop1"
     song.duration_secs = 210
-    song.duration = "0:03:30"
+    song.duration_label = "0:03:30"
     song.uploader = "Loop Channel"
     song.thumbnail = ""
     song.views = None
@@ -3665,7 +3665,7 @@ class TestUpdateActivity:
         assert activity.type == discord.ActivityType.listening
         # Name encodes uploader as suffix since bot activities only render name
         assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
-        assert activity.state == mock_song.duration
+        assert activity.state == mock_song.duration_label
         assert activity.state_url == mock_song.webpage_url
         assert "start" in activity.timestamps
         now_ms = int(time.time() * 1000)
@@ -3846,7 +3846,7 @@ class TestUpdateActivityPause:
         await music_player.update_activity(mock_song)
         activity = music_player.bot.change_presence.call_args.kwargs["activity"]
         assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
-        assert activity.state == mock_song.duration
+        assert activity.state == mock_song.duration_label
 
     async def test_resumed_timestamps_reflect_elapsed_not_full_duration(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -8808,7 +8808,7 @@ class TestLoop:
         song.title = title
         song.webpage_url = url
         song.duration_secs = 210
-        song.duration = "0:03:30"
+        song.duration_label = "0:03:30"
         song.uploader = "Loop Channel"
         song.thumbnail = ""
         song.views = None
@@ -11019,7 +11019,7 @@ class TestLoopAdditional:
         song.title = title
         song.webpage_url = url
         song.duration_secs = 210
-        song.duration = "0:03:30"
+        song.duration_label = "0:03:30"
         song.uploader = "Loop Channel"
         song.thumbnail = ""
         song.views = None

@@ -157,14 +157,14 @@ class TestYTDLDuration:
         # Same rendering as the progress bar's labels — not timedelta's
         # "0:03:00", which disagreed with the bar for the same song.
         song = ytdl_instance({"duration": 180})
-        assert song.duration == "3:00"
+        assert song.duration_label == "3:00"
         assert song.duration_secs == 180
 
     def test_duration_over_an_hour_keeps_hours(
         self, ytdl_instance: Callable[..., Any]
     ) -> None:
         song = ytdl_instance({"duration": 3725})
-        assert song.duration == "1:02:05"
+        assert song.duration_label == "1:02:05"
 
     def test_null_duration_does_not_raise(
         self, ytdl_instance: Callable[..., Any]
@@ -175,7 +175,7 @@ class TestYTDLDuration:
         construction."""
         song = ytdl_instance({"duration": None})
         assert song.duration_secs == 0
-        assert song.duration == "0:00"
+        assert song.duration_label == "0:00"
 
     def test_missing_duration_key_does_not_raise(
         self, ytdl_instance: Callable[..., Any], mock_channel: MagicMock
