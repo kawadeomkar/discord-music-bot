@@ -1010,7 +1010,7 @@ _FIXED_OFFSET_RE: Final = re.compile(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TimezoneRedirect:
     targets: tuple[str, ...]
     # synonym: another name for UTC or GMT. legacy: an old name with the same
@@ -1019,15 +1019,15 @@ class TimezoneRedirect:
 
 
 def _synonym(target: str) -> TimezoneRedirect:
-    return TimezoneRedirect((target,), "synonym")
+    return TimezoneRedirect(targets=(target,), reason="synonym")
 
 
 def _legacy(target: str) -> TimezoneRedirect:
-    return TimezoneRedirect((target,), "legacy")
+    return TimezoneRedirect(targets=(target,), reason="legacy")
 
 
 def _abbreviation(*targets: str) -> TimezoneRedirect:
-    return TimezoneRedirect(targets, "abbreviation")
+    return TimezoneRedirect(targets=targets, reason="abbreviation")
 
 
 # Every name tzdata carries outside the ten areas that is not UTC, GMT, Factory or a
