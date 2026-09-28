@@ -210,9 +210,9 @@ class GuildQueue:
         # replaces the list: a rebuild, a DELETE, or the next song start.
         self._mirror_dirty = False
         # The entry the list holds for an item requeue_front() or replace_item()
-        # swapped in, which serializes differently from it. Keyed by id() and
-        # holding the item, so the id cannot be reused while the record lives.
-        self._listed: dict[int, tuple[QueueObject, SongQueueEntry]] = {}
+        # swapped in, which serializes differently from it. Keyed on the item,
+        # which hashes by identity.
+        self._listed: dict[QueueObject, SongQueueEntry] = {}
         # The objects mirror_entries() serialized for the song start's rebuild,
         # so note_mirror_write drops the records of exactly those once that write
         # lands. Replaced by the next mirror_entries().
@@ -276,8 +276,8 @@ class GuildQueue:
             self._cursor -= 1
             claimed = self._items[0]
             if item is not claimed:
-                self._listed[id(item)] = (item, self._mirror_entry(claimed))
-                self._listed.pop(id(claimed), None)
+                self._listed[item] = self._mirror_entry(claimed)
+                self._listed.pop(claimed, None)
             self._items[0] = item
         self._sync_wake()
 
@@ -291,8 +291,8 @@ class GuildQueue:
             if held is item:
                 if new is not item:
                     entry = self._mirror_entry(item)
-                    self._listed.pop(id(item), None)
-                    self._listed[id(new)] = (new, entry)
+                    self._listed.pop(item, None)
+                    self._listed[new] = entry
                     self._items[index] = new
                 return True
         return False
@@ -487,7 +487,7 @@ class GuildQueue:
             finally:
                 # After the write, which LREMs by these records.
                 for item in removed_items:
-                    self._listed.pop(id(item), None)
+                    self._listed.pop(item, None)
 
         return RemoveOutcome(
             removed=removed_items,
@@ -623,7 +623,7 @@ class GuildQueue:
         (I1)."""
         if self._cursor == 0:
             return False
-        self._listed.pop(id(self._items.popleft()), None)
+        self._listed.pop(self._items.popleft(), None)
         self._cursor -= 1
         self._sync_wake()
         return True
@@ -768,9 +768,8 @@ class GuildQueue:
             self._drop_listed(written)
 
     def holds(self, item: QueueObject) -> bool:
-        """Whether this exact object is on the deque, claimed prefix included.
-        Identity, not equality: the caller is asking about the object it just
-        inserted, and two entries for one song compare equal."""
+        """Whether this exact object is on the deque, claimed prefix included: the
+        caller is asking about the object it just inserted."""
         return any(held is item for held in self._items)
 
     def _mirror_entry(self, item: QueueObject) -> SongQueueEntry:
@@ -779,10 +778,8 @@ class GuildQueue:
         replaced. Every write that must match the list byte for byte (an LREM, the
         claimed-entry guard) serializes through here; a rebuild writes the live
         objects instead and drops the records it answered for (_drop_listed)."""
-        listed = self._listed.get(id(item))
-        if listed is not None and listed[0] is item:
-            return listed[1]
-        return _to_entry(item)
+        listed = self._listed.get(item)
+        return listed if listed is not None else _to_entry(item)
 
     def _drop_listed(self, written: Sequence[QueueObject]) -> None:
         """Drop the swap records of the objects a landed rebuild serialized: the
@@ -790,9 +787,7 @@ class GuildQueue:
         await and land after it, so a swap in that window keeps its record — the
         bytes on the list are still the ones it replaced."""
         for item in written:
-            listed = self._listed.get(id(item))
-            if listed is not None and listed[0] is item:
-                del self._listed[id(item)]
+            self._listed.pop(item, None)
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a

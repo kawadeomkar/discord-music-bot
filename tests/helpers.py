@@ -324,6 +324,16 @@ ASK_FIELDS: tuple[str, ...] = tuple(
 )
 
 
+def same_ask(a: QueueObject, b: QueueObject) -> bool:
+    """Whether two items are one ask field for field, `analytics` aside: a put
+    re-mints the depth, so the item it takes is a copy of the one the caller built."""
+    return all(
+        getattr(a, f.name) == getattr(b, f.name)
+        for f in dataclasses.fields(QueueObject)
+        if f.name != "analytics"
+    )
+
+
 def unresolved(term: str, requester: Any = None, **fields: Any) -> QueueObject:
     """A queue item still waiting to resolve, the way a Spotify collection track is
     queued by a walk that named no display row: `search` holds the term and the

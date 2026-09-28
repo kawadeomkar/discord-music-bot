@@ -528,22 +528,16 @@ class TestQueueObject:
 
         assert dataclasses.is_dataclass(QueueObject)
 
-    def test_equality(self, mock_author: MagicMock) -> None:
+    def test_two_asks_for_one_song_are_two_items(self, mock_author: MagicMock) -> None:
+        """An item is one ask: a second ask for the same song, built the same way,
+        is a different item, as it is on the deque."""
         q1 = QueueObject(
             webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
         )
         q2 = QueueObject(
             webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
         )
-        assert q1 == q2
-
-    def test_inequality_different_url(self, mock_author: MagicMock) -> None:
-        q1 = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        q2 = QueueObject(
-            webpage_url="https://yt.com/watch?v=2", title="Song", requester=mock_author
-        )
+        assert q1 == q1
         assert q1 != q2
 
     def test_a_queued_item_is_frozen(self, mock_author: MagicMock) -> None:
@@ -553,12 +547,10 @@ class TestQueueObject:
         with pytest.raises(FrozenInstanceError):
             setattr(item, "title", "Retitled")
 
-    def test_the_value_hash_is_not_what_the_queue_keys_on(
-        self, mock_author: MagicMock
-    ) -> None:
-        """Pins the class comment: frozen generates __hash__ over the fields, so
-        two distinct asks for one song are one element in a set, while the queue
-        tells them apart by identity (holds, display_index, _listed)."""
+    def test_an_item_hashes_by_identity(self, mock_author: MagicMock) -> None:
+        """Pins the class comment: a set tells two asks for one song apart the way
+        the queue does (holds, display_index, _listed), and a resume tail carrying
+        np_host_ref hashes too, its own_embeds list notwithstanding."""
         first = QueueObject(
             webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
         )
@@ -566,7 +558,12 @@ class TestQueueObject:
             webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
         )
         assert first is not second
-        assert {first, second} == {first}
+        assert len({first, second}) == 2
+        tail = replace(
+            first,
+            np_host_ref=NpHostRef(message=MagicMock(), own_embeds=[], dedicated=True),
+        )
+        assert hash(tail) == hash(tail)
 
     def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
         # webpage_url and title are both str: positional, either order type-checks.

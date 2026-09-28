@@ -1521,7 +1521,11 @@ class TestEnqueueSingle:
         )
 
         mp.repin_now_playing.assert_not_awaited()
-        mp.build_queued_song_embed.assert_called_once_with(qobj, note="", warning=None)
+        # The card is built from the item the put took, re-minted with its depth.
+        (queued,), _ = mp.queue_put.await_args
+        mp.build_queued_song_embed.assert_called_once_with(
+            queued, note="", warning=None
+        )
         assert (
             mock_ctx.send.await_args.kwargs["embed"]
             is mp.build_queued_song_embed.return_value
@@ -1608,8 +1612,9 @@ class TestEnqueueSingle:
             cog=music_bot,
         )
 
+        (queued,), _ = mp.queue_put.await_args
         mp.build_queued_song_embed.assert_called_once_with(
-            qobj, note="", warning="watch out"
+            queued, note="", warning="watch out"
         )
 
     async def test_enqueues_before_reading_the_head(

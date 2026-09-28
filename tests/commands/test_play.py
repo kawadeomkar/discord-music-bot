@@ -61,6 +61,7 @@ from tests.helpers import (
     playing_vc,
     queue_object,
     recording_span,
+    same_ask,
     seed_queue,
     settle,
     song,
@@ -964,7 +965,10 @@ class TestPlayFrontInsertion:
             cog=music_bot,
         )
 
-        mp.queue_put_front.assert_awaited_once_with(qobj)
+        # The put takes the item re-minted with its depth: the same ask, a copy.
+        mp.queue_put_front.assert_awaited_once()
+        (placed,), _ = mp.queue_put_front.await_args
+        assert same_ask(placed, qobj)
         mp.queue_put.assert_not_awaited()
         # The song being started is handed to the builder: it is the only thing
         # in this response that names it (no Now Playing block exists yet).
@@ -995,7 +999,9 @@ class TestPlayFrontInsertion:
             cog=music_bot,
         )
 
-        mp.queue_put_front.assert_awaited_once_with(qobj)
+        mp.queue_put_front.assert_awaited_once()
+        (placed,), _ = mp.queue_put_front.await_args
+        assert same_ask(placed, qobj)
         mock_ctx.send.assert_not_awaited()
 
     async def test_front_playlist_inserts_all_tracks_in_order(

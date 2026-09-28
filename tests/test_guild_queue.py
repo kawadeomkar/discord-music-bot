@@ -2922,7 +2922,7 @@ class TestRequeueFrontSwap:
         await gq.put([head, _qobj(2, mock_author)])
         swapped = _restyled(gq.get_nowait())
         gq.requeue_front(swapped)
-        assert id(swapped) in gq._listed
+        assert swapped in gq._listed
 
         if leaves_by == "commit":
             assert gq.get_nowait() is swapped
@@ -2986,7 +2986,7 @@ class TestReplaceItem:
         await gq.put([item, *keeps])
         new = replace(item, duration=180)
         gq.replace_item(item, new)
-        assert id(new) in gq._listed
+        assert new in gq._listed
 
         assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
 
@@ -3007,7 +3007,7 @@ class TestReplaceItem:
         gq.replace_item(item, new)
 
         gq.note_mirror_write(landed=True, retired=True)  # an LPOP landed
-        assert id(new) in gq._listed
+        assert new in gq._listed
         gq.note_mirror_write(landed=False, retired=True)  # stale: the start rebuilds
         assert gq.mirror_entries() == [_to_entry(new), _to_entry(other)]
         gq.note_mirror_write(landed=True, retired=True)
