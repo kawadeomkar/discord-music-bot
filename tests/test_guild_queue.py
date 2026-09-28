@@ -1973,7 +1973,7 @@ class TestRestoreEntries:
             )
         assert (
             f"Restored 3 queued songs for guild {gq._guild.id}; "
-            "2 of 3 entries were in the pre-2.54.0 shape"
+            '2 of 3 entries were in the retired "ytsource" shape'
         ) in caplog.text
 
     async def test_an_empty_restore_still_reports_zero(
@@ -1986,7 +1986,7 @@ class TestRestoreEntries:
             assert await gq.restore_entries([]) == 0
         assert (
             f"Restored 0 queued songs for guild {gq._guild.id}; "
-            "0 of 0 entries were in the pre-2.54.0 shape"
+            '0 of 0 entries were in the retired "ytsource" shape'
         ) in caplog.text
 
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:

@@ -566,7 +566,8 @@ class GuildQueue:
         # watched for, and a missing line is not one.
         log.info(
             f"Restored {count} queued songs for guild {self._guild.id}; "
-            f"{old_shape} of {len(entries)} entries were in the pre-2.54.0 shape"
+            f"{old_shape} of {len(entries)} entries were in the retired "
+            '"ytsource" shape'
         )
         self._sync_wake()
         return count
