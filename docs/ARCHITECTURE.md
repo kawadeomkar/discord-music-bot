@@ -1037,7 +1037,7 @@ channel · @requester                                   (with a byline)
 
 **An unresolved search renders the same row.** A Spotify track is queued as a `QueueObject` carrying its `ytsearch:` term and only becomes a song when it is about to play, so the row cannot wait for yt-dlp. The four display fields the walk knows sit under the names a resolved song uses — `title`, `uploader` (the artists), `duration` and `webpage_url` (the Spotify track page) — and the formatter reads one set of attributes whether or not the item has resolved. They persist on its `SongQueueEntry`, so a track the walk named no row for restores as its search text and `resolving...`. The length is Spotify's and not the YouTube match's: `EtaWalk.advance_estimate` counts it and marks everything after it approximate, and `queue_runtime` adds it while keeping the total's `~`.
 
-**What the rows cost.** The four display fields are stored per queued track, so a fully described collection track on `guild:{id}:queue` is ~540 bytes (measured; serializing one `_PUT_CHUNK` of 1,000 is ~1.5ms). The cached walk under `spotify:playlist:v4:{id}` / `spotify:album_tracks:v2:{id}` carries a `tracks` array beside `titles`, one `[name, artists, duration_secs, url]` row per title — which is what the key versions were bumped for, and roughly triples that value. A 10,000-track collection therefore holds ~2 MB of cache plus ~5 MB of queue mirror, against the 256 MB the bundled Redis is given; both keys carry a TTL, so they stay eviction candidates under `volatile-lru` (see the eviction rules). On a cache HIT the rows are rebuilt `_CACHE_ROWS_CHUNK` at a time with a loop yield between chunks: the rebuild is ~6ms for 10,000 rows and a hit takes neither the walk slot nor the single flight, so without the yield every caller paid it on one tick.
+**What the rows cost.** The four display fields are stored per queued track, so a fully described collection track on `guild:{id}:queue` is ~540 bytes (measured; serializing one `_PUT_CHUNK` of 1,000 is ~2.1ms). The cached walk under `spotify:playlist:v4:{id}` / `spotify:album_tracks:v2:{id}` carries a `tracks` array beside `titles`, one `[name, artists, duration_secs, url]` row per title — which is what the key versions were bumped for, and roughly triples that value. A 10,000-track collection therefore holds ~2 MB of cache plus ~5 MB of queue mirror, against the 256 MB the bundled Redis is given; both keys carry a TTL, so they stay eviction candidates under `volatile-lru` (see the eviction rules). On a cache HIT the rows are rebuilt `_CACHE_ROWS_CHUNK` at a time with a loop yield between chunks: the rebuild is ~6ms for 10,000 rows and a hit takes neither the walk slot nor the single flight, so without the yield every caller paid it on one tick.
 
 **A queued-collection card lists -queue's rows.** `queued_rows` runs after the put: it finds the first queued track in the display order by identity, walks the ETA to that slot and lists from there, so the card's numbers and times are the ones `-queue` shows for the same tracks. On the card every row would share one requester and mostly one artist, so it takes the one-line density, and its facts line drops "Est. playing at" because each row has its own. A YouTube playlist's tracks are resolved songs already, so its card gets links, lengths and times from the same call with no new data.
 
@@ -2419,7 +2419,13 @@ wrote — so entries already on a list still restore. Such an entry rewrites onc
 it rehydrates into re-serializes as `"qobj"`, and because LREM matches exact bytes, the
 first `-remove` or `-clear` touching it misses and rebuilds the list. The read leg stays
 until no restore still meets one, which `restore_entries` measures: it logs the restored
-count and the `"ytsource"` tally on one INFO line per guild, every restore, zero included.
+count and the `"ytsource"` tally on one INFO line per guild, every restore, zero included,
+and returns both as a `RestoreOutcome` so `_restore_state` stamps the tally as
+`restore.old_shape_entries` beside `restore.queue_count` on the `player.state_restore`
+span. The measurement covers the guilds a start actually restored: `restore_guild` returns
+before building a player when the state hash records no channels, when they no longer
+resolve, or when the voice reconnect fails, and such a guild's list survives its 24 h TTL
+uncounted.
 
 `slots=True` is what keeps the merge cheap rather than free. By `sys.getsizeof` on this
 interpreter a 23-field `QueueObject` is **216 B**, against **344 B** for the same instance

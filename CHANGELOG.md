@@ -32,9 +32,16 @@ forward at.
   tracks were saved in the old shape, so the first attempt misses and the list is rebuilt
   instead. Nothing is lost and nothing is duplicated; afterwards every entry is in the new
   shape and removals are one-shot again.
-- **Each restart logs, per guild, how many restored entries were still in the old shape.**
-  Watch the line that reports the restored count: when it reads zero old-shape entries
-  across restarts, no queue anywhere still holds one and the reader for that shape can go.
+- **Each restart reports, per guild, how many restored entries were still in the old
+  shape** — on the line that gives the restored count, and as `restore.old_shape_entries`
+  on that guild's restore span. A zero covers only the guilds this start actually put a
+  player back into. A server the bot had been told to leave, one whose saved voice or text
+  channel is gone, and one whose reconnect failed are all skipped — the last two say so in
+  their own warning — and each keeps its saved queue for the 24 hours that list lives,
+  counted by nobody. So read the zeros alongside the `Recovery skipped` and `Could not
+  rejoin voice` warnings, and give the last of those a full day before you believe them.
+  To settle it outright rather than infer it, scan the `guild:*:queue` lists for entries
+  whose `"type"` is `"ytsource"`.
 - **A queued collection costs a little more Redis**: ~540 bytes per unresolved track
   against ~400 before, so a 10,000-track playlist holds ~5 MB of queue mirror rather than
   ~4 MB, against the 256 MB the bundled Redis is given. Nothing to do; noted so the number

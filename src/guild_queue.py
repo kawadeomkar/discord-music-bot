@@ -52,7 +52,7 @@ log = get_logger(__name__)
 _LREM_MAX_ENTRIES = 16
 
 # Entries serialized and RPUSHed per round trip by a bulk put. Serialization measured
-# ~1.5ms per thousand at ~400 bytes an entry, which is how long each chunk holds the
+# ~2.1ms per thousand at ~540 bytes an entry, which is how long each chunk holds the
 # event loop; the RPUSH between chunks is what yields it.
 _PUT_CHUNK = 1000
 
