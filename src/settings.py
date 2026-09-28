@@ -1273,7 +1273,7 @@ def parse_value(spec: SettingSpec, value: str) -> Parsed | Refusal:
 # ── Keys and requests ───────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Suggestion:
     """No setting has that name; `name` is the closest setting's card name, if any."""
 
@@ -1307,9 +1307,9 @@ def find(token: str, scope: SettingScope) -> SettingSpec | Suggestion:
     names = _BY_NAME[scope]
     folded = _fold(token)
     if scope is SettingScope.BOT and (by_env := _BOT_BY_ENV.get(folded)) is not None:
-        return Suggestion(card_name(by_env))
+        return Suggestion(name=card_name(by_env))
     close = difflib.get_close_matches(folded, list(names), n=1)
-    return Suggestion(card_name(names[close[0]]) if close else None)
+    return Suggestion(name=card_name(names[close[0]]) if close else None)
 
 
 def wrong_scope_text(spec: SettingSpec, *, operator: bool) -> str:
