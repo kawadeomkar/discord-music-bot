@@ -918,6 +918,27 @@ deploying — is under
 Deliberately not repeated here: two copies of an irreversible runbook is how one of them
 ends up missing the step that matters.
 
+## Troubleshooting
+
+### The bot sounds muffled or quiet to one person
+
+The stream every listener receives is the same packets. When one person hears it muffled,
+thin or quiet and nobody else does, the cause is on their side:
+
+- **A phone with the microphone live.** iOS and Android switch the app into call
+  processing while a mic is open, which narrows the phone's own output. Push-to-talk, or
+  muting, restores it.
+- **Discord's voice processing.** Settings → Voice & Video: Automatic Gain Control and
+  Noise Suppression act on everything that person hears, not only on what they say. Both
+  off fixes a bot that "pumps" or drops out under quiet passages.
+- **Per-user volume.** Right-click the bot in the voice channel — that slider is theirs
+  alone, and it starts wherever they last left it.
+
+If *everyone* hears it, it is the stream. `-ping` shows the format the current song is
+playing from, and the only two settings that change how a song sounds are
+`-settings volume` and `-settings loudness` (whose `off` is the default, and the only
+value that sends YouTube's own bitstream through untouched).
+
 ## Architecture
 
 One `MusicPlayer` per guild orchestrates a playback loop that streams Opus audio to
