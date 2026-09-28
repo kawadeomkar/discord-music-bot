@@ -17,6 +17,19 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.54.0 — 2026-09-28
+
+**`-analytics` no longer turns you away.** Asking for a window the server has not
+charted today used to be refused if someone had run the command in the last half
+minute. Now the command runs, and a second caller in the same server waits behind the
+first instead of being told to come back later.
+
+- **An uncached window posts a notice first**, then replaces it with the card. A window
+  already charted today still answers immediately — the answer is cached until midnight
+  UTC, so only the first call of the day for each window pays the wait.
+- **Nothing else changes.** The chart, the numbers and the windows are the same, and
+  the server's database still runs one analytics query at a time.
+
 ## 2.53.4 — 2026-09-26
 
 **Crash recovery keeps the flags of the song that was actually playing.** The parked entry's

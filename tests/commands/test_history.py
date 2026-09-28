@@ -166,7 +166,6 @@ class TestHistoryCommand:
             "history",
             "ping",
             "leaderboard",
-            "analytics",
             "debug",
             "resume",
             "replay",
@@ -180,7 +179,10 @@ class TestHistoryCommand:
         NP block), so unbounded concurrent renders rate-limit a guild out of its own
         channel — and deleting the decorator that prevents it left the suite green.
         `wait=False` is half the point: queueing the extra invocations still issues
-        every send, so they must be declined outright. `-leaderboard` carries it for
+        every send, so they must be declined outright. `-analytics` is deliberately
+        not in this list: its cost is a Postgres aggregate and a worker render, not
+        the send, and each window's answer is cached to midnight, so the caller who
+        waits is the one who fills the cache — see TestCommandRegistration there. `-leaderboard` carries it for
         a second reason: it draws on the same Postgres pool as the drainer, and
         `-debug` for a third: a Postgres stats query, a Prometheus round trip and
         two Redis reads, live-editing under an 8s deadline. `-resume` for a fourth:

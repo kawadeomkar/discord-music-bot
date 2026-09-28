@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+from discord.ext import commands
 import orjson
 import pytest
 
@@ -491,17 +492,13 @@ class TestAnalyticsCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock, days: int
     ) -> None:
         """A rejection must not take a read slot either — that is the whole point of
-        rejecting before the archive rather than inside it. It also hands the guild's
-        cooldown slot back, since the cooldown's only job is protecting the archive
-        and this never reached it."""
+        rejecting before the archive rather than inside it."""
         archive = _fake_archive(_metrics())
         music_bot.history_archive = archive
-        mock_ctx.command.reset_cooldown = MagicMock()
         await command_callback(MusicBot.analytics)(
             music_bot, mock_ctx, flags=_flags(days)
         )
         archive.analytics.assert_not_awaited()
-        mock_ctx.command.reset_cooldown.assert_called_once_with(mock_ctx)
         embed = mock_ctx.send.call_args[1]["embed"]
         assert embed.color == discord.Color.red()
         assert "7, 30, 90, 365" in embed.description
@@ -514,16 +511,14 @@ class TestAnalyticsCommand:
         ],
         ids=["no-guild", "no-archive"],
     )
-    async def test_a_refusal_that_never_reaches_postgres_hands_the_slot_back(
+    async def test_a_refusal_answers_without_reaching_postgres(
         self, music_bot: MusicBot, mock_ctx: MagicMock, setup: Any
     ) -> None:
-        """discord.py charges the cooldown in prepare(), before the body. These two
-        refusals never reach Postgres, so holding the guild's slot for 30s afterwards
-        refuses a corrected retry over a query that never ran."""
+        """Both refusals are decided from the context alone, so neither takes a read
+        slot and neither posts the placeholder that stands in for a real query."""
         setup(mock_ctx, music_bot)
-        mock_ctx.command.reset_cooldown = MagicMock()
         await command_callback(MusicBot.analytics)(music_bot, mock_ctx, flags=_flags())
-        mock_ctx.command.reset_cooldown.assert_called_once_with(mock_ctx)
+        mock_ctx.send.assert_awaited_once()
 
     async def test_a_listed_window_renders_the_card(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -633,27 +628,29 @@ class TestAnalyticsCommand:
     async def test_it_sends_through_ctx_send_so_the_np_block_rides_along(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Unlike -ping and -debug, this command sends once and never edits, so it
-        behaves like -history and -leaderboard: MusicContext.send prepends the Now
-        Playing block and the message may adopt the NP host."""
+        """This command never edits, so it behaves like -history and -leaderboard:
+        MusicContext.send prepends the Now Playing block and the message may adopt
+        the NP host. An uncached window sends the placeholder the same way, so both
+        messages carry the block rather than one bypassing it."""
         music_bot.history_archive = _fake_archive(_metrics())
         await command_callback(MusicBot.analytics)(music_bot, mock_ctx, flags=_flags())
-        mock_ctx.send.assert_awaited_once()
+        card = mock_ctx.send.await_args_list[-1].kwargs["embed"]
+        assert "Analytics" in card.title
         mock_ctx.channel.send.assert_not_called()
 
 
 class TestCommandRegistration:
-    def test_the_command_is_bounded_on_both_axes(self) -> None:
-        """max_concurrency bounds how many run at once; the cooldown bounds how
-        OFTEN, which is the axis a closed key space and a day-long cache cannot
-        cover on their own — four cold windows are four real queries."""
+    def test_a_second_caller_waits_rather_than_being_refused(self) -> None:
+        """One run per guild at a time, and the next caller queues behind it. The
+        refusal this replaced cost a caller their answer for 30s; the queue costs
+        them the wait and fills the cache on the way. Postgres still sees one
+        analytics query per guild at a time, which is the axis that protects it."""
         cmd = MusicBot.analytics
         assert cmd._max_concurrency is not None
         assert cmd._max_concurrency.number == 1
-        assert cmd._max_concurrency.wait is False
-        cooldown = cmd._buckets._cooldown
-        assert cooldown is not None
-        assert (cooldown.rate, cooldown.per) == (1, 30.0)
+        assert cmd._max_concurrency.per is commands.BucketType.guild
+        assert cmd._max_concurrency.wait is True
+        assert cmd._buckets._cooldown is None
 
     def test_stats_is_not_an_alias(self) -> None:
         """-ping already answers to `status`, and the two are one character apart
@@ -844,6 +841,7 @@ class TestChartFallback:
         Retrying then posts the card twice, the second adopting the NP host."""
         mock_ctx.send = AsyncMock(
             side_effect=[
+                MagicMock(delete=AsyncMock()),  # the window's placeholder
                 discord.HTTPException(MagicMock(status=503), "upstream"),
                 MagicMock(),
             ]
@@ -855,8 +853,8 @@ class TestChartFallback:
                 self._bot(music_bot), mock_ctx, flags=_flags()
             )
         # The second send is the error card, not the analytics card a second time.
-        assert mock_ctx.send.await_count == 2
-        second = mock_ctx.send.await_args_list[1].kwargs["embed"]
+        assert mock_ctx.send.await_count == 3
+        second = mock_ctx.send.await_args_list[2].kwargs["embed"]
         assert "unavailable" in (second.title or "").lower()
 
     async def test_a_refused_upload_retries_without_the_image(
@@ -865,13 +863,17 @@ class TestChartFallback:
         """A permission can change between the preflight and the send. Losing the
         whole card to a lost image would be the worse trade."""
         mock_ctx.send = AsyncMock(
-            side_effect=[discord.Forbidden(MagicMock(status=403), "nope"), MagicMock()]
+            side_effect=[
+                MagicMock(delete=AsyncMock()),  # the window's placeholder
+                discord.Forbidden(MagicMock(status=403), "nope"),
+                MagicMock(),
+            ]
         )
         with patch("src.chart_pool.chart_pool.run", AsyncMock(return_value=b"\x89PNG")):
             await command_callback(MusicBot.analytics)(
                 self._bot(music_bot), mock_ctx, flags=_flags()
             )
-        assert mock_ctx.send.await_count == 2
+        assert mock_ctx.send.await_count == 3
         assert "file" not in mock_ctx.send.await_args[1]
 
     async def test_the_render_is_bounded_by_its_own_deadline(

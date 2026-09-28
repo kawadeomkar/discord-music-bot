@@ -1084,10 +1084,13 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # No validate_commands: needs no voice channel. max_concurrency bounds how
-    # many run at once, the cooldown how often. See docs/ARCHITECTURE.md#analytics-rendering.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
-    @commands.cooldown(1, 30.0, commands.BucketType.guild)
+    # No validate_commands: needs no voice channel. One run per guild at a time,
+    # and a second caller waits for it rather than being refused: the window is an
+    # allowlist and every answer is cached to the next UTC midnight, so the run a
+    # caller waits through is the one that fills the cache for everyone else.
+    # Postgres still sees one analytics query per guild at a time.
+    # See docs/ARCHITECTURE.md#analytics-rendering.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=True)
     @_tracer.start_as_current_span("bot.analytics")
     async def analytics(self, ctx: commands.Context, *, flags: AnalyticsFlags) -> None:
         try:
