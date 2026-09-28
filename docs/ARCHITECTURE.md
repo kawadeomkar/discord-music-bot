@@ -1308,12 +1308,13 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`, and `ytsearch` only while the item has not resolved), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`, and, each only when known, `requester_id` and the display fields `title`, `uploader`, `duration`, `webpage_url`). RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
 | `bot:{application_id}:config` | Hash | One field per `-settings bot` knob, named as its env var in lower case (`Knob.field`); absent runs the knob on its environment value. Written only by `BotSettings.write`/`write_reset`, applied at startup by `BotSettings.hydrate`, skipped while `BOT_SETTINGS_OVERRIDES=ignore`. One per application, so bots sharing a Redis cannot retune each other; `debug-default` is never stored | **none, ever** |
-| `guild:{id}:config` | Hash | 8 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off), `queue_progress_delay_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
+| `guild:{id}:config` | Hash | 9 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time), `loudness` (`off`/`peak`/`normalize`, resolved by `GuildConfig.loudness_mode()` at read time, which reads a mode it does not know as unset), `idle_timeout_secs`, `alone_timeout_secs`, `np_refresh_secs`, `slow_notice_secs` (`0.0` is off), `queue_progress_delay_secs`. Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. A numeric value outside `CONFIG_DOMAIN` reads as unset. Beside the settings, `writer_app_id` records the application that last wrote one (not a setting; reads ignore it). Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` and by the startup orphan sweep ([Settings resolution](#settings-resolution)) | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
 | `analytics:png:v{n}:{guild_id}:{days}:{digest}` | Bytes | the rendered chart, keyed by a digest of the aggregate it was drawn from so a stale entry MISSES rather than pairing an old chart with fresh numbers. Raw bytes, not orjson — that would base64 it for a 33% penalty | to the next UTC midnight |
 | `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
+| `ytdl:loudness:v1:{webpage_url}` | String | `{i, peak}` — one song's integrated loudness and true peak, in LUFS and dBFS, written only by a server running `loudness normalize`. 30-day TTL and evictable: losing it costs one re-scan ([Loudness normalization](#loudness-normalization)) |
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, 1.28 KB/rung measured, taking an entry from 4.66 KB to 8.49 KB of payload and 5.22 KB to 10.34 KB resident (it crosses jemalloc's 8192 size class) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
@@ -1753,7 +1754,7 @@ Span conventions worth knowing:
 ```mermaid
 flowchart LR
     YT["YouTube CDN\n(signed HTTPS stream)"]
-    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Seek: -ss N before -i, -ss 0 after\n- Output: Opus frames (remuxed when eligible)\n- Volume filter (encoder path only)"]
+    FFmpeg["FFmpeg process\n- Input: HTTP stream\n- Reconnect flags\n- Seek: -ss N before -i, -ss 0 after\n- Output: Opus frames (remuxed when eligible)\n- Filter chain: volume, loudness (encoder path only)"]
     Reader["discord.py reader thread\n(reads Opus frames from FFmpeg stdout\n→ YTDL.read() counts frames)"]
     VC["Discord Voice UDP\n(Opus + NaCl encryption)"]
     User["Discord Client\n(decodes Opus)"]
@@ -1766,7 +1767,7 @@ flowchart LR
 
 **FFmpeg flags:**
 - `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
-- `options`: `-vn -fec false -packet_loss 0` (audio only; the encoder stays in CELT — see [Encoder mode](#encoder-mode)); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
+- `options`: `-vn -fec false -packet_loss 0` (audio only; the encoder stays in CELT — see [Encoder mode](#encoder-mode)); extended with `-ss 0` whenever the input-side seek is present, and with a `-filter:a` chain for a non-unity volume or a loudness mode ([Loudness normalization](#loudness-normalization)) — but never both a filtergraph and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
 
@@ -1774,7 +1775,7 @@ flowchart LR
 
 | Clause | Why |
 |---|---|
-| no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Volume is the only source today. |
+| no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Two sources today: a non-unity volume, and any loudness mode but `off`. |
 | `audio_channels in (1, 2)` | a 5.1 serve copied verbatim reaches Discord as 6-channel multistream Opus and clients decode only the front pair, silently losing centre-channel vocals. yt-dlp ranks `channels` **above** `acodec` when sorting, so `bestaudio` does select itag 338 where it exists. Absent means re-encode. |
 | `format_id` in `{249, 250, 251}` | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly — measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream. SoundCloud's `http_opus` is exactly the case this excludes, and its exclusion is right on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3. |
 
@@ -1808,6 +1809,67 @@ Where the hybrid encode fails, by octave band (SDR against the lossless source, 
 Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
 
 ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
+
+#### Loudness normalization
+
+`-settings loudness` chooses how much of the level difference between songs the bot takes
+out. The target is **−14 LUFS** — YouTube's own reference, so most tracks move a decibel or
+two rather than being rebuilt, and a song lands where a listener already hears it.
+
+| Mode | Filters it contributes | What it measures |
+|---|---|---|
+| `off` (the default, and what an unset field resolves to) | none — the filtergraph stays empty | nothing |
+| `peak` | `alimiter=limit=0.891:level=disabled:latency=1` | nothing; a −1 dBFS ceiling, with everything below it untouched |
+| `normalize` | `volume={gain}dB`, then that same limiter | integrated loudness and true peak, once per song, by `ebur128` |
+
+`_audio_filters` (src/youtube.py) is the only place a filter enters the argv, and it orders
+them volume → measured gain → ceiling: a limiter has to cap the signal the listener
+receives, so a guild playing at 200 % is capped after its gain rather than before it.
+`level=disabled` is required because alimiter auto-levels its output by default, which
+would RAISE a quiet song. **`latency=1` is load-bearing**: alimiter reports its 5 ms
+lookahead as latency, which ffmpeg answers by delaying the stream, so without that option
+every sample moves — worst difference 834 of 32768 against the unfiltered decode. With it
+the filter is transparent below the ceiling to within one 16-bit step (1.9e-09 in float),
+and inserting the filtergraph itself is bit-exact. The ffmpeg tier measures all three.
+
+Only `off` emits no filtergraph, so only `off` keeps the remux — the passthrough gate above
+refuses `-c:a copy` alongside any filter — and `peak` and `normalize` each cost the one
+lossy generation that path avoids, ~3 dB against the copy. Gain is −14 LUFS minus the
+measured `I`, clamped to (−20, +12) dB: past that a track is a field recording or a
+mastering error, and moving it 30 dB amplifies its noise floor into the room. A scan that
+fails, times out or prints no summary yields no gain at all — the song takes the ceiling and
+plays at its own level.
+
+Why a static gain rather than a normalizing filter, measured on the same loud/quiet pair:
+
+| Approach | On the target | What it costs |
+|---|---|---|
+| `dynaudnorm` | no — **7 LU** still between the loud and the quiet track | — |
+| single-pass `loudnorm` | yes — both tracks landed on −13.2 LUFS asked for −16 | squeezes the loudness range, LRA 21.4 → 16.5 LU, and 55 ms on first byte |
+| `volume=<gain>dB` + limiter (shipped) | yes, exactly, and LRA untouched | needs the track's loudness before the argv is assembled |
+
+`ebur128` scans at roughly 400× realtime, so a 4-minute song is about 0.6 s of CPU; the real
+cost is fetching the audio a second time (3–4 MB). `measure_loudness` caches the result
+under `ytdl:loudness:v1:{webpage_url}` for 30 days — what a song measures does not change,
+so the TTL is there because the entry is cheap to lose, not because it goes stale. That key
+is TTL'd and evictable, so it carries none of the non-evictable-key obligations in
+[`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
+`LOUDNESS_SCAN_TIMEOUT_SECS` (8.0) bounds the scan, and the child is spawned with asyncio
+rather than in an executor so a cancellation KILLS it: this runs inside the prefetch, which
+every bulk queue mutation cancels and whose contract forbids uninterruptible work there.
+Livestreams — no duration — are never scanned: the scan would read until its timeout and
+measure whatever it caught.
+
+One wait is the cost a user sees: the first play of a song in a normalizing server sits
+through its scan, bounded by the knob and 1–3 s in practice, once per song per 30 days.
+A changed mode applies from the song after next, since the next song's argv — gain included
+— is already assembled.
+
+Considered and left out:
+
+- **Measuring during the first play** — needs a filter or an in-process decoder, and leaves that first play unnormalized.
+- **YouTube's own `loudnessDb`** — not in the info-dict, and a player-response hook breaks on the nightly yt-dlp pin.
+- **Per-listener gain** — Discord has no such control.
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
 

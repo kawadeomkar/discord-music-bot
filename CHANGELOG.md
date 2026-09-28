@@ -17,6 +17,26 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.55.0 — 2026-09-28
+
+**New setting: `-settings loudness`.** Off by default, and off behaves exactly as this
+bot always has. The other two even out how loud songs play:
+
+- `peak` caps the loudest peaks, so a hot track stops jumping out of the mix. Anything
+  below the ceiling is left alone.
+- `normalize` brings every song to one loudness, raising quiet ones as well as lowering
+  loud ones. It measures each song once and remembers the answer for a month, so the
+  first play of a new song waits a second or two for that; a replay does not.
+
+Two costs worth knowing before you turn it on. Either mode re-encodes the audio instead
+of copying YouTube's bitstream through untouched, which spends one lossy generation —
+about 3 dB by measurement, and `off` remains the only bit-exact setting. And the
+measurement `normalize` needs fetches the song a second time.
+
+Operators get `-settings bot loudness-scan-timeout` (default 8s, `LOUDNESS_SCAN_TIMEOUT_SECS`)
+to bound that measurement; past it the song plays at its own level rather than waiting.
+Nothing to do on deploy: no guild has the setting until someone sets it.
+
 ## 2.54.0 — 2026-09-28
 
 **Spotify links now play the album recording, not the music video.** A Spotify track

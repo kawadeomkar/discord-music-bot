@@ -51,6 +51,7 @@ class TestServerValues:
     def test_unset_is_the_default(self) -> None:
         assert [shown for _, shown in _server_rows(None)] == [
             card.Shown(100.0, "default"),
+            card.Shown("off", "default"),
             card.Shown(DEFAULT_TIMEZONE, "default"),
             card.Shown(300.0, "default"),
             card.Shown(10.0, "default"),
@@ -63,6 +64,7 @@ class TestServerValues:
     def test_set_values_render_in_their_unit(self) -> None:
         stored = GuildConfig(
             volume=0.29,
+            loudness="normalize",
             timezone="Asia/Tokyo",
             idle_timeout_secs=600.0,
             alone_timeout_secs=120.0,
@@ -73,6 +75,7 @@ class TestServerValues:
         )
         assert [shown for _, shown in _server_rows(stored)] == [
             card.Shown(29, "set here"),
+            card.Shown("normalize", "set here"),
             card.Shown("Asia/Tokyo", "set here"),
             card.Shown(600.0, "set here"),
             card.Shown(120.0, "set here"),
@@ -263,6 +266,10 @@ class TestServerCard:
             "Playback level.\n"
             "`-settings volume <value>` · 0%–100%\n"
             "\n"
+            "**Loudness** · off · default\n"
+            "How much the levels between songs are evened out.\n"
+            "`-settings loudness <value>` · `off`, `peak` or `normalize`\n"
+            "\n"
             "**Timezone** · America/Los_Angeles · default\n"
             "Time zone for estimated play times.\n"
             "`-settings timezone <value>` · a city like Europe/London, or UTC"
@@ -317,6 +324,8 @@ def _lowest(spec: SettingSpec) -> str:
         return "on"
     if spec.kind is SettingKind.TIMEZONE:
         return "UTC"
+    if spec.kind is SettingKind.CHOICE:
+        return spec.choices[0]
     return format_value(spec, write_range(spec)[0] or 0.0)
 
 

@@ -16,7 +16,7 @@ from redis.asyncio import Redis
 
 from src import config
 from src import settings_card as card
-from src.guild_state import DEFAULT_VOLUME, GuildConfig
+from src.guild_state import DEFAULT_VOLUME, GuildConfig, LoudnessMode
 from src.musicbot import MusicBot
 from src.redis_client import BotConfigStore, GuildRedisStore
 from src.settings import BotSettings, GuildSettings, WriteResult
@@ -583,6 +583,26 @@ class TestReplies:
             f"saved for this server. Changed by {MENTION}."
         )
 
+    async def test_loudness(self, cog: MusicBot, settings_ctx: MagicMock) -> None:
+        ctx = _with_manage_server(settings_ctx)
+        await _invoke(cog, ctx, "ln NORMALIZE")
+        assert _text(ctx) == (
+            "**Loudness** is now **normalize** for this server (was **off**, the "
+            "default). It applies from the song after next, since the next one is "
+            f"already built. It is saved for this server. Changed by {MENTION}."
+        )
+        await _invoke(cog, ctx, "reset loudness")
+        assert _text(ctx) == (
+            "**Loudness** is back to the default, **off**. It is saved for this "
+            f"server. Changed by {MENTION}."
+        )
+
+    async def test_a_mode_that_is_not_one_is_refused_by_name(
+        self, cog: MusicBot, settings_ctx: MagicMock
+    ) -> None:
+        await _invoke(cog, _with_manage_server(settings_ctx), "loudness louder")
+        assert "`off`, `peak` or `normalize`" in _text(settings_ctx)
+
     async def test_idle_timeout(self, cog: MusicBot, settings_ctx: MagicMock) -> None:
         ctx = _with_manage_server(settings_ctx)
         await _invoke(cog, ctx, "leave-when-idle 10m")
@@ -757,6 +777,7 @@ class TestCard:
         ]
         assert states == [
             "**Volume** · 100% · default",
+            "**Loudness** · off · default",
             "**Timezone** · America/Los_Angeles · default",
             "**Leave when idle** · 5:00 · default",
             "**Leave when alone** · 0:10 · default",
@@ -855,8 +876,12 @@ class TestTheLivePlayer:
         assert player.volume == 0.3
         await _invoke(cog, ctx, "timezone Asia/Tokyo")
         assert player.timezone == ZoneInfo("Asia/Tokyo")
+        await _invoke(cog, ctx, "loudness peak")
+        assert player.loudness is LoudnessMode.PEAK
         await _invoke(cog, ctx, "volume reset")
         assert player.volume == DEFAULT_VOLUME
+        await _invoke(cog, ctx, "reset loudness")
+        assert player.loudness is LoudnessMode.OFF
 
     async def test_no_player_is_built(
         self, cog: MusicBot, settings_ctx: MagicMock

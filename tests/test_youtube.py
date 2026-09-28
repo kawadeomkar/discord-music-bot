@@ -13,7 +13,7 @@ import time
 from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from typing import Any, Optional, cast
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -28,15 +28,26 @@ import pytest
 from redis.asyncio import Redis
 from yt_dlp.utils import DownloadError, UnsupportedError
 
+from src import config
+from src.redis_client import cache_set
 from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
-from src.guild_state import Analytics
+from src.guild_state import Analytics, LoudnessMode
 from src import youtube
 from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
+    Loudness,
     NpHostRef,
+    _LOUDNESS_GAIN_CLAMP_DB,
+    _LOUDNESS_TARGET_LUFS,
+    _PEAK_LIMITER,
+    _audio_filters,
+    _loudness_cache_key,
+    measure_loudness,
+    normalize_gain_db,
+    parse_ebur128_summary,
     QueueObject,
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
@@ -3524,6 +3535,7 @@ class TestOpusPassthrough:
             captured["options"] = options or ""
 
         volume = data_overrides.pop("volume", 1.0)
+        loudness = data_overrides.pop("loudness", LoudnessMode.OFF)
         # A remuxable YouTube serve, spelled out: opus, stereo, and one of the itags
         # known to be 20ms-framed. Every clause of the gate is defeatable per test.
         data: dict[str, Any] = {
@@ -3544,6 +3556,7 @@ class TestOpusPassthrough:
                 ),
                 AsyncMock(spec=discord.TextChannel),
                 volume=volume,
+                loudness=loudness,
             )
         return captured["codec"], captured["options"]
 
@@ -3566,10 +3579,10 @@ class TestOpusPassthrough:
     async def test_any_filter_forces_the_encoder_not_just_volume(self) -> None:
         """The invariant is "a filtergraph exists", not "volume is non-unity".
 
-        Volume is only today's filter source. This stands in a future one (the
-        per-guild loudness setting is the next) by making _audio_filters emit a
-        filter yt_stream knows nothing about: the copy path must still refuse, or
-        ffmpeg exits 234 with zero bytes and the player reports a refused stream.
+        Volume and the loudness setting are today's two filter sources. This
+        stands in for the next one by making _audio_filters emit a filter yt_stream
+        knows nothing about: the copy path must still refuse, or ffmpeg exits 234
+        with zero bytes and the player reports a refused stream.
         """
         with patch("src.youtube._audio_filters", return_value=["dynaudnorm"]):
             codec, options = await self._ffmpeg_args()
@@ -6774,3 +6787,306 @@ class TestYtPlaylistProgress:
 
         assert seen == [(0, 1671), (25, None)]
         assert youtube._PROGRESS_SUBSCRIBERS == {}
+
+
+class TestLoudnessFilters:
+    """What each mode contributes to the chain, and in what order. The order is the
+    invariant: a ceiling has to apply to the signal the listener receives."""
+
+    def test_off_emits_nothing_so_the_copy_path_survives(self) -> None:
+        """The only mode that can stay bit-exact: any filtergraph refuses
+        `-c:a copy`, so OFF has to produce an EMPTY list, not a no-op filter."""
+        assert _audio_filters(1.0, LoudnessMode.OFF, None) == []
+
+    def test_peak_is_the_limiter_alone(self) -> None:
+        assert _audio_filters(1.0, LoudnessMode.PEAK, None) == [_PEAK_LIMITER]
+
+    def test_peak_ignores_a_gain_it_was_handed(self) -> None:
+        """A measured gain belongs to NORMALIZE. PEAK caps peaks and moves nothing."""
+        assert _audio_filters(1.0, LoudnessMode.PEAK, -6.0) == [_PEAK_LIMITER]
+
+    def test_normalize_is_the_gain_then_the_ceiling(self) -> None:
+        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, -6.0) == [
+            "volume=-6.0dB",
+            _PEAK_LIMITER,
+        ]
+
+    def test_volume_leads_the_chain(self) -> None:
+        """A guild at 200% is capped AFTER its gain, or the ceiling describes a
+        signal nobody receives."""
+        assert _audio_filters(2.0, LoudnessMode.NORMALIZE, 3.0) == [
+            "volume=2.0",
+            "volume=3.0dB",
+            _PEAK_LIMITER,
+        ]
+
+    def test_normalize_without_a_measurement_still_takes_the_ceiling(self) -> None:
+        """A scan that failed or timed out leaves the song at its own level rather
+        than unplayed."""
+        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, None) == [_PEAK_LIMITER]
+
+    def test_the_limiter_disables_auto_levelling(self) -> None:
+        """alimiter auto-levels its output by default, which would RAISE a quiet
+        song — the opposite of the setting's purpose. `latency=1` is what keeps it
+        transparent below the ceiling instead of shifting every sample by its 5 ms
+        lookahead; the ffmpeg tier measures both halves."""
+        assert "level=disabled" in _PEAK_LIMITER
+        assert "latency=1" in _PEAK_LIMITER
+
+
+class TestEbur128Summary:
+    """ffmpeg prints the summary once, at info level, after the stream ends."""
+
+    _CAPTURED = (
+        "[Parsed_ebur128_0 @ 0x14f6069b0] Summary:\n"
+        "\n"
+        "  Integrated loudness:\n"
+        "    I:         -19.7 LUFS\n"
+        "    Threshold: -30.4 LUFS\n"
+        "\n"
+        "  Loudness range:\n"
+        "    LRA:         8.2 LU\n"
+        "    Threshold: -34.6 LUFS\n"
+        "    LRA low:   -25.1 LUFS\n"
+        "    LRA high:  -16.9 LUFS\n"
+        "\n"
+        "  True peak:\n"
+        "    Peak:       -3.8 dBFS\n"
+    )
+
+    def test_the_captured_block_parses(self) -> None:
+        assert parse_ebur128_summary(self._CAPTURED) == Loudness(i=-19.7, peak=-3.8)
+
+    def test_nothing_printed_is_not_a_level(self) -> None:
+        assert parse_ebur128_summary("") is None
+
+    def test_a_half_written_summary_is_not_a_level(self) -> None:
+        """What a scan killed mid-stream leaves behind."""
+        assert parse_ebur128_summary("    I:         -19.7 LUFS\n") is None
+
+    def test_the_per_frame_log_is_not_mistaken_for_the_summary(self) -> None:
+        """`framelog=quiet` suppresses it, but the words are the same, and a
+        per-frame M/I line is an instantaneous reading rather than the whole song."""
+        frame = "[Parsed_ebur128_0 @ 0x1] t: 1.9 TARGET:-23 M: -22.0 S: -22.5 I: -21.9 LUFS  LRA: 0.9 LU"
+        assert parse_ebur128_summary(frame) is None
+
+
+class TestNormalizeGain:
+    """The gain that puts a song on the target, and the clamp that keeps a field
+    recording from being amplified into the room."""
+
+    def test_a_song_on_the_target_is_not_moved(self) -> None:
+        assert normalize_gain_db(Loudness(i=_LOUDNESS_TARGET_LUFS, peak=-1.0)) == 0.0
+
+    def test_a_quiet_song_is_raised(self) -> None:
+        assert normalize_gain_db(Loudness(i=-19.7, peak=-3.8)) == pytest.approx(5.7)
+
+    def test_a_loud_song_is_lowered(self) -> None:
+        assert normalize_gain_db(Loudness(i=-8.0, peak=-0.1)) == pytest.approx(-6.0)
+
+    def test_a_silent_recording_is_clamped(self) -> None:
+        assert (
+            normalize_gain_db(Loudness(i=-60.0, peak=-40.0))
+            == (_LOUDNESS_GAIN_CLAMP_DB[1])
+        )
+
+    def test_a_mastering_error_is_clamped_the_other_way(self) -> None:
+        assert (
+            normalize_gain_db(Loudness(i=6.0, peak=3.0)) == (_LOUDNESS_GAIN_CLAMP_DB[0])
+        )
+
+
+class TestMeasureLoudness:
+    """The one thing between a normalizing guild's first play of a song and its
+    audio. Bounded, cached for a month, and killed by a cancellation — the prefetch
+    this runs inside is cancelled by every bulk queue mutation."""
+
+    _URL = "https://yt.com/watch?v=loud"
+
+    @staticmethod
+    def _child(
+        *, stderr: bytes = b"", hangs: bool = False
+    ) -> tuple[MagicMock, Callable[..., Awaitable[Any]]]:
+        """A stand-in for the ffmpeg child, and the create_subprocess_exec that
+        answers with it. `hangs` never returns from communicate()."""
+        process = MagicMock()
+        process.returncode = None
+
+        async def communicate() -> tuple[bytes, bytes]:
+            if hangs:
+                await asyncio.Event().wait()
+            process.returncode = 0
+            return b"", stderr
+
+        process.communicate = communicate
+        process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
+
+        async def spawn(*_args: Any, **_kwargs: Any) -> MagicMock:
+            return process
+
+        return process, spawn
+
+    async def test_a_scan_measures_and_caches(self, fake_redis: Any) -> None:
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+        assert await fake_redis.get(_loudness_cache_key(self._URL)) is not None
+
+    async def test_a_cache_hit_spawns_nothing(self, fake_redis: Any) -> None:
+        """The whole point of the cache: a song measured once never pays again, so a
+        replay and a second guild both start immediately."""
+        await cache_set(
+            fake_redis, _loudness_cache_key(self._URL), {"i": -12.5, "peak": -1.2}, 60
+        )
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("spawned ffmpeg for a song already measured")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            measured = await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        assert measured == Loudness(i=-12.5, peak=-1.2)
+
+    async def test_an_unreadable_cache_entry_is_re_measured(
+        self, fake_redis: Any
+    ) -> None:
+        await cache_set(
+            fake_redis, _loudness_cache_key(self._URL), {"i": "loud", "peak": -1.0}, 60
+        )
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+
+    async def test_a_timeout_kills_the_child_and_plays_the_song_anyway(self) -> None:
+        """A dead child left behind holds a CDN connection open for the life of the
+        process."""
+        process, spawn = self._child(hangs=True)
+        config.loudness_scan_timeout_secs.set_override(
+            config.loudness_scan_timeout_secs.floor
+        )
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            measured = await asyncio.wait_for(
+                measure_loudness("https://cdn/a", self._URL, None), 5
+            )
+
+        assert measured is None
+        process.kill.assert_called_once()
+
+    async def test_a_cancellation_propagates_and_the_child_is_dead(self) -> None:
+        """The prefetch's contract: every bulk queue mutation awaits its cancel, so
+        nothing here may swallow one or outlive it."""
+        process, spawn = self._child(hangs=True)
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            task = asyncio.ensure_future(
+                measure_loudness("https://cdn/a", self._URL, None)
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        process.kill.assert_called_once()
+
+    async def test_a_scan_that_printed_no_summary_is_not_a_level(self) -> None:
+        _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+    async def test_a_missing_ffmpeg_is_not_a_failed_play(self) -> None:
+        """A level is an improvement to a play, not a precondition for one."""
+
+        async def missing(*_args: Any, **_kwargs: Any) -> Any:
+            raise FileNotFoundError(2, "No such file or directory: 'ffmpeg'")
+
+        with patch("asyncio.create_subprocess_exec", new=missing):
+            assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+
+class TestYtStreamLoudness:
+    """What the mode does to one song's argv, end to end."""
+
+    @staticmethod
+    async def _options(
+        mode: LoudnessMode,
+        *,
+        stderr: bytes = b"",
+        duration: Optional[int] = 213,
+        spawn: Optional[Callable[..., Awaitable[Any]]] = None,
+    ) -> tuple[Optional[str], str]:
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            options: Optional[str] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["options"] = options or ""
+
+        _, default_spawn = TestMeasureLoudness._child(stderr=stderr)
+        data = _fake_ytdl_data(
+            acodec="opus", audio_channels=2, format_id="251", duration=duration
+        )
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=data),
+            patch("asyncio.create_subprocess_exec", new=spawn or default_spawn),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject(
+                    webpage_url="https://yt.com/v=x",
+                    title="Song",
+                    requester=MagicMock(),
+                ),
+                AsyncMock(spec=discord.TextChannel),
+                loudness=mode,
+            )
+        return captured["codec"], captured["options"]
+
+    async def test_off_still_copies_the_bitstream(self) -> None:
+        codec, options = await self._options(LoudnessMode.OFF)
+        assert codec == "copy"
+        assert "-filter:a" not in options
+
+    async def test_peak_re_encodes_with_the_limiter(self) -> None:
+        codec, options = await self._options(LoudnessMode.PEAK)
+        assert codec is None
+        assert f"-filter:a {_PEAK_LIMITER}" in options
+
+    async def test_normalize_measures_the_song_and_emits_its_gain(self) -> None:
+        codec, options = await self._options(
+            LoudnessMode.NORMALIZE,
+            stderr=TestEbur128Summary._CAPTURED.encode(),
+        )
+        assert codec is None
+        # -19.7 LUFS against a -14 target.
+        assert "volume=5.7dB" in options
+        assert options.index("volume=5.7dB") < options.index("alimiter")
+
+    async def test_normalize_plays_a_song_it_could_not_measure(self) -> None:
+        codec, options = await self._options(LoudnessMode.NORMALIZE, stderr=b"nope")
+        assert codec is None
+        assert "volume=" not in options
+        assert _PEAK_LIMITER in options
+
+    async def test_a_livestream_is_never_scanned(self) -> None:
+        """No duration: the scan would read the stream until its own timeout and
+        measure whatever it happened to catch."""
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("scanned a livestream")
+
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, duration=None, spawn=refuse
+        )
+
+        assert _PEAK_LIMITER in options

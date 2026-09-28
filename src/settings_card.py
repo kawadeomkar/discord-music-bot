@@ -289,7 +289,7 @@ def _names(spec: SettingSpec) -> str:
 
 def _accepts(spec: SettingSpec) -> str:
     text = allowed_text(spec, now=True)
-    if spec.kind in (SettingKind.SWITCH, SettingKind.TIMEZONE):
+    if spec.kind in (SettingKind.SWITCH, SettingKind.TIMEZONE, SettingKind.CHOICE):
         return f"Takes {text}"
     return f"Allowed {text}"
 

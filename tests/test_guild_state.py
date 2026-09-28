@@ -42,6 +42,7 @@ from src.guild_state import (
     parse_history_entry,
     parse_queue_entry,
     serialize_history_entry,
+    LoudnessMode,
     valid_timezone,
     parse_number_fields,
 )
@@ -2715,6 +2716,59 @@ class TestGuildConfigTimezone:
         assert GuildConfig.from_redis(raw).timezone is None
 
 
+class TestGuildConfigLoudness:
+    """How much loudness processing a guild wants. Stored as the mode's own name and
+    resolved at read time, so a mode a later build adds costs an older one that
+    setting rather than its whole config."""
+
+    def test_unset_resolves_to_off(self) -> None:
+        """OFF is the only mode that emits no filter, which is the only way a song
+        stays bit-exact: a guild that never chose must land here."""
+        assert GuildConfig().loudness_mode() is LoudnessMode.OFF
+        assert GuildConfig().to_redis() == {}
+
+    @pytest.mark.parametrize("mode", list(LoudnessMode))
+    def test_every_mode_round_trips(self, mode: LoudnessMode) -> None:
+        config = GuildConfig(loudness=mode.value)
+        assert config.to_redis() == {ConfigField.LOUDNESS: mode.value}
+        raw = {ConfigField.LOUDNESS.encode(): mode.value.encode()}
+        assert GuildConfig.from_redis(raw).loudness_mode() is mode
+
+    def test_an_explicit_off_is_not_absent(self) -> None:
+        """The two stay distinguishable on the wire, so a future host-level default
+        can tell "chose off" from "never chose"."""
+        assert GuildConfig(loudness="off").to_redis() == {ConfigField.LOUDNESS: "off"}
+
+    @pytest.mark.parametrize("stored", ["", "loud", "PEAK ", "dynaudnorm", "1"])
+    def test_a_mode_this_build_does_not_know_reads_as_unset(self, stored: str) -> None:
+        raw = {ConfigField.LOUDNESS.encode(): stored.encode()}
+        parsed = GuildConfig.from_redis(raw)
+        assert parsed.loudness is None or parsed.loudness in {
+            mode.value for mode in LoudnessMode
+        }
+        assert parsed.loudness_mode() in set(LoudnessMode)
+
+    def test_a_stored_mode_is_canonicalised(self) -> None:
+        """The wire holds the enum's own spelling, whatever case reached it."""
+        raw = {ConfigField.LOUDNESS.encode(): b"NORMALIZE"}
+        assert GuildConfig.from_redis(raw).loudness == "normalize"
+
+    @pytest.mark.parametrize(
+        ("typed", "expected"),
+        [
+            ("off", LoudnessMode.OFF),
+            ("PEAK", LoudnessMode.PEAK),
+            ("  normalize  ", LoudnessMode.NORMALIZE),
+            ("loud", None),
+            ("", None),
+        ],
+    )
+    def test_parse_is_one_grammar_for_the_wire_and_the_command(
+        self, typed: str, expected: LoudnessMode | None
+    ) -> None:
+        assert LoudnessMode.parse(typed) is expected
+
+
 class TestValidTimezone:
     """The WRITE-boundary check. tzinfo()'s fallback covers a name that stopped
     resolving; this stops an unusable one being stored in the first place, because
@@ -2834,7 +2888,11 @@ class TestConfigDomain:
         assert not ConfigDomain(4.0, 60.0).admits(OFF_SECS)
 
     def test_every_numeric_config_field_has_a_domain(self) -> None:
-        numeric = members(ConfigField) - {ConfigField.DEBUG_MODE, ConfigField.TIMEZONE}
+        numeric = members(ConfigField) - {
+            ConfigField.DEBUG_MODE,
+            ConfigField.TIMEZONE,
+            ConfigField.LOUDNESS,
+        }
         assert set(CONFIG_DOMAIN) == numeric
 
     def test_np_refresh_floor_is_the_bot_knob_env_floor(self) -> None:
