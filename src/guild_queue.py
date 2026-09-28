@@ -211,9 +211,9 @@ class GuildQueue:
         # did not land, or a mirror write cut short. Cleared by the next write that
         # replaces the list: a rebuild, a DELETE, or the next song start.
         self._mirror_dirty = False
-        # The entry the list holds for an item requeue_front() swapped in, which
-        # serializes as its resolved or rebuilt form. Keyed by id() and holding the
-        # item, so the id cannot be reused while the record lives.
+        # The entry the list holds for an item requeue_front() or replace_item()
+        # swapped in, which serializes differently from it. Keyed by id() and
+        # holding the item, so the id cannot be reused while the record lives.
         self._listed: dict[int, tuple[QueueObject, QueueEntry]] = {}
         # The objects mirror_entries() serialized for the song start's rebuild,
         # so note_mirror_write drops the records of exactly those once that write
