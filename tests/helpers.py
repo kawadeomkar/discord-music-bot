@@ -18,11 +18,12 @@ from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue
-from src.guild_state import Analytics, GuildConfig
+from src.guild_state import GuildConfig
+from src.queue_item import Analytics, QueueObject
 from src.redis_client import GuildRedisStore, iter_guild_configs
 from src.settings import GuildSettings
 from src.play_placement import PlayMode, PlayRequest
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 
 if TYPE_CHECKING:
     from src.musicbot import MusicBot

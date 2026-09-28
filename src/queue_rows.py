@@ -14,7 +14,7 @@ from typing import Optional, Union
 import discord
 
 from src.util import fmt_duration, safe_label
-from src.youtube import QueueObject
+from src.queue_item import QueueObject
 
 # Nothing bounds a yt-dlp title or uploader, and every row of a listing shares
 # one 4096-character embed description.

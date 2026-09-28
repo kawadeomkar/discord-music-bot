@@ -13,7 +13,8 @@ from discord.ext import commands
 
 import src.debug as debug_mode
 from src.config import SpotifyStatus
-from src.guild_state import Analytics, HistoryEntry
+from src.guild_state import HistoryEntry
+from src.queue_item import Analytics
 from src.recovery import _Countdown
 from src.musicbot import MusicBot, SpotifyDisabledError
 from src.play_placement import check_voice_permissions, play_takes_the_queue

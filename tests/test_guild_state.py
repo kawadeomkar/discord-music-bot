@@ -16,10 +16,10 @@ from unittest.mock import MagicMock
 from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
-from src.youtube import YTDL, QueueObject
+from src.queue_item import Analytics, QueueObject
+from src.youtube import YTDL
 from tests.helpers import give_queue_object
 from src.guild_state import (
-    Analytics,
     CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
     OFF_SECS,

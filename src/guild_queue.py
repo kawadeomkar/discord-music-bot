@@ -36,11 +36,11 @@ from typing import Optional, Union
 
 import discord
 
-from src.guild_state import Analytics, SongQueueEntry
+from src.guild_state import SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import is_link, unwrap
 from src.util import get_logger
-from src.youtube import QueueObject
+from src.queue_item import Analytics, QueueObject
 
 log = get_logger(__name__)
 

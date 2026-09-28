@@ -28,7 +28,7 @@ from src.guild_queue import (
 )
 from src.guild_state import SongQueueEntry, parse_queue_entry
 from src.redis_client import GUILD_TTL, GuildRedisStore
-from src.youtube import QueueObject
+from src.queue_item import QueueObject
 from tests.helpers import (
     queue_object,
     seed_queue,

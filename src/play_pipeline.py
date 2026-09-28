@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Sequence
 import discord
 from discord.ext import commands
 
-from src.guild_state import Analytics
+from src.queue_item import Analytics, QueueObject
 from src.musicplayer import InterjectOutcome, MusicPlayer
 from src.play_placement import (
     Placement,
@@ -66,7 +66,7 @@ from src.util import (
     truncate_embed_title,
     verbatim_code,
 )
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports this module).

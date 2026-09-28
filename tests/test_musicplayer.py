@@ -26,9 +26,8 @@ from src.debug import DebugSettings, RuntimeSnapshot
 from src.guild_history import GuildHistory
 
 from src.guild_queue import GuildQueue, RemoveMode
+from src.queue_item import ANALYTICS_ZERO, Analytics
 from src.guild_state import (
-    ANALYTICS_ZERO,
-    Analytics,
     DEFAULT_TIMEZONE,
     ConfigField,
     GuildConfig,
@@ -60,7 +59,8 @@ from src.util import (
     fmt_duration,
     trace_id_of,
 )
-from src.youtube import NpHostRef, QueueObject, YTDL
+from src.queue_item import NpHostRef, QueueObject
+from src.youtube import YTDL
 from tests.helpers import (
     REPLAY_ASK,
     described,

@@ -29,7 +29,7 @@ from src.redis_client import GuildRedisStore
 from src.settings import SETTINGS, BotSettings, SettingScope
 from src.musicbot import MusicBot as MusicBotCog
 from src.util import FOOTER_LIMIT, FOOTER_SUFFIX_SEP, cancel_task, spawn_background
-from src.guild_queue import QueueObject
+from src.queue_item import QueueObject
 from tests.helpers import command_callback, seed_queue, stored_config
 from src.musicplayer import MusicPlayer
 from src.debug import (

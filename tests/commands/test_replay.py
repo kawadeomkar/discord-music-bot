@@ -15,7 +15,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.commands._common import NOTHING_PLAYING
-from src.guild_state import Analytics
+from src.queue_item import Analytics, NpHostRef, QueueObject
 from src.commands import replay as replay_cmd
 from src.commands.replay import ReplayOutcome, ReplayResult
 from src.guild_queue import GuildQueue
@@ -23,7 +23,7 @@ from src.guild_state import SongQueueEntry, parse_queue_entry
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.util import cancel_task
-from src.youtube import YTDL, NpHostRef, QueueObject
+from src.youtube import YTDL
 from tests.helpers import (
     REPLAY_ASK,
     command_callback,
