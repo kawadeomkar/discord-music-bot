@@ -170,7 +170,7 @@ class SpotifySource:
 
 # slots: one instance per parsed input, and a playlist parse is on the -play path.
 # Keep the class free of __dict__ readers (asdict/vars) and off any pickle path.
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class YTSource:
     """A YouTube track or playlist: a pasted `url` or a `ytsearch:` term, with
     an optional `ts` start offset. `list_id`, `index` (1-based start position)
@@ -399,7 +399,7 @@ def _youtube_source(
     list_id = _last(args, "list")
     if list_id is None:
         return YTSource(
-            link,
+            url=link,
             ts=ts,
             process=False,
             bad_timestamp=bad_timestamp,
@@ -409,7 +409,7 @@ def _youtube_source(
     # youtu.be carries its video in the path, where `v=` never appears.
     video_id = path[1:].split("/", 1)[0] if host == "youtu.be" else _last(args, "v")
     return YTSource(
-        link,
+        url=link,
         ts=ts,
         process=False,
         type=YTType.PLAYLIST,

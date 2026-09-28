@@ -281,7 +281,7 @@ graph TD
 |---|---|---|
 | `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song), `search` (the `ytsearch:` term while the item is unresolved — [one queue item](#one-queue-item)) |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; holds the `QueueObject` it plays (`queued`) and answers the ask off it ([the ask a playing song holds](#the-ask-a-playing-song-holds)); counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
-| `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — a parse result, never a queue item |
+| `YTSource` | `sources.py` | Frozen, slotted, keyword-only dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — a parse result, never a queue item |
 | `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id`; `url` is the canonical open.spotify.com link |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; every live item is a `QueueObject`, resolved or not ([one queue item](#one-queue-item)) |

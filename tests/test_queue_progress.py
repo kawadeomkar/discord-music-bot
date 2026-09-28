@@ -346,7 +346,7 @@ class TestIsCollection:
         assert is_collection(SpotifySource(SpotifyType.PLAYLIST, "pid"))
         assert is_collection(SpotifySource(SpotifyType.ALBUM, "aid"))
         assert not is_collection(SpotifySource(SpotifyType.TRACK, "tid"))
-        assert not is_collection(YTSource("https://yt.com/v=1", type=YTType.TRACK))
+        assert not is_collection(YTSource(url="https://yt.com/v=1", type=YTType.TRACK))
         assert not is_collection(SoundcloudSource("https://soundcloud.com/a/b"))
 
 

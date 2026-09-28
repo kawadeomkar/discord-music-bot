@@ -1,5 +1,6 @@
 """Tests for src/sources.py — URL parsing and source type detection."""
 
+import dataclasses
 import re
 import time
 from collections.abc import Callable
@@ -1383,3 +1384,17 @@ class TestLinkParsingIsLinear:
     def test_a_token_past_the_cap_is_searched(self) -> None:
         link = f"https://www.youtube.com/watch?v={_VIDEO}&x={'a' * LINK_MAX_CHARS}"
         assert parse_input(link).stype is URLSource.SEARCH
+
+
+class TestParseResultsMeetTheDataclassConvention:
+    """The three parse results are value objects: frozen, slotted and built by
+    keyword (CLAUDE.md, code conventions). Pinned at runtime beside the pyright
+    proof that no positional construction survives in src or tests."""
+
+    def test_a_youtube_parse_is_frozen_slotted_and_keyword_only(self) -> None:
+        source = YTSource(url="https://yt.com/watch?v=1")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(source, "ts", 5)
+        assert not hasattr(source, "__dict__")
+        with pytest.raises(TypeError):
+            YTSource("https://yt.com/watch?v=1")  # pyright: ignore[reportCallIssue]
