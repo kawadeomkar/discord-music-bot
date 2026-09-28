@@ -722,7 +722,7 @@ class Refusal:
     scope: SettingScope | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Parsed:
     value: SettingValue
 
@@ -929,7 +929,7 @@ def _duration_shape_refusal(spec: SettingSpec, value: str) -> Refusal:
 
 def _parse_time(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if spec.kind is SettingKind.SECONDS_OR_OFF and value.casefold() == "off":
-        return Parsed(OFF_SECS)
+        return Parsed(value=OFF_SECS)
     total = _seconds_total(value)
     if total is None or (total * 100).denominator != 1:
         return _duration_shape_refusal(spec, value)
@@ -947,12 +947,12 @@ def _parse_time(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if spec.kind is SettingKind.SECONDS_OR_OFF and seconds == OFF_SECS:
         # `0` could mean "at once" as easily as "never", so off has one spelling.
         return _out_of_range(spec, "minimum", bound(spec.minimum), bound(spec.maximum))
-    return Parsed(seconds)
+    return Parsed(value=seconds)
 
 
 def _parse_percent(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if match := _PERCENT_RE.fullmatch(value):
-        return Parsed(int(match.group(1)))
+        return Parsed(value=int(match.group(1)))
     lo, hi = bound(spec.minimum), bound(spec.maximum)
     return Refusal(
         reason=RefusalReason.BAD_SHAPE,
@@ -963,7 +963,7 @@ def _parse_percent(spec: SettingSpec, value: str) -> Parsed | Refusal:
 
 def _parse_count(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if _COUNT_RE.fullmatch(value):
-        return Parsed(int(value))
+        return Parsed(value=int(value))
     lo, hi = bound(spec.minimum), bound(spec.maximum)
     span = f" from {int(lo)} to {int(hi)}" if lo is not None and hi is not None else ""
     return Refusal(
@@ -976,7 +976,7 @@ def _parse_count(spec: SettingSpec, value: str) -> Parsed | Refusal:
 def _parse_switch(spec: SettingSpec, value: str) -> Parsed | Refusal:
     choice = _SWITCH_WORDS.get(value.casefold())
     if choice is not None:
-        return Parsed(choice)
+        return Parsed(value=choice)
     return Refusal(
         reason=RefusalReason.BAD_SHAPE,
         text=f"**{spec.label}** takes `on` or `off`.",
@@ -1221,7 +1221,7 @@ def _parse_timezone(spec: SettingSpec, value: str) -> Parsed | Refusal:
             spec=spec,
         )
     if (canonical := _zone_index().get(folded)) is not None:
-        return Parsed(canonical)
+        return Parsed(value=canonical)
     if (redirect := _REDIRECT_KEYS.get(folded)) is not None:
         return _redirect_refusal(spec, redirect)
     if (cities := _city_index().get(folded)) is not None:
