@@ -19,7 +19,7 @@ from src.musicbot import MusicBot
 from src.play_placement import ResolveWaitExpired
 from src.commands import play as play_cmd
 from src.recovery import abandon_cold_start
-from src.guild_queue import RemoveMode, RemoveOutcome
+from src.guild_queue import GuildQueue, RemoveMode, RemoveOutcome
 from src.play_placement import (
     PLACE_TIMEOUT_SECS,
     PlaceResult,
@@ -61,6 +61,7 @@ from tests.helpers import (
     playing_vc,
     queue_object,
     recording_span,
+    seed_queue,
     settle,
     song,
     stalled_config_reads,
@@ -2639,7 +2640,10 @@ class TestPlacementInsertsAndConfirmations:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """The head is queued before the warm runs, so what the warm learned goes
-        into the queue's slot for it rather than onto an object nothing holds."""
+        into the queue's slot for it rather than onto an object nothing holds.
+        Driven through a REAL queue: replace_item matches by identity, and the
+        rebase put copies in, so a warm handed the pre-rebase list swaps nothing
+        and a mocked queue would take the miss without a word."""
         tracks = [
             QueueObject(
                 webpage_url=f"https://yt.com/v={i}",
@@ -2650,6 +2654,11 @@ class TestPlacementInsertsAndConfirmations:
         ]
         source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
         mp = mock_mp()
+        queue = GuildQueue(MagicMock(spec=discord.Guild), None)
+        mp.queue = queue
+        mp.queue_put_next = AsyncMock(
+            side_effect=lambda items, **_: seed_queue(queue, *items)
+        )
         mock_ctx.message.add_reaction = AsyncMock()
         filled = dataclasses.replace(tracks[0], duration=180)
 
@@ -2666,9 +2675,8 @@ class TestPlacementInsertsAndConfirmations:
                 cog=music_bot,
             )
 
-        (swap,) = mp.queue.replace_item.call_args_list
-        assert swap.args[0].webpage_url == tracks[0].webpage_url
-        assert swap.args[1] is filled
+        assert queue.display_items()[0] is filled
+        assert tracks[0].duration is None, "the caller's object was written"
 
     @pytest.mark.parametrize(
         "placement,warmed",
