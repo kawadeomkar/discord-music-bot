@@ -1973,6 +1973,26 @@ class TestRestoreEntries:
             assert await gq.restore_entries([]) == 0
         assert f"Restored 0 queued songs for guild {mock_guild.id}" in caplog.text
 
+    async def test_the_restore_line_counts_what_the_snapshot_could_not_read(
+        self,
+        gq: GuildQueue,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Without the count, "Restored 1" reads as a one-song queue rather than
+        as a three-entry list two of whose entries were dropped upstream."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        with caplog.at_level(logging.INFO, logger="src.guild_queue"):
+            assert (
+                await gq.restore_entries([self._entry(1, mock_author.id)], unreadable=2)
+                == 1
+            )
+        assert (
+            f"Restored 1 queued songs for guild {mock_guild.id}, past 2 the "
+            "snapshot could not read" in caplog.text
+        )
+
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:
         return SongQueueEntry(
             webpage_url=f"https://yt.com/v={n}",

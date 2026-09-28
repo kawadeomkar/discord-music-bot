@@ -848,11 +848,11 @@ class SongQueueEntry:
 
 # `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
 # narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
-def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
-    """Deserialize one queue-list entry. One whose "type" is not "qobj", or
-    missing webpage_url, title or requester_id, returns None with a warning, so
-    the rest of the queue survives; it is dropped from the snapshot, leaving the
-    deque shorter than the Redis list until the next mirror rebuild."""
+def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
+    """Deserialize one queue-list entry, logging nothing: (entry, "") when it
+    reads, (None, reason) when it does not. A caller reading a whole list takes
+    this one and reports the drops once — a straggler collection is one bad
+    entry per track."""
     try:
         d = orjson.loads(data)
         # Every writer of this list stamps "type" as "qobj"; an entry carrying
@@ -861,7 +861,7 @@ def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
         entry_type = d[QueueEntryField.TYPE]
         if entry_type != _ENTRY_TYPE_SONG:
             raise ValueError(f"entry type {entry_type!r}")
-        return SongQueueEntry(
+        entry = SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],
             title=d[QueueEntryField.TITLE],
             requester_id=d[QueueEntryField.REQUESTER_ID],
@@ -887,8 +887,19 @@ def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
             search=d.get(QueueEntryField.YTSEARCH) or "",
         )
     except Exception as e:
-        log.warning(f"guild_state: corrupt queue entry dropped: {e}")
-        return None
+        return None, str(e)
+    return entry, ""
+
+
+def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
+    """read_queue_entry for a caller holding one entry: None with a warning
+    naming the shape it met, so the rest of the queue survives; it is dropped
+    from the snapshot, leaving the deque shorter than the Redis list until the
+    next mirror rebuild."""
+    entry, reason = read_queue_entry(data)
+    if entry is None:
+        log.warning(f"guild_state: corrupt queue entry dropped: {reason}")
+    return entry
 
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────

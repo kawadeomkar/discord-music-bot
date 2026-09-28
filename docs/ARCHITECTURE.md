@@ -2414,10 +2414,14 @@ unchanged, and `_rehydrate` restores such an entry as an item that still cannot 
 The **rollback floor is 2.53.7**, the build that first read `search` back: an earlier one
 parses the new entry into a `SongQueueEntry` with none, rehydrates an item that looks
 resolved with an empty `webpage_url`, and tries to stream it.
-`parse_queue_entry` reads that one shape, and only that one: an entry whose `"type"` is
+`read_queue_entry` reads that one shape, and only that one: an entry whose `"type"` is
 not `"qobj"` — the retired `"ytsource"` among them, whatever display fields it carries —
-or missing `webpage_url`, `title` or `requester_id`, is dropped with a warning, which
-leaves the deque shorter than the Redis list until the next mirror rebuild.
+or missing `webpage_url`, `title` or `requester_id`, is dropped, which leaves the deque
+shorter than the Redis list until the next mirror rebuild. It logs nothing itself: a
+straggler collection is one unreadable entry per track, so `get_playback_snapshot`
+reports them once, naming the guild, the count and the distinct shapes it met, and
+`restore_entries` carries the count onto its own line. `parse_queue_entry` is the
+warn-per-entry wrapper the parked-song blob reads through, where there is only one.
 
 `slots=True` is what keeps the merge cheap rather than free. By `sys.getsizeof` on this
 interpreter a 23-field `QueueObject` is **216 B**, against **344 B** for the same instance
