@@ -490,14 +490,13 @@ crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, whic
 back `None` on the one song that was playing).
 
 **An UNRESOLVED item takes the same checklist**, and nothing more: a collection's tracks
-wait as `QueueObject`s with `search` set, carrying whatever the walk named them
-(`webpage_url` the track's own page, `title` the row's name — both empty only when the
-walk sent no rows), and `_to_entry` writes
-them as the one `SongQueueEntry` shape every other item takes. `search` rides it as
-`ytsearch`, written **only when non-empty** — a resolved entry's bytes never move, and
-LREM matches these entries by their exact bytes, so a key written unconditionally would
-make every `-remove` and `-clear` miss on every entry already in Redis, each one then
-rewriting the whole list under the bulk mutex. Pin any such when-known key with a
+wait as `QueueObject`s with `search` set and `webpage_url` the track's own page (empty
+only where the walk named no row), and `_to_entry` writes them as the one
+`SongQueueEntry` shape every other item takes. `search` rides it as `ytsearch`, written
+**only when non-empty** — a resolved entry's bytes never move, and LREM matches these
+entries by their exact bytes, so a key written unconditionally would make every
+`-remove` miss on every entry already in Redis, each one then rewriting the whole list
+under the bulk mutex. Pin any such when-known key with a
 golden-bytes test beside `_GOLDEN_QOBJ_SEARCH`.
 `SearchQueueEntry` is the read-only `"ytsource"` shape of entries builds before 2.54.0
 wrote, and stays until no restore still meets one — `restore_entries` logs the restored

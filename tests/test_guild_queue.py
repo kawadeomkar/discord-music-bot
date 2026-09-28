@@ -2472,8 +2472,8 @@ class TestARestoredSearchReSerializesToItself:
     """Every LREM and every mirror rebuild re-serializes a restored item, and a
     byte that differs there misses the entry the list holds. A track an older
     build queued rests in the `"ytsource"` shape and comes back in this one, so
-    its first -remove or -clear misses and rebuilds the whole list once; from
-    the bytes that rebuild writes, the entry holds still."""
+    its first -remove misses and rebuilds the whole list once; from the bytes
+    that rebuild writes, the entry holds still."""
 
     @staticmethod
     async def _settle(gq: GuildQueue, written: bytes) -> tuple[bytes, bytes]:

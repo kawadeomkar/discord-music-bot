@@ -2412,22 +2412,24 @@ fallback requester, else the entry is dropped.
 term as `ytsearch`, written only when non-empty, so a resolved entry's bytes are
 unchanged, and `_rehydrate` restores such an entry as an item that still cannot stream.
 The **rollback floor is 2.53.7**, the build that first read `search` back: an earlier one
-parses the new entry into a `SongQueueEntry` with none, rehydrates an item that looks
-resolved with an empty `webpage_url`, and tries to stream it.
+parses the new entry into a `SongQueueEntry` with none and rehydrates an item that looks
+resolved, holding the Spotify track page — empty only where the walk named no row. It
+hands that to yt-dlp, which fails per track, so the loop errors one song at a time and
+drains rather than wedging.
 `SearchQueueEntry` remains as the READ shape — `"ytsource"`, what builds before 2.54.0
 wrote — so entries already on a list still restore. Such an entry rewrites once: the item
 it rehydrates into re-serializes as `"qobj"`, and because LREM matches exact bytes, the
-first `-remove` or `-clear` touching it misses and rebuilds the list. The read leg stays
-until no restore still meets one, which `restore_entries` measures: it logs the restored
-count on one INFO line per guild, every restore, and the `"ytsource"` tally beside it
-whenever the list held anything — so every zero on that line is a list that was read and
-held none, and a guild missing from the log was never measured at all. It returns both as
-a `RestoreOutcome` so `_restore_state` stamps the tally as
-`restore.old_shape_entries` beside `restore.queue_count` on the `player.state_restore`
-span. The measurement covers the guilds a start actually restored: `restore_guild` returns
-before building a player when the state hash records no channels, when they no longer
-resolve, or when the voice reconnect fails, and such a guild's list survives its 24 h TTL
-uncounted.
+first `-remove` touching it misses, warns and rebuilds the list; `-clear` DELETEs and
+matches nothing, so it never gets there. The read leg stays until no restore still meets
+one, which `restore_entries` measures: it logs the restored count on one INFO line per
+guild, every restore, and the `"ytsource"` tally beside it whenever the list held
+anything — so every zero on that line is a list that was read and held none, and a guild
+missing from the log was never measured at all. It returns both as a `RestoreOutcome` so
+`_restore_state` stamps the tally as `restore.old_shape_entries` beside
+`restore.queue_count` on the `player.state_restore` span. The measurement covers the
+guilds a start actually restored: `restore_guild` returns before building a player when
+the state hash records no channels, when they no longer resolve, or when the voice
+reconnect fails, and such a guild's list survives its 24 h TTL uncounted.
 
 `slots=True` is what keeps the merge cheap rather than free. By `sys.getsizeof` on this
 interpreter a 23-field `QueueObject` is **216 B**, against **344 B** for the same instance
@@ -3134,9 +3136,9 @@ Every persisted byte is defined in `guild_state.py` as frozen value objects with
 
 `-play --now` interrupts the current song and hands it back afterward without any new task, timer, or side channel: the parked song becomes an ordinary `is_resume` `SongQueueEntry` LPUSHed to the front of the queue (`put_front`), carrying its `position_secs` as `ts` and its paused state as `start_paused`. The loop replays it through the same `-ss`/seek path any `?t=` song uses, so resume fidelity and crash recovery come for free. The only extra state is `_skip_history_for` (so a parked song is logged to history once, at its resume tail, not twice). Interjections **stack**: an interjection on top of an interjection parks that song too, and the queue unwinds LIFO. One `_skip_history_for` slot is still enough at any depth — each interjection stops exactly one song, and that song's loop iteration consumes the marker before the next can finish resolving.
 
-### Persisted `YTSource` entries
+### Persisted unresolved entries
 
-Spotify playlist tracks are enqueued as unresolved `QueueObject`s carrying their `ytsearch:` term, to keep `-play` fast for large playlists (metadata comes from Spotify's cached API, not N yt-dlp calls). They are **not** prefetched at enqueue time (no stable `webpage_url`; would saturate the extraction pool), but they **are** persisted to the Redis queue as ordinary `"qobj"` wire entries carrying their `ytsearch` term, and survive restarts.
+Spotify playlist tracks are enqueued as unresolved `QueueObject`s carrying their `ytsearch:` term, to keep `-play` fast for large playlists (metadata comes from Spotify's cached API, not N yt-dlp calls). They are **not** prefetched at enqueue time (no YouTube URL yet; N searches would saturate the extraction pool), but they **are** persisted to the Redis queue as ordinary `"qobj"` wire entries carrying their `ytsearch` term, and survive restarts.
 
 ### Now Playing block attached at send time
 

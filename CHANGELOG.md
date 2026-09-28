@@ -25,13 +25,17 @@ moves is the shape of the saved entry, so this is the release the 2.53.2 note po
 forward at.
 
 - **Do not roll back past 2.53.7 once this build has run.** 2.53.7 is the first build
-  that can read the new entry; an older one restores such a track as a playable song with
-  nothing to stream, and it fails when its turn comes. Rolling back TO 2.53.7 is safe.
-- **The first `-remove` or `-clear` touching a track an earlier build queued rewrites the
-  whole queue list once.** Removal matches an entry by its exact saved bytes, and those
-  tracks were saved in the old shape, so the first attempt misses and the list is rebuilt
-  instead. Nothing is lost and nothing is duplicated; afterwards every entry is in the new
-  shape and removals are one-shot again.
+  that can read the new entry; an older one restores such a track as a song it believes
+  is playable, pointing at the Spotify track page — at nothing at all when the collection
+  gave no link for it — and neither plays. Each one posts an error as its turn comes and
+  the queue moves on to the next. Rolling back TO 2.53.7 is safe.
+- **The first `-remove` touching a track an earlier build queued rewrites the whole queue
+  list once.** Removal matches an entry by its exact saved bytes, and those tracks were
+  saved in the old shape, so the first attempt misses and the list is rebuilt instead.
+  That rebuild logs one `queue mirror diverged from memory` warning for the guild, which
+  is expected here and not a sign of damage. Nothing is lost and nothing is duplicated;
+  afterwards every entry is in the new shape and removals are one-shot again. `-clear`
+  never has to match bytes — it deletes the list — so it costs nothing extra.
 - **Each restart reports, per guild, how many restored entries were still in the old
   shape** — on the line that gives the restored count, and as `restore.old_shape_entries`
   on that guild's restore span. A guild whose saved queue was empty gets the count with

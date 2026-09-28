@@ -666,8 +666,9 @@ class NowPlayingData:
 
 class QueueEntryField:
     TYPE: Final[str] = "type"
-    # "qobj" entries. webpage_url, title, duration and uploader are also a
-    # search's display fields, written there only when known.
+    # "qobj" entries. webpage_url, title, duration and uploader are written
+    # unconditionally and double as an unresolved track's display fields; the
+    # "ytsource" entries older builds left carry them only when known.
     WEBPAGE_URL: Final[str] = "webpage_url"
     TITLE: Final[str] = "title"
     REQUESTER_ID: Final[str] = "requester_id"
@@ -696,7 +697,9 @@ class QueueEntryField:
     # The term an unresolved item still owes yt-dlp: written on a "qobj" entry
     # while non-empty, and read off the "ytsource" entries as well.
     YTSEARCH: Final[str] = "ytsearch"
-    # "ytsource" entries, read only
+    # "ytsource" entries, read only. `url` stands in as the term where
+    # `ytsearch` is absent; `process` is parsed so the shape stays described
+    # and lands on nothing a live item holds.
     URL: Final[str] = "url"
     PROCESS: Final[str] = "process"
 
