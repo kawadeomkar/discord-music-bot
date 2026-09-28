@@ -13,6 +13,7 @@ import contextlib
 import logging
 from unittest.mock import MagicMock, patch
 
+import orjson
 import pytest
 
 from src.guild_queue import (
@@ -27,7 +28,12 @@ from src.guild_queue import (
     item_label,
     remove_matcher,
 )
-from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
+from src.guild_state import (
+    QueueEntry,
+    SearchQueueEntry,
+    SongQueueEntry,
+    parse_queue_entry,
+)
 from src.redis_client import GUILD_TTL, GuildRedisStore
 from src.youtube import QueueObject
 from tests.helpers import (
@@ -2428,6 +2434,31 @@ _NEW_SHAPE_SEARCH = (
     b'"ytsearch":"ytsearch:DNA. Kendrick Lamar"}'
 )
 
+# A whole collection in that shape, one track per call: the retired writer's key
+# order, its when-known keys last, spelled out because nothing here produces the
+# shape any more. _OLD_SHAPE_EMPTY_DISPLAY above is the same layout by hand.
+_OLD_SHAPE_ALBUM = "https://open.spotify.com/album/abc123"
+
+
+def _old_shape_track(n: int, requester_id: int) -> bytes:
+    return orjson.dumps(
+        {
+            "type": "ytsource",
+            "ytsearch": f"ytsearch:Track {n}",
+            "url": None,
+            "process": True,
+            "ts": None,
+            "user_input": _OLD_SHAPE_ALBUM,
+            "queued_at": 0.0,
+            "queue_position": n + 1,
+            "query_source": "open.spotify.com",
+            "requester_id": requester_id,
+            "title": f"Track {n}",
+            "webpage_url": f"https://open.spotify.com/track/t{n}",
+        }
+    )
+
+
 class TestARestoredSearchReSerializesToItself:
     """Every LREM and every mirror rebuild re-serializes a restored item, and a
     byte that differs there misses the entry the list holds. A track an older
@@ -2504,6 +2535,55 @@ class TestARestoredSearchReSerializesToItself:
         first, second = await self._settle(gq, _NEW_SHAPE_SEARCH)
 
         assert (first, second) == (_NEW_SHAPE_SEARCH, _NEW_SHAPE_SEARCH)
+
+    async def test_a_list_of_old_shape_entries_costs_one_rebuild(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """What a deployment is promised, end to end over a real list: eight
+        tracks an older build wrote, one -remove. The LREM matches no byte on
+        the list, so it rebuilds — ONCE, for the whole list, not per entry — and
+        the next -remove is a clean LREM. Nothing is lost either time."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        written = [_old_shape_track(n, mock_author.id) for n in range(8)]
+        await fake_redis.rpush(store.queue_key(), *written)
+        entries: list[QueueEntry] = []
+        for blob in written:
+            entry = parse_queue_entry(blob)
+            assert isinstance(entry, SearchQueueEntry)
+            entries.append(entry)
+        assert (await gq.restore_entries(entries)).restored == 8
+        assert not gq.mirror_dirty
+
+        with caplog.at_level(logging.WARNING):
+            first = await gq.remove(remove_matcher("https://open.spotify.com/track/t2"))
+
+        assert [item.title for item in first.removed] == ["Track 2"]
+        assert caplog.text.count("queue mirror diverged from memory") == 1
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [entry.to_redis() for entry in gq.mirror_entries()]
+        assert [item.title for item in gq.display_items()] == [
+            f"Track {n}" for n in (0, 1, 3, 4, 5, 6, 7)
+        ]
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            second = await gq.remove(
+                remove_matcher("https://open.spotify.com/track/t5")
+            )
+
+        assert [item.title for item in second.removed] == ["Track 5"]
+        assert "queue mirror diverged from memory" not in caplog.text
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [entry.to_redis() for entry in gq.mirror_entries()]
+        assert [item.title for item in gq.display_items()] == [
+            f"Track {n}" for n in (0, 1, 3, 4, 6, 7)
+        ]
 
 
 class TestRestoreCrashed:
