@@ -67,6 +67,7 @@ from tests.helpers import (
     give_queue_object,
     loop_song,
     mocked,
+    passthrough_prefetch,
     stub_requester,
     queue_object,
     replayed_song,
@@ -98,7 +99,7 @@ def _stub_prefetch(monkeypatch: pytest.MonkeyPatch) -> None:
     asserting on prefetch override this with their own patch(), which wins."""
     from src import youtube
 
-    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
 
 def _loop_song() -> MagicMock:
@@ -162,7 +163,7 @@ def _stub_queue_put_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent prefetch_stream tasks in queue_put from doing real yt-dlp work."""
     from src import youtube
 
-    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
 
 # ── Archive wiring ────────────────────────────────────────────────────────────
@@ -331,11 +332,11 @@ class TestQueuePut:
         mock_author: MagicMock,
     ) -> None:
         assert music_player.store is not None
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
 
         src = unresolved("test")
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(src)
             await asyncio.sleep(0)
@@ -358,7 +359,7 @@ class TestQueuePut:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(queue_obj)
             await asyncio.sleep(0)
@@ -370,7 +371,7 @@ class TestQueuePut:
     ) -> None:
         source = unresolved("test song")
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(source)
             await asyncio.sleep(0)
@@ -380,10 +381,10 @@ class TestQueuePut:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """queue_put(prefetch=False) never spawns a background prefetch_stream task."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
 
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(queue_obj, prefetch=False)
             await asyncio.sleep(0)
@@ -412,7 +413,7 @@ class TestQueuePutNext:
         so anything added elsewhere to "warm the next song" would be a second
         concurrent extraction of it, not a missing one."""
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put_next(queue_obj)
             await asyncio.sleep(0)
@@ -580,7 +581,7 @@ class TestQueuePutNext:
             webpage_url="https://yt.com/v=x", title="X", requester=mock_author
         )
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put_next(newcomer)
             await asyncio.sleep(0)
@@ -1392,7 +1393,7 @@ class TestQueueRemove:
     def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from src import youtube
 
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
     async def test_remove_by_webpage_url(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -4265,7 +4266,7 @@ class TestQueuePutFront:
     def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from src import youtube
 
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
     async def test_single_item_goes_to_the_head(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -4346,7 +4347,7 @@ class TestQueuePutFront:
             for i in range(2)
         ]
         with patch.object(
-            youtube.YTDL, "prefetch_stream", new=AsyncMock()
+            youtube.YTDL, "prefetch_stream", new=passthrough_prefetch()
         ) as mock_prefetch:
             await music_player.queue_put_front(tracks)
             await asyncio.sleep(0)
@@ -4369,7 +4370,7 @@ class TestQueuePutFront:
             for i in range(2)
         ]
         with patch.object(
-            youtube.YTDL, "prefetch_stream", new=AsyncMock()
+            youtube.YTDL, "prefetch_stream", new=passthrough_prefetch()
         ) as mock_prefetch:
             await music_player.queue_put_front(tracks, prefetch=False)
             await asyncio.sleep(0)
@@ -4384,7 +4385,7 @@ class TestQueuePutFront:
         from src import youtube
 
         with patch.object(
-            youtube.YTDL, "prefetch_stream", new=AsyncMock()
+            youtube.YTDL, "prefetch_stream", new=passthrough_prefetch()
         ) as mock_prefetch:
             await music_player.queue_put_front([unresolved("a song")])
             await asyncio.sleep(0)
@@ -8387,6 +8388,36 @@ class TestPrefetchNextSong:
         assert music_player.queue._cursor == 0
         assert music_player.queue.get_nowait() is queue_obj
         assert music_player.queue.get_nowait() is queue_obj_no_meta
+
+    async def test_cancellation_keeps_a_warm_that_landed_on_the_claimed_slot(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+    ) -> None:
+        """_warm_stream swaps its back-fill into the slot of the item the prefetch
+        is holding. Giving back the captured local instead of the slot's object
+        would write the pre-warm copy over it, and -queue and the ETA would show
+        the bare ask again until the play-time resolve."""
+        await music_player.queue.put([queue_obj])
+        started = asyncio.Event()
+        never_set = asyncio.Event()
+
+        async def hang(self: MusicPlayer, source: Any) -> Any:
+            started.set()
+            await never_set.wait()
+            return source
+
+        with patch.object(MusicPlayer, "_resolve_source", new=hang):
+            task = asyncio.create_task(music_player._prefetch_next_song())
+            await started.wait()
+            warmed = dataclasses.replace(queue_obj, duration=180, uploader="Chan")
+            assert music_player.queue.replace_item(queue_obj, warmed) is True
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert music_player.queue.display_items()[0] is warmed
+        assert music_player.queue.get_nowait() is warmed
 
 
 # ── Loop task accounting ──────────────────────────────────────────────────────
@@ -15466,6 +15497,22 @@ class TestEnqueueWarmBound:
 
         assert held == [True], "the extraction ran outside the bound"
         assert not sem.locked(), "the slot outlived the warm"
+
+    async def test_a_warm_puts_its_back_fill_into_the_queue(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """What prefetch_stream learned reaches the queue's slot for the item, not
+        the object the caller kept: the copy is what the cards read from here on."""
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+        )
+        seed_queue(music_player.queue, qobj)
+        filled = dataclasses.replace(qobj, duration=180, uploader="Channel")
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=filled)):
+            await music_player._warm_stream(qobj)
+
+        assert music_player.queue.display_items()[0] is filled
+        assert qobj.duration is None
 
     async def test_an_enqueue_warms_through_the_bound(
         self, music_player: MusicPlayer, mock_author: MagicMock

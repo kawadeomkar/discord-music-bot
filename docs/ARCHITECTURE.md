@@ -732,7 +732,7 @@ flowchart LR
     end
 
     subgraph Phase1b["Phase 1b — Eager Prefetch (background)"]
-        P1b["prefetch_stream(QueueObject)\ncache-hit no-op after a full Phase 1;\nthe extraction itself after a flat one,\nand for playlists and requeues\n+ enriches QueueObject metadata"]
+        P1b["prefetch_stream(QueueObject)\ncache-hit no-op after a full Phase 1;\nthe extraction itself after a flat one,\nand for playlists and requeues\n+ hands the item back with its metadata back-filled"]
     end
 
     subgraph Phase2["Phase 2 — Play (low latency)"]
@@ -751,7 +751,7 @@ flowchart LR
 
 Returns a `QueueObject`.
 
-**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). After a full Phase 1 it is a cache-hit no-op (one Redis GET); after a flat one it **is** the stream extraction, single-flighted with the playback loop's own resolve of the same song, and it runs a full extraction for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`, joined through `_start_stream_warm` so a warm yt_source already started is shared rather than repeated — see [Warming the stream cache](#warming-the-stream-cache)), and back-fills the live `QueueObject`'s `duration`/`uploader`/`thumbnail` via `_enrich_queueobject` so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
+**Phase 1b** (`YTDL.prefetch_stream`): Fire-and-forget task spawned by `queue_put` (single tracks only). After a full Phase 1 it is a cache-hit no-op (one Redis GET); after a flat one it **is** the stream extraction, single-flighted with the playback loop's own resolve of the same song, and it runs a full extraction for bare `QueueObject`s that skipped the unified path (playlist entries, requeues). On extraction it strips the yt-dlp payload to `_STREAM_CACHE_FIELDS` (16 fields) before caching (via the shared `_probe_and_cache`, joined through `_start_stream_warm` so a warm yt_source already started is shared rather than repeated — see [Warming the stream cache](#warming-the-stream-cache)), and hands the item back with `duration`/`uploader`/`thumbnail` back-filled (`_enrich_queueobject` returns a `replace()` copy), which `_warm_stream` swaps into the queue's slot for it (`GuildQueue.replace_item`) so queue embeds/ETA improve as prefetches land. Errors are logged and swallowed — Phase 2 recovers by extracting fresh.
 
 **Phase 2** (`YTDL.yt_stream`): Called just before playback. Cache hit → construct `YTDL` with no yt-dlp call; miss → extract and cache.
 

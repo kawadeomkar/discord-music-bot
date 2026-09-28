@@ -58,6 +58,7 @@ from tests.helpers import (
     in_authors_channel,
     no_typing,
     mock_mp,
+    passthrough_prefetch,
     queue_object,
     stub_requester,
     stub_yt_playlist,
@@ -1283,8 +1284,10 @@ class TestEnqueuePlaylist:
         resolves at dequeue — and prefetch_stream reads a webpage_url it has not
         got, which would raise AFTER the tracks are already queued."""
         head = unresolved("song one")
-        with patch.object(YTDL, "prefetch_stream", new=AsyncMock()) as warm:
-            await play_pipeline._warm_front_track([head], Placement.NEXT, cog=music_bot)
+        with patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()) as warm:
+            await play_pipeline._warm_front_track(
+                [head], Placement.NEXT, mp=mock_mp(), cog=music_bot
+            )
         warm.assert_not_awaited()
 
     @pytest.mark.parametrize("placement", list(Placement))

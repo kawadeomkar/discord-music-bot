@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 from collections.abc import AsyncIterator, Coroutine
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +19,7 @@ from src.musicbot import MusicBot
 from src.play_placement import ResolveWaitExpired
 from src.commands import play as play_cmd
 from src.recovery import abandon_cold_start
-from src.guild_queue import RemoveMode, RemoveOutcome
+from src.guild_queue import GuildQueue, RemoveMode, RemoveOutcome
 from src.play_placement import (
     PLACE_TIMEOUT_SECS,
     PlaceResult,
@@ -55,10 +56,12 @@ from tests.helpers import (
     mock_mp,
     no_slow_notice,
     no_typing,
+    passthrough_prefetch,
     paused_vc,
     playing_vc,
     queue_object,
     recording_span,
+    seed_queue,
     settle,
     song,
     stalled_config_reads,
@@ -481,7 +484,7 @@ class TestPlayWhilePaused:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
@@ -510,7 +513,7 @@ class TestPlayWhilePaused:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
@@ -590,9 +593,9 @@ class TestPlayWhilePaused:
         )
         play_pipeline.queue_source = AsyncMock(return_value=qobj)
 
-        async def _resolve_then_resume(*a: Any, **kw: Any) -> bool:
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> Any:
             vc.is_paused.return_value = False  # user hit -resume mid-extraction
-            return True
+            return a[0]
 
         with (
             no_typing("src.commands.play.background_typing"),
@@ -666,7 +669,7 @@ class TestPlayWhilePaused:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
             patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
@@ -1106,7 +1109,7 @@ class TestPlayFrontInsertion:
             webpage_url="https://yt.com/v=new", title="New Song", requester=mock_author
         )
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("src.youtube.YTDL.prefetch_stream", new=AsyncMock()):
+        with patch("src.youtube.YTDL.prefetch_stream", new=passthrough_prefetch()):
             await play_pipeline.enqueue_single(
                 mock_ctx,
                 qobj,
@@ -1834,7 +1837,7 @@ class TestNowFlag:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
             patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(
@@ -1873,7 +1876,7 @@ class TestNowFlag:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
             patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(
@@ -1993,6 +1996,34 @@ class TestNowFlag:
         live_mp.interject.assert_not_awaited()
         mock_ctx.send.assert_awaited()  # error embed
 
+    async def test_interject_receives_the_head_the_warm_handed_back(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """prefetch_stream hands the head back with its embed fields back-filled;
+        interject() must get that copy, or the card shows the bare ask."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=x", title="Urgent", requester=mock_ctx.author
+        )
+        play_pipeline.queue_source = AsyncMock(return_value=qobj)
+        prefetch = AsyncMock(
+            side_effect=lambda qo, *, redis=None: dataclasses.replace(
+                qo, duration=180, uploader="Chan"
+            )
+        )
+
+        with patch("src.play_pipeline.YTDL.prefetch_stream", new=prefetch):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
+
+        assert live_mp.interject.await_args is not None
+        head = live_mp.interject.await_args.args[0]
+        assert (head.duration, head.uploader, head.interjected) == (180, "Chan", True)
+
     async def test_warms_stream_cache_before_interjecting(
         self,
         music_bot: MusicBot,
@@ -2014,7 +2045,7 @@ class TestNowFlag:
 
         order: list[str] = []
         prefetch = AsyncMock(
-            side_effect=lambda *a, **k: order.append("prefetch") or True
+            side_effect=lambda *a, **k: order.append("prefetch") or a[0]
         )
         outcome = InterjectOutcome(
             interrupted_title="Original Song",
@@ -2074,7 +2105,7 @@ class TestNowFlag:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
@@ -2179,7 +2210,7 @@ class TestNowFlag:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(
                 music_bot, mock_ctx, url="--next test"
@@ -2341,9 +2372,9 @@ class TestPlacementInsertsAndConfirmations:
         mock_ctx.message.add_reaction = AsyncMock()
         url = "https://www.youtube.com/playlist?list=PLabc"
 
-        async def _resolve_then_resume(*a: Any, **kw: Any) -> bool:
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> Any:
             vc.is_paused.return_value = False  # user hit -resume mid-extraction
-            return True
+            return a[0]
 
         with (
             no_typing("src.commands.play.background_typing"),
@@ -2399,9 +2430,9 @@ class TestPlacementInsertsAndConfirmations:
             stopped.extend(music_bot._plays.inflight(play_key(mock_ctx), "remove"))
             await append(*args, **kwargs)
 
-        async def _resolve_then_resume(*a: Any, **kw: Any) -> bool:
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> Any:
             vc.is_paused.return_value = False
-            return True
+            return a[0]
 
         with (
             no_typing("src.commands.play.background_typing"),
@@ -2448,9 +2479,9 @@ class TestPlacementInsertsAndConfirmations:
         ]
         mock_ctx.message.add_reaction = AsyncMock()
 
-        async def _resolve_then_resume(*a: Any, **kw: Any) -> bool:
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> Any:
             vc.is_paused.return_value = False
-            return True
+            return a[0]
 
         with (
             no_typing("src.commands.play.background_typing"),
@@ -2504,7 +2535,7 @@ class TestPlacementInsertsAndConfirmations:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
             patch.object(YTDL, "yt_playlist", new=stub_yt_playlist(tracks)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
@@ -2605,6 +2636,88 @@ class TestPlacementInsertsAndConfirmations:
         # Said, not implied: "Queued playlist" alone reads as "at the back".
         assert "plays next" in mock_ctx.send.call_args.kwargs["embed"].title
 
+    async def test_the_front_warm_puts_its_back_fill_into_the_queue(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The head is queued before the warm runs, so what the warm learned goes
+        into the queue's slot for it rather than onto an object nothing holds.
+        Driven through a REAL queue: replace_item matches by identity, and the
+        rebase put copies in, so a warm handed the pre-rebase list swaps nothing
+        and a mocked queue would take the miss without a word."""
+        tracks = [
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Track {i}",
+                requester=mock_ctx.author,
+            )
+            for i in range(2)
+        ]
+        source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
+        mp = mock_mp()
+        queue = GuildQueue(MagicMock(spec=discord.Guild), None)
+        mp.queue = queue
+        mp.queue_put_next = AsyncMock(
+            side_effect=lambda items, **_: seed_queue(queue, *items)
+        )
+        mock_ctx.message.add_reaction = AsyncMock()
+        filled = dataclasses.replace(tracks[0], duration=180)
+
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=filled)):
+            await play_pipeline.enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedPlaylist(tracks=tracks),
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                placement=Placement.NEXT,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                cog=music_bot,
+            )
+
+        assert queue.display_items()[0] is filled
+        assert tracks[0].duration is None, "the caller's object was written"
+
+    async def test_a_front_warm_that_produced_nothing_leaves_the_slot_alone(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """prefetch_stream answers None when an extraction was attempted and
+        produced nothing — there is no back-fill to swap in. Swapping anyway puts
+        that None in the queue, where the head is what the loop plays next."""
+        tracks = [
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"Track {i}",
+                requester=mock_ctx.author,
+            )
+            for i in range(2)
+        ]
+        source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
+        mp = mock_mp()
+        queue = GuildQueue(MagicMock(spec=discord.Guild), None)
+        mp.queue = queue
+        mp.queue_put_next = AsyncMock(
+            side_effect=lambda items, **_: seed_queue(queue, *items)
+        )
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=None)):
+            await play_pipeline.enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedPlaylist(tracks=tracks),
+                mp,
+                admit(music_bot, mock_ctx, mp),
+                placement=Placement.NEXT,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                cog=music_bot,
+            )
+
+        head = queue.display_items()[0]
+        assert isinstance(head, QueueObject)
+        assert head.webpage_url == tracks[0].webpage_url
+
     @pytest.mark.parametrize(
         "placement,warmed",
         [
@@ -2636,7 +2749,7 @@ class TestPlacementInsertsAndConfirmations:
         mp = mock_mp()
         mock_ctx.message.add_reaction = AsyncMock()
 
-        with patch.object(YTDL, "prefetch_stream", new=AsyncMock()) as warm:
+        with patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()) as warm:
             await play_pipeline.enqueue_playlist(
                 mock_ctx,
                 source,
@@ -3310,7 +3423,7 @@ class TestResolveThenPlace:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             collection = asyncio.create_task(
                 command_callback(MusicBot.play)(music_bot, mock_ctx, url="list")
@@ -3931,7 +4044,7 @@ class TestPlaceRefuses:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
@@ -3981,7 +4094,7 @@ class TestPlaceRefuses:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
             patch("src.play_placement.PLACE_TIMEOUT_SECS", 0.01),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now x")
@@ -4541,7 +4654,7 @@ class TestPlacementRevalidationCarriesDispatch:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(
                 music_bot, mock_ctx, url="--next test"
@@ -4598,7 +4711,7 @@ class TestTheInterjectionHeadMustBePlayable:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=False)),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=None)),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
@@ -4628,7 +4741,7 @@ class TestTheInterjectionHeadMustBePlayable:
         with (
             no_typing("src.commands.play.background_typing"),
             no_slow_notice("src.commands.play.slow_resolve_notice"),
-            patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=True)),
+            patch.object(YTDL, "prefetch_stream", new=passthrough_prefetch()),
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
@@ -5380,7 +5493,7 @@ class TestQueueProgressCard:
             patch("src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=qobj)),
             patch(
                 "src.play_pipeline.YTDL.prefetch_stream",
-                new=AsyncMock(return_value=True),
+                new=passthrough_prefetch(),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -5776,7 +5889,7 @@ class TestQueueProgressCard:
             ),
             patch(
                 "src.play_pipeline.YTDL.prefetch_stream",
-                new=AsyncMock(return_value=True),
+                new=passthrough_prefetch(),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -5945,7 +6058,7 @@ class TestQueueProgressCard:
             ),
             patch(
                 "src.play_pipeline.YTDL.prefetch_stream",
-                new=AsyncMock(return_value=True),
+                new=passthrough_prefetch(),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -6009,7 +6122,7 @@ class TestQueueProgressCard:
             ),
             patch(
                 "src.play_pipeline.YTDL.prefetch_stream",
-                new=AsyncMock(return_value=True),
+                new=passthrough_prefetch(),
             ),
         ):
             await command_callback(MusicBot.play)(
@@ -6360,7 +6473,7 @@ class TestAnInterjectedOffsetIsSettledBeforeTheInterrupt:
                 duration=60,
             )
         )
-        prefetch = AsyncMock(return_value=True)
+        prefetch = passthrough_prefetch()
 
         await self._run(music_bot, mock_ctx, "-ts 99:00 test", prefetch=prefetch)
 
@@ -6418,7 +6531,7 @@ class TestAnInterjectedOffsetIsSettledBeforeTheInterrupt:
         )
 
         await self._run(
-            music_bot, mock_ctx, "-ts 1:32 test", prefetch=AsyncMock(return_value=True)
+            music_bot, mock_ctx, "-ts 1:32 test", prefetch=passthrough_prefetch()
         )
 
         resolve = play_pipeline.queue_source.await_args

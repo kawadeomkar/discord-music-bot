@@ -1030,7 +1030,13 @@ class MusicPlayer:
         if self.store is None:
             return
         async with prefetch_warm_slot():
-            await YTDL.prefetch_stream(item, redis=self.store.redis)
+            warmed = await YTDL.prefetch_stream(item, redis=self.store.redis)
+        if warmed is not None:
+            # The back-fill goes into the queue's slot for the item; a card already
+            # rendered from the old object shows it when it next re-renders. A
+            # refused swap means the item left the queue, and what it drops is
+            # display fields the play-time resolve derives again.
+            self.queue.replace_item(item, warmed)
 
     async def queue_put_front(
         self,
@@ -2546,6 +2552,13 @@ class MusicPlayer:
             # resolve decides.
             song = await self._stream_source(source, allow_reextract=False)
         except asyncio.CancelledError:
+            held = self.queue.claimed_head()
+            if source is claimed and held is not None:
+                # A warm swapped the slot for a back-filled copy while this ran,
+                # and the slot's object is the one to give back. Only an
+                # unresolved item resolves here and only a resolved one is
+                # warmed, so a resolve to hand back rules the swap out.
+                source = held
             self.queue.requeue_front(source)
             raise
         except Exception as e:

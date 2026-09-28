@@ -537,17 +537,25 @@ def front_insert_depth(mp: MusicPlayer) -> int:
 
 @_tracer.start_as_current_span("bot.warm_front_track")
 async def _warm_front_track(
-    tracks: Sequence[QueueObject], placement: Placement, *, cog: MusicBot
+    tracks: Sequence[QueueObject],
+    placement: Placement,
+    *,
+    mp: MusicPlayer,
+    cog: MusicBot,
 ) -> None:
     """Warm the stream URL of a playlist's head when it is about to play. Bulk
     enqueues pass prefetch=False, and under `--next` queue_put_next killed the
     loop's one-ahead prefetch, so the head is left with no warm at all. An item
-    that has not resolved has no URL yet; it resolves at dequeue."""
+    that has not resolved has no URL yet; it resolves at dequeue. The head is
+    queued already, so what the warm back-fills goes into its slot — or nowhere,
+    when it has left the queue, and only display fields go with it."""
     if placement is not Placement.NEXT or not tracks:
         return
     head = tracks[0]
     if not head.unresolved:
-        await YTDL.prefetch_stream(head, redis=cog.redis)
+        warmed = await YTDL.prefetch_stream(head, redis=cog.redis)
+        if warmed is not None:
+            mp.queue.replace_item(head, warmed)
 
 
 def playing_next_embed(
@@ -773,7 +781,7 @@ async def enqueue_playlist(
         )
     await asyncio.gather(
         _reply(ctx, embeds, together=True),
-        _warm_front_track(tracks, placement, cog=cog),
+        _warm_front_track(tracks, placement, mp=mp, cog=cog),
     )
 
 
@@ -1061,12 +1069,15 @@ async def interject_flow(
         # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
         # the interrupt and the new song, and the current song plays through the wait.
         # A gate, not a hint — this flow stops what is playing, so a head that could
-        # not be extracted must not get that far. Also back-fills the embed fields.
-        if not await YTDL.prefetch_stream(qobj, redis=cog.redis):
+        # not be extracted must not get that far. Hands the head back with its embed
+        # fields back-filled.
+        warmed = await YTDL.prefetch_stream(qobj, redis=cog.redis)
+        if warmed is None:
             raise RuntimeError(
                 "Could not get a playable stream for that song, so the current "
                 "song was left alone."
             )
+        qobj = warmed
 
         # Before the lock: the neutralize can wait on a prefetch pinned in the
         # yt-dlp executor, which under _place would hold the guild's lock.
