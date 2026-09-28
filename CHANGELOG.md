@@ -17,6 +17,26 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.53.7 — 2026-09-26
+
+**This build can read a queue entry the next one writes.** Nothing changes in chat, and
+nothing this build writes to Redis changes. A queued song entry may now carry the search
+term of a collection track that has not resolved yet; this build reads that entry back and
+restores the track as still-to-resolve, while it keeps writing such tracks in the shape
+earlier builds read.
+
+- **Deploy this before the release that stops writing the old shape.** That release says
+  so in its own section; with this one running underneath it, rolling it back lands on a
+  build that can still play every queued track.
+- **Coming back down to this build rewrites a queue list once.** Every track the newer
+  build queued still plays, but this build writes those tracks in the old shape again,
+  so the first `-remove` in a server holding one rewrites that server's whole queue
+  list instead of deleting out of it, and logs `queue mirror diverged from memory in
+  guild …` at WARNING when it does — expected here, not damage. (`-clear` deletes the
+  list outright, so it never matches bytes and never pays this.) Once per server,
+  nothing is lost, and there is nothing to do about it.
+- **Roll back freely.** No entry this build writes is new to the build before it.
+
 ## 2.53.4 — 2026-09-26
 
 **Crash recovery keeps the flags of the song that was actually playing.** The parked entry's

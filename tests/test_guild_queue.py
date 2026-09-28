@@ -2249,12 +2249,69 @@ class TestRestoreEntries:
             "",
         )
 
+    async def test_a_song_entry_carrying_a_search_rehydrates_unresolved(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """A "qobj" entry with a search term comes back as an item nothing may
+        stream yet, its display fields intact; without the term it would look
+        resolved with no URL to stream. Its own re-serialization still takes
+        the "ytsource" shape, which is what every build before this one reads."""
+        mock_guild.get_member.return_value = mock_author
+        written = SongQueueEntry(
+            webpage_url="https://open.spotify.com/track/abc",
+            title="DNA.",
+            requester_id=mock_author.id,
+            duration=185,
+            uploader="Kendrick Lamar",
+            search="ytsearch:DNA. Kendrick Lamar",
+        ).to_redis()
+        entry = parse_queue_entry(written)
+        assert isinstance(entry, SongQueueEntry)
+        assert await gq.restore_entries([entry]) == 1
+        item = gq.display_items()[0]
+        assert item.unresolved
+        assert (item.search, item.title, item.webpage_url, item.duration) == (
+            "ytsearch:DNA. Kendrick Lamar",
+            "DNA.",
+            "https://open.spotify.com/track/abc",
+            185,
+        )
+        assert isinstance(_to_entry(item), SearchQueueEntry)
+
+    async def test_a_term_only_song_entry_comes_back_labelled_by_its_term(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The other shape the term can arrive in: a track the walk named no row
+        for, so the display fields are empty and the term is all there is. It
+        proves the paths that read an unresolved item off this entry —
+        `unresolved`, item_label's term leg, and _to_entry's "ytsource" shape.
+
+        It does not reach the fields only a "qobj" entry can carry alongside a
+        term — thumbnail, the interjection flags, played_at and the np_* trio.
+        Nothing sets those on an item that has not resolved.
+        """
+        mock_guild.get_member.return_value = mock_author
+        written = SongQueueEntry(
+            webpage_url="",
+            title="",
+            requester_id=mock_author.id,
+            search="ytsearch:mystery track",
+        ).to_redis()
+        entry = parse_queue_entry(written)
+        assert isinstance(entry, SongQueueEntry)
+        assert await gq.restore_entries([entry]) == 1
+        item = gq.display_items()[0]
+        assert item.unresolved
+        assert item_label(item) == "mystery track"
+        assert isinstance(_to_entry(item), SearchQueueEntry)
+
 
 class TestARestoredSearchReSerializesToItself:
     """Every LREM and every mirror rebuild re-serializes a restored item, and a
     byte that differs there misses the entry the list holds. A live item carries
-    no "absent": two shapes an older build could have written settle on other
-    bytes the first time this one rewrites them, and on those bytes after."""
+    no "absent" and no "qobj" for an unresolved track: two shapes an older build
+    could have written and one a later build writes settle on other bytes the
+    first time this one rewrites them, and on those bytes after."""
 
     @staticmethod
     async def _settle(gq: GuildQueue, written: bytes) -> tuple[bytes, bytes]:
@@ -2307,6 +2364,30 @@ class TestARestoredSearchReSerializesToItself:
 
         assert b'"requester_id"' not in written
         assert f'"requester_id":{owner.id}'.encode() in first
+        assert second == first
+
+    async def test_a_song_entry_carrying_a_term_settles_as_a_search(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The one restored shape that does not re-serialize to itself: a track
+        a later build queued as "qobj" with its term. This build rewrites it as
+        the "ytsource" it writes for an unresolved track, so the first LREM
+        touching one misses and the list is rebuilt — once, because the second
+        pass holds the bytes the first settled on."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        written = SongQueueEntry(
+            webpage_url="https://open.spotify.com/track/abc",
+            title="DNA.",
+            requester_id=mock_author.id,
+            duration=185,
+            uploader="Kendrick Lamar",
+            search="ytsearch:DNA. Kendrick Lamar",
+        ).to_redis()
+
+        first, second = await self._settle(gq, written)
+
+        assert written.startswith(b'{"type":"qobj"')
+        assert first.startswith(b'{"type":"ytsource"')
         assert second == first
 
     async def test_what_a_walk_writes_today_survives_untouched(
