@@ -2802,11 +2802,11 @@ class TestConfigDomain:
     def test_bounds_are_inclusive_and_nan_is_refused(
         self, value: float, admitted: bool
     ) -> None:
-        assert ConfigDomain(4.0, 60.0).admits(value) is admitted
+        assert ConfigDomain(lo=4.0, hi=60.0).admits(value) is admitted
 
     def test_off_is_admitted_only_where_the_domain_says_so(self) -> None:
-        assert ConfigDomain(4.0, 60.0, off=True).admits(OFF_SECS)
-        assert not ConfigDomain(4.0, 60.0).admits(OFF_SECS)
+        assert ConfigDomain(lo=4.0, hi=60.0, off=True).admits(OFF_SECS)
+        assert not ConfigDomain(lo=4.0, hi=60.0).admits(OFF_SECS)
 
     def test_every_numeric_config_field_has_a_domain(self) -> None:
         numeric = members(ConfigField) - {ConfigField.DEBUG_MODE, ConfigField.TIMEZONE}
