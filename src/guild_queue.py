@@ -136,12 +136,10 @@ class RemoveOutcome:
     mode: Optional[RemoveMode] = None
 
 
-def _to_entry(item: QueueObject) -> QueueEntry:
-    """Live queue item → at-rest entry for the Redis mirror. An item still
-    waiting to resolve keeps the `"ytsource"` shape it has always had on the
-    wire, so a rollback can still read the list."""
-    if item.unresolved:
-        return SearchQueueEntry.from_queue_object(item)
+def _to_entry(item: QueueObject) -> SongQueueEntry:
+    """Live queue item → at-rest entry for the Redis mirror. One shape for every
+    item: one still waiting to resolve writes its term under `ytsearch` and is
+    restored unresolved. See docs/ARCHITECTURE.md#one-queue-item."""
     return SongQueueEntry.from_queue_object(item)
 
 
@@ -214,7 +212,7 @@ class GuildQueue:
         # The entry the list holds for an item requeue_front() or replace_item()
         # swapped in, which serializes differently from it. Keyed by id() and
         # holding the item, so the id cannot be reused while the record lives.
-        self._listed: dict[int, tuple[QueueObject, QueueEntry]] = {}
+        self._listed: dict[int, tuple[QueueObject, SongQueueEntry]] = {}
         # The objects mirror_entries() serialized for the song start's rebuild,
         # so note_mirror_write drops the records of exactly those once that write
         # lands. Replaced by the next mirror_entries().
@@ -681,7 +679,7 @@ class GuildQueue:
         elif retired:
             self._mirror_dirty = True
 
-    def mirror_entries(self) -> list[QueueEntry]:
+    def mirror_entries(self) -> list[SongQueueEntry]:
         """The persisted subset of the deque, claimed prefix included, in order —
         what a rebuild writes: each live object's own serialization. The objects
         are held for note_mirror_write, which answers for exactly these."""
@@ -765,7 +763,7 @@ class GuildQueue:
         inserted, and two entries for one song compare equal."""
         return any(held is item for held in self._items)
 
-    def _mirror_entry(self, item: QueueObject) -> QueueEntry:
+    def _mirror_entry(self, item: QueueObject) -> SongQueueEntry:
         """The entry the list holds for `item`: its own serialization, or, for an
         item requeue_front() or replace_item() swapped in, the entry of what it
         replaced. Every write that must match the list byte for byte (an LREM, the

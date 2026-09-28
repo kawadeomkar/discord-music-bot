@@ -316,13 +316,14 @@ class TestQueuePut:
     async def test_put_mirrors_an_unresolved_item_to_redis(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
+        # Same entry shape as a resolved song, with the term it still owes.
         assert music_player.store is not None
         src = unresolved("Never Gonna Give You Up")
         await music_player.queue_put(src)
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
         data = orjson.loads(items[0])
-        assert data["type"] == "ytsource"
+        assert data["type"] == "qobj"
         assert data["ytsearch"] == "ytsearch:Never Gonna Give You Up"
 
     async def test_put_does_not_warm_an_unresolved_item(

@@ -489,21 +489,18 @@ needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
 crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
 back `None` on the one song that was playing).
 
-**An UNRESOLVED item takes the same checklist**, with one step of its own: a collection's
-tracks wait as `QueueObject`s with `search` set, carrying whatever the walk named them
+**An UNRESOLVED item takes the same checklist**, and nothing more: a collection's tracks
+wait as `QueueObject`s with `search` set, carrying whatever the walk named them
 (`webpage_url` the track's own page, `title` the row's name — both empty only when the
-walk sent no rows). `SongQueueEntry` carries `search` (as `ytsearch`, written only when
-non-empty) and `_rehydrate` restores it, but `_to_entry` still serializes these items
-as `"ytsource"` entries so a rollback can read the list. So a field that an unresolved
-item must carry needs the `SearchQueueEntry` leg of `to_redis` too, written **only when
-the value is not None**,
-never as a flat table entry.
-That when-known write keeps an entry queued by the previous build byte-identical, and
-LREM matches these entries by their exact bytes: write the key unconditionally and every
-`-remove` and `-clear` misses on every entry already in Redis, each one then rewriting the
-whole list under the bulk mutex. Pin it with a golden-bytes test beside `_GOLDEN_YTSOURCE`.
-The leg goes when `_to_entry` stops writing `"ytsource"`; `SearchQueueEntry` itself stays
-until no restore still meets an entry of that shape.
+walk sent no rows), and `_to_entry` writes
+them as the one `SongQueueEntry` shape every other item takes. `search` rides it as
+`ytsearch`, written **only when non-empty** — a resolved entry's bytes never move, and
+LREM matches these entries by their exact bytes, so a key written unconditionally would
+make every `-remove` and `-clear` miss on every entry already in Redis, each one then
+rewriting the whole list under the bulk mutex. Pin any such when-known key with a
+golden-bytes test beside `_GOLDEN_QOBJ_SEARCH`.
+`SearchQueueEntry` is the read-only `"ytsource"` shape of entries builds before 2.54.0
+wrote, and stays until no restore still meets one.
 
 **Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
 the loop() bookkeeping comments first; every claim, release, and Redis

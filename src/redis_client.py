@@ -43,7 +43,6 @@ from src.guild_state import (
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
-    QueueEntry,
     ResettableConfigField,
     SongQueueEntry,
     StateField,
@@ -849,7 +848,7 @@ class GuildRedisStore:
     # Queue operations
 
     @_guild_op(default=False)
-    async def push_queue(self, entry: QueueEntry) -> bool:
+    async def push_queue(self, entry: SongQueueEntry) -> bool:
         """RPUSH one queue entry and refresh TTL on all guild keys. Reports whether
         it landed: the failure is swallowed here, and the caller has no other way to
         learn its mirror is now short of the deque."""
@@ -860,7 +859,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> bool:
+    async def push_queue_batch(self, entries: Sequence[SongQueueEntry]) -> bool:
         """RPUSH all entries in one round-trip and refresh TTL on all guild keys.
         Reports whether it landed, like push_queue; nothing to write is a landed
         write, since the mirror already agrees with the deque."""
@@ -873,7 +872,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> bool:
+    async def push_queue_front(self, entries: Sequence[SongQueueEntry]) -> bool:
         """LPUSH entries so entries[0] ends up at the queue head — the interjection
         front insert; reversed first because LPUSH sends each successive
         argument to the head. A swallowed failure here leaves memory
@@ -988,7 +987,7 @@ class GuildRedisStore:
     async def rebuild_queue_and_start_song(
         self,
         current: SongQueueEntry,
-        entries: Sequence[QueueEntry],
+        entries: Sequence[SongQueueEntry],
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
         start_offset: float = 0.0,
@@ -1030,7 +1029,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> bool:
+    async def rebuild_queue(self, entries: Sequence[SongQueueEntry]) -> bool:
         """DELETE + RPUSH all entries in one MULTI, so a concurrent LPOP never
         sees an empty window. Returns whether it landed."""
         pipe = self.redis.pipeline(transaction=True)
@@ -1041,7 +1040,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=0)
-    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
+    async def remove_queue_entries(self, entries: Sequence[SongQueueEntry]) -> int:
         """LREM the given entries out of the list, leaving the rest in place.
         Returns HOW MANY were removed — the caller must check it: LREM matches
         exact serialized bytes, so an entry the list no longer holds in that form

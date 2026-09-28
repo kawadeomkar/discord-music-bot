@@ -7,6 +7,7 @@ in memory only, by design, so the mirror is a subset rather than a copy."""
 import redis.asyncio as aioredis
 from dataclasses import replace
 from typing import Any
+import dataclasses
 import asyncio
 import contextlib
 import logging
@@ -260,15 +261,18 @@ class TestPut:
         assert len(redis_items) == 2
         await _assert_mirror_matches(gq, fake_redis, store)
 
-    async def test_unresolved_items_persist_as_search_entries(
+    async def test_unresolved_items_persist_as_song_entries(
         self, gq: GuildQueue, fake_redis: aioredis.Redis, store: GuildRedisStore
     ) -> None:
+        """One shape for every item: a track still waiting to resolve is written
+        as a "qobj" entry carrying its term under `ytsearch`."""
         src = unresolved("some song")
         await gq.put([src], batch=True)
+        expected = SongQueueEntry.from_queue_object(src).to_redis()
+        assert expected.startswith(b'{"type":"qobj"')
+        assert b'"ytsearch":"ytsearch:some song"' in expected
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert parse_queue_entry(redis_items[0]) == SearchQueueEntry.from_queue_object(
-            src
-        )
+        assert redis_items == [expected]
 
     async def test_in_memory_before_redis(
         self, mock_guild: MagicMock, store: GuildRedisStore, mock_author: MagicMock
@@ -1901,7 +1905,7 @@ class TestRestoreEntries:
         entry = SearchQueueEntry(
             ytsearch="ytsearch:abc", requester_id=424242424242424242
         )
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
         assert gq.display_items()[0].requester is left_the_guild
 
     async def test_a_search_entry_without_a_requester_is_kept(
@@ -1992,7 +1996,7 @@ class TestRestoreEntries:
             duration=185,
             webpage_url="https://open.spotify.com/track/abc",
         )
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
 
         (item,) = gq.display_items()
         assert (item.title, item.uploader, item.duration, item.webpage_url) == (
@@ -2007,10 +2011,13 @@ class TestRestoreEntries:
     ) -> None:
         """_rehydrate's search leg is the one field list built keyword by
         keyword: the resolved leg's neighbours are replace() copies of an item
-        that already holds every field. Comparing entries rather than naming
-        fields covers all thirteen at once — dropping `query_source` archives
-        every restored Spotify-collection track as youtube.com, and only the
-        write side of that field has a test."""
+        that already holds every field. Every field the entry names is checked
+        against where it lands, and the set assertion fails on a field added to
+        the entry — dropping `query_source` archives every restored
+        Spotify-collection track as youtube.com, and only the write side of
+        that field has a test. `process` and `url` name nothing on a live item;
+        the term arrives under `search`, and the two analytics values under
+        `analytics`."""
         requester = stub_requester(424242424242424242)
         mock_guild.get_member = MagicMock(return_value=requester)
         entry = SearchQueueEntry(
@@ -2028,10 +2035,26 @@ class TestRestoreEntries:
             webpage_url="https://open.spotify.com/track/xyz",
         )
 
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
 
         (item,) = gq.display_items()
-        assert SearchQueueEntry.from_queue_object(item) == entry
+        landed = {
+            "ytsearch": item.search,
+            "ts": item.ts,
+            "user_input": item.user_input,
+            "queued_at": item.analytics.queued_at,
+            "queue_position": item.analytics.queue_position,
+            "query_source": item.query_source,
+            "requester_id": item.requester.id,
+            "title": item.title,
+            "uploader": item.uploader,
+            "duration": item.duration,
+            "webpage_url": item.webpage_url,
+        }
+        assert set(landed) | {"process", "url"} == {
+            f.name for f in dataclasses.fields(entry)
+        }
+        assert landed == {name: getattr(entry, name) for name in landed}
 
     async def test_departed_member_falls_back_to_owner(
         self, gq: GuildQueue, mock_guild: MagicMock
@@ -2174,7 +2197,7 @@ class TestRestoreEntries:
             is_resume=True,
             start_paused=True,
         )
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
         item = gq.display_items()[0]
         assert isinstance(item, QueueObject)
         assert item.is_resume is True
@@ -2196,7 +2219,7 @@ class TestRestoreEntries:
             requester_id=mock_author.id,
             user_input=typed,
         )
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
 
         (restored,) = gq.display_items()
         assert isinstance(restored, QueueObject)
@@ -2269,8 +2292,7 @@ class TestRestoreEntries:
     ) -> None:
         """A "qobj" entry with a search term comes back as an item nothing may
         stream yet, its display fields intact; without the term it would look
-        resolved with no URL to stream. Its own re-serialization still takes
-        the "ytsource" shape, which is what every build before this one reads."""
+        resolved with no URL to stream. It re-serializes as the same shape."""
         mock_guild.get_member.return_value = mock_author
         written = SongQueueEntry(
             webpage_url="https://open.spotify.com/track/abc",
@@ -2282,7 +2304,7 @@ class TestRestoreEntries:
         ).to_redis()
         entry = parse_queue_entry(written)
         assert isinstance(entry, SongQueueEntry)
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
         item = gq.display_items()[0]
         assert item.unresolved
         assert (item.search, item.title, item.webpage_url, item.duration) == (
@@ -2291,7 +2313,9 @@ class TestRestoreEntries:
             "https://open.spotify.com/track/abc",
             185,
         )
-        assert isinstance(_to_entry(item), SearchQueueEntry)
+        rewritten = _to_entry(item)
+        assert isinstance(rewritten, SongQueueEntry)
+        assert rewritten.search == "ytsearch:DNA. Kendrick Lamar"
 
     async def test_a_term_only_song_entry_comes_back_labelled_by_its_term(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
@@ -2299,7 +2323,7 @@ class TestRestoreEntries:
         """The other shape the term can arrive in: a track the walk named no row
         for, so the display fields are empty and the term is all there is. It
         proves the paths that read an unresolved item off this entry —
-        `unresolved`, item_label's term leg, and _to_entry's "ytsource" shape.
+        `unresolved`, item_label's term leg, and the term _to_entry writes back.
 
         It does not reach the fields only a "qobj" entry can carry alongside a
         term — thumbnail, the interjection flags, played_at and the np_* trio.
@@ -2314,19 +2338,52 @@ class TestRestoreEntries:
         ).to_redis()
         entry = parse_queue_entry(written)
         assert isinstance(entry, SongQueueEntry)
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
         item = gq.display_items()[0]
         assert item.unresolved
         assert item_label(item) == "mystery track"
-        assert isinstance(_to_entry(item), SearchQueueEntry)
+        rewritten = _to_entry(item)
+        assert isinstance(rewritten, SongQueueEntry)
+        assert rewritten.search == "ytsearch:mystery track"
 
+
+# What builds before 2.54.0 left on a queue list for a track still resolving.
+# Byte literals, as the goldens in test_guild_state are: the bytes are what LREM
+# matches, and an entry rewritten from one has to be compared against them.
+_OLD_SHAPE_BARE = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:x","url":null,"process":true,'
+    b'"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
+    b'"query_source":"","requester_id":222222222222222222}'
+)
+_OLD_SHAPE_NO_REQUESTER = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:x","url":null,"process":true,'
+    b'"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
+    b'"query_source":""}'
+)
+_OLD_SHAPE_EMPTY_DISPLAY = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:x","url":null,"process":true,'
+    b'"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
+    b'"query_source":"","requester_id":222222222222222222,"title":"",'
+    b'"webpage_url":""}'
+)
+# The same track in the shape this build writes, requester 222222222222222222 —
+# tests/conftest.py's mock_author, whom every restore below resolves to.
+_NEW_SHAPE_SEARCH = (
+    b'{"type":"qobj","webpage_url":"https://open.spotify.com/track/abc",'
+    b'"title":"DNA.","requester_id":222222222222222222,"ts":null,'
+    b'"user_input":null,"duration":185,"uploader":"Kendrick Lamar",'
+    b'"thumbnail":null,"persisted":true,"interjected":false,"is_resume":false,'
+    b'"start_paused":false,"queued_at":0.0,"queue_position":0,"query_source":"",'
+    b'"played_at":0.0,"np_message_id":0,"np_channel_id":0,"np_dedicated":false,'
+    b'"ytsearch":"ytsearch:DNA. Kendrick Lamar"}'
+)
 
 class TestARestoredSearchReSerializesToItself:
     """Every LREM and every mirror rebuild re-serializes a restored item, and a
-    byte that differs there misses the entry the list holds. A live item carries
-    no "absent" and no "qobj" for an unresolved track: two shapes an older build
-    could have written and one a later build writes settle on other bytes the
-    first time this one rewrites them, and on those bytes after."""
+    byte that differs there misses the entry the list holds. A track an older
+    build queued rests in the `"ytsource"` shape and comes back in this one, so
+    its first -remove or -clear misses and rebuilds the whole list once; from
+    the bytes that rebuild writes, the entry holds still."""
 
     @staticmethod
     async def _settle(gq: GuildQueue, written: bytes) -> tuple[bytes, bytes]:
@@ -2336,31 +2393,38 @@ class TestARestoredSearchReSerializesToItself:
         for _ in range(2):
             entry = parse_queue_entry(written)
             assert entry is not None
-            assert await gq.restore_entries([entry]) == 1
+            assert (await gq.restore_entries([entry])).restored == 1
             written = _to_entry(gq.display_items()[-1]).to_redis()
             passes.append(written)
         return passes[0], passes[1]
 
-    async def test_an_empty_display_value_settles_as_no_key(
+    async def test_an_old_shape_entry_settles_as_a_song_entry(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The one rewrite: what rests as `"ytsource"` is written back as
+        `"qobj"` with the term under `ytsearch`, and holds those bytes."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+
+        first, second = await self._settle(gq, _OLD_SHAPE_BARE)
+
+        assert first.startswith(b'{"type":"qobj"')
+        assert b'"ytsearch":"ytsearch:x"' in first
+        assert first != _OLD_SHAPE_BARE
+        assert second == first
+
+    async def test_an_empty_display_value_settles_as_an_empty_one(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         """A Spotify row whose name or url is empty was written as the key with
-        an empty value; the item it rehydrates into cannot tell that from no row
-        at all, so it writes back what a no-row walk writes."""
+        an empty value; the song shape writes both unconditionally, so the empty
+        string is what it settles on."""
         mock_guild.get_member = MagicMock(return_value=mock_author)
-        written = SearchQueueEntry(
-            ytsearch="ytsearch:x",
-            process=True,
-            requester_id=mock_author.id,
-            title="",
-            webpage_url="",
-        ).to_redis()
 
-        first, second = await self._settle(gq, written)
+        first, second = await self._settle(gq, _OLD_SHAPE_EMPTY_DISPLAY)
 
-        assert b'"title"' not in first
-        assert b'"webpage_url"' not in first
-        assert first != written
+        assert b'"title":""' in first
+        assert b'"webpage_url":""' in first
+        assert first != _OLD_SHAPE_EMPTY_DISPLAY
         assert second == first
 
     async def test_an_entry_with_no_requester_settles_with_one(
@@ -2373,61 +2437,23 @@ class TestARestoredSearchReSerializesToItself:
         mock_guild.get_member = MagicMock(
             side_effect=lambda uid: owner if uid == owner.id else None
         )
-        written = SearchQueueEntry(ytsearch="ytsearch:x", process=True).to_redis()
 
-        first, second = await self._settle(gq, written)
+        first, second = await self._settle(gq, _OLD_SHAPE_NO_REQUESTER)
 
-        assert b'"requester_id"' not in written
+        assert b'"requester_id"' not in _OLD_SHAPE_NO_REQUESTER
         assert f'"requester_id":{owner.id}'.encode() in first
         assert second == first
 
-    async def test_a_song_entry_carrying_a_term_settles_as_a_search(
+    async def test_what_this_build_writes_survives_untouched(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
-        """The one restored shape that does not re-serialize to itself: a track
-        a later build queued as "qobj" with its term. This build rewrites it as
-        the "ytsource" it writes for an unresolved track, so the first LREM
-        touching one misses and the list is rebuilt — once, because the second
-        pass holds the bytes the first settled on."""
+        """The other side of the one rewrite: an entry already in the new shape
+        does not move a byte, so a restart costs no LREM its match."""
         mock_guild.get_member = MagicMock(return_value=mock_author)
-        written = SongQueueEntry(
-            webpage_url="https://open.spotify.com/track/abc",
-            title="DNA.",
-            requester_id=mock_author.id,
-            duration=185,
-            uploader="Kendrick Lamar",
-            search="ytsearch:DNA. Kendrick Lamar",
-        ).to_redis()
 
-        first, second = await self._settle(gq, written)
+        first, second = await self._settle(gq, _NEW_SHAPE_SEARCH)
 
-        assert written.startswith(b'{"type":"qobj"')
-        assert first.startswith(b'{"type":"ytsource"')
-        assert second == first
-
-    async def test_what_a_walk_writes_today_survives_untouched(
-        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
-    ) -> None:
-        """The entries the two above are the edges of: neither a named row nor an
-        unnamed one moves a byte, so a restart costs no LREM its match."""
-        mock_guild.get_member = MagicMock(return_value=mock_author)
-        for entry in (
-            SearchQueueEntry(
-                ytsearch="ytsearch:x", process=True, requester_id=mock_author.id
-            ),
-            SearchQueueEntry(
-                ytsearch="ytsearch:DNA. Kendrick Lamar",
-                process=True,
-                requester_id=mock_author.id,
-                title="DNA.",
-                uploader="Kendrick Lamar",
-                duration=185,
-                webpage_url="https://open.spotify.com/track/abc",
-            ),
-        ):
-            written = entry.to_redis()
-            first, second = await self._settle(gq, written)
-            assert (first, second) == (written, written)
+        assert (first, second) == (_NEW_SHAPE_SEARCH, _NEW_SHAPE_SEARCH)
 
 
 class TestRestoreCrashed:
@@ -3926,17 +3952,19 @@ class TestItemLabelNamesEveryItem:
     async def test_an_unresolved_link_falls_back_to_the_url(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
-        """A `"ytsource"` entry holding a url and no ytsearch — what a link queued
-        before it resolved rests as. Its search is that url, with no `ytsearch:`
-        to strip, so the -remove reply names the link rather than `?`."""
+        """A `"ytsource"` entry holding a url and no ytsearch — what a link an
+        older build queued before it resolved rests as. Its search is that url,
+        with no `ytsearch:` to strip, so the -remove reply names the link
+        rather than `?`."""
         mock_guild.get_member = MagicMock(return_value=mock_author)
         entry = parse_queue_entry(
-            SearchQueueEntry(
-                url="https://yt.com/v=2", process=True, requester_id=mock_author.id
-            ).to_redis()
+            b'{"type":"ytsource","ytsearch":null,"url":"https://yt.com/v=2",'
+            b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,'
+            b'"queue_position":0,"query_source":"",'
+            b'"requester_id":222222222222222222}'
         )
         assert entry is not None
-        assert await gq.restore_entries([entry]) == 1
+        assert (await gq.restore_entries([entry])).restored == 1
 
         assert item_label(gq.display_items()[0]) == "https://yt.com/v=2"
 

@@ -1290,7 +1290,7 @@ class QueueObject:
     @property
     def unresolved(self) -> bool:
         """True while this item is a search: nothing may stream it, and its Redis
-        entry is a `"ytsource"` one."""
+        entry carries the term under `ytsearch`."""
         return bool(self.search)
 
 

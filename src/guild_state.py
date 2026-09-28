@@ -693,15 +693,16 @@ class QueueEntryField:
     NP_MESSAGE_ID: Final[str] = "np_message_id"
     NP_CHANNEL_ID: Final[str] = "np_channel_id"
     NP_DEDICATED: Final[str] = "np_dedicated"
-    # The term an unresolved item still owes yt-dlp: on every "ytsource" entry,
-    # and on a "qobj" entry only while non-empty.
+    # The term an unresolved item still owes yt-dlp: written on a "qobj" entry
+    # while non-empty, and read off the "ytsource" entries as well.
     YTSEARCH: Final[str] = "ytsearch"
-    # "ytsource" entries
+    # "ytsource" entries, read only
     URL: Final[str] = "url"
     PROCESS: Final[str] = "process"
 
 
-# Wire discriminator values; entries written before and after stay readable.
+# Wire discriminator values. Everything is written as "qobj"; "ytsource" is the
+# shape builds before 2.54.0 gave an unresolved item, and is still read.
 _ENTRY_TYPE_SONG: Final[str] = "qobj"
 _ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 
@@ -852,10 +853,10 @@ class SongQueueEntry:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SearchQueueEntry:
-    """An unresolved search at rest ("ytsource" on the wire) — a Spotify playlist
-    track awaiting yt-dlp resolution. Holds exactly the fields that shape persists;
-    the rest default on rehydration. Still written, and read, while a rollback to
-    a build that knows only this shape is possible."""
+    """The "ytsource" shape, READ only: what builds before 2.54.0 wrote for a
+    track still awaiting yt-dlp. Nothing serializes it — parse_queue_entry
+    builds one, GuildQueue._rehydrate makes an item of it, and that item
+    re-serializes as a "qobj" entry. Fields absent from the shape default here."""
 
     ytsearch: str | None = None
     url: str | None = None
@@ -873,64 +874,12 @@ class SearchQueueEntry:
     # Who queued it. None, never 0, on an entry written before the field existed:
     # the resolve at dequeue routes None to the fallback requester.
     requester_id: int | None = None
-    # What a listing shows until the search resolves (YTSource's display fields).
+    # What a listing shows until the search resolves; absent on entries written
+    # before they existed, which read back None and render as the term.
     title: str | None = None
     uploader: str | None = None
     duration: int | None = None
     webpage_url: str | None = None
-
-    @classmethod
-    def from_queue_object(cls, item: QueueObject) -> Self:
-        """The at-rest form of an item that is still a search. `process` is the
-        True every search entry has been written with: these bytes have to match
-        what is already on the list, or an LREM misses the entry.
-
-        A live item has no "absent": it always names a requester, and an empty
-        display value is the same value as none. An entry rewritten from one
-        therefore settles on the bytes this writer gives it and holds them."""
-        return cls(
-            ytsearch=item.search,
-            process=True,
-            ts=item.ts,
-            user_input=item.user_input,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
-            query_source=item.query_source,
-            requester_id=item.requester.id,
-            # What a listing shows until the search resolves, off the same item
-            # the row is rendered from. Empty writes as no key — the bytes a walk
-            # that named no display row writes for the same track.
-            title=item.title or None,
-            uploader=item.uploader,
-            duration=item.duration,
-            webpage_url=item.webpage_url or None,
-        )
-
-    def to_redis(self) -> bytes:
-        fields = {
-            QueueEntryField.TYPE: _ENTRY_TYPE_SEARCH,
-            QueueEntryField.YTSEARCH: self.ytsearch,
-            QueueEntryField.URL: self.url,
-            QueueEntryField.PROCESS: self.process,
-            QueueEntryField.TS: self.ts,
-            QueueEntryField.USER_INPUT: self.user_input,
-            QueueEntryField.QUEUED_AT: self.queued_at,
-            QueueEntryField.QUEUE_POSITION: self.queue_position,
-            QueueEntryField.QUERY_SOURCE: self.query_source,
-        }
-        # Only when known: an entry queued before the field existed must serialize
-        # to the bytes already on the list, or its LREM misses and rebuilds.
-        if self.requester_id is not None:
-            fields[QueueEntryField.REQUESTER_ID] = self.requester_id
-        for key, value in (
-            (QueueEntryField.TITLE, self.title),
-            (QueueEntryField.UPLOADER, self.uploader),
-            (QueueEntryField.DURATION, self.duration),
-            (QueueEntryField.WEBPAGE_URL, self.webpage_url),
-        ):
-            if value is not None:
-                fields[key] = value
-        return orjson.dumps(fields)
 
 
 QueueEntry = Union[SongQueueEntry, SearchQueueEntry]

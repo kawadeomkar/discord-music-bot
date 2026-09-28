@@ -17,6 +17,29 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.54.0 — 2026-09-26
+
+**A collection track that has not resolved yet is written to Redis as an ordinary queued
+song.** Nothing changes in chat: the same tracks queue, show and play the same way. What
+moves is the shape of the saved entry, so this is the release the 2.53.2 note pointed
+forward at.
+
+- **Do not roll back past 2.53.7 once this build has run.** 2.53.7 is the first build
+  that can read the new entry; an older one restores such a track as a playable song with
+  nothing to stream, and it fails when its turn comes. Rolling back TO 2.53.7 is safe.
+- **The first `-remove` or `-clear` touching a track an earlier build queued rewrites the
+  whole queue list once.** Removal matches an entry by its exact saved bytes, and those
+  tracks were saved in the old shape, so the first attempt misses and the list is rebuilt
+  instead. Nothing is lost and nothing is duplicated; afterwards every entry is in the new
+  shape and removals are one-shot again.
+- **Each restart logs, per guild, how many restored entries were still in the old shape.**
+  Watch the line that reports the restored count: when it reads zero old-shape entries
+  across restarts, no queue anywhere still holds one and the reader for that shape can go.
+- **A queued collection costs a little more Redis**: ~540 bytes per unresolved track
+  against ~400 before, so a 10,000-track playlist holds ~5 MB of queue mirror rather than
+  ~4 MB, against the 256 MB the bundled Redis is given. Nothing to do; noted so the number
+  is not a surprise.
+
 ## 2.53.7 — 2026-09-26
 
 **This build can read a queue entry the next one writes.** Nothing changes in chat, and
