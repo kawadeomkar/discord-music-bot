@@ -3,7 +3,6 @@
 import asyncio
 import copy
 import pathlib
-import re
 import contextlib
 import logging
 import redis.asyncio as aioredis
@@ -557,24 +556,31 @@ class TestQueueObject:
 
         assert [f.name for f in dataclasses.fields(QueueObject) if not f.init] == []
 
-    def test_no_dict_reader_reaches_a_slotted_item(
-        self, mock_author: MagicMock
-    ) -> None:
-        """A slotted item has no __dict__, so asdict()/vars() on one is either a
-        TypeError or an empty view; the wire tables spell every field out instead.
-        Pins the comment above the class against the whole of src/."""
+    def test_asdict_and_vars_stay_off_the_item(self, mock_author: MagicMock) -> None:
+        """vars() raises on a slotted item, but asdict() does not: it reads
+        fields() and deep-copies every value, including the Member on requester.
+        The wire tables spell the fields out instead. Pins the class comment: no
+        asdict() call anywhere in src/, qualified or not, and no vars() in a
+        module that names QueueObject (argparse's vars(args) elsewhere is fine)."""
+        import ast
+
         item = QueueObject(
             webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
         )
         assert not hasattr(item, "__dict__")
         src = pathlib.Path(__file__).resolve().parents[1] / "src"
-        reader = re.compile(r"(?<![\w.])(?:asdict|vars)\(\s*\w")
-        hits = [
-            f"{path.relative_to(src.parent)}:{n}"
-            for path in sorted(src.rglob("*.py"))
-            for n, line in enumerate(path.read_text().splitlines(), 1)
-            if reader.search(line) and not line.lstrip().startswith("#")
-        ]
+        hits: list[str] = []
+        for path in sorted(src.rglob("*.py")):
+            text = path.read_text()
+            handles_item = "QueueObject" in text
+            for node in ast.walk(ast.parse(text)):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if called == "asdict" or (called == "vars" and handles_item):
+                    hits.append(f"{path.relative_to(src.parent)}:{node.lineno}")
         assert hits == []
 
 

@@ -1217,8 +1217,8 @@ class NpHostRef:
 
 # slots: a 10,000-track Spotify playlist holds one of these per track while its
 # searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
-# against 344 B for the same instance carrying a __dict__. Keep the class free of
-# __dict__ readers (asdict/vars) and off any pickle path.
+# against 344 B for the same instance carrying a __dict__. Keep the class off
+# asdict (it deep-copies requester), vars (it raises) and any pickle path.
 @dataclass(slots=True, kw_only=True)
 class QueueObject:
     """One queued song, resolved or not. A track queued from a Spotify playlist
