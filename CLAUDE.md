@@ -337,6 +337,21 @@ so a tag never lies about its commit.
 The job graph, the three-stage image, host networking and the GIT_SHA seam:
 `.claude/rules/ci-and-build.md`.
 
+### PR titles carry a bracketed tag
+
+Every PR opened here prefixes its title with a **`[Tag]`** — square brackets, PascalCase,
+exactly one tag — then a declarative summary written like a commit subject:
+`[Archive] Say when an enabled history archive has no database behind it`. A stacked
+series adds a second bracket after the tag (`[QueueFlags][3/7] …`); every part of that
+series repeats the same tag and the same `N`.
+
+Reuse an existing tag before minting one. Subsystem tags name the area:
+`[Play]` `[Playback]` `[Extraction]` `[Spotify]` `[Archive]` `[QueueRows]` `[Command]`.
+Kind tags cover a change no subsystem dominates: `[Fix]` (the current spelling — not
+`[Bugfix]`) `[Refactor]` `[Docs]` `[Tooling]` `[Testing]`. A multi-PR campaign mints its
+own tag and keeps it for every part (`[CommandOrg]`, `[QueueFlags]`, `[RemoveFixes]`).
+Dependabot's `Bump <dep> from <a> to <b>` titles are exempt — generated, not written.
+
 ## Configuration reference
 
 Every environment variable, its default and its bounds: `.claude/rules/config.md`.
