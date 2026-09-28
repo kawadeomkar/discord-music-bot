@@ -3000,25 +3000,32 @@ class MusicPlayer:
                         and pending_tail is not None
                         and pending_tail.webpage_url == song.webpage_url
                     )
+                    stamps: dict[str, Any] = {}
                     if folded_into_tail and pending_tail is not None:
                         attempts_used = song.stream_attempts + 1
-                        pending_tail.stream_attempts = attempts_used
-                        pending_tail.failed_format_ids = self._blacklist_after(
+                        stamps["stream_attempts"] = attempts_used
+                        stamps["failed_format_ids"] = self._blacklist_after(
                             song, attempts_used
                         )
                     if skip_history and pending_tail is not None:
-                        pending_tail.np_host_ref = (
+                        stamps["np_host_ref"] = (
                             NpHostRef(finished_host, finished_own, finished_dedicated)
                             if finished_host is not None
                             else None
                         )
-                        pending_tail.np_message_id = (
+                        stamps["np_message_id"] = (
                             finished_host.id if finished_host is not None else 0
                         )
-                        pending_tail.np_channel_id = (
+                        stamps["np_channel_id"] = (
                             finished_host.channel.id if finished_host is not None else 0
                         )
-                        pending_tail.np_dedicated = finished_dedicated
+                        stamps["np_dedicated"] = finished_dedicated
+                    if stamps and pending_tail is not None:
+                        # interject() put the tail on the deque, so the queue swaps
+                        # its slot for the stamped copy, which the next rebuild writes.
+                        self.queue.replace_item(
+                            pending_tail, replace(pending_tail, **stamps)
+                        )
                     # stream_failed means THIS fragment never opened a stream —
                     # "nobody heard it" for a fresh song, but not for a resume tail,
                     # whose offset is audio heard under the fragment that parked it

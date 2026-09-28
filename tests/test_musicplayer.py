@@ -10424,14 +10424,18 @@ class TestStreamRetry:
         music_player._pending_resume_tail = tail
         music_player._skip_history_for = mock_song
 
-        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+        await self._run_failed_iteration(
+            music_player, queue_obj, mock_song, behind=tail
+        )
 
-        assert music_player.queue.qsize() == 0, "the tail is the re-queue, not a copy"
+        # The tail interject() queued IS the re-queue: one item, not a copy beside it.
+        (requeued,) = music_player.queue.display_items()
+        assert requeued.webpage_url == tail.webpage_url
         assert len(music_player.history) == 0
         # interject() builds the tail with a FRESH budget, on the premise that the
         # song it interrupted was producing audio. It was not, so the tail inherits
         # the attempt instead — otherwise one -playnow per attempt is an endless chain.
-        assert tail.stream_attempts == 1
+        assert requeued.stream_attempts == 1
 
     async def test_a_resume_flag_alone_does_not_make_a_retry_inherit_the_stamp(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -13501,14 +13505,19 @@ class TestHistorySkipMarker:
     """The _skip_history_for identity marker consumed by loop()'s history step."""
 
     async def _run_one_song(
-        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        *,
+        behind: Optional[QueueObject] = None,
     ) -> None:
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        seed_queue(music_player.queue, queue_obj)
+        seed_queue(music_player.queue, queue_obj, *([behind] if behind else []))
 
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
@@ -13574,14 +13583,17 @@ class TestHistorySkipMarker:
         music_player._pending_resume_tail = tail
 
         with patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()):
-            await self._run_one_song(music_player, queue_obj, mock_song)
+            await self._run_one_song(music_player, queue_obj, mock_song, behind=tail)
 
-        assert (tail.np_message_id, tail.np_channel_id) == (
+        # The stamped tail is what the queue now holds in the tail's slot.
+        (stamped,) = music_player.queue.display_items()
+        assert stamped.webpage_url == tail.webpage_url
+        assert (stamped.np_message_id, stamped.np_channel_id) == (
             777777777777777777,
             888888888888888888,
         )
-        assert tail.np_dedicated is True
-        assert tail.np_host_ref is not None and tail.np_host_ref.message is host
+        assert stamped.np_dedicated is True
+        assert stamped.np_host_ref is not None and stamped.np_host_ref.message is host
         assert music_player._pending_resume_tail is None
 
     async def test_a_stale_tail_is_not_stamped_by_a_later_fragment(
@@ -13606,8 +13618,10 @@ class TestHistorySkipMarker:
         music_player._pending_resume_tail = tail
 
         with patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()):
-            await self._run_one_song(music_player, queue_obj, mock_song)
+            await self._run_one_song(music_player, queue_obj, mock_song, behind=tail)
 
+        # Untouched: the queue still holds the very object, with no ids on it.
+        assert music_player.queue.display_items()[-1] is tail
         assert (tail.np_message_id, tail.np_channel_id) == (0, 0)
         assert tail.np_host_ref is None
         assert music_player._pending_resume_tail is None  # cleared either way
@@ -13680,7 +13694,7 @@ class TestHistorySkipMarker:
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
-        seed_queue(music_player.queue, queue_obj)
+        seed_queue(music_player.queue, queue_obj, tail)
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
         mocked(music_player._guild).voice_client = vc
@@ -13706,6 +13720,8 @@ class TestHistorySkipMarker:
             await music_player.loop()
 
         assert music_player._pending_resume_tail is None
+        # Untouched: the tail's slot still holds the very object, with no ids.
+        assert music_player.queue.display_items()[-1] is tail
         assert (tail.np_message_id, tail.np_channel_id) == (0, 0)
 
     async def test_one_marker_suffices_at_depth(
