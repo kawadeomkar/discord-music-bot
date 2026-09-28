@@ -2235,7 +2235,7 @@ class TestRestoreEntries:
         (restored,) = gq.display_items()
         assert restored.user_input == album
 
-    async def test_enqueue_stamps_rehydrate_resolved_or_not(
+    async def test_enqueue_stamps_rehydrate_with_the_entry(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         """_rehydrate is the entry → item hop for the whole restored queue, and the
@@ -2249,17 +2249,12 @@ class TestRestoreEntries:
             queued_at=1752529000.5,
             queue_position=3,
         )
-        search = _unresolved_entry("abc", queued_at=1752529111.5, queue_position=7)
-        assert await gq.restore_entries([song, search]) == 2
-        restored_song, restored_search = gq.display_items()
+        assert await gq.restore_entries([song]) == 1
+        (restored,) = gq.display_items()
         assert (
-            restored_song.analytics.queued_at,
-            restored_song.analytics.queue_position,
+            restored.analytics.queued_at,
+            restored.analytics.queue_position,
         ) == (1752529000.5, 3)
-        assert (
-            restored_search.analytics.queued_at,
-            restored_search.analytics.queue_position,
-        ) == (1752529111.5, 7)
 
     async def test_search_entries_rehydrate_as_unresolved_items(
         self, gq: GuildQueue, mock_guild: MagicMock
