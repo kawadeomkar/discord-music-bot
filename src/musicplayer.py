@@ -933,15 +933,13 @@ class MusicPlayer:
                         await self.store.clear_song_end_state()
 
                     # After the crashed head, so the interrupted song plays first.
+                    # restore_entries logs the count itself, with the tally of
+                    # entries still in the retired wire shape.
                     count = await self.queue.restore_entries(
                         snapshot.queue,
                         requester_fallback=self._last_author,
                         unreadable=snapshot.queue_unreadable,
                     )
-                    if count:
-                        log.info(
-                            f"Restored {count} queued songs for guild {self._guild.id}"
-                        )
 
                     # Corrupt entries were already dropped at parse time.
                     self.history.restore(snapshot.history)

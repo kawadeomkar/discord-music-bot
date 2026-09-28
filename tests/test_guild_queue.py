@@ -1950,6 +1950,45 @@ class TestRestoreEntries:
         assert gq.display_items() == []
         assert "dropped 2 restored queue entries" in caplog.text
 
+    async def test_the_restore_reports_the_old_shape_it_met(
+        self,
+        gq: GuildQueue,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The number that says whether the "ytsource" reader can go yet. One
+        line per restore, carrying both counts."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        with caplog.at_level(logging.INFO):
+            assert (
+                await gq.restore_entries(
+                    [
+                        self._entry(1, mock_author.id),
+                        SearchQueueEntry(ytsearch="ytsearch:a", process=True),
+                        SearchQueueEntry(ytsearch="ytsearch:b", process=True),
+                    ]
+                )
+                == 3
+            )
+        assert (
+            f"Restored 3 queued songs for guild {gq._guild.id}; "
+            "2 of 3 entries were in the pre-2.54.0 shape"
+        ) in caplog.text
+
+    async def test_an_empty_restore_still_reports_zero(
+        self, gq: GuildQueue, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A restore with nothing to say still says it: a guild that logs no line
+        is a guild whose queues were never looked at, which is not the same
+        measurement as a zero."""
+        with caplog.at_level(logging.INFO):
+            assert await gq.restore_entries([]) == 0
+        assert (
+            f"Restored 0 queued songs for guild {gq._guild.id}; "
+            "0 of 0 entries were in the pre-2.54.0 shape"
+        ) in caplog.text
+
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:
         return SongQueueEntry(
             webpage_url=f"https://yt.com/v={n}",

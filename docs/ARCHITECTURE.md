@@ -2418,7 +2418,8 @@ resolved with an empty `webpage_url`, and tries to stream it.
 wrote — so entries already on a list still restore. Such an entry rewrites once: the item
 it rehydrates into re-serializes as `"qobj"`, and because LREM matches exact bytes, the
 first `-remove` or `-clear` touching it misses and rebuilds the list. The read leg stays
-until no restore still meets one.
+until no restore still meets one, which `restore_entries` measures: it logs the restored
+count and the `"ytsource"` tally on one INFO line per guild, every restore, zero included.
 
 `slots=True` is what keeps the merge cheap rather than free. By `sys.getsizeof` on this
 interpreter a 23-field `QueueObject` is **216 B**, against **344 B** for the same instance

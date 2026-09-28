@@ -526,7 +526,9 @@ class GuildQueue:
         unreadable: int = 0,
     ) -> int:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Returns the number restored.
+        (they are already on the Redis list). Returns the number restored, and
+        reports it — with how many entries were still in the "ytsource" shape —
+        on one INFO line, which is this restore's whole log output.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
@@ -536,7 +538,12 @@ class GuildQueue:
         owner, for entries persisted before searches carried a requester id."""
         count = 0
         dropped = 0
+        # Entries no build writes any more. Zero here across restarts is the
+        # measurement that lets the "ytsource" read leg go.
+        old_shape = 0
         for entry in entries:
+            if isinstance(entry, SearchQueueEntry):
+                old_shape += 1
             item = self._rehydrate(entry, requester_fallback=requester_fallback)
             if item is None:
                 dropped += 1
@@ -555,6 +562,12 @@ class GuildQueue:
                 f"requester in guild {self._guild.id}; the Redis list still holds "
                 "them until the next mirror rebuild"
             )
+        # Unconditional, an empty restore included: a zero is the number being
+        # watched for, and a missing line is not one.
+        log.info(
+            f"Restored {count} queued songs for guild {self._guild.id}; "
+            f"{old_shape} of {len(entries)} entries were in the pre-2.54.0 shape"
+        )
         self._sync_wake()
         return count
 
