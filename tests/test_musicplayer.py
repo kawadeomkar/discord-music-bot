@@ -8389,6 +8389,36 @@ class TestPrefetchNextSong:
         assert music_player.queue.get_nowait() is queue_obj
         assert music_player.queue.get_nowait() is queue_obj_no_meta
 
+    async def test_cancellation_keeps_a_warm_that_landed_on_the_claimed_slot(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+    ) -> None:
+        """_warm_stream swaps its back-fill into the slot of the item the prefetch
+        is holding. Giving back the captured local instead of the slot's object
+        would write the pre-warm copy over it, and -queue and the ETA would show
+        the bare ask again until the play-time resolve."""
+        await music_player.queue.put([queue_obj])
+        started = asyncio.Event()
+        never_set = asyncio.Event()
+
+        async def hang(self: MusicPlayer, source: Any) -> Any:
+            started.set()
+            await never_set.wait()
+            return source
+
+        with patch.object(MusicPlayer, "_resolve_source", new=hang):
+            task = asyncio.create_task(music_player._prefetch_next_song())
+            await started.wait()
+            warmed = dataclasses.replace(queue_obj, duration=180, uploader="Chan")
+            assert music_player.queue.replace_item(queue_obj, warmed) is True
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert music_player.queue.display_items()[0] is warmed
+        assert music_player.queue.get_nowait() is warmed
+
 
 # ── Loop task accounting ──────────────────────────────────────────────────────
 

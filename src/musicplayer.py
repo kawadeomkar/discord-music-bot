@@ -2550,6 +2550,13 @@ class MusicPlayer:
             # resolve decides.
             song = await self._stream_source(source, allow_reextract=False)
         except asyncio.CancelledError:
+            held = self.queue.claimed_head()
+            if source is claimed and held is not None:
+                # A warm swapped the slot for a back-filled copy while this ran,
+                # and the slot's object is the one to give back. Only an
+                # unresolved item resolves here and only a resolved one is
+                # warmed, so a resolve to hand back rules the swap out.
+                source = held
             self.queue.requeue_front(source)
             raise
         except Exception as e:
