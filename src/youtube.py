@@ -1228,8 +1228,9 @@ class QueueObject:
     about the ask is the same either way, which is why there is one type — see
     docs/ARCHITECTURE.md#one-queue-item.
 
-    Not `frozen`: `_enrich_queueobject`, the `played_at` stamp and a resume tail's
-    NP ids all write attributes on a live item."""
+    Every change to a queued item is a `replace()` copy: the queue swaps it into the
+    item's slot (`GuildQueue.replace_item`) and a playing song holds its own
+    (`YTDL.queued`)."""
 
     webpage_url: str
     title: str
@@ -1289,16 +1290,19 @@ class QueueObject:
         return bool(self.search)
 
 
-def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
-    """Back-fill fields unknown at enqueue time (flat playlist entries carry no
-    duration/uploader/thumbnail) onto the same instance queue_embed() reads."""
+def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> QueueObject:
+    """`qo` with the fields unknown at enqueue time (flat playlist entries carry no
+    duration/uploader/thumbnail) filled from `data`, or `qo` itself when nothing
+    was missing. The caller puts the copy where the item is held."""
+    fills: dict[str, Any] = {}
     fetched_duration = data.get("duration")
     if qo.duration is None and fetched_duration is not None:
-        qo.duration = int(fetched_duration)
-    if qo.uploader is None:
-        qo.uploader = data.get("uploader")
-    if qo.thumbnail is None:
-        qo.thumbnail = data.get("thumbnail")
+        fills["duration"] = int(fetched_duration)
+    if qo.uploader is None and data.get("uploader") is not None:
+        fills["uploader"] = data.get("uploader")
+    if qo.thumbnail is None and data.get("thumbnail") is not None:
+        fills["thumbnail"] = data.get("thumbnail")
+    return replace(qo, **fills) if fills else qo
 
 
 # The served format's fields: present on a processed entry, never on a flat one. One
@@ -1820,25 +1824,26 @@ class YTDL(discord.FFmpegOpusAudio):
         cls,
         qo: QueueObject,
         redis: Optional[aioredis.Redis] = None,
-    ) -> bool:
+    ) -> Optional[QueueObject]:
         """Populate the stream URL cache for a queued song so yt_stream() is a
         cache hit by the time it plays. No-op with no redis or an already-cached
         URL; errors are logged and swallowed (yt_stream() extracts fresh).
 
-        Returns False ONLY when an extraction was attempted and produced nothing,
-        so an interjection can decline a head it cannot prove playable. Anything
-        unprovable — no Redis — answers True."""
+        Returns the item — with duration/uploader/thumbnail back-filled from what
+        the cache or the extraction knew, when it lacked them — and None ONLY when
+        an extraction was attempted and produced nothing, so an interjection can
+        decline a head it cannot prove playable. Anything unprovable — no Redis —
+        answers with the item as it came."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
         if redis is None:
             trace.get_current_span().set_attribute("ytdl.skipped", True)
-            return True
+            return qo
         cache_key = _stream_cache_key(qo.webpage_url)
         cached = await _stream_cache_get(redis, cache_key)
         already_cached = cached is not None
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
         if already_cached:
-            _enrich_queueobject(qo, cached)
-            return True
+            return _enrich_queueobject(qo, cached)
         try:
             # Single-video cast: stream opts on a watch URL never yield a
             # search/playlist wrapper. Single-flighted with the playback loop's
@@ -1860,15 +1865,14 @@ class YTDL(discord.FFmpegOpusAudio):
                 StatusCode.ERROR, f"prefetch_stream failed: {e}"
             )
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
-            return False
+            return None
         if data is not None:
             # Shielded like every other join: a cancelled prefetch (every bulk queue
             # mutation cancels one) must leave the warm running for whoever else is
             # waiting on this key. The CancelledError still propagates from here.
             await asyncio.shield(_start_stream_warm(redis, cache_key, data))
-            _enrich_queueobject(qo, data)
-            return True
-        return False
+            return _enrich_queueobject(qo, data)
+        return None
 
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:

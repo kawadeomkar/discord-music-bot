@@ -1030,7 +1030,11 @@ class MusicPlayer:
         if self.store is None:
             return
         async with prefetch_warm_slot():
-            await YTDL.prefetch_stream(item, redis=self.store.redis)
+            warmed = await YTDL.prefetch_stream(item, redis=self.store.redis)
+        if warmed is not None:
+            # The back-fill goes into the queue's slot for the item; a card already
+            # rendered from the old object shows it when it next re-renders.
+            self.queue.replace_item(item, warmed)
 
     async def queue_put_front(
         self,
