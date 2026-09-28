@@ -17,6 +17,15 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.1 — 2026-09-28
+
+**A song no longer ends halfway when the connection hiccups.** If a song's connection died
+mid-play and the retry came back with a server error, the song simply stopped there —
+cleanly, as far as the bot could tell, so nothing retried and nothing was logged that a
+listener would connect to the audio cutting out. ffmpeg now retries those, and resumes
+exactly where it left off. A failure that cannot be recovered ends the song about four
+seconds later than it used to; everything else about how failures are handled is unchanged.
+
 ## 2.56.0 — 2026-09-28
 
 **A lossless link now encodes at the voice channel's bitrate.** A direct FLAC, WAV, ALAC or

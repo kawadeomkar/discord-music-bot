@@ -57,6 +57,7 @@ import math
 import socketserver
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional
@@ -121,16 +122,70 @@ class _FailingHandler(http.server.BaseHTTPRequestHandler):
     payload: bytes = b""
     mode: str = "ok"
     seen_range: Optional[str] = None
+    gets: int = 0
 
     def log_message(self, *_args: Any) -> None:  # noqa: D102 - quiet under pytest
         pass
 
+    def _serve_half(self) -> None:
+        """Open, deliver half the sample, then let the connection die."""
+        payload = type(self).payload
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        self.wfile.write(payload[: len(payload) // 2])
+        self.wfile.flush()
+        self.close_connection = True
+
+    def _serve_range(self) -> None:
+        """Honour the Range the reconnect asks for, which is what makes the
+        recovered stream the same audio rather than merely the same length."""
+        payload = type(self).payload
+        raw = self.headers.get("Range") or ""
+        start = int(raw.split("=")[1].split("-")[0]) if "=" in raw else 0
+        self.send_response(206 if start else 200)
+        self.send_header(
+            "Content-Range", f"bytes {start}-{len(payload) - 1}/{len(payload)}"
+        )
+        self.send_header("Content-Length", str(len(payload) - start))
+        self.end_headers()
+        self.wfile.write(payload[start:])
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
         type(self).seen_range = self.headers.get("Range")
+        type(self).gets += 1
         mode = type(self).mode
         if mode == "refused":
             # A revoked URL: what YouTube returns once the signature expires.
             self.send_response(403)
+            self.end_headers()
+            return
+        if mode == "dead_then_503_then_ok":
+            # A transient CDN failure, and the shape the reconnect flag exists for:
+            # the connection dies mid-stream, two retries are refused, the fourth
+            # request is honoured as a Range. Content-Length on the 503 is what
+            # makes it a well-formed HTTP error rather than another truncation —
+            # a plain `-reconnect` already retries the latter.
+            if type(self).gets == 1:
+                self._serve_half()
+                return
+            if type(self).gets in (2, 3):
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                self.close_connection = True
+                return
+            self._serve_range()
+            return
+        if mode == "dead_then_403":
+            # The same death, never answered. The retry flag must not turn this
+            # into a wait: `stream_failed` and the cache drop decide it as before.
+            if type(self).gets == 1:
+                self._serve_half()
+                return
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         if mode == "header_then_dead":
@@ -154,6 +209,7 @@ def server(opus_sample: bytes) -> Iterator[type[_FailingHandler]]:
     _FailingHandler.payload = opus_sample
     _FailingHandler.mode = "ok"
     _FailingHandler.seen_range = None
+    _FailingHandler.gets = 0
     with socketserver.TCPServer(("127.0.0.1", 0), _FailingHandler) as srv:
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
@@ -170,7 +226,29 @@ def server(opus_sample: bytes) -> Iterator[type[_FailingHandler]]:
 _EXIT_TIMEOUT_SECS = 10
 
 
-def _drain(url: str) -> tuple[int, int, Optional[Exception]]:
+def _packets(url: str, before_options: Optional[str] = None) -> list[bytes]:
+    """Every Opus packet a source yields, in order. The packets rather than their
+    count, because a reconnect that overlaps or skips a byte range still delivers
+    the right NUMBER of them."""
+    source = discord.FFmpegOpusAudio(url, before_options=before_options, options="-vn")
+    process = source._process
+    packets: list[bytes] = []
+    try:
+        while packet := source.read():
+            packets.append(bytes(packet))
+        process.wait(timeout=_RECONNECT_TIMEOUT_SECS)
+        return packets
+    finally:
+        source.cleanup()
+        for pipe in (process.stdout, process.stderr, process.stdin):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+def _drain(
+    url: str, before_options: Optional[str] = None
+) -> tuple[int, int, Optional[Exception]]:
     """Read a source to exhaustion the way discord.py's AudioPlayer does, then
     let the child exit and ask discord.py what it makes of the exit code.
 
@@ -184,7 +262,7 @@ def _drain(url: str) -> tuple[int, int, Optional[Exception]]:
     backstop), but it is a race, and what this tier exists to pin is the exit
     code itself. `_check_process_returncode` is then called explicitly, which is
     what `read()` would have done had the child been reaped in time."""
-    source = discord.FFmpegOpusAudio(url, options="-vn")
+    source = discord.FFmpegOpusAudio(url, before_options=before_options, options="-vn")
     process = source._process
     packets = 0
     try:
@@ -441,3 +519,71 @@ class TestMeasureLoudnessReadsTheRealBinary:
         precondition for one."""
         server.mode = "refused"
         assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # type: ignore[attr-defined]
+
+
+# The reconnect backoff is 0 + 1 + 3 s before -reconnect_delay_max refuses a 7,
+# so a recovering stream needs several seconds and a stalled one gives up inside ~4.
+_RECONNECT_TIMEOUT_SECS = 40
+
+
+class TestAMidSongReconnect:
+    """A song whose connection dies mid-stream. `-reconnect` alone retries a
+    truncated stream but not a well-formed HTTP error, so a transient 503 used to
+    end the song wherever it died — exit 0, no error, no retry, and nothing in the
+    logs a listener could connect to the audio stopping.
+    See docs/ARCHITECTURE.md#mid-song-reconnects."""
+
+    def test_a_transient_503_recovers_the_whole_song(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        healthy = _packets(server.url)  # type: ignore[attr-defined]
+        server.mode = "dead_then_503_then_ok"
+        server.gets = 0
+
+        recovered = _packets(
+            server.url,  # type: ignore[attr-defined]
+            YTDL.FFMPEG_OPTS["before_options"],
+        )
+
+        # Byte-identical, not merely the same length: the reconnect resumes by
+        # Range, and an overlapping or short range would still count right.
+        assert recovered == healthy
+        assert server.gets == 4, "the 503s were not retried"
+
+    def test_without_the_flag_the_song_ends_where_it_died(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The control, and the measurement that earns the flag: half a song,
+        reported as a clean end."""
+        healthy = _packets(server.url)  # type: ignore[attr-defined]
+        server.mode = "dead_then_503_then_ok"
+        server.gets = 0
+
+        truncated = _packets(
+            server.url,  # type: ignore[attr-defined]
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        )
+
+        assert len(truncated) < len(healthy) / 2 + 2
+        # What it did deliver is still the right audio; it just stops.
+        assert truncated[:-1] == healthy[: len(truncated) - 1]
+
+    def test_a_death_that_is_never_answered_still_ends_the_song(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """The flag must not turn an unrecoverable death into a wait. ffmpeg does
+        not retry a 403 when the list is `5xx`, so this decides exactly as it did
+        before: exit 0, no error, and the loop falls to
+        `_drop_unplayable_stream_cache` rather than the retry ladder."""
+        server.mode = "dead_then_403"
+        server.gets = 0
+        started = time.monotonic()
+
+        packets, code, error = _drain(
+            server.url,  # type: ignore[attr-defined]
+            YTDL.FFMPEG_OPTS["before_options"],
+        )
+
+        assert (code, error) == (0, None)
+        assert packets > _OGG_HEADER_PACKETS, "delivered nothing at all"
+        assert time.monotonic() - started < 5.0, "waited on a death nothing will answer"

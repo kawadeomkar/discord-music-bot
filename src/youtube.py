@@ -1936,7 +1936,14 @@ async def _revalidate_source(
 
 class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        # `-reconnect_on_http_error 5xx` is what answers a mid-song 503: a plain
+        # `-reconnect` retries a truncated stream but not a well-formed HTTP error,
+        # so the song used to end wherever the connection died. See
+        # docs/ARCHITECTURE.md#mid-song-reconnects.
+        "before_options": (
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+            " -reconnect_on_http_error 5xx"
+        ),
         # discord.py emits `-fec true -packet_loss 15` on every spawn, and libopus
         # answers in-band FEC above 8 % expected loss by leaving CELT for SILK/hybrid
         # on every frame. These trail its arguments, so they win; `-c:a copy` has no

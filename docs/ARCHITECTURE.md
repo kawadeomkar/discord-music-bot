@@ -1766,7 +1766,7 @@ flowchart LR
 ```
 
 **FFmpeg flags:**
-- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
+- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_http_error 5xx` — reconnects to the stream URL on drop, including when the drop is answered with a 5xx ([Mid-song reconnects](#mid-song-reconnects)); extended with `-ss {ts}` (**input side**) when the song carries a start offset
 - `options`: `-vn -fec false -packet_loss 0` (audio only; the encoder stays in CELT — see [Encoder mode](#encoder-mode)); extended with `-ss 0` whenever the input-side seek is present, and with a `-filter:a` chain for a non-unity volume or a loudness mode ([Loudness normalization](#loudness-normalization)) — but never both a filtergraph and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
@@ -1825,6 +1825,36 @@ lossless there would triple the egress of every AAC file. `ext` is in
 `_STREAM_CACHE_FIELDS` for the same reason `audio_channels` is: a cache hit that lost it
 would silently drop those sources back to 128k. Like volume, the value is baked into the
 argv, so it applies from the song after next.
+
+#### Mid-song reconnects
+
+A song's connection can die after it has been playing for a while, and what happens next
+depends on how the **reconnect** is answered rather than on the death itself. `-reconnect`
+and `-reconnect_streamed` retry a stream that simply stopped, but not one whose retry comes
+back as a well-formed HTTP error — so a transient 503 ended the song wherever it died, with
+exit 0, no stored error and nothing in the logs tied to the audio stopping.
+`-reconnect_on_http_error 5xx` is what closes that, measured against a local server that
+dies halfway, refuses two retries and honours the third as a Range request:
+
+| `before_options` | Packets delivered | Exit | Stored error | Wall time |
+|---|---|---|---|---|
+| a healthy stream, for reference | 153 | 0 | none | 0.05 s |
+| without the flag | **77** | 0 | none | 0.04 s |
+| with it | **153**, byte-identical to the healthy stream | 0 | none | 1.05 s |
+
+Byte-identical matters more than the count: the reconnect resumes by `Range`, and a range
+that overlapped or skipped would still deliver 153 packets. The ffmpeg tier pins both rows.
+
+What the flag deliberately does not change is failure detection. A death nothing will
+answer — the retry returning 403 — measures identically with and without it (77 packets,
+exit 0, no error), so it still falls to `_drop_unplayable_stream_cache` rather than the
+retry ladder, and a 403 on the *first* request still exits 8 with an `FFmpegProcessError`
+either way. ffmpeg never retries a 403 when the list is `5xx`. The cost is bounded by
+`-reconnect_delay_max 5`: a 5xx that never clears is retried after 0, 1 and 3 seconds and
+then refused, so an unrecoverable song ends about 4 seconds later than it used to.
+
+`-reconnect_on_network_error` was measured alongside and is **not** set: every network-level
+death in these cases was already retried by `-reconnect`, so it changed nothing.
 
 #### Loudness normalization
 
@@ -2448,9 +2478,11 @@ deliberately **reset** by `interject()`'s resume tail (that song is producing au
 which ends the chain, and a format blacklisted at 0:00 may be healthy again by the time
 a deeply-stacked tail resolves).
 
-Mid-song death stays out of scope: it produced audio and earned its history entry, and
-retrying it means resuming at the death position — a different feature this machinery
-makes cheap to add later.
+Mid-song death stays out of scope for the LADDER: it produced audio and earned its history
+entry, and retrying it means resuming at the death position — a different feature this
+machinery makes cheap to add later. ffmpeg's own reconnect is the first line of defence and
+recovers the transient case before the loop hears about it
+([Mid-song reconnects](#mid-song-reconnects)).
 
 ### yt-dlp process boundary
 
