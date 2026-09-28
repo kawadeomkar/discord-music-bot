@@ -67,6 +67,7 @@ from tests.helpers import (
     give_queue_object,
     loop_song,
     mocked,
+    passthrough_prefetch,
     stub_requester,
     queue_object,
     replayed_song,
@@ -98,7 +99,7 @@ def _stub_prefetch(monkeypatch: pytest.MonkeyPatch) -> None:
     asserting on prefetch override this with their own patch(), which wins."""
     from src import youtube
 
-    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
 
 def _loop_song() -> MagicMock:
@@ -162,7 +163,7 @@ def _stub_queue_put_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent prefetch_stream tasks in queue_put from doing real yt-dlp work."""
     from src import youtube
 
-    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
 
 # ── Archive wiring ────────────────────────────────────────────────────────────
@@ -331,11 +332,11 @@ class TestQueuePut:
         mock_author: MagicMock,
     ) -> None:
         assert music_player.store is not None
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
 
         src = unresolved("test")
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(src)
             await asyncio.sleep(0)
@@ -358,7 +359,7 @@ class TestQueuePut:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(queue_obj)
             await asyncio.sleep(0)
@@ -370,7 +371,7 @@ class TestQueuePut:
     ) -> None:
         source = unresolved("test song")
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(source)
             await asyncio.sleep(0)
@@ -380,10 +381,10 @@ class TestQueuePut:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """queue_put(prefetch=False) never spawns a background prefetch_stream task."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
 
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put(queue_obj, prefetch=False)
             await asyncio.sleep(0)
@@ -412,7 +413,7 @@ class TestQueuePutNext:
         so anything added elsewhere to "warm the next song" would be a second
         concurrent extraction of it, not a missing one."""
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put_next(queue_obj)
             await asyncio.sleep(0)
@@ -580,7 +581,7 @@ class TestQueuePutNext:
             webpage_url="https://yt.com/v=x", title="X", requester=mock_author
         )
         with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+            "src.musicplayer.YTDL.prefetch_stream", new=passthrough_prefetch()
         ) as mock_pf:
             await music_player.queue_put_next(newcomer)
             await asyncio.sleep(0)
@@ -851,10 +852,10 @@ class TestQueueClearFlushesPlayedSongs:
             ts=95,
             is_resume=True,
             played_at=1752530001.0,
+            np_message_id=777777777777777777,
+            np_channel_id=888888888888888888,
+            np_dedicated=True,
         )
-        tail.np_message_id = 777777777777777777
-        tail.np_channel_id = 888888888888888888
-        tail.np_dedicated = True
 
         entry = SongQueueEntry.from_queue_object(tail)
         wire = entry.to_redis()
@@ -932,7 +933,7 @@ class TestQueueClearFlushesPlayedSongs:
             ts=30,
             played_at=2.0,
         )
-        bad.np_message_id = {"nested": "object"}  # pyright: ignore[reportAttributeAccessIssue]
+        bad = dataclasses.replace(bad, np_message_id={"nested": "object"})
 
         await music_player._flush_played([good, bad])
 
@@ -947,7 +948,7 @@ class TestQueueClearFlushesPlayedSongs:
         item = QueueObject(
             webpage_url="https://yt.com/v=x", title="X", requester=mock_author, ts=30
         )
-        item.played_at = None  # pyright: ignore[reportAttributeAccessIssue]
+        item = dataclasses.replace(item, played_at=None)
 
         await music_player._flush_played([item])
 
@@ -1392,7 +1393,7 @@ class TestQueueRemove:
     def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from src import youtube
 
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
     async def test_remove_by_webpage_url(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -2850,8 +2851,7 @@ class TestReparkCrashedHead:
         path and must still carry the start of the play it belongs to. Free —
         _now_playing_state_mapping is the single signature both writers use — but
         only while the head carries the field, which is what this pins."""
-        head = _crashed(mock_author)
-        head.played_at = 1752530000.5
+        head = dataclasses.replace(_crashed(mock_author), played_at=1752530000.5)
         seed_queue(music_player.queue, head)
 
         await music_player.repark_crashed_head()
@@ -2887,8 +2887,9 @@ class TestReparkCrashedHead:
         only from_crashed_state mints a persisted=False item — and this is the
         only thing standing between that and the slot now that one type serves
         both."""
-        head = unresolved("a song", mock_author, webpage_url="https://sp/a")
-        head.persisted = False
+        head = unresolved(
+            "a song", mock_author, webpage_url="https://sp/a", persisted=False
+        )
         seed_queue(music_player.queue, head)
 
         assert await music_player.repark_crashed_head() is False
@@ -4265,7 +4266,7 @@ class TestQueuePutFront:
     def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from src import youtube
 
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", passthrough_prefetch())
 
     async def test_single_item_goes_to_the_head(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -4346,7 +4347,7 @@ class TestQueuePutFront:
             for i in range(2)
         ]
         with patch.object(
-            youtube.YTDL, "prefetch_stream", new=AsyncMock()
+            youtube.YTDL, "prefetch_stream", new=passthrough_prefetch()
         ) as mock_prefetch:
             await music_player.queue_put_front(tracks)
             await asyncio.sleep(0)
@@ -4369,7 +4370,7 @@ class TestQueuePutFront:
             for i in range(2)
         ]
         with patch.object(
-            youtube.YTDL, "prefetch_stream", new=AsyncMock()
+            youtube.YTDL, "prefetch_stream", new=passthrough_prefetch()
         ) as mock_prefetch:
             await music_player.queue_put_front(tracks, prefetch=False)
             await asyncio.sleep(0)
@@ -4384,7 +4385,7 @@ class TestQueuePutFront:
         from src import youtube
 
         with patch.object(
-            youtube.YTDL, "prefetch_stream", new=AsyncMock()
+            youtube.YTDL, "prefetch_stream", new=passthrough_prefetch()
         ) as mock_prefetch:
             await music_player.queue_put_front([unresolved("a song")])
             await asyncio.sleep(0)
@@ -8022,8 +8023,8 @@ class TestQueueEntryCard:
             requester=mock_author,
             duration=300,
             ts=83,
+            is_resume=True,
         )
-        item.is_resume = True
         seed_queue(music_player.queue, item)
 
         assert "⏮ Resumes at `1:23`" in self._next_up_body(music_player)
@@ -8080,11 +8081,13 @@ class TestQueueEntryCard:
     def test_an_unresolved_track_renders_the_fields_it_was_queued_with(
         self, music_player: MusicPlayer
     ) -> None:
-        item = unresolved("DNA. Kendrick Lamar")
-        item.title = "DNA."
-        item.uploader = "Kendrick Lamar"
-        item.duration = 185
-        item.webpage_url = "https://open.spotify.com/track/abc"
+        item = unresolved(
+            "DNA. Kendrick Lamar",
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
         seed_queue(music_player.queue, item)
 
         lines = self._next_up_body(music_player).split("\n")
@@ -8115,9 +8118,7 @@ class TestQueueEntryCard:
         }
         # webpage_url is a `str`, so "no link" is empty rather than None.
         fields[missing] = "" if missing == "webpage_url" else None
-        item = unresolved("DNA. Kendrick Lamar")
-        for name, value in fields.items():
-            setattr(item, name, value)
+        item = unresolved("DNA. Kendrick Lamar", **fields)
         seed_queue(music_player.queue, item)
 
         body = self._next_up_body(music_player)
@@ -8387,6 +8388,36 @@ class TestPrefetchNextSong:
         assert music_player.queue._cursor == 0
         assert music_player.queue.get_nowait() is queue_obj
         assert music_player.queue.get_nowait() is queue_obj_no_meta
+
+    async def test_cancellation_keeps_a_warm_that_landed_on_the_claimed_slot(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+    ) -> None:
+        """_warm_stream swaps its back-fill into the slot of the item the prefetch
+        is holding. Giving back the captured local instead of the slot's object
+        would write the pre-warm copy over it, and -queue and the ETA would show
+        the bare ask again until the play-time resolve."""
+        await music_player.queue.put([queue_obj])
+        started = asyncio.Event()
+        never_set = asyncio.Event()
+
+        async def hang(self: MusicPlayer, source: Any) -> Any:
+            started.set()
+            await never_set.wait()
+            return source
+
+        with patch.object(MusicPlayer, "_resolve_source", new=hang):
+            task = asyncio.create_task(music_player._prefetch_next_song())
+            await started.wait()
+            warmed = dataclasses.replace(queue_obj, duration=180, uploader="Chan")
+            assert music_player.queue.replace_item(queue_obj, warmed) is True
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert music_player.queue.display_items()[0] is warmed
+        assert music_player.queue.get_nowait() is warmed
 
 
 # ── Loop task accounting ──────────────────────────────────────────────────────
@@ -10424,14 +10455,44 @@ class TestStreamRetry:
         music_player._pending_resume_tail = tail
         music_player._skip_history_for = mock_song
 
-        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+        await self._run_failed_iteration(
+            music_player, queue_obj, mock_song, behind=tail
+        )
 
-        assert music_player.queue.qsize() == 0, "the tail is the re-queue, not a copy"
+        # The tail interject() queued IS the re-queue: one item, not a copy beside it.
+        (requeued,) = music_player.queue.display_items()
+        assert requeued.webpage_url == tail.webpage_url
         assert len(music_player.history) == 0
         # interject() builds the tail with a FRESH budget, on the premise that the
         # song it interrupted was producing audio. It was not, so the tail inherits
         # the attempt instead — otherwise one -playnow per attempt is an endless chain.
-        assert tail.stream_attempts == 1
+        assert requeued.stream_attempts == 1
+
+    async def test_a_tail_that_left_the_queue_says_so_on_the_song_s_span(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The death window awaits the prefetch between interject() parking the
+        tail and this stamp, and a -clear/-remove there takes the tail off the
+        deque. The queue then refuses the swap and the spent retry budget and the
+        frozen card's ids go with it — silently, unless the iteration says so."""
+        tail = QueueObject(
+            webpage_url=mock_song.webpage_url,
+            title=mock_song.title,
+            requester=mock_song.requester,
+            ts=42,
+            is_resume=True,
+        )
+        music_player._pending_resume_tail = tail
+        music_player._skip_history_for = mock_song
+
+        # Parked but never queued: the state a mutation in that window leaves.
+        with _recording_tracer() as exporter:
+            await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert not music_player.queue.holds(tail)
+        (iteration,) = _iterations(exporter)
+        assert iteration.attributes is not None
+        assert iteration.attributes["song.tail_stamps_lost"] is True
 
     async def test_a_resume_flag_alone_does_not_make_a_retry_inherit_the_stamp(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -11737,7 +11798,9 @@ class TestInterject:
         # interject() no longer stamps anything: the interruption arrives already
         # carrying the depth-0 analytics the command minted at dispatch, and the tail
         # is the same play, so it keeps the interrupted song's.
-        interject_obj.analytics = Analytics(queued_at=1752530500.5, queue_position=0)
+        interject_obj = dataclasses.replace(
+            interject_obj, analytics=Analytics(queued_at=1752530500.5, queue_position=0)
+        )
         live_song.elapsed_secs = 42.0
         live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=5)
         music_player.current_song = live_song
@@ -13501,14 +13564,19 @@ class TestHistorySkipMarker:
     """The _skip_history_for identity marker consumed by loop()'s history step."""
 
     async def _run_one_song(
-        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        *,
+        behind: Optional[QueueObject] = None,
     ) -> None:
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        seed_queue(music_player.queue, queue_obj)
+        seed_queue(music_player.queue, queue_obj, *([behind] if behind else []))
 
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
@@ -13574,14 +13642,17 @@ class TestHistorySkipMarker:
         music_player._pending_resume_tail = tail
 
         with patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()):
-            await self._run_one_song(music_player, queue_obj, mock_song)
+            await self._run_one_song(music_player, queue_obj, mock_song, behind=tail)
 
-        assert (tail.np_message_id, tail.np_channel_id) == (
+        # The stamped tail is what the queue now holds in the tail's slot.
+        (stamped,) = music_player.queue.display_items()
+        assert stamped.webpage_url == tail.webpage_url
+        assert (stamped.np_message_id, stamped.np_channel_id) == (
             777777777777777777,
             888888888888888888,
         )
-        assert tail.np_dedicated is True
-        assert tail.np_host_ref is not None and tail.np_host_ref.message is host
+        assert stamped.np_dedicated is True
+        assert stamped.np_host_ref is not None and stamped.np_host_ref.message is host
         assert music_player._pending_resume_tail is None
 
     async def test_a_stale_tail_is_not_stamped_by_a_later_fragment(
@@ -13606,8 +13677,10 @@ class TestHistorySkipMarker:
         music_player._pending_resume_tail = tail
 
         with patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()):
-            await self._run_one_song(music_player, queue_obj, mock_song)
+            await self._run_one_song(music_player, queue_obj, mock_song, behind=tail)
 
+        # Untouched: the queue still holds the very object, with no ids on it.
+        assert music_player.queue.display_items()[-1] is tail
         assert (tail.np_message_id, tail.np_channel_id) == (0, 0)
         assert tail.np_host_ref is None
         assert music_player._pending_resume_tail is None  # cleared either way
@@ -13680,7 +13753,7 @@ class TestHistorySkipMarker:
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
-        seed_queue(music_player.queue, queue_obj)
+        seed_queue(music_player.queue, queue_obj, tail)
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
         mocked(music_player._guild).voice_client = vc
@@ -13706,6 +13779,8 @@ class TestHistorySkipMarker:
             await music_player.loop()
 
         assert music_player._pending_resume_tail is None
+        # Untouched: the tail's slot still holds the very object, with no ids.
+        assert music_player.queue.display_items()[-1] is tail
         assert (tail.np_message_id, tail.np_channel_id) == (0, 0)
 
     async def test_one_marker_suffices_at_depth(
@@ -15424,6 +15499,22 @@ class TestEnqueueWarmBound:
 
         assert held == [True], "the extraction ran outside the bound"
         assert not sem.locked(), "the slot outlived the warm"
+
+    async def test_a_warm_puts_its_back_fill_into_the_queue(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """What prefetch_stream learned reaches the queue's slot for the item, not
+        the object the caller kept: the copy is what the cards read from here on."""
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="One", requester=mock_author
+        )
+        seed_queue(music_player.queue, qobj)
+        filled = dataclasses.replace(qobj, duration=180, uploader="Channel")
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock(return_value=filled)):
+            await music_player._warm_stream(qobj)
+
+        assert music_player.queue.display_items()[0] is filled
+        assert qobj.duration is None
 
     async def test_an_enqueue_warms_through_the_bound(
         self, music_player: MusicPlayer, mock_author: MagicMock

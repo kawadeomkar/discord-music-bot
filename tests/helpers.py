@@ -177,6 +177,13 @@ def bind_loopback_only(container: Any, port: int) -> None:
     container.ports[port] = ("127.0.0.1", None)
 
 
+def passthrough_prefetch() -> AsyncMock:
+    """A `YTDL.prefetch_stream` double honouring its contract: the item it was
+    handed comes back as warmed. A bare AsyncMock answers a Mock, which the
+    callers would swap into the queue in the item's place."""
+    return AsyncMock(side_effect=lambda qo, *, redis=None: qo)
+
+
 def seed_queue(gq: GuildQueue, *items: QueueObject) -> None:
     """Queue items without touching Redis — `put()` minus the mirror.
 

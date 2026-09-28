@@ -116,9 +116,9 @@ class TestTheSongsFieldNamesItemsAsClearDoes:
     async def test_a_queued_spotify_track_is_named_by_its_title(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        track = unresolved("DNA. Kendrick Lamar")
-        track.title = "DNA."
-        track.uploader = "Kendrick Lamar"
+        track = unresolved(
+            "DNA. Kendrick Lamar", title="DNA.", uploader="Kendrick Lamar"
+        )
         await _run_remove(music_bot, mock_ctx, removed=[track], positions=[3])
         songs = _songs_field(mock_ctx)
         assert item_label(track) == "DNA."
@@ -128,8 +128,7 @@ class TestTheSongsFieldNamesItemsAsClearDoes:
     async def test_a_search_with_no_title_still_falls_back_to_its_term(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        item = unresolved("Artist - Song")
-        item.title = ""
+        item = unresolved("Artist - Song", title="")
         await _run_remove(music_bot, mock_ctx, removed=[item], positions=[1])
         assert item_label(item) == "Artist - Song"
         assert _songs_field(mock_ctx) == "1: Artist - Song"

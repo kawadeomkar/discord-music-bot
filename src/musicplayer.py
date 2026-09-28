@@ -1030,7 +1030,13 @@ class MusicPlayer:
         if self.store is None:
             return
         async with prefetch_warm_slot():
-            await YTDL.prefetch_stream(item, redis=self.store.redis)
+            warmed = await YTDL.prefetch_stream(item, redis=self.store.redis)
+        if warmed is not None:
+            # The back-fill goes into the queue's slot for the item; a card already
+            # rendered from the old object shows it when it next re-renders. A
+            # refused swap means the item left the queue, and what it drops is
+            # display fields the play-time resolve derives again.
+            self.queue.replace_item(item, warmed)
 
     async def queue_put_front(
         self,
@@ -2546,6 +2552,13 @@ class MusicPlayer:
             # resolve decides.
             song = await self._stream_source(source, allow_reextract=False)
         except asyncio.CancelledError:
+            held = self.queue.claimed_head()
+            if source is claimed and held is not None:
+                # A warm swapped the slot for a back-filled copy while this ran,
+                # and the slot's object is the one to give back. Only an
+                # unresolved item resolves here and only a resolved one is
+                # warmed, so a resolve to hand back rules the swap out.
+                source = held
             self.queue.requeue_front(source)
             raise
         except Exception as e:
@@ -3000,25 +3013,35 @@ class MusicPlayer:
                         and pending_tail is not None
                         and pending_tail.webpage_url == song.webpage_url
                     )
+                    stamps: dict[str, Any] = {}
                     if folded_into_tail and pending_tail is not None:
                         attempts_used = song.stream_attempts + 1
-                        pending_tail.stream_attempts = attempts_used
-                        pending_tail.failed_format_ids = self._blacklist_after(
+                        stamps["stream_attempts"] = attempts_used
+                        stamps["failed_format_ids"] = self._blacklist_after(
                             song, attempts_used
                         )
                     if skip_history and pending_tail is not None:
-                        pending_tail.np_host_ref = (
+                        stamps["np_host_ref"] = (
                             NpHostRef(finished_host, finished_own, finished_dedicated)
                             if finished_host is not None
                             else None
                         )
-                        pending_tail.np_message_id = (
+                        stamps["np_message_id"] = (
                             finished_host.id if finished_host is not None else 0
                         )
-                        pending_tail.np_channel_id = (
+                        stamps["np_channel_id"] = (
                             finished_host.channel.id if finished_host is not None else 0
                         )
-                        pending_tail.np_dedicated = finished_dedicated
+                        stamps["np_dedicated"] = finished_dedicated
+                    if stamps and pending_tail is not None:
+                        # interject() put the tail on the deque, so the queue swaps
+                        # its slot for the stamped copy, which the next rebuild writes.
+                        # A refused swap is a -clear/-remove inside the prefetch
+                        # await above: the tail is gone and the stamps go with it.
+                        if not self.queue.replace_item(
+                            pending_tail, replace(pending_tail, **stamps)
+                        ):
+                            span.set_attribute("song.tail_stamps_lost", True)
                     # stream_failed means THIS fragment never opened a stream —
                     # "nobody heard it" for a fresh song, but not for a resume tail,
                     # whose offset is audio heard under the fragment that parked it
@@ -3069,7 +3092,9 @@ class MusicPlayer:
                     # own bookkeeping, so the requeue never races it.
                     if stream_failed:
                         if folded_into_tail:
-                            # Already back on the queue, carrying the budget.
+                            # The tail IS the re-queue: back on the queue carrying
+                            # the budget stamped above, or off it by the mutation
+                            # that refused the stamp.
                             pass
                         elif retrying:
                             await self._retry_failed_stream(song)

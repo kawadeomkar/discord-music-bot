@@ -284,12 +284,15 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   200-entry LREMs that cost 1.6× the rebuild while holding one MULTI/EXEC, which stalls
   every guild, not just the one removing. A test pins the value (`≤ 18`) because the
   other tests size their input from the constant and move with it.
-- **A swapped-in item keeps the entry the list holds.** `requeue_front` may hand back a
-  claimed item's resolved or rebuilt form, which serializes differently from its entry.
-  `_listed` records the replaced entry, and `_mirror_entry()` serializes the item as it
-  for every byte-exact write: the rebuild, the LREM and `_claimed_blobs()`. Without it a
-  claimed swap hides from `_claimed_blobs()`, an LREM takes its entry instead of a
-  byte-identical twin's, and the song start's LPOP retires the next song's.
+- **A swapped-in item keeps the entry the list holds until a rebuild.** `requeue_front`
+  may hand back a claimed item's resolved or rebuilt form, and `replace_item` swaps a held
+  slot for a re-minted copy; both serialize differently from the entry. `_listed` records
+  the replaced entry, `_mirror_entry()` serializes the item as it for the byte-exact
+  writes — the LREM and `_claimed_blobs()` — and a rebuild writes the live objects and
+  drops the records of the ones it serialized, so a swap landing inside that write keeps
+  its own. Without the record a claimed swap hides from `_claimed_blobs()`, an LREM takes
+  its entry instead of a byte-identical twin's, and the song start's LPOP retires the
+  next song's.
 - `remove()` takes a **predicate**, and `remove_matcher()` beside the class owns the
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
   casefolds — folding a link would let one Spotify playlist's base62 id match another's.
@@ -473,9 +476,10 @@ the level baked into that source, and a requeued song is rebuilt at the level cu
 then. **Not gated on "playback-relevant"** —
 `user_input` and `persisted` are neither, and both were lost when the rebuilds copied
 field by field. The only ask field a playing song WRITES is `played_at`, whose setter
-writes through to the entry; a second write-through owes the same argument the first
-one makes (`docs/ARCHITECTURE.md#the-ask-a-playing-song-holds`), since a prefetched
-song's entry is still queued while it resolves. The rebuilds are
+replaces the entry the source holds (`song.queued`) with a stamped copy — the object the
+song was built from is never written, so a prefetched song's still-queued entry cannot
+be changed by it (`docs/ARCHITECTURE.md#the-ask-a-playing-song-holds`); a second stamp
+takes the same form. The rebuilds are
 invisible to the tests while their song fixtures are bare `MagicMock()` — drive one off
 a real `YTDL` (the `ytdl_instance` fixture takes carried fields as kwargs) or off a
 double wired with `give_queue_object`, so a dropped field fails the suite rather than a

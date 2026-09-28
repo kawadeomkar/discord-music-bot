@@ -346,7 +346,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
     ) -> None:
         """The one ask field a playing song WRITES, asserted on a real source: the
         doubles re-implement this setter on their own type, so every loop test
-        that stamps the start passes whether or not youtube.py's setter does."""
+        that stamps the start passes whether or not youtube.py's setter does.
+        The stamp lands on the entry the source holds, not on the object the
+        song was built from."""
         qobj = QueueObject(
             webpage_url="https://www.youtube.com/watch?v=test",
             title="Test Song",
@@ -356,8 +358,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
         song.played_at = 5.0
 
-        assert qobj.played_at == 5.0
+        assert song.queued.played_at == 5.0
         assert song.played_at == 5.0
+        assert qobj.played_at == 0.0
 
     async def test_no_queueobject_field_is_silently_left_behind(
         self, mock_ctx: MagicMock
@@ -543,6 +546,28 @@ class TestQueueObject:
         )
         assert q1 != q2
 
+    def test_a_queued_item_is_frozen(self, mock_author: MagicMock) -> None:
+        item = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        with pytest.raises(FrozenInstanceError):
+            setattr(item, "title", "Retitled")
+
+    def test_the_value_hash_is_not_what_the_queue_keys_on(
+        self, mock_author: MagicMock
+    ) -> None:
+        """Pins the class comment: frozen generates __hash__ over the fields, so
+        two distinct asks for one song are one element in a set, while the queue
+        tells them apart by identity (holds, display_index, _listed)."""
+        first = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        second = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        assert first is not second
+        assert {first, second} == {first}
+
     def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
         # webpage_url and title are both str: positional, either order type-checks.
         with pytest.raises(TypeError):
@@ -585,11 +610,39 @@ class TestQueueObject:
 
 
 class TestEnrichQueueObject:
+    def test_returns_the_same_object_when_nothing_is_missing(
+        self, mock_author: MagicMock
+    ) -> None:
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Song",
+            requester=mock_author,
+            duration=120,
+            uploader="Chan",
+            thumbnail="https://img.yt.com/x.jpg",
+        )
+        assert (
+            _enrich_queueobject(
+                qobj, {"duration": 1, "uploader": "Other", "thumbnail": "https://i/y"}
+            )
+            is qobj
+        )
+
+    def test_leaves_the_object_it_was_handed_as_it_was(
+        self, mock_author: MagicMock
+    ) -> None:
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
+        )
+        filled = _enrich_queueobject(qobj, {"duration": 180})
+        assert filled is not qobj
+        assert (qobj.duration, filled.duration) == (None, 180)
+
     def test_sets_duration_when_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
         )
-        _enrich_queueobject(qobj, {"duration": 180, "uploader": "Chan"})
+        qobj = _enrich_queueobject(qobj, {"duration": 180, "uploader": "Chan"})
         assert qobj.duration == 180
 
     def test_does_not_overwrite_existing_duration(self, mock_author: MagicMock) -> None:
@@ -599,14 +652,14 @@ class TestEnrichQueueObject:
             requester=mock_author,
             duration=120,
         )
-        _enrich_queueobject(qobj, {"duration": 999, "uploader": "Chan"})
+        qobj = _enrich_queueobject(qobj, {"duration": 999, "uploader": "Chan"})
         assert qobj.duration == 120
 
     def test_sets_uploader_when_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
         )
-        _enrich_queueobject(qobj, {"uploader": "My Channel"})
+        qobj = _enrich_queueobject(qobj, {"uploader": "My Channel"})
         assert qobj.uploader == "My Channel"
 
     def test_does_not_overwrite_existing_uploader(self, mock_author: MagicMock) -> None:
@@ -616,14 +669,14 @@ class TestEnrichQueueObject:
             requester=mock_author,
             uploader="Original",
         )
-        _enrich_queueobject(qobj, {"uploader": "New Channel"})
+        qobj = _enrich_queueobject(qobj, {"uploader": "New Channel"})
         assert qobj.uploader == "Original"
 
     def test_handles_missing_keys_gracefully(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
         )
-        _enrich_queueobject(qobj, {})
+        qobj = _enrich_queueobject(qobj, {})
         assert qobj.duration is None
         assert qobj.uploader is None
         assert qobj.thumbnail is None
@@ -632,7 +685,7 @@ class TestEnrichQueueObject:
         qobj = QueueObject(
             webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
         )
-        _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/x.jpg"})
+        qobj = _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/x.jpg"})
         assert qobj.thumbnail == "https://img.yt.com/x.jpg"
 
     def test_does_not_overwrite_existing_thumbnail(
@@ -644,14 +697,14 @@ class TestEnrichQueueObject:
             requester=mock_author,
             thumbnail="https://img.yt.com/original.jpg",
         )
-        _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/new.jpg"})
+        qobj = _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/new.jpg"})
         assert qobj.thumbnail == "https://img.yt.com/original.jpg"
 
     def test_duration_cast_to_int(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             webpage_url="https://yt.com/v=1", title="Song", requester=mock_author
         )
-        _enrich_queueobject(qobj, {"duration": 180.7})
+        qobj = _enrich_queueobject(qobj, {"duration": 180.7})
         assert qobj.duration == 180
         assert isinstance(qobj.duration, int)
 
@@ -3148,9 +3201,10 @@ class TestStreamExtractionSingleflight:
 
 
 class TestPrefetchStream:
-    """Its bool is a gate, not a hint: _interject_flow stops what is already
-    playing, so a head this could not extract must not get that far. Anything
-    unprovable answers True — the bot plays without Redis."""
+    """Its answer is a gate, not a hint: None means an extraction was tried and
+    produced nothing, and _interject_flow stops what is already playing, so a
+    head it could not extract must not get that far. Anything unprovable answers
+    with the item — the bot plays without Redis."""
 
     async def test_a_failed_extraction_reports_not_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -3161,7 +3215,7 @@ class TestPrefetchStream:
             webpage_url="https://yt.com/v=pfg1", title="Boom", requester=mock_ctx.author
         )
         with patch("src.youtube._ytdlp_extract", side_effect=ExtractionError("nope")):
-            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is None
 
     async def test_an_empty_extraction_reports_not_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -3172,7 +3226,7 @@ class TestPrefetchStream:
             requester=mock_ctx.author,
         )
         with patch("src.youtube._ytdlp_extract", return_value=None):
-            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is False
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is None
 
     async def test_a_warmed_song_reports_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -3182,7 +3236,7 @@ class TestPrefetchStream:
         )
         data = _fake_ytdl_data(webpage_url="https://yt.com/v=pfg3", title="Fine")
         with patch("src.youtube._ytdlp_extract", return_value=data):
-            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is not None
 
     async def test_no_redis_reports_warmed(self, mock_ctx: MagicMock) -> None:
         """Nothing to warm and nothing provable — not a "not playable" answer."""
@@ -3191,7 +3245,7 @@ class TestPrefetchStream:
             title="No Redis",
             requester=mock_ctx.author,
         )
-        assert await YTDL.prefetch_stream(qobj, redis=None) is True
+        assert await YTDL.prefetch_stream(qobj, redis=None) is qobj
 
     async def test_an_already_cached_song_reports_warmed(
         self, mock_ctx: MagicMock, fake_redis: Redis
@@ -3208,7 +3262,7 @@ class TestPrefetchStream:
             ),
         )
         with patch("src.youtube._ytdlp_extract") as extract:
-            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is True
+            assert await YTDL.prefetch_stream(qobj, redis=fake_redis) is not None
         extract.assert_not_called()
 
     async def test_populates_cache_on_miss(
@@ -4278,7 +4332,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 await asyncio.sleep(0)
             assert not prefetch.done()  # parked on the warm, not extracting
             release.set()
-            assert await prefetch is True
+            assert await prefetch is not None
         mock_extract.assert_not_called()
 
     async def test_the_warm_records_onto_a_span_that_is_still_open(
