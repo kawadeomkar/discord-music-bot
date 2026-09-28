@@ -1984,15 +1984,25 @@ class TestRestoreEntries:
         ) in caplog.text
 
     async def test_an_entry_dropped_for_its_requester_still_counts_old_shape(
-        self, gq: GuildQueue, mock_guild: MagicMock
+        self,
+        gq: GuildQueue,
+        mock_guild: MagicMock,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The tally counts what the list HELD, not what reached the deque: a
         dropped entry stays on the Redis list until the next rebuild, so a zero
-        that skipped it would retire the reader over bytes still at rest."""
+        that skipped it would retire the reader over bytes still at rest. The
+        denominator counts the same population — against the restored count it
+        would read "1 of 0" here."""
         mock_guild.owner = None
         mock_guild.get_member = MagicMock(return_value=None)
-        outcome = await gq.restore_entries([SearchQueueEntry(ytsearch="y")])
+        with caplog.at_level(logging.INFO):
+            outcome = await gq.restore_entries([SearchQueueEntry(ytsearch="y")])
         assert (outcome.restored, outcome.old_shape) == (0, 1)
+        assert (
+            f"Restored 0 queued songs for guild {gq._guild.id}; "
+            '1 of 1 entries were in the retired "ytsource" shape'
+        ) in caplog.text
 
     async def test_an_empty_restore_still_reports_zero(
         self, gq: GuildQueue, caplog: pytest.LogCaptureFixture
