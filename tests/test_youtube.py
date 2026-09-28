@@ -546,6 +546,13 @@ class TestQueueObject:
         )
         assert q1 != q2
 
+    def test_a_queued_item_is_frozen(self, mock_author: MagicMock) -> None:
+        item = QueueObject(
+            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
+        )
+        with pytest.raises(FrozenInstanceError):
+            setattr(item, "title", "Retitled")
+
     def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
         # webpage_url and title are both str: positional, either order type-checks.
         with pytest.raises(TypeError):

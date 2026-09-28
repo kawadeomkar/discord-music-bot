@@ -829,11 +829,13 @@ class TestSearchQueueEntryWire:
     def test_the_display_fields_round_trip(self) -> None:
         """What -queue shows for an unresolved Spotify track has to survive a
         restart, or a restored queue reads "resolving..." again."""
-        item = unresolved("DNA. Kendrick Lamar")
-        item.title = "DNA."
-        item.uploader = "Kendrick Lamar"
-        item.duration = 185
-        item.webpage_url = "https://open.spotify.com/track/abc"
+        item = unresolved(
+            "DNA. Kendrick Lamar",
+            title="DNA.",
+            uploader="Kendrick Lamar",
+            duration=185,
+            webpage_url="https://open.spotify.com/track/abc",
+        )
         parsed = parse_queue_entry(SearchQueueEntry.from_queue_object(item).to_redis())
         assert isinstance(parsed, SearchQueueEntry)
         assert (parsed.title, parsed.uploader, parsed.duration, parsed.webpage_url) == (

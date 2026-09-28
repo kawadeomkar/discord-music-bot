@@ -1,6 +1,7 @@
 """Tests for src/queue_rows.py — the row every queue listing shares."""
 
 import datetime
+from dataclasses import replace
 from typing import Any
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -120,8 +121,10 @@ class TestQueueRow:
     ) -> None:
         """The title sits inside a masked link's LABEL and is uploader-chosen: an
         unbalanced `]` closes the label early and re-points the link."""
-        item = _song(mock_author, duration=100)
-        item.title = "Song](https://evil.example) [FREE NITRO"
+        item = replace(
+            _song(mock_author, duration=100),
+            title="Song](https://evil.example) [FREE NITRO",
+        )
         line = queue_row(item, 1, now=_NOW, walk=_START)
         assert "](https://evil.example)" not in line
         assert "[FREE NITRO" not in line
@@ -255,9 +258,10 @@ class TestQueueRows:
         self, mock_author: MagicMock
     ) -> None:
         """Ten rows at both caps overflow a 4096-character description."""
-        items = [_song(mock_author, n, uploader="C" * 500) for n in range(ROW_LIMIT)]
-        for item in items:
-            item.title = "T" * 500
+        items = [
+            replace(_song(mock_author, n, uploader="C" * 500), title="T" * 500)
+            for n in range(ROW_LIMIT)
+        ]
         text = queue_rows(items, first_index=1, now=_NOW, walk=_START, budget=1500)
         shown = text.count("Est. playing at")
         assert 1 <= shown < ROW_LIMIT
