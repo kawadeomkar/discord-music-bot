@@ -136,6 +136,17 @@ class RemoveOutcome:
     mode: Optional[RemoveMode] = None
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RestoreOutcome:
+    """What restore_entries() replayed. Two counts of the same entries, so
+    kw_only: `restored` is how many reached the deque, `old_shape` how many of
+    the entries offered were still the retired "ytsource" shape. The caller
+    stamps both on the restore span."""
+
+    restored: int
+    old_shape: int
+
+
 def _to_entry(item: QueueObject) -> SongQueueEntry:
     """Live queue item → at-rest entry for the Redis mirror. One shape for every
     item: one still waiting to resolve writes its term under `ytsearch` and is
@@ -524,11 +535,11 @@ class GuildQueue:
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
         unreadable: int = 0,
-    ) -> int:
+    ) -> RestoreOutcome:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Returns the number restored, and
-        reports it — with how many entries were still in the "ytsource" shape —
-        on one INFO line, which is this restore's whole log output.
+        (they are already on the Redis list). Returns the number restored and
+        how many entries were still in the "ytsource" shape, and logs both on
+        one INFO line, unconditionally.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
@@ -538,8 +549,9 @@ class GuildQueue:
         owner, for entries persisted before searches carried a requester id."""
         count = 0
         dropped = 0
-        # Entries no build writes any more. Zero here across restarts is the
-        # measurement that lets the "ytsource" read leg go.
+        # Entries no build writes any more. Counted per restore and returned so
+        # the caller can stamp it on the span; a zero covers only the guilds this
+        # start restored. See docs/ARCHITECTURE.md#one-queue-item.
         old_shape = 0
         for entry in entries:
             if isinstance(entry, SearchQueueEntry):
@@ -570,7 +582,7 @@ class GuildQueue:
             '"ytsource" shape'
         )
         self._sync_wake()
-        return count
+        return RestoreOutcome(restored=count, old_shape=old_shape)
 
     # ── Display data (embed/ETA builders live in MusicPlayer) ─────────────────
 

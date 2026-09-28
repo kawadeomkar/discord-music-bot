@@ -329,7 +329,7 @@ class TestRemoveByOriginSurvivesARestart:
         restored = GuildQueue(mock_guild, store)
         snapshot = await store.get_playback_snapshot()
         assert snapshot is not None
-        assert await restored.restore_entries(snapshot.queue) == 4
+        assert (await restored.restore_entries(snapshot.queue)).restored == 4
 
         outcome = await restored.remove(remove_matcher(album))
 
@@ -1087,7 +1087,7 @@ class TestBlockingWait:
             title="Song 1",
             requester_id=mock_author.id,
         )
-        assert await gq_no_redis.restore_entries([entry]) == 1
+        assert (await gq_no_redis.restore_entries([entry])).restored == 1
 
         item = await asyncio.wait_for(getter, 0.5)
         assert isinstance(item, QueueObject)
@@ -1914,7 +1914,9 @@ class TestRestoreEntries:
         """An entry written before searches carried a requester: it restores
         against the guild owner, the same fallback a song entry takes, rather than
         being dropped."""
-        assert await gq.restore_entries([SearchQueueEntry(ytsearch="y")]) == 1
+        assert (
+            await gq.restore_entries([SearchQueueEntry(ytsearch="y")])
+        ).restored == 1
         assert gq.display_items()[0].requester is gq._guild.owner
 
     async def test_the_callers_fallback_is_taken_before_the_owner(
@@ -1925,10 +1927,10 @@ class TestRestoreEntries:
         exactly when a restart is still filling its caches. Both are available
         here: an owner nulled out would pass whichever way the two are ordered."""
         assert mock_guild.owner is not mock_author and mock_guild.owner is not None
-        count = await gq.restore_entries(
+        outcome = await gq.restore_entries(
             [SearchQueueEntry(ytsearch="y")], requester_fallback=mock_author
         )
-        assert count == 1
+        assert outcome.restored == 1
         assert gq.display_items()[0].requester is mock_author
 
     async def test_an_entry_nobody_can_be_found_for_is_reported(
@@ -1943,10 +1945,10 @@ class TestRestoreEntries:
         mock_guild.owner = None
         mock_guild.get_member = MagicMock(return_value=None)
         with caplog.at_level(logging.WARNING):
-            count = await gq.restore_entries(
+            outcome = await gq.restore_entries(
                 [SearchQueueEntry(ytsearch="y"), SearchQueueEntry(ytsearch="z")]
             )
-        assert count == 0
+        assert outcome.restored == 0
         assert gq.display_items() == []
         assert "dropped 2 restored queue entries" in caplog.text
 
@@ -1957,24 +1959,34 @@ class TestRestoreEntries:
         mock_author: MagicMock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """The number that says whether the "ytsource" reader can go yet. One
-        line per restore, carrying both counts."""
+        """The number that says whether the "ytsource" reader can go yet. It is
+        returned as well as logged, because the caller stamps it on the restore
+        span and an operator reads the gate from there."""
         mock_guild.get_member = MagicMock(return_value=mock_author)
         with caplog.at_level(logging.INFO):
-            assert (
-                await gq.restore_entries(
-                    [
-                        self._entry(1, mock_author.id),
-                        SearchQueueEntry(ytsearch="ytsearch:a", process=True),
-                        SearchQueueEntry(ytsearch="ytsearch:b", process=True),
-                    ]
-                )
-                == 3
+            outcome = await gq.restore_entries(
+                [
+                    self._entry(1, mock_author.id),
+                    SearchQueueEntry(ytsearch="ytsearch:a", process=True),
+                    SearchQueueEntry(ytsearch="ytsearch:b", process=True),
+                ]
             )
+        assert (outcome.restored, outcome.old_shape) == (3, 2)
         assert (
             f"Restored 3 queued songs for guild {gq._guild.id}; "
             '2 of 3 entries were in the retired "ytsource" shape'
         ) in caplog.text
+
+    async def test_an_entry_dropped_for_its_requester_still_counts_old_shape(
+        self, gq: GuildQueue, mock_guild: MagicMock
+    ) -> None:
+        """The tally counts what the list HELD, not what reached the deque: a
+        dropped entry stays on the Redis list until the next rebuild, so a zero
+        that skipped it would retire the reader over bytes still at rest."""
+        mock_guild.owner = None
+        mock_guild.get_member = MagicMock(return_value=None)
+        outcome = await gq.restore_entries([SearchQueueEntry(ytsearch="y")])
+        assert (outcome.restored, outcome.old_shape) == (0, 1)
 
     async def test_an_empty_restore_still_reports_zero(
         self, gq: GuildQueue, caplog: pytest.LogCaptureFixture
@@ -1983,7 +1995,8 @@ class TestRestoreEntries:
         is a guild whose queues were never looked at, which is not the same
         measurement as a zero."""
         with caplog.at_level(logging.INFO):
-            assert await gq.restore_entries([]) == 0
+            outcome = await gq.restore_entries([])
+        assert (outcome.restored, outcome.old_shape) == (0, 0)
         assert (
             f"Restored 0 queued songs for guild {gq._guild.id}; "
             '0 of 0 entries were in the retired "ytsource" shape'
@@ -2006,10 +2019,10 @@ class TestRestoreEntries:
         mock_author: MagicMock,
     ) -> None:
         mock_guild.get_member = MagicMock(return_value=mock_author)
-        count = await gq.restore_entries(
+        outcome = await gq.restore_entries(
             [self._entry(1, mock_author.id), self._entry(2, mock_author.id)]
         )
-        assert count == 2
+        assert outcome.restored == 2
         assert not gq.mirror_dirty
         items = gq.display_items()
         assert [queue_object(i).webpage_url for i in items] == [
@@ -2099,8 +2112,8 @@ class TestRestoreEntries:
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
         mock_guild.get_member = MagicMock(return_value=None)
-        count = await gq.restore_entries([self._entry(1, 12345)])
-        assert count == 1
+        outcome = await gq.restore_entries([self._entry(1, 12345)])
+        assert outcome.restored == 1
         assert queue_object(gq.display_items()[0]).requester is mock_guild.owner
 
     async def test_a_departed_member_still_resolves_through_the_user_cache(
@@ -2119,7 +2132,7 @@ class TestRestoreEntries:
             user_lookup=lambda uid: departed if uid == 4242 else None,
         )
 
-        assert await gq.restore_entries([self._entry(1, 4242)]) == 1
+        assert (await gq.restore_entries([self._entry(1, 4242)])).restored == 1
 
         assert queue_object(gq.display_items()[0]).requester is departed
 
@@ -2131,7 +2144,7 @@ class TestRestoreEntries:
         mock_guild.get_member = MagicMock(return_value=None)
         gq = GuildQueue(mock_guild, store, user_lookup=lambda _uid: None)
 
-        assert await gq.restore_entries([self._entry(1, 4242)]) == 1
+        assert (await gq.restore_entries([self._entry(1, 4242)])).restored == 1
 
         assert queue_object(gq.display_items()[0]).requester is mock_guild.owner
 
@@ -2140,8 +2153,8 @@ class TestRestoreEntries:
     ) -> None:
         mock_guild.get_member = MagicMock(return_value=None)
         mock_guild.owner = None
-        count = await gq.restore_entries([self._entry(1, 12345)])
-        assert count == 0
+        outcome = await gq.restore_entries([self._entry(1, 12345)])
+        assert outcome.restored == 0
         assert gq.qsize() == 0
 
     async def test_a_dropped_entry_marks_the_mirror_stale(
@@ -2170,7 +2183,7 @@ class TestRestoreEntries:
         for entry in entries:
             await store.push_queue(entry)
 
-        assert await gq.restore_entries(entries) == 2
+        assert (await gq.restore_entries(entries)).restored == 2
         assert gq.mirror_dirty
         assert await fake_redis.llen(store.queue_key()) == 3
 
@@ -2209,7 +2222,7 @@ class TestRestoreEntries:
         await fake_redis.rpush(store.queue_key(), b"not json")
         await store.push_queue(readable[1])
 
-        assert await gq.restore_entries(readable, unreadable=1) == 2
+        assert (await gq.restore_entries(readable, unreadable=1)).restored == 2
         assert gq.mirror_dirty
         assert await fake_redis.llen(store.queue_key()) == 3
 
@@ -2273,12 +2286,10 @@ class TestRestoreEntries:
         that link nowhere else, so losing it here breaks -remove after a restart."""
         mock_guild.get_member.return_value = mock_author
         album = "https://open.spotify.com/album/abc123"
-        assert (
-            await gq.restore_entries(
-                [SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)]
-            )
-            == 1
+        outcome = await gq.restore_entries(
+            [SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)]
         )
+        assert outcome.restored == 1
         (restored,) = gq.display_items()
         assert restored.user_input == album
 
@@ -2302,7 +2313,7 @@ class TestRestoreEntries:
             queued_at=1752529111.5,
             queue_position=7,
         )
-        assert await gq.restore_entries([song, search]) == 2
+        assert (await gq.restore_entries([song, search])).restored == 2
         restored_song, restored_search = gq.display_items()
         assert (
             restored_song.analytics.queued_at,
@@ -2317,8 +2328,8 @@ class TestRestoreEntries:
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
         entry = SearchQueueEntry(ytsearch="ytsearch:abc", process=True)
-        count = await gq.restore_entries([entry])
-        assert count == 1
+        outcome = await gq.restore_entries([entry])
+        assert outcome.restored == 1
         item = gq.display_items()[0]
         assert (item.search, item.title, item.webpage_url) == (
             "ytsearch:abc",
