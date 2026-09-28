@@ -1835,14 +1835,14 @@ class WriteResult:
     previous: Optional[GuildConfig]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _Entry:
     config: GuildConfig
     # The fields a successful read or a write has covered; the rest read as unset.
     known: frozenset[str]
 
 
-_EMPTY: Final = _Entry(_UNSET_CONFIG, ALL_CONFIG_FIELDS)
+_EMPTY: Final = _Entry(config=_UNSET_CONFIG, known=ALL_CONFIG_FIELDS)
 
 
 class _GuildLock:
@@ -2012,7 +2012,7 @@ class GuildSettings:
         if known is ALL_CONFIG_FIELDS and config == _UNSET_CONFIG:
             self._entries[guild_id] = _EMPTY
         else:
-            self._entries[guild_id] = _Entry(config, known)
+            self._entries[guild_id] = _Entry(config=config, known=known)
 
     # ── Reads into the cache ──────────────────────────────────────────────────
 
