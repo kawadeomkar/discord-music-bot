@@ -54,7 +54,10 @@ def gq_no_redis(mock_guild: MagicMock) -> GuildQueue:
 
 def _qobj(n: int, requester: Any, *, persisted: bool = True) -> QueueObject:
     return QueueObject(
-        f"https://yt.com/v={n}", f"Song {n}", requester, persisted=persisted
+        webpage_url=f"https://yt.com/v={n}",
+        title=f"Song {n}",
+        requester=requester,
+        persisted=persisted,
     )
 
 
@@ -154,7 +157,10 @@ class TestPut:
         of the deque."""
         keep = _qobj(1, mock_author)
         recovered = QueueObject(
-            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+            webpage_url="https://yt.com/v=crashed",
+            title="Crashed",
+            requester=mock_author,
+            persisted=False,
         )
         await gq.put([keep, recovered])
 
@@ -389,10 +395,18 @@ class TestSmallSurfacesThatNothingElseCovers:
         second copy of the live song's URL stops the live song being counted,
         which writes a queue_position one too low to play_history."""
         url = "https://yt.com/v=same"
-        await gq_no_redis.put([QueueObject(url, "Plain", mock_author)])
+        await gq_no_redis.put(
+            [QueueObject(webpage_url=url, title="Plain", requester=mock_author)]
+        )
         assert gq_no_redis.has_resume_tail(url) is False
 
-        await gq_no_redis.put([QueueObject(url, "Tail", mock_author, is_resume=True)])
+        await gq_no_redis.put(
+            [
+                QueueObject(
+                    webpage_url=url, title="Tail", requester=mock_author, is_resume=True
+                )
+            ]
+        )
         assert gq_no_redis.has_resume_tail(url) is True
 
     async def test_a_large_removal_from_a_short_queue_rebuilds(
@@ -404,7 +418,10 @@ class TestSmallSurfacesThatNothingElseCovers:
         await gq.put(
             [
                 QueueObject(
-                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                    webpage_url=f"https://yt.com/v={n}",
+                    title=f"T{n}",
+                    requester=mock_author,
+                    user_input=album,
                 )
                 for n in range(8)
             ]
@@ -532,7 +549,10 @@ async def test_a_rebuilding_removal_serializes_only_the_survivors(
     collection = "https://open.spotify.com/playlist/big"
     drops = [
         QueueObject(
-            f"https://yt.com/v=drop{n}", f"Drop {n}", mock_author, user_input=collection
+            webpage_url=f"https://yt.com/v=drop{n}",
+            title=f"Drop {n}",
+            requester=mock_author,
+            user_input=collection,
         )
         for n in range(_LREM_MAX_ENTRIES * 4)  # far past the count cap
     ]
@@ -669,9 +689,9 @@ class TestLremFallsBackWhenItCannotBeTrusted:
         collection = "https://open.spotify.com/playlist/cap"
         drops = [
             QueueObject(
-                f"https://yt.com/v=drop{n}",
-                f"Drop {n}",
-                mock_author,
+                webpage_url=f"https://yt.com/v=drop{n}",
+                title=f"Drop {n}",
+                requester=mock_author,
                 user_input=collection,
             )
             for n in range(_LREM_MAX_ENTRIES + 1)
@@ -741,9 +761,9 @@ class TestLremFallsBackWhenItCannotBeTrusted:
         collection = "https://open.spotify.com/playlist/hoist"
         drops = [
             QueueObject(
-                f"https://yt.com/v=drop{n}",
-                f"Drop {n}",
-                mock_author,
+                webpage_url=f"https://yt.com/v=drop{n}",
+                title=f"Drop {n}",
+                requester=mock_author,
                 user_input=collection,
             )
             for n in range(_LREM_MAX_ENTRIES + 1)  # one past the cap: rebuild path
@@ -1579,7 +1599,9 @@ class TestRemoveMatcher:
     tried first so every removal that worked before works identically."""
 
     def _song(self, url: str, origin: str | None) -> QueueObject:
-        return QueueObject(url, "Song", MagicMock(), user_input=origin)
+        return QueueObject(
+            webpage_url=url, title="Song", requester=MagicMock(), user_input=origin
+        )
 
     def test_an_empty_needle_matches_nothing(self) -> None:
         """An unresolved search carries url=None, which the resolved leg reads as
@@ -1687,7 +1709,11 @@ class TestRemove:
     ) -> None:
         target = _qobj(2, mock_author)
         other = _qobj(1, mock_author)
-        duplicate = QueueObject("https://yt.com/v=2", "Song 2 again", mock_author)
+        duplicate = QueueObject(
+            webpage_url="https://yt.com/v=2",
+            title="Song 2 again",
+            requester=mock_author,
+        )
         await gq.put([other, target, duplicate])
 
         outcome = await gq.remove(remove_matcher("https://yt.com/v=2"))
@@ -1770,7 +1796,11 @@ class TestResumeTailDepth:
 
     def _tail(self, n: int, requester: Any) -> QueueObject:
         return QueueObject(
-            f"https://yt.com/v={n}", f"Song {n}", requester, ts=30 * n, is_resume=True
+            webpage_url=f"https://yt.com/v={n}",
+            title=f"Song {n}",
+            requester=requester,
+            ts=30 * n,
+            is_resume=True,
         )
 
     async def test_empty_queue_is_zero(self, gq_no_redis: GuildQueue) -> None:
@@ -3221,7 +3251,10 @@ class TestMirrorWriteChoice:
         await gq.put(
             [
                 QueueObject(
-                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                    webpage_url=f"https://yt.com/v={n}",
+                    title=f"T{n}",
+                    requester=mock_author,
+                    user_input=album,
                 )
                 for n in range(_LREM_MAX_ENTRIES)
             ]
@@ -3242,7 +3275,10 @@ class TestMirrorWriteChoice:
         await gq.put(
             [
                 QueueObject(
-                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                    webpage_url=f"https://yt.com/v={n}",
+                    title=f"T{n}",
+                    requester=mock_author,
+                    user_input=album,
                 )
                 for n in range(_LREM_MAX_ENTRIES + 1)
             ]
@@ -3671,7 +3707,9 @@ class TestItemLabelNamesEveryItem:
     exact case the field was added for, and the one the -remove help advertises."""
 
     def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
-        item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
+        item = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Real Title", requester=mock_author
+        )
         assert item_label(item) == "Real Title"
 
     def test_an_unresolved_item_uses_its_search_text(self) -> None:
@@ -3685,7 +3723,14 @@ class TestItemLabelNamesEveryItem:
     def test_an_item_with_no_title_at_all_is_named(
         self, mock_author: MagicMock
     ) -> None:
-        assert item_label(QueueObject("https://yt.com/v=2", "", mock_author)) == "?"
+        assert (
+            item_label(
+                QueueObject(
+                    webpage_url="https://yt.com/v=2", title="", requester=mock_author
+                )
+            )
+            == "?"
+        )
 
     async def test_an_unresolved_link_falls_back_to_the_url(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock

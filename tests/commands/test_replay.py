@@ -669,7 +669,9 @@ class TestReplayCurrent:
     ) -> None:
         live_song.elapsed_secs = 42.0
         music_player.current_song = live_song
-        queued = QueueObject("https://yt.com/v=b", "Queued B", mock_author)
+        queued = QueueObject(
+            webpage_url="https://yt.com/v=b", title="Queued B", requester=mock_author
+        )
         await music_player.queue.put([queued])
 
         outcome = await replay_cmd.replay_current(
@@ -717,9 +719,9 @@ class TestReplayCurrent:
         give_queue_object(
             live_song,
             QueueObject(
-                live_song.webpage_url,
-                live_song.title,
-                mock_author,
+                webpage_url=live_song.webpage_url,
+                title=live_song.title,
+                requester=mock_author,
                 stream_attempts=2,
                 failed_format_ids=frozenset({"251"}),
             ),
@@ -749,9 +751,9 @@ class TestReplayCurrent:
         field at its default reads the inherited value as the reset."""
         live_song.elapsed_secs = 42.0
         accumulated = QueueObject(
-            live_song.webpage_url,
-            live_song.title,
-            mock_author,
+            webpage_url=live_song.webpage_url,
+            title=live_song.title,
+            requester=mock_author,
             ts=120,
             persisted=False,
             interjected=True,
@@ -1069,7 +1071,9 @@ class TestReplayCurrent:
         )
         async with asyncio.timeout(5):
             await claimed.wait()
-        interjection = QueueObject("https://yt.com/v=x", "Song X", mock_author)
+        interjection = QueueObject(
+            webpage_url="https://yt.com/v=x", title="Song X", requester=mock_author
+        )
 
         outcome = await music_player.interject(interjection, mock_vc)
         async with asyncio.timeout(5):
@@ -1298,7 +1302,10 @@ class TestReplayCurrent:
                 await mp.queue_shuffle()
         else:
             await mp.queue_put_next(
-                QueueObject("https://yt.com/v=n", "Next", author), prefetch=False
+                QueueObject(
+                    webpage_url="https://yt.com/v=n", title="Next", requester=author
+                ),
+                prefetch=False,
             )
 
     @pytest.mark.parametrize("command", ["clear", "shuffle", "next"])
@@ -1319,7 +1326,11 @@ class TestReplayCurrent:
         music_player.current_song = live_song
         await music_player.queue.put(
             [
-                QueueObject(f"https://yt.com/v={v}", f"Song {v}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v={v}",
+                    title=f"Song {v}",
+                    requester=mock_author,
+                )
                 for v in "bcde"
             ]
         )
@@ -1367,12 +1378,19 @@ class TestReplayCurrent:
         copy, so identity with the copy is what tells them apart."""
         music_player.current_song = live_song
         replay = QueueObject(
-            live_song.webpage_url, "Song A", mock_author, is_replay=True
+            webpage_url=live_song.webpage_url,
+            title="Song A",
+            requester=mock_author,
+            is_replay=True,
         )
         await music_player.queue.put(
             [replay]
             + [
-                QueueObject(f"https://yt.com/v={v}", f"Song {v}", mock_author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v={v}",
+                    title=f"Song {v}",
+                    requester=mock_author,
+                )
                 for v in "bcde"
             ]
         )

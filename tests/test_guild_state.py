@@ -1368,9 +1368,9 @@ def _history_song_stub(**overrides: Any) -> YTDL:
     # The entry keeps real strings whatever the payload holds: QueueObject's url
     # and title are `str`, and it is the yt-dlp payload that can answer None.
     queued = QueueObject(
-        "https://youtu.be/abc",
-        "Test Song",
-        cast(Any, ask.pop("requester")),
+        webpage_url="https://youtu.be/abc",
+        title="Test Song",
+        requester=cast(Any, ask.pop("requester")),
         **ask,
     )
     return cast(YTDL, SimpleNamespace(queued=queued, **payload))
@@ -1679,7 +1679,12 @@ class TestCrashedSongRoundTrip:
         song.title = "Interrupted Song"
         # The ask reads through the queue object, as it does on a real source, so
         # the values set below reach from_song's from_queue_object leg.
-        give_queue_object(song, QueueObject(song.webpage_url, song.title, MagicMock()))
+        give_queue_object(
+            song,
+            QueueObject(
+                webpage_url=song.webpage_url, title=song.title, requester=MagicMock()
+            ),
+        )
         song.requester = MagicMock()
         song.requester.id = 7
         song.duration_secs = 200

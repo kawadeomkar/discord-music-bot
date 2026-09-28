@@ -476,7 +476,11 @@ class TestGuildBlock:
         mock_guild.voice_client = None
         seed_queue(
             music_player.queue,
-            QueueObject("https://yt.com/watch?v=claimed", "Claimed", mock_author),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=claimed",
+                title="Claimed",
+                requester=mock_author,
+            ),
         )
         await music_player.queue.get()
         assert music_player.queue.qsize() == 0

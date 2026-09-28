@@ -51,7 +51,9 @@ async def settle(ticks: int = 12) -> None:
 
 
 def song(n: int, ctx: MagicMock) -> QueueObject:
-    return QueueObject(f"https://yt.com/v={n}", f"Song {n}", ctx.author)
+    return QueueObject(
+        webpage_url=f"https://yt.com/v={n}", title=f"Song {n}", requester=ctx.author
+    )
 
 
 @contextlib.contextmanager
@@ -321,9 +323,9 @@ def unresolved(term: str, requester: Any = None, **fields: Any) -> QueueObject:
     display fields arrive with the resolve. `title` and `webpage_url` are the two
     a walk DOES supply rows for, so both are keywords here and both default empty."""
     return QueueObject(
-        fields.pop("webpage_url", ""),
-        fields.pop("title", ""),
-        requester if requester is not None else stub_requester(),
+        webpage_url=fields.pop("webpage_url", ""),
+        title=fields.pop("title", ""),
+        requester=requester if requester is not None else stub_requester(),
         search=f"ytsearch:{term}",
         **fields,
     )
@@ -390,7 +392,9 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     song.position_secs = position
     song.produced_audio = True
     song.data = {}
-    give_queue_object(song, QueueObject(url, title, stub_requester()))
+    give_queue_object(
+        song, QueueObject(webpage_url=url, title=title, requester=stub_requester())
+    )
     return song
 
 

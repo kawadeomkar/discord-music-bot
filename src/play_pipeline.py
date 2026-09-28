@@ -429,10 +429,10 @@ async def _searches_for(
             QueueObject(
                 # The track's own page until the search resolves: what the listing
                 # links, and what -remove accepts for it.
-                row.url or "" if row else "",
+                webpage_url=row.url or "" if row else "",
                 # Empty without a row: every renderer falls back to the term.
-                row.name if row else "",
-                requester,
+                title=row.name if row else "",
+                requester=requester,
                 search=f"ytsearch:{title}",
                 user_input=origin,
                 query_source=QUERY_SOURCE_SPOTIFY,

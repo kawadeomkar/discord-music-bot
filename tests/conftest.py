@@ -569,7 +569,12 @@ def mock_song() -> MagicMock:
     # MagicMock, and played_at starts unstamped for the loop's or-stamp to fill.
     # A test assigning any of them moves it on the entry, so a rebuild reading
     # song.queued sees what the test set.
-    give_queue_object(song, QueueObject(song.webpage_url, song.title, requester))
+    give_queue_object(
+        song,
+        QueueObject(
+            webpage_url=song.webpage_url, title=song.title, requester=requester
+        ),
+    )
     # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the loop
     # reads `traceparent` off it to link this song's trace to the extraction that
     # minted its URL, and a MagicMock there would be a str where a str is parsed.
@@ -721,9 +726,9 @@ def ytdl_instance(
         if "start_offset" in carried:
             carried["ts"] = carried.pop("start_offset")
         queued = carried.pop("queued", None) or QueueObject(
-            str(default_data["webpage_url"]),
-            str(default_data["title"]),
-            carried.pop("requester", mock_author),
+            webpage_url=str(default_data["webpage_url"]),
+            title=str(default_data["title"]),
+            requester=carried.pop("requester", mock_author),
             **carried,
         )
         with patch.object(d.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):

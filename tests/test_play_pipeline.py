@@ -199,7 +199,11 @@ class TestQueueSource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
-        fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="My Track",
+            requester=mock_ctx.author,
+        )
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
         with patch(
@@ -220,7 +224,9 @@ class TestQueueSource:
     ) -> None:
         source = YTSource(url="https://yt.com/watch?v=abc", process=False)
         fake_qobj = QueueObject(
-            "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
+            webpage_url="https://yt.com/watch?v=abc",
+            title="YT Song",
+            requester=mock_ctx.author,
         )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
@@ -336,7 +342,11 @@ class TestTheStartOffsetReachesTheSong:
         source = parse_url("https://youtube.com/watch?v=vid4&list=PL1&index=4")
         tracks = [
             queue_object(
-                QueueObject(f"https://yt.com/v=vid{n}", f"S{n}", mock_ctx.author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v=vid{n}",
+                    title=f"S{n}",
+                    requester=mock_ctx.author,
+                )
             )
             for n in range(1, 6)
         ]
@@ -366,7 +376,11 @@ class TestTheStartOffsetReachesTheSong:
         source = parse_url("https://youtube.com/watch?v=vid4&list=PL1")
         tracks = [
             queue_object(
-                QueueObject(f"https://yt.com/v=vid{n}", f"S{n}", mock_ctx.author)
+                QueueObject(
+                    webpage_url=f"https://yt.com/v=vid{n}",
+                    title=f"S{n}",
+                    requester=mock_ctx.author,
+                )
             )
             for n in range(1, 6)
         ]
@@ -461,7 +475,10 @@ class TestStartOffsetRefusals:
 
     def test_an_offset_at_or_past_the_end_is_refused(self, mock_ctx: MagicMock) -> None:
         qobj = QueueObject(
-            "https://yt.com/v=1", "Test Song", mock_ctx.author, duration=210
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+            duration=210,
         )
         assert past_end_refusal(qobj, 210) is not None
         assert past_end_refusal(qobj, 900) is not None
@@ -474,7 +491,10 @@ class TestStartOffsetRefusals:
         ffmpeg judges it."""
         for duration in (None, 0):
             qobj = QueueObject(
-                "https://yt.com/v=1", "Live", mock_ctx.author, duration=duration
+                webpage_url="https://yt.com/v=1",
+                title="Live",
+                requester=mock_ctx.author,
+                duration=duration,
             )
             assert past_end_refusal(qobj, 9000) is None
 
@@ -482,7 +502,11 @@ class TestStartOffsetRefusals:
         """A link's own `?t=` past the end keeps starting at 0:00 as it always
         has; only the explicit flag is answered."""
         qobj = QueueObject(
-            "https://yt.com/v=1", "T", mock_ctx.author, duration=60, ts=900
+            webpage_url="https://yt.com/v=1",
+            title="T",
+            requester=mock_ctx.author,
+            duration=60,
+            ts=900,
         )
         assert past_end_refusal(qobj, None) is None
 
@@ -501,7 +525,11 @@ class TestStartOffsetRefusals:
         placement has to answer it the way the interjection does — there the head
         arrives as a bare QueueObject and would be checked either way."""
         head = QueueObject(
-            "https://yt.com/v=v4", "S4", mock_ctx.author, duration=210, ts=9000
+            webpage_url="https://yt.com/v=v4",
+            title="S4",
+            requester=mock_ctx.author,
+            duration=210,
+            ts=9000,
         )
         playlist = ResolvedPlaylist(tracks=[head])
         assert past_end_refusal(playlist, 9000) is not None
@@ -509,7 +537,10 @@ class TestStartOffsetRefusals:
 
     def test_it_names_both_clocks(self, mock_ctx: MagicMock) -> None:
         qobj = QueueObject(
-            "https://yt.com/v=1", "Test Song", mock_ctx.author, duration=210
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+            duration=210,
         )
         refusal = past_end_refusal(qobj, 7470)
         assert refusal is not None
@@ -521,7 +552,10 @@ class TestStartOffsetRefusals:
     ) -> None:
         """The title is yt-dlp's text on its way into an embed description."""
         qobj = QueueObject(
-            "https://yt.com/v=1", "[a](http://evil)`x`", mock_ctx.author, duration=60
+            webpage_url="https://yt.com/v=1",
+            title="[a](http://evil)`x`",
+            requester=mock_ctx.author,
+            duration=60,
         )
         refusal = past_end_refusal(qobj, 900)
         assert refusal is not None
@@ -575,7 +609,13 @@ class TestEnqueuePlaylist:
                 _enqueue_mp(mock_ctx),
                 yt,
                 ResolvedPlaylist(
-                    tracks=[QueueObject("https://yt.com/v=1", "T", mock_ctx.author)],
+                    tracks=[
+                        QueueObject(
+                            webpage_url="https://yt.com/v=1",
+                            title="T",
+                            requester=mock_ctx.author,
+                        )
+                    ],
                     link=yt.url,
                 ),
             )
@@ -633,9 +673,16 @@ class TestEnqueuePlaylist:
         )
         tracks = [
             QueueObject(
-                "https://yt.com/watch?v=1", "T1", mock_ctx.author, duration=100
+                webpage_url="https://yt.com/watch?v=1",
+                title="T1",
+                requester=mock_ctx.author,
+                duration=100,
             ),
-            QueueObject("https://yt.com/watch?v=2", "T2", mock_ctx.author),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=2",
+                title="T2",
+                requester=mock_ctx.author,
+            ),
         ]
         mp = _enqueue_mp(mock_ctx)
 
@@ -778,7 +825,13 @@ class TestEnqueuePlaylist:
             type=YTType.PLAYLIST,
             list_id="PLtest",
         )
-        tracks = [QueueObject("https://yt.com/watch?v=1", "T1", mock_ctx.author)]
+        tracks = [
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="T1",
+                requester=mock_ctx.author,
+            )
+        ]
         mp = _enqueue_mp(mock_ctx)
 
         await self._enqueue(
@@ -817,8 +870,16 @@ class TestEnqueuePlaylist:
             list_id="PLtest",
         )
         qobjs = [
-            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
-            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Track 1",
+                requester=mock_ctx.author,
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=2",
+                title="Track 2",
+                requester=mock_ctx.author,
+            ),
         ]
         mp = _enqueue_mp(mock_ctx)
 
@@ -855,7 +916,13 @@ class TestEnqueuePlaylist:
             list_id="PLtest",
             index=4,
         )
-        qobjs = [QueueObject("https://yt.com/watch?v=4", "Track 4", mock_ctx.author)]
+        qobjs = [
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=4",
+                title="Track 4",
+                requester=mock_ctx.author,
+            )
+        ]
         mp = _enqueue_mp(mock_ctx)
 
         await play_pipeline.enqueue_playlist(
@@ -881,7 +948,13 @@ class TestEnqueuePlaylist:
             type=YTType.PLAYLIST,
             list_id="PLtest",
         )
-        qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
+        qobjs = [
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Track 1",
+                requester=mock_ctx.author,
+            )
+        ]
         mp = _enqueue_mp(mock_ctx)
 
         await play_pipeline.enqueue_playlist(
@@ -906,7 +979,13 @@ class TestEnqueuePlaylist:
             type=YTType.PLAYLIST,
             list_id="PLtest",
         )
-        qobjs = [QueueObject("https://yt.com/watch?v=1", "Only Track", mock_ctx.author)]
+        qobjs = [
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Only Track",
+                requester=mock_ctx.author,
+            )
+        ]
         mp = _enqueue_mp(mock_ctx)
 
         await play_pipeline.enqueue_playlist(
@@ -932,7 +1011,13 @@ class TestEnqueuePlaylist:
             type=YTType.PLAYLIST,
             list_id="PLtest",
         )
-        qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
+        qobjs = [
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Track 1",
+                requester=mock_ctx.author,
+            )
+        ]
         mp = _enqueue_mp(mock_ctx)
 
         await play_pipeline.enqueue_playlist(
@@ -1154,8 +1239,16 @@ class TestEnqueuePlaylist:
         queue_put_next's neutralize under it — so the settle is hoisted once, above
         the branch, for the same reason the single-track route hoists its own."""
         qobjs = [
-            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
-            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Track 1",
+                requester=mock_ctx.author,
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=2",
+                title="Track 2",
+                requester=mock_ctx.author,
+            ),
         ]
         mp = _enqueue_mp(mock_ctx)
         order: list[str] = []
@@ -1223,7 +1316,10 @@ class TestEnqueuePlaylist:
         mp.queue_put_next = AsyncMock(side_effect=_put_front)
         tracks = [
             QueueObject(
-                f"https://yt.com/v={n}", f"T{n}", mock_ctx.author, user_input=link
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=mock_ctx.author,
+                user_input=link,
             )
             for n in range(4)
         ]
@@ -1280,7 +1376,10 @@ class TestEnqueueSingle:
         mp.queue_put = AsyncMock(side_effect=_put)
         head, *tail = [
             QueueObject(
-                f"https://yt.com/v={n}", f"T{n}", mock_ctx.author, user_input=link
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=mock_ctx.author,
+                user_input=link,
             )
             for n in range(4)
         ]
@@ -1313,9 +1412,15 @@ class TestEnqueueSingle:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = mock_mp()
-        head = QueueObject("https://yt.com/v=0", "Head", mock_ctx.author)
+        head = QueueObject(
+            webpage_url="https://yt.com/v=0", title="Head", requester=mock_ctx.author
+        )
         tail = [
-            QueueObject(f"https://yt.com/v={n}", f"T{n}", mock_ctx.author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=mock_ctx.author,
+            )
             for n in (1, 2)
         ]
 
@@ -1358,7 +1463,11 @@ class TestEnqueueSingle:
             MagicMock(spec=discord.VoiceClient), mock_ctx
         )
         mock_ctx.voice_client.is_playing.return_value = True
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         mp = self._playing_mp(head=qobj)
 
         await play_pipeline.enqueue_single(
@@ -1380,7 +1489,11 @@ class TestEnqueueSingle:
             MagicMock(spec=discord.VoiceClient), mock_ctx
         )
         mock_ctx.voice_client.is_playing.return_value = True
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         mp = self._playing_mp()  # head is some other song
 
         await play_pipeline.enqueue_single(
@@ -1407,7 +1520,11 @@ class TestEnqueueSingle:
             MagicMock(spec=discord.VoiceClient), mock_ctx
         )
         mock_ctx.voice_client.is_playing.return_value = True
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         mp = self._playing_mp(head=qobj)
         mp.repin_now_playing = AsyncMock(return_value=False)
 
@@ -1433,7 +1550,11 @@ class TestEnqueueSingle:
             MagicMock(spec=discord.VoiceClient), mock_ctx
         )
         mock_ctx.voice_client.is_playing.return_value = True
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         mp = self._playing_mp(head=qobj)
 
         await play_pipeline.enqueue_single(
@@ -1455,7 +1576,11 @@ class TestEnqueueSingle:
             MagicMock(spec=discord.VoiceClient), mock_ctx
         )
         mock_ctx.voice_client.is_playing.return_value = True
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         mp = self._playing_mp()
 
         await play_pipeline.enqueue_single(
@@ -1481,7 +1606,11 @@ class TestEnqueueSingle:
             MagicMock(spec=discord.VoiceClient), mock_ctx
         )
         mock_ctx.voice_client.is_playing.return_value = True
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         mp = self._playing_mp(head=None)
         mp.queue.peek_next = MagicMock(return_value=None)
 
@@ -1504,7 +1633,11 @@ class TestEnqueueSingle:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mock_ctx.voice_client = None
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
 
         mp = MagicMock()
         mp.queue.display_size.return_value = 0
@@ -1534,7 +1667,11 @@ class TestASongBehindTheInFlightHeadIsConfirmed:
         mp.queue.qsize = MagicMock(return_value=0)
         mp.queue.display_size = MagicMock(return_value=1)
         mp.queue.peek_next = MagicMock(return_value=None)
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
 
         await play_pipeline.enqueue_single(
             mock_ctx, qobj, mp, admit(music_bot, mock_ctx, mp), cog=music_bot
@@ -1552,7 +1689,11 @@ class TestTimestampWarningReachesTheUser:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = mock_mp(qsize=3)  # something already queued
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
 
         await play_pipeline.enqueue_single(
             mock_ctx,
@@ -1576,7 +1717,11 @@ class TestTimestampWarningReachesTheUser:
         mp = mock_mp()
         mock_ctx.voice_client = connected_vc(mock_ctx)
         mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
 
         await play_pipeline.enqueue_single(
             mock_ctx,
@@ -1601,7 +1746,11 @@ class TestTimestampWarningReachesTheUser:
         build their own embeds. `-p --next <link>?t=bogus` would otherwise lose the
         only word the user gets that the timestamp was ignored."""
         mp = mock_mp(qsize=3)
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
 
         await play_pipeline.enqueue_single(
             mock_ctx,
@@ -1636,7 +1785,11 @@ class TestQuerySourceClassification:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
-        fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="My Track",
+            requester=mock_ctx.author,
+        )
         assert music_bot.spotify is not None
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
         spy = AsyncMock(return_value=fake_qobj)
@@ -1655,7 +1808,9 @@ class TestQuerySourceClassification:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = parse_input("never gonna give you up")
-        fake_qobj = QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song", requester=mock_ctx.author
+        )
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):
             await play_pipeline.queue_source(
@@ -1673,7 +1828,9 @@ class TestQuerySourceClassification:
     ) -> None:
         url = "https://www.tiktok.com/@user/video/1234567890"
         source = parse_input(url)
-        fake_qobj = QueueObject(url, "Clip", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url=url, title="Clip", requester=mock_ctx.author
+        )
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):
             await play_pipeline.queue_source(
@@ -1694,7 +1851,11 @@ class TestQuerySourceClassification:
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
         tracks = [
-            QueueObject(f"https://yt.com/v={i}", f"T{i}", mock_ctx.author)
+            QueueObject(
+                webpage_url=f"https://yt.com/v={i}",
+                title=f"T{i}",
+                requester=mock_ctx.author,
+            )
             for i in range(3)
         ]
         spy = stub_yt_playlist(tracks)
@@ -1713,7 +1874,11 @@ class TestQuerySourceClassification:
     @staticmethod
     def _yt_tracks(author: MagicMock, count: int) -> list[QueueObject]:
         return [
-            QueueObject(f"https://yt.com/watch?v=v{i}", f"T{i}", author)
+            QueueObject(
+                webpage_url=f"https://yt.com/watch?v=v{i}",
+                title=f"T{i}",
+                requester=author,
+            )
             for i in range(count)
         ]
 
@@ -1748,9 +1913,9 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = [
             QueueObject(
-                f"https://yt.com/watch?v=v{i}",
-                f"T{i}",
-                mock_ctx.author,
+                webpage_url=f"https://yt.com/watch?v=v{i}",
+                title=f"T{i}",
+                requester=mock_ctx.author,
                 analytics=Analytics(queued_at=1752530000.5, queue_position=i),
             )
             for i in range(6)
@@ -1780,9 +1945,9 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = [
             QueueObject(
-                f"https://yt.com/watch?v=v{i}",
-                f"T{i}",
-                mock_ctx.author,
+                webpage_url=f"https://yt.com/watch?v=v{i}",
+                title=f"T{i}",
+                requester=mock_ctx.author,
                 analytics=Analytics(queued_at=1752530000.5, queue_position=2 + i),
             )
             for i in range(5)
@@ -2002,7 +2167,9 @@ class TestQuerySourceClassification:
                 unavailable=0,
             )
         )
-        fake_qobj = QueueObject("https://yt.com/v=1", "Song A", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="Song A", requester=mock_ctx.author
+        )
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):
             await play_pipeline._resolve_interjection_source(
@@ -2015,7 +2182,11 @@ class TestQuerySourceClassification:
     ) -> None:
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
-        tracks = [QueueObject("https://yt.com/v=1", "T", mock_ctx.author)]
+        tracks = [
+            QueueObject(
+                webpage_url="https://yt.com/v=1", title="T", requester=mock_ctx.author
+            )
+        ]
         spy = stub_yt_playlist(tracks)
         with patch("src.play_pipeline.YTDL.yt_playlist", new=spy):
             await play_pipeline._resolve_interjection_source(
@@ -2033,9 +2204,9 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = [
             QueueObject(
-                f"https://yt.com/watch?v=v{i}",
-                f"T{i}",
-                mock_ctx.author,
+                webpage_url=f"https://yt.com/watch?v=v{i}",
+                title=f"T{i}",
+                requester=mock_ctx.author,
                 analytics=Analytics(queued_at=1752530000.5, queue_position=i),
             )
             for i in range(6)
@@ -2059,7 +2230,9 @@ class TestQuerySourceClassification:
         # queue depth at all — and its queued_at is still the ask time.
         url = "https://www.youtube.com/watch?v=abc"
         source = parse_input(url)
-        fake_qobj = QueueObject(url, "Song", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url=url, title="Song", requester=mock_ctx.author
+        )
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):
             await play_pipeline._resolve_interjection_source(
@@ -2158,7 +2331,9 @@ class TestSpotifyDisabled:
         music_bot.spotify_status = SpotifyStatus.DISABLED
         source = YTSource(url="https://yt.com/watch?v=abc", process=False)
         fake_qobj = QueueObject(
-            "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
+            webpage_url="https://yt.com/watch?v=abc",
+            title="YT Song",
+            requester=mock_ctx.author,
         )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
@@ -2188,7 +2363,11 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = YTSource(ytsearch="ytsearch:test song", process=True)
-        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        fake_qobj = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Test Song",
+            requester=mock_ctx.author,
+        )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ) as mock_yt:
@@ -2213,8 +2392,16 @@ class TestSpotifyDisabled:
             list_id="PLtest123",
         )
         fake_qobjs = [
-            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
-            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Track 1",
+                requester=mock_ctx.author,
+            ),
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=2",
+                title="Track 2",
+                requester=mock_ctx.author,
+            ),
         ]
         with patch(
             "src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(fake_qobjs)
@@ -2251,7 +2438,13 @@ class TestSpotifyDisabled:
             type=YTType.PLAYLIST,
             list_id="PLtest123",
         )
-        tracks = [QueueObject("https://yt.com/watch?v=1", "T1", mock_ctx.author)]
+        tracks = [
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="T1",
+                requester=mock_ctx.author,
+            )
+        ]
         with patch(
             "src.play_pipeline.YTDL.yt_playlist",
             new=stub_yt_playlist(tracks, title="Road Trip", unavailable=3),
@@ -2302,7 +2495,11 @@ class TestSpotifyDisabled:
             list_id="RDXfHbPIx42uo",
         )
         fake_qobjs = [
-            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)
+            QueueObject(
+                webpage_url="https://yt.com/watch?v=1",
+                title="Track 1",
+                requester=mock_ctx.author,
+            )
         ]
         with patch(
             "src.play_pipeline.YTDL.yt_playlist", new=stub_yt_playlist(fake_qobjs)
@@ -2344,7 +2541,9 @@ class TestInterjectionCollectionHandling:
                 unavailable=0,
             )
         )
-        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        head = QueueObject(
+            webpage_url="https://yt.com/v=h", title="Head", requester=mock_ctx.author
+        )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
         ):
@@ -2357,7 +2556,11 @@ class TestInterjectionCollectionHandling:
     @staticmethod
     def _yt_tracks(author: MagicMock, count: int) -> list[QueueObject]:
         return [
-            QueueObject(f"https://yt.com/watch?v=v{i}", f"T{i}", author)
+            QueueObject(
+                webpage_url=f"https://yt.com/watch?v=v{i}",
+                title=f"T{i}",
+                requester=author,
+            )
             for i in range(count)
         ]
 
@@ -2388,9 +2591,9 @@ class TestInterjectionCollectionHandling:
         source = parse_input(url)
         tracks = [
             QueueObject(
-                f"https://yt.com/watch?v=v{i}",
-                f"T{i}",
-                mock_ctx.author,
+                webpage_url=f"https://yt.com/watch?v=v{i}",
+                title=f"T{i}",
+                requester=mock_ctx.author,
                 analytics=Analytics(queued_at=1752530000.5, queue_position=i),
             )
             for i in range(6)
@@ -2424,9 +2627,9 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
         mp = self._wire(music_bot, mock_ctx, depth)
         tracks = [
             QueueObject(
-                f"https://yt.com/v={n}",
-                f"T{n}",
-                mock_ctx.author,
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=mock_ctx.author,
                 analytics=Analytics(queued_at=1.0, queue_position=n),
             )
             for n in range(3)
@@ -2462,9 +2665,9 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
         mp.enqueue_depth = MagicMock(side_effect=_depth)
         tracks = [
             QueueObject(
-                f"https://yt.com/v={n}",
-                f"T{n}",
-                mock_ctx.author,
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=mock_ctx.author,
                 analytics=Analytics(queued_at=1.0, queue_position=n),
             )
             for n in range(3)
@@ -2487,7 +2690,10 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
         the common case free."""
         tracks = [
             QueueObject(
-                f"https://yt.com/v={n}", f"T{n}", MagicMock(), analytics=_ANALYTICS
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=MagicMock(),
+                analytics=_ANALYTICS,
             )
             for n in range(3)
         ]
@@ -2508,7 +2714,10 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
         monkeypatch.setattr(play_pipeline, "_REBASE_CHUNK", 2)
         tracks = [
             QueueObject(
-                f"https://yt.com/v={n}", f"T{n}", MagicMock(), analytics=_ANALYTICS
+                webpage_url=f"https://yt.com/v={n}",
+                title=f"T{n}",
+                requester=MagicMock(),
+                analytics=_ANALYTICS,
             )
             for n in range(5)
         ]
@@ -2550,7 +2759,11 @@ class TestResolveModeThreading:
         mode: ResolveMode,
     ) -> AsyncMock:
         spy = AsyncMock(
-            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song",
+                requester=mock_ctx.author,
+            )
         )
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):
             await play_pipeline.queue_source(
@@ -2635,7 +2848,11 @@ class TestResolveModeThreading:
         """interject() stops the current song; a head that turns out to be
         unplayable would have stopped it for nothing."""
         spy = AsyncMock(
-            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="Song",
+                requester=mock_ctx.author,
+            )
         )
         with patch.object(play_pipeline, "queue_source", new=spy):
             await play_pipeline._resolve_interjection_source(
@@ -2657,7 +2874,9 @@ class TestTheResumeNoticeDescribesARestoredQueue:
         mp.queue.qsize = MagicMock(return_value=1)
         mock_ctx.voice_client = connected_vc(mock_ctx)
         music_bot.get_mp = MagicMock(return_value=mp)
-        qobj = QueueObject("https://yt.com/v=2", "Second", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=2", title="Second", requester=mock_ctx.author
+        )
 
         first = admit(music_bot, mock_ctx, mp)
         first.placed = True
@@ -2681,7 +2900,9 @@ class TestTheResumeNoticeDescribesARestoredQueue:
         mp = mock_mp()
         mock_ctx.voice_client = connected_vc(mock_ctx)
         music_bot.get_mp = MagicMock(return_value=mp)
-        qobj = QueueObject("https://yt.com/v=1", "First", mock_ctx.author)
+        qobj = QueueObject(
+            webpage_url="https://yt.com/v=1", title="First", requester=mock_ctx.author
+        )
 
         await play_pipeline.enqueue_single(
             mock_ctx,
@@ -2787,7 +3008,10 @@ class TestCollectionNote:
     ) -> None:
         note = collection_note(url, 483, head_playing=False, noun="playlist")
         track = QueueObject(
-            "https://www.youtube.com/watch?v=x", "X", mock_ctx.author, user_input=url
+            webpage_url="https://www.youtube.com/watch?v=x",
+            title="X",
+            requester=mock_ctx.author,
+            user_input=url,
         )
         assert remove_matcher(self._copied(note))(track) is RemoveMode.ORIGIN
 
@@ -3101,7 +3325,11 @@ class TestTheYoutubeCollectionResult:
         return YoutubePlaylist(
             title="Road Trip",
             tracks=[
-                QueueObject(f"https://yt.com/watch?v={n}", f"T{n}", stub_requester())
+                QueueObject(
+                    webpage_url=f"https://yt.com/watch?v={n}",
+                    title=f"T{n}",
+                    requester=stub_requester(),
+                )
                 for n in range(3)
             ],
             unavailable=3,
@@ -3227,7 +3455,11 @@ class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
         # Three tracks, so an arm that queued a prefix of the walk shows up as a
         # shorter list than the one the stub returned.
         walked = [
-            QueueObject(f"https://yt.com/watch?v={n}", f"T{n}", mock_ctx.author)
+            QueueObject(
+                webpage_url=f"https://yt.com/watch?v={n}",
+                title=f"T{n}",
+                requester=mock_ctx.author,
+            )
             for n in range(3)
         ]
         stub = stub_yt_playlist(walked, title="Road Trip", unavailable=2)
@@ -3450,7 +3682,9 @@ class TestSpotifyAlbum:
         music_bot.spotify.album = AsyncMock(
             return_value=_album_walk(titles=["Head", "Two"], short=True)
         )
-        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        head = QueueObject(
+            webpage_url="https://yt.com/v=h", title="Head", requester=mock_ctx.author
+        )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
         ):
@@ -3566,7 +3800,9 @@ class TestSpotifyAlbum:
         music_bot.spotify.album = AsyncMock(
             return_value=_album_walk(titles=["Head", "Two", "Three"])
         )
-        head = QueueObject("https://yt.com/v=h", "Head", mock_ctx.author)
+        head = QueueObject(
+            webpage_url="https://yt.com/v=h", title="Head", requester=mock_ctx.author
+        )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=head)
         ) as resolve:

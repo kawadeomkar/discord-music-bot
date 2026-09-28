@@ -1219,7 +1219,7 @@ class NpHostRef:
 # searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
 # against 344 B for the same instance carrying a __dict__. Keep the class free of
 # __dict__ readers (asdict/vars) and off any pickle path.
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class QueueObject:
     """One queued song, resolved or not. A track queued from a Spotify playlist
     arrives as a search: `search` set, `webpage_url` its own Spotify page or empty.
@@ -1228,8 +1228,8 @@ class QueueObject:
     about the ask is the same either way, which is why there is one type — see
     docs/ARCHITECTURE.md#one-queue-item.
 
-    Neither `frozen` nor `kw_only`: `_enrich_queueobject`, the `played_at` stamp and
-    a resume tail's NP ids all write attributes on a live item."""
+    Not `frozen`: `_enrich_queueobject`, the `played_at` stamp and a resume tail's
+    NP ids all write attributes on a live item."""
 
     webpage_url: str
     title: str
@@ -1382,9 +1382,9 @@ def _queue_object_from_identity(
     """The one place a resolved identity becomes a queue entry — shared by the flat
     path, the full path and a source-cache hit, so all three build the same object."""
     return QueueObject(
-        identity.webpage_url,
-        identity.title,
-        requester,
+        webpage_url=identity.webpage_url,
+        title=identity.title,
+        requester=requester,
         ts=ts,
         user_input=user_input,
         duration=identity.duration,
