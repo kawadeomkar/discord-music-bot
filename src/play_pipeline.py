@@ -555,7 +555,8 @@ async def _warm_front_track(
     enqueues pass prefetch=False, and under `--next` queue_put_next killed the
     loop's one-ahead prefetch, so the head is left with no warm at all. An item
     that has not resolved has no URL yet; it resolves at dequeue. The head is
-    queued already, so what the warm back-fills goes into its slot."""
+    queued already, so what the warm back-fills goes into its slot — or nowhere,
+    when it has left the queue, and only display fields go with it."""
     if placement is not Placement.NEXT or not tracks:
         return
     head = tracks[0]

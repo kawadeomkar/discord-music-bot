@@ -10468,6 +10468,32 @@ class TestStreamRetry:
         # the attempt instead — otherwise one -playnow per attempt is an endless chain.
         assert requeued.stream_attempts == 1
 
+    async def test_a_tail_that_left_the_queue_says_so_on_the_song_s_span(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The death window awaits the prefetch between interject() parking the
+        tail and this stamp, and a -clear/-remove there takes the tail off the
+        deque. The queue then refuses the swap and the spent retry budget and the
+        frozen card's ids go with it — silently, unless the iteration says so."""
+        tail = QueueObject(
+            webpage_url=mock_song.webpage_url,
+            title=mock_song.title,
+            requester=mock_song.requester,
+            ts=42,
+            is_resume=True,
+        )
+        music_player._pending_resume_tail = tail
+        music_player._skip_history_for = mock_song
+
+        # Parked but never queued: the state a mutation in that window leaves.
+        with _recording_tracer() as exporter:
+            await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert not music_player.queue.holds(tail)
+        (iteration,) = _iterations(exporter)
+        assert iteration.attributes is not None
+        assert iteration.attributes["song.tail_stamps_lost"] is True
+
     async def test_a_resume_flag_alone_does_not_make_a_retry_inherit_the_stamp(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:

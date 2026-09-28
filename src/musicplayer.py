@@ -1033,7 +1033,9 @@ class MusicPlayer:
             warmed = await YTDL.prefetch_stream(item, redis=self.store.redis)
         if warmed is not None:
             # The back-fill goes into the queue's slot for the item; a card already
-            # rendered from the old object shows it when it next re-renders.
+            # rendered from the old object shows it when it next re-renders. A
+            # refused swap means the item left the queue, and what it drops is
+            # display fields the play-time resolve derives again.
             self.queue.replace_item(item, warmed)
 
     async def queue_put_front(
@@ -3034,9 +3036,12 @@ class MusicPlayer:
                     if stamps and pending_tail is not None:
                         # interject() put the tail on the deque, so the queue swaps
                         # its slot for the stamped copy, which the next rebuild writes.
-                        self.queue.replace_item(
+                        # A refused swap is a -clear/-remove inside the prefetch
+                        # await above: the tail is gone and the stamps go with it.
+                        if not self.queue.replace_item(
                             pending_tail, replace(pending_tail, **stamps)
-                        )
+                        ):
+                            span.set_attribute("song.tail_stamps_lost", True)
                     # stream_failed means THIS fragment never opened a stream —
                     # "nobody heard it" for a fresh song, but not for a resume tail,
                     # whose offset is audio heard under the fragment that parked it
@@ -3087,7 +3092,9 @@ class MusicPlayer:
                     # own bookkeeping, so the requeue never races it.
                     if stream_failed:
                         if folded_into_tail:
-                            # Already back on the queue, carrying the budget.
+                            # The tail IS the re-queue: back on the queue carrying
+                            # the budget stamped above, or off it by the mutation
+                            # that refused the stamp.
                             pass
                         elif retrying:
                             await self._retry_failed_stream(song)
