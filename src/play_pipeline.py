@@ -138,8 +138,8 @@ class EmptyPlaylistError(PlaylistInputError):
 
 
 # kw_only: `title` and `link` are adjacent Optional[str]s that transpose silently.
-# frozen: nothing writes a field back; the enqueue re-mints the ITEMS in place
-# (with_queue_position) and rebinds its own local for the list.
+# frozen: nothing writes a field back; the enqueue re-mints the ITEMS into a new
+# list (with_queue_position) and rebinds its own local for it.
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ResolvedPlaylist:
     """A collection resolved to queue items. A Spotify collection's items are
