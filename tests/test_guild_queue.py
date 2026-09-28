@@ -1960,6 +1960,19 @@ class TestRestoreEntries:
         assert gq.display_items() == []
         assert "dropped 2 restored queue entries" in caplog.text
 
+    async def test_an_empty_restore_still_reports_zero(
+        self,
+        gq: GuildQueue,
+        mock_guild: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The INFO line is unconditional, and it is the whole log output of a
+        restore: an operator reading a restart needs the zero as much as any
+        other count, and a guild that restored nothing prints nothing else."""
+        with caplog.at_level(logging.INFO, logger="src.guild_queue"):
+            assert await gq.restore_entries([]) == 0
+        assert f"Restored 0 queued songs for guild {mock_guild.id}" in caplog.text
+
     def _entry(self, n: int, requester_id: int) -> SongQueueEntry:
         return SongQueueEntry(
             webpage_url=f"https://yt.com/v={n}",
