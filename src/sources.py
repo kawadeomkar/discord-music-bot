@@ -154,7 +154,7 @@ class YTType(Enum):
     PLAYLIST = "playlist"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SpotifySource:
     type: SpotifyType
     id: str
@@ -464,7 +464,7 @@ def _spotify_source(kind: str, spotify_id: str) -> SpotifySource:
             "again from Spotify."
         )
     log.info(f"Spotify source ID: {spotify_id}")
-    return SpotifySource(spotify_type, spotify_id, process=True)
+    return SpotifySource(type=spotify_type, id=spotify_id, process=True)
 
 
 def unquote_argument(text: str) -> str:

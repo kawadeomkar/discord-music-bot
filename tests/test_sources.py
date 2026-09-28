@@ -412,7 +412,9 @@ class TestParseUrlSpotify:
         """Localized clients prefix `intl-<locale>`, and the embed player `embed/`.
         Real locales answer 200 on that path, so it is what users paste."""
         result = parse_url(f"https://open.spotify.com/{path}")
-        assert result == SpotifySource(SpotifyType.TRACK, "4cOdK2wGLETKBW3PvgPWqT")
+        assert result == SpotifySource(
+            type=SpotifyType.TRACK, id="4cOdK2wGLETKBW3PvgPWqT"
+        )
 
     @pytest.mark.parametrize(
         "link",
@@ -427,7 +429,9 @@ class TestParseUrlSpotify:
         self, link: str
     ) -> None:
         result = parse_input(link)
-        assert result == SpotifySource(SpotifyType.PLAYLIST, "37i9dQZF1DXcBWIGoYBM5M")
+        assert result == SpotifySource(
+            type=SpotifyType.PLAYLIST, id="37i9dQZF1DXcBWIGoYBM5M"
+        )
 
     def test_a_uri_that_is_not_a_spotify_item_stays_a_search(self) -> None:
         """Only the exact URI shape is Spotify's; anything else spelled with the
@@ -1398,3 +1402,11 @@ class TestParseResultsMeetTheDataclassConvention:
         assert not hasattr(source, "__dict__")
         with pytest.raises(TypeError):
             YTSource("https://yt.com/watch?v=1")  # pyright: ignore[reportCallIssue]
+
+    def test_a_spotify_parse_is_frozen_slotted_and_keyword_only(self) -> None:
+        source = SpotifySource(type=SpotifyType.TRACK, id="4cOdK2wGLETKBW3PvgPWqT")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(source, "id", "x")
+        assert not hasattr(source, "__dict__")
+        with pytest.raises(TypeError):
+            SpotifySource(SpotifyType.TRACK, "x")  # pyright: ignore[reportCallIssue]
