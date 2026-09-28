@@ -169,7 +169,7 @@ class PauseContext:
     by: Optional[Union[discord.User, discord.Member]] = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InterjectOutcome:
     """What MusicPlayer.interject() did — everything `-play --now` needs for its
     confirmation wording."""
