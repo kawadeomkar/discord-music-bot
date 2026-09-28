@@ -2256,7 +2256,7 @@ class TestRestoreEntries:
             restored.analytics.queue_position,
         ) == (1752529000.5, 3)
 
-    async def test_search_entries_rehydrate_as_unresolved_items(
+    async def test_an_unresolved_entry_rehydrates_as_an_unresolved_item(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
         count = await gq.restore_entries([_unresolved_entry("abc")])
