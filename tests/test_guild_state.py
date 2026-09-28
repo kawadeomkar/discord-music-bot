@@ -509,6 +509,31 @@ _GOLDEN_QOBJ_SEARCH = (
     + _NP_HOST_NONE
     + b',"ytsearch":"ytsearch:DNA. Kendrick Lamar"}'
 )
+# The "ytsource" shape builds before 2.54.0 wrote for an unresolved item,
+# reconstructed field for field from that writer (SearchQueueEntry.to_redis at
+# ac264d60): type, ytsearch, url, process, ts, user_input, queued_at,
+# queue_position, query_source, then requester_id and the display fields when
+# the walk knew them.
+_RETIRED_BARE = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,'
+    b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,'
+    b'"queue_position":0,"query_source":""}'
+)
+# What a Spotify collection walk wrote when it returned display rows: every
+# optional key set, so the entry names all three the song reader requires.
+_RETIRED_WITH_DISPLAY = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null,'
+    b'"process":true,"ts":null,"user_input":"https://open.spotify.com/album/x",'
+    b'"queued_at":1752530000.5,"queue_position":7,"query_source":"spotify.com",'
+    b'"requester_id":424242424242424242,"title":"DNA.",'
+    b'"uploader":"Kendrick Lamar","duration":185,'
+    b'"webpage_url":"https://open.spotify.com/track/abc"}'
+)
+# The same, for a link queued before it resolved: `url` set, no search term.
+_RETIRED_WITH_DISPLAY_NO_TERM = _RETIRED_WITH_DISPLAY.replace(
+    b'"ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null',
+    b'"ytsearch":null,"url":"https://yt.com/v=9"',
+)
 _SEARCH_ENTRY = SongQueueEntry(
     webpage_url="https://open.spotify.com/track/abc",
     title="DNA.",
@@ -774,6 +799,8 @@ class TestParseQueueEntryCorrupt:
             b'{"type":"qobj","title":"missing url and requester"}',
             # A search may omit its requester; a resolved song may not.
             b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"missing requester"}',
+            # "type" is required: every writer of this list stamps it.
+            b'{"webpage_url":"https://yt.com/v=1","title":"T","requester_id":42}',
             b"",
         ],
     )
@@ -784,20 +811,33 @@ class TestParseQueueEntryCorrupt:
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param(_RETIRED_BARE, id="no-display-fields"),
+            pytest.param(_RETIRED_WITH_DISPLAY, id="display-fields"),
+            pytest.param(_RETIRED_WITH_DISPLAY_NO_TERM, id="display-fields-no-term"),
+        ],
+    )
     def test_a_retired_search_entry_is_dropped(
-        self, caplog: pytest.LogCaptureFixture
+        self, raw: bytes, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The shape builds before 2.54.0 gave an unresolved track names none of
-        the keys required here, so it takes the corrupt path: the entry is gone
-        from the restore and the Redis list is a rebuild longer than the deque."""
-        raw = (
-            b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,'
-            b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,'
-            b'"queue_position":0,"query_source":""}'
-        )
+        """The shape builds before 2.54.0 gave an unresolved track is "ytsource",
+        so it takes the corrupt path whichever optional keys it carries — including
+        the display-bearing variety a Spotify collection walk wrote, which names
+        every key a song entry requires."""
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
+
+    def test_the_drop_warning_names_the_shape(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The value is what tells an operator a straggler was dropped rather than
+        # a byte-corrupt entry, so the log line carries it.
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            parse_queue_entry(_RETIRED_WITH_DISPLAY)
+        assert "ytsource" in caplog.text
 
     def test_a_malformed_optional_field_keeps_the_song(self) -> None:
         """Only the REQUIRED keys drop an entry. The optional ones are read with a

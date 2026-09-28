@@ -4695,6 +4695,7 @@ class TestStateRestore:
         assert music_player.store is not None
         item = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=abc",
                 "title": "Restored Song",
                 "requester_id": mock_author.id,
@@ -4850,6 +4851,7 @@ class TestRestoreCrashedSong:
         )
         normal_item = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=normal",
                 "title": "Normal Song",
                 "requester_id": mock_author.id,
@@ -5004,6 +5006,7 @@ class TestRestoreCrashedSong:
         assert music_player.store is not None
         normal_item = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=abc",
                 "title": "Normal",
                 "requester_id": mock_author.id,
@@ -5366,6 +5369,7 @@ class TestRestoreCompleteLoopGuard:
         for i in range(2):
             item = orjson.dumps(
                 {
+                    "type": "qobj",
                     "webpage_url": f"https://yt.com/v={i}",
                     "title": f"Queued {i}",
                     "requester_id": mock_author.id,
@@ -5418,6 +5422,7 @@ class TestRestoreCompleteLoopGuard:
         for i in range(4):
             item = orjson.dumps(
                 {
+                    "type": "qobj",
                     "webpage_url": f"https://yt.com/v={i}",
                     "title": f"Queued {i}",
                     "requester_id": mock_author.id,
@@ -8640,6 +8645,7 @@ class TestRestoreStateTtlRefresh:
         assert music_player.store is not None
         valid = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=ok",
                 "title": "Good Song",
                 "requester_id": mock_author.id,

@@ -849,12 +849,18 @@ class SongQueueEntry:
 # `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
 # narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
 def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
-    """Deserialize one queue-list entry. One naming none of the keys read here
-    returns None with a warning, so the rest of the queue survives; it is
-    dropped from the snapshot, leaving the deque shorter than the Redis list
-    until the next mirror rebuild."""
+    """Deserialize one queue-list entry. One whose "type" is not "qobj", or
+    missing webpage_url, title or requester_id, returns None with a warning, so
+    the rest of the queue survives; it is dropped from the snapshot, leaving the
+    deque shorter than the Redis list until the next mirror rebuild."""
     try:
         d = orjson.loads(data)
+        # Every writer of this list stamps "type" as "qobj"; an entry carrying
+        # anything else is a shape this reader does not know, and takes the
+        # corrupt path whatever other keys it names.
+        entry_type = d[QueueEntryField.TYPE]
+        if entry_type != _ENTRY_TYPE_SONG:
+            raise ValueError(f"entry type {entry_type!r}")
         return SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],
             title=d[QueueEntryField.TITLE],
