@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from functools import partial
 from enum import Enum
-from typing import Any, Optional, TypedDict, Union, cast
+from typing import Any, Final, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
@@ -393,17 +393,28 @@ def _mine_audio_candidates(node: dict[str, Any]) -> list[AudioCandidate]:
     return ladder[: _STREAM_CANDIDATES - 1]
 
 
+# Two results this close to the wanted length are the same recording as far as a
+# listener is concerned, so the tie goes to YouTube's own ranking rather than to a
+# second of arithmetic: a master and its remaster differ by more than this.
+_DURATION_TIE_SECS = 5
+
+
 def select_search_entry(
     entries: list[Optional[YTDLEntry]],
+    *,
+    expected_duration: Optional[int] = None,
 ) -> Optional[YTDLEntry]:
     """The entry of a search result that would actually be played, or None if the
     result holds nothing playable.
 
     Prefers an entry carrying a `url` (the stream URL of a processed result, the
     watch URL of a flat one), falling back to the first non-playlist entry so an
-    unrecognised shape still plays. Every search this bot builds is a bare
-    `ytsearch:`, which yields exactly one entry, so this only matters on multi-entry
-    shapes.
+    unrecognised shape still plays.
+
+    `expected_duration` narrows a multi-result search to the entries closest to a
+    length the caller already knows — Spotify's, for a track resolving by title,
+    where the first hit is usually the music video. Entries carrying no duration
+    are out of that comparison unless none of them carries one.
 
     Public because `just ytdl-formats` has to make the same choice, and two copies of
     this rule would drift.
@@ -413,6 +424,19 @@ def select_search_entry(
     ]
     if not playable:
         return None
+    if expected_duration is not None:
+        deltas = [
+            (abs(int(secs) - expected_duration), entry)
+            for entry in playable
+            if isinstance(secs := entry.get("duration"), (int, float))
+        ]
+        if deltas:
+            closest = min(delta for delta, _ in deltas)
+            playable = [
+                entry
+                for delta, entry in deltas
+                if delta <= closest + _DURATION_TIE_SECS
+            ]
     return next((entry for entry in playable if entry.get("url")), playable[0])
 
 
@@ -1286,6 +1310,9 @@ class QueueObject:
     # resolve at dequeue. `title` meanwhile is the walk's row name, or empty when
     # the walk had none — every renderer falls back to this term.
     search: str = ""
+    # The recording this item names, when the walk knew one. Read only by the
+    # resolve, which searches it before the term: see _search_terms.
+    isrc: Optional[str] = None
 
     @property
     def unresolved(self) -> bool:
@@ -1520,7 +1547,68 @@ async def _extract_for_source(
         raise
 
 
-def _first_video_entry(data: YTDLExtractResult) -> Optional[YTDLEntry]:
+class _NothingFound(Exception):
+    """One search term resolved to nothing: yt-dlp answered with no result, or with
+    a result holding no playable entry. Private to yt_source's term ladder, which
+    either falls through to the next term or re-raises `public` — the failure every
+    caller has always seen — for the last one."""
+
+    def __init__(self, public: Exception) -> None:
+        super().__init__(str(public))
+        self.public = public
+
+
+_SEARCH_KIND_ISRC: Final[str] = "isrc"
+_SEARCH_KIND_TITLE: Final[str] = "title"
+_SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
+
+# How many results a length gets to choose between. One search POST costs the same
+# for one result as for five (0.51 s either way), but a PROCESSED search extracts
+# every entry it answers with — 3.69 s for three against 1.22 s for the one this
+# would replace, and three times the player requests. So the widening rides the
+# flat path only, and the processed path keeps the single result it always had.
+_DURATION_MATCH_RESULTS: Final[int] = 3
+_SEARCH_PREFIX_RE = re.compile(r"^ytsearch\d*:")
+
+
+def _search_terms(
+    search: str,
+    *,
+    isrc: Optional[str],
+    expected_duration: Optional[int],
+    flat: bool,
+) -> list[tuple[str, str]]:
+    """The terms one ask resolves through, in order, each with the kind it is.
+
+    An ISRC leads when the ask has one. YouTube indexes it on the label's
+    art-track upload, which is the album recording, where the title of a
+    well-known song finds the music video — 234 s against 263 s for "Shape of
+    You", the second carrying a film intro before the music. It can also find
+    nothing at all (no art track, nothing indexed), which is what the title term
+    behind it is for. A search whose length is known is widened so that
+    select_search_entry has something to choose between.
+    """
+    terms: list[tuple[str, str]] = []
+    if isrc is not None:
+        # Quoted: unquoted, YouTube reads the code as loose tokens and answers
+        # with whatever shares them.
+        terms.append((_SEARCH_KIND_ISRC, f'ytsearch:"{isrc}"'))
+    if flat and expected_duration is not None and not is_link(search.strip()):
+        widened = _SEARCH_PREFIX_RE.sub("", search)
+        terms.append(
+            (
+                _SEARCH_KIND_TITLE_MATCHED,
+                f"ytsearch{_DURATION_MATCH_RESULTS}:{widened}",
+            )
+        )
+    else:
+        terms.append((_SEARCH_KIND_TITLE, search))
+    return terms
+
+
+def _first_video_entry(
+    data: YTDLExtractResult, *, expected_duration: Optional[int] = None
+) -> Optional[YTDLEntry]:
     """A wrapper carries the video in `entries`; a lone-video result already is the
     entry. None for a wrapper holding no video: its own webpage_url is the search
     string, and cached as a song it would fail every play for the entry's TTL."""
@@ -1531,7 +1619,7 @@ def _first_video_entry(data: YTDLExtractResult) -> Optional[YTDLEntry]:
     # for an https audio URL at a usable bitrate, so a format-less or
     # low-quality entry is accepted when nothing better exists and only blows
     # up at stream time, looking unrelated.
-    return select_search_entry(data["entries"])
+    return select_search_entry(data["entries"], expected_duration=expected_duration)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1622,20 +1710,32 @@ def _playlist_tracks(
 
 
 async def _revalidate_source(
-    redis: Optional[aioredis.Redis], cache_key: str, search: str
+    redis: Optional[aioredis.Redis],
+    cache_key: str,
+    search: str,
+    *,
+    expected_duration: Optional[int] = None,
 ) -> None:
     """Refresh a stale source entry behind the reply that was served from it.
 
     Searches only: what goes stale is the query → video mapping YouTube's ranking
     decides, and a link's mapping is the link. One flat POST, so the refresh costs a
     fraction of the resolve it saves the next play. Nothing here may raise into the
-    task — the entry it failed to refresh is still the one being served."""
+    task — the entry it failed to refresh is still the one being served.
+
+    `expected_duration` is the one its resolve used, so the refresh re-picks under the
+    same rule and a length-matched term keeps the recording it chose. The write
+    re-stamps the entry, so a term played daily never ages out of this path."""
     try:
         data = await _extract_once(
             _inflight_key(cache_key, "flat"),
             ExtractRequest(url=search, opts=_YTDL_FLAT_SEARCH_OPTS),
         )
-        entry = _first_video_entry(data) if data is not None else None
+        entry = (
+            _first_video_entry(data, expected_duration=expected_duration)
+            if data is not None
+            else None
+        )
         identity = _flat_entry_fields(entry) if entry is not None else None
         if identity is None:
             # A live result, one without a duration, or none at all. The stale entry
@@ -2158,6 +2258,8 @@ class YTDL(discord.FFmpegOpusAudio):
         redis: Optional[aioredis.Redis] = None,
         flat: bool = False,
         pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+        isrc: Optional[str] = None,
+        expected_duration: Optional[int] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject, from the source cache
         when present. flat=True answers a SEARCH from one search POST when the
@@ -2167,7 +2269,66 @@ class YTDL(discord.FFmpegOpusAudio):
         REQUIRED so the QueueObject leaves complete — a default would let a call
         site write a plausible zero. user_input None falls back to `search`, which
         is what the user typed only for a direct -play of one song; for an expanded
-        collection `search` is a generated title, not the link -remove matches."""
+        collection `search` is a generated title, not the link -remove matches.
+
+        `isrc` and `expected_duration` are what a Spotify track knows about itself,
+        and they decide WHICH term resolves: see _search_terms. Each term caches
+        under its own key, so a fallback is spent once per track per TTL.
+        """
+        terms = _search_terms(
+            search, isrc=isrc, expected_duration=expected_duration, flat=flat
+        )
+        for index, (kind, term) in enumerate(terms):
+            trace.get_current_span().set_attribute("ytdl.search_kind", kind)
+            try:
+                return await cls._resolve_term(
+                    requester,
+                    term,
+                    expected_duration=expected_duration,
+                    query_source=query_source,
+                    analytics=analytics,
+                    user_input=user_input,
+                    download=download,
+                    ts=ts,
+                    redis=redis,
+                    flat=flat,
+                    pool_slot=pool_slot,
+                )
+            except _NothingFound as miss:
+                if index == len(terms) - 1:
+                    # The ask is out of terms, so this miss is the answer. Raised
+                    # as the failure the caller has always seen, `from None`
+                    # because the wrapper is this method's private business.
+                    raise miss.public from None
+                log.info(
+                    f"{kind} search {term!r} found nothing; "
+                    f"falling back to {terms[index + 1][1]!r}"
+                )
+        raise AssertionError("_search_terms never returns an empty ladder")
+
+    @classmethod
+    async def _resolve_term(
+        cls,
+        requester: Union[discord.User, discord.Member],
+        search: str,
+        *,
+        expected_duration: Optional[int] = None,
+        query_source: str,
+        analytics: Analytics,
+        user_input: Optional[str],
+        download: bool = False,
+        ts: Optional[int] = None,
+        redis: Optional[aioredis.Redis] = None,
+        flat: bool = False,
+        pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+    ) -> QueueObject:
+        """One term resolved, or _NothingFound when yt-dlp answered with nothing
+        playable — which is what lets yt_source try the next term. flat=True
+        answers a SEARCH from one search POST when the first result is a plain
+        video with a duration — no watch page, no player call, and no stream URL,
+        which the prefetch fills later; anything else takes the full extraction.
+        `expected_duration` chooses between the entries of a multi-result search
+        (see select_search_entry)."""
         origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
         # ts is excluded — a per-request playback offset, not part of the identity.
@@ -2187,7 +2348,12 @@ class YTDL(discord.FFmpegOpusAudio):
                     # ranking a search resolved through, and a link's mapping is
                     # the link. Not awaited — this play uses the entry it has.
                     spawn_background(
-                        _revalidate_source(redis, cache_key, search),
+                        _revalidate_source(
+                            redis,
+                            cache_key,
+                            search,
+                            expected_duration=expected_duration,
+                        ),
                         _SOURCE_REVALIDATIONS,
                     )
                 return _queue_object_from_identity(
@@ -2218,7 +2384,9 @@ class YTDL(discord.FFmpegOpusAudio):
                 pool_slot=pool_slot,
             )
             flat_entry = (
-                _first_video_entry(flat_data) if flat_data is not None else None
+                _first_video_entry(flat_data, expected_duration=expected_duration)
+                if flat_data is not None
+                else None
             )
             flat_qobj = (
                 _queue_object_from_flat_entry(
@@ -2272,19 +2440,21 @@ class YTDL(discord.FFmpegOpusAudio):
             # Every failure mode raises the same untyped "Could not find song", so
             # callers cannot tell "no such video" from "extractor broken" from
             # "network down", and nothing can retry selectively.
-            raise Exception("Could not find song")
+            raise _NothingFound(Exception("Could not find song"))
 
         # Separate from `data` because a leaf (YTDLEntry) is not assignable back to the
         # result type, and "raw result" vs "chosen entry" are two things.
-        selected = _first_video_entry(data)
+        selected = _first_video_entry(data, expected_duration=expected_duration)
         if selected is None or not str(selected.get("webpage_url", "")).startswith(
             ("https://", "http://")
         ):
             # Refused before the cache write below: an identity that is not a page
             # URL cannot be streamed, and cached it fails every play for 24h.
             log.warning(f"no playable result for {search!r}")
-            raise ExtractionError(
-                "Couldn't find anything playable for that.", expected=True
+            raise _NothingFound(
+                ExtractionError(
+                    "Couldn't find anything playable for that.", expected=True
+                )
             )
         if not selected.get("url"):
             # This path runs processed, so a result with no stream URL is one
@@ -2310,6 +2480,10 @@ class YTDL(discord.FFmpegOpusAudio):
         uploader = video_data.get("uploader")
         thumbnail = video_data.get("thumbnail")
         trace.get_current_span().set_attribute("ytdl.result_title", title)
+        if expected_duration is not None and duration is not None:
+            trace.get_current_span().set_attribute(
+                "ytdl.duration_delta_secs", abs(duration - expected_duration)
+            )
         identity = SourceIdentity(
             webpage_url=webpage_url,
             title=title,

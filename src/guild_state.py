@@ -696,6 +696,8 @@ class QueueEntryField:
     # The term an unresolved item still owes yt-dlp: on every "ytsource" entry,
     # and on a "qobj" entry only while non-empty.
     YTSEARCH: Final[str] = "ytsearch"
+    # The recording an unresolved item names, on a "ytsource" entry that has one.
+    ISRC: Final[str] = "isrc"
     # "ytsource" entries
     URL: Final[str] = "url"
     PROCESS: Final[str] = "process"
@@ -878,6 +880,9 @@ class SearchQueueEntry:
     uploader: str | None = None
     duration: int | None = None
     webpage_url: str | None = None
+    # The recording the walk named, which the resolve searches before the term.
+    # Only this shape carries it: a resolved item has no search left to steer.
+    isrc: str | None = None
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
@@ -904,6 +909,7 @@ class SearchQueueEntry:
             uploader=item.uploader,
             duration=item.duration,
             webpage_url=item.webpage_url or None,
+            isrc=item.isrc,
         )
 
     def to_redis(self) -> bytes:
@@ -927,6 +933,7 @@ class SearchQueueEntry:
             (QueueEntryField.UPLOADER, self.uploader),
             (QueueEntryField.DURATION, self.duration),
             (QueueEntryField.WEBPAGE_URL, self.webpage_url),
+            (QueueEntryField.ISRC, self.isrc),
         ):
             if value is not None:
                 fields[key] = value
@@ -960,6 +967,7 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
                 uploader=d.get(QueueEntryField.UPLOADER),
                 duration=d.get(QueueEntryField.DURATION),
                 webpage_url=d.get(QueueEntryField.WEBPAGE_URL),
+                isrc=d.get(QueueEntryField.ISRC),
             )
         return SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],

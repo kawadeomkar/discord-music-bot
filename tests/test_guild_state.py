@@ -501,7 +501,8 @@ _GOLDEN_YTSOURCE_FULL = (
     b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
     b'"query_source":"","requester_id":424242424242424242,"title":"DNA.",'
     b'"uploader":"Kendrick Lamar","duration":185,'
-    b'"webpage_url":"https://open.spotify.com/track/abc"}'
+    b'"webpage_url":"https://open.spotify.com/track/abc",'
+    b'"isrc":"USUM71703861"}'
 )
 
 _FULL_ENTRY = SongQueueEntry(
@@ -805,6 +806,7 @@ class TestSearchQueueEntryWire:
             uploader="Kendrick Lamar",
             duration=185,
             webpage_url="https://open.spotify.com/track/abc",
+            isrc="USUM71703861",
         )
         assert entry.to_redis() == _GOLDEN_YTSOURCE_FULL
 
@@ -819,6 +821,29 @@ class TestSearchQueueEntryWire:
         raw = entry.to_redis()
         assert b'"title":""' in raw
         assert b'"duration":0' in raw
+
+    def test_an_entry_without_an_isrc_writes_the_bytes_it_always_did(self) -> None:
+        """The key is written only when known. An entry queued by the previous
+        build has to serialize to the same bytes, or its LREM misses and -remove
+        rewrites the whole list under the bulk mutex."""
+        entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
+        assert b"isrc" not in entry.to_redis()
+
+    def test_the_isrc_round_trips(self) -> None:
+        """Without it a restart sends every queued Spotify track back down the
+        title path, which is the music video for anything well known."""
+        parsed = parse_queue_entry(
+            SearchQueueEntry(
+                ytsearch="ytsearch:x", process=True, isrc="GBAHS1600463"
+            ).to_redis()
+        )
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.isrc == "GBAHS1600463"
+
+    def test_an_entry_written_before_the_isrc_existed_parses(self) -> None:
+        parsed = parse_queue_entry(_GOLDEN_YTSOURCE)
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.isrc is None
 
     def test_the_requester_round_trips_through_the_lazy_resolve(self) -> None:
         item = unresolved("x", stub_requester(424242424242424242))

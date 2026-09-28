@@ -843,6 +843,7 @@ class GuildQueue:
                 analytics=analytics,
                 query_source=entry.query_source,
                 search=entry.ytsearch or entry.url or "",
+                isrc=entry.isrc,
             )
         return QueueObject(
             webpage_url=entry.webpage_url,

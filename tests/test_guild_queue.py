@@ -2008,9 +2008,9 @@ class TestRestoreEntries:
         """_rehydrate's search leg is the one field list built keyword by
         keyword: the resolved leg's neighbours are replace() copies of an item
         that already holds every field. Comparing entries rather than naming
-        fields covers all thirteen at once — dropping `query_source` archives
-        every restored Spotify-collection track as youtube.com, and only the
-        write side of that field has a test."""
+        fields covers all fourteen at once — dropping `query_source` archives
+        every restored Spotify-collection track as youtube.com, and dropping
+        `isrc` re-resolves the track by title, which is the music video."""
         requester = stub_requester(424242424242424242)
         mock_guild.get_member = MagicMock(return_value=requester)
         entry = SearchQueueEntry(
@@ -2026,6 +2026,7 @@ class TestRestoreEntries:
             uploader="Kendrick Lamar",
             duration=185,
             webpage_url="https://open.spotify.com/track/xyz",
+            isrc="USUM71703861",
         )
 
         assert await gq.restore_entries([entry]) == 1

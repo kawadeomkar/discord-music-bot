@@ -2074,6 +2074,10 @@ class MusicPlayer:
             query_source=source.query_source,
             analytics=source.analytics,
             user_input=source.user_input,
+            # What the ask knows about the recording: the walk's ISRC and its
+            # length, which pick the album master over the music video.
+            isrc=source.isrc,
+            expected_duration=source.duration,
         )
         return replace(
             source,

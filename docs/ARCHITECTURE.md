@@ -712,12 +712,49 @@ a link that `-play` searched for, or the reverse.
 
 Spotify sources are converted to YouTube searches before any audio work:
 
-- **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTDL.yt_source()`, which resolves
-  that string as a search, flat when the placement allows one
+- **Track**: `Spotify.track(id)` → a `SpotifyTrack` → `YTDL.yt_source()`, which resolves
+  it as a search, flat when the placement allows one
 - **Playlist**: `Spotify.playlist(id)` → `SpotifyPlaylist` → its `titles` →
   `play_pipeline._searches_for()` wraps each as a `QueueObject` whose `search` is the term
 - **Album**: `Spotify.album(id)` → the same `SpotifyPlaylist`, plus its artists and cover
   → the playlist's path from there
+
+#### Which recording a Spotify track resolves to
+
+A title search finds what YouTube ranks first for it, which for anything well known is the
+music video — a different edit, often with a film intro before the music:
+
+| Term | First result | Length |
+|---|---|---|
+| `ytsearch:Shape of You Ed Sheeran` | Official Music Video | 263 s |
+| `ytsearch:"GBAHS1600463"` | the label's art track | 234 s |
+| Spotify's own duration for the track | | 233 s |
+
+So `_search_terms` (src/youtube.py) builds a ladder, and `yt_source` walks it: the ISRC
+first when the ask has one, the title behind it. The ISRC is a recording's identity, which
+YouTube indexes on art-track uploads; it is quoted, because unquoted the code reads as
+loose tokens. It can also find nothing — no art track, or nothing indexed — and the title
+term behind it is what makes that harmless. Each term caches under its own
+`ytdl:source:` key, so a fallback is spent once per track per TTL.
+
+Where the ISRC comes from, and where it does not:
+
+- A **full** Spotify track object carries `external_ids.isrc`. `/v1/tracks/{id}` returns
+  one, and the playlist walk asks for it inside its `fields` mask.
+- An **album**'s items are SIMPLIFIED track objects, which carry no `external_ids` at all.
+  `_page_isrcs` batches one `/v1/tracks?ids=` request per page of 50 to fill them in,
+  best-effort like the album's name: a failure there leaves every track resolving by
+  title, which is what the walk did before.
+- Anything malformed is refused by `_ISRC_RE` rather than searched, because a code that is
+  not one finds nothing and costs a round trip.
+
+The length Spotify reports is the second half of the rule: `select_search_entry` prefers
+the entry closest to it, with everything inside `_DURATION_TIE_SECS` of the best treated
+as a tie and settled by YouTube's own ranking. That widening rides the FLAT path only. One
+search POST costs the same for one result as for five (0.51 s measured, either way), where
+a processed search extracts every entry it answers with — 3.69 s for three against 1.22 s
+for one, and three times the player requests, which is not a cost worth paying at the
+dequeue resolve for a re-upload instead of a music video.
 
 ---
 

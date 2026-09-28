@@ -17,6 +17,21 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.54.0 — 2026-09-28
+
+**Spotify links now play the album recording, not the music video.** A Spotify track
+carries the recording's ISRC, and YouTube indexes that on the label's own upload, so the
+bot searches it before falling back to the title. "Shape of You" used to queue the
+4:24 official video — dialogue, then the song — and now queues the 3:54 album master
+Spotify names. Album tracks get the same treatment through one extra Spotify request per
+50 tracks; a track with no ISRC, or whose ISRC YouTube does not know, resolves by title
+exactly as before.
+
+Two things to know. Spotify links resolved in the last 24 hours keep the video they
+already resolved to until that entry ages out. And the Spotify caches are re-keyed by
+this release: the first play of a playlist or album after deploying walks it again.
+Rolling back is safe — the old build ignores the new keys and re-walks once itself.
+
 ## 2.53.10 — 2026-09-28
 
 **Songs the bot re-encodes sound right.** Anything that is not bit-copied from YouTube —

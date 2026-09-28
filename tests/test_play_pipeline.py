@@ -211,7 +211,15 @@ class TestQueueSource:
             requester=mock_ctx.author,
         )
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
+        music_bot.spotify.track = AsyncMock(
+            return_value=SpotifyTrack(
+                name="My Track",
+                artists=["Artist"],
+                duration_secs=200,
+                url=None,
+                isrc="GBAHS1600463",
+            )
+        )
         with patch(
             "src.play_pipeline.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
@@ -1809,7 +1817,15 @@ class TestQuerySourceClassification:
             requester=mock_ctx.author,
         )
         assert music_bot.spotify is not None
-        music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
+        music_bot.spotify.track = AsyncMock(
+            return_value=SpotifyTrack(
+                name="My Track",
+                artists=["Artist"],
+                duration_secs=200,
+                url=None,
+                isrc="GBAHS1600463",
+            )
+        )
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.play_pipeline.YTDL.yt_source", new=spy):
             await play_pipeline.queue_source(
@@ -2809,7 +2825,15 @@ class TestResolveModeThreading:
     ) -> None:
         """It resolves to a YouTube title search, so it has the same cheap mode."""
         assert music_bot.spotify is not None
-        music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
+        music_bot.spotify.track = AsyncMock(
+            return_value=SpotifyTrack(
+                name="My Track",
+                artists=["Artist"],
+                duration_secs=200,
+                url=None,
+                isrc="GBAHS1600463",
+            )
+        )
         spy = await self._resolve(
             music_bot,
             mock_ctx,
