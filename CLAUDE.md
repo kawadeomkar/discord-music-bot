@@ -27,7 +27,7 @@ The tier boundary is a rule, not a preference, and it governs reads in BOTH mode
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,530 passing tests (this figure is always the PASSING count, not the collected one) plus three opt-in integration tiers: a 99-test `pg` and a 58-test `redis` tier (testcontainers), and a 4-test `ffmpeg` tier that spawns the real binary; coverage gate `fail_under = 80` (actual ~96%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,790 passing tests (this figure is always the PASSING count, not the collected one) plus three opt-in integration tiers: a 99-test `pg` and a 60-test `redis` tier (testcontainers), and a 15-test `ffmpeg` tier that spawns the real binary; coverage gate `fail_under = 80` (actual ~97%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -141,7 +141,7 @@ just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment cons
 just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~38s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
-just test-ffmpeg    # opt-in real-ffmpeg tier (needs ffmpeg on PATH, no Docker)  ~3s
+just test-ffmpeg    # opt-in real-ffmpeg tier (needs ffmpeg on PATH, no Docker)  ~9s
 just container-test # build test image, run suite inside it (spec cache OFF) ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
