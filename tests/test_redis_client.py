@@ -2694,6 +2694,24 @@ class TestGetRecoveryGate:
         assert gate is not None and gate.pending_count == 1
         assert store.queue_key() not in lrange_keys
 
+    async def test_an_entry_the_snapshot_cannot_read_still_counts(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """LLEN counts what is on the list, so a guild whose entries are all
+        unreadable passes the gate and reconnects to restore nothing. The two
+        halves of the read disagree here: get_playback_snapshot reports the
+        same list as zero pending and two unreadable."""
+        await fake_redis.rpush(store.queue_key(), b"not json", b'{"type":"gone"}')
+        gate = await store.get_recovery_gate()
+        assert gate is not None
+        assert gate.pending_count == 2
+        assert gate.has_restorable_playback
+
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert (snap.pending_count, snap.queue_unreadable) == (0, 2)
+        assert not snap.has_restorable_playback
+
     async def test_crashed_song_makes_empty_queue_restorable(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
