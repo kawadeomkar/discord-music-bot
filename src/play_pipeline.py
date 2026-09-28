@@ -78,10 +78,10 @@ log = get_logger(__name__)
 # thousand, which is how long each chunk holds the event loop.
 _SEARCH_BUILD_CHUNK = 1000
 
-# Items re-minted per event-loop turn by _rebase_positions. Measured 0.43 ms a
-# thousand, so 2,000 is the chunk that holds the event loop for about a
-# millisecond: 10,000 tracks pay five of those instead of one slice of 4.3 ms.
-_REBASE_CHUNK = 2000
+# Items re-minted per event-loop turn by _mint_positions. Each is a whole
+# dataclass copy, measured 3.2 ms a thousand, so 300 is the chunk that holds the
+# event loop for about a millisecond: 10,000 tracks pay 34 of those.
+_REBASE_CHUNK = 300
 
 # Blank lines and the "... and N more" tail the rows add around themselves.
 _DESCRIPTION_MARGIN = 64
@@ -138,8 +138,8 @@ class EmptyPlaylistError(PlaylistInputError):
 
 
 # kw_only: `title` and `link` are adjacent Optional[str]s that transpose silently.
-# frozen: nothing writes a field back; the enqueue re-mints the ITEMS in place
-# (with_queue_position) and rebinds its own local for the list.
+# frozen: nothing writes a field back; the enqueue re-mints the ITEMS into a new
+# list (with_queue_position) and rebinds its own local for it.
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ResolvedPlaylist:
     """A collection resolved to queue items. A Spotify collection's items are
@@ -449,12 +449,25 @@ async def _searches_for(
     return tracks
 
 
+async def _mint_positions(
+    tracks: Sequence[QueueObject], base: int
+) -> list[QueueObject]:
+    """`tracks` re-minted onto consecutive `queue_position`s from `base`, yielding
+    the loop every _REBASE_CHUNK. Every collection pass that moves a depth goes
+    through here, so one chunk rule bounds them all."""
+    minted: list[QueueObject] = []
+    for offset, track in enumerate(tracks):
+        if offset and offset % _REBASE_CHUNK == 0:
+            await asyncio.sleep(0)
+        minted.append(with_queue_position(track, base + offset))
+    return minted
+
+
 async def _rebase_positions(
     tracks: Sequence[QueueObject], minted_from: int, base: int
 ) -> Sequence[QueueObject]:
     """Move a resolved collection's `queue_position`s from one head depth to
-    another, returning `tracks` unchanged when the head has not moved and yielding
-    the loop every chunk otherwise.
+    another, returning `tracks` unchanged when the head has not moved.
 
     Called twice per collection enqueue. The first is unconditional: the resolve
     mints depths against the ASK, which is 0 for every collection, so the pass is
@@ -462,12 +475,7 @@ async def _rebase_positions(
     lock, moves only when another request placed in between."""
     if base == minted_from:
         return tracks
-    rebased: list[QueueObject] = []
-    for offset, track in enumerate(tracks):
-        if offset and offset % _REBASE_CHUNK == 0:
-            await asyncio.sleep(0)
-        rebased.append(with_queue_position(track, base + offset))
-    return rebased
+    return await _mint_positions(tracks, base)
 
 
 def _head_depth(mp: MusicPlayer, placement: Placement) -> int:
@@ -850,14 +858,11 @@ async def enqueue_single(
         # guild spends its place bound waiting on the lock.
         await mp.settle_prefetch()
     # Minted before the lock, like the playlist branch's: `--now`/`--next` take a
-    # collection in full, so this is up to 9,999 entries of event-loop time every
-    # sibling -play in the guild would spend its place bound waiting out.
+    # collection in full, so up to 9,999 re-mints — 32 ms — is what every sibling
+    # -play in the guild would otherwise spend its place bound waiting out.
     # _rebase_positions inside is a no-op unless another request placed between.
     provisional = _head_depth(mp, placement) + 1
-    follow_on = [
-        with_queue_position(item, provisional + offset)
-        for offset, item in enumerate(follow_on)
-    ]
+    follow_on = await _mint_positions(follow_on, provisional)
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             depth = _head_depth(mp, placement)

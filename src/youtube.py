@@ -1706,8 +1706,8 @@ class YTDL(discord.FFmpegOpusAudio):
 
     # ── the ask, read off the queue object this source was built from ──
     # Aliases, so a playing song's ask is spelled the way a queued item's is.
-    # Read-only on purpose: the item is still on the deque while a prefetch holds
-    # it, so a write here would reach the queue. played_at is the exception below.
+    # Read-only because the item they read is frozen. played_at below is the one
+    # field the loop writes, and it writes it by replacing the item held here.
 
     @property
     def requester(self) -> Union[discord.User, discord.Member]:

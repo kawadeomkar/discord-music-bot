@@ -1044,9 +1044,9 @@ class GuildRedisStore:
     async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
         """LREM the given entries out of the list, leaving the rest in place.
         Returns HOW MANY were removed — the caller must check it: LREM matches
-        exact serialized bytes, so a queued object mutated after its entry was
-        written matches nothing, and a short count means only a rebuild can be
-        trusted (a Redis failure returns 0 and takes the same path). Counted per
+        exact serialized bytes, so an entry the list no longer holds in that form
+        matches nothing, and a short count means only a rebuild can be trusted
+        (a Redis failure returns 0 and takes the same path). Counted per
         distinct serialization, never `LREM ... 0`: two enqueues of one song can
         serialize identically, and "all matching" would take out the copy still
         queued."""
