@@ -192,7 +192,7 @@ class InterjectOutcome:
         return fmt_duration(self.resume_position or 0)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class StreamFailure:
     """Why a song's stream failed to resolve, captured at the failure point so the
     skip notice can name the cause and the trace carrying the full exception."""
