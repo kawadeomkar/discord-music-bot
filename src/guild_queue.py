@@ -535,7 +535,8 @@ class GuildQueue:
         were dropped before reaching here. Either kind of drop marks the mirror
         stale so the shorter queue is written back for good.
         `requester_fallback` is the caller's last resort, ahead of the guild
-        owner, for entries persisted before searches carried a requester id."""
+        owner, for an entry whose requester id no longer resolves to a member
+        or to a cached user."""
         count = 0
         dropped = 0
         for entry in entries:

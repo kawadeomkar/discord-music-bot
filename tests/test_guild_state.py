@@ -798,7 +798,8 @@ class TestParseQueueEntryCorrupt:
         [
             b"not json at all",
             b'{"type":"qobj","title":"missing url and requester"}',
-            # A search may omit its requester; a resolved song may not.
+            # requester_id is required of every entry, one still unresolved
+            # included; a `null` is a value, a missing key is corrupt.
             b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"missing requester"}',
             # "type" is required: every writer of this list stamps it.
             b'{"webpage_url":"https://yt.com/v=1","title":"T","requester_id":42}',

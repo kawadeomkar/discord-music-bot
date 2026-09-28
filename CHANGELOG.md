@@ -17,6 +17,23 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.54.1 — 2026-09-27
+
+**The reader for the queue entry builds before 2.54.0 wrote is gone.** Nothing changes in
+chat, and nothing this build writes to Redis changes. What goes with the reader is the
+old-shape tally 2.54.0 asked you to watch: the restart line reports the restored count
+and, when a queue held entries it could not read, how many.
+
+- **Deploy this only once that tally has read zero across restarts**, which is what
+  2.54.0 put it there for. If a queue does still hold an old-shape track, that track is
+  dropped and does not play. Nothing else in that queue is affected: the list is
+  rewritten once, so no other song shifts position or replays, and the restart logs one
+  warning per server naming how many entries it dropped and the shape it met
+  (`entry type 'ytsource'`).
+- **Roll back freely, to 2.53.7 or newer.** No entry this build writes is new to the
+  build before it. A track already dropped does not come back, though — the rollback
+  restores the reader, not the queue.
+
 ## 2.54.0 — 2026-09-26
 
 **A collection track that has not resolved yet is written to Redis as an ordinary queued
