@@ -498,12 +498,6 @@ entries by their exact bytes, so a key written unconditionally would make every
 `-remove` miss on every entry already in Redis, each one then rewriting the whole list
 under the bulk mutex. Pin any such when-known key with a
 golden-bytes test beside `_GOLDEN_QOBJ_SEARCH`.
-`SearchQueueEntry` is the read-only `"ytsource"` shape of entries builds before 2.54.0
-wrote, and stays until no restore still meets one — `restore_entries` logs the restored
-count on one INFO line per restore and the tally beside it whenever the list held
-anything, and returns both so the `player.state_restore` span carries
-`restore.old_shape_entries`. Only a guild that got a player is counted, so a guild
-`restore_guild` skipped keeps its list uncounted.
 
 **Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
 the loop() bookkeeping comments first; every claim, release, and Redis

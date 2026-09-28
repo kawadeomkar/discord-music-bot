@@ -34,7 +34,6 @@ from src.guild_state import (
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
-    SearchQueueEntry,
     SongQueueEntry,
     StateField,
     TopListener,
@@ -430,19 +429,18 @@ class TestNowPlayingDataImmutability:
 
 # ── Queue-entry value objects ─────────────────────────────────────────────────
 
-# Golden wire fixtures — byte literals of the exact orjson output. The _QOBJ ones
-# pin the writer and the reader against each other; the _YTSOURCE ones are what
-# builds before 2.54.0 left on a list and pin the reader alone. _PRE_INTERJECTION
-# and _PRE_STAMPS pin it against entries written before those fields existed.
+# Golden wire fixtures — byte literals of the exact orjson output, pinning the
+# writer and the reader against each other. _PRE_INTERJECTION pins the reader
+# against entries written before the interjection flags existed.
 
 _INTERJECTION_FLAGS_FALSE = (
     b'"interjected":false,"is_resume":false,"start_paused":false'
 )
 _ENQUEUE_STAMPS_ZERO = b'"queued_at":0.0,"queue_position":0'
 _QUERY_SOURCE_UNKNOWN = b'"query_source":""'
-# "qobj" only — a search has not played, so SearchQueueEntry carries no such field.
+# A queued entry has not played, so this is 0.0 on all but a resume tail.
 _PLAYED_AT_UNPLAYED = b'"played_at":0.0'
-# Likewise "qobj" only: the frozen NP card a resume tail is responsible for.
+# The frozen NP card a resume tail is responsible for.
 _NP_HOST_NONE = b'"np_message_id":0,"np_channel_id":0,"np_dedicated":false'
 _GOLDEN_QOBJ_FULL = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
@@ -484,38 +482,6 @@ _GOLDEN_QOBJ_UNPERSISTED = (
     + b"}"
 )
 _GOLDEN_QOBJ_PRE_INTERJECTION = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
-_GOLDEN_YTSOURCE = (
-    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,'
-    b'"ts":null,"user_input":null,'
-    + _ENQUEUE_STAMPS_ZERO
-    + b","
-    + _QUERY_SOURCE_UNKNOWN
-    + b"}"
-)
-# Written before the enqueue stamps existed: the reader defaults both to 0.
-_GOLDEN_YTSOURCE_PRE_STAMPS = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
-# Every optional key an older build wrote when it knew the value.
-_GOLDEN_YTSOURCE_FULL = (
-    b'{"type":"ytsource","ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null,'
-    b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
-    b'"query_source":"","requester_id":424242424242424242,"title":"DNA.",'
-    b'"uploader":"Kendrick Lamar","duration":185,'
-    b'"webpage_url":"https://open.spotify.com/track/abc"}'
-)
-# A collection track as an earlier build wrote it: the link the expansion came
-# from in user_input, its classification, and the position it was queued at.
-_GOLDEN_YTSOURCE_COLLECTION_TRACK = (
-    b'{"type":"ytsource","ytsearch":"ytsearch:Track One","url":null,"process":true,'
-    b'"ts":null,"user_input":"https://open.spotify.com/album/abc123",'
-    b'"queued_at":1752530000.5,"queue_position":7,"query_source":"spotify.com",'
-    b'"requester_id":424242424242424242}'
-)
-# A link queued before it resolved: `url`, no `ytsearch`.
-_GOLDEN_YTSOURCE_LINK = (
-    b'{"type":"ytsource","ytsearch":null,"url":"https://yt.com/v=9","process":null,'
-    b'"ts":10,"user_input":null,"queued_at":0.0,"queue_position":0,"query_source":""}'
-)
-
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
     title="Golden Song",
@@ -800,91 +766,6 @@ class TestSongQueueEntryWire:
         assert SongQueueEntry.from_queue_object(item) == _SEARCH_ENTRY
 
 
-class TestSearchQueueEntryWire:
-    """The "ytsource" shape is read, never written: these pin what an entry an
-    earlier build left on a list parses back to. Its input is a byte literal for
-    the same reason the writer goldens are — the bytes are the contract."""
-
-    def test_the_requester_reads_back_off_the_wire(self) -> None:
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_FULL)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.requester_id == 424242424242424242
-
-    def test_the_display_fields_read_back(self) -> None:
-        """What -queue shows for an unresolved Spotify track has to survive a
-        restart, or a restored queue reads "resolving..." again."""
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_FULL)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert (parsed.title, parsed.uploader, parsed.duration, parsed.webpage_url) == (
-            "DNA.",
-            "Kendrick Lamar",
-            185,
-            "https://open.spotify.com/track/abc",
-        )
-
-    def test_an_entry_without_display_fields_parses_them_as_none(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert isinstance(entry, SearchQueueEntry)
-        assert (entry.title, entry.uploader, entry.duration, entry.webpage_url) == (
-            None,
-            None,
-            None,
-            None,
-        )
-
-    def test_a_pre_requester_entry_parses_as_none(self) -> None:
-        # Not 0: None routes to the fallback requester, 0 to member 0, nobody.
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert isinstance(entry, SearchQueueEntry)
-        assert entry.requester_id is None
-
-    def test_origin_survives_the_wire(self) -> None:
-        """An unresolved Spotify-playlist track is the only place that link still
-        exists: its ytsearch is a title the expansion generated, and the resolved
-        YouTube URL it becomes names neither. Lose this field on the way back in
-        and -remove <playlist link> stops matching such a track after a restart."""
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_COLLECTION_TRACK)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.user_input == "https://open.spotify.com/album/abc123"
-
-    def test_pre_feature_entry_parses_with_no_origin(self) -> None:
-        """Absent reads as None, not as an error — the same convention every other
-        added field follows, so a queue written by an older build still restores."""
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_STAMPS)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.user_input is None
-
-    def test_reader_parses_golden_bytes(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert entry == SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
-
-    def test_reader_parses_a_link_entry(self) -> None:
-        # A link queued before it resolved: `url` rather than `ytsearch`, which
-        # _rehydrate falls back to for the item's search term.
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE_LINK)
-        assert entry == SearchQueueEntry(url="https://yt.com/v=9", ts=10)
-
-    def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
-        # Searches written before the enqueue stamps existed must still parse.
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_STAMPS)
-        assert isinstance(entry, SearchQueueEntry)
-        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
-        assert entry.query_source == ""
-
-    def test_query_source_reads_back_off_the_wire(self) -> None:
-        # The leg that makes a Spotify playlist track archive as Spotify: these
-        # entries sit in Redis unresolved and become YouTube URLs at dequeue, so
-        # nothing downstream could recover the classification.
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_COLLECTION_TRACK)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.query_source == "spotify.com"
-
-    def test_enqueue_stamps_read_back(self) -> None:
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_COLLECTION_TRACK)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert (parsed.queued_at, parsed.queue_position) == (1752530000.5, 7)
-
-
 class TestParseQueueEntryCorrupt:
     @pytest.mark.parametrize(
         "raw",
@@ -899,6 +780,21 @@ class TestParseQueueEntryCorrupt:
     def test_corrupt_entry_dropped_with_warning(
         self, raw: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert parse_queue_entry(raw) is None
+        assert "corrupt queue entry" in caplog.text
+
+    def test_a_retired_search_entry_is_dropped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The shape builds before 2.54.0 gave an unresolved track names none of
+        the keys required here, so it takes the corrupt path: the entry is gone
+        from the restore and the Redis list is a rebuild longer than the deque."""
+        raw = (
+            b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,'
+            b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,'
+            b'"queue_position":0,"query_source":""}'
+        )
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
@@ -2205,11 +2101,6 @@ class TestQueueEntryImmutability:
     def test_song_entry_frozen(self) -> None:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(_FULL_ENTRY, "title", "x")
-
-    def test_search_entry_frozen(self) -> None:
-        entry = SearchQueueEntry()
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(entry, "url", "x")
 
 
 class TestSharedBoardRows:
