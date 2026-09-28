@@ -13622,17 +13622,26 @@ class TestHistorySkipMarker:
         assert music_player.history[0].title == mock_song.title
         assert music_player._skip_history_for is None
 
+    @pytest.mark.parametrize("dedicated", [True, False])
     async def test_matching_marker_stamps_the_tail_with_the_finished_host(
-        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        dedicated: bool,
     ) -> None:
         """The late-bound half of the NP-card cleanup: the tail learns which
-        message froze this fragment's bar, at the one moment that is settled."""
+        message froze this fragment's bar, at the one moment that is settled.
+        Both flags run each way because a `dedicated` that does not track the
+        host sends _dispose_previous_np_card down the wrong branch — a strip
+        edit where the card should be deleted, or the reverse."""
+        own = discord.Embed(title="reply")
         host = AsyncMock(spec=discord.Message)
         host.id = 777777777777777777
         host.channel.id = 888888888888888888
         music_player._np_host_message = host
-        music_player._np_host_own_embeds = []
-        music_player._np_host_dedicated = True
+        music_player._np_host_own_embeds = [own]
+        music_player._np_host_dedicated = dedicated
 
         tail = QueueObject(
             webpage_url="https://yt.com/v=t",
@@ -13653,8 +13662,11 @@ class TestHistorySkipMarker:
             777777777777777777,
             888888888888888888,
         )
-        assert stamped.np_dedicated is True
-        assert stamped.np_host_ref is not None and stamped.np_host_ref.message is host
+        assert stamped.np_dedicated is dedicated
+        assert stamped.np_host_ref is not None
+        assert stamped.np_host_ref.message is host
+        assert stamped.np_host_ref.own_embeds == [own]
+        assert stamped.np_host_ref.dedicated is dedicated
         assert music_player._pending_resume_tail is None
 
     async def test_a_stale_tail_is_not_stamped_by_a_later_fragment(
