@@ -24,7 +24,6 @@ from typing import (
     Literal,
     Self,
     TypeIs,
-    Union,
     get_args,
 )
 
@@ -668,9 +667,8 @@ class NowPlayingData:
 
 class QueueEntryField:
     TYPE: Final[str] = "type"
-    # "qobj" entries. webpage_url, title, duration and uploader are written
-    # unconditionally and double as an unresolved track's display fields; the
-    # "ytsource" entries older builds left carry them only when known.
+    # webpage_url, title, duration and uploader are written unconditionally and
+    # double as the display fields of a track that has not resolved yet.
     WEBPAGE_URL: Final[str] = "webpage_url"
     TITLE: Final[str] = "title"
     REQUESTER_ID: Final[str] = "requester_id"
@@ -684,32 +682,24 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Ask-time analytics, on both entry types. FLAT on the wire although they
-    # group as Analytics in memory. Absent on pre-feature entries → 0 defaults.
+    # Ask-time analytics. FLAT on the wire although they group as Analytics in
+    # memory. Absent on pre-feature entries → 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
-    # Parse-time classification, on both entry types (see sources.py).
+    # Parse-time classification (see sources.py).
     QUERY_SOURCE: Final[str] = "query_source"
-    # When the audio started; "qobj" entries only. Absent → 0.0.
+    # When the audio started. Absent → 0.0.
     PLAYED_AT: Final[str] = "played_at"
     # The frozen Now Playing card a resume tail disposes of. Absent → 0/0/False.
     NP_MESSAGE_ID: Final[str] = "np_message_id"
     NP_CHANNEL_ID: Final[str] = "np_channel_id"
     NP_DEDICATED: Final[str] = "np_dedicated"
-    # The term an unresolved item still owes yt-dlp: written on a "qobj" entry
-    # while non-empty, and read off the "ytsource" entries as well.
+    # The term an unresolved item still owes yt-dlp, written only while non-empty.
     YTSEARCH: Final[str] = "ytsearch"
-    # "ytsource" entries, read only. `url` stands in as the term where
-    # `ytsearch` is absent; `process` is parsed so the shape stays described
-    # and lands on nothing a live item holds.
-    URL: Final[str] = "url"
-    PROCESS: Final[str] = "process"
 
 
-# Wire discriminator values. Everything is written as "qobj"; "ytsource" is the
-# shape builds before 2.54.0 gave an unresolved item, and is still read.
+# The wire discriminator, kept verbatim from the original serializer.
 _ENTRY_TYPE_SONG: Final[str] = "qobj"
-_ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 
 
 # ── Queue-entry value objects — the guild:{id}:queue list at rest ────────────
@@ -856,66 +846,22 @@ class SongQueueEntry:
         return orjson.dumps(fields)
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SearchQueueEntry:
-    """The "ytsource" shape, READ only: what builds before 2.54.0 wrote for a
-    track still awaiting yt-dlp. Nothing serializes it — parse_queue_entry
-    builds one, GuildQueue._rehydrate makes an item of it, and that item
-    re-serializes as a "qobj" entry. Fields absent from the shape default here."""
-
-    ytsearch: str | None = None
-    url: str | None = None
-    process: bool | None = None
-    ts: int | None = None
-    # What the user typed, for -remove: the ytsearch here is a generated title.
-    user_input: str | None = None
-    # Ask-time analytics, so a Spotify playlist track keeps its position through
-    # the resolve at dequeue.
-    queued_at: float = 0.0
-    queue_position: int = 0
-    # The leg that makes a Spotify playlist track archive as Spotify rather than
-    # as the YouTube URL it becomes.
-    query_source: str = ""
-    # Who queued it. None, never 0, on an entry written before the field existed:
-    # the resolve at dequeue routes None to the fallback requester.
-    requester_id: int | None = None
-    # What a listing shows until the search resolves; absent on entries written
-    # before they existed, which read back None and render as the term.
-    title: str | None = None
-    uploader: str | None = None
-    duration: int | None = None
-    webpage_url: str | None = None
-
-
-QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
-
-
 # `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
 # narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
-def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
-    """Deserialize one queue-list entry; "type" discriminates searches from
-    songs. Corrupt entries return None with a warning, so the rest of the queue
-    survives."""
+def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
+    """Deserialize one queue-list entry, logging nothing: (entry, "") when it
+    reads, (None, reason) when it does not. A caller reading a whole list takes
+    this one and reports the drops once — a straggler collection is one bad
+    entry per track."""
     try:
         d = orjson.loads(data)
-        if d.get(QueueEntryField.TYPE) == _ENTRY_TYPE_SEARCH:
-            return SearchQueueEntry(
-                ytsearch=d.get(QueueEntryField.YTSEARCH),
-                url=d.get(QueueEntryField.URL),
-                process=d.get(QueueEntryField.PROCESS),
-                ts=d.get(QueueEntryField.TS),
-                user_input=d.get(QueueEntryField.USER_INPUT),
-                queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
-                queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-                query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
-                # No default: absent stays None, which is not requester 0.
-                requester_id=d.get(QueueEntryField.REQUESTER_ID),
-                title=d.get(QueueEntryField.TITLE),
-                uploader=d.get(QueueEntryField.UPLOADER),
-                duration=d.get(QueueEntryField.DURATION),
-                webpage_url=d.get(QueueEntryField.WEBPAGE_URL),
-            )
-        return SongQueueEntry(
+        # Every writer of this list stamps "type" as "qobj"; an entry carrying
+        # anything else is a shape this reader does not know, and takes the
+        # corrupt path whatever other keys it names.
+        entry_type = d[QueueEntryField.TYPE]
+        if entry_type != _ENTRY_TYPE_SONG:
+            raise ValueError(f"entry type {entry_type!r}")
+        entry = SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],
             title=d[QueueEntryField.TITLE],
             requester_id=d[QueueEntryField.REQUESTER_ID],
@@ -941,8 +887,19 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             search=d.get(QueueEntryField.YTSEARCH) or "",
         )
     except Exception as e:
-        log.warning(f"guild_state: corrupt queue entry dropped: {e}")
-        return None
+        return None, str(e)
+    return entry, ""
+
+
+def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
+    """read_queue_entry for a caller holding one entry: None with a warning
+    naming the shape it met, so the rest of the queue survives; it is dropped
+    from the snapshot, leaving the deque shorter than the Redis list until the
+    next mirror rebuild."""
+    entry, reason = read_queue_entry(data)
+    if entry is None:
+        log.warning(f"guild_state: corrupt queue entry dropped: {reason}")
+    return entry
 
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────
@@ -1211,7 +1168,7 @@ class GuildPlaybackSnapshot:
     the halves live here as named properties."""
 
     state: GuildStateData
-    queue: tuple[QueueEntry, ...] = ()
+    queue: tuple[SongQueueEntry, ...] = ()
     # List entries parse_queue_entry could not read. They stay on the Redis list
     # at their positions while `queue` skips them, so the restore marks the
     # mirror stale when this is non-zero.
@@ -1255,7 +1212,10 @@ class GuildRecoveryGate:
 
     @property
     def has_restorable_playback(self) -> bool:
-        """GuildPlaybackSnapshot.has_restorable_playback over the queue length."""
+        """GuildPlaybackSnapshot.has_restorable_playback over the queue length.
+        LLEN counts entries parse_queue_entry cannot read, so a list of only
+        those reconnects and restores nothing; that restore marks the mirror
+        stale, and the next write rebuilds the list without them."""
         return self.pending_count > 0 or self.state.has_crashed_song
 
 

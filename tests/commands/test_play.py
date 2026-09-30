@@ -1094,6 +1094,7 @@ class TestPlayFrontInsertion:
                 music_player.store.queue_key(),
                 orjson.dumps(
                     {
+                        "type": "qobj",
                         "webpage_url": f"https://yt.com/v={title}",
                         "title": title,
                         "requester_id": mock_author.id,

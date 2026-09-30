@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import inspect
+import logging
 from dataclasses import replace
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -2519,6 +2520,67 @@ class TestGetPlaybackSnapshot:
         # restore mark the mirror stale for them.
         assert snap.queue_unreadable == 2
 
+    async def test_one_warning_covers_every_corrupt_entry_in_a_read(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A queued collection is read by one LRANGE, so a per-entry line would
+        put one WARNING per track on stdout and OTLP. The read reports the guild
+        and the count once instead."""
+        retired = [
+            orjson.dumps({"type": "ytsource", "ytsearch": f"ytsearch:t{n}"})
+            for n in range(20)
+        ]
+        await fake_redis.rpush(store.queue_key(), *retired, _entry(1).to_redis())
+
+        with caplog.at_level(logging.WARNING, logger="src.redis_client"):
+            snap = await store.get_playback_snapshot()
+
+        assert snap is not None
+        assert snap.queue_unreadable == 20
+        lines = [r for r in caplog.records if "queue entries as corrupt" in r.message]
+        assert len(lines) == 1
+        assert "[guild:123456789] dropped 20 of 21" in lines[0].message
+
+    async def test_the_corrupt_warning_names_the_shapes_it_met(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The aggregate is the only line an operator gets, so it carries the
+        distinct reasons: a retired entry type reads differently from a blob
+        that is not JSON, and only the first tells them a straggler was met."""
+        await fake_redis.rpush(
+            store.queue_key(),
+            orjson.dumps({"type": "ytsource", "ytsearch": "ytsearch:a"}),
+            orjson.dumps({"type": "ytsource", "ytsearch": "ytsearch:b"}),
+            b"not json",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="src.redis_client"):
+            await store.get_playback_snapshot()
+
+        assert "ytsource" in caplog.text
+        # Deduplicated: twenty stragglers of one shape name it once.
+        assert caplog.text.count("ytsource") == 1
+
+    async def test_a_clean_queue_read_warns_about_nothing(
+        self,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await fake_redis.rpush(store.queue_key(), _entry(1).to_redis())
+
+        with caplog.at_level(logging.WARNING, logger="src.redis_client"):
+            snap = await store.get_playback_snapshot()
+
+        assert snap is not None and snap.queue_unreadable == 0
+        assert "corrupt" not in caplog.text
+
     async def test_includes_now_playing_and_history(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -2631,6 +2693,24 @@ class TestGetRecoveryGate:
             fake_redis.lrange = real_lrange
         assert gate is not None and gate.pending_count == 1
         assert store.queue_key() not in lrange_keys
+
+    async def test_an_entry_the_snapshot_cannot_read_still_counts(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """LLEN counts what is on the list, so a guild whose entries are all
+        unreadable passes the gate and reconnects to restore nothing. The two
+        halves of the read disagree here: get_playback_snapshot reports the
+        same list as zero pending and two unreadable."""
+        await fake_redis.rpush(store.queue_key(), b"not json", b'{"type":"gone"}')
+        gate = await store.get_recovery_gate()
+        assert gate is not None
+        assert gate.pending_count == 2
+        assert gate.has_restorable_playback
+
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert (snap.pending_count, snap.queue_unreadable) == (0, 2)
+        assert not snap.has_restorable_playback
 
     async def test_crashed_song_makes_empty_queue_restorable(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
