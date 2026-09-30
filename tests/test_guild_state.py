@@ -40,6 +40,7 @@ from src.guild_state import (
     TopSong,
     parse_history_entry,
     parse_queue_entry,
+    read_queue_entry,
     serialize_history_entry,
     valid_timezone,
     parse_number_fields,
@@ -839,6 +840,21 @@ class TestParseQueueEntryCorrupt:
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             parse_queue_entry(_RETIRED_WITH_DISPLAY)
         assert "ytsource" in caplog.text
+
+    def test_the_silent_reader_hands_the_reason_back_instead(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A caller reading a whole list logs the drops once itself, so
+        read_queue_entry returns the reason and says nothing: a straggler
+        collection is one unreadable entry per track."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            entry, reason = read_queue_entry(_RETIRED_WITH_DISPLAY)
+        assert entry is None
+        assert "ytsource" in reason
+        assert caplog.text == ""
+
+    def test_the_silent_reader_reports_no_reason_for_an_entry_it_read(self) -> None:
+        assert read_queue_entry(_GOLDEN_QOBJ_SEARCH) == (_SEARCH_ENTRY, "")
 
     def test_a_malformed_optional_field_keeps_the_song(self) -> None:
         """Only the REQUIRED keys drop an entry. The optional ones are read with a

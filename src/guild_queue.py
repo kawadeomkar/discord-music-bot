@@ -526,8 +526,9 @@ class GuildQueue:
         unreadable: int = 0,
     ) -> int:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Returns the number restored, and
-        reports it on one INFO line, which is this restore's whole log output.
+        (they are already on the Redis list). Returns the number restored and
+        reports it on one unconditional INFO line, which names `unreadable`
+        beside the count so the restore is read against the list it came off.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
@@ -558,8 +559,12 @@ class GuildQueue:
                 "them until the next mirror rebuild"
             )
         # Unconditional, an empty restore included: a restart that restored
-        # nothing is a fact, not an absence of one.
-        log.info(f"Restored {count} queued songs for guild {self._guild.id}")
+        # nothing is a fact, not an absence of one. The unreadable count rides
+        # along so the number is read against the list it came off.
+        summary = f"Restored {count} queued songs for guild {self._guild.id}"
+        if unreadable:
+            summary += f", past {unreadable} the snapshot could not read"
+        log.info(summary)
         self._sync_wake()
         return count
 
