@@ -1212,7 +1212,10 @@ class GuildRecoveryGate:
 
     @property
     def has_restorable_playback(self) -> bool:
-        """GuildPlaybackSnapshot.has_restorable_playback over the queue length."""
+        """GuildPlaybackSnapshot.has_restorable_playback over the queue length.
+        LLEN counts entries parse_queue_entry cannot read, so a list of only
+        those reconnects and restores nothing; that restore marks the mirror
+        stale, and the next write rebuilds the list without them."""
         return self.pending_count > 0 or self.state.has_crashed_song
 
 
