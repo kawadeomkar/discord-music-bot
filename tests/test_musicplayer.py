@@ -13037,7 +13037,9 @@ class TestNeutralizePrefetch:
         # strands the previous fragment's frozen card with nothing left that knows
         # to delete it. The runtime ref rides along too — it is what allows a
         # strip-edit, which the ids alone cannot do.
-        ref = NpHostRef(AsyncMock(spec=discord.Message), [], True)
+        ref = NpHostRef(
+            message=AsyncMock(spec=discord.Message), own_embeds=[], dedicated=True
+        )
         original = QueueObject(
             webpage_url="https://yt.com/v=orig",
             title="Interrupted Song",
@@ -13620,17 +13622,26 @@ class TestHistorySkipMarker:
         assert music_player.history[0].title == mock_song.title
         assert music_player._skip_history_for is None
 
+    @pytest.mark.parametrize("dedicated", [True, False])
     async def test_matching_marker_stamps_the_tail_with_the_finished_host(
-        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        dedicated: bool,
     ) -> None:
         """The late-bound half of the NP-card cleanup: the tail learns which
-        message froze this fragment's bar, at the one moment that is settled."""
+        message froze this fragment's bar, at the one moment that is settled.
+        Both flags run each way because a `dedicated` that does not track the
+        host sends _dispose_previous_np_card down the wrong branch — a strip
+        edit where the card should be deleted, or the reverse."""
+        own = discord.Embed(title="reply")
         host = AsyncMock(spec=discord.Message)
         host.id = 777777777777777777
         host.channel.id = 888888888888888888
         music_player._np_host_message = host
-        music_player._np_host_own_embeds = []
-        music_player._np_host_dedicated = True
+        music_player._np_host_own_embeds = [own]
+        music_player._np_host_dedicated = dedicated
 
         tail = QueueObject(
             webpage_url="https://yt.com/v=t",
@@ -13651,8 +13662,11 @@ class TestHistorySkipMarker:
             777777777777777777,
             888888888888888888,
         )
-        assert stamped.np_dedicated is True
-        assert stamped.np_host_ref is not None and stamped.np_host_ref.message is host
+        assert stamped.np_dedicated is dedicated
+        assert stamped.np_host_ref is not None
+        assert stamped.np_host_ref.message is host
+        assert stamped.np_host_ref.own_embeds == [own]
+        assert stamped.np_host_ref.dedicated is dedicated
         assert music_player._pending_resume_tail is None
 
     async def test_a_stale_tail_is_not_stamped_by_a_later_fragment(
@@ -13848,7 +13862,9 @@ class TestDisposePreviousNpCard:
 
     async def test_dedicated_ref_is_deleted(self, music_player: MusicPlayer) -> None:
         message = AsyncMock(spec=discord.Message)
-        song = self._song(np_host_ref=NpHostRef(message, [], True))
+        song = self._song(
+            np_host_ref=NpHostRef(message=message, own_embeds=[], dedicated=True)
+        )
 
         await music_player._dispose_previous_np_card(song)
 
@@ -13951,7 +13967,9 @@ class TestDisposePreviousNpCard:
         reconstructed from ids, which is why the by-id path skips non-dedicated."""
         message = AsyncMock(spec=discord.Message)
         own = [discord.Embed(title="the reply's own embed")]
-        song = self._song(np_host_ref=NpHostRef(message, own, False))
+        song = self._song(
+            np_host_ref=NpHostRef(message=message, own_embeds=own, dedicated=False)
+        )
 
         await music_player._dispose_previous_np_card(song)
 
@@ -14039,7 +14057,7 @@ class TestDisposePreviousNpCard:
         message = AsyncMock(spec=discord.Message)
         music_player.bot.get_partial_messageable = MagicMock()
         song = self._song(
-            np_host_ref=NpHostRef(message, [], True),
+            np_host_ref=NpHostRef(message=message, own_embeds=[], dedicated=True),
             np_message_id=7,
             np_channel_id=8,
             np_dedicated=True,
@@ -14766,7 +14784,9 @@ class TestInterjectLoopStart:
         order: list[str] = []
         mock_song.is_resume = True
         mock_song.start_offset = 42
-        mock_song.np_host_ref = NpHostRef(AsyncMock(spec=discord.Message), [], True)
+        mock_song.np_host_ref = NpHostRef(
+            message=AsyncMock(spec=discord.Message), own_embeds=[], dedicated=True
+        )
 
         async def track_send(self_inner: Any, _song: object) -> None:
             # The sleep is what makes the ordering OBSERVABLE. _spawn_background
