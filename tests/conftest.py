@@ -550,7 +550,7 @@ def mock_song() -> MagicMock:
     requester.id = 123456
     requester.display_name = "TestUser"
     song.webpage_url = "https://www.youtube.com/watch?v=testid"
-    song.duration = "0:03:30"
+    song.duration_label = "0:03:30"
     song.uploader = "Test Channel"
     song.views = 1_000_000
     song.likes = 50_000

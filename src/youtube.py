@@ -1219,11 +1219,10 @@ class NpHostRef:
 # searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
 # against 344 B for the same instance carrying a __dict__. Keep the class off
 # asdict (it deep-copies requester), vars (it raises) and any pickle path.
-# frozen hashes it BY VALUE, while the queue keys on identity (holds,
-# display_index, _listed): two asks for one song are one element in a set, and a
-# resume tail carrying np_host_ref cannot be hashed at all (own_embeds is a
-# list). Keep the class out of sets and dict keys.
-@dataclass(frozen=True, slots=True, kw_only=True)
+# eq=False: an item is one ask, so it compares and hashes by identity — two asks
+# for one song are two items in a set as on the deque, and GuildQueue keys its
+# swap records on the object itself.
+@dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class QueueObject:
     """One queued song, resolved or not. A track queued from a Spotify playlist
     arrives as a search: `search` set, `webpage_url` its own Spotify page or empty.
@@ -1693,8 +1692,9 @@ class YTDL(discord.FFmpegOpusAudio):
         # `or 0`, not a dict default: yt-dlp sets "duration" to None (not absent)
         # for livestreams, and int(None) raises.
         self.duration_secs: int = int(data.get("duration") or 0)
-        # fmt_duration everywhere, so the embeds and the bar agree on "3:30".
-        self.duration = fmt_duration(self.duration_secs)
+        # fmt_duration everywhere, so the embeds and the bar agree on "3:30". A
+        # label, named apart from the item's `duration`, which is the seconds.
+        self.duration_label = fmt_duration(self.duration_secs)
         self.tags = data.get("tags")
         self.webpage_url = data.get("webpage_url")
         self.views = data.get("view_count")

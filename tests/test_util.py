@@ -257,7 +257,7 @@ class TestPluralize:
 
 class TestFmtDuration:
     """The one clock formatter — progress bar, queue/pause/skip lines, history,
-    and YTDL.duration all render through this."""
+    and YTDL.duration_label all render through this."""
 
     def test_minutes_seconds(self) -> None:
         assert fmt_duration(225) == "3:45"

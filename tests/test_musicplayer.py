@@ -111,7 +111,7 @@ def _loop_song() -> MagicMock:
     song.title = "Loop Test Song"
     song.webpage_url = "https://yt.com/v=loop1"
     song.duration_secs = 210
-    song.duration = "0:03:30"
+    song.duration_label = "0:03:30"
     song.uploader = "Loop Channel"
     song.thumbnail = ""
     song.views = None
@@ -3121,7 +3121,7 @@ class TestPlaylistFacts:
 
 
 # One requester for every album-track stand-in, so two items built from the same
-# track compare EQUAL — which is what the identity lookup has to see past.
+# track differ only by identity — which is what the slot lookup goes by.
 _ALBUM_ASKER = stub_requester()
 
 
@@ -3219,14 +3219,14 @@ class TestQueuedRows:
 
         assert _card_rows(music_player, tracks, ahead=0).startswith("`2` ")
 
-    def test_the_slot_is_found_by_identity_not_by_equality(
+    def test_two_items_for_one_track_take_two_slots(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """A collection holding the same track twice queues two EQUAL items. An
-        equality lookup returns the first one's slot for both, so the second block
-        of rows would be numbered from the first block's position."""
+        """A collection holding the same track twice queues two items that differ
+        only by identity. Each block of rows is numbered from its own item's slot,
+        so the second block does not repeat the first block's position."""
         first, second = _album_track(1, 100), _album_track(1, 100)
-        assert first == second and first is not second
+        assert first is not second
         seed_queue(music_player.queue, first, second)
 
         assert _card_rows(music_player, [first], ahead=0).startswith("`1` ")
@@ -3665,7 +3665,7 @@ class TestUpdateActivity:
         assert activity.type == discord.ActivityType.listening
         # Name encodes uploader as suffix since bot activities only render name
         assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
-        assert activity.state == mock_song.duration
+        assert activity.state == mock_song.duration_label
         assert activity.state_url == mock_song.webpage_url
         assert "start" in activity.timestamps
         now_ms = int(time.time() * 1000)
@@ -3846,7 +3846,7 @@ class TestUpdateActivityPause:
         await music_player.update_activity(mock_song)
         activity = music_player.bot.change_presence.call_args.kwargs["activity"]
         assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
-        assert activity.state == mock_song.duration
+        assert activity.state == mock_song.duration_label
 
     async def test_resumed_timestamps_reflect_elapsed_not_full_duration(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -8808,7 +8808,7 @@ class TestLoop:
         song.title = title
         song.webpage_url = url
         song.duration_secs = 210
-        song.duration = "0:03:30"
+        song.duration_label = "0:03:30"
         song.uploader = "Loop Channel"
         song.thumbnail = ""
         song.views = None
@@ -11019,7 +11019,7 @@ class TestLoopAdditional:
         song.title = title
         song.webpage_url = url
         song.duration_secs = 210
-        song.duration = "0:03:30"
+        song.duration_label = "0:03:30"
         song.uploader = "Loop Channel"
         song.thumbnail = ""
         song.views = None

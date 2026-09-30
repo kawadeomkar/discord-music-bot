@@ -321,7 +321,7 @@ def _full_song_stub() -> YTDL:
             title="Test Song",
             webpage_url="https://youtu.be/abc",
             uploader="Test Channel",
-            duration="4:00",
+            duration_label="4:00",
             duration_secs=240,
             thumbnail="https://img/x.jpg",
             views=1000,

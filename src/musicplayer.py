@@ -1721,7 +1721,7 @@ class MusicPlayer:
             activity = discord.Activity(
                 type=discord.ActivityType.listening,
                 name=name,
-                state=song.duration,
+                state=song.duration_label,
                 state_url=song.webpage_url,  # discord.py >= 2.6; silent no-op if downgraded
                 timestamps=timestamps,
             )
