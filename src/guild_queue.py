@@ -36,7 +36,7 @@ from typing import Optional, Union
 
 import discord
 
-from src.guild_state import Analytics, QueueEntry, SearchQueueEntry, SongQueueEntry
+from src.guild_state import Analytics, SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import is_link, unwrap
 from src.util import get_logger
@@ -134,17 +134,6 @@ class RemoveOutcome:
     positions: list[int]  # 1-indexed, as the queue embed numbers them
     # ORIGIN when anything matched on what the user typed; None when nothing did.
     mode: Optional[RemoveMode] = None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class RestoreOutcome:
-    """What restore_entries() replayed. Two counts of the same entries, so
-    kw_only: `restored` is how many reached the deque, `old_shape` how many of
-    the entries offered were still the retired "ytsource" shape. The caller
-    stamps both on the restore span."""
-
-    restored: int
-    old_shape: int
 
 
 def _to_entry(item: QueueObject) -> SongQueueEntry:
@@ -531,32 +520,25 @@ class GuildQueue:
 
     async def restore_entries(
         self,
-        entries: Sequence[QueueEntry],
+        entries: Sequence[SongQueueEntry],
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
         unreadable: int = 0,
-    ) -> RestoreOutcome:
+    ) -> int:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Returns the number restored and
-        how many entries were still in the "ytsource" shape, and logs the
-        restored count on one INFO line for every guild, the tally beside it
-        whenever the list held anything.
+        (they are already on the Redis list). Returns the number restored, and
+        reports it on one INFO line, which is this restore's whole log output.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
         were dropped before reaching here. Either kind of drop marks the mirror
         stale so the shorter queue is written back for good.
         `requester_fallback` is the caller's last resort, ahead of the guild
-        owner, for entries persisted before searches carried a requester id."""
+        owner, for an entry whose requester id no longer resolves to a member
+        or to a cached user."""
         count = 0
         dropped = 0
-        # Entries no build writes any more. Counted per restore and returned so
-        # the caller can stamp it on the span; a zero covers only the guilds this
-        # start restored. See docs/ARCHITECTURE.md#one-queue-item.
-        old_shape = 0
         for entry in entries:
-            if isinstance(entry, SearchQueueEntry):
-                old_shape += 1
             item = self._rehydrate(entry, requester_fallback=requester_fallback)
             if item is None:
                 dropped += 1
@@ -575,19 +557,11 @@ class GuildQueue:
                 f"requester in guild {self._guild.id}; the Redis list still holds "
                 "them until the next mirror rebuild"
             )
-        # Unconditional, an empty restore included: a guild that logs no line is
-        # one nothing measured, and that is not a zero. The tally rides it only
-        # when the list held something, so the zeros on the line are the ones
-        # being watched for rather than a fraction of no entries.
-        line = f"Restored {count} queued songs for guild {self._guild.id}"
-        if entries:
-            line += (
-                f"; {old_shape} of {len(entries)} entries were in the retired "
-                '"ytsource" shape'
-            )
-        log.info(line)
+        # Unconditional, an empty restore included: a restart that restored
+        # nothing is a fact, not an absence of one.
+        log.info(f"Restored {count} queued songs for guild {self._guild.id}")
         self._sync_wake()
-        return RestoreOutcome(restored=count, old_shape=old_shape)
+        return count
 
     # ── Display data (embed/ETA builders live in MusicPlayer) ─────────────────
 
@@ -829,7 +803,7 @@ class GuildQueue:
 
     def _rehydrate(
         self,
-        entry: QueueEntry,
+        entry: SongQueueEntry,
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
     ) -> Optional[QueueObject]:
@@ -857,22 +831,6 @@ class GuildQueue:
         analytics = Analytics(
             queued_at=entry.queued_at, queue_position=entry.queue_position
         )
-        if isinstance(entry, SearchQueueEntry):
-            return QueueObject(
-                # What a listing shows for it until the resolve lands, as the walk
-                # named them: dropping these reads "resolving..." again after a
-                # restart, for a track the queue could already describe.
-                webpage_url=entry.webpage_url or "",
-                title=entry.title or "",
-                requester=requester,
-                ts=entry.ts,
-                user_input=entry.user_input,
-                duration=entry.duration,
-                uploader=entry.uploader,
-                analytics=analytics,
-                query_source=entry.query_source,
-                search=entry.ytsearch or entry.url or "",
-            )
         return QueueObject(
             webpage_url=entry.webpage_url,
             title=entry.title,

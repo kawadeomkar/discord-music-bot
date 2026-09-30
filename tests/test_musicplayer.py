@@ -1894,7 +1894,7 @@ class TestQueueRemoveWithAPrefetch:
         # The restart resolves each requester through the guild.
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player.queue = GuildQueue(music_player._guild, store)
-        assert (await music_player.queue.restore_entries(snapshot.queue)).restored == 8
+        assert await music_player.queue.restore_entries(snapshot.queue) == 8
         song = ytdl_instance({"webpage_url": "https://yt.com/v=head", "title": "Head"})
         song.cleanup = MagicMock()
         _completed_prefetch(music_player, song)
@@ -4695,6 +4695,7 @@ class TestStateRestore:
         assert music_player.store is not None
         item = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=abc",
                 "title": "Restored Song",
                 "requester_id": mock_author.id,
@@ -4764,43 +4765,6 @@ class TestStateRestore:
 
         (item,) = music_player.queue.display_items()
         assert item.requester is mock_author
-
-    async def test_restore_stamps_the_old_shape_tally_on_the_span(
-        self,
-        music_player: MusicPlayer,
-        fake_redis: aioredis.Redis,
-        mock_author: MagicMock,
-    ) -> None:
-        """The number retiring the "ytsource" read leg waits on reaches the
-        restore span beside the restored count, so an operator reads the gate
-        off one attribute per guild rather than out of every guild's INFO line."""
-        assert music_player.store is not None
-        await fake_redis.rpush(
-            music_player.store.queue_key(),
-            orjson.dumps(
-                {
-                    "type": "ytsource",
-                    "ytsearch": "ytsearch:a",
-                    "requester_id": mock_author.id,
-                }
-            ),
-            SongQueueEntry(
-                webpage_url="https://yt.com/v=abc",
-                title="Restored Song",
-                requester_id=mock_author.id,
-            ).to_redis(),
-        )
-        music_player._guild.get_member = MagicMock(return_value=mock_author)
-
-        with _recording_tracer() as exporter:
-            await music_player._restore_state()
-
-        (span,) = [
-            s for s in exporter.get_finished_spans() if s.name == "player.state_restore"
-        ]
-        assert span.attributes is not None
-        assert span.attributes["restore.queue_count"] == 2
-        assert span.attributes["restore.old_shape_entries"] == 1
 
     async def test_restore_sets_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
@@ -4887,6 +4851,7 @@ class TestRestoreCrashedSong:
         )
         normal_item = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=normal",
                 "title": "Normal Song",
                 "requester_id": mock_author.id,
@@ -5041,6 +5006,7 @@ class TestRestoreCrashedSong:
         assert music_player.store is not None
         normal_item = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=abc",
                 "title": "Normal",
                 "requester_id": mock_author.id,
@@ -5403,6 +5369,7 @@ class TestRestoreCompleteLoopGuard:
         for i in range(2):
             item = orjson.dumps(
                 {
+                    "type": "qobj",
                     "webpage_url": f"https://yt.com/v={i}",
                     "title": f"Queued {i}",
                     "requester_id": mock_author.id,
@@ -5455,6 +5422,7 @@ class TestRestoreCompleteLoopGuard:
         for i in range(4):
             item = orjson.dumps(
                 {
+                    "type": "qobj",
                     "webpage_url": f"https://yt.com/v={i}",
                     "title": f"Queued {i}",
                     "requester_id": mock_author.id,
@@ -5486,7 +5454,7 @@ class TestResolveSource:
         result = await music_player._resolve_source(queue_obj)
         assert result is queue_obj
 
-    async def test_resolves_ytsource_via_yt_source(
+    async def test_resolves_an_unresolved_item_via_yt_source(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
         fake_qobj = QueueObject(
@@ -8677,6 +8645,7 @@ class TestRestoreStateTtlRefresh:
         assert music_player.store is not None
         valid = orjson.dumps(
             {
+                "type": "qobj",
                 "webpage_url": "https://yt.com/v=ok",
                 "title": "Good Song",
                 "requester_id": mock_author.id,
