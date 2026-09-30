@@ -154,7 +154,7 @@ RESTORE_WAIT_SECS = 5.0
 DEPTH_RESTORE_WAIT_SECS = 1.0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PauseContext:
     """Who paused the current song and when, for the paused card's byline.
 
