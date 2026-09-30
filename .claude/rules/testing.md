@@ -23,7 +23,9 @@ plus the traps that make a green run mean nothing if they are broken.
   there are one behavior; `play_placement.py`'s grammar and registry are tested in
   `test_play_placement.py`, the placement itself in `commands/test_play.py`),
   plus `conftest.py` (shared fixtures/seams),
-  `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` is
+  `helpers.py` (builders), `test_context.py` (Discord context doubles) and
+  `test_dataclass_convention.py`, which belongs to no module: it walks every `src/`
+  dataclass for `frozen, slots, kw_only` against a named allow-list. `config.py` is
   the intentionally-least-covered module.
   `test_telemetry.py` restores structlog's PROCESS-wide configuration itself, because
   conftest's `configure_structlog_for_tests` is session-scoped and `setup_telemetry()`
