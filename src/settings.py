@@ -722,7 +722,7 @@ class Refusal:
     scope: SettingScope | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Parsed:
     value: SettingValue
 
@@ -929,7 +929,7 @@ def _duration_shape_refusal(spec: SettingSpec, value: str) -> Refusal:
 
 def _parse_time(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if spec.kind is SettingKind.SECONDS_OR_OFF and value.casefold() == "off":
-        return Parsed(OFF_SECS)
+        return Parsed(value=OFF_SECS)
     total = _seconds_total(value)
     if total is None or (total * 100).denominator != 1:
         return _duration_shape_refusal(spec, value)
@@ -947,12 +947,12 @@ def _parse_time(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if spec.kind is SettingKind.SECONDS_OR_OFF and seconds == OFF_SECS:
         # `0` could mean "at once" as easily as "never", so off has one spelling.
         return _out_of_range(spec, "minimum", bound(spec.minimum), bound(spec.maximum))
-    return Parsed(seconds)
+    return Parsed(value=seconds)
 
 
 def _parse_percent(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if match := _PERCENT_RE.fullmatch(value):
-        return Parsed(int(match.group(1)))
+        return Parsed(value=int(match.group(1)))
     lo, hi = bound(spec.minimum), bound(spec.maximum)
     return Refusal(
         reason=RefusalReason.BAD_SHAPE,
@@ -963,7 +963,7 @@ def _parse_percent(spec: SettingSpec, value: str) -> Parsed | Refusal:
 
 def _parse_count(spec: SettingSpec, value: str) -> Parsed | Refusal:
     if _COUNT_RE.fullmatch(value):
-        return Parsed(int(value))
+        return Parsed(value=int(value))
     lo, hi = bound(spec.minimum), bound(spec.maximum)
     span = f" from {int(lo)} to {int(hi)}" if lo is not None and hi is not None else ""
     return Refusal(
@@ -976,7 +976,7 @@ def _parse_count(spec: SettingSpec, value: str) -> Parsed | Refusal:
 def _parse_switch(spec: SettingSpec, value: str) -> Parsed | Refusal:
     choice = _SWITCH_WORDS.get(value.casefold())
     if choice is not None:
-        return Parsed(choice)
+        return Parsed(value=choice)
     return Refusal(
         reason=RefusalReason.BAD_SHAPE,
         text=f"**{spec.label}** takes `on` or `off`.",
@@ -1010,7 +1010,7 @@ _FIXED_OFFSET_RE: Final = re.compile(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TimezoneRedirect:
     targets: tuple[str, ...]
     # synonym: another name for UTC or GMT. legacy: an old name with the same
@@ -1019,15 +1019,15 @@ class TimezoneRedirect:
 
 
 def _synonym(target: str) -> TimezoneRedirect:
-    return TimezoneRedirect((target,), "synonym")
+    return TimezoneRedirect(targets=(target,), reason="synonym")
 
 
 def _legacy(target: str) -> TimezoneRedirect:
-    return TimezoneRedirect((target,), "legacy")
+    return TimezoneRedirect(targets=(target,), reason="legacy")
 
 
 def _abbreviation(*targets: str) -> TimezoneRedirect:
-    return TimezoneRedirect(targets, "abbreviation")
+    return TimezoneRedirect(targets=targets, reason="abbreviation")
 
 
 # Every name tzdata carries outside the ten areas that is not UTC, GMT, Factory or a
@@ -1221,7 +1221,7 @@ def _parse_timezone(spec: SettingSpec, value: str) -> Parsed | Refusal:
             spec=spec,
         )
     if (canonical := _zone_index().get(folded)) is not None:
-        return Parsed(canonical)
+        return Parsed(value=canonical)
     if (redirect := _REDIRECT_KEYS.get(folded)) is not None:
         return _redirect_refusal(spec, redirect)
     if (cities := _city_index().get(folded)) is not None:
@@ -1273,7 +1273,7 @@ def parse_value(spec: SettingSpec, value: str) -> Parsed | Refusal:
 # ── Keys and requests ───────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Suggestion:
     """No setting has that name; `name` is the closest setting's card name, if any."""
 
@@ -1307,9 +1307,9 @@ def find(token: str, scope: SettingScope) -> SettingSpec | Suggestion:
     names = _BY_NAME[scope]
     folded = _fold(token)
     if scope is SettingScope.BOT and (by_env := _BOT_BY_ENV.get(folded)) is not None:
-        return Suggestion(card_name(by_env))
+        return Suggestion(name=card_name(by_env))
     close = difflib.get_close_matches(folded, list(names), n=1)
-    return Suggestion(card_name(names[close[0]]) if close else None)
+    return Suggestion(name=card_name(names[close[0]]) if close else None)
 
 
 def wrong_scope_text(spec: SettingSpec, *, operator: bool) -> str:
@@ -1835,14 +1835,14 @@ class WriteResult:
     previous: Optional[GuildConfig]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _Entry:
     config: GuildConfig
     # The fields a successful read or a write has covered; the rest read as unset.
     known: frozenset[str]
 
 
-_EMPTY: Final = _Entry(_UNSET_CONFIG, ALL_CONFIG_FIELDS)
+_EMPTY: Final = _Entry(config=_UNSET_CONFIG, known=ALL_CONFIG_FIELDS)
 
 
 class _GuildLock:
@@ -2012,7 +2012,7 @@ class GuildSettings:
         if known is ALL_CONFIG_FIELDS and config == _UNSET_CONFIG:
             self._entries[guild_id] = _EMPTY
         else:
-            self._entries[guild_id] = _Entry(config, known)
+            self._entries[guild_id] = _Entry(config=config, known=known)
 
     # ── Reads into the cache ──────────────────────────────────────────────────
 

@@ -549,7 +549,7 @@ class TestReplies:
                 or ""
             )
             shown = text.split("**")[3]
-            assert parse_value(spec, shown) == Parsed(value)
+            assert parse_value(spec, shown) == Parsed(value=value)
 
     def test_a_reset_states_the_value_it_returns_to(self) -> None:
         text = card.reset_reply(
