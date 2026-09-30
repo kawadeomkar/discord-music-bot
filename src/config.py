@@ -79,7 +79,7 @@ _BASELINES: Final[dict[str, float]] = {}
 _OVERRIDES: Final[dict[str, float]] = {}
 
 
-@dataclass(frozen=True, slots=True, eq=False)
+@dataclass(frozen=True, slots=True, kw_only=True, eq=False)
 class Knob[T: (int, float)]:
     """One tunable `-settings bot` may override. Calling it returns the override,
     else the environment value: consumers call it when the value applies, never at
@@ -134,7 +134,7 @@ KNOBS: Final[dict[str, AnyKnob]] = {}
 def _secs(name: str, default: float, *, minimum: float) -> Knob[float]:
     """A settable float knob: its environment value parsed, its handle registered."""
     _BASELINES[name] = _float_env(name, default, minimum=minimum)
-    knob = Knob(name, float, minimum)
+    knob = Knob(env=name, kind=float, floor=minimum)
     KNOBS[knob.field] = knob
     return knob
 
@@ -142,7 +142,7 @@ def _secs(name: str, default: float, *, minimum: float) -> Knob[float]:
 def _count(name: str, default: int, *, minimum: int) -> Knob[int]:
     """A settable int knob, as _secs."""
     _BASELINES[name] = _int_env(name, default, minimum=minimum)
-    knob = Knob(name, int, minimum)
+    knob = Knob(env=name, kind=int, floor=minimum)
     KNOBS[knob.field] = knob
     return knob
 

@@ -50,14 +50,14 @@ def _server_rows(
 class TestServerValues:
     def test_unset_is_the_default(self) -> None:
         assert [shown for _, shown in _server_rows(None)] == [
-            card.Shown(100.0, "default"),
-            card.Shown(DEFAULT_TIMEZONE, "default"),
-            card.Shown(300.0, "default"),
-            card.Shown(10.0, "default"),
-            card.Shown(3.0, "default"),
-            card.Shown(6.0, "default"),
-            card.Shown(2.5, "default"),
-            card.Shown(False, "default"),
+            card.Shown(value=100.0, source="default"),
+            card.Shown(value=DEFAULT_TIMEZONE, source="default"),
+            card.Shown(value=300.0, source="default"),
+            card.Shown(value=10.0, source="default"),
+            card.Shown(value=3.0, source="default"),
+            card.Shown(value=6.0, source="default"),
+            card.Shown(value=2.5, source="default"),
+            card.Shown(value=False, source="default"),
         ]
 
     def test_set_values_render_in_their_unit(self) -> None:
@@ -72,44 +72,48 @@ class TestServerValues:
             debug_mode=False,
         )
         assert [shown for _, shown in _server_rows(stored)] == [
-            card.Shown(29, "set here"),
-            card.Shown("Asia/Tokyo", "set here"),
-            card.Shown(600.0, "set here"),
-            card.Shown(120.0, "set here"),
-            card.Shown(10.0, "set here"),
-            card.Shown(OFF_SECS, "set here"),
-            card.Shown(45.0, "set here"),
-            card.Shown(False, "set here"),
+            card.Shown(value=29, source="set here"),
+            card.Shown(value="Asia/Tokyo", source="set here"),
+            card.Shown(value=600.0, source="set here"),
+            card.Shown(value=120.0, source="set here"),
+            card.Shown(value=10.0, source="set here"),
+            card.Shown(value=OFF_SECS, source="set here"),
+            card.Shown(value=45.0, source="set here"),
+            card.Shown(value=False, source="set here"),
         ]
 
     def test_debug_follows_the_bots_current_default_while_unset(self) -> None:
         rows = dict(_server_rows(None, debug_default=True))
-        assert rows[_spec("debug")] == card.Shown(True, "default")
+        assert rows[_spec("debug")] == card.Shown(value=True, source="default")
 
     def test_np_refresh_follows_the_bots_current_value_while_unset(self) -> None:
         config.now_playing_update_interval_secs.set_override(5.0)
         rows = dict(_server_rows(None))
-        assert rows[_spec("np-refresh")] == card.Shown(5.0, "default")
+        assert rows[_spec("np-refresh")] == card.Shown(value=5.0, source="default")
 
     def test_a_value_under_the_bots_runs_as_the_bots_and_names_both(self) -> None:
         rows = dict(_server_rows(GuildConfig(np_refresh_secs=4.0)))
-        assert rows[_spec("np-refresh")] == card.Shown(4.0, "set here")
+        assert rows[_spec("np-refresh")] == card.Shown(value=4.0, source="set here")
         config.now_playing_update_interval_secs.set_override(5.0)
         rows = dict(_server_rows(GuildConfig(np_refresh_secs=4.0)))
-        assert rows[_spec("np-refresh")] == card.Shown(5.0, "bot minimum; set here 4s")
+        assert rows[_spec("np-refresh")] == card.Shown(
+            value=5.0, source="bot minimum; set here 4s"
+        )
 
     def test_a_bot_minimum_renders_as_the_cards_range_prints_it(self) -> None:
         """The range rounds a bound to a value that can be typed; the row naming
         that bound must print the same one."""
         config.now_playing_update_interval_secs.set_override(3.333)
         rows = dict(_server_rows(GuildConfig(np_refresh_secs=3.0)))
-        assert rows[_spec("np-refresh")] == card.Shown(3.34, "bot minimum; set here 3s")
+        assert rows[_spec("np-refresh")] == card.Shown(
+            value=3.34, source="bot minimum; set here 3s"
+        )
 
     def test_not_saved_replaces_the_source(self) -> None:
         rows = dict(
             _server_rows(GuildConfig(volume=0.5), unsaved=frozenset({"volume"}))
         )
-        assert rows[_spec("volume")] == card.Shown(50, "not saved")
+        assert rows[_spec("volume")] == card.Shown(value=50, source="not saved")
 
     @pytest.mark.parametrize("stored", ["Mars/Olympus", "Europe/London](x)" * 70])
     def test_an_unusable_stored_zone_renders_the_default_it_runs_on(
@@ -121,7 +125,9 @@ class TestServerValues:
             debug_default=False,
             persisted=True,
         )
-        assert shown == card.Shown(DEFAULT_TIMEZONE, card.STORED_ZONE_UNUSABLE)
+        assert shown == card.Shown(
+            value=DEFAULT_TIMEZONE, source=card.STORED_ZONE_UNUSABLE
+        )
 
 
 class TestBotValues:
@@ -130,13 +136,13 @@ class TestBotValues:
     @pytest.mark.parametrize(
         ("override", "env", "expected"),
         [
-            (None, None, card.Shown(3.0, "default")),
+            (None, None, card.Shown(value=3.0, source="default")),
             # Blank is unset to the environment parse, so it must not read as env.
-            (None, "", card.Shown(3.0, "default")),
-            (None, "   ", card.Shown(3.0, "default")),
-            (None, "3", card.Shown(3.0, "env")),
-            (5.0, "3", card.Shown(5.0, "bot owner; env 3s")),
-            (5.0, None, card.Shown(5.0, "bot owner; default 3s")),
+            (None, "", card.Shown(value=3.0, source="default")),
+            (None, "   ", card.Shown(value=3.0, source="default")),
+            (None, "3", card.Shown(value=3.0, source="env")),
+            (5.0, "3", card.Shown(value=5.0, source="bot owner; env 3s")),
+            (5.0, None, card.Shown(value=5.0, source="bot owner; default 3s")),
         ],
     )
     def test_a_knob(
@@ -173,12 +179,12 @@ class TestBotValues:
         shown = card.bot_shown(
             spec, host_debug_default=False, debug_default_override=None
         )
-        assert shown == card.Shown(4, "env, outside chat range")
+        assert shown == card.Shown(value=4, source="env, outside chat range")
         config.play_resolve_concurrency.set_override(2)
         shown = card.bot_shown(
             spec, host_debug_default=False, debug_default_override=None
         )
-        assert shown == card.Shown(2, "bot owner; env 4")
+        assert shown == card.Shown(value=2, source="bot owner; env 4")
 
     def test_an_unsaved_knob_says_so(self) -> None:
         config.heartbeat_interval_secs.set_override(5.0)
@@ -188,13 +194,16 @@ class TestBotValues:
             debug_default_override=None,
             persisted=False,
         )
-        assert shown == card.Shown(5.0, "not saved")
+        assert shown == card.Shown(value=5.0, source="not saved")
 
     @pytest.mark.parametrize(
         ("override", "expected"),
         [
-            (None, card.Shown(False, "default")),
-            (True, card.Shown(True, "bot owner, until restart; default off")),
+            (None, card.Shown(value=False, source="default")),
+            (
+                True,
+                card.Shown(value=True, source="bot owner, until restart; default off"),
+            ),
         ],
     )
     def test_debug_default(self, override: bool | None, expected: card.Shown) -> None:
@@ -403,7 +412,9 @@ class TestDetail:
     def test_a_server_setting_that_follows_the_bot(self) -> None:
         """Its caveat, which the cards have no room for, follows the summary."""
         spec = _spec("debug")
-        embed = card.detail(spec, card.Shown(True, "set here"), default=False)
+        embed = card.detail(
+            spec, card.Shown(value=True, source="set here"), default=False
+        )
         assert embed.description == (
             "**Debug footer** (`debug`; also `debug-footer`) — Adds trace and "
             "bot-load details to every embed here. Anyone who can read the channel "
@@ -413,7 +424,9 @@ class TestDetail:
 
     def test_a_duration_setting(self) -> None:
         spec = _spec("idle-timeout")
-        embed = card.detail(spec, card.Shown(600.0, "set here"), default=300.0)
+        embed = card.detail(
+            spec, card.Shown(value=600.0, source="set here"), default=300.0
+        )
         assert embed.description == (
             "**Leave when idle** (`idle-timeout`; also `idle`, `leave-when-idle`) — "
             "How long to stay in voice with nothing queued. Current **10:00** "
@@ -424,7 +437,7 @@ class TestDetail:
     def test_a_setting_that_follows_the_bots_value_quotes_it_live(self) -> None:
         spec = _spec("np-refresh")
         config.now_playing_update_interval_secs.set_override(5.0)
-        embed = card.detail(spec, card.Shown(5.0, "default"), default=5.0)
+        embed = card.detail(spec, card.Shown(value=5.0, source="default"), default=5.0)
         assert embed.description == (
             "**Progress bar refresh** (`np-refresh`; also `progress-bar`, "
             "`progress-bar-refresh`) — How often the Now Playing bar moves. Current "
@@ -434,7 +447,9 @@ class TestDetail:
 
     def test_an_off_setting(self) -> None:
         spec = _spec("slow-notice")
-        embed = card.detail(spec, card.Shown(OFF_SECS, "set here"), default=6.0)
+        embed = card.detail(
+            spec, card.Shown(value=OFF_SECS, source="set here"), default=6.0
+        )
         assert embed.description == (
             "**Lookup notice** (`slow-notice`; also `lookup-notice`) — Wait before a "
             "slow song lookup posts a notice. Current **off** (set here) · Default 6s "
@@ -443,7 +458,9 @@ class TestDetail:
 
     def test_a_bot_setting_names_its_baseline_in_the_source(self) -> None:
         spec = _spec("heartbeat", SettingScope.BOT)
-        embed = card.detail(spec, card.Shown(5.0, "bot owner; env 3s"), default=None)
+        embed = card.detail(
+            spec, card.Shown(value=5.0, source="bot owner; env 3s"), default=None
+        )
         assert embed.description == (
             f"**Heartbeat** (`heartbeat`) — {spec.summary} Current **5s** (bot "
             "owner; env 3s) · Environment variable `HEARTBEAT_INTERVAL_SECS` · "
@@ -453,7 +470,7 @@ class TestDetail:
     def test_an_unread_store_is_named_first(self) -> None:
         embed = card.detail(
             _spec("timezone"),
-            card.Shown(DEFAULT_TIMEZONE, "default"),
+            card.Shown(value=DEFAULT_TIMEZONE, source="default"),
             default=DEFAULT_TIMEZONE,
             read_failed=True,
         )
@@ -549,7 +566,7 @@ class TestReplies:
                 or ""
             )
             shown = text.split("**")[3]
-            assert parse_value(spec, shown) == Parsed(value)
+            assert parse_value(spec, shown) == Parsed(value=value)
 
     def test_a_reset_states_the_value_it_returns_to(self) -> None:
         text = card.reset_reply(

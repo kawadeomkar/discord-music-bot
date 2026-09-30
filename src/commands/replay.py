@@ -62,7 +62,7 @@ class ReplayResult(Enum):
     DROPPED = "dropped"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ReplayOutcome:
     """What replay_current() did, for -replay's confirmation wording."""
 

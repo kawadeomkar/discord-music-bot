@@ -154,7 +154,7 @@ RESTORE_WAIT_SECS = 5.0
 DEPTH_RESTORE_WAIT_SECS = 1.0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PauseContext:
     """Who paused the current song and when, for the paused card's byline.
 
@@ -169,7 +169,7 @@ class PauseContext:
     by: Optional[Union[discord.User, discord.Member]] = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InterjectOutcome:
     """What MusicPlayer.interject() did — everything `-play --now` needs for its
     confirmation wording."""
@@ -192,7 +192,7 @@ class InterjectOutcome:
         return fmt_duration(self.resume_position or 0)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class StreamFailure:
     """Why a song's stream failed to resolve, captured at the failure point so the
     skip notice can name the cause and the trace carrying the full exception."""
@@ -3021,7 +3021,11 @@ class MusicPlayer:
                         )
                     if skip_history and pending_tail is not None:
                         stamps["np_host_ref"] = (
-                            NpHostRef(finished_host, finished_own, finished_dedicated)
+                            NpHostRef(
+                                message=finished_host,
+                                own_embeds=finished_own,
+                                dedicated=finished_dedicated,
+                            )
                             if finished_host is not None
                             else None
                         )

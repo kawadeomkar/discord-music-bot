@@ -347,7 +347,7 @@ DEFAULT_ALONE_TIMEOUT_SECS: Final = 10.0
 OFF_SECS: Final = 0.0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ConfigDomain:
     """The values a numeric guild:{id}:config field may hold."""
 
@@ -365,12 +365,14 @@ class ConfigDomain:
 # the lowest bot value an operator can run.
 CONFIG_DOMAIN: Final[Mapping[ConfigFieldName, ConfigDomain]] = MappingProxyType(
     {
-        ConfigField.VOLUME: ConfigDomain(0.0, 1.0),
-        ConfigField.IDLE_TIMEOUT: ConfigDomain(DEFAULT_IDLE_TIMEOUT_SECS, 1800.0),
-        ConfigField.ALONE_TIMEOUT: ConfigDomain(DEFAULT_ALONE_TIMEOUT_SECS, 120.0),
-        ConfigField.NP_REFRESH: ConfigDomain(1.0, 30.0),
-        ConfigField.SLOW_NOTICE: ConfigDomain(4.0, 60.0, off=True),
-        ConfigField.QUEUE_PROGRESS_DELAY: ConfigDomain(2.0, 60.0),
+        ConfigField.VOLUME: ConfigDomain(lo=0.0, hi=1.0),
+        ConfigField.IDLE_TIMEOUT: ConfigDomain(lo=DEFAULT_IDLE_TIMEOUT_SECS, hi=1800.0),
+        ConfigField.ALONE_TIMEOUT: ConfigDomain(
+            lo=DEFAULT_ALONE_TIMEOUT_SECS, hi=120.0
+        ),
+        ConfigField.NP_REFRESH: ConfigDomain(lo=1.0, hi=30.0),
+        ConfigField.SLOW_NOTICE: ConfigDomain(lo=4.0, hi=60.0, off=True),
+        ConfigField.QUEUE_PROGRESS_DELAY: ConfigDomain(lo=2.0, hi=60.0),
     }
 )
 
