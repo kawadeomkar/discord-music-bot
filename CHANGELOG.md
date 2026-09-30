@@ -17,6 +17,41 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.54.0 — 2026-09-26
+
+**A collection track that has not resolved yet is written to Redis as an ordinary queued
+song.** Nothing changes in chat: the same tracks queue, show and play the same way. What
+moves is the shape of the saved entry, so this is the release the 2.53.2 note pointed
+forward at.
+
+- **Do not roll back past 2.53.7 once this build has run.** 2.53.7 is the first build
+  that can read the new entry; an older one restores such a track as a song it believes
+  is playable, pointing at the Spotify track page — at nothing at all when the collection
+  gave no link for it — and neither plays. Each one posts an error as its turn comes and
+  the queue moves on to the next. Rolling back TO 2.53.7 is safe.
+- **The first `-remove` touching a track an earlier build queued rewrites the whole queue
+  list once.** Removal matches an entry by its exact saved bytes, and those tracks were
+  saved in the old shape, so the first attempt misses and the list is rebuilt instead.
+  That rebuild logs one `queue mirror diverged from memory` warning for the guild, which
+  is expected here and not a sign of damage. Nothing is lost and nothing is duplicated;
+  afterwards every entry is in the new shape and removals are one-shot again. `-clear`
+  never has to match bytes — it deletes the list — so it costs nothing extra.
+- **Each restart reports, per guild, how many restored entries were still in the old
+  shape** — on the line that gives the restored count, and as `restore.old_shape_entries`
+  on that guild's restore span. A guild whose saved queue was empty gets the count with
+  no tally after it, so every `N of M` in the log is a list that was really read. A zero
+  covers only the guilds this start actually put a player back into. A server the bot had
+  been told to leave, one whose saved voice or text channel is gone, and one whose
+  reconnect failed are all skipped — the last two say so in their own warning — and each
+  keeps its saved queue for the 24 hours that list lives, counted by nobody. So read the
+  zeros alongside the `Recovery skipped` and `Could not rejoin voice` warnings, and give
+  the last of those a full day before you believe them. To settle it outright rather than
+  infer it, scan the `guild:*:queue` lists for entries whose `"type"` is `"ytsource"`.
+- **A queued collection costs a little more Redis**: ~540 bytes per unresolved track
+  against ~400 before, so a 10,000-track playlist holds ~5 MB of queue mirror rather than
+  ~4 MB, against the 256 MB the bundled Redis is given. Nothing to do; noted so the number
+  is not a surprise.
+
 ## 2.53.7 — 2026-09-26
 
 **This build can read a queue entry the next one writes.** Nothing changes in chat, and

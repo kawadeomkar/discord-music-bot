@@ -316,13 +316,14 @@ class TestQueuePut:
     async def test_put_mirrors_an_unresolved_item_to_redis(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
+        # Same entry shape as a resolved song, with the term it still owes.
         assert music_player.store is not None
         src = unresolved("Never Gonna Give You Up")
         await music_player.queue_put(src)
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
         data = orjson.loads(items[0])
-        assert data["type"] == "ytsource"
+        assert data["type"] == "qobj"
         assert data["ytsearch"] == "ytsearch:Never Gonna Give You Up"
 
     async def test_put_does_not_warm_an_unresolved_item(
@@ -1893,7 +1894,7 @@ class TestQueueRemoveWithAPrefetch:
         # The restart resolves each requester through the guild.
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player.queue = GuildQueue(music_player._guild, store)
-        assert await music_player.queue.restore_entries(snapshot.queue) == 8
+        assert (await music_player.queue.restore_entries(snapshot.queue)).restored == 8
         song = ytdl_instance({"webpage_url": "https://yt.com/v=head", "title": "Head"})
         song.cleanup = MagicMock()
         _completed_prefetch(music_player, song)
@@ -4763,6 +4764,43 @@ class TestStateRestore:
 
         (item,) = music_player.queue.display_items()
         assert item.requester is mock_author
+
+    async def test_restore_stamps_the_old_shape_tally_on_the_span(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The number retiring the "ytsource" read leg waits on reaches the
+        restore span beside the restored count, so an operator reads the gate
+        off one attribute per guild rather than out of every guild's INFO line."""
+        assert music_player.store is not None
+        await fake_redis.rpush(
+            music_player.store.queue_key(),
+            orjson.dumps(
+                {
+                    "type": "ytsource",
+                    "ytsearch": "ytsearch:a",
+                    "requester_id": mock_author.id,
+                }
+            ),
+            SongQueueEntry(
+                webpage_url="https://yt.com/v=abc",
+                title="Restored Song",
+                requester_id=mock_author.id,
+            ).to_redis(),
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+
+        with _recording_tracer() as exporter:
+            await music_player._restore_state()
+
+        (span,) = [
+            s for s in exporter.get_finished_spans() if s.name == "player.state_restore"
+        ]
+        assert span.attributes is not None
+        assert span.attributes["restore.queue_count"] == 2
+        assert span.attributes["restore.old_shape_entries"] == 1
 
     async def test_restore_sets_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis

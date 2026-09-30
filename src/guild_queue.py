@@ -52,7 +52,7 @@ log = get_logger(__name__)
 _LREM_MAX_ENTRIES = 16
 
 # Entries serialized and RPUSHed per round trip by a bulk put. Serialization measured
-# ~1.5ms per thousand at ~400 bytes an entry, which is how long each chunk holds the
+# ~2.1ms per thousand at ~540 bytes an entry, which is how long each chunk holds the
 # event loop; the RPUSH between chunks is what yields it.
 _PUT_CHUNK = 1000
 
@@ -136,12 +136,21 @@ class RemoveOutcome:
     mode: Optional[RemoveMode] = None
 
 
-def _to_entry(item: QueueObject) -> QueueEntry:
-    """Live queue item → at-rest entry for the Redis mirror. An item still
-    waiting to resolve keeps the `"ytsource"` shape it has always had on the
-    wire, so a rollback can still read the list."""
-    if item.unresolved:
-        return SearchQueueEntry.from_queue_object(item)
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RestoreOutcome:
+    """What restore_entries() replayed. Two counts of the same entries, so
+    kw_only: `restored` is how many reached the deque, `old_shape` how many of
+    the entries offered were still the retired "ytsource" shape. The caller
+    stamps both on the restore span."""
+
+    restored: int
+    old_shape: int
+
+
+def _to_entry(item: QueueObject) -> SongQueueEntry:
+    """Live queue item → at-rest entry for the Redis mirror. One shape for every
+    item: one still waiting to resolve writes its term under `ytsearch` and is
+    restored unresolved. See docs/ARCHITECTURE.md#one-queue-item."""
     return SongQueueEntry.from_queue_object(item)
 
 
@@ -214,7 +223,7 @@ class GuildQueue:
         # The entry the list holds for an item requeue_front() or replace_item()
         # swapped in, which serializes differently from it. Keyed by id() and
         # holding the item, so the id cannot be reused while the record lives.
-        self._listed: dict[int, tuple[QueueObject, QueueEntry]] = {}
+        self._listed: dict[int, tuple[QueueObject, SongQueueEntry]] = {}
         # The objects mirror_entries() serialized for the song start's rebuild,
         # so note_mirror_write drops the records of exactly those once that write
         # lands. Replaced by the next mirror_entries().
@@ -526,9 +535,12 @@ class GuildQueue:
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
         unreadable: int = 0,
-    ) -> int:
+    ) -> RestoreOutcome:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Returns the number restored.
+        (they are already on the Redis list). Returns the number restored and
+        how many entries were still in the "ytsource" shape, and logs the
+        restored count on one INFO line for every guild, the tally beside it
+        whenever the list held anything.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
@@ -538,7 +550,13 @@ class GuildQueue:
         owner, for entries persisted before searches carried a requester id."""
         count = 0
         dropped = 0
+        # Entries no build writes any more. Counted per restore and returned so
+        # the caller can stamp it on the span; a zero covers only the guilds this
+        # start restored. See docs/ARCHITECTURE.md#one-queue-item.
+        old_shape = 0
         for entry in entries:
+            if isinstance(entry, SearchQueueEntry):
+                old_shape += 1
             item = self._rehydrate(entry, requester_fallback=requester_fallback)
             if item is None:
                 dropped += 1
@@ -557,8 +575,19 @@ class GuildQueue:
                 f"requester in guild {self._guild.id}; the Redis list still holds "
                 "them until the next mirror rebuild"
             )
+        # Unconditional, an empty restore included: a guild that logs no line is
+        # one nothing measured, and that is not a zero. The tally rides it only
+        # when the list held something, so the zeros on the line are the ones
+        # being watched for rather than a fraction of no entries.
+        line = f"Restored {count} queued songs for guild {self._guild.id}"
+        if entries:
+            line += (
+                f"; {old_shape} of {len(entries)} entries were in the retired "
+                '"ytsource" shape'
+            )
+        log.info(line)
         self._sync_wake()
-        return count
+        return RestoreOutcome(restored=count, old_shape=old_shape)
 
     # ── Display data (embed/ETA builders live in MusicPlayer) ─────────────────
 
@@ -681,7 +710,7 @@ class GuildQueue:
         elif retired:
             self._mirror_dirty = True
 
-    def mirror_entries(self) -> list[QueueEntry]:
+    def mirror_entries(self) -> list[SongQueueEntry]:
         """The persisted subset of the deque, claimed prefix included, in order —
         what a rebuild writes: each live object's own serialization. The objects
         are held for note_mirror_write, which answers for exactly these."""
@@ -765,7 +794,7 @@ class GuildQueue:
         inserted, and two entries for one song compare equal."""
         return any(held is item for held in self._items)
 
-    def _mirror_entry(self, item: QueueObject) -> QueueEntry:
+    def _mirror_entry(self, item: QueueObject) -> SongQueueEntry:
         """The entry the list holds for `item`: its own serialization, or, for an
         item requeue_front() or replace_item() swapped in, the entry of what it
         replaced. Every write that must match the list byte for byte (an LREM, the
