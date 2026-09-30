@@ -1203,7 +1203,7 @@ async def invalidate_stream_cache(
     return await cache_del(redis, _stream_cache_key(webpage_url))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class NpHostRef:
     """The live Now Playing host an interrupted fragment left behind, for its
     resume tail to dispose of. Runtime only: a Message cannot be serialized and

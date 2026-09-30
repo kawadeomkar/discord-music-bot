@@ -29,7 +29,7 @@ from tests.helpers import command_callback, mocked
 
 
 def _probe(state: ProbeState, ms: float | None = None) -> ProbeResult:
-    return ProbeResult("x", state, latency_ms=ms)
+    return ProbeResult(label="x", state=state, latency_ms=ms)
 
 
 def _patch_probes(**results: ProbeResult) -> Any:
@@ -197,7 +197,9 @@ class TestPingCommand:
 
         async def _gated(*a: Any, **k: Any) -> ProbeResult:
             await gate.wait()
-            return ProbeResult("Spotify API", ProbeState.OK, latency_ms=42.0)
+            return ProbeResult(
+                label="Spotify API", state=ProbeState.OK, latency_ms=42.0
+            )
 
         with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
             with patch("src.ping.probe_spotify", new=_gated):
@@ -531,7 +533,9 @@ class TestDownReasonRendering:
 
     def test_down_row_shows_the_reason(self) -> None:
         results = {
-            "Redis": ProbeResult("Redis", ProbeState.DOWN, detail="MISCONF"),
+            "Redis": ProbeResult(
+                label="Redis", state=ProbeState.DOWN, detail="MISCONF"
+            ),
         }
         versions: dict[str, str] = dict.fromkeys(
             ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
@@ -541,7 +545,7 @@ class TestDownReasonRendering:
         assert "down (MISCONF)" in latency
 
     def test_down_without_detail_stays_bare(self) -> None:
-        results = {"Redis": ProbeResult("Redis", ProbeState.DOWN)}
+        results = {"Redis": ProbeResult(label="Redis", state=ProbeState.DOWN)}
         versions: dict[str, str] = dict.fromkeys(
             ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
         )
@@ -1009,7 +1013,9 @@ class TestDefaultPasswordWarningReachesTheWire:
 
         async def _gated(*a: Any, **k: Any) -> ProbeResult:
             await gate.wait()
-            return ProbeResult("Spotify API", ProbeState.OK, latency_ms=42.0)
+            return ProbeResult(
+                label="Spotify API", state=ProbeState.OK, latency_ms=42.0
+            )
 
         with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
             with patch("src.ping.probe_spotify", new=_gated):

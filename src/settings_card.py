@@ -80,7 +80,7 @@ DEBUG_DISCLOSURE: Final = (
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Shown:
     """A value in its spec's unit, and the source label it renders with."""
 
@@ -117,7 +117,9 @@ def server_shown(
         # never rendered: the key is no-TTL and hand-editable, so it can be any text.
         if GuildConfig(timezone=raw).tzinfo().key != raw:
             default = server_default(spec, debug_default=debug_default)
-            return Shown(default, STORED_ZONE_UNUSABLE if persisted else NOT_SAVED)
+            return Shown(
+                value=default, source=STORED_ZONE_UNUSABLE if persisted else NOT_SAVED
+            )
     if raw is None:
         value = server_default(spec, debug_default=debug_default)
     elif isinstance(raw, (bool, str)):
@@ -134,7 +136,7 @@ def server_shown(
     ):
         source = f"{BOT_MINIMUM}; set here {format_value(spec, value)}"
         value = floor
-    return Shown(value, source if persisted else NOT_SAVED)
+    return Shown(value=value, source=source if persisted else NOT_SAVED)
 
 
 def _env_set(spec: SettingSpec) -> bool:
@@ -155,9 +157,12 @@ def bot_shown(
         return knob_shown(spec, persisted=persisted)
     origin = "env" if _env_set(spec) else "default"
     if debug_default_override is None:
-        return Shown(host_debug_default, origin)
+        return Shown(value=host_debug_default, source=origin)
     base = format_value(spec, host_debug_default)
-    return Shown(debug_default_override, f"bot owner, until restart; {origin} {base}")
+    return Shown(
+        value=debug_default_override,
+        source=f"bot owner, until restart; {origin} {base}",
+    )
 
 
 def knob_shown(spec: SettingSpec, *, persisted: bool = True) -> Shown:
@@ -170,13 +175,15 @@ def knob_shown(spec: SettingSpec, *, persisted: bool = True) -> Shown:
     override = spec.knob.override()
     baseline = spec.knob.baseline
     if not persisted:
-        return Shown(spec.knob(), NOT_SAVED)
+        return Shown(value=spec.knob(), source=NOT_SAVED)
     if override is None:
         # Honoured as set; a chat write can only move it back inside.
         if not in_bounds(spec, baseline):
-            return Shown(baseline, f"{origin}, {OUTSIDE_CHAT_RANGE}")
-        return Shown(baseline, origin)
-    return Shown(override, f"bot owner; {origin} {format_value(spec, baseline)}")
+            return Shown(value=baseline, source=f"{origin}, {OUTSIDE_CHAT_RANGE}")
+        return Shown(value=baseline, source=origin)
+    return Shown(
+        value=override, source=f"bot owner; {origin} {format_value(spec, baseline)}"
+    )
 
 
 # ── Cards ────────────────────────────────────────────────────────────────────
