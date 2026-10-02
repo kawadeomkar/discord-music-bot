@@ -10,6 +10,7 @@ import discord
 import pytest
 
 from discord.ext import commands
+from discord.voice_state import ConnectionFlowState, VoiceConnectionState
 
 import src.debug as debug_mode
 from src.config import SpotifyStatus
@@ -460,6 +461,18 @@ class TestCleanup:
         await music_bot.cleanup(mock_guild)
         mock_guild.voice_client.disconnect.assert_awaited_once()
 
+    async def test_the_disconnect_is_forced(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Unforced, a handshake abandoned before it reached `connected` leaves the
+        bot in the channel Discord-side, and the next join is deduplicated away
+        into a 10s handshake timeout. TestVoiceDisconnectContract pins that the
+        flag is what decides it."""
+        self._make_minimal_mp(music_bot, mock_guild)
+        mock_guild.voice_client.disconnect = AsyncMock()
+        await music_bot.cleanup(mock_guild)
+        mock_guild.voice_client.disconnect.assert_awaited_once_with(force=True)
+
     async def test_removes_guild_from_mps(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -801,6 +814,63 @@ class TestCleanup:
         await music_bot.cleanup(mock_guild)
 
         assert order == ["claim", "retire"]
+
+
+class TestVoiceDisconnectContract:
+    """Why `cleanup()` passes `force=True`, driven against the pinned discord.py
+    rather than a mock of it: `VoiceClient.disconnect` forwards the flag straight
+    to the state machine below, and that is where an unforced teardown of an
+    unfinished handshake becomes a silent no-op. A version bump that moves this
+    has to fail here. See docs/ARCHITECTURE.md#voice-teardown."""
+
+    @staticmethod
+    def _abandoned_handshake() -> tuple[VoiceConnectionState, AsyncMock]:
+        """A real connection state parked where a cancelled cold-start join leaves
+        one: both voice updates in, websocket never finished, so `is_connected()`
+        is False. The client is a bare MagicMock because `channel` is set in
+        __init__ and `spec=discord.VoiceClient` therefore refuses it."""
+        change_voice_state = AsyncMock()
+        voice_client = MagicMock()
+        voice_client.channel.id = 925632451882143764
+        voice_client.channel.guild.change_voice_state = change_voice_state
+        voice_client.guild.id = 924267988138483772
+
+        state = VoiceConnectionState(voice_client)
+        state.state = ConnectionFlowState.got_both_voice_updates
+
+        def _answer_the_clear(**_: Any) -> None:
+            """The VOICE_STATE_UPDATE Discord answers the clear with, which is what
+            the disconnect then blocks on. Scheduled rather than set inline:
+            _voice_disconnect clears the event after this call returns."""
+            asyncio.get_running_loop().call_soon(state._disconnected.set)
+
+        change_voice_state.side_effect = _answer_the_clear
+        # A simulation that stops answering fails the test instead of parking it
+        # on discord.py's own 30s default.
+        state.timeout = 1.0
+        return state, change_voice_state
+
+    async def test_unforced_disconnect_sends_no_clear(self) -> None:
+        """The leak: Discord is never told, and the caller's VoiceClient.cleanup()
+        then unregisters the one object that could still tell it."""
+        state, change_voice_state = self._abandoned_handshake()
+        try:
+            await state.disconnect(force=False, wait=True)
+        finally:
+            state._socket_reader.stop()
+
+        change_voice_state.assert_not_awaited()
+        assert not state._expecting_disconnect
+
+    async def test_forced_disconnect_clears_the_voice_state(self) -> None:
+        state, change_voice_state = self._abandoned_handshake()
+        try:
+            await state.disconnect(force=True, wait=True)
+        finally:
+            state._socket_reader.stop()
+
+        change_voice_state.assert_awaited_once_with(channel=None)
+        assert state.state is ConnectionFlowState.disconnected
 
 
 class TestCogBeforeInvoke:

@@ -313,7 +313,12 @@ class MusicBot(commands.Cog):
             # Tasks are down, so no tick can race this.
             await mp.retire_np_host_on_stop()
             if guild.voice_client:
-                await guild.voice_client.disconnect(force=False)
+                # force=True: below `connected` discord.py's disconnect returns
+                # before the op-4 clear, and VoiceClient.cleanup() unregisters the
+                # client anyway — the bot stays in the channel Discord-side with
+                # nothing left that can clear it. See
+                # docs/ARCHITECTURE.md#voice-teardown.
+                await guild.voice_client.disconnect(force=True)
             if pending_history is not None:
                 # After the disconnect: Redis IO ahead of it delays the silence
                 # -stop asked for, unboundedly against a stalled host.

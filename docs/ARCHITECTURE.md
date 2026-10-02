@@ -48,6 +48,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Stream-retry ladder](#stream-retry-ladder)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Stream probe session](#stream-probe-session)
+    - [Voice teardown](#voice-teardown)
     - [Queue invariant](#queue-invariant)
     - [One queue item](#one-queue-item)
     - [The ask a playing song holds](#the-ask-a-playing-song-holds)
@@ -2394,6 +2395,52 @@ cache entry and burns the one re-extraction, for every guild, until restart. Not
 recovers from it: `probe_path_looks_broken()` watches `UNCONFIRMED` streaks, and a
 `DEAD` verdict resets that counter. A per-call session was immune only because its
 jar died with it.
+
+### Voice teardown
+
+`cleanup()` is an unconditional teardown, so its disconnect passes `force=True`.
+discord.py's default is the other one, and below `ConnectionFlowState.connected` that
+default is silently a no-op:
+
+```python
+# discord/voice_state.py — VoiceConnectionState
+async def disconnect(
+    self, *, force: bool = True, cleanup: bool = True, wait: bool = False
+):
+    if not force and not self.is_connected():  # is_connected() is `state is connected`
+        return
+```
+
+`_voice_disconnect()` sits past that return, and it is the only caller of
+`change_voice_state(channel=None)` — the only thing that tells Discord the bot left.
+Its own caller, `VoiceClient.disconnect`, does **not** sit past it: it runs
+`self.cleanup()` either way, unregistering the client from
+`ConnectionState._voice_clients`. So a `force=False` disconnect on a handshake that
+never reached `connected` splits the two views — no voice client locally, still in the
+channel Discord-side — and nothing afterwards can close the gap, because the object
+that would have sent the clear is gone.
+
+**A cancelled cold-start join is how a handshake gets there.** `-play` runs the join
+concurrently with the resolve and cancels it when the resolve raises
+(`_resolve_and_place`'s `except BaseException`). discord.py's `_wrap_connect` catches
+that `CancelledError` and calls `soft_disconnect()`, which closes the websocket and
+parks the state at `got_both_voice_updates` without sending the clear — it leaves that
+to the abandon path.
+
+The next `-play` then cannot join at all: it sends an op 4 naming the channel the bot
+is already in, Discord has no state change to report, no `VOICE_SERVER_UPDATE` arrives,
+and `_inner_connect` waits out the whole `channel.connect(timeout=10.0)`. The stall a
+user sees is twice that. `_wrap_connect` force-disconnects and unregisters the client,
+then `abc.connect` force-disconnects again with `wait=True`, and the `channel=None`
+confirmation that second wait blocks on can no longer be routed to a client that is no
+longer registered — so it also runs to its timeout. The play lands as
+`play.dropped_by = join_failed`.
+
+**Reading it from the logs:** `_voice_disconnect()` logs `The voice handshake is being
+terminated for Channel ID …` at INFO every time it sends the clear, so that line's
+ABSENCE around an abandoned join is the leak itself. `soft_disconnect` logs at DEBUG
+and says nothing at the deployed level. A timed-out bot member looks similar from
+chat and is not this: that one carries 50013 on every send.
 
 ### Queue invariant
 
