@@ -50,6 +50,7 @@ from src.youtube import (
     _source_entry_is_stale,
     _YTDL_FLAT_SEARCH_OPTS,
     _mine_audio_candidates,
+    _search_terms,
     select_search_entry,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
@@ -1399,6 +1400,122 @@ class TestSearchEntrySelection:
         result = await self._pick(mock_ctx, [first, second])
 
         assert result.title == "First"
+
+
+class TestYTSourceTermLadder:
+    """A Spotify track resolves through its ISRC first and its title second. The
+    fallback exists because an ISRC finds nothing at all for anything the label
+    never uploaded an art track for."""
+
+    _FOUND = {
+        "webpage_url": "https://www.youtube.com/watch?v=art",
+        "title": "Shape of You",
+        "url": "https://cdn/art",
+        "duration": 234,
+    }
+
+    @staticmethod
+    def _answers(mapping: dict[str, Any]) -> Any:
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            return mapping.get(search)
+
+        return extract
+
+    async def test_the_isrc_search_resolves_and_the_title_is_never_asked(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            return self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:Shape of You Ed Sheeran",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                isrc="GBAHS1600463",
+            )
+
+        assert asked == ['ytsearch:"GBAHS1600463"']
+        assert result.duration == 234
+
+    async def test_an_isrc_that_finds_nothing_falls_through_to_the_title(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            return None if search.startswith('ytsearch:"') else self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:Shape of You Ed Sheeran",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                isrc="GBAHS1600463",
+            )
+
+        assert asked == [
+            'ytsearch:"GBAHS1600463"',
+            "ytsearch:Shape of You Ed Sheeran",
+        ]
+        assert result.title == "Shape of You"
+
+    async def test_the_last_term_raises_what_it_always_raised(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The ladder swallows a miss only while it has somewhere to go. The
+        caller's error path is unchanged."""
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            return None
+
+        with (
+            patch("src.youtube._extract_for_source", new=extract),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:nothing at all",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                isrc="GBAHS1600463",
+            )
+
+    async def test_each_term_caches_under_its_own_key(
+        self, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        """The fallback is spent once per track per TTL: the second play reads the
+        title term's entry rather than re-asking for the ISRC."""
+        calls: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            calls.append(search)
+            return None if search.startswith('ytsearch:"') else self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            for _ in range(2):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "ytsearch:Shape of You Ed Sheeran",
+                    query_source="spotify",
+                    **_ANALYTICS,
+                    user_input=None,
+                    isrc="GBAHS1600463",
+                    redis=fake_redis,
+                )
+
+        # The ISRC miss is not cached — only a resolve writes an entry — so it is
+        # re-asked, and the title term is not.
+        assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
 
 
 class TestYTSourceUnifiedExtraction:
@@ -3811,6 +3928,101 @@ class TestSearchEntryPicker:
         """An all-playlist result used to IndexError inside the diagnostic."""
         assert select_search_entry(cast(Any, [{"_type": "playlist"}, None])) is None
 
+    # "Shape of You" as YouTube answers it: the music video first, two re-uploads
+    # of the album master behind it. Spotify says 233 s.
+    _SHAPE_OF_YOU = [
+        {"_type": "video", "id": "video", "duration": 264, "url": "https://v"},
+        {"_type": "video", "id": "lyrics-a", "duration": 232},
+        {"_type": "video", "id": "lyrics-b", "duration": 234, "url": "https://b"},
+    ]
+
+    def test_a_known_length_beats_youtubes_ranking(self) -> None:
+        """The music video leads the result and is 31 s long in dialogue. Both
+        re-uploads tie on |delta| = 1, so the tie-break is the existing rule — the
+        first entry carrying a URL."""
+        chosen = select_search_entry(
+            cast(Any, self._SHAPE_OF_YOU), expected_duration=233
+        )
+        assert chosen is not None and chosen.get("id") == "lyrics-b"
+
+    def test_without_a_length_the_ranking_stands(self) -> None:
+        chosen = select_search_entry(cast(Any, self._SHAPE_OF_YOU))
+        assert chosen is not None and chosen.get("id") == "video"
+
+    def test_an_entry_outside_the_tie_window_loses_to_a_closer_one(self) -> None:
+        entries = [
+            {"_type": "video", "id": "far", "duration": 264, "url": "https://far"},
+            {"_type": "video", "id": "near", "duration": 230, "url": "https://near"},
+        ]
+        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
+        assert chosen is not None and chosen.get("id") == "near"
+
+    def test_entries_with_no_length_are_out_of_the_comparison(self) -> None:
+        entries = [
+            {"_type": "video", "id": "unknown", "url": "https://u"},
+            {"_type": "video", "id": "known", "duration": 233, "url": "https://k"},
+        ]
+        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
+        assert chosen is not None and chosen.get("id") == "known"
+
+    def test_a_result_where_nothing_carries_a_length_still_plays(self) -> None:
+        """A live entry, or an extractor that reports none: the length cannot
+        choose, so the ranking does rather than the search failing."""
+        entries = [
+            {"_type": "video", "id": "a", "url": "https://a"},
+            {"_type": "video", "id": "b", "url": "https://b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
+        assert chosen is not None and chosen.get("id") == "a"
+
+
+class TestSearchTerms:
+    """Which terms one ask resolves through, in order. The ISRC finds the album
+    recording where a title finds the music video; the widening that lets a length
+    choose is flat-only, because a processed search extracts every entry."""
+
+    def test_an_isrc_leads_and_the_title_follows(self) -> None:
+        assert _search_terms(
+            "ytsearch:Shape of You Ed Sheeran",
+            isrc="GBAHS1600463",
+            expected_duration=None,
+            flat=False,
+        ) == [
+            ("isrc", 'ytsearch:"GBAHS1600463"'),
+            ("title", "ytsearch:Shape of You Ed Sheeran"),
+        ]
+
+    def test_without_an_isrc_the_title_is_the_only_term(self) -> None:
+        assert _search_terms(
+            "ytsearch:a song", isrc=None, expected_duration=None, flat=False
+        ) == [("title", "ytsearch:a song")]
+
+    def test_a_known_length_widens_the_flat_search(self) -> None:
+        """One search POST answers with three results for what one costs; a
+        PROCESSED one would extract all three."""
+        assert _search_terms(
+            "ytsearch:a song", isrc=None, expected_duration=200, flat=True
+        ) == [("title_matched", "ytsearch3:a song")]
+
+    def test_the_processed_path_keeps_one_result(self) -> None:
+        assert _search_terms(
+            "ytsearch:a song", isrc=None, expected_duration=200, flat=False
+        ) == [("title", "ytsearch:a song")]
+
+    def test_a_link_is_never_widened(self) -> None:
+        """`ytsearch3:https://...` is a search for the text of a URL."""
+        link = "https://www.youtube.com/watch?v=abc"
+        assert _search_terms(link, isrc=None, expected_duration=200, flat=True) == [
+            ("title", link)
+        ]
+
+    def test_an_unprefixed_term_is_widened_too(self) -> None:
+        """A Spotify track link resolves through a bare term — `default_search`
+        makes it a search — so the prefix has to be added, not replaced."""
+        assert _search_terms(
+            "Shape of You Ed Sheeran", isrc=None, expected_duration=233, flat=True
+        ) == [("title_matched", "ytsearch3:Shape of You Ed Sheeran")]
+
 
 class TestFlatEntryMapper:
     """_queue_object_from_flat_entry turns one search entry into a queue card, or
@@ -4424,7 +4636,15 @@ class TestSourceCacheRevalidation:
         assert raw is not None
         return orjson.loads(raw)
 
-    async def _hit(self, ctx: MagicMock, redis: aioredis.Redis, query: str) -> Any:
+    async def _hit(
+        self,
+        ctx: MagicMock,
+        redis: aioredis.Redis,
+        query: str,
+        *,
+        flat: bool = False,
+        expected_duration: Optional[int] = None,
+    ) -> Any:
         return await YTDL.yt_source(
             ctx.author,
             query,
@@ -4432,7 +4652,31 @@ class TestSourceCacheRevalidation:
             query_source="search",
             **_ANALYTICS,
             user_input=None,
+            flat=flat,
+            expected_duration=expected_duration,
         )
+
+    @staticmethod
+    def _ranked_video_first() -> dict[str, Any]:
+        """What YouTube answers for a hit single: the music video on top, the album
+        master below it."""
+        return {
+            "_type": "playlist",
+            "entries": [
+                {
+                    "id": "musicvideo",
+                    "title": "Shape of You [Official Video]",
+                    "duration": 264,
+                    "uploader": "Ed Sheeran",
+                },
+                {
+                    "id": "master",
+                    "title": "Shape of You",
+                    "duration": 234,
+                    "uploader": "Ed Sheeran",
+                },
+            ],
+        }
 
     def test_an_entry_with_no_stamp_reads_as_fresh(self) -> None:
         """Written by a build that stamped nothing — and carrying that build's one-hour
@@ -4479,6 +4723,61 @@ class TestSourceCacheRevalidation:
         assert rewritten["webpage_url"] == "https://www.youtube.com/watch?v=new1"
         assert rewritten["cached_at"] == pytest.approx(time.time(), abs=60)
         assert await fake_redis.ttl("ytdl:source:stale search") == _YT_SOURCE_TTL
+
+    async def test_a_refresh_re_picks_by_length(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """The refresh chooses under the rule its resolve used. YouTube ranks the
+        music video first, so a term that matched the album master's length has to
+        match it again or the refresh writes the wrong recording over it."""
+        key = "ytdl:source:ytsearch3:shape of you"
+        await fake_redis.set(
+            key,
+            orjson.dumps(
+                self._entry(
+                    webpage_url="https://www.youtube.com/watch?v=master",
+                    duration=234,
+                    cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1,
+                )
+            ),
+        )
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=self._ranked_video_first()
+        ):
+            await youtube._revalidate_source(
+                fake_redis, key, "ytsearch3:shape of you", expected_duration=233
+            )
+
+        rewritten = await self._stored(fake_redis, key)
+        assert rewritten["webpage_url"] == "https://www.youtube.com/watch?v=master"
+        assert rewritten["duration"] == 234
+
+    async def test_a_stale_hit_hands_the_refresh_the_length_it_resolved_with(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The seam: a length only narrows the refresh if the hit passes its own one
+        down. Without it the entry survives the hour and not the refresh behind it."""
+        key = "ytdl:source:ytsearch3:shape of you"
+        await fake_redis.set(
+            key,
+            orjson.dumps(
+                self._entry(
+                    webpage_url="https://www.youtube.com/watch?v=master",
+                    duration=234,
+                    cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1,
+                )
+            ),
+        )
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=self._ranked_video_first()
+        ):
+            await self._hit(
+                mock_ctx, fake_redis, "shape of you", flat=True, expected_duration=233
+            )
+            await asyncio.gather(*tuple(youtube._SOURCE_REVALIDATIONS))
+
+        rewritten = await self._stored(fake_redis, key)
+        assert rewritten["webpage_url"] == "https://www.youtube.com/watch?v=master"
 
     async def test_a_fresh_hit_refreshes_nothing(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
