@@ -1593,6 +1593,64 @@ class TestYTSourceTermLadder:
         assert asked == ['ytsearch:"GBAHS1600463"']
         assert result.duration == 234
 
+    async def test_the_flat_fallback_keeps_the_length_its_choice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A flat entry too thin to play falls through to a processed extraction of
+        the SAME widened term, so the length still chooses there. One result would
+        hand that resolve YouTube's top-ranked video instead."""
+        asked: list[tuple[str, str]] = []
+        live = {"_type": "playlist", "entries": [{"id": "x", "title": "L", "url": "u"}]}
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            flat = request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
+            asked.append(("flat" if flat else "processed", search))
+            return live if flat else self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "Shape of You Ed Sheeran",
+                query_source="spotify",
+                analytics=_ANALYTICS,
+                user_input=None,
+                flat=True,
+                expected_duration=233,
+            )
+
+        widened = f"ytsearch{youtube._DURATION_MATCH_RESULTS}:Shape of You Ed Sheeran"
+        assert asked == [("flat", widened), ("processed", widened)]
+
+    async def test_a_term_nothing_is_indexed_under_costs_one_call(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An empty search does not become a result by being asked a second time
+        processed, and the ISRC rung misses by design. Checked against the live
+        service: a code nothing is indexed under answers with a playlist of no
+        entries, where a real one answers with exactly one."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search.startswith('ytsearch:"'):
+                return {"_type": "playlist", "entries": []}
+            return self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "Shape of You Ed Sheeran",
+                query_source="spotify",
+                analytics=_ANALYTICS,
+                user_input=None,
+                isrc="GBAHS1600463",
+                flat=True,
+                expected_duration=233,
+            )
+
+        assert asked.count('ytsearch:"GBAHS1600463"') == 1
+        assert result.duration == 234
+
     async def test_an_isrc_that_finds_nothing_falls_through_to_the_title(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -7000,6 +7058,56 @@ class TestMeasureLoudness:
         _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
         with patch("asyncio.create_subprocess_exec", new=spawn):
             assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+    async def test_the_scan_reads_sample_peak(self) -> None:
+        """Sample peak is the one alimiter holds the ceiling on, and asking for it
+        costs what asking for no peak costs — `peak=true` is four times the scan."""
+        argv: list[str] = []
+        process, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+
+        async def record(*args: Any, **kwargs: Any) -> MagicMock:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record):
+            await measure_loudness("https://cdn/a", self._URL, None)
+
+        assert "ebur128=framelog=quiet:peak=sample" in argv
+
+    @pytest.mark.parametrize(
+        ("kind", "kwargs"),
+        [("no summary", {"stderr": b"nothing useful\n"}), ("timeout", {"hangs": True})],
+    )
+    async def test_a_scan_that_measured_nothing_is_remembered_briefly(
+        self, fake_redis: Any, kind: str, kwargs: dict[str, Any]
+    ) -> None:
+        """Otherwise the whole timeout is spent again on every play of a song the
+        knob cannot cover, and it never yields a level."""
+        _, spawn = self._child(**kwargs)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch.object(config, "loudness_scan_timeout_secs", return_value=0.01),
+        ):
+            assert (
+                await measure_loudness("https://cdn/a", self._URL, fake_redis) is None
+            )
+
+        key = _loudness_cache_key(self._URL)
+        assert orjson.loads(await fake_redis.get(key)) == {"unmeasured": True}
+        assert await fake_redis.ttl(key) == youtube._LOUDNESS_UNMEASURED_TTL
+
+    async def test_a_remembered_failure_spawns_nothing(self, fake_redis: Any) -> None:
+        await cache_set(
+            fake_redis, _loudness_cache_key(self._URL), {"unmeasured": True}, 60
+        )
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("re-scanned a song that already measured nothing")
+
+        with patch("asyncio.create_subprocess_exec", new=refuse):
+            assert (
+                await measure_loudness("https://cdn/a", self._URL, fake_redis) is None
+            )
 
     async def test_a_missing_ffmpeg_is_not_a_failed_play(self) -> None:
         """A level is an improvement to a play, not a precondition for one."""

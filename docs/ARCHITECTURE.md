@@ -750,11 +750,16 @@ Where the ISRC comes from, and where it does not:
 
 The length Spotify reports is the second half of the rule: `select_search_entry` prefers
 the entry closest to it, with everything inside `_DURATION_TIE_SECS` of the best treated
-as a tie and settled by YouTube's own ranking. That widening rides the FLAT path only. One
-search POST costs the same for one result as for five (0.51 s measured, either way), where
-a processed search extracts every entry it answers with — 3.69 s for three against 1.22 s
-for one, and three times the player requests, which is not a cost worth paying at the
-dequeue resolve for a re-upload instead of a music video.
+as a tie and settled by YouTube's own ranking.
+
+The widening is asked for on the FLAT path, and the flat fallback re-uses the same term, so
+a resolve whose flat entry is too thin to play extracts three entries processed rather than
+one. A flat POST costs the same for one result as for five (0.51 s measured, either way); a
+processed extraction reads every entry it answers with — 3.69 s for three against 1.22 s
+for one, and three times the player requests. That is the cost of the fallback choosing the
+right recording instead of YouTube's top result, and it is paid only when the flat entry was
+unusable. The **dequeue** resolve is not widened at all: `_search_terms` returns the bare
+term when `flat` is false, so there is nothing for the length to choose between there.
 
 ---
 
@@ -1919,11 +1924,17 @@ Why a static gain rather than a normalizing filter, measured on the same loud/qu
 | single-pass `loudnorm` | yes — both tracks landed on −13.2 LUFS asked for −16 | squeezes the loudness range, LRA 21.4 → 16.5 LU, and 55 ms on first byte |
 | `volume=<gain>dB` + limiter (shipped) | yes, exactly, and LRA untouched | needs the track's loudness before the argv is assembled |
 
-`ebur128` scans at roughly 400× realtime, so a 4-minute song is about 0.6 s of CPU; the real
-cost is fetching the audio a second time (3–4 MB). `measure_loudness` caches the result
-under `ytdl:loudness:v1:{webpage_url}` for 30 days — what a song measures does not change,
-so the TTL is there because the entry is cheap to lose, not because it goes stale. That key
-is TTL'd and evictable, so it carries none of the non-evictable-key obligations in
+`ebur128` reads SAMPLE peak, which is the one `alimiter` holds the ceiling on, and asking
+for it costs what asking for no peak costs: 0.25 s against 0.98 s for `peak=true` on a
+four-minute song, measured on ffmpeg 9.0.2. That puts the scan near 960× realtime — 0.40 s
+of CPU for four minutes, 2.87 s for an hour — so the 8 s default covers a song of about two
+and a half hours, and the real cost is fetching the audio a second time (3–4 MB).
+`measure_loudness` caches the result under `ytdl:loudness:v1:{webpage_url}` for 30 days —
+what a song measures does not change, so the TTL is there because the entry is cheap to
+lose, not because it goes stale. A scan that measured nothing is cached too, under the same
+key for an hour (`_LOUDNESS_UNMEASURED_TTL`), so a song past the timeout costs it once an
+hour instead of on every play. Both are TTL'd and evictable, so they carry none of the
+non-evictable-key obligations in
 [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
 `LOUDNESS_SCAN_TIMEOUT_SECS` (8.0) bounds the scan, and the child is spawned with asyncio
 rather than in an executor so a cancellation KILLS it: this runs inside the prefetch, which
@@ -1932,7 +1943,18 @@ Livestreams — no duration — are never scanned: the scan would read until its
 measure whatever it caught.
 
 One wait is the cost a user sees: the first play of a song in a normalizing server sits
-through its scan, bounded by the knob and 1–3 s in practice, once per song per 30 days.
+through its scan, bounded by the knob and by the re-fetch rather than the measuring, once
+per song per 30 days. It runs wherever the source is built — inside the prefetch for a
+queued song, and in the playback loop itself for the first song of a session or the first
+after an empty queue, which is the one case a listener waits on.
+
+A track whose peaks leave less headroom than its gain lands short of the target: the
+limiter holds back the difference rather than clipping, so a 20 dB-crest recording measured
+at −23.3 LUFS comes out at −20.4 rather than −14. The span carries
+`ytdl.normalize_headroom_db` beside `ytdl.normalize_gain_db` so the two can be read against
+each other. Capping the gain at the headroom instead was measured and is worse — the same
+track lands at −21.3 — because the limiter does deliver real loudness, so the gain is asked
+for in full.
 A changed mode applies from the song after next, since the next song's argv — gain included
 — is already assembled.
 

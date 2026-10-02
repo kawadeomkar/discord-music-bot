@@ -366,7 +366,7 @@ class TestEncoderMode:
     assumed. See docs/ARCHITECTURE.md#encoder-mode."""
 
     def test_the_shipped_options_hold_celt(self, server: type[_FailingHandler]) -> None:
-        tocs = _audio_tocs(server.url, YTDL.FFMPEG_OPTS["options"])  # type: ignore[attr-defined]
+        tocs = _audio_tocs(server.url, YTDL.FFMPEG_OPTS["options"])  # pyright: ignore[reportAttributeAccessIssue]
         assert all(t >= _CELT_CONFIG_FLOOR for t in tocs), tocs
 
     def test_discord_py_defaults_alone_leave_celt(
@@ -374,7 +374,7 @@ class TestEncoderMode:
     ) -> None:
         """The control. When this starts seeing CELT, the override no longer
         earns its place and the encoder-mode section can shrink."""
-        tocs = _audio_tocs(server.url, "-vn")  # type: ignore[attr-defined]
+        tocs = _audio_tocs(server.url, "-vn")  # pyright: ignore[reportAttributeAccessIssue]
         assert all(t < _CELT_CONFIG_FLOOR for t in tocs), tocs
 
 
@@ -503,7 +503,7 @@ class TestMeasureLoudnessReadsTheRealBinary:
     async def test_the_tiers_sample_measures(
         self, server: type[_FailingHandler]
     ) -> None:
-        measured = await measure_loudness(server.url, "https://yt.com/v=tier", None)  # type: ignore[attr-defined]
+        measured = await measure_loudness(server.url, "https://yt.com/v=tier", None)  # pyright: ignore[reportAttributeAccessIssue]
 
         assert measured is not None, "ebur128 printed no summary this parser could read"
         assert math.isfinite(measured.i) and math.isfinite(measured.peak)
@@ -518,7 +518,7 @@ class TestMeasureLoudnessReadsTheRealBinary:
         the prefetch, where a level is an improvement to a play and not a
         precondition for one."""
         server.mode = "refused"
-        assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # type: ignore[attr-defined]
+        assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # pyright: ignore[reportAttributeAccessIssue]
 
 
 # The reconnect backoff is 0 + 1 + 3 s before -reconnect_delay_max refuses a 7,
@@ -536,12 +536,12 @@ class TestAMidSongReconnect:
     def test_a_transient_503_recovers_the_whole_song(
         self, server: type[_FailingHandler]
     ) -> None:
-        healthy = _packets(server.url)  # type: ignore[attr-defined]
+        healthy = _packets(server.url)  # pyright: ignore[reportAttributeAccessIssue]
         server.mode = "dead_then_503_then_ok"
         server.gets = 0
 
         recovered = _packets(
-            server.url,  # type: ignore[attr-defined]
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
             YTDL.FFMPEG_OPTS["before_options"],
         )
 
@@ -555,12 +555,12 @@ class TestAMidSongReconnect:
     ) -> None:
         """The control, and the measurement that earns the flag: half a song,
         reported as a clean end."""
-        healthy = _packets(server.url)  # type: ignore[attr-defined]
+        healthy = _packets(server.url)  # pyright: ignore[reportAttributeAccessIssue]
         server.mode = "dead_then_503_then_ok"
         server.gets = 0
 
         truncated = _packets(
-            server.url,  # type: ignore[attr-defined]
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
             "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         )
 
@@ -580,7 +580,7 @@ class TestAMidSongReconnect:
         started = time.monotonic()
 
         packets, code, error = _drain(
-            server.url,  # type: ignore[attr-defined]
+            server.url,  # pyright: ignore[reportAttributeAccessIssue]
             YTDL.FFMPEG_OPTS["before_options"],
         )
 

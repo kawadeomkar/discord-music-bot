@@ -911,12 +911,17 @@ _LOUDNESS_TARGET_LUFS: Final[float] = -14.0
 # quiet — it is a field recording or a mastering error, and moving it by 30 dB
 # amplifies its noise floor into the room.
 _LOUDNESS_GAIN_CLAMP_DB: Final[tuple[float, float]] = (-20.0, 12.0)
-# -1 dBFS, the ceiling every loudness mode applies. `level=disabled` is required:
-# alimiter auto-levels its output by default, which would RAISE a quiet song.
-# `latency=1` is what keeps it transparent below the ceiling — without it the
-# filter delays by its 5 ms lookahead and every sample moves. Measured in the
-# ffmpeg tier. See docs/ARCHITECTURE.md#loudness-normalization.
-_PEAK_LIMITER: Final[str] = "alimiter=limit=0.891:level=disabled:latency=1"
+# The ceiling every loudness mode applies, and the headroom a gain is read against.
+# Sample peak, which is what alimiter holds.
+_PEAK_CEILING_DBFS: Final[float] = -1.0
+# The same ceiling in the linear unit the filter takes, so the two cannot drift.
+# `level=disabled` is required: alimiter auto-levels its output by default, which
+# would RAISE a quiet song. `latency=1` is what keeps it transparent below the
+# ceiling — without it the filter delays by its 5 ms lookahead and every sample
+# moves. Measured in the ffmpeg tier. See docs/ARCHITECTURE.md#loudness-normalization.
+_PEAK_LIMITER: Final[str] = (
+    f"alimiter=limit={10 ** (_PEAK_CEILING_DBFS / 20):.3f}:level=disabled:latency=1"
+)
 
 
 def _audio_filters(
@@ -1048,6 +1053,11 @@ _LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)$", re.M
 # carries none of the non-evictable-key obligations.
 _LOUDNESS_TTL: Final[int] = 30 * 86400
 
+# An hour, for "this one did not measure". A song longer than the scan timeout can
+# cover fails identically every play, and without this the whole timeout is spent
+# again each time; an hour is short enough that a transient failure heals.
+_LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
+
 
 def _loudness_cache_key(webpage_url: str) -> str:
     return f"ytdl:loudness:v1:{webpage_url}"
@@ -1090,6 +1100,9 @@ async def measure_loudness(
     span = trace.get_current_span()
     cache_key = _loudness_cache_key(webpage_url)
     cached = await cache_get(redis, cache_key)
+    if isinstance(cached, dict) and cached.get("unmeasured"):
+        span.set_attribute("ytdl.loudness_source", "cached-unmeasured")
+        return None
     if isinstance(cached, dict) and "i" in cached and "peak" in cached:
         try:
             measured = Loudness(i=float(cached["i"]), peak=float(cached["peak"]))
@@ -1101,6 +1114,8 @@ async def measure_loudness(
             return measured
 
     process: Optional[asyncio.subprocess.Process] = None
+    stderr = b""
+    failure: Optional[str] = None
     try:
         async with asyncio.timeout(config.loudness_scan_timeout_secs()):
             process = await asyncio.create_subprocess_exec(
@@ -1112,7 +1127,10 @@ async def measure_loudness(
                 stream_url,
                 "-vn",
                 "-af",
-                "ebur128=framelog=quiet:peak=true",
+                # Sample peak, which is the one `alimiter` holds the ceiling on, and
+                # it costs what asking for no peak costs: 0.25 s against 0.98 s for
+                # `peak=true` on a four-minute song, measured.
+                "ebur128=framelog=quiet:peak=sample",
                 "-f",
                 "null",
                 "-",
@@ -1121,9 +1139,7 @@ async def measure_loudness(
             )
             _, stderr = await process.communicate()
     except (TimeoutError, OSError) as e:
-        span.set_attribute("ytdl.loudness_source", "none")
-        log.warning(f"loudness scan failed for {webpage_url}: {e!r}")
-        return None
+        failure = repr(e)
     finally:
         # Both the timeout and an outer cancellation land here, and either leaves a
         # child holding a CDN connection. kill(), not terminate(): this one has no
@@ -1132,10 +1148,22 @@ async def measure_loudness(
             with contextlib.suppress(ProcessLookupError):
                 process.kill()
 
-    measured = parse_ebur128_summary(stderr.decode("utf-8", "replace"))
+    measured = (
+        None if failure else parse_ebur128_summary(stderr.decode("utf-8", "replace"))
+    )
     if measured is None:
+        log.warning(
+            f"loudness scan failed for {webpage_url}: {failure}"
+            if failure
+            else f"loudness scan printed no summary for {webpage_url}"
+        )
         span.set_attribute("ytdl.loudness_source", "none")
-        log.warning(f"loudness scan printed no summary for {webpage_url}")
+        # Remembered for an hour rather than re-paid on every play: a song the scan
+        # timeout cannot cover times out the same way next time. Short, so a
+        # transient failure heals itself.
+        await cache_set(
+            redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
+        )
         return None
     span.set_attribute("ytdl.loudness_source", "scan")
     span.set_attribute("ytdl.loudness_lufs", measured.i)
@@ -1778,11 +1806,11 @@ _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
 
-# How many results a length gets to choose between. One search POST costs the same
-# for one result as for five (0.51 s either way), but a PROCESSED search extracts
-# every entry it answers with — 3.69 s for three against 1.22 s for the one this
-# would replace, and three times the player requests. So the widening rides the
-# flat path only, and the processed path keeps the single result it always had.
+# How many results a length gets to choose between, on the term the FLAT search
+# asks for and on the processed fallback that re-uses it. A flat POST costs the same
+# for one result as for five (0.51 s either way); a processed extraction reads every
+# entry, 3.69 s for three, which is what buys the length a choice on the path a
+# flat entry too thin to play falls through to.
 _DURATION_MATCH_RESULTS: Final[int] = 3
 _SEARCH_PREFIX_RE = re.compile(r"^ytsearch\d*:")
 
@@ -1820,6 +1848,15 @@ def _search_terms(
     else:
         terms.append((_SEARCH_KIND_TITLE, search))
     return terms
+
+
+def _search_answered_with_nothing(data: YTDLExtractResult) -> bool:
+    """A search that found no results at all, as against one whose results are
+    unusable — the second is worth a second look at, the first is not. Only a list
+    is read: the pick below walks the same entries, and a generator would come back
+    empty from having been counted here."""
+    entries = data.get("entries")
+    return isinstance(entries, list) and not entries
 
 
 def _first_video_entry(
@@ -2469,8 +2506,14 @@ class YTDL(discord.FFmpegOpusAudio):
             measured = await measure_loudness(data["url"], qo.webpage_url, redis)
             if measured is not None:
                 gain_db = normalize_gain_db(measured)
-                trace.get_current_span().set_attribute(
-                    "ytdl.normalize_gain_db", gain_db
+                span = trace.get_current_span()
+                span.set_attribute("ytdl.normalize_gain_db", gain_db)
+                # The gain asked for, against what fits under the ceiling. A song
+                # with less headroom than gain lands short of the target, because
+                # the limiter holds back the difference — which is the whole
+                # reading of a quiet song that stays quieter than the rest.
+                span.set_attribute(
+                    "ytdl.normalize_headroom_db", _PEAK_CEILING_DBFS - measured.peak
                 )
         # Chain first, codec second: ffmpeg refuses `-c:a copy` alongside any
         # filtergraph, and asking _audio_filters what it produced keeps the two
@@ -2636,6 +2679,18 @@ class YTDL(discord.FFmpegOpusAudio):
                 search,
                 pool_slot=pool_slot,
             )
+            if flat_data is not None and _search_answered_with_nothing(flat_data):
+                # Nothing is indexed under this term, which the next one may still
+                # answer. The processed extraction below would ask the same question
+                # and spend a pool slot on the same empty answer — the ISRC rung
+                # misses by design, and this is what keeps the miss one call.
+                # The same error the full path raises: on the last term this is what
+                # the user reads.
+                raise _NothingFound(
+                    ExtractionError(
+                        "Couldn't find anything playable for that.", expected=True
+                    )
+                )
             flat_entry = (
                 _first_video_entry(flat_data, expected_duration=expected_duration)
                 if flat_data is not None

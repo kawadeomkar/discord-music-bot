@@ -17,6 +17,21 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.4 — 2026-10-01
+
+**`normalize` now measures long songs, and stops re-measuring the ones it cannot.** The
+loudness scan reads the peak it actually needs, which made it nearly four times faster: an
+hour-long upload measures in under three seconds where it used to run past the eight-second
+limit and give up. A song that still cannot be measured — too long, or a connection that
+dropped — is remembered for an hour, so it costs that wait once rather than on every single
+play. Nothing to do, and no setting changes.
+
+**A Spotify track whose ISRC YouTube does not index resolves one search faster.** The
+fallback to a title search used to ask the same empty question twice.
+
+Also: the troubleshooting section in the README no longer points at Discord's microphone
+settings or at `-ping` for the playing format, neither of which does what it said.
+
 ## 2.56.1 — 2026-09-28
 
 **A song no longer ends halfway when the connection hiccups.** If a song's connection died
@@ -47,11 +62,12 @@ bot always has. The other two even out how loud songs play:
   below the ceiling is left alone.
 - `normalize` brings every song to one loudness, raising quiet ones as well as lowering
   loud ones. It measures each song once and remembers the answer for a month, so the
-  first play of a new song waits a second or two for that; a replay does not.
+  first play of a new song waits a second or two for that; a replay does not. A recording
+  with very sharp peaks lands short of the rest rather than being squashed into line.
 
 Two costs worth knowing before you turn it on. Either mode re-encodes the audio instead
-of copying YouTube's bitstream through untouched, which spends one lossy generation —
-about 3 dB by measurement, and `off` remains the only bit-exact setting. And the
+of copying YouTube's bitstream through untouched, which spends one lossy generation;
+`off` remains the only bit-exact setting. And the
 measurement `normalize` needs fetches the song a second time.
 
 Operators get `-settings bot loudness-scan-timeout` (default 8s, `LOUDNESS_SCAN_TIMEOUT_SECS`)

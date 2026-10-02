@@ -34,6 +34,7 @@ from src.guild_state import (
     GuildConfig,
     GuildStateData,
     HistoryEntry,
+    LoudnessMode,
     NowPlayingData,
     SongQueueEntry,
     parse_queue_entry,
@@ -4772,6 +4773,29 @@ class TestStateRestore:
         await music_player._restore_state()
         assert music_player.volume == 0.5
 
+    async def test_restore_sets_loudness(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Without this leg a restart silently returns every normalizing guild to
+        off, while `-settings` keeps printing the mode it stored."""
+        assert music_player.store is not None
+        await fake_redis.hset(
+            music_player.store.config_key(), ConfigField.LOUDNESS.encode(), b"normalize"
+        )
+        await music_player._restore_state()
+        assert music_player.loudness is LoudnessMode.NORMALIZE
+
+    async def test_the_settings_cache_seeds_loudness_before_any_read(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """`_adopt_cached_settings` is the pre-restore fallback: the first song of a
+        session is built from it."""
+        mocked(music_player._cog.guild_settings).peek = MagicMock(
+            return_value=GuildConfig(loudness="peak")
+        )
+        music_player._adopt_cached_settings()
+        assert music_player.loudness is LoudnessMode.PEAK
+
     async def test_restore_noop_when_no_redis(
         self,
         mock_bot: MagicMock,
@@ -5461,6 +5485,25 @@ class TestResolveSource:
         assert isinstance(result, QueueObject)
         assert result.title == "Resolved"
 
+    async def test_the_items_recording_reaches_the_resolve(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The dequeue resolve is the only path a Spotify COLLECTION track takes, so
+        this hand-off carries the majority of the ISRC's traffic. Without it every
+        album track resolves by title again and plays the music video."""
+        spy = AsyncMock(
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=1", title="R", requester=mock_author
+            )
+        )
+        item = unresolved("shape of you", isrc="GBAHS1600463", duration=233)
+        with patch("src.musicplayer.YTDL.yt_source", new=spy):
+            await music_player._resolve_source(item)
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["isrc"] == "GBAHS1600463"
+        assert spy.await_args.kwargs["expected_duration"] == 233
+
 
 class TestResolveUsesTheItemsRequester:
     """A playlist's tracks resolve minutes to an hour after the command that
@@ -5547,6 +5590,41 @@ class TestStreamSource:
         ):
             result = await music_player._stream_source(queue_obj)
         assert result is mock_ytdl
+
+    @staticmethod
+    async def _kwargs_of_a_stream(
+        player: MusicPlayer, source: QueueObject
+    ) -> dict[str, Any]:
+        stream = AsyncMock(return_value=MagicMock())
+        with patch("src.musicplayer.YTDL.yt_stream", new=stream):
+            await player._stream_source(source)
+        assert stream.await_args is not None
+        return dict(stream.await_args.kwargs)
+
+    async def test_the_guilds_loudness_reaches_the_stream(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """The hand-off `-settings loudness` depends on. Both ends are covered on
+        their own — the setting reaching the player, and the mode reaching the
+        argv — and this is the step between them."""
+        music_player.loudness = LoudnessMode.NORMALIZE
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["loudness"] is LoudnessMode.NORMALIZE
+
+    async def test_the_channels_own_bitrate_reaches_the_stream(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        mocked(music_player._guild).voice_client.channel.bitrate = 256000
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["channel_bitrate"] == 256000
+
+    async def test_a_disconnected_guild_spends_no_bitrate(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """A resolve can outlive the connection it was started for."""
+        mocked(music_player._guild).voice_client = None
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["channel_bitrate"] is None
 
 
 # ── FromContext ───────────────────────────────────────────────────────────────
