@@ -806,6 +806,39 @@ class TestSongQueueEntryWire:
         )
         assert SongQueueEntry.from_queue_object(item) == _SEARCH_ENTRY
 
+    def test_an_entry_without_an_isrc_writes_the_bytes_it_always_did(self) -> None:
+        """The key is written only when known: an entry queued by the previous
+        build has to serialize to the same bytes, or its LREM misses and -remove
+        rewrites the whole list."""
+        assert _SEARCH_ENTRY.isrc is None
+        assert b"isrc" not in _SEARCH_ENTRY.to_redis()
+        assert _SEARCH_ENTRY.to_redis() == _GOLDEN_QOBJ_SEARCH
+
+    def test_the_isrc_round_trips(self) -> None:
+        """Without it a restart sends every queued Spotify track back down the
+        title path, which is the music video for anything well known."""
+        entry = dataclasses.replace(_SEARCH_ENTRY, isrc="GBAHS1600463")
+        raw = entry.to_redis()
+        assert raw.endswith(b'"isrc":"GBAHS1600463"}')
+        assert parse_queue_entry(raw) == entry
+
+    def test_reader_defaults_isrc_on_a_pre_feature_entry(self) -> None:
+        entry = parse_queue_entry(_GOLDEN_QOBJ_SEARCH)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.isrc is None
+
+    def test_from_queue_object_carries_the_isrc(self) -> None:
+        item = QueueObject(
+            webpage_url="https://open.spotify.com/track/abc",
+            title="DNA.",
+            requester=_requester_stub(424242424242424242),
+            duration=185,
+            uploader="Kendrick Lamar",
+            search="ytsearch:DNA. Kendrick Lamar",
+            isrc="GBAHS1600463",
+        )
+        assert SongQueueEntry.from_queue_object(item).isrc == "GBAHS1600463"
+
 
 class TestParseQueueEntryCorrupt:
     @pytest.mark.parametrize(
@@ -1570,6 +1603,16 @@ class TestSongQueueEntryFromSong:
         song = ytdl_instance(None, search="ytsearch:some other song")
 
         assert SongQueueEntry.from_song(song).search == ""
+
+    def test_the_parked_song_owes_no_isrc(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
+        """The recording's identity steers a search, and a playing song has none
+        left; carried into the blob it would come back on the recovered song
+        for no reader to use."""
+        song = ytdl_instance(None, isrc="GBAHS1600463")
+
+        assert SongQueueEntry.from_song(song).isrc is None
 
     def test_the_payload_thumbnail_is_written_over_the_queued_one(
         self, ytdl_instance: Callable[..., Any]

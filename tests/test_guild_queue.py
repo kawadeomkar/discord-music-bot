@@ -1922,6 +1922,12 @@ class TestRestoreEntries:
         assert await gq.restore_entries([entry]) == 1
         assert gq.display_items()[0].requester is left_the_guild
 
+    async def test_the_isrc_rehydrates(self, gq: GuildQueue) -> None:
+        """The recording a collection walk named has to survive a restart, or
+        the restored track resolves by title, which is the music video."""
+        assert await gq.restore_entries([_unresolved_entry(isrc="GBAHS1600463")]) == 1
+        assert gq.display_items()[0].isrc == "GBAHS1600463"
+
     async def test_an_entry_without_a_requester_is_kept(self, gq: GuildQueue) -> None:
         """An entry whose requester id is null restores against the guild owner
         rather than being dropped."""

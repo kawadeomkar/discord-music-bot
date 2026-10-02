@@ -291,6 +291,9 @@ def _carried_queueobject_fields() -> set[str]:
         "ts",
         # Empty by the time anything can stream the item: the resolve clears it.
         "search",
+        # Read by the resolve and nowhere else: a playing song is already the
+        # recording this named, so there is nothing left for it to steer.
+        "isrc",
     }
     return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
 

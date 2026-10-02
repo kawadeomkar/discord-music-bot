@@ -861,4 +861,5 @@ class GuildQueue:
             # comes back looking resolved, pointed at the page the walk named,
             # and the stream attempt fails on it.
             search=entry.search,
+            isrc=entry.isrc,
         )

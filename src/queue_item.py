@@ -109,6 +109,10 @@ class QueueObject:
     # resolve at dequeue. `title` meanwhile is the walk's row name, or empty when
     # the walk had none — every renderer falls back to this term.
     search: str = ""
+    # The recording this item names, when the walk knew one. Read only by the
+    # resolve, which searches it before the term (youtube._search_terms) and
+    # clears it with the term.
+    isrc: Optional[str] = None
 
     @property
     def unresolved(self) -> bool:
