@@ -854,7 +854,10 @@ def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
             start_paused=d.get(QueueEntryField.START_PAUSED, False),
             queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
             queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-            query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+            # Coalesced like the term below: a stored null would arrive as None
+            # behind the str annotation and raise in HistoryEntry.__post_init__'s
+            # slug clamp when the song ends.
+            query_source=d.get(QueueEntryField.QUERY_SOURCE) or "",
             played_at=d.get(QueueEntryField.PLAYED_AT, 0.0),
             np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
             np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),

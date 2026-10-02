@@ -781,6 +781,20 @@ class TestSongQueueEntryWire:
         assert isinstance(entry, SongQueueEntry)
         assert entry.search == ""
 
+    def test_reader_reads_a_null_query_source_as_unknown(self) -> None:
+        """A present key holding null is not an absent key, so the default never
+        applies. Left as None it rides the item to song end, where
+        HistoryEntry.__post_init__ clamps the field with a regex and raises."""
+        written = _GOLDEN_QOBJ_FULL.replace(
+            _QUERY_SOURCE_UNKNOWN, b'"query_source":null'
+        )
+        assert written != _GOLDEN_QOBJ_FULL
+        entry = parse_queue_entry(written)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.query_source == ""
+        # The clamp a None reached: a str it accepts without a word.
+        assert HistoryEntry(query_source=entry.query_source).query_source == ""
+
     def test_from_queue_object_carries_the_search(self) -> None:
         item = QueueObject(
             webpage_url="https://open.spotify.com/track/abc",
