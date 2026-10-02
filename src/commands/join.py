@@ -7,7 +7,8 @@ from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
 from src.ping import send_latency_line
-from src.util import get_logger, spawn_background
+from src.recovery import join_succeeded
+from src.util import get_logger, notice_embed, spawn_background
 
 log = get_logger(__name__)
 
@@ -42,6 +43,21 @@ async def run(
     vc = ctx.voice_client
     if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
         await vc.move_to(channel)
+    # A parked client answers `ctx.voice_client` as truthy, so the connect above is
+    # skipped and nothing has raised: this is the only place that notices. Reported
+    # and returned rather than raised, which is the same thing a failed join tells
+    # its creator, and ahead of set_connection so on_ready cannot recover a guild
+    # this never joined.
+    if not join_succeeded(ctx):
+        log.warning(f"join found an unconnected voice client in guild {ctx.guild.id}")
+        await ctx.send(
+            embed=notice_embed(
+                "Couldn't finish connecting to your voice channel — try again in a "
+                "moment.",
+                discord.Color.red(),
+            )
+        )
+        return
     await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True)
 
     if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):

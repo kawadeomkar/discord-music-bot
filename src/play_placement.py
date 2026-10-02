@@ -33,6 +33,7 @@ from src.util import (
     ECHO_ROW_MAX,
     get_logger,
     PoolSlotUnavailable,
+    cancel_task,
     channel_claim,
     join_task,
     notice_embed,
@@ -708,6 +709,21 @@ class PlayRegistry:
             task.add_done_callback(_done)
             return task, True
         return plays.join, False
+
+    async def cancel_join(self, guild_id: int) -> None:
+        """Cancel the guild's in-flight cold join, so a teardown cannot leave one
+        running behind it. A surviving connector sends op 4 naming the channel the
+        teardown just cleared, and its own timeout then pops the guild's voice
+        client by id alone — which by then may be a NEWER, connected one.
+        See docs/ARCHITECTURE.md#voice-teardown.
+
+        Never cancels the CALLING task: `-join` starts the player that reaches
+        cleanup, and cancelling yourself mid-teardown abandons the rest of it.
+        """
+        plays = self._guilds.get(guild_id)
+        join = plays.join if plays is not None else None
+        if join is not None and join is not asyncio.current_task():
+            await cancel_task(join)
 
     @contextlib.asynccontextmanager
     async def place(self, req: PlayRequest) -> AsyncGenerator[PlaceResult]:

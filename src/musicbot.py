@@ -300,8 +300,11 @@ class MusicBot(commands.Cog):
         log.info("going to cleanup/disconnect")
         try:
             # Cancel before disconnecting so the loop cannot start the next song
-            # between voice_client.stop() and cancellation.
+            # between voice_client.stop() and cancellation. The cold join is in
+            # here for the same reason: it is the one task that can put the bot
+            # BACK in the channel after the disconnect below takes it out.
             teardown = [
+                self._plays.cancel_join(guild.id),
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
                 cancel_task(mp._heartbeat_task),

@@ -492,6 +492,20 @@ class TestCleanup:
 
         mock_guild.voice_client.disconnect.assert_awaited_once_with(force=False)
 
+    async def test_cancels_the_in_flight_cold_join(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The cold join is the one task that can put the bot BACK in the channel
+        after the disconnect below takes it out. TestPlayRegistry pins what the
+        cancel itself does."""
+        self._make_minimal_mp(music_bot, mock_guild)
+        mock_guild.voice_client.disconnect = AsyncMock()
+        music_bot._plays.cancel_join = AsyncMock()
+
+        await music_bot.cleanup(mock_guild)
+
+        music_bot._plays.cancel_join.assert_awaited_once_with(mock_guild.id)
+
     async def test_removes_guild_from_mps(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:

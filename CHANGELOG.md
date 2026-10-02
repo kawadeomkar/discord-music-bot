@@ -17,6 +17,34 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.55.3 — 2026-10-02
+
+**Two ways a half-connected bot used to go unnoticed, both closed.** discord.py registers
+a voice client before the handshake lands, so an abandoned one stays registered and
+answers as if the bot had joined. Nothing checked.
+
+- **The bot no longer rejoins a channel after you stopped it.** `-stop`, the alone timer,
+  an eject and `-resume` all tore the session down without cancelling a join that was
+  still running, so that join could land afterwards and put the bot back in the channel
+  — silent, with no queue and nothing playing, after the saved connection had already
+  been cleared. Worse, when that stale join finally timed out it dropped whatever voice
+  client the guild held by then, which could be a healthy one a later `-play` had just
+  made. That one presented as the bot being in the channel while every command insisted
+  it was not.
+- **`-join` now says so instead of half-working.** Handed an abandoned client it skipped
+  its own connect, reported nothing, saved the channel and started playback — and every
+  song then failed one at a time, emptying the queue in memory while Redis still held it.
+  It now refuses with "Couldn't finish connecting to your voice channel", saves nothing,
+  and leaves the queue alone. A `-play` that joins for you reports the same way it always
+  did.
+
+- **Nothing to do**, and no state to clean up: both windows were in memory only. If you
+  have a server where the bot shows as connected but answers "I'm not in a voice
+  channel", `-join` once after deploying this.
+- **Roll back freely**, to any 2.54.x.
+
+## 2.54.6 — 2026-10-01
+
 ## 2.55.2 — 2026-10-02
 
 **A `-play` whose song lookup fails no longer breaks the next one.** When the lookup

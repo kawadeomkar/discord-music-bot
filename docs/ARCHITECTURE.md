@@ -465,8 +465,9 @@ sequenceDiagram
 
     User->>Bot: -join
     Bot->>Bot: validate_commands()
-    Bot->>VC: channel.connect(timeout=10.0)
+    Bot->>VC: channel.connect(timeout=10.0) — skipped if a client is registered
     VC-->>Bot: VoiceClient connected
+    Bot->>Bot: join_succeeded(ctx) — else report and return
     Bot->>VC: guild.change_voice_state(self_deaf=True)
     Bot->>MP: get_mp(ctx) → MusicPlayer.from_context()
     MP->>MP: start() → create_task(_restore_state()), create_task(loop())
@@ -474,7 +475,13 @@ sequenceDiagram
     Bot->>User: 👋 reaction + ping embed
 ```
 
-`self_deaf=True` is always set — the bot does not listen to voice, only transmit. `MusicPlayer.start()` sets `_restore_complete` immediately when there is no Redis store; otherwise `_restore_state()` sets it when done, and `loop()` blocks on it before its first dequeue.
+`self_deaf=True` is always set — the bot does not listen to voice, only transmit. The
+`join_succeeded(ctx)` step is the one that notices a PARKED client: `ctx.voice_client`
+answers truthy for a registration whose handshake never landed, so the connect above is
+skipped and nothing raises. Everything after it — the deafen, `set_connection`, the
+playback gate — is held behind it, because persisting a channel the bot is not in makes
+`on_ready` recover a guild that never connected, and the loop's own check is only an
+`isinstance`, so an open gate costs a song per iteration. `MusicPlayer.start()` sets `_restore_complete` immediately when there is no Redis store; otherwise `_restore_state()` sets it when done, and `loop()` blocks on it before its first dequeue.
 
 ---
 
@@ -1262,7 +1269,8 @@ sequenceDiagram
     Trigger->>MusicBot: cleanup(guild)
     MusicBot->>MusicBot: cancel alone-timer; atomic mps.pop(guild.id)
     Note over MusicBot: pop-first gate — a concurrent cleanup call gets None and returns
-    MusicBot->>MP: gather-cancel: _prefetch_task, _progress_task,<br/>_heartbeat_task, _pause_debounce_task, _player, _restore_task
+    MusicBot->>MP: gather-cancel: the guild's cold join, then _prefetch_task,<br/>_progress_task, _heartbeat_task, _pause_debounce_task, _player, _restore_task
+    Note over MusicBot: the join goes first of those — it is the one task that can<br/>put the bot back in the channel after the disconnect below
     MusicBot->>MP: retire_np_host_on_stop()
     Note over MP: no task can race this; dedicated NP msg deleted,<br/>command-response host strip-edited
     MusicBot->>VC: voice_client.disconnect(force=bot still in a channel?)
@@ -2453,6 +2461,18 @@ no player — and a `-play` landing there reads `cold_start = not ctx.voice_clie
 False, takes the warm path, never joins, and hands its song to a loop whose `vc.play()`
 raises. Keeping the force off when there is nothing to clear keeps that window at one
 round trip.
+
+**The teardown also cancels the guild's cold join**, through
+`PlayRegistry.cancel_join`. A join left running outlives the teardown that was supposed
+to end it: `_voice_connect()` sends op 4 naming the channel `cleanup()` has just
+cleared, so the bot rejoins a session already declared over and after
+`clear_connection()` fired. Worse, that connector's own timeout ends in
+`voice_client.cleanup()` → `ConnectionState._remove_voice_client(guild_id)`, which is
+`self._voice_clients.pop(guild_id, None)` — no identity check. A `-play` that registered
+a fresh, connected client in the meantime loses it to that pop, which is the same
+bot-gone-locally/still-in-channel split described above. The cancel is self-guarded:
+`-join` starts the player that can reach `cleanup()`, and a task cancelling itself
+mid-teardown abandons every step after it.
 
 **Reading it from the logs:** `_voice_disconnect()` logs `The voice handshake is being
 terminated for Channel ID …` at INFO every time it sends the clear, so that line's
