@@ -4785,6 +4785,22 @@ class TestStateRestore:
         await music_player._restore_state()
         assert music_player.loudness is LoudnessMode.NORMALIZE
 
+    async def test_a_mode_the_cache_already_holds_is_not_overwritten_by_restore(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """`seed` returns the fields it ACCEPTED: a write that has not reached Redis
+        yet is the newer one, so the snapshot must not undo it."""
+        assert music_player.store is not None
+        await fake_redis.hset(
+            music_player.store.config_key(), ConfigField.LOUDNESS.encode(), b"off"
+        )
+        music_player.loudness = LoudnessMode.NORMALIZE
+        with patch.object(
+            music_player._cog.guild_settings, "seed", return_value=frozenset()
+        ):
+            await music_player._restore_state()
+        assert music_player.loudness is LoudnessMode.NORMALIZE
+
     async def test_the_settings_cache_seeds_loudness_before_any_read(
         self, music_player: MusicPlayer
     ) -> None:

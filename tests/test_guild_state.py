@@ -2739,14 +2739,31 @@ class TestGuildConfigLoudness:
         can tell "chose off" from "never chose"."""
         assert GuildConfig(loudness="off").to_redis() == {ConfigField.LOUDNESS: "off"}
 
-    @pytest.mark.parametrize("stored", ["", "loud", "PEAK ", "dynaudnorm", "1"])
+    @pytest.mark.parametrize("stored", ["", "loud", "dynaudnorm", "1", "\x00", "peakk"])
     def test_a_mode_this_build_does_not_know_reads_as_unset(self, stored: str) -> None:
+        """A value a NEWER build wrote, or a corrupt one. Both read as unset and
+        play at the default rather than raising out of from_redis."""
         raw = {ConfigField.LOUDNESS.encode(): stored.encode()}
         parsed = GuildConfig.from_redis(raw)
-        assert parsed.loudness is None or parsed.loudness in {
-            mode.value for mode in LoudnessMode
-        }
-        assert parsed.loudness_mode() in set(LoudnessMode)
+        assert parsed.loudness is None
+        assert parsed.loudness_mode() is LoudnessMode.OFF
+
+    @pytest.mark.parametrize(
+        ("stored", "mode"),
+        [
+            ("PEAK ", LoudnessMode.PEAK),
+            (" normalize", LoudnessMode.NORMALIZE),
+            ("Off", LoudnessMode.OFF),
+        ],
+    )
+    def test_a_mode_this_build_knows_survives_its_spelling(
+        self, stored: str, mode: LoudnessMode
+    ) -> None:
+        """Case and surrounding space are the user's, not the wire's."""
+        raw = {ConfigField.LOUDNESS.encode(): stored.encode()}
+        parsed = GuildConfig.from_redis(raw)
+        assert parsed.loudness == mode.value
+        assert parsed.loudness_mode() is mode
 
     def test_a_stored_mode_is_canonicalised(self) -> None:
         """The wire holds the enum's own spelling, whatever case reached it."""

@@ -418,8 +418,8 @@ class MusicPlayer:
         self.play_next = asyncio.Event()
         self.play_message: Optional[discord.Embed] = None
         self.volume = DEFAULT_VOLUME
-        # OFF until a restore says otherwise, so a guild that never chose plays as
-        # it did before this setting existed: filterless, and bit-copied.
+        # OFF until a restore says otherwise: a guild that never chose plays
+        # filterless, and bit-copied.
         self.loudness = LoudnessMode.OFF
         # Replaced at restore from GuildConfig.
         self.timezone = ZoneInfo(DEFAULT_TIMEZONE)
@@ -823,9 +823,9 @@ class MusicPlayer:
     # ── State restore ─────────────────────────────────────────────────────────
 
     def _adopt_cached_settings(self) -> None:
-        """The volume and zone the settings cache holds, taken before any read. The
-        cache keeps a write that did not reach Redis, which seed() never replaces,
-        and it is all a player has without a store or a readable snapshot."""
+        """Every setting the cache holds, taken before any read. The cache keeps a
+        write that did not reach Redis, which seed() never replaces, and it is all a
+        player has without a store or a readable snapshot."""
         cached = self._cog.guild_settings.peek(self._guild.id)
         if cached is None:
             return

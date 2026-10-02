@@ -803,6 +803,12 @@ class TestYTDLFfmpegOpts:
     def test_before_options_has_reconnect_flag(self) -> None:
         assert "-reconnect" in YTDL.FFMPEG_OPTS["before_options"]
 
+    def test_before_options_retries_a_well_formed_5xx(self) -> None:
+        """A plain `-reconnect` retries a truncated stream but not an HTTP error, so
+        the ladder's own tier is the only thing that notices this flag going missing
+        — and `just check` does not run it."""
+        assert "-reconnect_on_http_error 5xx" in YTDL.FFMPEG_OPTS["before_options"]
+
     def test_options_strips_video(self) -> None:
         assert "-vn" in YTDL.FFMPEG_OPTS["options"]
 
@@ -1701,8 +1707,10 @@ class TestYTSourceTermLadder:
     async def test_each_term_caches_under_its_own_key(
         self, mock_ctx: MagicMock, fake_redis: Any
     ) -> None:
-        """The fallback is spent once per track per TTL: the second play reads the
-        title term's entry rather than re-asking for the ISRC."""
+        """Each term owns its own entry, so the resolve a term earned is not re-paid:
+        the title term is asked once across both plays. The ISRC MISS is not cached —
+        only a resolve writes an entry — so that term is asked on every play, which
+        is the standing cost of a track no art track was uploaded for."""
         calls: list[str] = []
 
         async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
@@ -1721,9 +1729,8 @@ class TestYTSourceTermLadder:
                     redis=fake_redis,
                 )
 
-        # The ISRC miss is not cached — only a resolve writes an entry — so it is
-        # re-asked, and the title term is not.
         assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
+        assert calls.count('ytsearch:"GBAHS1600463"') == 2
 
 
 class TestYTSourceUnifiedExtraction:
@@ -4158,6 +4165,20 @@ class TestSearchEntryPicker:
             cast(Any, self._SHAPE_OF_YOU), expected_duration=233
         )
         assert chosen is not None and chosen.get("id") == "lyrics-b"
+
+    def test_the_tie_window_leaves_the_ranking_in_charge_of_a_near_miss(self) -> None:
+        """What `_DURATION_TIE_SECS` is FOR: a few seconds of arithmetic must not
+        override YouTube's own ranking, because a master and its remaster differ by
+        more than the ranking does. Here the ranked entry is 4 s out and the one
+        behind it is exact, and the ranked one still wins — narrowing the window to
+        an exact match would silently change which recording plays."""
+        entries = [
+            {"_type": "video", "id": "ranked", "duration": 237, "url": "https://r"},
+            {"_type": "video", "id": "exact", "duration": 233, "url": "https://e"},
+        ]
+        assert youtube._DURATION_TIE_SECS == 5
+        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
+        assert chosen is not None and chosen.get("id") == "ranked"
 
     def test_without_a_length_the_ranking_stands(self) -> None:
         chosen = select_search_entry(cast(Any, self._SHAPE_OF_YOU))
@@ -6926,6 +6947,16 @@ class TestEbur128Summary:
         """What a scan killed mid-stream leaves behind."""
         assert parse_ebur128_summary("    I:         -19.7 LUFS\n") is None
 
+    def test_a_number_the_pattern_accepts_and_float_refuses_is_not_a_level(
+        self,
+    ) -> None:
+        """`[\\d.]+` admits `-.` and `1.2.3`, which float() refuses. A level is an
+        improvement to a play, so an unreadable one plays at its own."""
+        for value in ("-.", "1.2.3", ".."):
+            summary = f"  I:  {value} LUFS\n  Peak:  -3.0 dBFS\n"
+            assert youtube._LOUDNESS_LINE.findall(summary)[0] == ("I", value)
+            assert parse_ebur128_summary(summary) is None
+
     def test_the_per_frame_log_is_not_mistaken_for_the_summary(self) -> None:
         """`framelog=quiet` suppresses it, but the words are the same, and a
         per-frame M/I line is an instantaneous reading rather than the whole song."""
@@ -6995,6 +7026,18 @@ class TestMeasureLoudness:
 
         assert measured == Loudness(i=-19.7, peak=-3.8)
         assert await fake_redis.get(_loudness_cache_key(self._URL)) is not None
+
+    async def test_a_measured_level_lives_a_month(self, fake_redis: Any) -> None:
+        """Documented as "remembers the answer for a month". A regression to a day
+        turns a normalizing guild's cached play into a daily re-scan and a daily
+        extra fetch of the song."""
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+        with patch("asyncio.create_subprocess_exec", new=spawn):
+            await measure_loudness("https://cdn/a", self._URL, fake_redis)
+
+        ttl = await fake_redis.ttl(_loudness_cache_key(self._URL))
+        assert youtube._LOUDNESS_TTL == 30 * 86400
+        assert youtube._LOUDNESS_TTL - 10 <= ttl <= youtube._LOUDNESS_TTL
 
     async def test_a_cache_hit_spawns_nothing(self, fake_redis: Any) -> None:
         """The whole point of the cache: a song measured once never pays again, so a
@@ -7173,6 +7216,17 @@ class TestYtStreamLoudness:
         codec, options = await self._options(LoudnessMode.PEAK)
         assert codec is None
         assert f"-filter:a {_PEAK_LIMITER}" in options
+
+    async def test_peak_measures_nothing(self) -> None:
+        """The ceiling needs no measurement, and that is the only reason PEAK adds
+        no wait to a first play. A gate that let it scan would cost every one."""
+
+        async def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("scanned a song for a mode that needs no level")
+
+        codec, options = await self._options(LoudnessMode.PEAK, spawn=refuse)
+        assert codec is None
+        assert "volume=" not in options
 
     async def test_normalize_measures_the_song_and_emits_its_gain(self) -> None:
         codec, options = await self._options(

@@ -51,6 +51,10 @@ _MAX_RETRY_AFTER_SECS = 10.0
 # size: halve the limit and the guard doubles with it.
 _PLAYLIST_MAX_ITEMS = 10_000
 _PLAYLIST_PAGE_SIZE = 100
+# The most ids `GET /v1/tracks` accepts in one request. Not the page size: an
+# album page arrives at Spotify's own default of 50, and batching past this
+# would 400 the whole request and lose every ISRC on the page.
+_TRACKS_IDS_MAX = 50
 # A loop guard on a malformed or repeating `next`, not a limit a real playlist
 # reaches. +1 so the largest legal playlist ends by exhausting `next`, which is
 # the only ending that is not reported as short.
@@ -194,8 +198,8 @@ async def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
 
 
 def _track_to_cache(track: SpotifyTrack) -> list[Any]:
-    """One row for orjson. Positional, so a walk's rows cost five values rather
-    than five keys each; every key that reads them is versioned by this shape."""
+    """One row for orjson, positional. Every key that reads them is versioned by
+    this shape."""
     return [
         track.name,
         track.artists,
@@ -915,14 +919,17 @@ class Spotify:
         with _subscribed(cache_key, on_progress):
             return await asyncio.shield(job)
 
-    async def _page_isrcs(self, items: list[Any], aid: str) -> dict[str, str]:
+    async def _page_isrcs(
+        self, items: list[Any], aid: str, *, walk_deadline: Optional[float] = None
+    ) -> dict[str, str]:
         """{track id: ISRC} for one album page, or {} when the request fails.
 
         An album's items are SIMPLIFIED track objects, which carry no
         `external_ids` — so the recording each names is one batched request away,
-        50 ids at a time, the page size the walk already uses. Best-effort like
-        the album's name: without it every track resolves by title, which is what
-        it did before this existed. Bounded like one page.
+        `_TRACKS_IDS_MAX` ids at a time, the most `/v1/tracks` accepts. Best-effort
+        like the album's name: without it every track resolves by title. Bounded
+        like one page AND by `walk_deadline`, because this runs inside the walk's
+        budget and its answer is discarded.
         """
         ids = [
             tid
@@ -932,26 +939,29 @@ class Spotify:
         ]
         if not ids:
             return {}
-        try:
-            async with asyncio.timeout(_PLAYLIST_PAGE_TIMEOUT_SECS) as bound:
-                resp = await self.http_call(
-                    self.spotify_endpoint + "v1/tracks",
-                    params={"ids": ",".join(ids[:_PLAYLIST_PAGE_SIZE])},
-                    deadline=bound.when(),
-                )
-        except Exception as e:
-            log.warning(f"spotify album {aid}: ISRC request failed: {e!r}")
-            return {}
         found: dict[str, str] = {}
-        for track in _list_or_empty(
-            resp.get("tracks") if isinstance(resp, dict) else None
-        ):
-            if not isinstance(track, dict):
-                continue
-            tid = _str_or_none(track.get("id"))
-            isrc = _track_isrc(track)
-            if tid is not None and isrc is not None:
-                found[tid] = isrc
+        for start in range(0, len(ids), _TRACKS_IDS_MAX):
+            batch = ids[start : start + _TRACKS_IDS_MAX]
+            try:
+                async with asyncio.timeout(_PLAYLIST_PAGE_TIMEOUT_SECS) as bound:
+                    bounds = (bound.when(), walk_deadline)
+                    resp = await self.http_call(
+                        self.spotify_endpoint + "v1/tracks",
+                        params={"ids": ",".join(batch)},
+                        deadline=min(t for t in bounds if t is not None),
+                    )
+            except Exception as e:
+                log.warning(f"spotify album {aid}: ISRC request failed: {e!r}")
+                return found
+            for track in _list_or_empty(
+                resp.get("tracks") if isinstance(resp, dict) else None
+            ):
+                if not isinstance(track, dict):
+                    continue
+                tid = _str_or_none(track.get("id"))
+                isrc = _track_isrc(track)
+                if tid is not None and isrc is not None:
+                    found[tid] = isrc
         return found
 
     async def _playlist_name(self, pid: str) -> Optional[str]:
@@ -1086,7 +1096,9 @@ class Spotify:
                     pages += 1
                     items = _list_or_empty(page.get("items"))
                     walked += len(items)
-                    isrcs = await self._page_isrcs(items, aid)
+                    isrcs = await self._page_isrcs(
+                        items, aid, walk_deadline=walk.when()
+                    )
                     for track in items:
                         # An album item IS the track: no `track` wrapper.
                         if not isinstance(track, dict) or not _str_or_none(

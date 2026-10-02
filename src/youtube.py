@@ -797,11 +797,10 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
 def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
     """Say so when YouTube serves an Opus itag the allowlist does not name.
 
-    That serve is re-encoded — a lossy generation spent on a source that could have
-    been copied, and a silent step DOWN from the 251 it replaced. Only a bare
-    numeric format_id, which is what a YouTube itag is: SoundCloud's `http_opus`
-    rungs are named, are Opus, and are correctly excluded (64 kbps, below its own
-    mp3). Once per itag per process, and never for a serve the gate accepted.
+    That serve is re-encoded, spending a lossy generation on a source that could
+    have been copied. Scoped to a bare numeric format_id, which is what a YouTube
+    itag is and what SoundCloud's named `http_opus` rungs are not. Once per itag per
+    process, and never for a serve the gate accepted.
     Response: see docs/ARCHITECTURE.md#an-unknown-opus-itag.
     """
     format_id = str(data.get("format_id") or "")
@@ -915,10 +914,9 @@ _LOUDNESS_GAIN_CLAMP_DB: Final[tuple[float, float]] = (-20.0, 12.0)
 # Sample peak, which is what alimiter holds.
 _PEAK_CEILING_DBFS: Final[float] = -1.0
 # The same ceiling in the linear unit the filter takes, so the two cannot drift.
-# `level=disabled` is required: alimiter auto-levels its output by default, which
-# would RAISE a quiet song. `latency=1` is what keeps it transparent below the
-# ceiling — without it the filter delays by its 5 ms lookahead and every sample
-# moves. Measured in the ffmpeg tier. See docs/ARCHITECTURE.md#loudness-normalization.
+# `level=disabled` holds it to a ceiling rather than a leveller, and `latency=1`
+# aligns the lookahead so everything under the ceiling comes through unchanged.
+# Both measured in the ffmpeg tier. See docs/ARCHITECTURE.md#loudness-normalization.
 _PEAK_LIMITER: Final[str] = (
     f"alimiter=limit={10 ** (_PEAK_CEILING_DBFS / 20):.3f}:level=disabled:latency=1"
 )
@@ -980,8 +978,8 @@ def _passthrough_codec(data: YTDLVideoMetadata, *, filtered: bool) -> Optional[s
 
 # Lossless by codec, and by container for the two that report no codec at all:
 # yt-dlp infers `acodec` from the extension only for aac/opus/mp3/flac/vorbis, so a
-# direct WAV arrives with acodec=None. m4a is deliberately absent — AAC and ALAC
-# share it, and guessing lossless there would triple the egress of an AAC file.
+# direct WAV arrives with acodec=None. Which containers count, and why m4a is not
+# one of them: docs/ARCHITECTURE.md#encoder-mode.
 _LOSSLESS_ACODECS = frozenset({"flac", "alac"})
 _LOSSLESS_EXTS = frozenset({"flac", "wav", "aiff", "aif"})
 # Discord's own ceiling. A 20 ms packet at 384k is ~1 KB, clear of UDP fragmentation.
@@ -995,10 +993,9 @@ def _encode_bitrate_kbps(
 ) -> Optional[int]:
     """The encoder bitrate to ask for, or None to leave discord.py's 128k.
 
-    Only for a source that is actually lossless: for a ~130 kbps lossy serve,
-    raising the target buys 0.0-0.3 dB because the encode saturates on what the
-    source already threw away. From a lossless source it buys 2 dB at 256k
-    (39.6 -> 41.5 measured), which is the whole reason this exists.
+    Only for a source that is actually lossless, where it buys 2 dB at 256k
+    (39.6 -> 41.5 measured). A ~130 kbps lossy serve gains 0.0-0.3 dB, because the
+    encode saturates on what the source already threw away.
     See docs/ARCHITECTURE.md#encoder-mode.
     """
     if not channel_bitrate:
@@ -2002,10 +1999,9 @@ async def _revalidate_source(
 
 class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
-        # `-reconnect_on_http_error 5xx` is what answers a mid-song 503: a plain
-        # `-reconnect` retries a truncated stream but not a well-formed HTTP error,
-        # so the song used to end wherever the connection died. See
-        # docs/ARCHITECTURE.md#mid-song-reconnects.
+        # `-reconnect_on_http_error 5xx` is what answers a mid-song 503; the
+        # `-reconnect` beside it covers a truncated stream. Needs an ffmpeg no older
+        # than late 2020. See docs/ARCHITECTURE.md#mid-song-reconnects.
         "before_options": (
             "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
             " -reconnect_on_http_error 5xx"

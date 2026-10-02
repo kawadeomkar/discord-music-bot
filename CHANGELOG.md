@@ -17,6 +17,20 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.5 — 2026-10-01
+
+**Corrections to earlier entries in this file.** 2.54.0 said a Spotify link played in the
+last 24 hours would keep the video it had; the opposite is true — it resolves to the new
+recording on its very next play. 2.56.0 listed Apple Lossless among the formats that get
+the channel's bitrate; it does not, because it shares the `.m4a` container with AAC.
+2.53.10's "about 7 %" more voice traffic was measured against the wrong baseline: budget
+for roughly a third more on real music, and note the figure depends entirely on the
+material. Nothing in the bot changed for any of these — the entries were wrong, not the
+releases.
+
+`LOUDNESS_SCAN_TIMEOUT_SECS` is now documented in `.env.example` and the README's variable
+table, where it was missing since 2.55.0.
+
 ## 2.56.4 — 2026-10-01
 
 **`normalize` now measures long songs, and stops re-measuring the ones it cannot.** The
@@ -32,6 +46,14 @@ fallback to a title search used to ask the same empty question twice.
 Also: the troubleshooting section in the README no longer points at Discord's microphone
 settings or at `-ping` for the playing format, neither of which does what it said.
 
+## 2.56.2 — 2026-09-28
+
+**A new WARNING, if YouTube ever serves an audio format this build does not copy.** It
+reads `YouTube served Opus itag <n>, which is not in the passthrough allowlist`, fires at
+most once per format per restart, and means those songs are being re-encoded instead of
+copied through untouched — audible, and worth reporting. No action otherwise; nothing about
+playback changed, and a build that never sees a new format never logs it.
+
 ## 2.56.1 — 2026-09-28
 
 **A song no longer ends halfway when the connection hiccups.** If a song's connection died
@@ -43,10 +65,11 @@ seconds later than it used to; everything else about how failures are handled is
 
 ## 2.56.0 — 2026-09-28
 
-**A lossless link now encodes at the voice channel's bitrate.** A direct FLAC, WAV, ALAC or
-AIFF URL was re-encoded at 128k like everything else, which threw away audio the source
-actually had; it now uses the channel's own ceiling, up to 384k. Measured at +2 dB on a
-256k channel.
+**A lossless link now encodes at the voice channel's bitrate.** A direct FLAC, WAV or AIFF
+URL was re-encoded at 128k like everything else, which threw away audio the source actually
+had; it now uses the channel's own ceiling, up to 384k. Measured at +2 dB on a 256k channel.
+Apple Lossless is NOT included: it shares the `.m4a` container with AAC, and treating that
+as lossless would triple the traffic of every AAC file.
 
 Only those sources, and only on channels above 128 kbps: everything from YouTube,
 SoundCloud or Spotify is already lossy, where raising the target buys 0.0-0.3 dB and costs
@@ -84,9 +107,11 @@ Spotify names. Album tracks get the same treatment through one extra Spotify req
 50 tracks; a track with no ISRC, or whose ISRC YouTube does not know, resolves by title
 exactly as before.
 
-Two things to know. Spotify links resolved in the last 24 hours keep the video they
-already resolved to until that entry ages out. And the Spotify caches are re-keyed by
-this release: the first play of a playlist or album after deploying walks it again.
+Two things to know. A Spotify link played recently resolves to the new recording on its
+very next play, not when some cache expires: the search term itself changes, so the old
+entry is never consulted. (A track with no ISRC, resolving at dequeue, is the one case that
+keeps what it had.) And the Spotify caches are re-keyed by this release: the first play of a
+playlist, album or track link after deploying fetches it again.
 Rolling back is safe — the old build ignores the new keys and re-walks once itself.
 
 ## 2.53.10 — 2026-09-28
@@ -94,8 +119,10 @@ Rolling back is safe — the old build ignores the new keys and re-walks once it
 **Songs the bot re-encodes sound right.** Anything that is not bit-copied from YouTube —
 every SoundCloud track, every song played at a volume other than 100 %, every video whose
 only audio is AAC — was leaving the encoder in Opus's speech mode. It now stays in the
-music mode, which is also cheaper to encode. Nothing to do; each such song sends about
-7 % more voice traffic. Rolling back restores the old sound and nothing else.
+music mode, which is also cheaper to encode. Nothing to do. Budget for roughly a third
+more voice traffic per such song: 119 to 153 kbps measured on a real YouTube stream, though
+how much more depends entirely on the music — simple material can even come out smaller.
+Rolling back restores the old sound and nothing else.
 
 ## 2.53.7 — 2026-09-26
 

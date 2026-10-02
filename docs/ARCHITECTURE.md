@@ -1319,7 +1319,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `analytics:agg:v{n}:{guild_id}:{days}` | String | orjson aggregate for `-analytics`, one entry per allowlisted window. The authoritative half: every text field on the card is built from it, so a PNG hit with this evicted still runs the SQL | to the next UTC midnight |
 | `analytics:png:v{n}:{guild_id}:{days}:{digest}` | Bytes | the rendered chart, keyed by a digest of the aggregate it was drawn from so a stale entry MISSES rather than pairing an old chart with fresh numbers. Raw bytes, not orjson — that would base64 it for a 33% penalty | to the next UTC midnight |
 | `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
-| `ytdl:loudness:v1:{webpage_url}` | String | `{i, peak}` — one song's integrated loudness and true peak, in LUFS and dBFS, written only by a server running `loudness normalize`. 30-day TTL and evictable: losing it costs one re-scan ([Loudness normalization](#loudness-normalization)) |
+| `ytdl:loudness:v1:{webpage_url}` | String | `{i, peak}` — one song's integrated loudness and SAMPLE peak, in LUFS and dBFS, written only by a server running `loudness normalize`. `{unmeasured: true}` instead when the scan produced no level. Evictable: losing it costs one re-scan ([Loudness normalization](#loudness-normalization)) | 30 days; 1 hour for `unmeasured` |
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, 1.28 KB/rung measured, taking an entry from 4.66 KB to 8.49 KB of payload and 5.22 KB to 10.34 KB resident (it crosses jemalloc's 8192 size class) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 24 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
@@ -1821,7 +1821,10 @@ raising the target for a ~130 kbps lossy serve buys 0.0–0.3 dB, because the en
 saturates on what the source already threw away, while a lossless source gains 2 dB at
 256k (39.6 → 41.5 measured). So `_encode_bitrate_kbps` raises it only for one, bounded by
 the voice channel's own ceiling and capped at 384k — Discord's limit, where a 20 ms packet
-is about 1 KB, clear of UDP fragmentation.
+reaches libopus's own 1276-byte per-packet ceiling. With discord.py's 12-byte RTP header,
+16-byte Poly1305 tag and 4-byte nonce that is a 1308-byte UDP payload — inside a 1500-byte
+path, and past the 1280-byte IPv6 minimum, where `voice_state`'s `sendall` failure surfaces
+only as a discord.py DEBUG line.
 
 "Lossless" is read from `acodec` **and** `ext`, because yt-dlp infers `acodec` from the
 extension only for aac/opus/mp3/flac/vorbis: a direct WAV arrives with `acodec` None and
@@ -1882,6 +1885,20 @@ retry ladder, and a 403 on the *first* request still exits 8 with an `FFmpegProc
 either way. ffmpeg never retries a 403 when the list is `5xx`. The cost is bounded by
 `-reconnect_delay_max 5`: a 5xx that never clears is retried after 0, 1 and 3 seconds and
 then refused, so an unrecoverable song ends about 4 seconds later than it used to.
+
+A 5xx on the FIRST request is changed, and the stream probe reaches this path: `_probe_stream_url`
+maps 429 and 5xx to `UNCONFIRMED` and plays anyway. Measured against a server that answers
+503 forever, one spawn goes from `exit 8, 1 GET, 0.02 s` to `exit 8, 4 GETs, 4.03 s`. A
+transient 5xx on open therefore recovers instead of burning a rung of
+`_STREAM_PLAY_ATTEMPTS`; a persistent one costs about 4 seconds per attempt, so roughly 12
+before the failure embed where it used to fail at once.
+
+**Required ffmpeg.** `-reconnect_on_http_error` post-dates the three `-reconnect*` flags
+beside it; the `4xx,5xx` list form was added upstream around late 2020. An ffmpeg without it
+fails at argv parse — `Error splitting the argument list: Option not found`, exit 8, on every
+song and on every one of its attempts — so the floor is an ffmpeg no older than that. The
+runtime image installs Debian's, unpinned; `-ping` reports the version a deployment actually
+has.
 
 `-reconnect_on_network_error` was measured alongside and is **not** set: every network-level
 death in these cases was already retried by `-reconnect`, so it changed nothing.

@@ -2421,6 +2421,80 @@ class TestSpotifyAlbumIsrcs:
         assert call.await_count == 2
         assert call.await_args_list[1].kwargs["params"] == {"ids": "t1,t2"}
 
+    async def test_a_page_past_the_endpoints_limit_is_batched_not_truncated(
+        self, spotify: Spotify
+    ) -> None:
+        """`GET /v1/tracks` takes 50 ids. A page over that used to be sliced, and
+        every id past the cut lost its ISRC behind no error at all."""
+        ids = [f"t{n}" for n in range(120)]
+        responses = [
+            _album(self._page(*ids)),
+            self._isrc_response({tid: "GBAHS1600463" for tid in ids[:50]}),
+            self._isrc_response({tid: "GBAHS1600463" for tid in ids[50:100]}),
+            self._isrc_response({tid: "GBAHS1600463" for tid in ids[100:]}),
+        ]
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=responses)
+        ) as call:
+            album = await spotify.album("aid_big_page")
+
+        batches = [
+            c.kwargs["params"]["ids"].split(",") for c in call.await_args_list[1:]
+        ]
+        assert [len(b) for b in batches] == [50, 50, 20]
+        assert all(row.isrc is not None for row in album.tracks)
+
+    async def test_the_isrc_batch_cannot_outlive_the_walks_budget(
+        self, spotify: Spotify
+    ) -> None:
+        """It runs inside the walk and its answer is discarded, so a throttled batch
+        must not sleep 429 retries against a deadline the walk knows nothing about.
+        Only visible when the walk is the tighter of the two bounds, which is what
+        a long collection's last pages are."""
+        seen: list[float] = []
+
+        async def record(url: str, **kwargs: Any) -> Any:
+            if "v1/tracks" in url:
+                deadline = kwargs.get("deadline")
+                assert deadline is not None
+                seen.append(deadline)
+                return self._isrc_response({"t1": "GBAHS1600463"})
+            return _album(self._page("t1"))
+
+        with (
+            patch.object(spotify_module, "_PLAYLIST_WALK_TIMEOUT_SECS", 0.5),
+            patch.object(spotify, "http_call", new=record),
+        ):
+            await spotify.album("aid_deadline")
+
+        assert len(seen) == 1
+        # Under the page's own bound, so it is the walk's that was handed over.
+        headroom = asyncio.get_running_loop().time() + (
+            spotify_module._PLAYLIST_PAGE_TIMEOUT_SECS / 2
+        )
+        assert seen[0] < headroom
+
+    async def test_a_batch_answer_the_endpoint_half_filled_is_read_anyway(
+        self, spotify: Spotify
+    ) -> None:
+        """Spotify answers `/v1/tracks` with a null per id it could not resolve, and
+        a track it resolved may still carry no ISRC. Both are the documented
+        fallback — that track resolves by title — not a failed page."""
+        responses = [
+            _album(self._page("t1", "t2", "t3")),
+            {
+                "tracks": [
+                    None,
+                    {"id": "t2"},
+                    {"id": "t3", "external_ids": {"isrc": "GBAHS1600463"}},
+                ]
+            },
+        ]
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=responses)):
+            album = await spotify.album("aid_partial")
+
+        assert [row.isrc for row in album.tracks] == [None, None, "GBAHS1600463"]
+
     async def test_a_failed_isrc_request_leaves_the_album_walked(
         self, spotify: Spotify
     ) -> None:

@@ -89,9 +89,12 @@ plus the traps that make a green run mean nothing if they are broken.
   CELT, and discord.py's bare defaults — the control — do not); and the two halves of
   the loudness ceiling, that `alimiter` is transparent below it with `latency=1` and
   shifts every sample without, plus that `measure_loudness` can still read what
-  ebur128 prints. Those last ones run ffmpeg directly rather than through
-  discord.py, because what is under test is the filter. Needs ffmpeg on PATH, not Docker: only the runtime stage installs it, so this
-  cannot run in the container tier. No network, and the sample is synthesised per session.
+  ebur128 prints. One more reads the bitstream a raised `-b:a` actually produces, which
+  is the only place `_encode_bitrate_kbps`' number is checked against libopus rather
+  than against an argv. Those last ones run ffmpeg directly rather than through
+  discord.py, because what is under test is the filter. Needs ffmpeg on PATH, not
+  Docker: only the runtime stage installs it, so this cannot run in the container
+  tier. No network, and the sample is synthesised per session.
 - **The `redis` tier** (`tests/test_redis_integration.py`, marker `redis`) is the same
   shape against a real `redis:7-alpine` (`just test-redis`, or `REDIS_TEST_URL` in CI),
   and the conftest hook gates it identically. It exists because of the divergence list
