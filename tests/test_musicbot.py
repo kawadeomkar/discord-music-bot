@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import time
 from typing import Any, Optional, cast
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -453,25 +454,43 @@ class TestCleanup:
         assert not current.cancelled()
         assert mock_guild.id not in music_bot.voice_watchdog._countdowns
 
-    async def test_disconnects_voice_client(
+    async def test_disconnects_voice_client_forcing_the_clear(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
+        """Discord has the bot in a channel, so the clear is forced. Unforced, a
+        handshake abandoned before it reached `connected` leaves the bot there and
+        the next join is deduplicated away into a 10s timeout —
+        TestVoiceDisconnectContract pins that the flag is what decides it."""
         self._make_minimal_mp(music_bot, mock_guild)
         mock_guild.voice_client.disconnect = AsyncMock()
-        await music_bot.cleanup(mock_guild)
-        mock_guild.voice_client.disconnect.assert_awaited_once()
 
-    async def test_the_disconnect_is_forced(
-        self, music_bot: MusicBot, mock_guild: MagicMock
+        await music_bot.cleanup(mock_guild)
+
+        mock_guild.voice_client.disconnect.assert_awaited_once_with(force=True)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            lambda g: setattr(g, "me", None),
+            lambda g: setattr(g.me, "voice", None),
+            lambda g: setattr(g.me.voice, "channel", None),
+        ],
+        ids=["no-bot-member", "no-voice-state", "state-without-channel"],
+    )
+    async def test_the_disconnect_is_unforced_with_nothing_to_clear(
+        self, music_bot: MusicBot, mock_guild: MagicMock, shape: Any
     ) -> None:
-        """Unforced, a handshake abandoned before it reached `connected` leaves the
-        bot in the channel Discord-side, and the next join is deduplicated away
-        into a 10s handshake timeout. TestVoiceDisconnectContract pins that the
-        flag is what decides it."""
+        """Forcing costs a wait on a VOICE_STATE_UPDATE that only arrives when there
+        was a voice state to clear. cleanup() has already popped the player, so a
+        wait taken for nothing leaves the guild holding a dead voice client and no
+        player — where a -play reads the warm path and never joins."""
         self._make_minimal_mp(music_bot, mock_guild)
         mock_guild.voice_client.disconnect = AsyncMock()
+        shape(mock_guild)
+
         await music_bot.cleanup(mock_guild)
-        mock_guild.voice_client.disconnect.assert_awaited_once_with(force=True)
+
+        mock_guild.voice_client.disconnect.assert_awaited_once_with(force=False)
 
     async def test_removes_guild_from_mps(
         self, music_bot: MusicBot, mock_guild: MagicMock
@@ -841,6 +860,11 @@ class TestVoiceDisconnectContract:
         voice_client.channel.guild.change_voice_state = change_voice_state
         voice_client.guild.id = 924267988138483772
 
+        # The real VoiceClient.guild is a property returning self.channel.guild;
+        # two unrelated mock children would make an upstream switch between the
+        # two spellings read as a behaviour change.
+        voice_client.guild = voice_client.channel.guild
+
         with patch("discord.voice_state.SocketReader.start"):
             state = VoiceConnectionState(voice_client)
         state.state = ConnectionFlowState.got_both_voice_updates
@@ -865,7 +889,6 @@ class TestVoiceDisconnectContract:
         await state.disconnect(force=False, wait=True)
 
         change_voice_state.assert_not_awaited()
-        assert not state._expecting_disconnect
 
     async def test_forced_disconnect_clears_the_voice_state(self) -> None:
         state, change_voice_state = self._abandoned_handshake()
@@ -874,6 +897,47 @@ class TestVoiceDisconnectContract:
 
         change_voice_state.assert_awaited_once_with(channel=None)
         assert state.state is ConnectionFlowState.disconnected
+
+    async def test_an_unanswered_clear_blocks_until_the_timeout(self) -> None:
+        """Why the force is conditional. With no voice state to clear Discord sends
+        no VOICE_STATE_UPDATE, and the disconnect blocks on one for the whole of
+        `timeout` — 10s after a join attempt, 30s before one — before
+        VoiceClient.cleanup() can unregister the client, with the guild's player
+        already popped."""
+        state, change_voice_state = self._abandoned_handshake()
+        change_voice_state.side_effect = None  # Discord has nothing to report
+        state.timeout = 0.05
+
+        started = time.monotonic()
+        await state.disconnect(force=True, wait=True)
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= state.timeout
+        change_voice_state.assert_awaited_once_with(channel=None)
+
+    async def test_voice_client_forwards_force_and_unregisters_regardless(
+        self,
+    ) -> None:
+        """The other half of the contract, and what makes the leak permanent rather
+        than recoverable: VoiceClient.disconnect hands `force` straight through,
+        pins `wait=True`, and calls self.cleanup() whatever the state machine did —
+        so an unforced no-op still unregisters the client that could have sent the
+        clear. __new__, because __init__ demands PyNaCl and davey."""
+        vc = object.__new__(discord.VoiceClient)
+        connection = MagicMock()
+        connection.disconnect = AsyncMock()
+        cleanup = MagicMock()
+        # cast: these overwrite bound methods, which the checker goes on reading
+        # as the method types rather than the doubles standing in for them. The
+        # assertions run against the locals for the same reason.
+        vc._connection = connection
+        vc.stop = cast(Any, MagicMock())
+        vc.cleanup = cast(Any, cleanup)
+
+        await discord.VoiceClient.disconnect(vc, force=False)
+
+        connection.disconnect.assert_awaited_once_with(force=False, wait=True)
+        cleanup.assert_called_once()
 
 
 class TestCogBeforeInvoke:

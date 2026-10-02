@@ -1265,7 +1265,8 @@ sequenceDiagram
     MusicBot->>MP: gather-cancel: _prefetch_task, _progress_task,<br/>_heartbeat_task, _pause_debounce_task, _player, _restore_task
     MusicBot->>MP: retire_np_host_on_stop()
     Note over MP: no task can race this; dedicated NP msg deleted,<br/>command-response host strip-edited
-    MusicBot->>VC: voice_client.disconnect(force=False)
+    MusicBot->>VC: voice_client.disconnect(force=bot still in a channel?)
+    Note over VC: forced only when there is a voice state to clear —<br/>see [Voice teardown](#voice-teardown)
     MusicBot->>Redis: store.clear_connection() + refresh_ttl()
 ```
 
@@ -2435,6 +2436,23 @@ then `abc.connect` force-disconnects again with `wait=True`, and the `channel=No
 confirmation that second wait blocks on can no longer be routed to a client that is no
 longer registered — so it also runs to its timeout. The play lands as
 `play.dropped_by = join_failed`.
+
+**The force is conditional, on `discord_holds_voice_state(guild)`.** Forcing costs a
+wait: `VoiceClient.disconnect` pins `wait=True`, and the state machine blocks on the
+`channel=None` VOICE_STATE_UPDATE for the whole of `VoiceConnectionState.timeout` —
+10s once a connect has run, 30s before one — then unregisters the client. With a voice
+state to clear that confirmation arrives in a gateway round trip. With none it never
+comes, because Discord has nothing to report, and `soft_disconnect` cannot tell the two
+apart: its `with_state` defaults to `got_both_voice_updates` whatever the handshake
+actually reached, so the state is no evidence. The bot member's own voice state is,
+which is what the predicate reads.
+
+That wait is not free to get wrong. `cleanup()` pops the guild out of `mps` before any
+of this, so for its whole duration the guild has a registered-but-dead voice client and
+no player — and a `-play` landing there reads `cold_start = not ctx.voice_client` as
+False, takes the warm path, never joins, and hands its song to a loop whose `vc.play()`
+raises. Keeping the force off when there is nothing to clear keeps that window at one
+round trip.
 
 **Reading it from the logs:** `_voice_disconnect()` logs `The voice handshake is being
 terminated for Channel ID …` at INFO every time it sends the clear, so that line's
