@@ -1663,12 +1663,17 @@ class TestCgroupReaders:
     ) -> None:
         """cpu.stat is readable off-container too, where /sys/fs/cgroup is the ROOT
         cgroup: its counter is EVERY process on the machine. Ungated, the bot reports
-        the whole host's CPU as its own — a wrong number, not a missing one."""
+        the whole host's CPU as its own — a wrong number, not a missing one. The
+        process times are pinned, so the fallback is recognised by its own value
+        rather than by not being the file's."""
         monkeypatch.setattr(debug, "_in_container", lambda: False)
+        monkeypatch.setattr(
+            debug.os, "times", lambda: os.times_result((1.0, 0.25, 0.0, 0.0, 0.0))
+        )
         (cgroup / "cpu.stat").write_text("usage_usec 4500000\nuser_usec 3000000\n")
         sample = debug.read_cpu_sample()
         assert sample.scope == "process"
-        assert sample.seconds != 4.5
+        assert sample.seconds == 1.25
 
     def test_cpu_sample_falls_back_to_process_times(
         self, cgroup: Path, in_container: None
@@ -2471,11 +2476,10 @@ class TestFooterRuntimeSegment:
         """Before the sampler's second tick there is no rate to report, and 0%
         would be a lie an operator acts on."""
         footer = debug.debug_footer(
-            runtime=self._snapshot(cpu_percent=None, mem_percent=None)
+            runtime=self._snapshot(cpu_percent=None, mem_percent=None),
+            skip_environment=True,
         )
-        assert "cpu" not in footer
-        assert "mem" not in footer
-        assert "lag 2.1 ms" in footer
+        assert footer == "🐞 lag 2.1 ms\ntasks 87 · pool 4"
 
     def test_no_snapshot_yields_no_runtime_segment(self) -> None:
         assert (
