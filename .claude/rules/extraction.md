@@ -116,7 +116,7 @@ same reason `audio_channels` is.
 **Opus passthrough**: `codec="copy"` remuxes instead of re-encoding. `_passthrough_codec`
 is the gate and all four clauses are required, because `-c:a copy` also discards the
 `-ac 2 -ar 48000 -b:a 128k -fec -packet_loss` discord.py always emits (the last two are
-overridden on the encode path — ARCHITECTURE.md#encoder-mode): `acodec` opus; no filter (ffmpeg
+overridden on the encode path — docs/ARCHITECTURE.md#encoder-mode): `acodec` opus; no filter (ffmpeg
 refuses copy alongside a filtergraph — exit 234, zero bytes — so `yt_stream` asks
 `_audio_filters` what it produced rather than re-testing volume); `audio_channels` in
 (1, 2) (a 5.1 serve reaches Discord as multistream and clients decode only the front
@@ -152,7 +152,7 @@ label's art track (263 s against 234 s for "Shape of You"). A playlist asks for 
 `fields` mask; an album's simplified tracks carry none, so `_page_isrcs` batches one
 `/v1/tracks?ids=` per page, best-effort. Spotify's length then picks between the results
 of a FLAT search, which costs the same for five as for one. Full rule and numbers:
-ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
+docs/ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
 the playlist's path through `queue_source`, the card and every placement; page 1 rides

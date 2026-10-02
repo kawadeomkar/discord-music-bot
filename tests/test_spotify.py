@@ -2338,6 +2338,15 @@ class TestSpotifyTrackRows:
             ({"isrc": ""}, None),
             ({}, None),
             ("not-a-dict", None),
+            # `$` matches before a trailing newline, so `^...$` let this through.
+            ({"isrc": "GBAHS1600463\n"}, None),
+            # `\d` without re.ASCII admits any Unicode decimal digit.
+            ({"isrc": "GBAHS\u0661\u0666\u0660\u0660\u0664\u0666\u0663"}, None),
+            # The hyphenated display form of ISO 3901; the API sends it unpunctuated.
+            ({"isrc": "US-S1Z-99-00001"}, None),
+            # Registrants may lead with a digit, and the Q-prefix pools are real.
+            ({"isrc": "US4KG1900001"}, "US4KG1900001"),
+            ({"isrc": "QM6MZ1600001"}, "QM6MZ1600001"),
         ],
         ids=[
             "shaped",
@@ -2347,6 +2356,11 @@ class TestSpotifyTrackRows:
             "empty",
             "no-key",
             "not-a-dict",
+            "trailing-newline",
+            "unicode-digits",
+            "hyphenated",
+            "digit-registrant",
+            "q-pool",
         ],
     )
     def test_only_a_shaped_isrc_survives(

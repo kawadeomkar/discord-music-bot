@@ -588,8 +588,8 @@ class TestReplies:
         await _invoke(cog, ctx, "ln NORMALIZE")
         assert _text(ctx) == (
             "**Loudness** is now **normalize** for this server (was **off**, the "
-            "default). It applies from the song after next, since the next one is "
-            f"already built. It is saved for this server. Changed by {MENTION}."
+            "default). It applies from the next song the player builds. It is saved "
+            f"for this server. Changed by {MENTION}."
         )
         await _invoke(cog, ctx, "reset loudness")
         assert _text(ctx) == (

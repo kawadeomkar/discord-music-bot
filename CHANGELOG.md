@@ -17,6 +17,22 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.6 — 2026-10-02
+
+**The "unknown Opus itag" warning stops crying wolf.** For the half-hour after a deploy it
+could name itag 251 — which IS one the bot copies — because the cached format details it
+reads do not carry a channel count until they are rewritten. It now only reports a format
+that genuinely is not on the list, so the warning means what the runbook says it means.
+
+**The loudness scan reconnects like playback does.** A connection that blips mid-scan used
+to give up, and since 2.56.4 remembers a failed scan for an hour, that blip cost the song
+its normalization for the hour. It now retries the same way a song does.
+
+Also: a malformed ISRC with a trailing newline or non-Western digits is no longer searched
+verbatim, and `-settings loudness` now says it applies "from the next song the player
+builds" — true whether or not one is already prefetched, where the old wording was only
+true when it was.
+
 ## 2.56.5 — 2026-10-01
 
 **Corrections to earlier entries in this file.** 2.54.0 said a Spotify link played in the

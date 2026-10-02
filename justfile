@@ -313,7 +313,7 @@ test *ARGS: (_tools 'pytest')
 # worker shares one server while raw_pg_dsn's database counter restarts at t1 in
 # each, so they collide: measured, -n 2 fails with a DuplicateDatabaseError per
 # test. Disabling the plugin makes -n an unrecognized argument (exit 4) instead.
-# The tiers are 99 and 49 tests behind a container start; nothing to parallelize.
+# The tiers are 99 and 60 tests behind a container start; nothing to parallelize.
 [doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
 [group('check')]
 test-pg *ARGS: _venv_pytest

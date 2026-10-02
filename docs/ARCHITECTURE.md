@@ -1402,7 +1402,9 @@ flowchart TD
 
 **Send pacing.** discord.py's `AudioPlayer` is a plain Python thread sleeping to a
 20 ms deadline, so it competes for the GIL with everything the event loop runs. Measured
-against a stub voice client, 8 s of sends per row:
+once against a stub voice client, 8 s of sends per row. The harness is not in the tree, so
+these are a recorded reading rather than something a reader can reproduce from it — treat
+them as the shape of the effect, not as a threshold to test against:
 
 | Load on the interpreter | p99 send gap | Gaps over 30 ms |
 |---|---|---|
@@ -1786,7 +1788,7 @@ flowchart LR
 
 Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
 
-Two differences from the encode path are accepted, and ffmpeg warns about neither, since no encoder is instantiated to read the options: a mono source stays mono rather than being upmixed, and the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251). The bitrate is not a quality lever in either direction: a 128k CELT re-encode of a 251 measures ~3 dB below the copy, and raising the target to 256k recovers 0.1 dB of it. Neither path carries in-band FEC — see [Encoder mode](#encoder-mode) for why the encode path turns it off — so the two differ by one lossy generation and nothing else.
+Two differences from the encode path are accepted, and ffmpeg warns about neither, since no encoder is instantiated to read the options: a mono source stays mono rather than being upmixed, and the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251). The bitrate is not a quality lever in either direction: on the one 251 these figures were taken from, a 128k CELT re-encode measured about 3 dB below the copy and raising the target to 256k recovered 0.1 dB of it. Treat the 3 dB as that sample rather than as a constant — nothing in the tree re-derives it. Neither path carries in-band FEC — see [Encoder mode](#encoder-mode) for why the encode path turns it off — so the two differ by one lossy generation and nothing else.
 
 #### Encoder mode
 
@@ -1832,7 +1834,8 @@ extension only for aac/opus/mp3/flac/vorbis: a direct WAV arrives with `acodec` 
 lossless there would triple the egress of every AAC file. `ext` is in
 `_STREAM_CACHE_FIELDS` for the same reason `audio_channels` is: a cache hit that lost it
 would silently drop those sources back to 128k. Like volume, the value is baked into the
-argv, so it applies from the song after next.
+argv, so it applies from the next song the player builds — the one after next while a
+prefetch holds a built one, and the very next after an empty queue.
 
 #### An unknown Opus itag
 
@@ -1921,13 +1924,17 @@ receives, so a guild playing at 200 % is capped after its gain rather than befor
 `level=disabled` is required because alimiter auto-levels its output by default, which
 would RAISE a quiet song. **`latency=1` is load-bearing**: alimiter reports its 5 ms
 lookahead as latency, which ffmpeg answers by delaying the stream, so without that option
-every sample moves — worst difference 834 of 32768 against the unfiltered decode. With it
-the filter is transparent below the ceiling to within one 16-bit step (1.9e-09 in float),
+every sample moves — worst difference 3324 of 32768 against the unfiltered decode on
+ffmpeg 9.0.2. With it the filter is transparent below the ceiling: 7.5e-09 in float, which
+is four thousand times under one 16-bit step (3.05e-05), so nothing survives quantisation.
+Both figures are build-dependent — an earlier reading on 7.1.5 gave 834 and 1.9e-09 — so
+the tier asserts the two thresholds rather than the numbers,
 and inserting the filtergraph itself is bit-exact. The ffmpeg tier measures all three.
 
 Only `off` emits no filtergraph, so only `off` keeps the remux — the passthrough gate above
 refuses `-c:a copy` alongside any filter — and `peak` and `normalize` each cost the one
-lossy generation that path avoids, ~3 dB against the copy. Gain is −14 LUFS minus the
+lossy generation that path avoids, about 3 dB against the copy on the one sample it was
+taken from ([Encoder mode](#encoder-mode)). Gain is −14 LUFS minus the
 measured `I`, clamped to (−20, +12) dB: past that a track is a field recording or a
 mastering error, and moving it 30 dB amplifies its noise floor into the room. A scan that
 fails, times out or prints no summary yields no gain at all — the song takes the ceiling and
@@ -1938,7 +1945,7 @@ Why a static gain rather than a normalizing filter, measured on the same loud/qu
 | Approach | On the target | What it costs |
 |---|---|---|
 | `dynaudnorm` | no — **7 LU** still between the loud and the quiet track | — |
-| single-pass `loudnorm` | yes — both tracks landed on −13.2 LUFS asked for −16 | squeezes the loudness range, LRA 21.4 → 16.5 LU, and 55 ms on first byte |
+| single-pass `loudnorm` | no — asked for −16 and both tracks landed on −13.2 LUFS, though they landed on the SAME loudness, which is the half that matters | squeezes the loudness range, LRA 21.4 → 16.5 LU, and 55 ms on first byte |
 | `volume=<gain>dB` + limiter (shipped) | yes, exactly, and LRA untouched | needs the track's loudness before the argv is assembled |
 
 `ebur128` reads SAMPLE peak, which is the one `alimiter` holds the ceiling on, and asking
@@ -1972,8 +1979,9 @@ at −23.3 LUFS comes out at −20.4 rather than −14. The span carries
 each other. Capping the gain at the headroom instead was measured and is worse — the same
 track lands at −21.3 — because the limiter does deliver real loudness, so the gain is asked
 for in full.
-A changed mode applies from the song after next, since the next song's argv — gain included
-— is already assembled.
+A changed mode applies from the next song the player BUILDS, because the gain is baked into
+the argv: the song after next while a prefetch holds one already assembled, and the very
+next song when the queue was empty and nothing was prefetched.
 
 Considered and left out:
 

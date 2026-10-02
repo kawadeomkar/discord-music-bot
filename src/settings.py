@@ -225,7 +225,7 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
             "`normalize` brings every song to one loudness, measuring each once. "
             "Either one re-encodes rather than copying the audio."
         ),
-        applies="from the song after next, since the next one is already built",
+        applies="from the next song the player builds",
         field=ConfigField.LOUDNESS,
         choices=(
             LoudnessMode.OFF.value,

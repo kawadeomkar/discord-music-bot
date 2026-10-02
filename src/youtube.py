@@ -764,6 +764,9 @@ _STREAM_CACHE_FIELDS = frozenset(
 _DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
 # Same rule, for a YouTube Opus itag the passthrough allowlist does not name.
 _UNKNOWN_OPUS_ITAG_WARNED: set[str] = set()
+# YouTube's audio-itag space is a few dozen wide, so this is a backstop against a
+# serve that is not an itag at all rather than an expected bound.
+_MAX_UNKNOWN_OPUS_ITAGS: Final[int] = 64
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -804,13 +807,22 @@ def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
     Response: see docs/ARCHITECTURE.md#an-unknown-opus-itag.
     """
     format_id = str(data.get("format_id") or "")
-    if not format_id.isdigit() or format_id in _UNKNOWN_OPUS_ITAG_WARNED:
+    # isascii first: str.isdigit() admits non-ASCII digits, which no itag is.
+    if not (format_id.isascii() and format_id.isdigit()):
+        return
+    if format_id in _UNKNOWN_OPUS_ITAG_WARNED:
+        return
+    if format_id in _PASSTHROUGH_FORMAT_IDS:
+        # Named, so not the thing this warns about. The gate also refuses an
+        # allowlisted itag whose cache entry predates `audio_channels`, which
+        # _STREAM_CACHE_FIELDS expects for the stream TTL after a deploy.
         return
     if not str(data.get("acodec") or "").startswith("opus"):
         return
     if _passthrough_codec(data, filtered=False) is not None:
         return
-    _UNKNOWN_OPUS_ITAG_WARNED.add(format_id)
+    if len(_UNKNOWN_OPUS_ITAG_WARNED) < _MAX_UNKNOWN_OPUS_ITAGS:
+        _UNKNOWN_OPUS_ITAG_WARNED.add(format_id)
     log.warning(
         f"YouTube served Opus itag {format_id}, which is not in the passthrough "
         f"allowlist ({sorted(_PASSTHROUGH_FORMAT_IDS)}), so the song was "
@@ -1043,7 +1055,7 @@ class Loudness:
 
 # ebur128's summary block, printed at info level once the stream ends. Anchored per
 # line, because the same words appear in its per-frame log.
-_LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)$", re.M)
+_LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)\s*$", re.M)
 
 # A month. What a song measures does not change, so the only reason to re-measure is
 # that the entry is cheap to lose, not that it goes stale. TTL'd and evictable, so it
@@ -1054,6 +1066,18 @@ _LOUDNESS_TTL: Final[int] = 30 * 86400
 # cover fails identically every play, and without this the whole timeout is spent
 # again each time; an hour is short enough that a transient failure heals.
 _LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
+
+# What FFMPEG_OPTS["before_options"] gives the play path, as argv for the scan.
+_SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-reconnect_on_http_error",
+    "5xx",
+)
 
 
 def _loudness_cache_key(webpage_url: str) -> str:
@@ -1120,6 +1144,9 @@ async def measure_loudness(
                 "-nostats",
                 "-loglevel",
                 "info",
+                # The play path's reconnects, because a drop here is now remembered
+                # for an hour: see FFMPEG_OPTS["before_options"].
+                *_SCAN_RECONNECT_ARGS,
                 "-i",
                 stream_url,
                 "-vn",
@@ -2478,7 +2505,7 @@ class YTDL(discord.FFmpegOpusAudio):
 
         `channel_bitrate` is the voice channel's own ceiling in bits/s, which only
         a lossless source spends — see _encode_bitrate_kbps. Like volume, it is
-        baked into the argv, so it applies from the song after next."""
+        baked into the argv, so it applies from the next song the player builds."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
 
         data = await cls._resolve_playable_stream(
@@ -2591,7 +2618,7 @@ class YTDL(discord.FFmpegOpusAudio):
                     # The ask is out of terms, so this miss is the answer. Raised
                     # as the failure the caller has always seen, `from None`
                     # because the wrapper is this method's private business.
-                    raise miss.public from None
+                    raise miss.public from miss
                 log.info(
                     f"{kind} search {term!r} found nothing; "
                     f"falling back to {terms[index + 1][1]!r}"
@@ -2599,6 +2626,7 @@ class YTDL(discord.FFmpegOpusAudio):
         raise AssertionError("_search_terms never returns an empty ladder")
 
     @classmethod
+    @_tracer.start_as_current_span("ytdl.resolve_term")
     async def _resolve_term(
         cls,
         requester: Union[discord.User, discord.Member],

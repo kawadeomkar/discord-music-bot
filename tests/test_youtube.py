@@ -1570,13 +1570,6 @@ class TestYTSourceTermLadder:
         "duration": 234,
     }
 
-    @staticmethod
-    def _answers(mapping: dict[str, Any]) -> Any:
-        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
-            return mapping.get(search)
-
-        return extract
-
     async def test_the_isrc_search_resolves_and_the_title_is_never_asked(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -6957,6 +6950,15 @@ class TestEbur128Summary:
             assert youtube._LOUDNESS_LINE.findall(summary)[0] == ("I", value)
             assert parse_ebur128_summary(summary) is None
 
+    def test_the_last_match_wins_so_the_summary_beats_the_frames(self) -> None:
+        """`framelog=info` prints the same two words per frame and the summary LAST.
+        The pick is a dict comprehension, which keeps the last of a repeated key."""
+        summary = (
+            "  I:  -30.0 LUFS\n  Peak:  -20.0 dBFS\n"
+            "  I:  -14.1 LUFS\n  Peak:   -0.9 dBFS\n"
+        )
+        assert parse_ebur128_summary(summary) == Loudness(i=-14.1, peak=-0.9)
+
     def test_the_per_frame_log_is_not_mistaken_for_the_summary(self) -> None:
         """`framelog=quiet` suppresses it, but the words are the same, and a
         per-frame M/I line is an instantaneous reading rather than the whole song."""
@@ -6976,6 +6978,11 @@ class TestNormalizeGain:
 
     def test_a_loud_song_is_lowered(self) -> None:
         assert normalize_gain_db(Loudness(i=-8.0, peak=-0.1)) == pytest.approx(-6.0)
+
+    def test_the_clamp_is_twenty_down_and_twelve_up(self) -> None:
+        """Asserting against the constant itself passes for any value, and these two
+        bound how far a mastering error can move a room."""
+        assert _LOUDNESS_GAIN_CLAMP_DB == (-20.0, 12.0)
 
     def test_a_silent_recording_is_clamped(self) -> None:
         assert (
@@ -7101,6 +7108,22 @@ class TestMeasureLoudness:
         _, spawn = self._child(stderr=b"ffmpeg: Server returned 403 Forbidden\n")
         with patch("asyncio.create_subprocess_exec", new=spawn):
             assert await measure_loudness("https://cdn/a", self._URL, None) is None
+
+    async def test_the_scan_suppresses_the_progress_line(self) -> None:
+        """ffmpeg's progress line is carriage-returned, and the summary pattern is
+        anchored per line. `-nostats` is what keeps the two from meeting."""
+        argv: list[str] = []
+        _, spawn = self._child(stderr=TestEbur128Summary._CAPTURED.encode())
+
+        async def record(*args: Any, **kwargs: Any) -> MagicMock:
+            argv.extend(args)
+            return await spawn(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record):
+            await measure_loudness("https://cdn/a", self._URL, None)
+
+        assert "-nostats" in argv
+        assert "-reconnect_on_http_error" in argv
 
     async def test_the_scan_reads_sample_peak(self) -> None:
         """Sample peak is the one alimiter holds the ceiling on, and asking for it
@@ -7425,6 +7448,9 @@ class TestUnknownOpusItagTripwire:
     def setup_method(self) -> None:
         youtube._UNKNOWN_OPUS_ITAG_WARNED.clear()
 
+    def teardown_method(self) -> None:
+        youtube._UNKNOWN_OPUS_ITAG_WARNED.clear()
+
     @staticmethod
     def _serve(**overrides: Any) -> Any:
         return {
@@ -7458,6 +7484,28 @@ class TestUnknownOpusItagTripwire:
         with caplog.at_level(logging.WARNING):
             _record_serving_format(self._serve(format_id="251"))
         assert "allowlist" not in caplog.text
+
+    def test_an_allowlisted_itag_with_no_channel_count_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A cache entry written before `audio_channels` joined the stream fields
+        reads as re-encode for the rest of its 30-minute TTL. That is a named itag,
+        so it is not what this warns about — and the runbook's response, adding it
+        to the allowlist, is a no-op for one already there."""
+        serve = self._serve(format_id="251")
+        serve.pop("audio_channels", None)
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(serve)
+        assert "allowlist" not in caplog.text
+
+    def test_a_format_id_that_is_not_ascii_digits_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`str.isdigit()` alone admits Unicode decimal digits, which no itag is."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id="\u0663\u0664"))
+        assert "allowlist" not in caplog.text
+        assert not youtube._UNKNOWN_OPUS_ITAG_WARNED
 
     def test_soundclouds_named_opus_rung_is_silent(
         self, caplog: pytest.LogCaptureFixture

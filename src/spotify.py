@@ -290,7 +290,9 @@ def _row_url(raw: object) -> Optional[str]:
 # IFPI's shape: two-letter country, three-character registrant, two-digit year,
 # five-digit designation. Spotify sends the odd empty string and the odd typo, and
 # a malformed one searched verbatim finds nothing and costs a round trip.
-_ISRC_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$")
+# \A/\Z and an explicit 0-9, not ^/$ and \d: `$` matches before a trailing
+# newline and `\d` admits any Unicode decimal digit, and neither is an ISRC.
+_ISRC_RE = re.compile(r"\A[A-Z]{2}[A-Z0-9]{3}[0-9]{7}\Z")
 
 
 def _track_isrc(track: dict[str, Any]) -> Optional[str]:

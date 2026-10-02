@@ -87,8 +87,14 @@ def render(info: dict[str, Any]) -> list[str]:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("usage: python -m scripts.ytdl_formats <url-or-search>", file=sys.stderr)
+        print(
+            "usage: python -m scripts.ytdl_formats <url-or-search> [expected-seconds]",
+            file=sys.stderr,
+        )
         return 2
+    # The length a Spotify ask carries, which is half of the bot's own rule. Without
+    # it a search reports on YouTube's top result and the bot may play another.
+    expected = int(sys.argv[2]) if len(sys.argv) > 2 else None
     # Copy and drop the logger: yt-dlp's warnings are the interesting part here, so
     # they go to stderr rather than through the bot's structlog routing.
     opts = copy.copy(_YTDL_STREAM_OPTS)
@@ -104,8 +110,11 @@ def main() -> int:
     info = cast(dict[str, Any], raw)
     if "entries" in info:  # a search result — report the entry that would be played
         # yt_source's own picker, not a copy of its rule: a second copy would drift and
-        # this tool would then answer for a song the bot does not choose.
-        chosen = select_search_entry(cast(Any, info["entries"]))
+        # this tool would then answer for a song the bot does not choose. Pass the
+        # length for a Spotify ask, which is what narrows a multi-result search.
+        chosen = select_search_entry(
+            cast(Any, info["entries"]), expected_duration=expected
+        )
         if chosen is None:
             print("search returned no playable entry", file=sys.stderr)
             return 1

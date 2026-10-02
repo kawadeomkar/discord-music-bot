@@ -382,6 +382,14 @@ class TestTheChannelBitrateIsSpent:
         assert raised > default, (default, raised)
 
 
+# Production's `before_options` minus the flag under test, derived rather than
+# written out: a change to the base flags would otherwise leave the control
+# quietly standing in for something that is no longer the baseline.
+_BASE_RECONNECT = YTDL.FFMPEG_OPTS["before_options"].replace(
+    " -reconnect_on_http_error 5xx", ""
+)
+
+
 def _audio_tocs(url: str, options: str) -> list[int]:
     """The TOC config of the first _MODE_SAMPLE_PACKETS audio packets, read the
     way the player reads them, past the two Ogg header packets."""
@@ -390,7 +398,14 @@ def _audio_tocs(url: str, options: str) -> list[int]:
     try:
         for _ in range(_OGG_HEADER_PACKETS):
             source.read()
-        return [source.read()[0] >> 3 for _ in range(_MODE_SAMPLE_PACKETS)]
+        tocs = []
+        for _ in range(_MODE_SAMPLE_PACKETS):
+            packet = source.read()
+            # read() answers b"" once the stream is spent; [0] on that is an
+            # IndexError that says nothing about the sample being too short.
+            assert packet, f"stream ended after {len(tocs)} of {_MODE_SAMPLE_PACKETS}"
+            tocs.append(packet[0] >> 3)
+        return tocs
     finally:
         source.cleanup()
         for pipe in (process.stdout, process.stderr, process.stdin):
@@ -420,10 +435,11 @@ class TestEncoderMode:
 # under the limiter's 0.891 ceiling; +24 dB puts it over, and clipping.
 _OVER_THE_CEILING_DB = 24
 # One step of 16-bit quantisation. The limiter's pass-through gain is 1.0 to within
-# float rounding (1.9e-09 measured), which lands here or nowhere once quantised.
+# float rounding (7.5e-09 on ffmpeg 9.0.2, four thousand times under this step), so a
+# quantised difference lands here or nowhere.
 _ONE_LSB = 1
-# Far above _ONE_LSB and far below the ~800 the 5 ms shift actually measures, so the
-# control fails on that shift rather than on a build's rounding.
+# Far above _ONE_LSB and far below the ~3300 the 5 ms shift measures, so the control
+# fails on that shift rather than on a build's rounding.
 _A_REAL_CHANGE = 100
 # 0.891 of full scale, plus a decibel of slack for the encode either side of it.
 _CEILING_SAMPLE = int(0.891 * 32768)
@@ -599,7 +615,7 @@ class TestAMidSongReconnect:
 
         truncated = _packets(
             server.url,  # pyright: ignore[reportAttributeAccessIssue]
-            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            _BASE_RECONNECT,
         )
 
         assert len(truncated) < len(healthy) / 2 + 2
