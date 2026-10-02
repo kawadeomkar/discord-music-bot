@@ -672,6 +672,8 @@ class QueueEntryField:
     NP_DEDICATED: Final[str] = "np_dedicated"
     # The term an unresolved item still owes yt-dlp, written only while non-empty.
     YTSEARCH: Final[str] = "ytsearch"
+    # The recording an unresolved item names, written only while it has one.
+    ISRC: Final[str] = "isrc"
 
 
 # The wire discriminator, kept verbatim from the original serializer.
@@ -719,6 +721,9 @@ class SongQueueEntry:
     # The `ytsearch:` term an unresolved item resolves through, "" once resolved.
     # Written only when non-empty, so a resolved entry's bytes never move.
     search: str = ""
+    # The recording the walk named, which the resolve searches before the term.
+    # Written only while the item has one, so a resolved entry's bytes never move.
+    isrc: str | None = None
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
@@ -746,6 +751,7 @@ class SongQueueEntry:
             np_channel_id=card.channel_id if card is not None else 0,
             np_dedicated=card.dedicated if card is not None else False,
             search=item.search,
+            isrc=item.isrc,
         )
 
     @classmethod
@@ -765,10 +771,11 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
-            # A playing song is resolved, so the parked blob owes no term. One
-            # riding into guild:{id}:state would come back out of
-            # from_crashed_state unresolved and re-search at the recovered ts.
+            # A playing song is resolved, so the parked blob owes no term and no
+            # recording. A term riding into guild:{id}:state would come back out
+            # of from_crashed_state unresolved and re-search at the recovered ts.
             search="",
+            isrc=None,
         )
 
     @staticmethod
@@ -821,6 +828,8 @@ class SongQueueEntry:
         # the bytes it was written with, or its LREM misses and rebuilds.
         if self.search:
             fields[QueueEntryField.YTSEARCH] = self.search
+        if self.isrc is not None:
+            fields[QueueEntryField.ISRC] = self.isrc
         return orjson.dumps(fields)
 
 
@@ -854,7 +863,10 @@ def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
             start_paused=d.get(QueueEntryField.START_PAUSED, False),
             queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
             queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-            query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+            # Coalesced like the term below: a stored null would arrive as None
+            # behind the str annotation and raise in HistoryEntry.__post_init__'s
+            # slug clamp when the song ends.
+            query_source=d.get(QueueEntryField.QUERY_SOURCE) or "",
             played_at=d.get(QueueEntryField.PLAYED_AT, 0.0),
             np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
             np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),
@@ -863,6 +875,7 @@ def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
             # None, which reads as resolved with no URL to stream and raises
             # where item_label strips the term's prefix.
             search=d.get(QueueEntryField.YTSEARCH) or "",
+            isrc=d.get(QueueEntryField.ISRC),
         )
     except Exception as e:
         return None, str(e)
