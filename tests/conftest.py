@@ -30,7 +30,8 @@ from src.recovery import VoiceWatchdog
 from src.settings import GuildSettings
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from src.youtube import QueueObject, close_probe_session
+from src.queue_item import QueueObject
+from src.youtube import close_probe_session
 from tests.helpers import (
     add_settings_state,
     give_queue_object,
@@ -696,7 +697,8 @@ def ytdl_instance(
     """Factory that creates a YTDL instance with FFmpegOpusAudio.__init__ patched out."""
     from unittest.mock import patch
     import discord as d
-    from src.youtube import YTDL, QueueObject, YTDLVideoInfo
+    from src.queue_item import QueueObject
+    from src.youtube import YTDL, YTDLVideoInfo
 
     def _make(data: Optional[dict] = None, **carried: Any) -> Any:
         default_data = {

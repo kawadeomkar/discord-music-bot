@@ -28,7 +28,7 @@ from src.guild_queue import (
 )
 from src.guild_state import SongQueueEntry, parse_queue_entry
 from src.redis_client import GUILD_TTL, GuildRedisStore
-from src.youtube import QueueObject
+from src.queue_item import QueueObject
 from tests.helpers import (
     queue_object,
     seed_queue,
@@ -2252,8 +2252,8 @@ class TestRestoreEntries:
         assert await gq.restore_entries([song]) == 1
         (restored,) = gq.display_items()
         assert (
-            restored.analytics.queued_at,
-            restored.analytics.queue_position,
+            restored.queued_at,
+            restored.queue_position,
         ) == (1752529000.5, 3)
 
     async def test_an_unresolved_entry_rehydrates_as_an_unresolved_item(
@@ -2474,7 +2474,7 @@ class TestRestoreCrashed:
         )
         assert await gq.restore_crashed(entry, requester_fallback=mock_guild.me)
         item = queue_object(gq.display_items()[0])
-        assert (item.analytics.queued_at, item.analytics.queue_position) == (
+        assert (item.queued_at, item.queue_position) == (
             1752529000.5,
             6,
         )

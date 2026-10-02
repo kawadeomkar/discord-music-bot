@@ -36,11 +36,11 @@ from typing import Optional, Union
 
 import discord
 
-from src.guild_state import Analytics, SongQueueEntry
+from src.guild_state import SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import is_link, unwrap
 from src.util import get_logger
-from src.youtube import QueueObject
+from src.queue_item import NpCard, QueueObject
 
 log = get_logger(__name__)
 
@@ -828,9 +828,6 @@ class GuildQueue:
             )
         if requester is None:
             return None
-        analytics = Analytics(
-            queued_at=entry.queued_at, queue_position=entry.queue_position
-        )
         return QueueObject(
             webpage_url=entry.webpage_url,
             title=entry.title,
@@ -844,14 +841,22 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
-            analytics=analytics,
+            queued_at=entry.queued_at,
+            queue_position=entry.queue_position,
             query_source=entry.query_source,
             played_at=entry.played_at,
-            # No np_host_ref: a live Message cannot survive a restart, so a
-            # rehydrated tail can only delete a dedicated card by id.
-            np_message_id=entry.np_message_id,
-            np_channel_id=entry.np_channel_id,
-            np_dedicated=entry.np_dedicated,
+            # The card by its ids alone: a live Message cannot survive a
+            # restart, so a rehydrated tail can only delete a dedicated card.
+            # No message id means no card.
+            np_card=(
+                NpCard(
+                    message_id=entry.np_message_id,
+                    channel_id=entry.np_channel_id,
+                    dedicated=entry.np_dedicated,
+                )
+                if entry.np_message_id
+                else None
+            ),
             # Non-empty for an item that had not resolved: without it the item
             # comes back looking resolved, pointed at the page the walk named,
             # and the stream attempt fails on it.

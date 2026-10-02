@@ -1,4 +1,4 @@
-"""Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
+"""Tests for src/youtube.py — YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
 import copy
@@ -30,14 +30,12 @@ from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
-from src.guild_state import Analytics
+from src.queue_item import NpCard, NpHostRef, QueueObject
 from src import youtube
 from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
-    NpHostRef,
-    QueueObject,
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
@@ -79,11 +77,11 @@ from src.youtube import (
     YTDLVideoMetadata,
     YoutubePlaylist,
 )
-from tests.helpers import noop_ffmpeg_init, settle
+from tests.helpers import Ask, ask_of, noop_ffmpeg_init, settle
 
 # Ask-time analytics for direct yt_source/yt_playlist calls — the command paths
 # mint this at dispatch; both params are REQUIRED so a call site cannot forget.
-_ANALYTICS = Analytics(queued_at=1752529000.5, queue_position=0)
+_ANALYTICS: Ask = {"queued_at": 1752529000.5, "queue_position": 0}
 
 
 @pytest.fixture(autouse=True)
@@ -401,12 +399,15 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             persisted=False,
             played_at=12.5,
             is_replay=True,
-            analytics=Analytics(queued_at=99.5, queue_position=7),
-            np_message_id=555,
-            np_channel_id=666,
-            np_dedicated=True,
-            np_host_ref=NpHostRef(
-                message=MagicMock(spec=discord.Message), own_embeds=[], dedicated=True
+            queued_at=99.5,
+            queue_position=7,
+            np_card=NpCard(
+                message_id=555,
+                channel_id=666,
+                dedicated=True,
+                host_ref=NpHostRef(
+                    message=MagicMock(spec=discord.Message), own_embeds=[]
+                ),
             ),
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
@@ -474,136 +475,6 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         )
 
         assert (await self._played(qobj)).persisted is False
-
-
-class TestQueueObject:
-    def test_required_fields(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://www.youtube.com/watch?v=abc",
-            title="My Song",
-            requester=mock_author,
-        )
-        assert qobj.webpage_url == "https://www.youtube.com/watch?v=abc"
-        assert qobj.title == "My Song"
-        assert qobj.requester is mock_author
-
-    def test_ts_defaults_to_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Title", requester=mock_author
-        )
-        assert qobj.ts is None
-
-    def test_ts_can_be_set(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1",
-            title="Title",
-            requester=mock_author,
-            ts=90,
-        )
-        assert qobj.ts == 90
-
-    def test_optional_fields_default_to_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Title", requester=mock_author
-        )
-        assert qobj.user_input is None
-        assert qobj.duration is None
-        assert qobj.uploader is None
-
-    def test_optional_fields_can_be_set(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1",
-            title="Title",
-            requester=mock_author,
-            user_input="search term",
-            duration=180,
-            uploader="My Channel",
-        )
-        assert qobj.user_input == "search term"
-        assert qobj.duration == 180
-        assert qobj.uploader == "My Channel"
-
-    def test_is_dataclass(self, mock_author: MagicMock) -> None:
-        import dataclasses
-
-        assert dataclasses.is_dataclass(QueueObject)
-
-    def test_two_asks_for_one_song_are_two_items(self, mock_author: MagicMock) -> None:
-        """An item is one ask: a second ask for the same song, built the same way,
-        is a different item, as it is on the deque."""
-        q1 = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        q2 = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        assert q1 == q1
-        assert q1 != q2
-
-    def test_a_queued_item_is_frozen(self, mock_author: MagicMock) -> None:
-        item = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        with pytest.raises(FrozenInstanceError):
-            setattr(item, "title", "Retitled")
-
-    def test_an_item_hashes_by_identity(self, mock_author: MagicMock) -> None:
-        """Pins the class comment: a set tells two asks for one song apart the way
-        the queue does (holds, display_index, _listed), and a resume tail carrying
-        np_host_ref hashes too, its own_embeds list notwithstanding."""
-        first = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        second = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        assert first is not second
-        assert len({first, second}) == 2
-        tail = replace(
-            first,
-            np_host_ref=NpHostRef(message=MagicMock(), own_embeds=[], dedicated=True),
-        )
-        assert hash(tail) == hash(tail)
-
-    def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
-        # webpage_url and title are both str: positional, either order type-checks.
-        with pytest.raises(TypeError):
-            QueueObject("https://yt.com/watch?v=1", "Song", mock_author)  # pyright: ignore[reportCallIssue]
-
-    def test_every_field_takes_part_in_replace(self) -> None:
-        """replace() carries the whole ask across the three rebuilds and the
-        crash restore, and it silently skips a field declared init=False — such a
-        field would be reset to its default at every rebuild."""
-        import dataclasses
-
-        assert [f.name for f in dataclasses.fields(QueueObject) if not f.init] == []
-
-    def test_asdict_and_vars_stay_off_the_item(self, mock_author: MagicMock) -> None:
-        """vars() raises on a slotted item, but asdict() does not: it reads
-        fields() and deep-copies every value, including the Member on requester.
-        The wire tables spell the fields out instead. Pins the class comment: no
-        asdict() call anywhere in src/, qualified or not, and no vars() in a
-        module that names QueueObject (argparse's vars(args) elsewhere is fine)."""
-        import ast
-
-        item = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        assert not hasattr(item, "__dict__")
-        src = pathlib.Path(__file__).resolve().parents[1] / "src"
-        hits: list[str] = []
-        for path in sorted(src.rglob("*.py")):
-            text = path.read_text()
-            handles_item = "QueueObject" in text
-            for node in ast.walk(ast.parse(text)):
-                if not isinstance(node, ast.Call):
-                    continue
-                called = getattr(node.func, "id", None) or getattr(
-                    node.func, "attr", None
-                )
-                if called == "asdict" or (called == "vars" and handles_item):
-                    hits.append(f"{path.relative_to(src.parent)}:{node.lineno}")
-        assert hits == []
 
 
 class TestEnrichQueueObject:
@@ -801,7 +672,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test song",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -824,7 +695,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test song",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert result.thumbnail == "https://img.yt.com/test123.jpg"
@@ -837,7 +708,7 @@ class TestYTSource:
                     mock_ctx.author,
                     "ytsearch:nothing",
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
 
@@ -864,7 +735,7 @@ class TestYTSource:
                     mock_ctx.author,
                     url,
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
 
@@ -885,7 +756,7 @@ class TestYTSource:
                     mock_ctx.author,
                     "ytsearch:test",
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
         assert caught.value.unsupported is False
@@ -915,7 +786,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -945,7 +816,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -965,7 +836,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "my search query",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert result.user_input == "my search query"
@@ -990,7 +861,7 @@ class TestYTSource:
             "cached search",
             redis=fake_redis,
             query_source="youtube.com",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
         assert result.user_input == "cached search"
@@ -1016,7 +887,7 @@ class TestYTSource:
             "cached search",
             redis=fake_redis,
             query_source="youtube.com",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
@@ -1037,7 +908,7 @@ class TestYTSource:
                 "some search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1046,7 +917,7 @@ class TestYTSource:
             "some search",
             redis=fake_redis,
             query_source="youtube.com",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/fresh.jpg"
@@ -1063,7 +934,7 @@ class TestYTSource:
                 "https://yt.com/watch?v=ts_test",
                 ts=45,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1082,7 +953,7 @@ class TestYTSource:
                 "https://yt.com/v=dl",
                 download=True,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         # download rides on the request object, not a positional bool
@@ -1118,12 +989,13 @@ class TestYTPlaylistAnalytics:
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=1752529000.5, queue_position=2),
+                queued_at=1752529000.5,
+                queue_position=2,
                 user_input="https://yt.com/playlist?list=PL1",
             )
         tracks = playlist.tracks
-        assert [t.analytics.queue_position for t in tracks] == [2, 3, 4]
-        assert all(t.analytics.queued_at == 1752529000.5 for t in tracks)
+        assert [t.queue_position for t in tracks] == [2, 3, 4]
+        assert all(t.queued_at == 1752529000.5 for t in tracks)
         assert all(t.query_source == "youtube.com" for t in tracks)
 
     async def test_skipped_entries_leave_no_gap_in_the_positions(
@@ -1141,13 +1013,13 @@ class TestYTPlaylistAnalytics:
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input="https://yt.com/playlist?list=PL1",
             )
         tracks = playlist.tracks
         assert [t.title for t in tracks] == ["Ta", "Tb", "Tc"]
         assert playlist.unavailable == 2
-        assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
+        assert [t.queue_position for t in tracks] == [0, 1, 2]
 
 
 class TestExtractSingleflight:
@@ -1488,7 +1360,7 @@ class TestSearchEntrySelection:
                 mock_ctx.author,
                 "some song",
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input="some song",
             )
 
@@ -1545,7 +1417,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "https://yt.com/watch?v=direct",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         req = mock_extract.call_args[0][0]
@@ -1571,7 +1443,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "some song",
                 query_source="ytsearch",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1590,7 +1462,7 @@ class TestYTSourceUnifiedExtraction:
                 "unified search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1626,7 +1498,7 @@ class TestYTSourceUnifiedExtraction:
                     "ytsearch:Fantasy Snow Strippers",
                     redis=fake_redis,
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                     flat=flat,
                 )
@@ -1658,7 +1530,7 @@ class TestYTSourceUnifiedExtraction:
                     "odd",
                     redis=fake_redis,
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
         assert await fake_redis.keys("ytdl:source:*") == []
@@ -1675,7 +1547,7 @@ class TestYTSourceUnifiedExtraction:
                 "prefetch noop search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
@@ -1696,7 +1568,7 @@ class TestYTSourceUnifiedExtraction:
                 "dead probe search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1723,7 +1595,7 @@ class TestYTSourceUnifiedExtraction:
                 "https://soundcloud.com/artist/track",
                 redis=fake_redis,
                 query_source="soundcloud.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert isinstance(result, QueueObject)
@@ -1744,7 +1616,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "no redis search",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         playable_urls.assert_not_awaited()
@@ -1760,7 +1632,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "metadata search",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert result.duration == 180
@@ -1973,7 +1845,8 @@ class TestYTStream:
             webpage_url="https://www.youtube.com/watch?v=test",
             title="Test Song",
             requester=mock_ctx.author,
-            analytics=Analytics(queued_at=1752529000.5, queue_position=4),
+            queued_at=1752529000.5,
+            queue_position=4,
         )
 
         with (
@@ -1982,8 +1855,8 @@ class TestYTStream:
         ):
             result = await YTDL.yt_stream(qobj, channel)
 
-        assert result.analytics.queued_at == 1752529000.5
-        assert result.analytics.queue_position == 4
+        assert result.queued_at == 1752529000.5
+        assert result.queue_position == 4
 
 
 class TestStreamUrlTtl:
@@ -3959,7 +3832,7 @@ class TestFlatEntryMapper:
             self._entry(**overrides),
             mock_ctx.author,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input="take on me",
         )
 
@@ -3972,7 +3845,7 @@ class TestFlatEntryMapper:
         assert qobj.thumbnail == "https://i.ytimg.com/vi/x/hq720.jpg"
         assert qobj.user_input == "take on me"
         assert qobj.query_source == "search"
-        assert qobj.analytics is _ANALYTICS
+        assert ask_of(qobj) == _ANALYTICS
 
     def test_webpage_url_is_derived_from_the_id_not_read_from_url(
         self, mock_ctx: MagicMock
@@ -3992,7 +3865,7 @@ class TestFlatEntryMapper:
             self._entry(),
             mock_ctx.author,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
             ts=42,
         )
@@ -4058,7 +3931,7 @@ class TestFlatYtSource:
                 "ytsearch:flat song",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4108,7 +3981,7 @@ class TestFlatYtSource:
                 "ytsearch:warm",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4140,7 +4013,7 @@ class TestFlatYtSource:
                 "ytsearch:lofi radio",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4173,7 +4046,7 @@ class TestFlatYtSource:
             return _fake_ytdl_data(webpage_url="https://yt.com/v=shared")
 
         kwargs: dict[str, Any] = dict(
-            query_source="search", analytics=_ANALYTICS, user_input=None
+            query_source="search", **_ANALYTICS, user_input=None
         )
         with patch("src.youtube._run_extract", new=_slow):
             tasks = [
@@ -4216,7 +4089,7 @@ class TestFlatYtSource:
                     "https://nope.example/x",
                     redis=fake_redis,
                     query_source="nope.example",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                     flat=True,
                 )
@@ -4243,7 +4116,7 @@ class TestFlatYtSource:
                 "ytsearch:playable",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4286,7 +4159,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 "slow probe search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -4317,7 +4190,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 "joined search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -4385,7 +4258,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 "cancelled search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -4554,7 +4427,7 @@ class TestSourceCacheRevalidation:
             query,
             redis=redis,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
 
@@ -4718,7 +4591,7 @@ class TestYtPlaylistEntries:
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input="https://www.youtube.com/playlist?list=PL1",
             )
         return playlist.tracks
@@ -4835,7 +4708,7 @@ class TestMixRepeats:
                 url,
                 ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=url,
                 redis=redis,
             )
@@ -4849,7 +4722,7 @@ class TestMixRepeats:
         queued = await self._fetch(mock_ctx, list_id, ("a", "b", "c", "a", "b", "d"))
         assert self._urls(queued) == ["a", "b", "c", "d"]
         # Positions come from the kept tracks, so a dropped repeat leaves no gap.
-        assert [q.analytics.queue_position for q in queued] == [0, 1, 2, 3]
+        assert [q.queue_position for q in queued] == [0, 1, 2, 3]
 
     @pytest.mark.parametrize("list_id", ["PLmine", "RDCLAK5uy_kmPRjHDECIcuVwnKsx2Ng"])
     async def test_a_playlist_keeps_a_video_its_owner_added_twice(
@@ -4872,7 +4745,7 @@ class TestMixRepeats:
                 url,
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=url,
                 redis=fake_redis,
             )
@@ -5022,13 +4895,13 @@ class TestPlaylistCache:
         redis: aioredis.Redis,
         url: str,
         *,
-        analytics: Analytics = _ANALYTICS,
+        ask: Ask = _ANALYTICS,
     ) -> YoutubePlaylist:
         return await YTDL.yt_playlist(
             url,
             ctx.author,
             query_source="youtube.com",
-            analytics=analytics,
+            **ask,
             user_input=url,
             redis=redis,
         )
@@ -5039,9 +4912,9 @@ class TestPlaylistCache:
         redis: aioredis.Redis,
         url: str,
         *,
-        analytics: Analytics = _ANALYTICS,
+        ask: Ask = _ANALYTICS,
     ) -> list[QueueObject]:
-        return (await self._resolve(ctx, redis, url, analytics=analytics)).tracks
+        return (await self._resolve(ctx, redis, url, ask=ask)).tracks
 
     async def test_a_second_paste_inside_the_window_is_one_redis_get(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -5136,7 +5009,7 @@ class TestPlaylistCache:
         assert len(hit.tracks) == 2
         assert miss.unavailable == hit.unavailable == 3
         # Positions count kept tracks, so the drops leave no gaps.
-        assert [q.analytics.queue_position for q in hit.tracks] == [0, 1]
+        assert [q.queue_position for q in hit.tracks] == [0, 1]
 
     async def test_a_hit_returns_the_title_the_miss_extracted(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -5221,13 +5094,14 @@ class TestPlaylistCache:
                 url,
                 mock_author,
                 query_source="youtube.com",
-                analytics=replace(_ANALYTICS, queue_position=7),
+                queued_at=_ANALYTICS["queued_at"],
+                queue_position=7,
                 user_input="the second paste",
                 redis=fake_redis,
             )
 
         assert [q.requester for q in second.tracks] == [mock_author, mock_author]
-        assert [q.analytics.queue_position for q in second.tracks] == [7, 8]
+        assert [q.queue_position for q in second.tracks] == [7, 8]
         assert {q.user_input for q in second.tracks} == {"the second paste"}
 
 
@@ -5943,7 +5817,7 @@ class TestTheFlatMapperDeclinesWhatItCannotDescribe:
             cast(Any, entry),
             author,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
 
@@ -6266,7 +6140,8 @@ class TestYtPlaylistProgress:
                 "https://www.youtube.com/playlist?list=PLkeymatch",
                 mock_author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=0.0, queue_position=0),
+                queued_at=0.0,
+                queue_position=0,
                 user_input="https://www.youtube.com/playlist?list=PLkeymatch",
                 on_progress=lambda done, total: seen.append((done, total)),
             )
@@ -6430,7 +6305,8 @@ class TestYtPlaylistProgress:
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=0.0, queue_position=0),
+                queued_at=0.0,
+                queue_position=0,
                 user_input="https://www.youtube.com/playlist?list=PL1",
             )
 
@@ -6453,7 +6329,8 @@ class TestYtPlaylistProgress:
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=0.0, queue_position=0),
+                queued_at=0.0,
+                queue_position=0,
                 user_input="https://www.youtube.com/playlist?list=PL1",
                 on_progress=lambda d, t: seen.append((d, t)),
             )

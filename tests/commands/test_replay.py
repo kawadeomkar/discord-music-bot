@@ -15,7 +15,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src.commands._common import NOTHING_PLAYING
-from src.guild_state import Analytics
+from src.queue_item import NpCard, NpHostRef, QueueObject
 from src.commands import replay as replay_cmd
 from src.commands.replay import ReplayOutcome, ReplayResult
 from src.guild_queue import GuildQueue
@@ -23,8 +23,9 @@ from src.guild_state import SongQueueEntry, parse_queue_entry
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.util import cancel_task
-from src.youtube import YTDL, NpHostRef, QueueObject
+from src.youtube import YTDL
 from tests.helpers import (
+    ask_of,
     REPLAY_ASK,
     command_callback,
     give_queue_object,
@@ -85,9 +86,8 @@ class TestReplayCommand:
         # The ask is this message by this caller, and it plays immediately. Both
         # columns must name the same person: split, the archive row claims the
         # original requester asked for the song at the moment someone else typed.
-        assert call.kwargs["analytics"] == Analytics(
-            queued_at=mock_ctx.message.created_at.timestamp(), queue_position=0
-        )
+        assert call.kwargs["queued_at"] == mock_ctx.message.created_at.timestamp()
+        assert call.kwargs["queue_position"] == 0
         assert call.kwargs["requester"] is mock_ctx.author
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "Original Song" in embed.description
@@ -591,7 +591,7 @@ async def _claim_the_head(mp: MusicPlayer) -> Optional[MagicMock]:
 
 
 # Every field replay_current's replace() sets back to its default: the offset,
-# the interjection flags, the start stamp, the retry budget and the card ids.
+# the interjection flags, the start stamp, the retry budget and the card.
 _REPLAY_RESETS = frozenset(
     {
         "ts",
@@ -602,10 +602,7 @@ _REPLAY_RESETS = frozenset(
         "played_at",
         "stream_attempts",
         "failed_format_ids",
-        "np_message_id",
-        "np_channel_id",
-        "np_dedicated",
-        "np_host_ref",
+        "np_card",
     }
 )
 
@@ -631,7 +628,7 @@ class TestReplayCurrent:
         music_player.current_song = None
         assert (
             await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
             is None
         )
@@ -651,7 +648,7 @@ class TestReplayCurrent:
 
         assert (
             await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
             is None
         )
@@ -675,7 +672,7 @@ class TestReplayCurrent:
         await music_player.queue.put([queued])
 
         outcome = await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         items = music_player.queue.display_items()
@@ -729,7 +726,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         replay = music_player.queue.display_items()[0]
@@ -762,10 +759,12 @@ class TestReplayCurrent:
             played_at=1752530000.0,
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
-            np_message_id=777,
-            np_channel_id=888,
-            np_dedicated=True,
-            np_host_ref=NpHostRef(message=MagicMock(), own_embeds=[], dedicated=True),
+            np_card=NpCard(
+                message_id=777,
+                channel_id=888,
+                dedicated=True,
+                host_ref=NpHostRef(message=MagicMock(), own_embeds=[]),
+            ),
         )
         defaults = {f.name: f.default for f in dataclasses.fields(QueueObject)}
         assert all(
@@ -775,7 +774,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         replay = music_player.queue.display_items()[0]
@@ -799,7 +798,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         replay = music_player.queue.display_items()[0]
@@ -822,7 +821,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         outcome = await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert outcome is not None
@@ -845,7 +844,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         replay = music_player.queue.display_items()[0]
@@ -866,17 +865,18 @@ class TestReplayCurrent:
         claims someone asked for a song at a moment they did not, which
         -leaderboard sums into their listening time."""
         live_song.requester = mock_author
-        live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=5)
+        live_song.queued_at = 1752530000.5
+        live_song.queue_position = 5
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         replay = music_player.queue.display_items()[0]
         assert isinstance(replay, QueueObject)
         assert replay.requester is replayer
-        assert replay.analytics == REPLAY_ASK
+        assert ask_of(replay) == REPLAY_ASK
 
     async def test_a_paused_song_comes_back_playing(
         self,
@@ -894,7 +894,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         outcome = await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         replay = music_player.queue.display_items()[0]
@@ -919,7 +919,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert music_player.store is not None
@@ -949,7 +949,7 @@ class TestReplayCurrent:
 
         assert (
             await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
             is None
         )
@@ -972,7 +972,7 @@ class TestReplayCurrent:
 
         assert (
             await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
             is None
         )
@@ -1000,7 +1000,7 @@ class TestReplayCurrent:
             MusicPlayer, "_prefetch_next_song", new=resolve_while_skipped
         ):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is not None
@@ -1030,7 +1030,7 @@ class TestReplayCurrent:
             MusicPlayer, "_prefetch_next_song", new=resolve_while_torn_down
         ):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is not None
@@ -1066,7 +1066,7 @@ class TestReplayCurrent:
         _stub_replay_resolve.side_effect = resolve_forever
         replaying = asyncio.create_task(
             replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
         )
         async with asyncio.timeout(5):
@@ -1108,7 +1108,7 @@ class TestReplayCurrent:
 
         assert (
             await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
             is None
         )
@@ -1136,7 +1136,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
         with patch.object(MusicPlayer, "_prefetch_next_song", new=cancel_self):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is not None
@@ -1159,7 +1159,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert music_player._skip_history_for is None
@@ -1178,7 +1178,7 @@ class TestReplayCurrent:
         music_player.current_song = live_song
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert music_player._retire_np_for is live_song
@@ -1211,7 +1211,7 @@ class TestReplayCurrent:
         _stub_replay_resolve.side_effect = resolve_slowly
 
         outcome = await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert order == ["resolve", "stop"]
@@ -1242,7 +1242,7 @@ class TestReplayCurrent:
 
         with patch("src.commands.replay._REPLAY_RESOLVE_TIMEOUT", 0.05):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is not None
@@ -1275,7 +1275,7 @@ class TestReplayCurrent:
         _stub_replay_resolve.side_effect = fail
 
         outcome = await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert outcome is not None
@@ -1350,7 +1350,7 @@ class TestReplayCurrent:
 
         replaying = asyncio.create_task(
             replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
         )
         async with asyncio.timeout(5):
@@ -1433,7 +1433,7 @@ class TestReplayCurrent:
             side_effect=lambda: order.append("mark"),
         ):
             await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert order == ["mark", "stop"]
@@ -1452,7 +1452,7 @@ class TestReplayCurrent:
         music_player._prefetch_task = blocker
 
         await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert blocker.cancelled()
@@ -1479,7 +1479,7 @@ class TestReplayCurrent:
         try:
             assert (
                 await replay_cmd.replay_current(
-                    music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                    music_player, mock_vc, requester=replayer, **REPLAY_ASK
                 )
                 is None
             )
@@ -1505,7 +1505,7 @@ class TestReplayCurrent:
 
         with patch.object(MusicPlayer, "_prefetch_next_song", new=resolve_and_advance):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is not None
@@ -1533,7 +1533,7 @@ class TestReplayCurrent:
             MusicPlayer, "_neutralize_prefetch", new=neutralize_and_advance
         ):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is None
@@ -1555,7 +1555,7 @@ class TestReplayCurrent:
         music_player.play_next.set()
 
         outcome = await replay_cmd.replay_current(
-            music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            music_player, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert outcome is None
@@ -1578,7 +1578,7 @@ class TestReplayCurrent:
 
         with patch.object(GuildQueue, "put_front", side_effect=advance_mid_await):
             outcome = await replay_cmd.replay_current(
-                music_player, mock_vc, requester=replayer, analytics=REPLAY_ASK
+                music_player, mock_vc, requester=replayer, **REPLAY_ASK
             )
 
         assert outcome is not None
@@ -1608,7 +1608,7 @@ class TestReplayCurrent:
         mp.current_song = live_song
 
         outcome = await replay_cmd.replay_current(
-            mp, mock_vc, requester=replayer, analytics=REPLAY_ASK
+            mp, mock_vc, requester=replayer, **REPLAY_ASK
         )
 
         assert outcome is not None

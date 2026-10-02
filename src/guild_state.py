@@ -30,34 +30,10 @@ from typing import (
 import orjson
 
 if TYPE_CHECKING:
-    from src.youtube import QueueObject, YTDL
+    from src.queue_item import QueueObject
+    from src.youtube import YTDL
 
 log = logging.getLogger(__name__)
-
-
-# ── Pure-analytics values, grouped ───────────────────────────────────────────
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Analytics:
-    """Values carried on live queue objects (QueueObject, YTDL) for
-    storage alone — read only to serialize or to carry onto the next object; a
-    field anything branches on or renders belongs elsewhere. In-memory shape
-    only: wire entries and play_history columns stay FLAT. Frozen, because carry
-    sites alias one instance across a resume tail and its source."""
-
-    # Unix epoch when the user ASKED: the command message's snowflake time
-    # (Discord's clock, so played_at - queued_at can go slightly negative).
-    # 0.0 = unknown (pre-feature wire entries).
-    queued_at: float
-    # Songs ahead at ask time, counting the one playing (0 = played immediately).
-    # Read once at dispatch, so it is approximate against the insert.
-    queue_position: int
-
-
-# What a pre-feature wire entry rehydrates as, and the default on live objects
-# whose construction site cannot know the values yet.
-ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
 
 # ── guild:{id}:state hash — field name constants ─────────────────────────────
@@ -682,8 +658,8 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Ask-time analytics. FLAT on the wire although they group as Analytics in
-    # memory. Absent on pre-feature entries → 0 defaults.
+    # Ask-time analytics, named as the item's fields are. Absent on pre-feature
+    # entries → 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
     # Parse-time classification (see sources.py).
@@ -708,7 +684,7 @@ _ENTRY_TYPE_SONG: Final[str] = "qobj"
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongQueueEntry:
     """A queued item at rest ("qobj" on the wire), the pure-data twin of
-    src.youtube.QueueObject — resolved, or still a search when `search` is
+    src.queue_item.QueueObject — resolved, or still a search when `search` is
     non-empty. requester is an ID (a live discord.Member cannot exist at rest;
     GuildQueue rehydrates it), None only for the crashed-head entry. Snowflakes
     stay exact end-to-end: orjson native ints, never floats."""
@@ -726,7 +702,7 @@ class SongQueueEntry:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
-    # Ask-time analytics (0 = unknown / played immediately), see Analytics.
+    # Ask-time analytics (0 = unknown / played immediately), see QueueObject.
     queued_at: float = 0.0
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
@@ -735,8 +711,8 @@ class SongQueueEntry:
     # interrupted by an interjection or recovered from a crash records the start
     # of the play, not of its last fragment.
     played_at: float = 0.0
-    # The interrupted fragment's frozen NP card. The live np_host_ref cannot be
-    # serialized, so a rehydrated tail can only DELETE a dedicated card.
+    # The interrupted fragment's frozen NP card, flat. The live host ref cannot
+    # be serialized, so a rehydrated tail can only DELETE a dedicated card.
     np_message_id: int = 0
     np_channel_id: int = 0
     np_dedicated: bool = False
@@ -746,7 +722,9 @@ class SongQueueEntry:
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
-        """Snapshot a live queue item for persistence."""
+        """Snapshot a live queue item for persistence. The card flattens to its
+        three wire fields; no card is 0/0/False."""
+        card = item.np_card
         return cls(
             webpage_url=item.webpage_url,
             title=item.title,
@@ -760,13 +738,13 @@ class SongQueueEntry:
             interjected=item.interjected,
             is_resume=item.is_resume,
             start_paused=item.start_paused,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
             query_source=item.query_source,
             played_at=item.played_at,
-            np_message_id=item.np_message_id,
-            np_channel_id=item.np_channel_id,
-            np_dedicated=item.np_dedicated,
+            np_message_id=card.message_id if card is not None else 0,
+            np_channel_id=card.channel_id if card is not None else 0,
+            np_dedicated=card.dedicated if card is not None else False,
             search=item.search,
         )
 
@@ -1072,8 +1050,9 @@ class HistoryEntry:
         counterpart to from_song, for an interjection-interrupted entry destroyed
         before its tail could play. played_secs comes from `ts`, the ABSOLUTE
         resume offset, capped at duration. The host ids come off the tail's
-        np_* fields: the cleanup that deletes that card fires only when a tail
-        STARTS, and a flushed tail never does."""
+        card: the cleanup that deletes that card fires only when a tail STARTS,
+        and a flushed tail never does."""
+        card = item.np_card
         played = item.ts or 0
         duration = item.duration or 0
         if duration:
@@ -1089,10 +1068,10 @@ class HistoryEntry:
             thumbnail=item.thumbnail or "",
             uploader=item.uploader or "",
             played_at=item.played_at,
-            message_id=item.np_message_id,
-            channel_id=item.np_channel_id,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
+            message_id=card.message_id if card is not None else 0,
+            channel_id=card.channel_id if card is not None else 0,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
             query_source=item.query_source,
         )
 

@@ -14,7 +14,7 @@ import discord
 import pytest
 
 from src import play_pipeline
-from src.guild_state import Analytics
+from src.queue_item import QueueObject
 from src.config import SpotifyStatus
 from src.musicbot import MusicBot, SpotifyDisabledError
 from src.musicplayer import MusicPlayer
@@ -50,8 +50,9 @@ from src.sources import (
     timestamp_warning,
 )
 from src.spotify import SpotifyPlaylist, SpotifyTrack
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 from tests.helpers import (
+    Ask,
     admit,
     command_callback,
     connected_vc,
@@ -66,7 +67,7 @@ from tests.helpers import (
 )
 
 
-_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=0)
+_ANALYTICS: Ask = {"queued_at": 1752530000.5, "queue_position": 0}
 
 
 _ORIGIN = "https://yt.com/v=origin"
@@ -119,7 +120,7 @@ class TestQueueSource:
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             mode=ResolveMode.FLAT_OK,
             cog=music_bot,
@@ -154,7 +155,7 @@ class TestQueueSource:
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             mode=ResolveMode.FLAT_OK,
             cog=music_bot,
@@ -193,7 +194,7 @@ class TestQueueSource:
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=link,
             mode=ResolveMode.FLAT_OK,
             cog=music_bot,
@@ -218,7 +219,7 @@ class TestQueueSource:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -240,7 +241,7 @@ class TestQueueSource:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -312,7 +313,7 @@ class TestTheStartOffsetReachesTheSong:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 start_offset=92,
@@ -330,7 +331,7 @@ class TestTheStartOffsetReachesTheSong:
             await play_pipeline.queue_source(
                 mock_ctx,
                 SoundcloudSource(url="https://soundcloud.com/a/b"),
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 start_offset=92,
@@ -360,7 +361,7 @@ class TestTheStartOffsetReachesTheSong:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 start_offset=92,
@@ -394,7 +395,7 @@ class TestTheStartOffsetReachesTheSong:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 start_offset=92,
@@ -584,7 +585,7 @@ class TestEnqueuePlaylist:
             resolved,
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             placement=placement,
             cog=music_bot,
@@ -895,7 +896,7 @@ class TestEnqueuePlaylist:
             ResolvedPlaylist(tracks=qobjs, link=source.url),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -937,7 +938,7 @@ class TestEnqueuePlaylist:
             ResolvedPlaylist(tracks=qobjs, skipped=3),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -969,7 +970,7 @@ class TestEnqueuePlaylist:
             ResolvedPlaylist(tracks=qobjs),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1000,7 +1001,7 @@ class TestEnqueuePlaylist:
             ResolvedPlaylist(tracks=qobjs),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1032,7 +1033,7 @@ class TestEnqueuePlaylist:
             ResolvedPlaylist(tracks=qobjs),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1056,7 +1057,7 @@ class TestEnqueuePlaylist:
             _spotify_playlist(titles),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1080,7 +1081,7 @@ class TestEnqueuePlaylist:
             _spotify_playlist(["Song A", "Song B"], mock_ctx.author),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1104,7 +1105,7 @@ class TestEnqueuePlaylist:
             _spotify_playlist([f"Song {n}" for n in range(300)]),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1123,7 +1124,7 @@ class TestEnqueuePlaylist:
             _spotify_playlist(["Song A"]),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1149,7 +1150,7 @@ class TestEnqueuePlaylist:
             _spotify_playlist([f"Song {n}" for n in range(300)]),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1209,7 +1210,7 @@ class TestEnqueuePlaylist:
                 _spotify_playlist([f"Song {n}" for n in range(500)], title="Biteki"),
                 mp,
                 admit(music_bot, mock_ctx, mp),
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 cog=music_bot,
             )
@@ -1229,7 +1230,7 @@ class TestEnqueuePlaylist:
             _spotify_playlist(titles),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -1275,7 +1276,7 @@ class TestEnqueuePlaylist:
             ResolvedPlaylist(tracks=qobjs),
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             placement=Placement.NEXT,
             cog=music_bot,
@@ -1343,7 +1344,7 @@ class TestEnqueuePlaylist:
                 ResolvedPlaylist(tracks=tracks),
                 mp,
                 admit(music_bot, mock_ctx, mp),
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=link,
                 placement=placement,
                 cog=music_bot,
@@ -1820,7 +1821,7 @@ class TestQuerySourceClassification:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -1839,7 +1840,7 @@ class TestQuerySourceClassification:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -1859,7 +1860,7 @@ class TestQuerySourceClassification:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -1886,7 +1887,7 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -1916,7 +1917,7 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -1939,7 +1940,8 @@ class TestQuerySourceClassification:
                 webpage_url=f"https://yt.com/watch?v=v{i}",
                 title=f"T{i}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
+                queued_at=1752530000.5,
+                queue_position=i,
             )
             for i in range(6)
         ]
@@ -1947,17 +1949,17 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
             )
         assert isinstance(result, ResolvedPlaylist)
-        assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
+        assert [t.queue_position for t in result.tracks] == [0, 1, 2]
         # The interjection keeps the whole tail now; -play enqueues it too.
         assert len(result.tracks) == 3
         # The ask time is untouched by the slice — one instant for the command.
-        assert all(t.analytics.queued_at == 1752530000.5 for t in result.tracks)
+        assert all(t.queued_at == 1752530000.5 for t in result.tracks)
 
     async def test_playlist_index_rebase_preserves_a_nonzero_base(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1971,7 +1973,8 @@ class TestQuerySourceClassification:
                 webpage_url=f"https://yt.com/watch?v=v{i}",
                 title=f"T{i}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1752530000.5, queue_position=2 + i),
+                queued_at=1752530000.5,
+                queue_position=2 + i,
             )
             for i in range(5)
         ]
@@ -1979,13 +1982,13 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
             )
         assert isinstance(result, ResolvedPlaylist)
-        assert [t.analytics.queue_position for t in result.tracks] == [2, 3, 4]
+        assert [t.queue_position for t in result.tracks] == [2, 3, 4]
 
     async def test_playlist_index_1_queues_everything(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1999,7 +2002,7 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2023,7 +2026,7 @@ class TestQuerySourceClassification:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2044,7 +2047,7 @@ class TestQuerySourceClassification:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2062,7 +2065,7 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2084,7 +2087,7 @@ class TestQuerySourceClassification:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2230,7 +2233,8 @@ class TestQuerySourceClassification:
                 webpage_url=f"https://yt.com/watch?v=v{i}",
                 title=f"T{i}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
+                queued_at=1752530000.5,
+                queue_position=i,
             )
             for i in range(6)
         ]
@@ -2241,12 +2245,12 @@ class TestQuerySourceClassification:
 
         head, follow_on = kept
         assert head.webpage_url == tracks[3].webpage_url
-        assert head.analytics.queue_position == 0
+        assert head.queue_position == 0
         # Rebased kept-relative, so the tail reads 1, 2 rather than 4, 5; the
         # re-mint returns new items, so the walk's own are untouched.
         assert [t.webpage_url for t in follow_on] == [t.webpage_url for t in tracks[4:]]
-        assert [t.analytics.queue_position for t in follow_on] == [1, 2]
-        assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
+        assert [t.queue_position for t in follow_on] == [1, 2]
+        assert [t.queue_position for t in tracks[4:]] == [4, 5]
 
     async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2264,9 +2268,9 @@ class TestQuerySourceClassification:
                 mock_ctx, source, origin=_ORIGIN, cog=music_bot
             )
         assert spy.await_args is not None
-        analytics = spy.await_args.kwargs["analytics"]
-        assert analytics.queue_position == 0
-        assert analytics.queued_at == mock_ctx.message.created_at.timestamp()
+        ask = spy.await_args.kwargs
+        assert ask["queue_position"] == 0
+        assert ask["queued_at"] == mock_ctx.message.created_at.timestamp()
 
 
 class TestSpotifyDisabled:
@@ -2309,7 +2313,7 @@ class TestSpotifyDisabled:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2325,7 +2329,7 @@ class TestSpotifyDisabled:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2342,7 +2346,7 @@ class TestSpotifyDisabled:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2366,7 +2370,7 @@ class TestSpotifyDisabled:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2399,7 +2403,7 @@ class TestSpotifyDisabled:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2434,7 +2438,7 @@ class TestSpotifyDisabled:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2445,7 +2449,7 @@ class TestSpotifyDisabled:
             # "" because this YTSource is built directly rather than by
             # parse_input, which is what classifies. See TestQuerySourceClassification.
             query_source="",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=_ORIGIN,
             redis=music_bot.redis,
             on_progress=None,
@@ -2477,7 +2481,7 @@ class TestSpotifyDisabled:
             result = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2503,7 +2507,7 @@ class TestSpotifyDisabled:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2532,7 +2536,7 @@ class TestSpotifyDisabled:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -2541,7 +2545,7 @@ class TestSpotifyDisabled:
             full_url,
             mock_ctx.author,
             query_source="",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=_ORIGIN,
             redis=music_bot.redis,
             on_progress=None,
@@ -2619,7 +2623,8 @@ class TestInterjectionCollectionHandling:
                 webpage_url=f"https://yt.com/watch?v=v{i}",
                 title=f"T{i}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
+                queued_at=1752530000.5,
+                queue_position=i,
             )
             for i in range(6)
         ]
@@ -2629,8 +2634,8 @@ class TestInterjectionCollectionHandling:
             )
 
         assert head.webpage_url == tracks[3].webpage_url
-        assert head.analytics.queue_position == 0
-        assert [queue_object(item).analytics.queue_position for item in rest] == [1, 2]
+        assert head.queue_position == 0
+        assert [queue_object(item).queue_position for item in rest] == [1, 2]
 
 
 class TestPlaylistPositionsAreMintedAtTheInsert:
@@ -2655,7 +2660,8 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
                 webpage_url=f"https://yt.com/v={n}",
                 title=f"T{n}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1.0, queue_position=n),
+                queued_at=1.0,
+                queue_position=n,
             )
             for n in range(3)
         ]
@@ -2668,7 +2674,7 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
             )
 
         queued = mp.queue_put.await_args.args[0]
-        assert [q.analytics.queue_position for q in queued] == [
+        assert [q.queue_position for q in queued] == [
             depth,
             depth + 1,
             depth + 2,
@@ -2693,7 +2699,8 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
                 webpage_url=f"https://yt.com/v={n}",
                 title=f"T{n}",
                 requester=mock_ctx.author,
-                analytics=Analytics(queued_at=1.0, queue_position=n),
+                queued_at=1.0,
+                queue_position=n,
             )
             for n in range(3)
         ]
@@ -2706,7 +2713,7 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
             )
 
         queued = mp.queue_put.await_args.args[0]
-        assert [q.analytics.queue_position for q in queued] == [9, 10, 11]
+        assert [q.queue_position for q in queued] == [9, 10, 11]
 
     async def test_the_rebase_is_skipped_when_the_head_has_not_moved(self) -> None:
         """The O(N) pass is one dataclass copy per track — milliseconds of
@@ -2718,7 +2725,7 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
                 webpage_url=f"https://yt.com/v={n}",
                 title=f"T{n}",
                 requester=MagicMock(),
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
             )
             for n in range(3)
         ]
@@ -2728,7 +2735,7 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
 
         moved = await _rebase_positions(tracks, 7, 9)
         assert moved is not tracks
-        assert [q.analytics.queue_position for q in moved] == [9, 10, 11]
+        assert [q.queue_position for q in moved] == [9, 10, 11]
 
     async def test_the_rebase_yields_a_chunk_at_a_time(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2742,7 +2749,7 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
                 webpage_url=f"https://yt.com/v={n}",
                 title=f"T{n}",
                 requester=MagicMock(),
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
             )
             for n in range(5)
         ]
@@ -2762,7 +2769,7 @@ class TestPlaylistPositionsAreMintedAtTheInsert:
         finally:
             ticker.cancel()
 
-        assert [q.analytics.queue_position for q in moved] == [4, 5, 6, 7, 8]
+        assert [q.queue_position for q in moved] == [4, 5, 6, 7, 8]
         assert ticks - started >= 2
 
 
@@ -2794,7 +2801,7 @@ class TestResolveModeThreading:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=mode,
                 cog=music_bot,
@@ -3059,7 +3066,7 @@ class TestSearchesForAPlaylist:
     when the same shape was a YTSource: the ask is set here because this is the
     last point that knows where these tracks came from."""
 
-    _ASK = Analytics(queued_at=1752530000.5, queue_position=3)
+    _ASK: Ask = {"queued_at": 1752530000.5, "queue_position": 3}
     _ORIGIN_LINK = "https://open.spotify.com/album/abc123"
 
     async def _built(
@@ -3071,7 +3078,7 @@ class TestSearchesForAPlaylist:
         return await play_pipeline._searches_for(
             titles,
             requester=requester if requester is not None else stub_requester(),
-            analytics=self._ASK,
+            **self._ASK,
             origin=self._ORIGIN_LINK,
             rows=rows,
         )
@@ -3155,8 +3162,8 @@ class TestSearchesForAPlaylist:
         # positions incrementing from the head's — a playlist behind 3 songs
         # waits at 3, 4, 5.
         tracks = await self._built(["a", "b", "c"])
-        assert [t.analytics.queue_position for t in tracks] == [3, 4, 5]
-        assert all(t.analytics.queued_at == 1752530000.5 for t in tracks)
+        assert [t.queue_position for t in tracks] == [3, 4, 5]
+        assert all(t.queued_at == 1752530000.5 for t in tracks)
 
     async def test_every_track_carries_the_requester_and_the_pasted_link(self) -> None:
         """These resolve at dequeue, minutes to an hour after the command returned.
@@ -3194,13 +3201,14 @@ class TestSearchesForAPlaylist:
             tracks = await play_pipeline._searches_for(
                 [f"T{n}" for n in range(5)],
                 requester=stub_requester(),
-                analytics=Analytics(queued_at=1.0, queue_position=7),
+                queued_at=1.0,
+                queue_position=7,
                 origin="https://open.spotify.com/playlist/x",
             )
         finally:
             ticker.cancel()
 
-        assert [t.analytics.queue_position for t in tracks] == [7, 8, 9, 10, 11]
+        assert [t.queue_position for t in tracks] == [7, 8, 9, 10, 11]
         assert [t.search for t in tracks] == [f"ytsearch:T{n}" for n in range(5)]
         assert ticks - started >= 2
 
@@ -3223,7 +3231,7 @@ class TestSearchesForAPlaylist:
         tracks = await play_pipeline._searches_for(
             [f"T{n}" for n in range(5)],
             requester=stub_requester(),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             rows=rows,
         )
@@ -3239,7 +3247,7 @@ class TestSearchesForAPlaylist:
         tracks = await play_pipeline._searches_for(
             [f"T{n}" for n in range(3)],
             requester=stub_requester(),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             rows=[SpotifyTrack(name="T0", artists=["A"], duration_secs=1, url=None)],
         )
@@ -3424,7 +3432,7 @@ class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
             resolved,
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -3445,7 +3453,7 @@ class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
         resolved = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             mode=ResolveMode.FLAT_OK,
             cog=music_bot,
@@ -3492,7 +3500,7 @@ class TestBothCollectionsReachTheEnqueueAsTheirClassmethodBuiltThem:
             resolved = await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -3529,7 +3537,7 @@ class TestSpotifyAlbum:
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             mode=ResolveMode.FLAT_OK,
             on_progress=report,
@@ -3561,7 +3569,7 @@ class TestSpotifyAlbum:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -3580,7 +3588,7 @@ class TestSpotifyAlbum:
             await play_pipeline.queue_source(
                 mock_ctx,
                 source,
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 origin=_ORIGIN,
                 mode=ResolveMode.FLAT_OK,
                 cog=music_bot,
@@ -3597,7 +3605,7 @@ class TestSpotifyAlbum:
             resolved,
             mp,
             admit(music_bot, mock_ctx, mp),
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             cog=music_bot,
         )
@@ -3691,7 +3699,7 @@ class TestSpotifyAlbum:
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             mode=ResolveMode.FLAT_OK,
             cog=music_bot,
@@ -3805,7 +3813,7 @@ class TestSpotifyAlbum:
         result = await play_pipeline.queue_source(
             mock_ctx,
             source,
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             origin=_ORIGIN,
             mode=ResolveMode.FLAT_OK,
             cog=music_bot,
