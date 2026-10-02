@@ -827,15 +827,22 @@ class TestVoiceDisconnectContract:
     def _abandoned_handshake() -> tuple[VoiceConnectionState, AsyncMock]:
         """A real connection state parked where a cancelled cold-start join leaves
         one: both voice updates in, websocket never finished, so `is_connected()`
-        is False. The client is a bare MagicMock because `channel` is set in
-        __init__ and `spec=discord.VoiceClient` therefore refuses it."""
+        is False.
+
+        The client is a bare MagicMock because `channel` is set in __init__ and
+        `spec=discord.VoiceClient` therefore refuses it. SocketReader.start is
+        patched out because __init__ starts that thread unconditionally: nothing
+        here feeds it a socket, and stopping it afterwards races its own
+        `_end.clear()` into a daemon thread parked for the run.
+        """
         change_voice_state = AsyncMock()
         voice_client = MagicMock()
         voice_client.channel.id = 925632451882143764
         voice_client.channel.guild.change_voice_state = change_voice_state
         voice_client.guild.id = 924267988138483772
 
-        state = VoiceConnectionState(voice_client)
+        with patch("discord.voice_state.SocketReader.start"):
+            state = VoiceConnectionState(voice_client)
         state.state = ConnectionFlowState.got_both_voice_updates
 
         def _answer_the_clear(**_: Any) -> None:
@@ -854,20 +861,16 @@ class TestVoiceDisconnectContract:
         """The leak: Discord is never told, and the caller's VoiceClient.cleanup()
         then unregisters the one object that could still tell it."""
         state, change_voice_state = self._abandoned_handshake()
-        try:
-            await state.disconnect(force=False, wait=True)
-        finally:
-            state._socket_reader.stop()
+
+        await state.disconnect(force=False, wait=True)
 
         change_voice_state.assert_not_awaited()
         assert not state._expecting_disconnect
 
     async def test_forced_disconnect_clears_the_voice_state(self) -> None:
         state, change_voice_state = self._abandoned_handshake()
-        try:
-            await state.disconnect(force=True, wait=True)
-        finally:
-            state._socket_reader.stop()
+
+        await state.disconnect(force=True, wait=True)
 
         change_voice_state.assert_awaited_once_with(channel=None)
         assert state.state is ConnectionFlowState.disconnected

@@ -19,18 +19,20 @@ differently, what you have to do, and whether you can roll it back.
 
 ## 2.55.2 — 2026-10-02
 
-**A `-play` that fails no longer breaks the next one.** When a play could not be
-served on a bot that was not yet in voice — nothing found for the search, a refusal,
-a resolve that gave up — the bot abandoned the half-finished voice handshake without
-telling Discord it was leaving. Discord went on listing it in the channel, so the next
-`-play` in that server could not join: it asked for the channel it was already in,
-got no answer, sat out a 10-second handshake timeout and another 10 waiting for a
-confirmation that could no longer arrive, then gave up with "I could not join your
-voice channel". Twenty seconds, and a second failure for a request that was fine.
+**A `-play` whose song lookup fails no longer breaks the next one.** When the lookup
+raised on a bot that was not yet in a voice channel — nothing found for the search, a
+link it could not read, a lookup that ran out of time — the bot abandoned the
+half-finished voice handshake without telling Discord it was leaving. Discord went on
+listing it in the channel, so the NEXT `-play` in that server could not join at all: it
+asked for the channel it was already in, got no answer, and sat out a 10-second
+handshake timeout plus another 10 waiting for a confirmation that could no longer
+arrive. Twenty seconds, then a red **Command failed** embed naming a bare
+`TimeoutError` — for a request that was perfectly fine.
 
-- **Nothing to do.** No setting, no migration, no state to clear. The window closed
-  itself after about 20 seconds before this build, which is why the symptom looked
-  like one bad song poisoning the one after it.
+- **Nothing to do.** No setting, no migration, no state to clear.
+- **The old symptom read as contagion**: one bad song appeared to poison the song after
+  it, and only that one. The failed join's own teardown forced the clear on its way
+  out, so a third `-play` connected normally.
 - **Roll back freely**, to any 2.54.x. Nothing here changes what is written to Redis
   or Postgres.
 
