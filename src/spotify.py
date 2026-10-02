@@ -198,8 +198,8 @@ async def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
 
 
 def _track_to_cache(track: SpotifyTrack) -> list[Any]:
-    """One row for orjson, positional. Every key that reads them is versioned by
-    this shape."""
+    """One row for orjson. Positional, so a walk's rows cost five values rather
+    than five keys each; every key that reads them is versioned by this shape."""
     return [
         track.name,
         track.artists,

@@ -1,4 +1,4 @@
-"""Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
+"""Tests for src/youtube.py — YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
 import copy
@@ -32,28 +32,27 @@ from src import config
 from src.redis_client import cache_set
 from src import ytdlp_pool as ytdlp_pool_module
 from src.telemetry import configure_worker_logging
-from src.guild_state import Analytics, LoudnessMode
+from src.queue_item import NpCard, NpHostRef, QueueObject
 from src import youtube
 from src.play_placement import ResolveWaitExpired
+from src.guild_state import LoudnessMode
 from src.youtube import (
     YTDL,
-    YTDL_OPTS,
     Loudness,
-    NpHostRef,
+    _audio_filters,
     _LOUDNESS_GAIN_CLAMP_DB,
     _LOUDNESS_TARGET_LUFS,
     _PEAK_LIMITER,
-    _audio_filters,
+    _encode_bitrate_kbps,
     _loudness_cache_key,
     measure_loudness,
     normalize_gain_db,
     parse_ebur128_summary,
-    QueueObject,
+    YTDL_OPTS,
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
     _cache_stream,
-    _encode_bitrate_kbps,
     _OGG_HEADER_PACKETS,
     _STREAM_CANDIDATES,
     _UNUSED_INFO_COLLECTIONS,
@@ -92,11 +91,11 @@ from src.youtube import (
     YTDLVideoMetadata,
     YoutubePlaylist,
 )
-from tests.helpers import noop_ffmpeg_init, settle
+from tests.helpers import Ask, ask_of, noop_ffmpeg_init, settle
 
 # Ask-time analytics for direct yt_source/yt_playlist calls — the command paths
 # mint this at dispatch; both params are REQUIRED so a call site cannot forget.
-_ANALYTICS = Analytics(queued_at=1752529000.5, queue_position=0)
+_ANALYTICS: Ask = {"queued_at": 1752529000.5, "queue_position": 0}
 
 
 @pytest.fixture(autouse=True)
@@ -170,14 +169,14 @@ class TestYTDLDuration:
         # Same rendering as the progress bar's labels — not timedelta's
         # "0:03:00", which disagreed with the bar for the same song.
         song = ytdl_instance({"duration": 180})
-        assert song.duration == "3:00"
+        assert song.duration_label == "3:00"
         assert song.duration_secs == 180
 
     def test_duration_over_an_hour_keeps_hours(
         self, ytdl_instance: Callable[..., Any]
     ) -> None:
         song = ytdl_instance({"duration": 3725})
-        assert song.duration == "1:02:05"
+        assert song.duration_label == "1:02:05"
 
     def test_null_duration_does_not_raise(
         self, ytdl_instance: Callable[..., Any]
@@ -188,7 +187,7 @@ class TestYTDLDuration:
         construction."""
         song = ytdl_instance({"duration": None})
         assert song.duration_secs == 0
-        assert song.duration == "0:00"
+        assert song.duration_label == "0:00"
 
     def test_missing_duration_key_does_not_raise(
         self, ytdl_instance: Callable[..., Any], mock_channel: MagicMock
@@ -417,12 +416,15 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             persisted=False,
             played_at=12.5,
             is_replay=True,
-            analytics=Analytics(queued_at=99.5, queue_position=7),
-            np_message_id=555,
-            np_channel_id=666,
-            np_dedicated=True,
-            np_host_ref=NpHostRef(
-                message=MagicMock(spec=discord.Message), own_embeds=[], dedicated=True
+            queued_at=99.5,
+            queue_position=7,
+            np_card=NpCard(
+                message_id=555,
+                channel_id=666,
+                dedicated=True,
+                host_ref=NpHostRef(
+                    message=MagicMock(spec=discord.Message), own_embeds=[]
+                ),
             ),
             stream_attempts=2,
             failed_format_ids=frozenset({"251"}),
@@ -490,139 +492,6 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         )
 
         assert (await self._played(qobj)).persisted is False
-
-
-class TestQueueObject:
-    def test_required_fields(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://www.youtube.com/watch?v=abc",
-            title="My Song",
-            requester=mock_author,
-        )
-        assert qobj.webpage_url == "https://www.youtube.com/watch?v=abc"
-        assert qobj.title == "My Song"
-        assert qobj.requester is mock_author
-
-    def test_ts_defaults_to_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Title", requester=mock_author
-        )
-        assert qobj.ts is None
-
-    def test_ts_can_be_set(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1",
-            title="Title",
-            requester=mock_author,
-            ts=90,
-        )
-        assert qobj.ts == 90
-
-    def test_optional_fields_default_to_none(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Title", requester=mock_author
-        )
-        assert qobj.user_input is None
-        assert qobj.duration is None
-        assert qobj.uploader is None
-
-    def test_optional_fields_can_be_set(self, mock_author: MagicMock) -> None:
-        qobj = QueueObject(
-            webpage_url="https://yt.com/watch?v=1",
-            title="Title",
-            requester=mock_author,
-            user_input="search term",
-            duration=180,
-            uploader="My Channel",
-        )
-        assert qobj.user_input == "search term"
-        assert qobj.duration == 180
-        assert qobj.uploader == "My Channel"
-
-    def test_is_dataclass(self, mock_author: MagicMock) -> None:
-        import dataclasses
-
-        assert dataclasses.is_dataclass(QueueObject)
-
-    def test_equality(self, mock_author: MagicMock) -> None:
-        q1 = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        q2 = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        assert q1 == q2
-
-    def test_inequality_different_url(self, mock_author: MagicMock) -> None:
-        q1 = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        q2 = QueueObject(
-            webpage_url="https://yt.com/watch?v=2", title="Song", requester=mock_author
-        )
-        assert q1 != q2
-
-    def test_a_queued_item_is_frozen(self, mock_author: MagicMock) -> None:
-        item = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        with pytest.raises(FrozenInstanceError):
-            setattr(item, "title", "Retitled")
-
-    def test_the_value_hash_is_not_what_the_queue_keys_on(
-        self, mock_author: MagicMock
-    ) -> None:
-        """Pins the class comment: frozen generates __hash__ over the fields, so
-        two distinct asks for one song are one element in a set, while the queue
-        tells them apart by identity (holds, display_index, _listed)."""
-        first = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        second = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        assert first is not second
-        assert {first, second} == {first}
-
-    def test_fields_are_named_at_construction(self, mock_author: MagicMock) -> None:
-        # webpage_url and title are both str: positional, either order type-checks.
-        with pytest.raises(TypeError):
-            QueueObject("https://yt.com/watch?v=1", "Song", mock_author)  # pyright: ignore[reportCallIssue]
-
-    def test_every_field_takes_part_in_replace(self) -> None:
-        """replace() carries the whole ask across the three rebuilds and the
-        crash restore, and it silently skips a field declared init=False — such a
-        field would be reset to its default at every rebuild."""
-        import dataclasses
-
-        assert [f.name for f in dataclasses.fields(QueueObject) if not f.init] == []
-
-    def test_asdict_and_vars_stay_off_the_item(self, mock_author: MagicMock) -> None:
-        """vars() raises on a slotted item, but asdict() does not: it reads
-        fields() and deep-copies every value, including the Member on requester.
-        The wire tables spell the fields out instead. Pins the class comment: no
-        asdict() call anywhere in src/, qualified or not, and no vars() in a
-        module that names QueueObject (argparse's vars(args) elsewhere is fine)."""
-        import ast
-
-        item = QueueObject(
-            webpage_url="https://yt.com/watch?v=1", title="Song", requester=mock_author
-        )
-        assert not hasattr(item, "__dict__")
-        src = pathlib.Path(__file__).resolve().parents[1] / "src"
-        hits: list[str] = []
-        for path in sorted(src.rglob("*.py")):
-            text = path.read_text()
-            handles_item = "QueueObject" in text
-            for node in ast.walk(ast.parse(text)):
-                if not isinstance(node, ast.Call):
-                    continue
-                called = getattr(node.func, "id", None) or getattr(
-                    node.func, "attr", None
-                )
-                if called == "asdict" or (called == "vars" and handles_item):
-                    hits.append(f"{path.relative_to(src.parent)}:{node.lineno}")
-        assert hits == []
 
 
 class TestEnrichQueueObject:
@@ -803,12 +672,6 @@ class TestYTDLFfmpegOpts:
     def test_before_options_has_reconnect_flag(self) -> None:
         assert "-reconnect" in YTDL.FFMPEG_OPTS["before_options"]
 
-    def test_before_options_retries_a_well_formed_5xx(self) -> None:
-        """A plain `-reconnect` retries a truncated stream but not an HTTP error, so
-        the ladder's own tier is the only thing that notices this flag going missing
-        — and `just check` does not run it."""
-        assert "-reconnect_on_http_error 5xx" in YTDL.FFMPEG_OPTS["before_options"]
-
     def test_options_strips_video(self) -> None:
         assert "-vn" in YTDL.FFMPEG_OPTS["options"]
 
@@ -818,6 +681,12 @@ class TestYTDLFfmpegOpts:
         options = YTDL.FFMPEG_OPTS["options"].split()
         assert options[options.index("-fec") + 1] == "false"
         assert options[options.index("-packet_loss") + 1] == "0"
+
+    def test_before_options_retries_a_well_formed_5xx(self) -> None:
+        """A plain `-reconnect` retries a truncated stream but not an HTTP error, so
+        the ladder's own tier is the only thing that notices this flag going missing
+        — and `just check` does not run it."""
+        assert "-reconnect_on_http_error 5xx" in YTDL.FFMPEG_OPTS["before_options"]
 
 
 class TestYTSource:
@@ -833,7 +702,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test song",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -856,7 +725,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test song",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert result.thumbnail == "https://img.yt.com/test123.jpg"
@@ -869,7 +738,7 @@ class TestYTSource:
                     mock_ctx.author,
                     "ytsearch:nothing",
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
 
@@ -896,7 +765,7 @@ class TestYTSource:
                     mock_ctx.author,
                     url,
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
 
@@ -917,7 +786,7 @@ class TestYTSource:
                     mock_ctx.author,
                     "ytsearch:test",
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
         assert caught.value.unsupported is False
@@ -947,7 +816,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -977,7 +846,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "ytsearch:test",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -997,7 +866,7 @@ class TestYTSource:
                 mock_ctx.author,
                 "my search query",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert result.user_input == "my search query"
@@ -1022,7 +891,7 @@ class TestYTSource:
             "cached search",
             redis=fake_redis,
             query_source="youtube.com",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
         assert result.user_input == "cached search"
@@ -1048,7 +917,7 @@ class TestYTSource:
             "cached search",
             redis=fake_redis,
             query_source="youtube.com",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
@@ -1069,7 +938,7 @@ class TestYTSource:
                 "some search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1078,7 +947,7 @@ class TestYTSource:
             "some search",
             redis=fake_redis,
             query_source="youtube.com",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/fresh.jpg"
@@ -1095,7 +964,7 @@ class TestYTSource:
                 "https://yt.com/watch?v=ts_test",
                 ts=45,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1114,7 +983,7 @@ class TestYTSource:
                 "https://yt.com/v=dl",
                 download=True,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         # download rides on the request object, not a positional bool
@@ -1150,12 +1019,13 @@ class TestYTPlaylistAnalytics:
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=1752529000.5, queue_position=2),
+                queued_at=1752529000.5,
+                queue_position=2,
                 user_input="https://yt.com/playlist?list=PL1",
             )
         tracks = playlist.tracks
-        assert [t.analytics.queue_position for t in tracks] == [2, 3, 4]
-        assert all(t.analytics.queued_at == 1752529000.5 for t in tracks)
+        assert [t.queue_position for t in tracks] == [2, 3, 4]
+        assert all(t.queued_at == 1752529000.5 for t in tracks)
         assert all(t.query_source == "youtube.com" for t in tracks)
 
     async def test_skipped_entries_leave_no_gap_in_the_positions(
@@ -1173,13 +1043,13 @@ class TestYTPlaylistAnalytics:
                 "https://yt.com/playlist?list=X",
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input="https://yt.com/playlist?list=PL1",
             )
         tracks = playlist.tracks
         assert [t.title for t in tracks] == ["Ta", "Tb", "Tc"]
         assert playlist.unavailable == 2
-        assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
+        assert [t.queue_position for t in tracks] == [0, 1, 2]
 
 
 class TestExtractSingleflight:
@@ -1520,7 +1390,7 @@ class TestSearchEntrySelection:
                 mock_ctx.author,
                 "some song",
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input="some song",
             )
 
@@ -1570,6 +1440,13 @@ class TestYTSourceTermLadder:
         "duration": 234,
     }
 
+    @staticmethod
+    def _answers(mapping: dict[str, Any]) -> Any:
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            return mapping.get(search)
+
+        return extract
+
     async def test_the_isrc_search_resolves_and_the_title_is_never_asked(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -1584,70 +1461,12 @@ class TestYTSourceTermLadder:
                 mock_ctx.author,
                 "ytsearch:Shape of You Ed Sheeran",
                 query_source="spotify",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 isrc="GBAHS1600463",
             )
 
         assert asked == ['ytsearch:"GBAHS1600463"']
-        assert result.duration == 234
-
-    async def test_the_flat_fallback_keeps_the_length_its_choice(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """A flat entry too thin to play falls through to a processed extraction of
-        the SAME widened term, so the length still chooses there. One result would
-        hand that resolve YouTube's top-ranked video instead."""
-        asked: list[tuple[str, str]] = []
-        live = {"_type": "playlist", "entries": [{"id": "x", "title": "L", "url": "u"}]}
-
-        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
-            flat = request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
-            asked.append(("flat" if flat else "processed", search))
-            return live if flat else self._FOUND
-
-        with patch("src.youtube._extract_for_source", new=extract):
-            await YTDL.yt_source(
-                mock_ctx.author,
-                "Shape of You Ed Sheeran",
-                query_source="spotify",
-                analytics=_ANALYTICS,
-                user_input=None,
-                flat=True,
-                expected_duration=233,
-            )
-
-        widened = f"ytsearch{youtube._DURATION_MATCH_RESULTS}:Shape of You Ed Sheeran"
-        assert asked == [("flat", widened), ("processed", widened)]
-
-    async def test_a_term_nothing_is_indexed_under_costs_one_call(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """An empty search does not become a result by being asked a second time
-        processed, and the ISRC rung misses by design. Checked against the live
-        service: a code nothing is indexed under answers with a playlist of no
-        entries, where a real one answers with exactly one."""
-        asked: list[str] = []
-
-        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
-            asked.append(search)
-            if search.startswith('ytsearch:"'):
-                return {"_type": "playlist", "entries": []}
-            return self._FOUND
-
-        with patch("src.youtube._extract_for_source", new=extract):
-            result = await YTDL.yt_source(
-                mock_ctx.author,
-                "Shape of You Ed Sheeran",
-                query_source="spotify",
-                analytics=_ANALYTICS,
-                user_input=None,
-                isrc="GBAHS1600463",
-                flat=True,
-                expected_duration=233,
-            )
-
-        assert asked.count('ytsearch:"GBAHS1600463"') == 1
         assert result.duration == 234
 
     async def test_an_isrc_that_finds_nothing_falls_through_to_the_title(
@@ -1664,7 +1483,7 @@ class TestYTSourceTermLadder:
                 mock_ctx.author,
                 "ytsearch:Shape of You Ed Sheeran",
                 query_source="spotify",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 isrc="GBAHS1600463",
             )
@@ -1692,7 +1511,7 @@ class TestYTSourceTermLadder:
                 mock_ctx.author,
                 "ytsearch:nothing at all",
                 query_source="spotify",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 isrc="GBAHS1600463",
             )
@@ -1700,10 +1519,8 @@ class TestYTSourceTermLadder:
     async def test_each_term_caches_under_its_own_key(
         self, mock_ctx: MagicMock, fake_redis: Any
     ) -> None:
-        """Each term owns its own entry, so the resolve a term earned is not re-paid:
-        the title term is asked once across both plays. The ISRC MISS is not cached —
-        only a resolve writes an entry — so that term is asked on every play, which
-        is the standing cost of a track no art track was uploaded for."""
+        """The fallback is spent once per track per TTL: the second play reads the
+        title term's entry rather than re-asking for the ISRC."""
         calls: list[str] = []
 
         async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
@@ -1716,14 +1533,73 @@ class TestYTSourceTermLadder:
                     mock_ctx.author,
                     "ytsearch:Shape of You Ed Sheeran",
                     query_source="spotify",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                     isrc="GBAHS1600463",
                     redis=fake_redis,
                 )
 
+        # The ISRC miss is not cached — only a resolve writes an entry — so it is
+        # re-asked, and the title term is not.
         assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
-        assert calls.count('ytsearch:"GBAHS1600463"') == 2
+
+    async def test_a_term_nothing_is_indexed_under_costs_one_call(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An empty search does not become a result by being asked a second time
+        processed, and the ISRC rung misses by design. Checked against the live
+        service: a code nothing is indexed under answers with a playlist of no
+        entries, where a real one answers with exactly one."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search.startswith('ytsearch:"'):
+                return {"_type": "playlist", "entries": []}
+            return self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "Shape of You Ed Sheeran",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                isrc="GBAHS1600463",
+                flat=True,
+                expected_duration=233,
+            )
+
+        assert asked.count('ytsearch:"GBAHS1600463"') == 1
+        assert result.duration == 234
+
+    async def test_the_flat_fallback_keeps_the_length_its_choice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A flat entry too thin to play falls through to a processed extraction of
+        the SAME widened term, so the length still chooses there. One result would
+        hand that resolve YouTube's top-ranked video instead."""
+        asked: list[tuple[str, str]] = []
+        live = {"_type": "playlist", "entries": [{"id": "x", "title": "L", "url": "u"}]}
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            flat = request.opts is youtube._YTDL_FLAT_SEARCH_OPTS
+            asked.append(("flat" if flat else "processed", search))
+            return live if flat else self._FOUND
+
+        with patch("src.youtube._extract_for_source", new=extract):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "Shape of You Ed Sheeran",
+                query_source="spotify",
+                **_ANALYTICS,
+                user_input=None,
+                flat=True,
+                expected_duration=233,
+            )
+
+        widened = f"ytsearch{youtube._DURATION_MATCH_RESULTS}:Shape of You Ed Sheeran"
+        assert asked == [("flat", widened), ("processed", widened)]
 
 
 class TestYTSourceUnifiedExtraction:
@@ -1745,7 +1621,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "https://yt.com/watch?v=direct",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         req = mock_extract.call_args[0][0]
@@ -1771,7 +1647,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "some song",
                 query_source="ytsearch",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1790,7 +1666,7 @@ class TestYTSourceUnifiedExtraction:
                 "unified search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1826,7 +1702,7 @@ class TestYTSourceUnifiedExtraction:
                     "ytsearch:Fantasy Snow Strippers",
                     redis=fake_redis,
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                     flat=flat,
                 )
@@ -1858,7 +1734,7 @@ class TestYTSourceUnifiedExtraction:
                     "odd",
                     redis=fake_redis,
                     query_source="youtube.com",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                 )
         assert await fake_redis.keys("ytdl:source:*") == []
@@ -1875,7 +1751,7 @@ class TestYTSourceUnifiedExtraction:
                 "prefetch noop search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
@@ -1896,7 +1772,7 @@ class TestYTSourceUnifiedExtraction:
                 "dead probe search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -1923,7 +1799,7 @@ class TestYTSourceUnifiedExtraction:
                 "https://soundcloud.com/artist/track",
                 redis=fake_redis,
                 query_source="soundcloud.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert isinstance(result, QueueObject)
@@ -1944,7 +1820,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "no redis search",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         playable_urls.assert_not_awaited()
@@ -1960,7 +1836,7 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "metadata search",
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
         assert result.duration == 180
@@ -2037,7 +1913,6 @@ class TestYTStream:
             await YTDL.yt_stream(qobj, channel, volume=0.5)
 
         assert "volume=0.5" in captured_options["options"]
-        assert "-fec false" in captured_options["options"]
 
     async def test_yt_stream_seeks_on_both_sides_when_ts_is_set(
         self, mock_ctx: MagicMock
@@ -2084,7 +1959,6 @@ class TestYTStream:
         assert "-ss 90" not in captured_options["options"]
         assert "volume=0.5" in captured_options["options"]
         assert "volume" not in captured_options["before_options"]
-        assert "-fec false" in captured_options["options"]
 
     async def test_a_zero_timestamp_is_not_a_seek(self, mock_ctx: MagicMock) -> None:
         """`?t=0` is a real input (sources.py int()s it), and "start at the start" is
@@ -2177,7 +2051,8 @@ class TestYTStream:
             webpage_url="https://www.youtube.com/watch?v=test",
             title="Test Song",
             requester=mock_ctx.author,
-            analytics=Analytics(queued_at=1752529000.5, queue_position=4),
+            queued_at=1752529000.5,
+            queue_position=4,
         )
 
         with (
@@ -2186,8 +2061,8 @@ class TestYTStream:
         ):
             result = await YTDL.yt_stream(qobj, channel)
 
-        assert result.analytics.queued_at == 1752529000.5
-        assert result.analytics.queue_position == 4
+        assert result.queued_at == 1752529000.5
+        assert result.queue_position == 4
 
 
 class TestStreamUrlTtl:
@@ -3589,6 +3464,7 @@ class TestOpusPassthrough:
             *,
             codec: Optional[str] = None,
             options: Optional[str] = None,
+            bitrate: Optional[int] = None,
             **kwargs: Any,
         ) -> None:
             noop_ffmpeg_init(self)
@@ -3596,7 +3472,6 @@ class TestOpusPassthrough:
             captured["options"] = options or ""
 
         volume = data_overrides.pop("volume", 1.0)
-        loudness = data_overrides.pop("loudness", LoudnessMode.OFF)
         # A remuxable YouTube serve, spelled out: opus, stereo, and one of the itags
         # known to be 20ms-framed. Every clause of the gate is defeatable per test.
         data: dict[str, Any] = {
@@ -3617,7 +3492,6 @@ class TestOpusPassthrough:
                 ),
                 AsyncMock(spec=discord.TextChannel),
                 volume=volume,
-                loudness=loudness,
             )
         return captured["codec"], captured["options"]
 
@@ -3640,10 +3514,10 @@ class TestOpusPassthrough:
     async def test_any_filter_forces_the_encoder_not_just_volume(self) -> None:
         """The invariant is "a filtergraph exists", not "volume is non-unity".
 
-        Volume and the loudness setting are today's two filter sources. This
-        stands in for the next one by making _audio_filters emit a filter yt_stream
-        knows nothing about: the copy path must still refuse, or ffmpeg exits 234
-        with zero bytes and the player reports a refused stream.
+        Volume is only today's filter source. This stands in a future one (the
+        per-guild loudness setting is the next) by making _audio_filters emit a
+        filter yt_stream knows nothing about: the copy path must still refuse, or
+        ffmpeg exits 234 with zero bytes and the player reports a refused stream.
         """
         with patch("src.youtube._audio_filters", return_value=["dynaudnorm"]):
             codec, options = await self._ffmpeg_args()
@@ -4159,20 +4033,6 @@ class TestSearchEntryPicker:
         )
         assert chosen is not None and chosen.get("id") == "lyrics-b"
 
-    def test_the_tie_window_leaves_the_ranking_in_charge_of_a_near_miss(self) -> None:
-        """What `_DURATION_TIE_SECS` is FOR: a few seconds of arithmetic must not
-        override YouTube's own ranking, because a master and its remaster differ by
-        more than the ranking does. Here the ranked entry is 4 s out and the one
-        behind it is exact, and the ranked one still wins — narrowing the window to
-        an exact match would silently change which recording plays."""
-        entries = [
-            {"_type": "video", "id": "ranked", "duration": 237, "url": "https://r"},
-            {"_type": "video", "id": "exact", "duration": 233, "url": "https://e"},
-        ]
-        assert youtube._DURATION_TIE_SECS == 5
-        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
-        assert chosen is not None and chosen.get("id") == "ranked"
-
     def test_without_a_length_the_ranking_stands(self) -> None:
         chosen = select_search_entry(cast(Any, self._SHAPE_OF_YOU))
         assert chosen is not None and chosen.get("id") == "video"
@@ -4202,6 +4062,20 @@ class TestSearchEntryPicker:
         ]
         chosen = select_search_entry(cast(Any, entries), expected_duration=233)
         assert chosen is not None and chosen.get("id") == "a"
+
+    def test_the_tie_window_leaves_the_ranking_in_charge_of_a_near_miss(self) -> None:
+        """What `_DURATION_TIE_SECS` is FOR: a few seconds of arithmetic must not
+        override YouTube's own ranking, because a master and its remaster differ by
+        more than the ranking does. Here the ranked entry is 4 s out and the one
+        behind it is exact, and the ranked one still wins — narrowing the window to
+        an exact match would silently change which recording plays."""
+        entries = [
+            {"_type": "video", "id": "ranked", "duration": 237, "url": "https://r"},
+            {"_type": "video", "id": "exact", "duration": 233, "url": "https://e"},
+        ]
+        assert youtube._DURATION_TIE_SECS == 5
+        chosen = select_search_entry(cast(Any, entries), expected_duration=233)
+        assert chosen is not None and chosen.get("id") == "ranked"
 
 
 class TestSearchTerms:
@@ -4275,7 +4149,7 @@ class TestFlatEntryMapper:
             self._entry(**overrides),
             mock_ctx.author,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input="take on me",
         )
 
@@ -4288,7 +4162,7 @@ class TestFlatEntryMapper:
         assert qobj.thumbnail == "https://i.ytimg.com/vi/x/hq720.jpg"
         assert qobj.user_input == "take on me"
         assert qobj.query_source == "search"
-        assert qobj.analytics is _ANALYTICS
+        assert ask_of(qobj) == _ANALYTICS
 
     def test_webpage_url_is_derived_from_the_id_not_read_from_url(
         self, mock_ctx: MagicMock
@@ -4308,7 +4182,7 @@ class TestFlatEntryMapper:
             self._entry(),
             mock_ctx.author,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
             ts=42,
         )
@@ -4374,7 +4248,7 @@ class TestFlatYtSource:
                 "ytsearch:flat song",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4424,7 +4298,7 @@ class TestFlatYtSource:
                 "ytsearch:warm",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4456,7 +4330,7 @@ class TestFlatYtSource:
                 "ytsearch:lofi radio",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4489,7 +4363,7 @@ class TestFlatYtSource:
             return _fake_ytdl_data(webpage_url="https://yt.com/v=shared")
 
         kwargs: dict[str, Any] = dict(
-            query_source="search", analytics=_ANALYTICS, user_input=None
+            query_source="search", **_ANALYTICS, user_input=None
         )
         with patch("src.youtube._run_extract", new=_slow):
             tasks = [
@@ -4532,7 +4406,7 @@ class TestFlatYtSource:
                     "https://nope.example/x",
                     redis=fake_redis,
                     query_source="nope.example",
-                    analytics=_ANALYTICS,
+                    **_ANALYTICS,
                     user_input=None,
                     flat=True,
                 )
@@ -4559,7 +4433,7 @@ class TestFlatYtSource:
                 "ytsearch:playable",
                 redis=fake_redis,
                 query_source="search",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
                 flat=True,
             )
@@ -4602,7 +4476,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 "slow probe search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -4633,7 +4507,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 "joined search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -4701,7 +4575,7 @@ class TestTheStreamWarmIsSharedNotAwaited:
                 "cancelled search",
                 redis=fake_redis,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=None,
             )
 
@@ -4878,7 +4752,7 @@ class TestSourceCacheRevalidation:
             query,
             redis=redis,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
             flat=flat,
             expected_duration=expected_duration,
@@ -5121,7 +4995,7 @@ class TestYtPlaylistEntries:
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input="https://www.youtube.com/playlist?list=PL1",
             )
         return playlist.tracks
@@ -5238,7 +5112,7 @@ class TestMixRepeats:
                 url,
                 ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=url,
                 redis=redis,
             )
@@ -5252,7 +5126,7 @@ class TestMixRepeats:
         queued = await self._fetch(mock_ctx, list_id, ("a", "b", "c", "a", "b", "d"))
         assert self._urls(queued) == ["a", "b", "c", "d"]
         # Positions come from the kept tracks, so a dropped repeat leaves no gap.
-        assert [q.analytics.queue_position for q in queued] == [0, 1, 2, 3]
+        assert [q.queue_position for q in queued] == [0, 1, 2, 3]
 
     @pytest.mark.parametrize("list_id", ["PLmine", "RDCLAK5uy_kmPRjHDECIcuVwnKsx2Ng"])
     async def test_a_playlist_keeps_a_video_its_owner_added_twice(
@@ -5275,7 +5149,7 @@ class TestMixRepeats:
                 url,
                 mock_ctx.author,
                 query_source="youtube.com",
-                analytics=_ANALYTICS,
+                **_ANALYTICS,
                 user_input=url,
                 redis=fake_redis,
             )
@@ -5425,13 +5299,13 @@ class TestPlaylistCache:
         redis: aioredis.Redis,
         url: str,
         *,
-        analytics: Analytics = _ANALYTICS,
+        ask: Ask = _ANALYTICS,
     ) -> YoutubePlaylist:
         return await YTDL.yt_playlist(
             url,
             ctx.author,
             query_source="youtube.com",
-            analytics=analytics,
+            **ask,
             user_input=url,
             redis=redis,
         )
@@ -5442,9 +5316,9 @@ class TestPlaylistCache:
         redis: aioredis.Redis,
         url: str,
         *,
-        analytics: Analytics = _ANALYTICS,
+        ask: Ask = _ANALYTICS,
     ) -> list[QueueObject]:
-        return (await self._resolve(ctx, redis, url, analytics=analytics)).tracks
+        return (await self._resolve(ctx, redis, url, ask=ask)).tracks
 
     async def test_a_second_paste_inside_the_window_is_one_redis_get(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -5539,7 +5413,7 @@ class TestPlaylistCache:
         assert len(hit.tracks) == 2
         assert miss.unavailable == hit.unavailable == 3
         # Positions count kept tracks, so the drops leave no gaps.
-        assert [q.analytics.queue_position for q in hit.tracks] == [0, 1]
+        assert [q.queue_position for q in hit.tracks] == [0, 1]
 
     async def test_a_hit_returns_the_title_the_miss_extracted(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -5624,13 +5498,14 @@ class TestPlaylistCache:
                 url,
                 mock_author,
                 query_source="youtube.com",
-                analytics=replace(_ANALYTICS, queue_position=7),
+                queued_at=_ANALYTICS["queued_at"],
+                queue_position=7,
                 user_input="the second paste",
                 redis=fake_redis,
             )
 
         assert [q.requester for q in second.tracks] == [mock_author, mock_author]
-        assert [q.analytics.queue_position for q in second.tracks] == [7, 8]
+        assert [q.queue_position for q in second.tracks] == [7, 8]
         assert {q.user_input for q in second.tracks} == {"the second paste"}
 
 
@@ -6346,7 +6221,7 @@ class TestTheFlatMapperDeclinesWhatItCannotDescribe:
             cast(Any, entry),
             author,
             query_source="search",
-            analytics=_ANALYTICS,
+            **_ANALYTICS,
             user_input=None,
         )
 
@@ -6669,7 +6544,8 @@ class TestYtPlaylistProgress:
                 "https://www.youtube.com/playlist?list=PLkeymatch",
                 mock_author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=0.0, queue_position=0),
+                queued_at=0.0,
+                queue_position=0,
                 user_input="https://www.youtube.com/playlist?list=PLkeymatch",
                 on_progress=lambda done, total: seen.append((done, total)),
             )
@@ -6833,7 +6709,8 @@ class TestYtPlaylistProgress:
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=0.0, queue_position=0),
+                queued_at=0.0,
+                queue_position=0,
                 user_input="https://www.youtube.com/playlist?list=PL1",
             )
 
@@ -6856,58 +6733,14 @@ class TestYtPlaylistProgress:
                 "https://www.youtube.com/playlist?list=PL1",
                 mock_author,
                 query_source="youtube.com",
-                analytics=Analytics(queued_at=0.0, queue_position=0),
+                queued_at=0.0,
+                queue_position=0,
                 user_input="https://www.youtube.com/playlist?list=PL1",
                 on_progress=lambda d, t: seen.append((d, t)),
             )
 
         assert seen == [(0, 1671), (25, None)]
         assert youtube._PROGRESS_SUBSCRIBERS == {}
-
-
-class TestLoudnessFilters:
-    """What each mode contributes to the chain, and in what order. The order is the
-    invariant: a ceiling has to apply to the signal the listener receives."""
-
-    def test_off_emits_nothing_so_the_copy_path_survives(self) -> None:
-        """The only mode that can stay bit-exact: any filtergraph refuses
-        `-c:a copy`, so OFF has to produce an EMPTY list, not a no-op filter."""
-        assert _audio_filters(1.0, LoudnessMode.OFF, None) == []
-
-    def test_peak_is_the_limiter_alone(self) -> None:
-        assert _audio_filters(1.0, LoudnessMode.PEAK, None) == [_PEAK_LIMITER]
-
-    def test_peak_ignores_a_gain_it_was_handed(self) -> None:
-        """A measured gain belongs to NORMALIZE. PEAK caps peaks and moves nothing."""
-        assert _audio_filters(1.0, LoudnessMode.PEAK, -6.0) == [_PEAK_LIMITER]
-
-    def test_normalize_is_the_gain_then_the_ceiling(self) -> None:
-        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, -6.0) == [
-            "volume=-6.0dB",
-            _PEAK_LIMITER,
-        ]
-
-    def test_volume_leads_the_chain(self) -> None:
-        """A guild at 200% is capped AFTER its gain, or the ceiling describes a
-        signal nobody receives."""
-        assert _audio_filters(2.0, LoudnessMode.NORMALIZE, 3.0) == [
-            "volume=2.0",
-            "volume=3.0dB",
-            _PEAK_LIMITER,
-        ]
-
-    def test_normalize_without_a_measurement_still_takes_the_ceiling(self) -> None:
-        """A scan that failed or timed out leaves the song at its own level rather
-        than unplayed."""
-        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, None) == [_PEAK_LIMITER]
-
-    def test_the_limiter_disables_auto_levelling(self) -> None:
-        """alimiter auto-levels its output by default, which would RAISE a quiet
-        song — the opposite of the setting's purpose. `latency=1` is what keeps it
-        transparent below the ceiling instead of shifting every sample by its 5 ms
-        lookahead; the ffmpeg tier measures both halves."""
-        assert "level=disabled" in _PEAK_LIMITER
-        assert "latency=1" in _PEAK_LIMITER
 
 
 class TestEbur128Summary:
@@ -6994,6 +6827,51 @@ class TestNormalizeGain:
         assert (
             normalize_gain_db(Loudness(i=6.0, peak=3.0)) == (_LOUDNESS_GAIN_CLAMP_DB[0])
         )
+
+
+class TestLoudnessFilters:
+    """What each mode contributes to the chain, and in what order. The order is the
+    invariant: a ceiling has to apply to the signal the listener receives."""
+
+    def test_off_emits_nothing_so_the_copy_path_survives(self) -> None:
+        """The only mode that can stay bit-exact: any filtergraph refuses
+        `-c:a copy`, so OFF has to produce an EMPTY list, not a no-op filter."""
+        assert _audio_filters(1.0, LoudnessMode.OFF, None) == []
+
+    def test_peak_is_the_limiter_alone(self) -> None:
+        assert _audio_filters(1.0, LoudnessMode.PEAK, None) == [_PEAK_LIMITER]
+
+    def test_peak_ignores_a_gain_it_was_handed(self) -> None:
+        """A measured gain belongs to NORMALIZE. PEAK caps peaks and moves nothing."""
+        assert _audio_filters(1.0, LoudnessMode.PEAK, -6.0) == [_PEAK_LIMITER]
+
+    def test_normalize_is_the_gain_then_the_ceiling(self) -> None:
+        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, -6.0) == [
+            "volume=-6.0dB",
+            _PEAK_LIMITER,
+        ]
+
+    def test_volume_leads_the_chain(self) -> None:
+        """A guild at 200% is capped AFTER its gain, or the ceiling describes a
+        signal nobody receives."""
+        assert _audio_filters(2.0, LoudnessMode.NORMALIZE, 3.0) == [
+            "volume=2.0",
+            "volume=3.0dB",
+            _PEAK_LIMITER,
+        ]
+
+    def test_normalize_without_a_measurement_still_takes_the_ceiling(self) -> None:
+        """A scan that failed or timed out leaves the song at its own level rather
+        than unplayed."""
+        assert _audio_filters(1.0, LoudnessMode.NORMALIZE, None) == [_PEAK_LIMITER]
+
+    def test_the_limiter_disables_auto_levelling(self) -> None:
+        """alimiter auto-levels its output by default, which would RAISE a quiet
+        song — the opposite of the setting's purpose. `latency=1` is what keeps it
+        transparent below the ceiling instead of shifting every sample by its 5 ms
+        lookahead; the ffmpeg tier measures both halves."""
+        assert "level=disabled" in _PEAK_LIMITER
+        assert "latency=1" in _PEAK_LIMITER
 
 
 class TestMeasureLoudness:
@@ -7204,6 +7082,7 @@ class TestYtStreamLoudness:
             *,
             codec: Optional[str] = None,
             options: Optional[str] = None,
+            bitrate: Optional[int] = None,
             **kwargs: Any,
         ) -> None:
             noop_ffmpeg_init(self)

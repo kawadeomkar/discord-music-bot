@@ -86,7 +86,7 @@ class ArchiveHealth(Protocol):
     async def health_check(self) -> None: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ProbeResult:
     label: str
     state: ProbeState
@@ -113,9 +113,9 @@ async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResu
         raise
     except Exception as e:  # noqa: BLE001 — a probe must never raise out
         log.warning(f"{label} probe failed: {type(e).__name__}: {e}")
-        return ProbeResult(label, ProbeState.DOWN, detail=_error_detail(e))
+        return ProbeResult(label=label, state=ProbeState.DOWN, detail=_error_detail(e))
     ms = (time.perf_counter() - start) * 1000
-    return ProbeResult(label, ProbeState.OK, latency_ms=ms)
+    return ProbeResult(label=label, state=ProbeState.OK, latency_ms=ms)
 
 
 # ── Probes ─────────────────────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
     """PING plus a throwaway write: Redis keeps serving reads while refusing writes
     (MISCONF after a failed bgsave, OOM, READONLY on a replica)."""
     if redis is None:
-        return ProbeResult("Redis", ProbeState.NA)
+        return ProbeResult(label="Redis", state=ProbeState.NA)
 
     async def _do() -> None:
         await redis.ping()
@@ -145,10 +145,12 @@ async def probe_spotify(
         or status is SpotifyStatus.DISABLED
         or not (spotify.client_id and spotify.client_secret)
     ):
-        return ProbeResult("Spotify API", ProbeState.NA, detail="not configured")
+        return ProbeResult(
+            label="Spotify API", state=ProbeState.NA, detail="not configured"
+        )
     if status is SpotifyStatus.INVALID:
         return ProbeResult(
-            "Spotify API", ProbeState.DOWN, detail="credentials rejected"
+            label="Spotify API", state=ProbeState.DOWN, detail="credentials rejected"
         )
 
     async def _do() -> None:
@@ -166,15 +168,17 @@ async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:
     way — tests, or a cog outside MusicBotApp — and stays NA."""
     if archive is None:
         if not history_archive_enabled():
-            return ProbeResult("Postgres", ProbeState.OFF, detail="archive disabled")
-        return ProbeResult("Postgres", ProbeState.NA)
+            return ProbeResult(
+                label="Postgres", state=ProbeState.OFF, detail="archive disabled"
+            )
+        return ProbeResult(label="Postgres", state=ProbeState.NA)
 
     return await _timed("Postgres", archive.health_check)
 
 
 async def probe_otel() -> ProbeResult:
     if telemetry._tracer_provider is None:
-        return ProbeResult("OTEL collector", ProbeState.OFF)
+        return ProbeResult(label="OTEL collector", state=ProbeState.OFF)
     # urlparse fills .hostname/.port only with a scheme present, and operators set
     # the endpoint scheme-less ("collector:4317"); prepend "//" so it parses.
     raw = telemetry._OTLP_ENDPOINT
@@ -184,7 +188,7 @@ async def probe_otel() -> ProbeResult:
     try:
         host, port = parsed.hostname or "localhost", parsed.port or 4317
     except ValueError:
-        return ProbeResult("OTEL collector", ProbeState.FAILED)
+        return ProbeResult(label="OTEL collector", state=ProbeState.FAILED)
 
     async def _do() -> None:
         # gRPC OTLP has no cheap app-level ping; a TCP connect proves the port
@@ -335,9 +339,13 @@ def render_ping_embed(
     footer, pre-rendered by the cog and constant for the invocation."""
     # nan latency means the gateway ws is reconnecting.
     disc = (
-        ProbeResult("Discord gateway", ProbeState.DOWN, detail="reconnecting")
+        ProbeResult(
+            label="Discord gateway", state=ProbeState.DOWN, detail="reconnecting"
+        )
         if math.isnan(discord_ms)
-        else ProbeResult("Discord gateway", ProbeState.OK, latency_ms=discord_ms)
+        else ProbeResult(
+            label="Discord gateway", state=ProbeState.OK, latency_ms=discord_ms
+        )
     )
     rows = [disc, *results.values()]
     lat_lines = [_ping_line(r) for r in rows]
@@ -475,7 +483,9 @@ async def run_health_dashboard(
         "Postgres": lambda: probe_postgres(archive),
         "OTEL collector": lambda: probe_otel(),
     }
-    results = {label: ProbeResult(label, ProbeState.PENDING) for label in probes}
+    results = {
+        label: ProbeResult(label=label, state=ProbeState.PENDING) for label in probes
+    }
     versions: dict[str, str] = {}
     warning: Optional[discord.Embed] = None
 
@@ -506,12 +516,12 @@ async def run_health_dashboard(
             log.warning(
                 "ping probe raised outside its guard", probe=label, error=str(outcome)
             )
-            results[label] = ProbeResult(label, ProbeState.FAILED)
+            results[label] = ProbeResult(label=label, state=ProbeState.FAILED)
         else:
             results[label] = outcome
 
     def _abandon(label: str) -> None:
-        results[label] = ProbeResult(label, ProbeState.FAILED)
+        results[label] = ProbeResult(label=label, state=ProbeState.FAILED)
 
     await run_live_dashboard(
         ctx,

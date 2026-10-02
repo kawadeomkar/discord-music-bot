@@ -36,11 +36,11 @@ from typing import Optional, Union
 
 import discord
 
-from src.guild_state import Analytics, QueueEntry, SearchQueueEntry, SongQueueEntry
+from src.guild_state import SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import is_link, unwrap
 from src.util import get_logger
-from src.youtube import QueueObject
+from src.queue_item import NpCard, QueueObject
 
 log = get_logger(__name__)
 
@@ -52,7 +52,7 @@ log = get_logger(__name__)
 _LREM_MAX_ENTRIES = 16
 
 # Entries serialized and RPUSHed per round trip by a bulk put. Serialization measured
-# ~1.5ms per thousand at ~400 bytes an entry, which is how long each chunk holds the
+# ~2.1ms per thousand at ~540 bytes an entry, which is how long each chunk holds the
 # event loop; the RPUSH between chunks is what yields it.
 _PUT_CHUNK = 1000
 
@@ -136,12 +136,10 @@ class RemoveOutcome:
     mode: Optional[RemoveMode] = None
 
 
-def _to_entry(item: QueueObject) -> QueueEntry:
-    """Live queue item → at-rest entry for the Redis mirror. An item still
-    waiting to resolve keeps the `"ytsource"` shape it has always had on the
-    wire, so a rollback can still read the list."""
-    if item.unresolved:
-        return SearchQueueEntry.from_queue_object(item)
+def _to_entry(item: QueueObject) -> SongQueueEntry:
+    """Live queue item → at-rest entry for the Redis mirror. One shape for every
+    item: one still waiting to resolve writes its term under `ytsearch` and is
+    restored unresolved. See docs/ARCHITECTURE.md#one-queue-item."""
     return SongQueueEntry.from_queue_object(item)
 
 
@@ -212,9 +210,9 @@ class GuildQueue:
         # replaces the list: a rebuild, a DELETE, or the next song start.
         self._mirror_dirty = False
         # The entry the list holds for an item requeue_front() or replace_item()
-        # swapped in, which serializes differently from it. Keyed by id() and
-        # holding the item, so the id cannot be reused while the record lives.
-        self._listed: dict[int, tuple[QueueObject, QueueEntry]] = {}
+        # swapped in, which serializes differently from it. Keyed on the item,
+        # which hashes by identity.
+        self._listed: dict[QueueObject, SongQueueEntry] = {}
         # The objects mirror_entries() serialized for the song start's rebuild,
         # so note_mirror_write drops the records of exactly those once that write
         # lands. Replaced by the next mirror_entries().
@@ -278,8 +276,8 @@ class GuildQueue:
             self._cursor -= 1
             claimed = self._items[0]
             if item is not claimed:
-                self._listed[id(item)] = (item, self._mirror_entry(claimed))
-                self._listed.pop(id(claimed), None)
+                self._listed[item] = self._mirror_entry(claimed)
+                self._listed.pop(claimed, None)
             self._items[0] = item
         self._sync_wake()
 
@@ -293,8 +291,8 @@ class GuildQueue:
             if held is item:
                 if new is not item:
                     entry = self._mirror_entry(item)
-                    self._listed.pop(id(item), None)
-                    self._listed[id(new)] = (new, entry)
+                    self._listed.pop(item, None)
+                    self._listed[new] = entry
                     self._items[index] = new
                 return True
         return False
@@ -489,7 +487,7 @@ class GuildQueue:
             finally:
                 # After the write, which LREMs by these records.
                 for item in removed_items:
-                    self._listed.pop(id(item), None)
+                    self._listed.pop(item, None)
 
         return RemoveOutcome(
             removed=removed_items,
@@ -522,20 +520,23 @@ class GuildQueue:
 
     async def restore_entries(
         self,
-        entries: Sequence[QueueEntry],
+        entries: Sequence[SongQueueEntry],
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
         unreadable: int = 0,
     ) -> int:
         """Re-queue persisted entries after a restart, in order, in memory only
-        (they are already on the Redis list). Returns the number restored.
+        (they are already on the Redis list). Returns the number restored and
+        reports it on one unconditional INFO line, which names `unreadable`
+        beside the count so the restore is read against the list it came off.
 
         An entry nobody can be found for is dropped and counted in a warning.
         `unreadable` is how many list entries the snapshot could not parse; they
         were dropped before reaching here. Either kind of drop marks the mirror
         stale so the shorter queue is written back for good.
         `requester_fallback` is the caller's last resort, ahead of the guild
-        owner, for entries persisted before searches carried a requester id."""
+        owner, for an entry whose requester id no longer resolves to a member
+        or to a cached user."""
         count = 0
         dropped = 0
         for entry in entries:
@@ -557,6 +558,13 @@ class GuildQueue:
                 f"requester in guild {self._guild.id}; the Redis list still holds "
                 "them until the next mirror rebuild"
             )
+        # Unconditional, an empty restore included: a restart that restored
+        # nothing is a fact, not an absence of one. The unreadable count rides
+        # along so the number is read against the list it came off.
+        summary = f"Restored {count} queued songs for guild {self._guild.id}"
+        if unreadable:
+            summary += f", past {unreadable} the snapshot could not read"
+        log.info(summary)
         self._sync_wake()
         return count
 
@@ -615,7 +623,7 @@ class GuildQueue:
         (I1)."""
         if self._cursor == 0:
             return False
-        self._listed.pop(id(self._items.popleft()), None)
+        self._listed.pop(self._items.popleft(), None)
         self._cursor -= 1
         self._sync_wake()
         return True
@@ -681,7 +689,7 @@ class GuildQueue:
         elif retired:
             self._mirror_dirty = True
 
-    def mirror_entries(self) -> list[QueueEntry]:
+    def mirror_entries(self) -> list[SongQueueEntry]:
         """The persisted subset of the deque, claimed prefix included, in order —
         what a rebuild writes: each live object's own serialization. The objects
         are held for note_mirror_write, which answers for exactly these."""
@@ -760,21 +768,18 @@ class GuildQueue:
             self._drop_listed(written)
 
     def holds(self, item: QueueObject) -> bool:
-        """Whether this exact object is on the deque, claimed prefix included.
-        Identity, not equality: the caller is asking about the object it just
-        inserted, and two entries for one song compare equal."""
+        """Whether this exact object is on the deque, claimed prefix included: the
+        caller is asking about the object it just inserted."""
         return any(held is item for held in self._items)
 
-    def _mirror_entry(self, item: QueueObject) -> QueueEntry:
+    def _mirror_entry(self, item: QueueObject) -> SongQueueEntry:
         """The entry the list holds for `item`: its own serialization, or, for an
         item requeue_front() or replace_item() swapped in, the entry of what it
         replaced. Every write that must match the list byte for byte (an LREM, the
         claimed-entry guard) serializes through here; a rebuild writes the live
         objects instead and drops the records it answered for (_drop_listed)."""
-        listed = self._listed.get(id(item))
-        if listed is not None and listed[0] is item:
-            return listed[1]
-        return _to_entry(item)
+        listed = self._listed.get(item)
+        return listed if listed is not None else _to_entry(item)
 
     def _drop_listed(self, written: Sequence[QueueObject]) -> None:
         """Drop the swap records of the objects a landed rebuild serialized: the
@@ -782,9 +787,7 @@ class GuildQueue:
         await and land after it, so a swap in that window keeps its record — the
         bytes on the list are still the ones it replaced."""
         for item in written:
-            listed = self._listed.get(id(item))
-            if listed is not None and listed[0] is item:
-                del self._listed[id(item)]
+            self._listed.pop(item, None)
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a
@@ -800,7 +803,7 @@ class GuildQueue:
 
     def _rehydrate(
         self,
-        entry: QueueEntry,
+        entry: SongQueueEntry,
         *,
         requester_fallback: Union[discord.Member, discord.User, None] = None,
     ) -> Optional[QueueObject]:
@@ -825,26 +828,6 @@ class GuildQueue:
             )
         if requester is None:
             return None
-        analytics = Analytics(
-            queued_at=entry.queued_at, queue_position=entry.queue_position
-        )
-        if isinstance(entry, SearchQueueEntry):
-            return QueueObject(
-                # What a listing shows for it until the resolve lands, as the walk
-                # named them: dropping these reads "resolving..." again after a
-                # restart, for a track the queue could already describe.
-                webpage_url=entry.webpage_url or "",
-                title=entry.title or "",
-                requester=requester,
-                ts=entry.ts,
-                user_input=entry.user_input,
-                duration=entry.duration,
-                uploader=entry.uploader,
-                analytics=analytics,
-                query_source=entry.query_source,
-                search=entry.ytsearch or entry.url or "",
-                isrc=entry.isrc,
-            )
         return QueueObject(
             webpage_url=entry.webpage_url,
             title=entry.title,
@@ -858,16 +841,25 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
-            analytics=analytics,
+            queued_at=entry.queued_at,
+            queue_position=entry.queue_position,
             query_source=entry.query_source,
             played_at=entry.played_at,
-            # No np_host_ref: a live Message cannot survive a restart, so a
-            # rehydrated tail can only delete a dedicated card by id.
-            np_message_id=entry.np_message_id,
-            np_channel_id=entry.np_channel_id,
-            np_dedicated=entry.np_dedicated,
+            # The card by its ids alone: a live Message cannot survive a
+            # restart, so a rehydrated tail can only delete a dedicated card.
+            # No message id means no card.
+            np_card=(
+                NpCard(
+                    message_id=entry.np_message_id,
+                    channel_id=entry.np_channel_id,
+                    dedicated=entry.np_dedicated,
+                )
+                if entry.np_message_id
+                else None
+            ),
             # Non-empty for an item that had not resolved: without it the item
             # comes back looking resolved, pointed at the page the walk named,
             # and the stream attempt fails on it.
             search=entry.search,
+            isrc=entry.isrc,
         )

@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Sequence
 import discord
 from discord.ext import commands
 
-from src.guild_state import Analytics
+from src.queue_item import QueueObject
 from src.musicplayer import InterjectOutcome, MusicPlayer
 from src.play_placement import (
     Placement,
@@ -66,7 +66,7 @@ from src.util import (
     truncate_embed_title,
     verbatim_code,
 )
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports this module).
@@ -218,13 +218,7 @@ def _apply_playlist_index(
     # Positions were assigned before this slice; the dropped tracks never
     # enqueue, so rebase or every kept track records N-1 too deep.
     kept = [
-        replace(
-            track,
-            analytics=replace(
-                track.analytics,
-                queue_position=track.analytics.queue_position - dropped,
-            ),
-        )
+        replace(track, queue_position=track.queue_position - dropped)
         for track in tracks[index - 1 :]
     ]
     return kept, dropped
@@ -327,7 +321,7 @@ def plays_after_note(
 
 def with_queue_position(item: QueueObject, position: int) -> QueueObject:
     """`item` with its `queue_position` re-minted."""
-    return replace(item, analytics=replace(item.analytics, queue_position=position))
+    return replace(item, queue_position=position)
 
 
 def _is_spotify_collection(
@@ -393,13 +387,14 @@ async def _searches_for(
     titles: Sequence[str],
     *,
     requester: Union[discord.User, discord.Member],
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     origin: str,
     rows: Sequence[SpotifyTrack] = (),
 ) -> list[QueueObject]:
     """A Spotify collection's titles as queue items still to resolve, yielding the
     loop every chunk so 10,000 of them do not hold it. Positions count on from
-    `analytics` across chunks, as they would in one pass. The Spotify token, the
+    `queue_position` across chunks, as they would in one pass. The Spotify token, the
     pasted collection link and the requester are set here, the last point that
     knows where these came from.
 
@@ -443,9 +438,8 @@ async def _searches_for(
                 duration=row.duration_secs if row else None,
                 # What the resolve at dequeue searches before the term.
                 isrc=row.isrc if row else None,
-                analytics=replace(
-                    analytics, queue_position=analytics.queue_position + offset
-                ),
+                queued_at=queued_at,
+                queue_position=queue_position + offset,
             )
         )
     return tracks
@@ -589,7 +583,8 @@ async def queue_source(
     ctx: commands.Context,
     source: Union[SpotifySource, YTSource, SoundcloudSource],
     *,
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     origin: str,
     mode: ResolveMode,
     on_progress: Optional[ProgressFn] = None,
@@ -597,10 +592,11 @@ async def queue_source(
     start_offset: Optional[int] = None,
     cog: MusicBot,
 ) -> Union[QueueObject, ResolvedPlaylist]:
-    """Resolve a parsed source into something enqueueable. `analytics` is the
-    command's ask-time head value; playlist tracks derive per-track positions
-    from it. `origin` is the raw command argument, carried onto every item —
-    for a collection the link, not the per-track search its expansion made.
+    """Resolve a parsed source into something enqueueable. `queued_at` and
+    `queue_position` are the command's ask-time head values; playlist tracks
+    derive per-track positions from the depth. `origin` is the raw command
+    argument, carried onto every item — for a collection the link, not the
+    per-track search its expansion made.
 
     `mode` is required and has no default: interjection resolves through this
     same helper, so "a search may go flat" cannot be decided from the input
@@ -627,7 +623,8 @@ async def queue_source(
         searches = await _searches_for(
             playlist.titles,
             requester=ctx.author,
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=queue_position,
             origin=origin,
             rows=playlist.tracks,
         )
@@ -639,7 +636,8 @@ async def queue_source(
             source.playlist_url,
             ctx.author,
             query_source=query_source_of(source),
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=queue_position,
             user_input=origin,
             redis=cog.redis,
             on_progress=on_progress,
@@ -682,7 +680,8 @@ async def queue_source(
         ts=ts,
         redis=cog.redis,
         query_source=query_source_of(source),
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
         user_input=origin,
         flat=flat,
         pool_slot=pool_slot,
@@ -699,7 +698,8 @@ async def enqueue_playlist(
     mp: MusicPlayer,
     req: PlayRequest,
     *,
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     origin: str,
     placement: Placement = Placement.TAIL,
     release_hold: Callable[[], Awaitable[None]] = _nothing_to_release,
@@ -707,8 +707,9 @@ async def enqueue_playlist(
 ) -> None:
     """Queue a resolved playlist under the place lock and notify the channel.
     Every collection arrives as queue items, whether or not they are resolved
-    yet. Positions are minted at the resolve and rebased here: `analytics`
-    carries the ask time, and its depth is replaced by the one the head takes."""
+    yet. Positions are minted at the resolve and rebased here, from
+    `queue_position`, the depth the resolve minted from, to the one the head
+    takes."""
     # A collection front-inserts in full, in order, under either flag. NEXT goes
     # through queue_put_next, for the claim the loop's prefetch holds.
     enqueue = {
@@ -748,7 +749,7 @@ async def enqueue_playlist(
     # this head's, and off the lock no sibling -play spends its place bound on the
     # pass. The one under the lock moves only when a sibling placed in between.
     provisional = _head_depth(mp, placement)
-    tracks = await _rebase_positions(tracks, analytics.queue_position, provisional)
+    tracks = await _rebase_positions(tracks, queue_position, provisional)
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             ahead = _songs_ahead(mp, placement)
@@ -879,9 +880,7 @@ async def enqueue_single(
     async with cog._plays.place(req) as verdict:
         if verdict.placed:
             depth = _head_depth(mp, placement)
-            qobj = replace(
-                qobj, analytics=replace(qobj.analytics, queue_position=depth)
-            )
+            qobj = replace(qobj, queue_position=depth)
             if placement is Placement.COLD_FRONT:
                 await mp.queue_put_front(qobj)
             elif placement is Placement.NEXT:
@@ -937,10 +936,8 @@ async def _resolve_interjection_source(
     one `-remove <the link>` takes it all back out. `origin` is the raw command
     argument — for a playlist the link, not the generated titles."""
     # Ask-time analytics: the snowflake time, depth 0 for the head. Tracks behind
-    # it derive 1, 2, … from this base; the caller re-mints the head's own depth.
-    analytics = Analytics(
-        queued_at=ctx.message.created_at.timestamp(), queue_position=0
-    )
+    # it derive 1, 2, … from that base; the caller re-mints the head's own depth.
+    queued_at = ctx.message.created_at.timestamp()
     if _is_spotify_collection(source):
         playlist = await _spotify_collection(source, on_progress=on_progress, cog=cog)
         if playlist.short:
@@ -948,7 +945,8 @@ async def _resolve_interjection_source(
         tracks = await _searches_for(
             playlist.titles,
             requester=ctx.author,
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=0,
             origin=origin,
             rows=playlist.tracks,
         )
@@ -959,7 +957,8 @@ async def _resolve_interjection_source(
             tracks[0].search,
             redis=cog.redis,
             query_source=tracks[0].query_source,
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=0,
             user_input=origin,
             pool_slot=pool_slot,
             isrc=tracks[0].isrc,
@@ -971,7 +970,8 @@ async def _resolve_interjection_source(
             source.playlist_url,
             ctx.author,
             query_source=query_source_of(source),
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=0,
             user_input=origin,
             redis=cog.redis,
             on_progress=on_progress,
@@ -997,7 +997,8 @@ async def _resolve_interjection_source(
     qobj = await queue_source(
         ctx,
         source,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=0,
         origin=origin,
         mode=ResolveMode.FULL,
         pool_slot=pool_slot,
@@ -1124,11 +1125,7 @@ async def interject_flow(
                     # interject() also returns None when the loop moved on to a
                     # DIFFERENT song, which this insert waits behind: depth 1.
                     qobj = replace(
-                        qobj,
-                        interjected=False,
-                        analytics=replace(
-                            qobj.analytics, queue_position=front_insert_depth(mp)
-                        ),
+                        qobj, interjected=False, queue_position=front_insert_depth(mp)
                     )
                     # queue_put_next, for the claim the loop's prefetch holds.
                     # prefetch=False — the stream URL was warmed above.

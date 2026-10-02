@@ -16,50 +16,25 @@ import re
 from zoneinfo import ZoneInfo, available_timezones
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from enum import Enum
 from functools import lru_cache
 from types import MappingProxyType
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Final,
     Literal,
     Self,
     TypeIs,
-    Union,
     get_args,
 )
 
 import orjson
 
 if TYPE_CHECKING:
-    from src.youtube import QueueObject, YTDL
+    from src.queue_item import QueueObject
+    from src.youtube import YTDL
 
 log = logging.getLogger(__name__)
-
-
-# ── Pure-analytics values, grouped ───────────────────────────────────────────
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Analytics:
-    """Values carried on live queue objects (QueueObject, YTDL) for
-    storage alone — read only to serialize or to carry onto the next object; a
-    field anything branches on or renders belongs elsewhere. In-memory shape
-    only: wire entries and play_history columns stay FLAT. Frozen, because carry
-    sites alias one instance across a resume tail and its source."""
-
-    # Unix epoch when the user ASKED: the command message's snowflake time
-    # (Discord's clock, so played_at - queued_at can go slightly negative).
-    # 0.0 = unknown (pre-feature wire entries).
-    queued_at: float
-    # Songs ahead at ask time, counting the one playing (0 = played immediately).
-    # Read once at dispatch, so it is approximate against the insert.
-    queue_position: int
-
-
-# What a pre-feature wire entry rehydrates as, and the default on live objects
-# whose construction site cannot know the values yet.
-ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
 
 # ── guild:{id}:state hash — field name constants ─────────────────────────────
@@ -362,6 +337,12 @@ class LoudnessMode(Enum):
             return None
 
 
+def _stored_loudness(value: str) -> str | None:
+    """`value` as a canonical LoudnessMode value, or None when it names none."""
+    mode = LoudnessMode.parse(value)
+    return mode.value if mode is not None else None
+
+
 # The zone every guild renders ETAs in until it picks one; the schema layer
 # validates against the same default it hands back.
 DEFAULT_TIMEZONE: Final[str] = "America/Los_Angeles"
@@ -377,7 +358,7 @@ DEFAULT_ALONE_TIMEOUT_SECS: Final = 10.0
 OFF_SECS: Final = 0.0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ConfigDomain:
     """The values a numeric guild:{id}:config field may hold."""
 
@@ -395,12 +376,14 @@ class ConfigDomain:
 # the lowest bot value an operator can run.
 CONFIG_DOMAIN: Final[Mapping[ConfigFieldName, ConfigDomain]] = MappingProxyType(
     {
-        ConfigField.VOLUME: ConfigDomain(0.0, 1.0),
-        ConfigField.IDLE_TIMEOUT: ConfigDomain(DEFAULT_IDLE_TIMEOUT_SECS, 1800.0),
-        ConfigField.ALONE_TIMEOUT: ConfigDomain(DEFAULT_ALONE_TIMEOUT_SECS, 120.0),
-        ConfigField.NP_REFRESH: ConfigDomain(1.0, 30.0),
-        ConfigField.SLOW_NOTICE: ConfigDomain(4.0, 60.0, off=True),
-        ConfigField.QUEUE_PROGRESS_DELAY: ConfigDomain(2.0, 60.0),
+        ConfigField.VOLUME: ConfigDomain(lo=0.0, hi=1.0),
+        ConfigField.IDLE_TIMEOUT: ConfigDomain(lo=DEFAULT_IDLE_TIMEOUT_SECS, hi=1800.0),
+        ConfigField.ALONE_TIMEOUT: ConfigDomain(
+            lo=DEFAULT_ALONE_TIMEOUT_SECS, hi=120.0
+        ),
+        ConfigField.NP_REFRESH: ConfigDomain(lo=1.0, hi=30.0),
+        ConfigField.SLOW_NOTICE: ConfigDomain(lo=4.0, hi=60.0, off=True),
+        ConfigField.QUEUE_PROGRESS_DELAY: ConfigDomain(lo=2.0, hi=60.0),
     }
 )
 
@@ -442,12 +425,6 @@ def valid_timezone(name: str) -> bool:
     return 0 < len(name) <= _MAX_TIMEZONE_NAME and name in _known_zones()
 
 
-def _stored_loudness(value: str) -> str | None:
-    """`value` as a canonical LoudnessMode value, or None when it names none."""
-    mode = LoudnessMode.parse(value)
-    return mode.value if mode is not None else None
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildConfig:
     """A guild's DURABLE preferences, in its own key: guild:{id}:state carries a
@@ -463,10 +440,8 @@ class GuildConfig:
     # tzinfo(), which is also where an unusable name degrades.
     timezone: str | None = None
     # A LoudnessMode value, not the enum: the wire stays human-readable and the
-    # settings registry's value type is a str, as timezone's is. Resolved by
-    # loudness_mode() below, which is where an unusable one degrades. Absent means
-    # OFF, and the two stay distinguishable so a future host-level default can
-    # tell "chose off" from "never chose".
+    # stored string is what -settings echoes back. Resolved by loudness_mode(),
+    # which is where an unusable one degrades. Absent means the guild never chose.
     loudness: str | None = None
     idle_timeout_secs: float | None = None
     alone_timeout_secs: float | None = None
@@ -535,9 +510,6 @@ class GuildConfig:
         return cls(
             debug_mode={"1": True, "0": False}.get(_b_str(raw, ConfigField.DEBUG_MODE)),
             timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
-            # Canonicalised through the enum, so an unrecognised mode reads as
-            # unset like every other field here: a build that stored a mode this
-            # one does not know costs the guild that setting, not its whole config.
             loudness=_stored_loudness(_b_str(raw, ConfigField.LOUDNESS)),
             **{field: _b_float(raw, field) for field in CONFIG_DOMAIN},
         )
@@ -662,7 +634,7 @@ class NowPlayingData:
             uploader=song.uploader or "",
             # Empty for unknown duration (livestream) rather than "0:00": the
             # recovered embed keys its Duration line off this being truthy.
-            duration=song.duration if song.duration_secs > 0 else "",
+            duration=song.duration_label if song.duration_secs > 0 else "",
             thumbnail=song.thumbnail or "",
             view_count=str(song.views) if song.views is not None else "",
             like_count=str(song.likes) if song.likes is not None else "",
@@ -720,8 +692,8 @@ class NowPlayingData:
 
 class QueueEntryField:
     TYPE: Final[str] = "type"
-    # "qobj" entries. webpage_url, title, duration and uploader are also a
-    # search's display fields, written there only when known.
+    # webpage_url, title, duration and uploader are written unconditionally and
+    # double as the display fields of a track that has not resolved yet.
     WEBPAGE_URL: Final[str] = "webpage_url"
     TITLE: Final[str] = "title"
     REQUESTER_ID: Final[str] = "requester_id"
@@ -735,31 +707,26 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Ask-time analytics, on both entry types. FLAT on the wire although they
-    # group as Analytics in memory. Absent on pre-feature entries → 0 defaults.
+    # Ask-time analytics, named as the item's fields are. Absent on pre-feature
+    # entries → 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
-    # Parse-time classification, on both entry types (see sources.py).
+    # Parse-time classification (see sources.py).
     QUERY_SOURCE: Final[str] = "query_source"
-    # When the audio started; "qobj" entries only. Absent → 0.0.
+    # When the audio started. Absent → 0.0.
     PLAYED_AT: Final[str] = "played_at"
     # The frozen Now Playing card a resume tail disposes of. Absent → 0/0/False.
     NP_MESSAGE_ID: Final[str] = "np_message_id"
     NP_CHANNEL_ID: Final[str] = "np_channel_id"
     NP_DEDICATED: Final[str] = "np_dedicated"
-    # The term an unresolved item still owes yt-dlp: on every "ytsource" entry,
-    # and on a "qobj" entry only while non-empty.
+    # The term an unresolved item still owes yt-dlp, written only while non-empty.
     YTSEARCH: Final[str] = "ytsearch"
-    # The recording an unresolved item names, on a "ytsource" entry that has one.
+    # The recording an unresolved item names, written only while it has one.
     ISRC: Final[str] = "isrc"
-    # "ytsource" entries
-    URL: Final[str] = "url"
-    PROCESS: Final[str] = "process"
 
 
-# Wire discriminator values; entries written before and after stay readable.
+# The wire discriminator, kept verbatim from the original serializer.
 _ENTRY_TYPE_SONG: Final[str] = "qobj"
-_ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 
 
 # ── Queue-entry value objects — the guild:{id}:queue list at rest ────────────
@@ -768,7 +735,7 @@ _ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongQueueEntry:
     """A queued item at rest ("qobj" on the wire), the pure-data twin of
-    src.youtube.QueueObject — resolved, or still a search when `search` is
+    src.queue_item.QueueObject — resolved, or still a search when `search` is
     non-empty. requester is an ID (a live discord.Member cannot exist at rest;
     GuildQueue rehydrates it), None only for the crashed-head entry. Snowflakes
     stay exact end-to-end: orjson native ints, never floats."""
@@ -786,7 +753,7 @@ class SongQueueEntry:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
-    # Ask-time analytics (0 = unknown / played immediately), see Analytics.
+    # Ask-time analytics (0 = unknown / played immediately), see QueueObject.
     queued_at: float = 0.0
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
@@ -795,18 +762,23 @@ class SongQueueEntry:
     # interrupted by an interjection or recovered from a crash records the start
     # of the play, not of its last fragment.
     played_at: float = 0.0
-    # The interrupted fragment's frozen NP card. The live np_host_ref cannot be
-    # serialized, so a rehydrated tail can only DELETE a dedicated card.
+    # The interrupted fragment's frozen NP card, flat. The live host ref cannot
+    # be serialized, so a rehydrated tail can only DELETE a dedicated card.
     np_message_id: int = 0
     np_channel_id: int = 0
     np_dedicated: bool = False
     # The `ytsearch:` term an unresolved item resolves through, "" once resolved.
     # Written only when non-empty, so a resolved entry's bytes never move.
     search: str = ""
+    # The recording the walk named, which the resolve searches before the term.
+    # Written only while the item has one, so a resolved entry's bytes never move.
+    isrc: str | None = None
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
-        """Snapshot a live queue item for persistence."""
+        """Snapshot a live queue item for persistence. The card flattens to its
+        three wire fields; no card is 0/0/False."""
+        card = item.np_card
         return cls(
             webpage_url=item.webpage_url,
             title=item.title,
@@ -820,14 +792,15 @@ class SongQueueEntry:
             interjected=item.interjected,
             is_resume=item.is_resume,
             start_paused=item.start_paused,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
             query_source=item.query_source,
             played_at=item.played_at,
-            np_message_id=item.np_message_id,
-            np_channel_id=item.np_channel_id,
-            np_dedicated=item.np_dedicated,
+            np_message_id=card.message_id if card is not None else 0,
+            np_channel_id=card.channel_id if card is not None else 0,
+            np_dedicated=card.dedicated if card is not None else False,
             search=item.search,
+            isrc=item.isrc,
         )
 
     @classmethod
@@ -847,10 +820,11 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
-            # A playing song is resolved, so the parked blob owes no term. One
-            # riding into guild:{id}:state would come back out of
-            # from_crashed_state unresolved and re-search at the recovered ts.
+            # A playing song is resolved, so the parked blob owes no term and no
+            # recording. A term riding into guild:{id}:state would come back out
+            # of from_crashed_state unresolved and re-search at the recovered ts.
             search="",
+            isrc=None,
         )
 
     @staticmethod
@@ -903,127 +877,27 @@ class SongQueueEntry:
         # the bytes it was written with, or its LREM misses and rebuilds.
         if self.search:
             fields[QueueEntryField.YTSEARCH] = self.search
+        if self.isrc is not None:
+            fields[QueueEntryField.ISRC] = self.isrc
         return orjson.dumps(fields)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SearchQueueEntry:
-    """An unresolved search at rest ("ytsource" on the wire) — a Spotify playlist
-    track awaiting yt-dlp resolution. Holds exactly the fields that shape persists;
-    the rest default on rehydration. Still written, and read, while a rollback to
-    a build that knows only this shape is possible."""
-
-    ytsearch: str | None = None
-    url: str | None = None
-    process: bool | None = None
-    ts: int | None = None
-    # What the user typed, for -remove: the ytsearch here is a generated title.
-    user_input: str | None = None
-    # Ask-time analytics, so a Spotify playlist track keeps its position through
-    # the resolve at dequeue.
-    queued_at: float = 0.0
-    queue_position: int = 0
-    # The leg that makes a Spotify playlist track archive as Spotify rather than
-    # as the YouTube URL it becomes.
-    query_source: str = ""
-    # Who queued it. None, never 0, on an entry written before the field existed:
-    # the resolve at dequeue routes None to the fallback requester.
-    requester_id: int | None = None
-    # What a listing shows until the search resolves (YTSource's display fields).
-    title: str | None = None
-    uploader: str | None = None
-    duration: int | None = None
-    webpage_url: str | None = None
-    # The recording the walk named, which the resolve searches before the term.
-    # Only this shape carries it: a resolved item has no search left to steer.
-    isrc: str | None = None
-
-    @classmethod
-    def from_queue_object(cls, item: QueueObject) -> Self:
-        """The at-rest form of an item that is still a search. `process` is the
-        True every search entry has been written with: these bytes have to match
-        what is already on the list, or an LREM misses the entry.
-
-        A live item has no "absent": it always names a requester, and an empty
-        display value is the same value as none. An entry rewritten from one
-        therefore settles on the bytes this writer gives it and holds them."""
-        return cls(
-            ytsearch=item.search,
-            process=True,
-            ts=item.ts,
-            user_input=item.user_input,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
-            query_source=item.query_source,
-            requester_id=item.requester.id,
-            # What a listing shows until the search resolves, off the same item
-            # the row is rendered from. Empty writes as no key — the bytes a walk
-            # that named no display row writes for the same track.
-            title=item.title or None,
-            uploader=item.uploader,
-            duration=item.duration,
-            webpage_url=item.webpage_url or None,
-            isrc=item.isrc,
-        )
-
-    def to_redis(self) -> bytes:
-        fields = {
-            QueueEntryField.TYPE: _ENTRY_TYPE_SEARCH,
-            QueueEntryField.YTSEARCH: self.ytsearch,
-            QueueEntryField.URL: self.url,
-            QueueEntryField.PROCESS: self.process,
-            QueueEntryField.TS: self.ts,
-            QueueEntryField.USER_INPUT: self.user_input,
-            QueueEntryField.QUEUED_AT: self.queued_at,
-            QueueEntryField.QUEUE_POSITION: self.queue_position,
-            QueueEntryField.QUERY_SOURCE: self.query_source,
-        }
-        # Only when known: an entry queued before the field existed must serialize
-        # to the bytes already on the list, or its LREM misses and rebuilds.
-        if self.requester_id is not None:
-            fields[QueueEntryField.REQUESTER_ID] = self.requester_id
-        for key, value in (
-            (QueueEntryField.TITLE, self.title),
-            (QueueEntryField.UPLOADER, self.uploader),
-            (QueueEntryField.DURATION, self.duration),
-            (QueueEntryField.WEBPAGE_URL, self.webpage_url),
-            (QueueEntryField.ISRC, self.isrc),
-        ):
-            if value is not None:
-                fields[key] = value
-        return orjson.dumps(fields)
-
-
-QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 
 
 # `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
 # narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
-def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
-    """Deserialize one queue-list entry; "type" discriminates searches from
-    songs. Corrupt entries return None with a warning, so the rest of the queue
-    survives."""
+def read_queue_entry(data: bytes | str) -> tuple[SongQueueEntry | None, str]:
+    """Deserialize one queue-list entry, logging nothing: (entry, "") when it
+    reads, (None, reason) when it does not. A caller reading a whole list takes
+    this one and reports the drops once — a straggler collection is one bad
+    entry per track."""
     try:
         d = orjson.loads(data)
-        if d.get(QueueEntryField.TYPE) == _ENTRY_TYPE_SEARCH:
-            return SearchQueueEntry(
-                ytsearch=d.get(QueueEntryField.YTSEARCH),
-                url=d.get(QueueEntryField.URL),
-                process=d.get(QueueEntryField.PROCESS),
-                ts=d.get(QueueEntryField.TS),
-                user_input=d.get(QueueEntryField.USER_INPUT),
-                queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
-                queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-                query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
-                # No default: absent stays None, which is not requester 0.
-                requester_id=d.get(QueueEntryField.REQUESTER_ID),
-                title=d.get(QueueEntryField.TITLE),
-                uploader=d.get(QueueEntryField.UPLOADER),
-                duration=d.get(QueueEntryField.DURATION),
-                webpage_url=d.get(QueueEntryField.WEBPAGE_URL),
-                isrc=d.get(QueueEntryField.ISRC),
-            )
-        return SongQueueEntry(
+        # Every writer of this list stamps "type" as "qobj"; an entry carrying
+        # anything else is a shape this reader does not know, and takes the
+        # corrupt path whatever other keys it names.
+        entry_type = d[QueueEntryField.TYPE]
+        if entry_type != _ENTRY_TYPE_SONG:
+            raise ValueError(f"entry type {entry_type!r}")
+        entry = SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],
             title=d[QueueEntryField.TITLE],
             requester_id=d[QueueEntryField.REQUESTER_ID],
@@ -1038,7 +912,10 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             start_paused=d.get(QueueEntryField.START_PAUSED, False),
             queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
             queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
-            query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+            # Coalesced like the term below: a stored null would arrive as None
+            # behind the str annotation and raise in HistoryEntry.__post_init__'s
+            # slug clamp when the song ends.
+            query_source=d.get(QueueEntryField.QUERY_SOURCE) or "",
             played_at=d.get(QueueEntryField.PLAYED_AT, 0.0),
             np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
             np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),
@@ -1047,10 +924,22 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             # None, which reads as resolved with no URL to stream and raises
             # where item_label strips the term's prefix.
             search=d.get(QueueEntryField.YTSEARCH) or "",
+            isrc=d.get(QueueEntryField.ISRC),
         )
     except Exception as e:
-        log.warning(f"guild_state: corrupt queue entry dropped: {e}")
-        return None
+        return None, str(e)
+    return entry, ""
+
+
+def parse_queue_entry(data: bytes | str) -> SongQueueEntry | None:
+    """read_queue_entry for a caller holding one entry: None with a warning
+    naming the shape it met, so the rest of the queue survives; it is dropped
+    from the snapshot, leaving the deque shorter than the Redis list until the
+    next mirror rebuild."""
+    entry, reason = read_queue_entry(data)
+    if entry is None:
+        log.warning(f"guild_state: corrupt queue entry dropped: {reason}")
+    return entry
 
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────
@@ -1223,8 +1112,9 @@ class HistoryEntry:
         counterpart to from_song, for an interjection-interrupted entry destroyed
         before its tail could play. played_secs comes from `ts`, the ABSOLUTE
         resume offset, capped at duration. The host ids come off the tail's
-        np_* fields: the cleanup that deletes that card fires only when a tail
-        STARTS, and a flushed tail never does."""
+        card: the cleanup that deletes that card fires only when a tail STARTS,
+        and a flushed tail never does."""
+        card = item.np_card
         played = item.ts or 0
         duration = item.duration or 0
         if duration:
@@ -1240,10 +1130,10 @@ class HistoryEntry:
             thumbnail=item.thumbnail or "",
             uploader=item.uploader or "",
             played_at=item.played_at,
-            message_id=item.np_message_id,
-            channel_id=item.np_channel_id,
-            queued_at=item.analytics.queued_at,
-            queue_position=item.analytics.queue_position,
+            message_id=card.message_id if card is not None else 0,
+            channel_id=card.channel_id if card is not None else 0,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
             query_source=item.query_source,
         )
 
@@ -1319,7 +1209,7 @@ class GuildPlaybackSnapshot:
     the halves live here as named properties."""
 
     state: GuildStateData
-    queue: tuple[QueueEntry, ...] = ()
+    queue: tuple[SongQueueEntry, ...] = ()
     # List entries parse_queue_entry could not read. They stay on the Redis list
     # at their positions while `queue` skips them, so the restore marks the
     # mirror stale when this is non-zero.
@@ -1363,7 +1253,10 @@ class GuildRecoveryGate:
 
     @property
     def has_restorable_playback(self) -> bool:
-        """GuildPlaybackSnapshot.has_restorable_playback over the queue length."""
+        """GuildPlaybackSnapshot.has_restorable_playback over the queue length.
+        LLEN counts entries parse_queue_entry cannot read, so a list of only
+        those reconnects and restores nothing; that restore marks the mirror
+        stale, and the next write rebuilds the list without them."""
         return self.pending_count > 0 or self.state.has_crashed_song
 
 

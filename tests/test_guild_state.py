@@ -16,10 +16,10 @@ from unittest.mock import MagicMock
 from src import config, guild_state
 
 from src.redis_client import GuildRedisStore
-from src.youtube import YTDL, QueueObject
-from tests.helpers import give_queue_object, stub_requester, unresolved
+from src.queue_item import NpCard, QueueObject
+from src.youtube import YTDL
+from tests.helpers import give_queue_object
 from src.guild_state import (
-    Analytics,
     CONFIG_DOMAIN,
     DEFAULT_TIMEZONE,
     OFF_SECS,
@@ -34,15 +34,14 @@ from src.guild_state import (
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
-    SearchQueueEntry,
     SongQueueEntry,
     StateField,
     TopListener,
     TopSong,
     parse_history_entry,
     parse_queue_entry,
+    read_queue_entry,
     serialize_history_entry,
-    LoudnessMode,
     valid_timezone,
     parse_number_fields,
 )
@@ -322,7 +321,7 @@ def _full_song_stub() -> YTDL:
             title="Test Song",
             webpage_url="https://youtu.be/abc",
             uploader="Test Channel",
-            duration="4:00",
+            duration_label="4:00",
             duration_secs=240,
             thumbnail="https://img/x.jpg",
             views=1000,
@@ -431,19 +430,18 @@ class TestNowPlayingDataImmutability:
 
 # ── Queue-entry value objects ─────────────────────────────────────────────────
 
-# Golden wire fixtures — byte literals capturing the current writer output.
-# These pin the wire format in both directions so a rolling restart can mix
-# old and new writers. The _PRE_INTERJECTION golden pins the reader against entries
-# written before the interjection flags existed (parsed as False).
+# Golden wire fixtures — byte literals of the exact orjson output, pinning the
+# writer and the reader against each other. _PRE_INTERJECTION pins the reader
+# against entries written before the interjection flags existed.
 
 _INTERJECTION_FLAGS_FALSE = (
     b'"interjected":false,"is_resume":false,"start_paused":false'
 )
 _ENQUEUE_STAMPS_ZERO = b'"queued_at":0.0,"queue_position":0'
 _QUERY_SOURCE_UNKNOWN = b'"query_source":""'
-# "qobj" only — a search has not played, so SearchQueueEntry carries no such field.
+# A queued entry has not played, so this is 0.0 on all but a resume tail.
 _PLAYED_AT_UNPLAYED = b'"played_at":0.0'
-# Likewise "qobj" only: the frozen NP card a resume tail is responsible for.
+# The frozen NP card a resume tail is responsible for.
 _NP_HOST_NONE = b'"np_message_id":0,"np_channel_id":0,"np_dedicated":false'
 _GOLDEN_QOBJ_FULL = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
@@ -485,27 +483,6 @@ _GOLDEN_QOBJ_UNPERSISTED = (
     + b"}"
 )
 _GOLDEN_QOBJ_PRE_INTERJECTION = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
-_GOLDEN_YTSOURCE = (
-    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,'
-    b'"ts":null,"user_input":null,'
-    + _ENQUEUE_STAMPS_ZERO
-    + b","
-    + _QUERY_SOURCE_UNKNOWN
-    + b"}"
-)
-# Written before the enqueue stamps existed: the reader defaults both to 0.
-_GOLDEN_YTSOURCE_PRE_STAMPS = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
-# Every optional key present. The ORDER is the contract: -remove and -clear LREM by
-# these exact bytes, so a reordered writer misses every entry already in Redis.
-_GOLDEN_YTSOURCE_FULL = (
-    b'{"type":"ytsource","ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null,'
-    b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,"queue_position":0,'
-    b'"query_source":"","requester_id":424242424242424242,"title":"DNA.",'
-    b'"uploader":"Kendrick Lamar","duration":185,'
-    b'"webpage_url":"https://open.spotify.com/track/abc",'
-    b'"isrc":"USUM71703861"}'
-)
-
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
     title="Golden Song",
@@ -532,6 +509,31 @@ _GOLDEN_QOBJ_SEARCH = (
     + b","
     + _NP_HOST_NONE
     + b',"ytsearch":"ytsearch:DNA. Kendrick Lamar"}'
+)
+# The "ytsource" shape builds before 2.54.0 wrote for an unresolved item,
+# reconstructed field for field from that writer (SearchQueueEntry.to_redis at
+# ac264d60): type, ytsearch, url, process, ts, user_input, queued_at,
+# queue_position, query_source, then requester_id and the display fields when
+# the walk knew them.
+_RETIRED_BARE = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,'
+    b'"process":true,"ts":null,"user_input":null,"queued_at":0.0,'
+    b'"queue_position":0,"query_source":""}'
+)
+# What a Spotify collection walk wrote when it returned display rows: every
+# optional key set, so the entry names all three the song reader requires.
+_RETIRED_WITH_DISPLAY = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null,'
+    b'"process":true,"ts":null,"user_input":"https://open.spotify.com/album/x",'
+    b'"queued_at":1752530000.5,"queue_position":7,"query_source":"spotify.com",'
+    b'"requester_id":424242424242424242,"title":"DNA.",'
+    b'"uploader":"Kendrick Lamar","duration":185,'
+    b'"webpage_url":"https://open.spotify.com/track/abc"}'
+)
+# The same, for a link queued before it resolved: `url` set, no search term.
+_RETIRED_WITH_DISPLAY_NO_TERM = _RETIRED_WITH_DISPLAY.replace(
+    b'"ytsearch":"ytsearch:DNA. Kendrick Lamar","url":null',
+    b'"ytsearch":null,"url":"https://yt.com/v=9"',
 )
 _SEARCH_ENTRY = SongQueueEntry(
     webpage_url="https://open.spotify.com/track/abc",
@@ -717,7 +719,8 @@ class TestSongQueueEntryWire:
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
             requester=_requester_stub(222222222222222222),
-            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+            queued_at=1752530000.5,
+            queue_position=4,
         )
         entry = SongQueueEntry.from_queue_object(item)
         parsed = parse_queue_entry(entry.to_redis())
@@ -778,6 +781,20 @@ class TestSongQueueEntryWire:
         assert isinstance(entry, SongQueueEntry)
         assert entry.search == ""
 
+    def test_reader_reads_a_null_query_source_as_unknown(self) -> None:
+        """A present key holding null is not an absent key, so the default never
+        applies. Left as None it rides the item to song end, where
+        HistoryEntry.__post_init__ clamps the field with a regex and raises."""
+        written = _GOLDEN_QOBJ_FULL.replace(
+            _QUERY_SOURCE_UNKNOWN, b'"query_source":null'
+        )
+        assert written != _GOLDEN_QOBJ_FULL
+        entry = parse_queue_entry(written)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.query_source == ""
+        # The clamp a None reached: a str it accepts without a word.
+        assert HistoryEntry(query_source=entry.query_source).query_source == ""
+
     def test_from_queue_object_carries_the_search(self) -> None:
         item = QueueObject(
             webpage_url="https://open.spotify.com/track/abc",
@@ -789,180 +806,38 @@ class TestSongQueueEntryWire:
         )
         assert SongQueueEntry.from_queue_object(item) == _SEARCH_ENTRY
 
-
-class TestSearchQueueEntryWire:
-    def test_writer_matches_golden_bytes(self) -> None:
-        entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
-        assert entry.to_redis() == _GOLDEN_YTSOURCE
-
-    def test_a_populated_writer_matches_golden_bytes(self) -> None:
-        """Pins the KEY ORDER, which the round-trip tests cannot see. LREM matches
-        an entry by its exact bytes, so reordering the writer leaves every already
-        queued track unremovable until the mirror is rebuilt."""
-        entry = SearchQueueEntry(
-            ytsearch="ytsearch:DNA. Kendrick Lamar",
-            process=True,
-            requester_id=424242424242424242,
-            title="DNA.",
-            uploader="Kendrick Lamar",
-            duration=185,
-            webpage_url="https://open.spotify.com/track/abc",
-            isrc="USUM71703861",
-        )
-        assert entry.to_redis() == _GOLDEN_YTSOURCE_FULL
-
-    def test_a_falsy_display_value_is_written_not_skipped(self) -> None:
-        """The writer's guard is `is not None`, not truthiness: a Spotify track
-        can carry a zero duration, and skipping the key would read back as
-        unknown and render `?:??`. This is the writer's own contract — a live
-        item reaches it with empty already mapped to absent."""
-        entry = SearchQueueEntry(
-            ytsearch="ytsearch:x", process=True, title="", duration=0
-        )
-        raw = entry.to_redis()
-        assert b'"title":""' in raw
-        assert b'"duration":0' in raw
-
     def test_an_entry_without_an_isrc_writes_the_bytes_it_always_did(self) -> None:
-        """The key is written only when known. An entry queued by the previous
+        """The key is written only when known: an entry queued by the previous
         build has to serialize to the same bytes, or its LREM misses and -remove
-        rewrites the whole list under the bulk mutex."""
-        entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
-        assert b"isrc" not in entry.to_redis()
+        rewrites the whole list."""
+        assert _SEARCH_ENTRY.isrc is None
+        assert b"isrc" not in _SEARCH_ENTRY.to_redis()
+        assert _SEARCH_ENTRY.to_redis() == _GOLDEN_QOBJ_SEARCH
 
     def test_the_isrc_round_trips(self) -> None:
         """Without it a restart sends every queued Spotify track back down the
         title path, which is the music video for anything well known."""
-        parsed = parse_queue_entry(
-            SearchQueueEntry(
-                ytsearch="ytsearch:x", process=True, isrc="GBAHS1600463"
-            ).to_redis()
-        )
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.isrc == "GBAHS1600463"
+        entry = dataclasses.replace(_SEARCH_ENTRY, isrc="GBAHS1600463")
+        raw = entry.to_redis()
+        assert raw.endswith(b'"isrc":"GBAHS1600463"}')
+        assert parse_queue_entry(raw) == entry
 
-    def test_an_entry_written_before_the_isrc_existed_parses(self) -> None:
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.isrc is None
+    def test_reader_defaults_isrc_on_a_pre_feature_entry(self) -> None:
+        entry = parse_queue_entry(_GOLDEN_QOBJ_SEARCH)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.isrc is None
 
-    def test_the_requester_round_trips_through_the_lazy_resolve(self) -> None:
-        item = unresolved("x", stub_requester(424242424242424242))
-        parsed = parse_queue_entry(SearchQueueEntry.from_queue_object(item).to_redis())
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.requester_id == 424242424242424242
-
-    def test_the_display_fields_round_trip(self) -> None:
-        """What -queue shows for an unresolved Spotify track has to survive a
-        restart, or a restored queue reads "resolving..." again."""
-        item = unresolved(
-            "DNA. Kendrick Lamar",
-            title="DNA.",
-            uploader="Kendrick Lamar",
-            duration=185,
+    def test_from_queue_object_carries_the_isrc(self) -> None:
+        item = QueueObject(
             webpage_url="https://open.spotify.com/track/abc",
+            title="DNA.",
+            requester=_requester_stub(424242424242424242),
+            duration=185,
+            uploader="Kendrick Lamar",
+            search="ytsearch:DNA. Kendrick Lamar",
+            isrc="GBAHS1600463",
         )
-        parsed = parse_queue_entry(SearchQueueEntry.from_queue_object(item).to_redis())
-        assert isinstance(parsed, SearchQueueEntry)
-        assert (parsed.title, parsed.uploader, parsed.duration, parsed.webpage_url) == (
-            "DNA.",
-            "Kendrick Lamar",
-            185,
-            "https://open.spotify.com/track/abc",
-        )
-
-    def test_absent_display_fields_write_no_keys(self) -> None:
-        """A typed search, and any entry queued before the fields existed, must
-        serialize to the bytes already on the list, or its LREM misses."""
-        raw = SearchQueueEntry(ytsearch="ytsearch:x").to_redis()
-        for key in (b"title", b"uploader", b"duration", b"webpage_url"):
-            assert key not in raw
-
-    def test_an_entry_without_display_fields_parses_them_as_none(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert isinstance(entry, SearchQueueEntry)
-        assert (entry.title, entry.uploader, entry.duration, entry.webpage_url) == (
-            None,
-            None,
-            None,
-            None,
-        )
-
-    def test_an_unknown_requester_writes_no_key(self) -> None:
-        """An entry queued before searches carried a requester must serialize to the
-        bytes already on the list, or removing it misses LREM and rebuilds."""
-        entry = SearchQueueEntry(ytsearch="ytsearch:x")
-        assert entry.requester_id is None
-        assert b"requester_id" not in entry.to_redis()
-
-    def test_a_pre_requester_entry_parses_as_none(self) -> None:
-        # Not 0: None routes to the fallback requester, 0 to member 0, nobody.
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert isinstance(entry, SearchQueueEntry)
-        assert entry.requester_id is None
-
-    def test_origin_survives_the_wire(self) -> None:
-        """An unresolved Spotify-playlist track is the only place that link still
-        exists: its ytsearch is a title the expansion generated, and the resolved
-        YouTube URL it becomes names neither. Drop this field on the wire and
-        -remove <playlist link> stops matching the moment the bot restarts."""
-        album = "https://open.spotify.com/album/abc123"
-        entry = SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)
-        parsed = parse_queue_entry(entry.to_redis())
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.user_input == album
-
-    def test_pre_feature_entry_parses_with_no_origin(self) -> None:
-        """Absent reads as None, not as an error — the same convention every other
-        added field follows, so a queue written by an older build still restores."""
-        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_STAMPS)
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.user_input is None
-
-    def test_reader_parses_golden_bytes(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
-        assert entry == SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
-
-    def test_round_trip(self) -> None:
-        entry = SearchQueueEntry(url="https://yt.com/v=9", ts=10)
-        assert parse_queue_entry(entry.to_redis()) == entry
-
-    def test_from_queue_object(self) -> None:
-        """Every entry written now carries its requester: the item holds a real
-        one, so there is no unknown left to write."""
-        item = unresolved("x", stub_requester(222222222222222222))
-        assert SearchQueueEntry.from_queue_object(item) == SearchQueueEntry(
-            ytsearch="ytsearch:x", process=True, requester_id=222222222222222222
-        )
-
-    def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
-        # Searches written before the enqueue stamps existed must still parse.
-        entry = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_STAMPS)
-        assert isinstance(entry, SearchQueueEntry)
-        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
-        assert entry.query_source == ""
-
-    def test_query_source_round_trips_through_the_lazy_resolve(self) -> None:
-        # The leg that makes a Spotify playlist track archive as Spotify: these
-        # entries sit in Redis unresolved and become YouTube URLs at dequeue, so
-        # nothing downstream could recover the classification.
-        entry = SearchQueueEntry.from_queue_object(
-            unresolved("x", query_source="spotify.com")
-        )
-        parsed = parse_queue_entry(entry.to_redis())
-        assert isinstance(parsed, SearchQueueEntry)
-        assert parsed.query_source == "spotify.com"
-
-    def test_enqueue_stamps_round_trip(self) -> None:
-        entry = SearchQueueEntry.from_queue_object(
-            unresolved(
-                "x", analytics=Analytics(queued_at=1752530000.5, queue_position=7)
-            )
-        )
-        parsed = parse_queue_entry(entry.to_redis())
-        assert parsed == entry
-        assert isinstance(parsed, SearchQueueEntry)
-        assert (parsed.queued_at, parsed.queue_position) == (1752530000.5, 7)
+        assert SongQueueEntry.from_queue_object(item).isrc == "GBAHS1600463"
 
 
 class TestParseQueueEntryCorrupt:
@@ -971,8 +846,11 @@ class TestParseQueueEntryCorrupt:
         [
             b"not json at all",
             b'{"type":"qobj","title":"missing url and requester"}',
-            # A search may omit its requester; a resolved song may not.
+            # requester_id is required of every entry, one still unresolved
+            # included; a `null` is a value, a missing key is corrupt.
             b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"missing requester"}',
+            # "type" is required: every writer of this list stamps it.
+            b'{"webpage_url":"https://yt.com/v=1","title":"T","requester_id":42}',
             b"",
         ],
     )
@@ -982,6 +860,49 @@ class TestParseQueueEntryCorrupt:
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            pytest.param(_RETIRED_BARE, id="no-display-fields"),
+            pytest.param(_RETIRED_WITH_DISPLAY, id="display-fields"),
+            pytest.param(_RETIRED_WITH_DISPLAY_NO_TERM, id="display-fields-no-term"),
+        ],
+    )
+    def test_a_retired_search_entry_is_dropped(
+        self, raw: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The shape builds before 2.54.0 gave an unresolved track is "ytsource",
+        so it takes the corrupt path whichever optional keys it carries — including
+        the display-bearing variety a Spotify collection walk wrote, which names
+        every key a song entry requires."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert parse_queue_entry(raw) is None
+        assert "corrupt queue entry" in caplog.text
+
+    def test_the_drop_warning_names_the_shape(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The value is what tells an operator a straggler was dropped rather than
+        # a byte-corrupt entry, so the log line carries it.
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            parse_queue_entry(_RETIRED_WITH_DISPLAY)
+        assert "ytsource" in caplog.text
+
+    def test_the_silent_reader_hands_the_reason_back_instead(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A caller reading a whole list logs the drops once itself, so
+        read_queue_entry returns the reason and says nothing: a straggler
+        collection is one unreadable entry per track."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            entry, reason = read_queue_entry(_RETIRED_WITH_DISPLAY)
+        assert entry is None
+        assert "ytsource" in reason
+        assert caplog.text == ""
+
+    def test_the_silent_reader_reports_no_reason_for_an_entry_it_read(self) -> None:
+        assert read_queue_entry(_GOLDEN_QOBJ_SEARCH) == (_SEARCH_ENTRY, "")
 
     def test_a_malformed_optional_field_keeps_the_song(self) -> None:
         """Only the REQUIRED keys drop an entry. The optional ones are read with a
@@ -1379,7 +1300,8 @@ def _history_song_stub(**overrides: Any) -> YTDL:
     source, the ask on the queue object it holds."""
     ask: dict = dict(
         requester=SimpleNamespace(id=333, display_name="Omkar"),
-        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
+        queued_at=1752529000.0,
+        queue_position=2,
         query_source="youtube.com",
         played_at=1752530000.0,
     )
@@ -1534,7 +1456,8 @@ def _played_tail(**overrides: Any) -> QueueObject:
         uploader="Chan",
         thumbnail="https://img/x.jpg",
         is_resume=True,
-        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
+        queued_at=1752529000.0,
+        queue_position=2,
         query_source="youtube.com",
         played_at=1752530000.0,
     )
@@ -1599,16 +1522,18 @@ class TestHistoryEntryFromQueueObject:
             == 0
         )
 
-    def test_host_ids_come_from_the_tails_np_fields(self) -> None:
+    def test_host_ids_come_from_the_tails_card(self) -> None:
         """The tail names the card its interrupted fragment left frozen — the last
         message that hosted this play, which is what the column means. Still
         resolvable here: the cleanup that deletes it fires only when a tail STARTS,
         and a flushed tail never does."""
         entry = HistoryEntry.from_queue_object(
             _played_tail(
-                np_message_id=777777777777777777,
-                np_channel_id=888888888888888888,
-                np_dedicated=True,
+                np_card=NpCard(
+                    message_id=777777777777777777,
+                    channel_id=888888888888888888,
+                    dedicated=True,
+                ),
             ),
             guild_id=111,
         )
@@ -1645,7 +1570,8 @@ class TestSongQueueEntryFromSong:
             user_input="https://open.spotify.com/playlist/abc",
             query_source="spotify.com",
             interjected=True,
-            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
+            queued_at=1752530000.5,
+            queue_position=4,
             played_at=1752530111.0,
         )
 
@@ -1677,6 +1603,16 @@ class TestSongQueueEntryFromSong:
         song = ytdl_instance(None, search="ytsearch:some other song")
 
         assert SongQueueEntry.from_song(song).search == ""
+
+    def test_the_parked_song_owes_no_isrc(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
+        """The recording's identity steers a search, and a playing song has none
+        left; carried into the blob it would come back on the recovered song
+        for no reader to use."""
+        song = ytdl_instance(None, isrc="GBAHS1600463")
+
+        assert SongQueueEntry.from_song(song).isrc is None
 
     def test_the_payload_thumbnail_is_written_over_the_queued_one(
         self, ytdl_instance: Callable[..., Any]
@@ -1724,7 +1660,8 @@ class TestCrashedSongRoundTrip:
         song.user_input = "https://open.spotify.com/playlist/xyz"
         song.query_source = "spotify.com"
         song.played_at = 1234.5
-        song.analytics = Analytics(queued_at=99.0, queue_position=3)
+        song.queued_at = 99.0
+        song.queue_position = 3
         for k, v in over.items():
             setattr(song, k, v)
         return song
@@ -2286,11 +2223,6 @@ class TestQueueEntryImmutability:
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(_FULL_ENTRY, "title", "x")
 
-    def test_search_entry_frozen(self) -> None:
-        entry = SearchQueueEntry()
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(entry, "url", "x")
-
 
 class TestSharedBoardRows:
     """The two rows -analytics and -leaderboard share. A column that goes
@@ -2716,76 +2648,6 @@ class TestGuildConfigTimezone:
         assert GuildConfig.from_redis(raw).timezone is None
 
 
-class TestGuildConfigLoudness:
-    """How much loudness processing a guild wants. Stored as the mode's own name and
-    resolved at read time, so a mode a later build adds costs an older one that
-    setting rather than its whole config."""
-
-    def test_unset_resolves_to_off(self) -> None:
-        """OFF is the only mode that emits no filter, which is the only way a song
-        stays bit-exact: a guild that never chose must land here."""
-        assert GuildConfig().loudness_mode() is LoudnessMode.OFF
-        assert GuildConfig().to_redis() == {}
-
-    @pytest.mark.parametrize("mode", list(LoudnessMode))
-    def test_every_mode_round_trips(self, mode: LoudnessMode) -> None:
-        config = GuildConfig(loudness=mode.value)
-        assert config.to_redis() == {ConfigField.LOUDNESS: mode.value}
-        raw = {ConfigField.LOUDNESS.encode(): mode.value.encode()}
-        assert GuildConfig.from_redis(raw).loudness_mode() is mode
-
-    def test_an_explicit_off_is_not_absent(self) -> None:
-        """The two stay distinguishable on the wire, so a future host-level default
-        can tell "chose off" from "never chose"."""
-        assert GuildConfig(loudness="off").to_redis() == {ConfigField.LOUDNESS: "off"}
-
-    @pytest.mark.parametrize("stored", ["", "loud", "dynaudnorm", "1", "\x00", "peakk"])
-    def test_a_mode_this_build_does_not_know_reads_as_unset(self, stored: str) -> None:
-        """A value a NEWER build wrote, or a corrupt one. Both read as unset and
-        play at the default rather than raising out of from_redis."""
-        raw = {ConfigField.LOUDNESS.encode(): stored.encode()}
-        parsed = GuildConfig.from_redis(raw)
-        assert parsed.loudness is None
-        assert parsed.loudness_mode() is LoudnessMode.OFF
-
-    @pytest.mark.parametrize(
-        ("stored", "mode"),
-        [
-            ("PEAK ", LoudnessMode.PEAK),
-            (" normalize", LoudnessMode.NORMALIZE),
-            ("Off", LoudnessMode.OFF),
-        ],
-    )
-    def test_a_mode_this_build_knows_survives_its_spelling(
-        self, stored: str, mode: LoudnessMode
-    ) -> None:
-        """Case and surrounding space are the user's, not the wire's."""
-        raw = {ConfigField.LOUDNESS.encode(): stored.encode()}
-        parsed = GuildConfig.from_redis(raw)
-        assert parsed.loudness == mode.value
-        assert parsed.loudness_mode() is mode
-
-    def test_a_stored_mode_is_canonicalised(self) -> None:
-        """The wire holds the enum's own spelling, whatever case reached it."""
-        raw = {ConfigField.LOUDNESS.encode(): b"NORMALIZE"}
-        assert GuildConfig.from_redis(raw).loudness == "normalize"
-
-    @pytest.mark.parametrize(
-        ("typed", "expected"),
-        [
-            ("off", LoudnessMode.OFF),
-            ("PEAK", LoudnessMode.PEAK),
-            ("  normalize  ", LoudnessMode.NORMALIZE),
-            ("loud", None),
-            ("", None),
-        ],
-    )
-    def test_parse_is_one_grammar_for_the_wire_and_the_command(
-        self, typed: str, expected: LoudnessMode | None
-    ) -> None:
-        assert LoudnessMode.parse(typed) is expected
-
-
 class TestValidTimezone:
     """The WRITE-boundary check. tzinfo()'s fallback covers a name that stopped
     resolving; this stops an unusable one being stored in the first place, because
@@ -2898,11 +2760,11 @@ class TestConfigDomain:
     def test_bounds_are_inclusive_and_nan_is_refused(
         self, value: float, admitted: bool
     ) -> None:
-        assert ConfigDomain(4.0, 60.0).admits(value) is admitted
+        assert ConfigDomain(lo=4.0, hi=60.0).admits(value) is admitted
 
     def test_off_is_admitted_only_where_the_domain_says_so(self) -> None:
-        assert ConfigDomain(4.0, 60.0, off=True).admits(OFF_SECS)
-        assert not ConfigDomain(4.0, 60.0).admits(OFF_SECS)
+        assert ConfigDomain(lo=4.0, hi=60.0, off=True).admits(OFF_SECS)
+        assert not ConfigDomain(lo=4.0, hi=60.0).admits(OFF_SECS)
 
     def test_every_numeric_config_field_has_a_domain(self) -> None:
         numeric = members(ConfigField) - {

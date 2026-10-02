@@ -30,7 +30,8 @@ from src.recovery import VoiceWatchdog
 from src.settings import GuildSettings
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from src.youtube import QueueObject, close_probe_session
+from src.queue_item import QueueObject
+from src.youtube import close_probe_session
 from tests.helpers import (
     add_settings_state,
     give_queue_object,
@@ -554,7 +555,7 @@ def mock_song() -> MagicMock:
     requester.id = 123456
     requester.display_name = "TestUser"
     song.webpage_url = "https://www.youtube.com/watch?v=testid"
-    song.duration = "0:03:30"
+    song.duration_label = "0:03:30"
     song.uploader = "Test Channel"
     song.views = 1_000_000
     song.likes = 50_000
@@ -700,7 +701,8 @@ def ytdl_instance(
     """Factory that creates a YTDL instance with FFmpegOpusAudio.__init__ patched out."""
     from unittest.mock import patch
     import discord as d
-    from src.youtube import YTDL, QueueObject, YTDLVideoInfo
+    from src.queue_item import QueueObject
+    from src.youtube import YTDL, YTDLVideoInfo
 
     def _make(data: Optional[dict] = None, **carried: Any) -> Any:
         default_data = {

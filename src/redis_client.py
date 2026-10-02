@@ -43,12 +43,11 @@ from src.guild_state import (
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
-    QueueEntry,
     ResettableConfigField,
     SongQueueEntry,
     StateField,
     parse_history_entry,
-    parse_queue_entry,
+    read_queue_entry,
     serialize_history_entry,
     valid_timezone,
 )
@@ -93,6 +92,10 @@ GUILD_TTL = 86400
 # corrupt or duplicate entry shortens the answer by one. Raising it costs ~625 B
 # per entry per guild, permanently. See docs/ARCHITECTURE.md#history-read-path.
 HISTORY_CACHE_LIMIT = 50
+# How many DISTINCT parse failures one queue read names before the rest are
+# only counted. A straggler collection fails the same way every track, so the
+# first few spell out the shape without the line growing with the queue.
+_CORRUPT_REASON_SAMPLE = 3
 
 # Transient per-song fields and the playback-position fields, cleared together
 # on song end / disconnect (clear_song_end_state, clear_connection). An older
@@ -849,7 +852,7 @@ class GuildRedisStore:
     # Queue operations
 
     @_guild_op(default=False)
-    async def push_queue(self, entry: QueueEntry) -> bool:
+    async def push_queue(self, entry: SongQueueEntry) -> bool:
         """RPUSH one queue entry and refresh TTL on all guild keys. Reports whether
         it landed: the failure is swallowed here, and the caller has no other way to
         learn its mirror is now short of the deque."""
@@ -860,7 +863,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> bool:
+    async def push_queue_batch(self, entries: Sequence[SongQueueEntry]) -> bool:
         """RPUSH all entries in one round-trip and refresh TTL on all guild keys.
         Reports whether it landed, like push_queue; nothing to write is a landed
         write, since the mirror already agrees with the deque."""
@@ -873,7 +876,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> bool:
+    async def push_queue_front(self, entries: Sequence[SongQueueEntry]) -> bool:
         """LPUSH entries so entries[0] ends up at the queue head — the interjection
         front insert; reversed first because LPUSH sends each successive
         argument to the head. A swallowed failure here leaves memory
@@ -988,7 +991,7 @@ class GuildRedisStore:
     async def rebuild_queue_and_start_song(
         self,
         current: SongQueueEntry,
-        entries: Sequence[QueueEntry],
+        entries: Sequence[SongQueueEntry],
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
         start_offset: float = 0.0,
@@ -1030,7 +1033,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=False)
-    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> bool:
+    async def rebuild_queue(self, entries: Sequence[SongQueueEntry]) -> bool:
         """DELETE + RPUSH all entries in one MULTI, so a concurrent LPOP never
         sees an empty window. Returns whether it landed."""
         pipe = self.redis.pipeline(transaction=True)
@@ -1041,7 +1044,7 @@ class GuildRedisStore:
         return True
 
     @_guild_op(default=0)
-    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
+    async def remove_queue_entries(self, entries: Sequence[SongQueueEntry]) -> int:
         """LREM the given entries out of the list, leaving the rest in place.
         Returns HOW MANY were removed — the caller must check it: LREM matches
         exact serialized bytes, so an entry the list no longer holds in that form
@@ -1289,11 +1292,7 @@ class GuildRedisStore:
                 raise reply
         raw_state, raw_queue, raw_np, raw_history = replies
         raw_config = _config_hash(config_reply, f"[guild:{self.guild_id}]")
-        entries = tuple(
-            entry
-            for entry in (parse_queue_entry(item) for item in raw_queue)
-            if entry is not None
-        )
+        entries = self._readable_queue(raw_queue)
         history = tuple(
             entry
             for entry in (parse_history_entry(item) for item in raw_history)
@@ -1309,6 +1308,29 @@ class GuildRedisStore:
             history=history,
             config=GuildConfig.from_redis(raw_config),
         )
+
+    def _readable_queue(self, raw_queue: list[Any]) -> tuple[SongQueueEntry, ...]:
+        """The entries of one LRANGE that parse, reporting the rest on a single
+        warning. A queued collection is read in one pass, so a per-entry line
+        would put one WARNING per track on stdout and OTLP; this names the
+        guild, the count and the distinct shapes met instead."""
+        entries: list[SongQueueEntry] = []
+        reasons: list[str] = []
+        for item in raw_queue:
+            entry, reason = read_queue_entry(item)
+            if entry is not None:
+                entries.append(entry)
+            elif reason not in reasons and len(reasons) < _CORRUPT_REASON_SAMPLE:
+                reasons.append(reason)
+        unreadable = len(raw_queue) - len(entries)
+        if unreadable:
+            log.warning(
+                f"[guild:{self.guild_id}] dropped {unreadable} of "
+                f"{len(raw_queue)} queue entries as corrupt: "
+                f"{'; '.join(reasons)} — they stay on the Redis list until the "
+                "next mirror rebuild"
+            )
+        return tuple(entries)
 
     def _volume_admitted(self, volume: float) -> bool:
         """The volume setters take a raw float, so they check CONFIG_DOMAIN

@@ -9,7 +9,7 @@ import contextlib
 import dataclasses
 from contextlib import AbstractContextManager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, TypedDict, cast
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -18,11 +18,12 @@ from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue
-from src.guild_state import Analytics, GuildConfig
+from src.guild_state import GuildConfig
+from src.queue_item import QueueObject
 from src.redis_client import GuildRedisStore, iter_guild_configs
 from src.settings import GuildSettings
 from src.play_placement import PlayMode, PlayRequest
-from src.youtube import YTDL, QueueObject, YoutubePlaylist
+from src.youtube import YTDL, YoutubePlaylist
 
 if TYPE_CHECKING:
     from src.musicbot import MusicBot
@@ -299,7 +300,7 @@ def mock_mp(qsize: int = 0) -> MagicMock:
     mp.queue.claim_outstanding = MagicMock(return_value=False)
     mp.queue.qsize = MagicMock(return_value=qsize)
     # Numeric for the same reason as playback_holds: this lands in
-    # Analytics.queue_position and rides to Postgres through HistoryEntry's
+    # QueueObject.queue_position and rides to Postgres through HistoryEntry's
     # integer clamp, which a Mock raises on rather than answering.
     mp.enqueue_depth = MagicMock(return_value=qsize)
     # Numeric for that reason too: _cold_start_left_something_playable compares it
@@ -322,6 +323,17 @@ ASK_FIELDS: tuple[str, ...] = tuple(
     for f in dataclasses.fields(QueueObject)
     if isinstance(getattr(YTDL, f.name, None), property)
 )
+
+
+def same_ask(a: QueueObject, b: QueueObject) -> bool:
+    """Whether two items are one ask field for field, `queue_position` aside: a
+    put re-mints the depth, so the item it takes is a copy of the one the caller
+    built."""
+    return all(
+        getattr(a, f.name) == getattr(b, f.name)
+        for f in dataclasses.fields(QueueObject)
+        if f.name != "queue_position"
+    )
 
 
 def unresolved(term: str, requester: Any = None, **fields: Any) -> QueueObject:
@@ -375,9 +387,23 @@ def give_queue_object(song: Any, queued: QueueObject) -> QueueObject:
     return queued
 
 
+class Ask(TypedDict):
+    """The two ask-time analytics keywords a queue item, the resolve functions
+    and -replay take together, spelled once per test module and splatted."""
+
+    queued_at: float
+    queue_position: int
+
+
+def ask_of(item: Any) -> Ask:
+    """The ask-time analytics an item or a song double carries, as the keywords
+    it was built from."""
+    return {"queued_at": item.queued_at, "queue_position": item.queue_position}
+
+
 # What -replay mints at dispatch: the command message's snowflake time, and
 # depth 0 — the replay plays immediately.
-REPLAY_ASK = Analytics(queued_at=1752530500.5, queue_position=0)
+REPLAY_ASK: Ask = {"queued_at": 1752530500.5, "queue_position": 0}
 
 
 def loop_song(url: str, title: str, *, position: float) -> MagicMock:
@@ -387,7 +413,7 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     song.title = title
     song.webpage_url = url
     song.duration_secs = 210
-    song.duration = "0:03:30"
+    song.duration_label = "0:03:30"
     song.uploader = "Loop Channel"
     song.thumbnail = ""
     song.views = None

@@ -76,11 +76,10 @@ from src.queue_rows import (
     queue_runtime,
     requester_mention,
 )
+from src.queue_item import NpCard, NpHostRef, QueueObject
 from src.youtube import (
     YTDL,
     ExtractionError,
-    NpHostRef,
-    QueueObject,
     invalidate_stream_cache,
     prefetch_warm_slot,
 )
@@ -155,7 +154,7 @@ RESTORE_WAIT_SECS = 5.0
 DEPTH_RESTORE_WAIT_SECS = 1.0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PauseContext:
     """Who paused the current song and when, for the paused card's byline.
 
@@ -170,7 +169,7 @@ class PauseContext:
     by: Optional[Union[discord.User, discord.Member]] = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class InterjectOutcome:
     """What MusicPlayer.interject() did — everything `-play --now` needs for its
     confirmation wording."""
@@ -193,7 +192,7 @@ class InterjectOutcome:
         return fmt_duration(self.resume_position or 0)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class StreamFailure:
     """Why a song's stream failed to resolve, captured at the failure point so the
     skip notice can name the cause and the trace carrying the full exception."""
@@ -942,15 +941,12 @@ class MusicPlayer:
                         await self.store.clear_song_end_state()
 
                     # After the crashed head, so the interrupted song plays first.
+                    # restore_entries logs the count itself.
                     count = await self.queue.restore_entries(
                         snapshot.queue,
                         requester_fallback=self._last_author,
                         unreadable=snapshot.queue_unreadable,
                     )
-                    if count:
-                        log.info(
-                            f"Restored {count} queued songs for guild {self._guild.id}"
-                        )
 
                     # Corrupt entries were already dropped at parse time.
                     self.history.restore(snapshot.history)
@@ -1619,21 +1615,25 @@ class MusicPlayer:
 
     async def _dispose_previous_np_card(self, song: YTDL | QueueObject) -> None:
         """Remove the frozen card the previous fragment of this song left behind.
-        Takes either form of the same tail (both carry the np_* fields). With the
-        live ref this is _retire_np_host verbatim; after a restart only the ids
+        Takes either form of the same tail (both carry np_card). With the live
+        ref this is _retire_np_host verbatim; after a restart only the ids
         survive and own_embeds cannot be reconstructed, so the by-id delete is
         gated to DEDICATED cards. Never a re-adopt: the live bar belongs at the
         channel bottom. See docs/ARCHITECTURE.md#now-playing-host-invariants."""
-        ref = song.np_host_ref
-        if ref is not None:
-            await self._retire_np_host(ref.message, ref.own_embeds, ref.dedicated)
+        card = song.np_card
+        if card is None:
             return
-        mid, cid = song.np_message_id, song.np_channel_id
-        # Three wire values reach this DESTRUCTIVE call unchecked. np_dedicated is
+        if card.host_ref is not None:
+            await self._retire_np_host(
+                card.host_ref.message, card.host_ref.own_embeds, card.dedicated
+            )
+            return
+        mid, cid = card.message_id, card.channel_id
+        # Three wire values reach this DESTRUCTIVE call unchecked. dedicated is
         # the authorization, so `is True` and not truthiness (a wire "false" is a
         # truthy string); bool is excluded from the ids because isinstance(True,
         # int) holds and would render "True" into the REST route.
-        if song.np_dedicated is not True or not all(
+        if card.dedicated is not True or not all(
             isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in (mid, cid)
         ):
             return
@@ -1733,7 +1733,7 @@ class MusicPlayer:
             activity = discord.Activity(
                 type=discord.ActivityType.listening,
                 name=name,
-                state=song.duration,
+                state=song.duration_label,
                 state_url=song.webpage_url,  # discord.py >= 2.6; silent no-op if downgraded
                 timestamps=timestamps,
             )
@@ -1907,15 +1907,12 @@ class MusicPlayer:
                     is_resume=True,
                     start_paused=was_paused and resume_paused,
                     # The tail is its own queue entry: it is put_front'd onto the
-                    # Redis list, and the card ids below are set on it afterwards,
+                    # Redis list, and the card below is set on it afterwards,
                     # so it takes neither a restored head's unlisted state nor the
                     # frozen card of the fragment being interrupted.
                     persisted=True,
                     is_replay=False,
-                    np_message_id=0,
-                    np_channel_id=0,
-                    np_dedicated=False,
-                    np_host_ref=None,
+                    np_card=None,
                     # Reset where the rest is inherited: this song is producing
                     # audio, which ends its retry chain.
                     stream_attempts=0,
@@ -2081,13 +2078,16 @@ class MusicPlayer:
             source.search,
             redis=self.store.redis if self.store is not None else None,
             query_source=source.query_source,
-            analytics=source.analytics,
+            queued_at=source.queued_at,
+            queue_position=source.queue_position,
             user_input=source.user_input,
             # What the ask knows about the recording: the walk's ISRC and its
             # length, which pick the album master over the music video.
             isrc=source.isrc,
             expected_duration=source.duration,
         )
+        # The term and the recording clear together: both steered this resolve,
+        # and a resolved entry writes neither.
         return replace(
             source,
             webpage_url=resolved.webpage_url,
@@ -2096,6 +2096,7 @@ class MusicPlayer:
             uploader=resolved.uploader,
             thumbnail=resolved.thumbnail,
             search="",
+            isrc=None,
         )
 
     def _channel_bitrate(self) -> Optional[int]:
@@ -2234,10 +2235,7 @@ class MusicPlayer:
             # Dropped: the pointer is a one-shot, and this song already started and
             # disposed of its predecessor's card. Carrying it re-announces "Resuming…"
             # on every further attempt.
-            np_message_id=0,
-            np_channel_id=0,
-            np_dedicated=False,
-            np_host_ref=None,
+            np_card=None,
         )
         # prefetch=False: the entry was just invalidated, and the loop resolves
         # this song in-band on its next iteration.
@@ -3045,18 +3043,18 @@ class MusicPlayer:
                             song, attempts_used
                         )
                     if skip_history and pending_tail is not None:
-                        stamps["np_host_ref"] = (
-                            NpHostRef(finished_host, finished_own, finished_dedicated)
+                        stamps["np_card"] = (
+                            NpCard(
+                                message_id=finished_host.id,
+                                channel_id=finished_host.channel.id,
+                                dedicated=finished_dedicated,
+                                host_ref=NpHostRef(
+                                    message=finished_host, own_embeds=finished_own
+                                ),
+                            )
                             if finished_host is not None
                             else None
                         )
-                        stamps["np_message_id"] = (
-                            finished_host.id if finished_host is not None else 0
-                        )
-                        stamps["np_channel_id"] = (
-                            finished_host.channel.id if finished_host is not None else 0
-                        )
-                        stamps["np_dedicated"] = finished_dedicated
                     if stamps and pending_tail is not None:
                         # interject() put the tail on the deque, so the queue swaps
                         # its slot for the stamped copy, which the next rebuild writes.

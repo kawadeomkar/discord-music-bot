@@ -126,7 +126,7 @@ class TestBotHelp:
         ) in body
         spec = find("leave-when-alone", SettingScope.SERVER)
         assert isinstance(spec, SettingSpec) and spec.default is not None
-        assert parse_value(spec, "0:10") == Parsed(spec.default)
+        assert parse_value(spec, "0:10") == Parsed(value=spec.default)
 
     async def test_respects_discord_size_limits(
         self, help_command: MusicHelpCommand, ctx: MagicMock

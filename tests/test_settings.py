@@ -233,7 +233,9 @@ class TestRegistryInvariants:
             if spec.kind is SettingKind.SECONDS_OR_OFF:
                 points.append(OFF_SECS)
             for value in points:
-                assert parse_value(spec, format_value(spec, value)) == Parsed(value), (
+                assert parse_value(spec, format_value(spec, value)) == Parsed(
+                    value=value
+                ), (
                     spec.key,
                     value,
                 )
@@ -268,7 +270,7 @@ class TestRegistryInvariants:
         spec = _spec("timezone")
         for key, redirect in TIMEZONE_REDIRECTS.items():
             for target in redirect.targets:
-                assert parse_value(spec, target) == Parsed(target), (key, target)
+                assert parse_value(spec, target) == Parsed(value=target), (key, target)
                 if redirect.reason != "synonym":
                     assert target.partition("/")[0] in _ZONE_AREAS, (key, target)
             result = parse_value(spec, key)
@@ -395,12 +397,12 @@ class TestDurationGrammar:
     )
     def test_accepted(self, value: str, seconds: float) -> None:
         assert parse_value(_local(SettingKind.DURATION), value) == Parsed(
-            float(seconds)
+            value=float(seconds)
         )
 
     def test_seconds_take_two_decimal_places(self) -> None:
-        assert parse_value(_local(SettingKind.SECONDS), "0.5s") == Parsed(0.5)
-        assert parse_value(_local(SettingKind.SECONDS), "10.25") == Parsed(10.25)
+        assert parse_value(_local(SettingKind.SECONDS), "0.5s") == Parsed(value=0.5)
+        assert parse_value(_local(SettingKind.SECONDS), "10.25") == Parsed(value=10.25)
 
     @pytest.mark.parametrize(
         "value",
@@ -428,13 +430,13 @@ class TestDurationGrammar:
     @pytest.mark.parametrize("secs", [10, 59, 60, 61, 300, 3599, 3600, 3725])
     def test_the_bots_own_clock_and_totals_parse_back(self, secs: int) -> None:
         spec = _local(SettingKind.DURATION)
-        assert parse_value(spec, fmt_duration(secs)) == Parsed(float(secs))
-        assert parse_value(spec, fmt_total_duration(secs)) == Parsed(float(secs))
+        assert parse_value(spec, fmt_duration(secs)) == Parsed(value=float(secs))
+        assert parse_value(spec, fmt_total_duration(secs)) == Parsed(value=float(secs))
 
     @pytest.mark.parametrize("secs", [0.05, 0.1, 0.25, 0.5, 3, 60, 120, 600])
     def test_fmt_seconds_parses_back(self, secs: float) -> None:
         assert parse_value(_local(SettingKind.SECONDS), fmt_seconds(secs)) == Parsed(
-            float(secs)
+            value=float(secs)
         )
 
 
@@ -455,7 +457,7 @@ class TestSecondsOrOff:
     @pytest.mark.parametrize("value", ["off", "OFF", "Off"])
     def test_off_parses_to_off_secs_and_renders_off(self, value: str) -> None:
         spec = self._notice()
-        assert parse_value(spec, value) == Parsed(OFF_SECS)
+        assert parse_value(spec, value) == Parsed(value=OFF_SECS)
         assert format_value(spec, OFF_SECS) == "off"
 
     @pytest.mark.parametrize("value", ["0", "0s", "0:00"])
@@ -500,7 +502,7 @@ class TestOutOfRange:
     ) -> None:
         spec = _spec("play-resolve-concurrency")
         monkeypatch.setattr(config, "YTDLP_POOL_WORKERS", 8)
-        assert parse_value(spec, "7") == Parsed(7)
+        assert parse_value(spec, "7") == Parsed(value=7)
         monkeypatch.setattr(config, "YTDLP_POOL_WORKERS", 4)
         assert isinstance(parse_value(spec, "7"), Refusal)
 
@@ -554,12 +556,12 @@ class TestOutOfRange:
 
     def test_np_refresh_follows_the_bots_value_at_the_write(self) -> None:
         spec = _spec("np-refresh")
-        assert parse_value(spec, "4s") == Parsed(4.0)
+        assert parse_value(spec, "4s") == Parsed(value=4.0)
         config.now_playing_update_interval_secs.set_override(5.0)
         result = parse_value(spec, "4s")
         assert isinstance(result, Refusal)
         assert "between **5s** and **30s** here" in result.text
-        assert parse_value(spec, "5s") == Parsed(5.0)
+        assert parse_value(spec, "5s") == Parsed(value=5.0)
         high = parse_value(spec, "31s")
         assert isinstance(high, Refusal)
         assert (
@@ -573,7 +575,7 @@ class TestOutOfRange:
         """Chat's own ranges never meet this bound; an environment delay longer than
         any setting accepts does, and a write must not undercut it."""
         spec = _spec("queue-progress-max")
-        assert parse_value(spec, "120s") == Parsed(120.0)
+        assert parse_value(spec, "120s") == Parsed(value=120.0)
         monkeypatch.setitem(config._BASELINES, "QUEUE_PROGRESS_DELAY_SECS", 100.0)
         config.queue_progress_tick_secs.set_override(15.0)
         result = parse_value(spec, "125s")
@@ -591,13 +593,13 @@ class TestOutOfRange:
         self,
     ) -> None:
         spec = _spec("queue-progress-tick")
-        assert parse_value(spec, "25s") == Parsed(25.0)
+        assert parse_value(spec, "25s") == Parsed(value=25.0)
         config.queue_progress_max_secs.set_override(100.0)
         result = parse_value(spec, "25s")
         assert isinstance(result, Refusal)
         assert result.side == "maximum"
         assert "between **3s** and **20s**" in result.text
-        assert parse_value(spec, "20s") == Parsed(20.0)
+        assert parse_value(spec, "20s") == Parsed(value=20.0)
         assert settings.allowed_text(spec, now=True) == "3s–20s"
 
     def test_a_card_max_with_no_room_for_a_tick_leaves_it_no_range(self) -> None:
@@ -621,7 +623,7 @@ class TestOutOfRange:
         spec = _spec("np-refresh")
         config.now_playing_update_interval_secs.set_override(3.333)
         assert settings.allowed_text(spec, now=True) == "3.34s–30s"
-        assert parse_value(spec, "3.34") == Parsed(3.34)
+        assert parse_value(spec, "3.34") == Parsed(value=3.34)
         assert isinstance(parse_value(spec, "3.33"), Refusal)
 
     @pytest.mark.parametrize(
@@ -641,7 +643,7 @@ class TestOutOfRange:
         the bound moved one step inward and refused the value that fits exactly."""
         spec = _spec(key)
         cast(config.Knob[float], config.KNOBS[attr.lower()]).set_override(value)
-        assert parse_value(spec, typed) == Parsed(float(typed))
+        assert parse_value(spec, typed) == Parsed(value=float(typed))
 
     def test_a_bot_refresh_slower_than_any_server_value_leaves_no_range(self) -> None:
         spec = _spec("np-refresh")
@@ -663,7 +665,9 @@ class TestOutOfRange:
         assert result.reason is RefusalReason.BAD_SHAPE
         example = re.search(r"`(\d+)`", result.text)
         assert example is not None
-        assert parse_value(spec, example.group(1)) == Parsed(float(example.group(1)))
+        assert parse_value(spec, example.group(1)) == Parsed(
+            value=float(example.group(1))
+        )
 
     @pytest.mark.parametrize("value", ["0", "0s", "0:00"])
     def test_a_server_slow_notice_of_zero_names_off(self, value: str) -> None:
@@ -684,7 +688,7 @@ class TestOutOfRange:
 class TestPercent:
     @pytest.mark.parametrize("value", ["80", "80%"])
     def test_accepted(self, value: str) -> None:
-        assert parse_value(_spec("volume"), value) == Parsed(80)
+        assert parse_value(_spec("volume"), value) == Parsed(value=80)
 
     @pytest.mark.parametrize("value", ["0.8", "٨٠"])
     def test_a_fraction_or_a_non_ascii_digit_is_refused(self, value: str) -> None:
@@ -707,7 +711,7 @@ class TestSwitch:
         ("value", "on"), [("on", True), ("ENABLE", True), ("no", False)]
     )
     def test_accepted(self, value: str, on: bool) -> None:
-        assert parse_value(_spec("debug"), value) == Parsed(on)
+        assert parse_value(_spec("debug"), value) == Parsed(value=on)
 
     def test_anything_else_is_refused(self) -> None:
         assert isinstance(parse_value(_spec("debug"), "maybe"), Refusal)
@@ -719,7 +723,9 @@ class TestChoice:
 
     @pytest.mark.parametrize("value", ["off", "PEAK", "  normalize  ", "Normalize"])
     def test_a_listed_name_is_accepted_in_any_case(self, value: str) -> None:
-        assert parse_value(_spec("loudness"), value) == Parsed(value.strip().lower())
+        assert parse_value(_spec("loudness"), value) == Parsed(
+            value=value.strip().lower()
+        )
 
     @pytest.mark.parametrize("value", ["loud", "", "on", "0.5", "peak peak"])
     def test_anything_else_is_refused(self, value: str) -> None:
@@ -753,7 +759,7 @@ class TestTimezone:
         ],
     )
     def test_canonicalized(self, value: str, canonical: str) -> None:
-        assert parse_value(_spec("timezone"), value) == Parsed(canonical)
+        assert parse_value(_spec("timezone"), value) == Parsed(value=canonical)
 
     @pytest.mark.parametrize(
         ("value", "names"),
@@ -940,13 +946,15 @@ class TestFind:
         assert find("Debug_Footer", SettingScope.SERVER) == _spec("debug")
 
     def test_a_suggestion_comes_from_the_requested_scope_only(self) -> None:
-        assert find("volum", SettingScope.SERVER) == Suggestion("volume")
+        assert find("volum", SettingScope.SERVER) == Suggestion(name="volume")
         suggestion = find("heartbeet", SettingScope.SERVER)
         assert isinstance(suggestion, Suggestion)
         assert suggestion.name != "heartbeat"
 
     def test_a_server_suggestion_is_the_name_the_card_prints(self) -> None:
-        assert find("leave-idle", SettingScope.SERVER) == Suggestion("leave-when-idle")
+        assert find("leave-idle", SettingScope.SERVER) == Suggestion(
+            name="leave-when-idle"
+        )
 
     @pytest.mark.parametrize(
         "env", ["NOW_PLAYING_UPDATE_INTERVAL_SECS", "ping_tick_secs"]
@@ -957,8 +965,8 @@ class TestFind:
         spec = next(
             s for s in SETTINGS if s.scope is SettingScope.BOT and s.env == env.upper()
         )
-        assert find(env, SettingScope.BOT) == Suggestion(spec.key)
-        assert find(env, SettingScope.SERVER) != Suggestion(spec.key)
+        assert find(env, SettingScope.BOT) == Suggestion(name=spec.key)
+        assert find(env, SettingScope.SERVER) != Suggestion(name=spec.key)
 
 
 class TestParseSettingsArgs:
@@ -2854,7 +2862,7 @@ _WORKER_ENTRIES: dict[str, tuple[str, ...]] = {
 }
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class _KnobReads:
     baseline: list[str]  # G1
     definition_time: list[str]  # G2
@@ -2883,7 +2891,13 @@ def _scan_knob_reads(
     """One pass per module. Identifiers are matched by name, so an aliased import
     (`import src.config as c; c.ping_tick_secs.baseline`) is caught without
     tracking it. A handle imported by name is no read: it reads when called."""
-    reads = _KnobReads([], [], [], [], set())
+    reads = _KnobReads(
+        baseline=[],
+        definition_time=[],
+        writers=[],
+        in_workers=[],
+        worker_entries=set(),
+    )
 
     def at(node: ast.AST) -> str:
         return f"{where}:{getattr(node, 'lineno', 0)}"
@@ -2970,7 +2984,13 @@ def knob_reads() -> _KnobReads:
     import src
 
     root = Path(src.__file__).parent
-    total = _KnobReads([], [], [], [], set())
+    total = _KnobReads(
+        baseline=[],
+        definition_time=[],
+        writers=[],
+        in_workers=[],
+        worker_entries=set(),
+    )
     for path in sorted(root.rglob("*.py")):
         where = path.relative_to(root.parent).as_posix()
         reads = _scan_knob_reads(

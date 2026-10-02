@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from opentelemetry import trace
 
-from src.guild_state import Analytics
+from src.queue_item import QueueObject
 from src.musicplayer import MusicPlayer
 from src.play_placement import (
     PlaceStalled,
@@ -41,7 +41,6 @@ from src.util import (
 )
 from src.commands._common import echo
 from src.queue_progress import EnqueueProgress, enqueue_progress, is_collection
-from src.youtube import QueueObject
 
 # Stage functions resolve through the module per call: the test seam is the name
 # on play_pipeline, which a from-import would bind here at import time.
@@ -295,9 +294,7 @@ async def _resolve_and_place(
             placement = Placement.TAIL
         # The message's snowflake time, so the wait covers gateway delivery.
         # The depth is minted at the insert, under the place lock.
-        analytics = Analytics(
-            queued_at=ctx.message.created_at.timestamp(), queue_position=0
-        )
+        queued_at = ctx.message.created_at.timestamp()
         resolve_started = time.monotonic()
         if cold_start:
             # Held across the join, which opens the gate the moment the
@@ -315,7 +312,8 @@ async def _resolve_and_place(
                 qobj = await play_pipeline.queue_source(
                     ctx,
                     source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=0,
                     origin=url,
                     mode=resolve_mode_for(placement),
                     on_progress=progress.update if progress else None,
@@ -367,7 +365,8 @@ async def _resolve_and_place(
             qobj = await play_pipeline.queue_source(
                 ctx,
                 source,
-                analytics=analytics,
+                queued_at=queued_at,
+                queue_position=0,
                 origin=url,
                 mode=resolve_mode_for(placement),
                 on_progress=progress.update if progress else None,
@@ -432,7 +431,8 @@ async def _resolve_and_place(
                     mp,
                     req,
                     placement=placement,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=0,
                     origin=url,
                     release_hold=hold.aclose,
                     cog=cog,

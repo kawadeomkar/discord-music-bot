@@ -26,7 +26,7 @@ from src.queue_rows import (
     remaining_secs,
 )
 from src.util import EMBED_DESCRIPTION_LIMIT
-from src.youtube import QueueObject
+from src.queue_item import QueueObject
 
 _NOW = datetime.datetime(2026, 9, 20, 21, 38, tzinfo=ZoneInfo("US/Pacific"))
 _START = EtaWalk(cumulative_secs=180, uncertain=False)

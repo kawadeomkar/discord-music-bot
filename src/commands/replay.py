@@ -12,7 +12,7 @@ from opentelemetry import trace
 
 from src.commands._common import NOTHING_PLAYING
 from src.guild_queue import is_replay_of
-from src.guild_state import Analytics
+from src.queue_item import QueueObject
 from src.musicplayer import MusicPlayer
 from src.telemetry import get_tracer
 from src.util import (
@@ -23,7 +23,7 @@ from src.util import (
     refund_cooldown,
     safe_label,
 )
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL
 
 _tracer = get_tracer(__name__)
 
@@ -62,7 +62,7 @@ class ReplayResult(Enum):
     DROPPED = "dropped"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ReplayOutcome:
     """What replay_current() did, for -replay's confirmation wording."""
 
@@ -85,13 +85,14 @@ async def replay_current(
     vc: discord.VoiceClient,
     *,
     requester: Union[discord.User, discord.Member],
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
 ) -> Optional[ReplayOutcome]:
     """Play `mp`'s live song again from `0:00`: front-insert a copy with no `ts`,
     persisted like any front insert, resolve it through the loop's prefetch, then stop
-    the song. `requester` and `analytics` are the caller's. None when nothing is live,
-    there is no URL to rebuild from, or the song stopped being live while the copy
-    resolved. See docs/ARCHITECTURE.md#-replay."""
+    the song. `requester`, `queued_at` and `queue_position` are the caller's. None
+    when nothing is live, there is no URL to rebuild from, or the song stopped being
+    live while the copy resolved. See docs/ARCHITECTURE.md#-replay."""
     current = mp.current_song
     if current is None or not current.webpage_url:
         return None
@@ -114,13 +115,14 @@ async def replay_current(
         duration=current.duration_secs or None,
         uploader=current.uploader,
         thumbnail=current.thumbnail,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
         # Renders the queue card as a replay for the window before the loop
         # dequeues it.
         is_replay=True,
         # A fresh play, from the top: no offset, no interjection flags, no start
-        # stamp, none of the card ids the fragment it copies is holding, and the
-        # full retry budget — the attempts the live play spent are its own.
+        # stamp, not the card the fragment it copies is holding, and the full
+        # retry budget — the attempts the live play spent are its own.
         ts=None,
         persisted=True,
         interjected=False,
@@ -129,10 +131,7 @@ async def replay_current(
         played_at=0.0,
         stream_attempts=0,
         failed_format_ids=frozenset(),
-        np_message_id=0,
-        np_channel_id=0,
-        np_dedicated=False,
-        np_host_ref=None,
+        np_card=None,
     )
     # A completed prefetch bypasses the queue and would play instead of the
     # front-inserted replay — take it off the board first.
@@ -309,9 +308,8 @@ async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
             # The replay is this caller's ask: the requester column and the ask-time
             # analytics both name them.
             requester=ctx.author,
-            analytics=Analytics(
-                queued_at=ctx.message.created_at.timestamp(), queue_position=0
-            ),
+            queued_at=ctx.message.created_at.timestamp(),
+            queue_position=0,
         )
         if outcome is None:
             # The song stopped being live while the replay resolved — distinct from

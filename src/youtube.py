@@ -5,7 +5,7 @@ import os
 import re
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
 from typing import Any, Final, Optional, TypedDict, Union, cast
@@ -22,7 +22,8 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src import config
-from src.guild_state import ANALYTICS_ZERO, Analytics, LoudnessMode
+from src.guild_state import LoudnessMode
+from src.queue_item import NpCard, QueueObject
 from src.redis_client import cache_del, cache_get, cache_set
 from src.sources import is_link, is_mix
 from src.telemetry import get_tracer
@@ -767,6 +768,7 @@ _UNKNOWN_OPUS_ITAG_WARNED: set[str] = set()
 # YouTube's audio-itag space is a few dozen wide, so this is a backstop against a
 # serve that is not an itag at all rather than an expected bound.
 _MAX_UNKNOWN_OPUS_ITAGS: Final[int] = 64
+_DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -829,6 +831,195 @@ def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
         f"re-encoded instead of copied (audio_channels="
         f"{data.get('audio_channels')}) — see ARCHITECTURE.md#an-unknown-opus-itag"
     )
+
+
+# Lossless by codec, and by container for the two that report no codec at all:
+# yt-dlp infers `acodec` from the extension only for aac/opus/mp3/flac/vorbis, so a
+# direct WAV arrives with acodec=None. Which containers count, and why m4a is not
+# one of them: docs/ARCHITECTURE.md#encoder-mode.
+_LOSSLESS_ACODECS = frozenset({"flac", "alac"})
+_LOSSLESS_EXTS = frozenset({"flac", "wav", "aiff", "aif"})
+# Discord's own ceiling. libopus caps a packet at 1276 B, so the largest 20 ms
+# datagram is 1308 B of UDP payload once discord.py's RTP header and Poly1305 tag
+# are on it. See docs/ARCHITECTURE.md#encoder-mode.
+_ENCODE_BITRATE_CAP_KBPS = 384
+# discord.py's default, which it emits as `-b:a 128k` with or without us.
+_DEFAULT_ENCODE_KBPS = 128
+
+
+def _encode_bitrate_kbps(
+    data: YTDLVideoMetadata, *, channel_bitrate: Optional[int]
+) -> Optional[int]:
+    """The encoder bitrate to ask for, or None to leave discord.py's 128k.
+
+    Only for a source that is actually lossless, where it buys 2 dB at 256k
+    (39.6 -> 41.5 measured). A ~130 kbps lossy serve gains 0.0-0.3 dB, because the
+    encode saturates on what the source already threw away.
+    See docs/ARCHITECTURE.md#encoder-mode.
+    """
+    if not channel_bitrate:
+        return None
+    lossless = (
+        data.get("acodec") in _LOSSLESS_ACODECS or data.get("ext") in _LOSSLESS_EXTS
+    )
+    if not lossless:
+        return None
+    kbps = min(channel_bitrate // 1000, _ENCODE_BITRATE_CAP_KBPS)
+    # Below the default is not an improvement, and equal to it is not a change.
+    return kbps if kbps > _DEFAULT_ENCODE_KBPS else None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Loudness:
+    """One song's measured level: integrated loudness in LUFS and true peak in
+    dBFS, both as ffmpeg's ebur128 summary reports them."""
+
+    i: float
+    peak: float
+
+
+# ebur128's summary block, printed at info level once the stream ends. Anchored per
+# line, because the same words appear in its per-frame log.
+_LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)\s*$", re.M)
+
+# A month. What a song measures does not change, so the only reason to re-measure is
+# that the entry is cheap to lose, not that it goes stale. TTL'd and evictable, so it
+# carries none of the non-evictable-key obligations.
+_LOUDNESS_TTL: Final[int] = 30 * 86400
+
+# An hour, for "this one did not measure". A song longer than the scan timeout can
+# cover fails identically every play, and without this the whole timeout is spent
+# again each time; an hour is short enough that a transient failure heals.
+_LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
+
+# What FFMPEG_OPTS["before_options"] gives the play path, as argv for the scan.
+_SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-reconnect_on_http_error",
+    "5xx",
+)
+
+
+def _loudness_cache_key(webpage_url: str) -> str:
+    return f"ytdl:loudness:v1:{webpage_url}"
+
+
+def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
+    """The I and Peak of an ebur128 summary, or None when either is missing —
+    which is what a scan that died mid-stream looks like, and is not a level."""
+    found = {key: value for key, value in _LOUDNESS_LINE.findall(stderr)}
+    if "I" not in found or "Peak" not in found:
+        return None
+    try:
+        return Loudness(i=float(found["I"]), peak=float(found["Peak"]))
+    except ValueError:
+        return None
+
+
+def normalize_gain_db(loudness: Loudness) -> float:
+    """The gain that puts this song on the target, clamped."""
+    lo, hi = _LOUDNESS_GAIN_CLAMP_DB
+    return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - loudness.i))
+
+
+async def measure_loudness(
+    stream_url: str,
+    webpage_url: str,
+    redis: Optional[aioredis.Redis],
+) -> Optional[Loudness]:
+    """How loud this song is, from the cache when it has been measured before.
+
+    None means "play it at its own level": a failed scan, a timed-out one, or no
+    summary in what ffmpeg printed. Never raises — a level is an improvement to a
+    play, not a precondition for one.
+
+    The child is spawned with asyncio, not run in an executor, so a cancellation
+    KILLS it: the prefetch this runs inside is cancelled by every bulk queue
+    mutation, and its contract forbids uninterruptible work there (an executor job
+    cannot be interrupted, which is why the resolve refuses to re-extract from it).
+    """
+    span = trace.get_current_span()
+    cache_key = _loudness_cache_key(webpage_url)
+    cached = await cache_get(redis, cache_key)
+    if isinstance(cached, dict) and cached.get("unmeasured"):
+        span.set_attribute("ytdl.loudness_source", "cached-unmeasured")
+        return None
+    if isinstance(cached, dict) and "i" in cached and "peak" in cached:
+        try:
+            measured = Loudness(i=float(cached["i"]), peak=float(cached["peak"]))
+        except TypeError, ValueError:
+            measured = None
+        if measured is not None:
+            span.set_attribute("ytdl.loudness_source", "cache")
+            span.set_attribute("ytdl.loudness_lufs", measured.i)
+            return measured
+
+    process: Optional[asyncio.subprocess.Process] = None
+    stderr = b""
+    failure: Optional[str] = None
+    try:
+        async with asyncio.timeout(config.loudness_scan_timeout_secs()):
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-nostats",
+                "-loglevel",
+                "info",
+                # The play path's reconnects, because a drop here is now remembered
+                # for an hour: see FFMPEG_OPTS["before_options"].
+                *_SCAN_RECONNECT_ARGS,
+                "-i",
+                stream_url,
+                "-vn",
+                "-af",
+                # Sample peak, which is the one `alimiter` holds the ceiling on, and
+                # it costs what asking for no peak costs: 0.25 s against 0.98 s for
+                # `peak=true` on a four-minute song, measured.
+                "ebur128=framelog=quiet:peak=sample",
+                "-f",
+                "null",
+                "-",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+    except (TimeoutError, OSError) as e:
+        failure = repr(e)
+    finally:
+        # Both the timeout and an outer cancellation land here, and either leaves a
+        # child holding a CDN connection. kill(), not terminate(): this one has no
+        # cleanup to do.
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+
+    measured = (
+        None if failure else parse_ebur128_summary(stderr.decode("utf-8", "replace"))
+    )
+    if measured is None:
+        log.warning(
+            f"loudness scan failed for {webpage_url}: {failure}"
+            if failure
+            else f"loudness scan printed no summary for {webpage_url}"
+        )
+        span.set_attribute("ytdl.loudness_source", "none")
+        # Remembered for an hour rather than re-paid on every play: a song the scan
+        # timeout cannot cover times out the same way next time. Short, so a
+        # transient failure heals itself.
+        await cache_set(
+            redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
+        )
+        return None
+    span.set_attribute("ytdl.loudness_source", "scan")
+    span.set_attribute("ytdl.loudness_lufs", measured.i)
+    await cache_set(
+        redis, cache_key, {"i": measured.i, "peak": measured.peak}, _LOUDNESS_TTL
+    )
+    return measured
 
 
 def _source_cache_key(search: str) -> str:
@@ -988,40 +1179,6 @@ def _passthrough_codec(data: YTDLVideoMetadata, *, filtered: bool) -> Optional[s
     return "copy"
 
 
-# Lossless by codec, and by container for the two that report no codec at all:
-# yt-dlp infers `acodec` from the extension only for aac/opus/mp3/flac/vorbis, so a
-# direct WAV arrives with acodec=None. Which containers count, and why m4a is not
-# one of them: docs/ARCHITECTURE.md#encoder-mode.
-_LOSSLESS_ACODECS = frozenset({"flac", "alac"})
-_LOSSLESS_EXTS = frozenset({"flac", "wav", "aiff", "aif"})
-# Discord's own ceiling. A 20 ms packet at 384k is ~1 KB, clear of UDP fragmentation.
-_ENCODE_BITRATE_CAP_KBPS = 384
-# discord.py's default, which it emits as `-b:a 128k` with or without us.
-_DEFAULT_ENCODE_KBPS = 128
-
-
-def _encode_bitrate_kbps(
-    data: YTDLVideoMetadata, *, channel_bitrate: Optional[int]
-) -> Optional[int]:
-    """The encoder bitrate to ask for, or None to leave discord.py's 128k.
-
-    Only for a source that is actually lossless, where it buys 2 dB at 256k
-    (39.6 -> 41.5 measured). A ~130 kbps lossy serve gains 0.0-0.3 dB, because the
-    encode saturates on what the source already threw away.
-    See docs/ARCHITECTURE.md#encoder-mode.
-    """
-    if not channel_bitrate:
-        return None
-    lossless = (
-        data.get("acodec") in _LOSSLESS_ACODECS or data.get("ext") in _LOSSLESS_EXTS
-    )
-    if not lossless:
-        return None
-    kbps = min(channel_bitrate // 1000, _ENCODE_BITRATE_CAP_KBPS)
-    # Below the default is not an improvement, and equal to it is not a change.
-    return kbps if kbps > _DEFAULT_ENCODE_KBPS else None
-
-
 def _stream_cache_key(webpage_url: str) -> str:
     return f"ytdl:stream:{webpage_url}"
 
@@ -1042,159 +1199,6 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
     # PEP 758 tuple catch (3.14+), normalized by ruff.
     except ValueError, IndexError:
         return None
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class Loudness:
-    """One song's measured level: integrated loudness in LUFS and true peak in
-    dBFS, both as ffmpeg's ebur128 summary reports them."""
-
-    i: float
-    peak: float
-
-
-# ebur128's summary block, printed at info level once the stream ends. Anchored per
-# line, because the same words appear in its per-frame log.
-_LOUDNESS_LINE = re.compile(r"^\s*(I|Peak):\s+(-?[\d.]+)\s+(?:LUFS|dBFS)\s*$", re.M)
-
-# A month. What a song measures does not change, so the only reason to re-measure is
-# that the entry is cheap to lose, not that it goes stale. TTL'd and evictable, so it
-# carries none of the non-evictable-key obligations.
-_LOUDNESS_TTL: Final[int] = 30 * 86400
-
-# An hour, for "this one did not measure". A song longer than the scan timeout can
-# cover fails identically every play, and without this the whole timeout is spent
-# again each time; an hour is short enough that a transient failure heals.
-_LOUDNESS_UNMEASURED_TTL: Final[int] = 3600
-
-# What FFMPEG_OPTS["before_options"] gives the play path, as argv for the scan.
-_SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_delay_max",
-    "5",
-    "-reconnect_on_http_error",
-    "5xx",
-)
-
-
-def _loudness_cache_key(webpage_url: str) -> str:
-    return f"ytdl:loudness:v1:{webpage_url}"
-
-
-def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
-    """The I and Peak of an ebur128 summary, or None when either is missing —
-    which is what a scan that died mid-stream looks like, and is not a level."""
-    found = {key: value for key, value in _LOUDNESS_LINE.findall(stderr)}
-    if "I" not in found or "Peak" not in found:
-        return None
-    try:
-        return Loudness(i=float(found["I"]), peak=float(found["Peak"]))
-    except ValueError:
-        return None
-
-
-def normalize_gain_db(loudness: Loudness) -> float:
-    """The gain that puts this song on the target, clamped."""
-    lo, hi = _LOUDNESS_GAIN_CLAMP_DB
-    return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - loudness.i))
-
-
-async def measure_loudness(
-    stream_url: str,
-    webpage_url: str,
-    redis: Optional[aioredis.Redis],
-) -> Optional[Loudness]:
-    """How loud this song is, from the cache when it has been measured before.
-
-    None means "play it at its own level": a failed scan, a timed-out one, or no
-    summary in what ffmpeg printed. Never raises — a level is an improvement to a
-    play, not a precondition for one.
-
-    The child is spawned with asyncio, not run in an executor, so a cancellation
-    KILLS it: the prefetch this runs inside is cancelled by every bulk queue
-    mutation, and its contract forbids uninterruptible work there (an executor job
-    cannot be interrupted, which is why the resolve refuses to re-extract from it).
-    """
-    span = trace.get_current_span()
-    cache_key = _loudness_cache_key(webpage_url)
-    cached = await cache_get(redis, cache_key)
-    if isinstance(cached, dict) and cached.get("unmeasured"):
-        span.set_attribute("ytdl.loudness_source", "cached-unmeasured")
-        return None
-    if isinstance(cached, dict) and "i" in cached and "peak" in cached:
-        try:
-            measured = Loudness(i=float(cached["i"]), peak=float(cached["peak"]))
-        except TypeError, ValueError:
-            measured = None
-        if measured is not None:
-            span.set_attribute("ytdl.loudness_source", "cache")
-            span.set_attribute("ytdl.loudness_lufs", measured.i)
-            return measured
-
-    process: Optional[asyncio.subprocess.Process] = None
-    stderr = b""
-    failure: Optional[str] = None
-    try:
-        async with asyncio.timeout(config.loudness_scan_timeout_secs()):
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-nostats",
-                "-loglevel",
-                "info",
-                # The play path's reconnects, because a drop here is now remembered
-                # for an hour: see FFMPEG_OPTS["before_options"].
-                *_SCAN_RECONNECT_ARGS,
-                "-i",
-                stream_url,
-                "-vn",
-                "-af",
-                # Sample peak, which is the one `alimiter` holds the ceiling on, and
-                # it costs what asking for no peak costs: 0.25 s against 0.98 s for
-                # `peak=true` on a four-minute song, measured.
-                "ebur128=framelog=quiet:peak=sample",
-                "-f",
-                "null",
-                "-",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
-    except (TimeoutError, OSError) as e:
-        failure = repr(e)
-    finally:
-        # Both the timeout and an outer cancellation land here, and either leaves a
-        # child holding a CDN connection. kill(), not terminate(): this one has no
-        # cleanup to do.
-        if process is not None and process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-
-    measured = (
-        None if failure else parse_ebur128_summary(stderr.decode("utf-8", "replace"))
-    )
-    if measured is None:
-        log.warning(
-            f"loudness scan failed for {webpage_url}: {failure}"
-            if failure
-            else f"loudness scan printed no summary for {webpage_url}"
-        )
-        span.set_attribute("ytdl.loudness_source", "none")
-        # Remembered for an hour rather than re-paid on every play: a song the scan
-        # timeout cannot cover times out the same way next time. Short, so a
-        # transient failure heals itself.
-        await cache_set(
-            redis, cache_key, {"unmeasured": True}, _LOUDNESS_UNMEASURED_TTL
-        )
-        return None
-    span.set_attribute("ytdl.loudness_source", "scan")
-    span.set_attribute("ytdl.loudness_lufs", measured.i)
-    await cache_set(
-        redis, cache_key, {"i": measured.i, "peak": measured.peak}, _LOUDNESS_TTL
-    )
-    return measured
 
 
 class StreamProbe(Enum):
@@ -1495,100 +1499,6 @@ async def invalidate_stream_cache(
     return await cache_del(redis, _stream_cache_key(webpage_url))
 
 
-@dataclass(frozen=True, slots=True)
-class NpHostRef:
-    """The live Now Playing host an interrupted fragment left behind, for its
-    resume tail to dispose of. Runtime only: a Message cannot be serialized and
-    own_embeds cannot be rebuilt from ids, so the wire fields alone can never
-    strip-edit a retirement (MusicPlayer._retire_np_host)."""
-
-    message: discord.Message
-    own_embeds: list[discord.Embed]
-    dedicated: bool
-
-
-# slots: a 10,000-track Spotify playlist holds one of these per track while its
-# searches wait to resolve — 216 B each by sys.getsizeof on this interpreter,
-# against 344 B for the same instance carrying a __dict__. Keep the class off
-# asdict (it deep-copies requester), vars (it raises) and any pickle path.
-# frozen hashes it BY VALUE, while the queue keys on identity (holds,
-# display_index, _listed): two asks for one song are one element in a set, and a
-# resume tail carrying np_host_ref cannot be hashed at all (own_embeds is a
-# list). Keep the class out of sets and dict keys.
-@dataclass(frozen=True, slots=True, kw_only=True)
-class QueueObject:
-    """One queued song, resolved or not. A track queued from a Spotify playlist
-    arrives as a search: `search` set, `webpage_url` its own Spotify page or empty.
-    The resolve at dequeue returns it with what yt-dlp found over its display fields
-    and `search` cleared, leaving the queued original on the deque. Everything else
-    about the ask is the same either way, which is why there is one type — see
-    docs/ARCHITECTURE.md#one-queue-item.
-
-    Every change to a queued item is a `replace()` copy: the queue swaps it into the
-    item's slot (`GuildQueue.replace_item`) and a playing song holds its own
-    (`YTDL.queued`)."""
-
-    webpage_url: str
-    title: str
-    requester: Union[discord.User, discord.Member]
-    ts: Optional[int] = None
-    user_input: Optional[str] = None
-    duration: Optional[int] = None  # seconds, from yt-dlp at enqueue time
-    uploader: Optional[str] = None  # YouTube channel name
-    thumbnail: Optional[str] = None
-    # False only for the crash-recovered head restore_crashed() re-queues: it was
-    # never RPUSHed to the Redis list, so the loop must skip its redis_pop_for().
-    # Read via guild_queue.is_persisted().
-    persisted: bool = True
-    # ── interjection flags ──
-    # `interjected` is attribution only (span attribute); `is_resume` marks the
-    # rebuilt tail of an interrupted song (ts = interrupt position) and selects
-    # the "Resuming…" notice; `start_paused` re-pauses right after vc.play() so
-    # a song paused at interjection returns parked.
-    interjected: bool = False
-    is_resume: bool = False
-    start_paused: bool = False
-    # A -replay copy. Runtime-only, so absent from SongQueueEntry: a crash restores
-    # an ordinary queued song. YTDL carries it so _neutralize_prefetch's rebuild
-    # keeps it; an interjection's resume tail never sets it.
-    is_replay: bool = field(default=False, repr=False)
-    # Ask-time analytics. yt_source/yt_playlist REQUIRE it; the default exists
-    # for rehydration and the carry sites, which always pass a real value.
-    analytics: Analytics = ANALYTICS_ZERO
-    # "search", or the host of the pasted link; "" = unknown (src.sources).
-    query_source: str = ""
-    # Epoch when the audio started, stamped by the loop at vc.play(). A resume
-    # tail INHERITS it so every fragment of one play records the same start;
-    # 0.0 = not played yet.
-    played_at: float = 0.0
-    # Stream-retry state, runtime only (never on the Redis wire): plays already
-    # spent on this song whose stream never opened, and the formats that failed.
-    # A crash resets both. See MusicPlayer._retry_failed_stream.
-    stream_attempts: int = 0
-    failed_format_ids: frozenset[str] = frozenset()
-    # The NP card the interrupted fragment left frozen, set on a resume tail at
-    # the fragment's iteration end and consumed when the tail starts. The ids
-    # survive a restart, the ref does not, and only the ref can strip-edit a
-    # response host. 0/0/False = nothing to clean up.
-    np_message_id: int = 0
-    np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
-    np_dedicated: bool = False  # a pure NP message (deletable) vs a response
-    np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
-    # The `ytsearch:` term an unresolved item still has to resolve, cleared by the
-    # resolve at dequeue. `title` meanwhile is the walk's row name, or empty when
-    # the walk had none — every renderer falls back to this term.
-    search: str = ""
-    # The recording this item names, when the walk knew one. Read only by the
-    # resolve, which searches it before the term: see _search_terms.
-    isrc: Optional[str] = None
-
-    @property
-    def unresolved(self) -> bool:
-        """True while this item is a search: nothing may stream it, and its Redis
-        entry is a `"ytsource"` one."""
-        return bool(self.search)
-
-
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> QueueObject:
     """`qo` with the fields unknown at enqueue time (flat playlist entries carry no
     duration/uploader/thumbnail) filled from `data`, or `qo` itself when nothing
@@ -1654,7 +1564,8 @@ def _queue_object_from_flat_entry(
     requester: Union[discord.User, discord.Member],
     *,
     query_source: str,
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     user_input: Optional[str],
     ts: Optional[int] = None,
 ) -> Optional[QueueObject]:
@@ -1667,7 +1578,8 @@ def _queue_object_from_flat_entry(
         identity,
         requester,
         query_source=query_source,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
         user_input=user_input,
         ts=ts,
     )
@@ -1678,7 +1590,8 @@ def _queue_object_from_identity(
     requester: Union[discord.User, discord.Member],
     *,
     query_source: str,
-    analytics: Analytics,
+    queued_at: float,
+    queue_position: int,
     user_input: Optional[str],
     ts: Optional[int] = None,
 ) -> QueueObject:
@@ -1694,7 +1607,8 @@ def _queue_object_from_identity(
         uploader=identity.uploader,
         thumbnail=identity.thumbnail,
         query_source=query_source,
-        analytics=analytics,
+        queued_at=queued_at,
+        queue_position=queue_position,
     )
 
 
@@ -1830,11 +1744,11 @@ _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
 
-# How many results a length gets to choose between, on the term the FLAT search
-# asks for and on the processed fallback that re-uses it. A flat POST costs the same
-# for one result as for five (0.51 s either way); a processed extraction reads every
-# entry, 3.69 s for three, which is what buys the length a choice on the path a
-# flat entry too thin to play falls through to.
+# How many results a length gets to choose between. One search POST costs the same
+# for one result as for five (0.51 s either way), but a PROCESSED search extracts
+# every entry it answers with — 3.69 s for three against 1.22 s for the one this
+# would replace, and three times the player requests. So the widening rides the
+# flat path only, and the processed path keeps the single result it always had.
 _DURATION_MATCH_RESULTS: Final[int] = 3
 _SEARCH_PREFIX_RE = re.compile(r"^ytsearch\d*:")
 
@@ -2054,7 +1968,7 @@ class YTDL(discord.FFmpegOpusAudio):
     ) -> None:
         # codec=None keeps discord.py's `-c:a libopus` default; "copy" remuxes.
         # bitrate=None keeps its 128k default; a kbps int raises the encode target
-        # and is discarded unread on the copy path, like every other encoder option.
+        # for the one source worth it. The copy path reads neither.
         super().__init__(
             url,
             executable="ffmpeg",
@@ -2084,8 +1998,9 @@ class YTDL(discord.FFmpegOpusAudio):
         # `or 0`, not a dict default: yt-dlp sets "duration" to None (not absent)
         # for livestreams, and int(None) raises.
         self.duration_secs: int = int(data.get("duration") or 0)
-        # fmt_duration everywhere, so the embeds and the bar agree on "3:30".
-        self.duration = fmt_duration(self.duration_secs)
+        # fmt_duration everywhere, so the embeds and the bar agree on "3:30". A
+        # label, named apart from the item's `duration`, which is the seconds.
+        self.duration_label = fmt_duration(self.duration_secs)
         self.tags = data.get("tags")
         self.webpage_url = data.get("webpage_url")
         self.views = data.get("view_count")
@@ -2141,28 +2056,20 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.queued.failed_format_ids
 
     @property
-    def analytics(self) -> Analytics:
-        return self.queued.analytics
+    def queued_at(self) -> float:
+        return self.queued.queued_at
+
+    @property
+    def queue_position(self) -> int:
+        return self.queued.queue_position
 
     @property
     def query_source(self) -> str:
         return self.queued.query_source
 
     @property
-    def np_message_id(self) -> int:
-        return self.queued.np_message_id
-
-    @property
-    def np_channel_id(self) -> int:
-        return self.queued.np_channel_id
-
-    @property
-    def np_dedicated(self) -> bool:
-        return self.queued.np_dedicated
-
-    @property
-    def np_host_ref(self) -> Optional[NpHostRef]:
-        return self.queued.np_host_ref
+    def np_card(self) -> Optional[NpCard]:
+        return self.queued.np_card
 
     @property
     def played_at(self) -> float:
@@ -2497,15 +2404,7 @@ class YTDL(discord.FFmpegOpusAudio):
         cache when present. `allow_reextract=False` keeps an unconfirmable
         cached URL rather than re-extracting: the background prefetch, whose
         cancellation every bulk mutation waits on, must not put an
-        uninterruptible executor job in that path.
-
-        `loudness` NORMALIZE measures the song before the argv is assembled, which
-        is the one thing that can delay a first play; the scan is bounded, cached
-        for a month and killed by a cancellation.
-
-        `channel_bitrate` is the voice channel's own ceiling in bits/s, which only
-        a lossless source spends — see _encode_bitrate_kbps. Like volume, it is
-        baked into the argv, so it applies from the next song the player builds."""
+        uninterruptible executor job in that path."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
 
         data = await cls._resolve_playable_stream(
@@ -2570,7 +2469,8 @@ class YTDL(discord.FFmpegOpusAudio):
         search: str,
         *,
         query_source: str,
-        analytics: Analytics,
+        queued_at: float,
+        queue_position: int,
         user_input: Optional[str],
         download: bool = False,
         ts: Optional[int] = None,
@@ -2584,11 +2484,12 @@ class YTDL(discord.FFmpegOpusAudio):
         when present. flat=True answers a SEARCH from one search POST when the
         first result is a plain video with a duration — no watch page, no player
         call, and no stream URL, which the prefetch fills later; anything else
-        takes the full extraction. query_source, analytics and user_input are
-        REQUIRED so the QueueObject leaves complete — a default would let a call
-        site write a plausible zero. user_input None falls back to `search`, which
-        is what the user typed only for a direct -play of one song; for an expanded
-        collection `search` is a generated title, not the link -remove matches.
+        takes the full extraction. query_source, queued_at, queue_position and
+        user_input are REQUIRED so the QueueObject leaves complete — a default
+        would let a call site write a plausible zero. user_input None falls back
+        to `search`, which is what the user typed only for a direct -play of one
+        song; for an expanded collection `search` is a generated title, not the
+        link -remove matches.
 
         `isrc` and `expected_duration` are what a Spotify track knows about itself,
         and they decide WHICH term resolves: see _search_terms. Each term caches
@@ -2605,7 +2506,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     term,
                     expected_duration=expected_duration,
                     query_source=query_source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=queue_position,
                     user_input=user_input,
                     download=download,
                     ts=ts,
@@ -2634,7 +2536,8 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         expected_duration: Optional[int] = None,
         query_source: str,
-        analytics: Analytics,
+        queued_at: float,
+        queue_position: int,
         user_input: Optional[str],
         download: bool = False,
         ts: Optional[int] = None,
@@ -2686,7 +2589,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     ),
                     requester,
                     query_source=query_source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=queue_position,
                     user_input=origin,
                     ts=ts,
                 )
@@ -2725,7 +2629,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     flat_entry,
                     requester,
                     query_source=query_source,
-                    analytics=analytics,
+                    queued_at=queued_at,
+                    queue_position=queue_position,
                     user_input=origin,
                     ts=ts,
                 )
@@ -2839,7 +2744,8 @@ class YTDL(discord.FFmpegOpusAudio):
             identity,
             requester,
             query_source=query_source,
-            analytics=analytics,
+            queued_at=queued_at,
+            queue_position=queue_position,
             user_input=origin,
             ts=ts,
         )
@@ -2851,7 +2757,8 @@ class YTDL(discord.FFmpegOpusAudio):
         requester: Union[discord.User, discord.Member],
         *,
         query_source: str,
-        analytics: Analytics,
+        queued_at: float,
+        queue_position: int,
         user_input: str,
         redis: Optional[aioredis.Redis] = None,
         on_progress: Optional[ProgressFn] = None,
@@ -2860,10 +2767,10 @@ class YTDL(discord.FFmpegOpusAudio):
         """Fetch flat entry metadata for every video in a YouTube playlist, with the
         playlist's title and the count of entries dropped as unavailable.
 
-        query_source, analytics and user_input are REQUIRED (see yt_source).
-        `analytics` is the head's — track positions are derived per kept track
-        below. `user_input` is the playlist link the user pasted, carried onto every
-        track so -remove can match it.
+        query_source, queued_at, queue_position and user_input are REQUIRED (see
+        yt_source). `queue_position` is the head's — track positions are derived
+        per kept track below. `user_input` is the playlist link the user pasted,
+        carried onto every track so -remove can match it.
 
         Cached and single-flighted: this is the most expensive resolve in the system
         (99s at 5,547 entries), and two users pasting one collection used to run two
@@ -2921,7 +2828,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
         span.set_attribute("ytdl.playlist_size", len(tracks))
         # Positions derive from the KEPT tracks, so the entries _playlist_tracks
-        # dropped leave no gaps. replace() so a field added to Analytics is carried.
+        # dropped leave no gaps.
         return YoutubePlaylist(
             title=title,
             tracks=[
@@ -2929,9 +2836,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     track,
                     requester,
                     query_source=query_source,
-                    analytics=replace(
-                        analytics, queue_position=analytics.queue_position + offset
-                    ),
+                    queued_at=queued_at,
+                    queue_position=queue_position + offset,
                     user_input=user_input,
                 )
                 for offset, track in enumerate(tracks)

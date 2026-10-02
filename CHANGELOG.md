@@ -92,7 +92,7 @@ SoundCloud or Spotify is already lossy, where raising the target buys 0.0-0.3 dB
 real egress. Those songs send up to 3x the voice traffic they did. Like `-volume`, it
 applies from the song after next.
 
-## 2.55.0 — 2026-09-28
+## 2.55.2 — 2026-09-28
 
 **New setting: `-settings loudness`.** Off by default, and off behaves exactly as this
 bot always has. The other two even out how loud songs play:
@@ -113,7 +113,17 @@ Operators get `-settings bot loudness-scan-timeout` (default 8s, `LOUDNESS_SCAN_
 to bound that measurement; past it the song plays at its own level rather than waiting.
 Nothing to do on deploy: no guild has the setting until someone sets it.
 
-## 2.54.0 — 2026-09-28
+## 2.55.1 — 2026-09-28
+
+**Songs the bot re-encodes sound right.** Anything that is not bit-copied from YouTube —
+every SoundCloud track, every song played at a volume other than 100 %, every video whose
+only audio is AAC — was leaving the encoder in Opus's speech mode. It now stays in the
+music mode, which is also cheaper to encode. Nothing to do. Budget for roughly a third
+more voice traffic per such song: 119 to 153 kbps measured on a real YouTube stream, though
+how much more depends entirely on the music — simple material can even come out smaller.
+Rolling back restores the old sound and nothing else.
+
+## 2.55.0 — 2026-10-02
 
 **Spotify links now play the album recording, not the music video.** A Spotify track
 carries the recording's ISRC, and YouTube indexes that on the label's own upload, so the
@@ -123,22 +133,62 @@ Spotify names. Album tracks get the same treatment through one extra Spotify req
 50 tracks; a track with no ISRC, or whose ISRC YouTube does not know, resolves by title
 exactly as before.
 
-Two things to know. A Spotify link played recently resolves to the new recording on its
-very next play, not when some cache expires: the search term itself changes, so the old
-entry is never consulted. (A track with no ISRC, resolving at dequeue, is the one case that
-keeps what it had.) And the Spotify caches are re-keyed by this release: the first play of a
-playlist, album or track link after deploying fetches it again.
+Two things to know. Spotify links resolved in the last 24 hours keep the video they
+already resolved to until that entry ages out. And the Spotify caches are re-keyed by
+this release: the first play of a playlist or album after deploying walks it again.
 Rolling back is safe — the old build ignores the new keys and re-walks once itself.
 
-## 2.53.10 — 2026-09-28
+## 2.54.1 — 2026-09-27
 
-**Songs the bot re-encodes sound right.** Anything that is not bit-copied from YouTube —
-every SoundCloud track, every song played at a volume other than 100 %, every video whose
-only audio is AAC — was leaving the encoder in Opus's speech mode. It now stays in the
-music mode, which is also cheaper to encode. Nothing to do. Budget for roughly a third
-more voice traffic per such song: 119 to 153 kbps measured on a real YouTube stream, though
-how much more depends entirely on the music — simple material can even come out smaller.
-Rolling back restores the old sound and nothing else.
+**The reader for the queue entry builds before 2.54.0 wrote is gone.** Nothing changes in
+chat, and nothing this build writes to Redis changes. What goes with the reader is the
+old-shape tally 2.54.0 asked you to watch: the restart line reports the restored count
+and, when a queue held entries it could not read, how many.
+
+- **Deploy this only once that tally has read zero across restarts**, which is what
+  2.54.0 put it there for. If a queue does still hold an old-shape track, that track is
+  dropped and does not play. Nothing else in that queue is affected: the list is
+  rewritten once, so no other song shifts position or replays, and the restart logs one
+  warning per server naming how many entries it dropped and the shape it met
+  (`entry type 'ytsource'`).
+- **Roll back freely, to 2.53.7 or newer.** No entry this build writes is new to the
+  build before it. A track already dropped does not come back, though — the rollback
+  restores the reader, not the queue.
+
+## 2.54.0 — 2026-09-26
+
+**A collection track that has not resolved yet is written to Redis as an ordinary queued
+song.** Nothing changes in chat: the same tracks queue, show and play the same way. What
+moves is the shape of the saved entry, so this is the release the 2.53.2 note pointed
+forward at.
+
+- **Do not roll back past 2.53.7 once this build has run.** 2.53.7 is the first build
+  that can read the new entry; an older one restores such a track as a song it believes
+  is playable, pointing at the Spotify track page — at nothing at all when the collection
+  gave no link for it — and neither plays. Each one posts an error as its turn comes and
+  the queue moves on to the next. Rolling back TO 2.53.7 is safe.
+- **The first `-remove` touching a track an earlier build queued rewrites the whole queue
+  list once.** Removal matches an entry by its exact saved bytes, and those tracks were
+  saved in the old shape, so the first attempt misses and the list is rebuilt instead.
+  That rebuild logs one `queue mirror diverged from memory` warning for the guild, which
+  is expected here and not a sign of damage. Nothing is lost and nothing is duplicated;
+  afterwards every entry is in the new shape and removals are one-shot again. `-clear`
+  never has to match bytes — it deletes the list — so it costs nothing extra.
+- **Each restart reports, per guild, how many restored entries were still in the old
+  shape** — on the line that gives the restored count, and as `restore.old_shape_entries`
+  on that guild's restore span. A guild whose saved queue was empty gets the count with
+  no tally after it, so every `N of M` in the log is a list that was really read. A zero
+  covers only the guilds this start actually put a player back into. A server the bot had
+  been told to leave, one whose saved voice or text channel is gone, and one whose
+  reconnect failed are all skipped — the last two say so in their own warning — and each
+  keeps its saved queue for the 24 hours that list lives, counted by nobody. So read the
+  zeros alongside the `Recovery skipped` and `Could not rejoin voice` warnings, and give
+  the last of those a full day before you believe them. To settle it outright rather than
+  infer it, scan the `guild:*:queue` lists for entries whose `"type"` is `"ytsource"`.
+- **A queued collection costs a little more Redis**: ~540 bytes per unresolved track
+  against ~400 before, so a 10,000-track playlist holds ~5 MB of queue mirror rather than
+  ~4 MB, against the 256 MB the bundled Redis is given. Nothing to do; noted so the number
+  is not a surprise.
 
 ## 2.53.7 — 2026-09-26
 
