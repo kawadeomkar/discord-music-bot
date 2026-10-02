@@ -136,9 +136,17 @@ searches** (`"<name> <artist1> <artist2>"`); album and playlist tracks enqueue a
 unresolved `QueueObject`s resolved per-song at dequeue, each carrying the requester
 itself (`play_pipeline._searches_for` puts it there): the resolve runs long after the
 command, when the player's last author is whoever typed most recently. Both walks keep a
-`SpotifyTrack` beside every title (name, artists, Spotify's length, the track's page),
-index for index, and `_searches_for` sets them as the item's display fields: that is
-what `-queue` and the queued card list until the track resolves (`src/queue_rows.py`).
+`SpotifyTrack` beside every title (name, artists, Spotify's length, the track's page,
+its ISRC), index for index, and `_searches_for` sets them as the item's display fields:
+that is what `-queue` and the queued card list until the track resolves
+(`src/queue_rows.py`).
+The **ISRC leads the resolve**: `yt_source` searches `ytsearch:"<isrc>"` before the title,
+because the title of a well-known song finds the music video and the ISRC finds the
+label's art track (263 s against 234 s for "Shape of You"). A playlist asks for it in its
+`fields` mask; an album's simplified tracks carry none, so `_page_isrcs` batches one
+`/v1/tracks?ids=` per page, best-effort. Spotify's length then picks between the results
+of a FLAT search, which costs the same for five as for one. Full rule and numbers:
+ARCHITECTURE.md#which-recording-a-spotify-track-resolves-to.
 An album (`Spotify.album`) returns
 the playlist's `SpotifyPlaylist` shape plus its artists and cover, and from there takes
 the playlist's path through `queue_source`, the card and every placement; page 1 rides
