@@ -2476,11 +2476,10 @@ class TestFooterRuntimeSegment:
         """Before the sampler's second tick there is no rate to report, and 0%
         would be a lie an operator acts on."""
         footer = debug.debug_footer(
-            runtime=self._snapshot(cpu_percent=None, mem_percent=None)
+            runtime=self._snapshot(cpu_percent=None, mem_percent=None),
+            skip_environment=True,
         )
-        assert "cpu" not in footer
-        assert "mem" not in footer
-        assert "lag 2.1 ms" in footer
+        assert footer == "🐞 lag 2.1 ms\ntasks 87 · pool 4"
 
     def test_no_snapshot_yields_no_runtime_segment(self) -> None:
         assert (
