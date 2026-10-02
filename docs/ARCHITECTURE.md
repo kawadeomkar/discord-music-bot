@@ -18,6 +18,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [-play Command Pipeline](#-play-command-pipeline)
    - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
+     - [The music search fallback](#the-music-search-fallback)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
    - [Queue Operations](#queue-operations)
@@ -778,6 +779,71 @@ search POST costs the same for one result as for five (0.51 s measured, either w
 a processed search extracts every entry it answers with — 3.69 s for three against 1.22 s
 for one, and three times the player requests, which is not a cost worth paying at the
 dequeue resolve for a re-upload instead of a music video.
+
+### The music search fallback
+
+A signed-out `ytsearch` can come back EMPTY for a query that has results. When the top
+of the result set holds age-restricted content, YouTube withholds the whole page from an
+anonymous client: `estimatedResults: "0"`, no `videoRenderer`, and a
+`backgroundPromoRenderer` reading **"Confirm your age" / "These results may be
+inappropriate for some users."** with a `Sign in` call to action. Measured, `xvi akiaura`
+is walled while `akiaura xvi` answers with 17,176 results — the two orderings rank
+differently and only one surfaces a restricted item. It is not a rule about word order or
+leading tokens: `xvi drake`, `xiv drake`, `xv drake` and `xvii drake` are all walled
+while `xvi sace`, `xvi song`, `xvi lonown` and `xvi taylor swift` answer normally, and
+`xvi drake` returning zero against `drake`'s 64.6 million is what proves the zero is not
+semantic.
+
+**Nothing in what yt-dlp returns says so.** The result is `entries: []`,
+`playlist_count: 0`, no warning and no error — byte-identical in shape to a query with no
+matches. So the bot cannot tell the two apart, and `-play` answered both with "Couldn't
+find anything playable for that." for a song that exists and plays.
+
+`music.youtube.com` is not subject to it, and yt-dlp reaches it natively through
+`youtube:music:search_url`. So the last rung of `yt_source`'s term ladder
+(`_ytmusic_candidate_url`) asks music search for the same query and hands back the watch
+URL of the first playable track, which then resolves through the ordinary LINK path —
+one round that fills both the source and stream caches. Measured end to end: 0.5 s for
+the flat music search plus 1.2 s for the resolve, on a path that previously just failed.
+
+Four properties are load-bearing:
+
+- **FLAT, always.** A processed extraction walks the whole result set, and the set
+  legitimately contains age-restricted tracks — with `ignoreerrors=False` one of them
+  raises for the entire search. Measured: the processed form dies on `rQvsCP38DJk` for
+  both orderings, including the one plain search answers fine.
+- **The entries are filtered by KIND and id length.** Music search interleaves album
+  (`MPREb_…`) and channel (`UC…`) pages with the tracks as `YoutubeTab` entries carrying
+  no title. They are not `_type` `"playlist"`, so `select_search_entry` would take one,
+  and queueing it plays nothing.
+- **A LINK never reaches this rung.** It named one video; a second opinion from another
+  corpus would play something the user did not ask for.
+- **The candidate has to share a word with the ask.** Music search NEVER answers with
+  nothing — asked for something with no matches it returns its loosest associations, so a
+  candidate existing is no evidence the ask was found. Measured, before this gate existed:
+  `zzzzqqqq no such song anywhere 98765` resolved to an unrelated devotional track and the
+  bot played it, which is worse than the failure being fixed. `_music_candidate_matches`
+  requires one shared word of `_MIN_MATCH_WORD` (3) characters — three because "xvi" is a
+  real ask, and not fewer because a two-letter word is shared by too much to mean anything
+  (`u2 akiaura` would take a U2 song). A declined candidate leaves the ask with the answer
+  it already had, and sets `ytdl.music_no_match` on the span.
+
+The fallback is best-effort: its own failure is logged and the ask keeps the answer it
+earned, because an age-restricted candidate raises yt-dlp's `--cookies-from-browser`
+boilerplate, which `user_message` shows verbatim for an `expected` error.
+
+Cookies would fix the wall at its source and are what yt-dlp's own wiki recommends for
+age-restricted content, but the same wiki warns that using an account "run[s] the risk of
+it being banned (temporarily or permanently)" and that the failure mode includes IP bans
+— which on a self-hosted bot would cost playback entirely, a worse outcome than the bug.
+PO tokens do not help: they buy format access, not age verification. The official Data
+API's `safeSearch=none` does not filter results, but `search.list` costs 100 of a
+10,000-unit daily quota, so ~100 searches a day.
+
+A repeat of a walled query re-walks the ladder: the identity is cached under the
+candidate's watch URL, not under the search term, so only the resolve is a hit. A search
+that genuinely has no matches pays the flat music ask (~0.8 s measured) and then declines,
+on a path that was already failing.
 
 ---
 

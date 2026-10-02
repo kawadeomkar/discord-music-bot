@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
 from typing import Any, Final, Optional, TypedDict, Union, cast
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import aiohttp
 import discord
@@ -1471,6 +1471,17 @@ class _NothingFound(Exception):
 _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
+_SEARCH_KIND_MUSIC: Final[str] = "music"
+
+# A YouTube video id. Music search answers with album (`MPREb_…`) and channel
+# (`UC…`) ids beside the tracks, and length is what separates them.
+_VIDEO_ID_LEN: Final[int] = 11
+
+# Shortest query word that can carry a match. Music search NEVER answers with
+# nothing, so a candidate existing is no evidence the ask was found; one shared word
+# is. Three, because "xvi" is a real ask.
+_MIN_MATCH_WORD: Final[int] = 3
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
 # How many results a length gets to choose between. One search POST costs the same
 # for one result as for five (0.51 s either way), but a PROCESSED search extracts
@@ -1514,6 +1525,66 @@ def _search_terms(
     else:
         terms.append((_SEARCH_KIND_TITLE, search))
     return terms
+
+
+def _music_candidate_matches(query: str, title: Optional[str]) -> bool:
+    """Whether a music-search title is plausibly an answer to `query`.
+
+    Asked for something with no matches, music search returns its loosest
+    associations rather than an empty result — measured, a typo'd query answered with
+    an unrelated devotional track. So the candidate has to earn its place: one shared
+    word of `_MIN_MATCH_WORD` characters is what separates "XVI" for `xvi akiaura`
+    from that. Rejecting leaves the ask with the answer it already had.
+    """
+    wanted = {w for w in _WORD_RE.findall(query.lower()) if len(w) >= _MIN_MATCH_WORD}
+    if not wanted:
+        return False
+    return bool(wanted & set(_WORD_RE.findall((title or "").lower())))
+
+
+async def _ytmusic_candidate_url(
+    search: str,
+    *,
+    pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+) -> Optional[str]:
+    """The watch URL of the first playable track music.youtube.com answers `search`
+    with, or None. The last rung of yt_source's ladder, and the only one that sees a
+    result set YouTube does not age-wall: a signed-out `ytsearch` whose top results
+    hold age-restricted content comes back EMPTY — `estimatedResults: 0` and a
+    "Confirm your age" card where the videos would be — with nothing in the result
+    yt-dlp hands back to say so. Music search answers the same query normally.
+    See docs/ARCHITECTURE.md#the-music-search-fallback.
+
+    FLAT, and only ever flat: a processed extraction walks the whole result set, and
+    `ignoreerrors=False` means one age-restricted track in it raises for the entire
+    search. Returning a watch URL hands the resolve back to the link path, which is
+    what fills both caches.
+    """
+    query = _SEARCH_PREFIX_RE.sub("", search).strip()
+    if not query:
+        return None
+    url = "https://music.youtube.com/search?q=" + quote_plus(query)
+    data = await _extract_for_source(
+        _inflight_key(_source_cache_key(url), "music"),
+        ExtractRequest(url=url, opts=_YTDL_FLAT_SEARCH_OPTS),
+        url,
+        pool_slot=pool_slot,
+    )
+    for entry in (data or {}).get("entries") or []:
+        # Music search interleaves album and channel pages with the tracks, as
+        # `YoutubeTab` entries carrying an `MPREb_`/`UC` id and no title.
+        # select_search_entry cannot tell them apart — they are not `_type`
+        # "playlist" — and queueing one plays nothing.
+        if not entry or entry.get("ie_key") != "Youtube":
+            continue
+        video_id = str(entry.get("id") or "")
+        if len(video_id) != _VIDEO_ID_LEN:
+            continue
+        if not _music_candidate_matches(query, entry.get("title")):
+            continue
+        return f"https://www.youtube.com/watch?v={video_id}"
+    trace.get_current_span().set_attribute("ytdl.music_no_match", True)
+    return None
 
 
 def _first_video_entry(
@@ -2179,34 +2250,61 @@ class YTDL(discord.FFmpegOpusAudio):
         terms = _search_terms(
             search, isrc=isrc, expected_duration=expected_duration, flat=flat
         )
+        resolve = partial(
+            cls._resolve_term,
+            requester,
+            expected_duration=expected_duration,
+            query_source=query_source,
+            queued_at=queued_at,
+            queue_position=queue_position,
+            user_input=user_input,
+            download=download,
+            ts=ts,
+            redis=redis,
+            pool_slot=pool_slot,
+        )
+        last_miss: Optional[_NothingFound] = None
         for index, (kind, term) in enumerate(terms):
             trace.get_current_span().set_attribute("ytdl.search_kind", kind)
             try:
-                return await cls._resolve_term(
-                    requester,
-                    term,
-                    expected_duration=expected_duration,
-                    query_source=query_source,
-                    queued_at=queued_at,
-                    queue_position=queue_position,
-                    user_input=user_input,
-                    download=download,
-                    ts=ts,
-                    redis=redis,
-                    flat=flat,
-                    pool_slot=pool_slot,
-                )
+                return await resolve(term, flat=flat)
             except _NothingFound as miss:
-                if index == len(terms) - 1:
-                    # The ask is out of terms, so this miss is the answer. Raised
-                    # as the failure the caller has always seen, `from None`
-                    # because the wrapper is this method's private business.
-                    raise miss.public from None
-                log.info(
-                    f"{kind} search {term!r} found nothing; "
-                    f"falling back to {terms[index + 1][1]!r}"
+                last_miss = miss
+                if index < len(terms) - 1:
+                    log.info(
+                        f"{kind} search {term!r} found nothing; "
+                        f"falling back to {terms[index + 1][1]!r}"
+                    )
+        if last_miss is None:
+            raise AssertionError("_search_terms never returns an empty ladder")
+
+        # Every ytsearch term missed. For a SEARCH that can mean YouTube withheld
+        # the results rather than holding none, which music search is not subject
+        # to. A LINK is excluded: it named one video, and a second opinion on a
+        # different corpus would play something the user did not ask for.
+        if not is_link(search.strip()):
+            watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
+            if watch_url is not None:
+                trace.get_current_span().set_attribute(
+                    "ytdl.search_kind", _SEARCH_KIND_MUSIC
                 )
-        raise AssertionError("_search_terms never returns an empty ladder")
+                log.info(
+                    f"search {search!r} found nothing; music search found {watch_url}"
+                )
+                try:
+                    # Never flat: the candidate is a link now, and the link path is
+                    # what fills both caches from one round.
+                    return await resolve(watch_url, flat=False)
+                except Exception as e:
+                    # The fallback is best-effort. Its own failure must not replace
+                    # the answer the ask already earned — an age-restricted
+                    # candidate raises yt-dlp's cookies boilerplate, which
+                    # user_message would show verbatim for an `expected` error.
+                    log.warning(f"music fallback for {search!r} failed: {e!r}")
+
+        # Raised as the failure the caller has always seen, `from None` because the
+        # wrapper is this method's private business.
+        raise last_miss.public from None
 
     @classmethod
     async def _resolve_term(

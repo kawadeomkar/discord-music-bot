@@ -50,7 +50,10 @@ from src.youtube import (
     _source_entry_is_stale,
     _YTDL_FLAT_SEARCH_OPTS,
     _mine_audio_candidates,
+    ExtractionError,
+    _music_candidate_matches,
     _search_terms,
+    _ytmusic_candidate_url,
     select_search_entry,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
@@ -1516,6 +1519,244 @@ class TestYTSourceTermLadder:
         # The ISRC miss is not cached — only a resolve writes an entry — so it is
         # re-asked, and the title term is not.
         assert calls.count("ytsearch:Shape of You Ed Sheeran") == 1
+
+
+class TestMusicSearchFallback:
+    """A signed-out `ytsearch` whose top results hold age-restricted content comes
+    back EMPTY — `estimatedResults: 0` and a "Confirm your age" card — and yt-dlp
+    hands the caller no way to tell that from a query with no matches. Music search
+    answers the same query normally, so an exhausted ladder asks it once.
+    See docs/ARCHITECTURE.md#the-music-search-fallback."""
+
+    _MUSIC_URL = "https://music.youtube.com/search?q=xvi+akiaura"
+    _FOUND = {
+        "webpage_url": "https://www.youtube.com/watch?v=kSAEcjWWuew",
+        "title": "XVI",
+        "url": "https://cdn/xvi",
+        "duration": 244,
+    }
+    # The shape music search answers with: album and channel pages interleaved with
+    # the tracks, carrying no title and an id that is not 11 characters.
+    _MUSIC_RESULT = {
+        "entries": [
+            {"ie_key": "YoutubeTab", "id": "MPREb_2Kryrn9iVK0", "title": None},
+            {"ie_key": "YoutubeTab", "id": "UCTuxLS8YPPDUn8xtwItOt_g", "title": None},
+            # Eleven characters, so length alone would admit it. The kind is what
+            # rules it out, and this is the entry that says so.
+            {"ie_key": "YoutubeTab", "id": "OLAK5uy_abc", "title": None},
+            # Right kind, wrong id. The length check is what rejects it, and the
+            # url it would build — watch?v=short — resolves to nothing.
+            {"ie_key": "Youtube", "id": "short", "title": "truncated id"},
+            {"ie_key": "Youtube", "id": "kSAEcjWWuew", "title": "XVI"},
+            {"ie_key": "Youtube", "id": "UH8OV1D091Q", "title": "also playable"},
+        ]
+    }
+
+    def _extract(self, answers: dict[str, Any], asked: list[str]) -> Any:
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            return answers.get(search)
+
+        return extract
+
+    async def test_an_exhausted_ladder_resolves_what_music_search_found(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert result.title == "XVI"
+        assert result.duration == 244
+        # The ytsearch term first, then music search, then the candidate as a LINK.
+        assert asked == [
+            "ytsearch:xvi akiaura",
+            self._MUSIC_URL,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew",
+        ]
+
+    async def test_the_album_and_channel_entries_are_never_chosen(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """They are not `_type` "playlist", so select_search_entry would take one,
+        and queueing it plays nothing. The two tracks sit BEHIND them in the
+        fixture, so a filter that only skipped `_type` would return an album."""
+        asked: list[str] = []
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: self._MUSIC_RESULT}, asked),
+        ):
+            got = await _ytmusic_candidate_url("ytsearch:xvi akiaura")
+        assert got == "https://www.youtube.com/watch?v=kSAEcjWWuew"
+
+    async def test_a_result_holding_no_track_is_no_candidate(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+        only_albums = {
+            "entries": [{"ie_key": "YoutubeTab", "id": "MPREb_x", "title": None}]
+        }
+        with patch(
+            "src.youtube._extract_for_source",
+            new=self._extract({self._MUSIC_URL: only_albums}, asked),
+        ):
+            assert await _ytmusic_candidate_url("ytsearch:xvi akiaura") is None
+
+    @pytest.mark.parametrize(
+        ("query", "title", "wanted"),
+        [
+            ("xvi akiaura", "XVI", True),
+            ("xvi drake", "Reflections - Drake's Head", True),
+            ("ytsearch:akiaura xvi", "akiaura, LONOWN, Sace - XVI", True),
+            # The measured regression: music search answered a typo with an
+            # unrelated devotional track, and the bot played it.
+            (
+                "zzzzqqqq no such song anywhere 98765",
+                "Sis Chinyere Udoma Jesus Bu Uzo Official Video",
+                False,
+            ),
+            ("u2", "Beautiful Day", False),  # no word long enough to carry a match
+            # What the floor is FOR: a two-letter word is shared by too much to
+            # mean anything, and matching on it plays the wrong artist entirely.
+            ("u2 akiaura", "U2 - With Or Without You", False),
+            ("xvi akiaura", None, False),  # an album page, were one to get this far
+        ],
+        ids=[
+            "short-word",
+            "across-punctuation",
+            "prefixed",
+            "unrelated",
+            "no-usable-word",
+            "short-word-is-not-a-match",
+            "titleless",
+        ],
+    )
+    def test_a_candidate_has_to_share_a_word_with_the_ask(
+        self, query: str, title: Any, wanted: bool
+    ) -> None:
+        assert _music_candidate_matches(query, title) is wanted
+
+    async def test_an_unrelated_candidate_is_declined(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Music search never answers with nothing, so "a candidate exists" cannot be
+        the test — the ask keeps the answer it earned instead of playing a stranger."""
+        asked: list[str] = []
+        unrelated = {
+            "entries": [
+                {"ie_key": "Youtube", "id": "NHmXV8GXN4a", "title": "Jesus Bu Uzo"}
+            ]
+        }
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract({self._MUSIC_URL: unrelated}, asked),
+            ),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        # The candidate was never resolved — only the ytsearch term and the music ask.
+        assert asked == ["ytsearch:xvi akiaura", self._MUSIC_URL]
+
+    async def test_a_link_that_finds_nothing_does_not_ask_music_search(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A link named one video. A second opinion on another corpus would play
+        something the user did not ask for."""
+        asked: list[str] = []
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract({}, asked)),
+            pytest.raises(Exception, match="Could not find song"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "https://www.youtube.com/watch?v=gone1234567",
+                query_source="link",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert asked == ["https://www.youtube.com/watch?v=gone1234567"]
+
+    async def test_a_failing_fallback_raises_the_original_answer(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """An age-restricted candidate raises yt-dlp's cookies boilerplate, which
+        user_message shows verbatim for an `expected` error. The ask keeps the
+        answer it earned."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search == self._MUSIC_URL:
+                return self._MUSIC_RESULT
+            if search.startswith("https://www.youtube.com/watch"):
+                raise ExtractionError(
+                    "ERROR: [youtube] kSAEcjWWuew: Sign in to confirm your age. "
+                    "Use --cookies-from-browser",
+                    expected=True,
+                )
+            return None
+
+        with (
+            patch("src.youtube._extract_for_source", new=extract),
+            pytest.raises(Exception, match="Could not find song") as raised,
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert "cookies" not in str(raised.value)
+
+    async def test_the_span_names_the_music_kind(self, mock_ctx: MagicMock) -> None:
+        asked: list[str] = []
+        answers = {
+            self._MUSIC_URL: self._MUSIC_RESULT,
+            "https://www.youtube.com/watch?v=kSAEcjWWuew": self._FOUND,
+        }
+        span = MagicMock()
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract(answers, asked)),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        kinds = [
+            c.args[1]
+            for c in span.set_attribute.call_args_list
+            if c.args and c.args[0] == "ytdl.search_kind"
+        ]
+        assert kinds[-1] == "music"
 
 
 class TestYTSourceUnifiedExtraction:

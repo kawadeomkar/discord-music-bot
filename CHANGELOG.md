@@ -98,6 +98,33 @@ already resolved to until that entry ages out. And the Spotify caches are re-key
 this release: the first play of a playlist or album after deploying walks it again.
 Rolling back is safe — the old build ignores the new keys and re-walks once itself.
 
+## 2.56.0 — 2026-10-02
+
+**Searches that YouTube refused to answer now play.** Some searches came back as
+"Couldn't find anything playable for that." for songs that exist and play fine. The cause
+was not the bot and not yt-dlp: when the top of a result set holds age-restricted content,
+YouTube serves a signed-out client an empty page — a "Confirm your age" card where the
+videos would be — and reports zero results. `xvi akiaura` is one; `akiaura xvi`, the same
+two words reordered, returns 17,176. Nothing in what yt-dlp hands back distinguishes that
+from a query with no matches, which is why the bot believed it.
+
+Such a search now gets one more try through YouTube Music, which answers it normally, and
+plays the first track it names.
+
+- **Nothing to do.** No setting, no key, no account, no new service. It uses the
+  music.youtube.com search yt-dlp already supports.
+- **Only a search that found NOTHING reaches it**, so no search that works today changes
+  its answer. A link never reaches it at all.
+- **It costs about 1.7 seconds**, and only on a request that previously failed outright.
+  A repeat of the same wording pays it again — the result is remembered against the track
+  it found, not against the words you typed.
+- **A search that genuinely has no matches still says so**, with the same wording as
+  before, about 0.8 seconds later than it used to. YouTube Music always offers *something*,
+  so a track is only accepted when it shares a word with what you asked for — a typo gets
+  the same "couldn't find anything" it always got, not a stranger's song.
+- **Roll back freely**, to any 2.55.x. Nothing here changes what is written to Redis or
+  Postgres.
+
 ## 2.54.1 — 2026-09-27
 
 **The reader for the queue entry builds before 2.54.0 wrote is gone.** Nothing changes in
