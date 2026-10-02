@@ -436,6 +436,8 @@ async def _searches_for(
                 query_source=QUERY_SOURCE_SPOTIFY,
                 uploader=byline(row) if row else None,
                 duration=row.duration_secs if row else None,
+                # What the resolve at dequeue searches before the term.
+                isrc=row.isrc if row else None,
                 queued_at=queued_at,
                 queue_position=queue_position + offset,
             )
@@ -650,8 +652,17 @@ async def queue_source(
         )
     ts = effective_start_offset(source, start_offset)
     search: str
+    # What Spotify knows about the recording, and nothing else does: every other
+    # source IS the recording it names.
+    isrc: Optional[str] = None
+    expected_duration: Optional[int] = None
     if isinstance(source, SpotifySource):
-        search = await cog._require_spotify().track(source.id)
+        row = await cog._require_spotify().track(source.id)
+        search, isrc, expected_duration = (
+            row.search_title,
+            row.isrc,
+            row.duration_secs,
+        )
     elif isinstance(source, YTSource):
         search = source.ytsearch or source.url or ""
     elif isinstance(source, SoundcloudSource):
@@ -674,6 +685,8 @@ async def queue_source(
         user_input=origin,
         flat=flat,
         pool_slot=pool_slot,
+        isrc=isrc,
+        expected_duration=expected_duration,
     )
 
 
@@ -948,6 +961,8 @@ async def _resolve_interjection_source(
             queue_position=0,
             user_input=origin,
             pool_slot=pool_slot,
+            isrc=tracks[0].isrc,
+            expected_duration=tracks[0].duration,
         )
         return head, list(tracks[1:])
     if isinstance(source, YTSource) and source.type is YTType.PLAYLIST:

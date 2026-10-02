@@ -2072,7 +2072,13 @@ class MusicPlayer:
             queued_at=source.queued_at,
             queue_position=source.queue_position,
             user_input=source.user_input,
+            # What the ask knows about the recording: the walk's ISRC and its
+            # length, which pick the album master over the music video.
+            isrc=source.isrc,
+            expected_duration=source.duration,
         )
+        # The term and the recording clear together: both steered this resolve,
+        # and a resolved entry writes neither.
         return replace(
             source,
             webpage_url=resolved.webpage_url,
@@ -2081,6 +2087,7 @@ class MusicPlayer:
             uploader=resolved.uploader,
             thumbnail=resolved.thumbnail,
             search="",
+            isrc=None,
         )
 
     async def _stream_source(

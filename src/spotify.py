@@ -1,8 +1,9 @@
 import asyncio
 import contextlib
 import os
+import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 from collections.abc import Awaitable, Callable, Iterator
 
@@ -96,12 +97,25 @@ class SpotifyRowMismatchError(Exception):
 class SpotifyTrack:
     """One walked track as a listing shows it: its own name, apart from the search
     string it is queued as. The length and the link are what Spotify sent, so
-    either may be missing."""
+    either may be missing.
+
+    `isrc` is the recording's identity, which YouTube indexes on the label's
+    art-track uploads — the album master rather than the music video a title
+    search finds. Absent on an album's simplified tracks and on anything Spotify
+    sent without one. See docs/ARCHITECTURE.md#source-resolution."""
 
     name: str
     artists: list[str]
     duration_secs: Optional[int]
     url: Optional[str]
+    isrc: Optional[str] = None
+
+    @property
+    def search_title(self) -> str:
+        """ "<name> <artist1> <artist2> ...", the yt-dlp search term this track
+        resolves through. A podcast episode carries no artists at all, and a
+        nameless one adds nothing to the search."""
+        return self.name + "".join(f" {name}" for name in self.artists)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -147,9 +161,7 @@ def _playlist_to_cache(playlist: SpotifyPlaylist) -> dict[str, Any]:
         "unavailable": playlist.unavailable,
         "artists": playlist.artists,
         "thumbnail": playlist.thumbnail,
-        "tracks": [
-            [t.name, t.artists, t.duration_secs, t.url] for t in playlist.tracks
-        ],
+        "tracks": [_track_to_cache(t) for t in playlist.tracks],
     }
 
 
@@ -181,6 +193,34 @@ async def _playlist_from_cache(raw: object) -> Optional[SpotifyPlaylist]:
         return None
 
 
+def _track_to_cache(track: SpotifyTrack) -> list[Any]:
+    """One row for orjson. Positional, so a walk's rows cost five values rather
+    than five keys each; every key that reads them is versioned by this shape."""
+    return [
+        track.name,
+        track.artists,
+        track.duration_secs,
+        track.url,
+        track.isrc,
+    ]
+
+
+def _track_from_cache(raw: object) -> Optional[SpotifyTrack]:
+    """One cached row back, or None for a shape this build does not write."""
+    if not isinstance(raw, list) or len(raw) != 5:
+        return None
+    name, artists, secs, url, isrc = cast(list[Any], raw)
+    if not isinstance(name, str) or not isinstance(artists, list):
+        return None
+    return SpotifyTrack(
+        name=name,
+        artists=[str(a) for a in cast(list[Any], artists)],
+        duration_secs=secs if isinstance(secs, int) else None,
+        url=_str_or_none(url),
+        isrc=_str_or_none(isrc),
+    )
+
+
 async def _tracks_from_cache(raw: object, count: int) -> list[SpotifyTrack]:
     """The cached display rows, or [] when they are absent, malformed or not one
     per title: the titles still queue, as searches with nothing to show."""
@@ -190,19 +230,10 @@ async def _tracks_from_cache(raw: object, count: int) -> list[SpotifyTrack]:
     for i, row in enumerate(cast(list[Any], raw)):
         if i and not i % _CACHE_ROWS_CHUNK:
             await asyncio.sleep(0)
-        if not isinstance(row, list) or len(row) != 4:
+        parsed = _track_from_cache(row)
+        if parsed is None:
             return []
-        name, artists, secs, url = cast(list[Any], row)
-        if not isinstance(name, str) or not isinstance(artists, list):
-            return []
-        tracks.append(
-            SpotifyTrack(
-                name=name,
-                artists=[str(a) for a in cast(list[Any], artists)],
-                duration_secs=secs if isinstance(secs, int) else None,
-                url=_str_or_none(url),
-            )
-        )
+        tracks.append(parsed)
     return tracks
 
 
@@ -252,8 +283,27 @@ def _row_url(raw: object) -> Optional[str]:
     return None if any(c in url for c in ") \t\n") else url
 
 
+# IFPI's shape: two-letter country, three-character registrant, two-digit year,
+# five-digit designation. Spotify sends the odd empty string and the odd typo, and
+# a malformed one searched verbatim finds nothing and costs a round trip.
+_ISRC_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$")
+
+
+def _track_isrc(track: dict[str, Any]) -> Optional[str]:
+    """The track's ISRC, upper-cased, or None when Spotify sent none or sent one
+    that is not an ISRC. Only full track objects carry `external_ids`: an album's
+    simplified tracks have none, and resolve by title."""
+    ids = track.get("external_ids")
+    raw = _str_or_none(ids.get("isrc")) if isinstance(ids, dict) else None
+    if raw is None:
+        return None
+    isrc = raw.upper()
+    return isrc if _ISRC_RE.match(isrc) else None
+
+
 def _track_row(track: dict[str, Any]) -> SpotifyTrack:
-    """A walked track's display row. The caller has checked it has a name."""
+    """A walked track's display row, and the search term it queues as. The caller
+    has checked it has a name."""
     ms = track.get("duration_ms")
     links = track.get("external_urls")
     return SpotifyTrack(
@@ -265,18 +315,7 @@ def _track_row(track: dict[str, Any]) -> SpotifyTrack:
         ],
         duration_secs=ms // 1000 if isinstance(ms, int) else None,
         url=_row_url(links.get("spotify")) if isinstance(links, dict) else None,
-    )
-
-
-def _track_search_title(track: dict[str, Any]) -> str:
-    """ "<name> <artist1> <artist2> ...", the yt-dlp search string a Spotify
-    track resolves to. Shared by track(), playlist() and album()."""
-    # artists defaulted: a playlist can hold a podcast episode, which carries a
-    # name and no artists at all. A nameless artist adds nothing to the search.
-    return track["name"] + "".join(
-        f" {name}"
-        for a in _list_or_empty(track.get("artists"))
-        if isinstance(a, dict) and (name := _str_or_none(a.get("name"))) is not None
+        isrc=_track_isrc(track),
     )
 
 
@@ -676,16 +715,24 @@ class Spotify:
         return result
 
     @_tracer.start_as_current_span("spotify.track")
-    async def track(self, tid: str) -> str:
-        """Return "<title> <artist1> <artist2> ..." for a track ID, cached for 24h."""
+    async def track(self, tid: str) -> SpotifyTrack:
+        """One track: its search term, its length and its ISRC, cached for 24h.
+
+        The row rather than the term alone, because the resolve wants all three —
+        the ISRC to find the recording, the length to choose between results."""
         trace.get_current_span().set_attribute("spotify.track_id", tid)
-
-        async def fetch() -> str:
-            endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
-            resp = await self.http_call(endpoint)
-            return _track_search_title(resp)
-
-        return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
+        # Versioned by the VALUE's shape, as the collection keys are: the build
+        # before this one cached the bare search string here.
+        cache_key = f"spotify:track:v2:{tid}"
+        # A malformed entry reads as a miss, and the fetch overwrites it.
+        cached = _track_from_cache(await cache_get(self._redis, cache_key))
+        trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
+        if cached is not None:
+            return cached
+        resp = await self.http_call(self.spotify_endpoint + f"v1/tracks/{tid}")
+        row = _track_row(resp)
+        await cache_set(self._redis, cache_key, _track_to_cache(row), _TRACK_TTL)
+        return row
 
     @_tracer.start_as_current_span("spotify.playlist")
     async def playlist(
@@ -709,7 +756,7 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
         # Versioned by the VALUE's shape: under a 1h TTL, a deploy that changes it
         # would otherwise be answered from the previous build's entries.
-        cache_key = f"spotify:playlist:v4:{pid}"
+        cache_key = f"spotify:playlist:v5:{pid}"
 
         async def fetch() -> tuple[SpotifyPlaylist, bool]:
             # Under `fields` Spotify answers with only the keys named, so `next`
@@ -719,7 +766,7 @@ class Spotify:
             params: Optional[dict[str, Union[str, int]]] = {
                 "fields": (
                     "items(track(name,artists(name),duration_ms,"
-                    "external_urls(spotify))),next,total"
+                    "external_ids(isrc),external_urls(spotify))),next,total"
                 ),
                 "limit": _PLAYLIST_PAGE_SIZE,
             }
@@ -765,8 +812,9 @@ class Spotify:
                                 # and is kept — the name is what the search wants.
                                 unavailable += 1
                                 continue
-                            titles.append(_track_search_title(track))
-                            tracks.append(_track_row(track))
+                            row = _track_row(track)
+                            titles.append(row.search_title)
+                            tracks.append(row)
                             ms = track.get("duration_ms")
                             if isinstance(ms, int):
                                 duration_ms += ms
@@ -867,6 +915,45 @@ class Spotify:
         with _subscribed(cache_key, on_progress):
             return await asyncio.shield(job)
 
+    async def _page_isrcs(self, items: list[Any], aid: str) -> dict[str, str]:
+        """{track id: ISRC} for one album page, or {} when the request fails.
+
+        An album's items are SIMPLIFIED track objects, which carry no
+        `external_ids` — so the recording each names is one batched request away,
+        50 ids at a time, the page size the walk already uses. Best-effort like
+        the album's name: without it every track resolves by title, which is what
+        it did before this existed. Bounded like one page.
+        """
+        ids = [
+            tid
+            for track in items
+            if isinstance(track, dict)
+            and (tid := _str_or_none(track.get("id"))) is not None
+        ]
+        if not ids:
+            return {}
+        try:
+            async with asyncio.timeout(_PLAYLIST_PAGE_TIMEOUT_SECS) as bound:
+                resp = await self.http_call(
+                    self.spotify_endpoint + "v1/tracks",
+                    params={"ids": ",".join(ids[:_PLAYLIST_PAGE_SIZE])},
+                    deadline=bound.when(),
+                )
+        except Exception as e:
+            log.warning(f"spotify album {aid}: ISRC request failed: {e!r}")
+            return {}
+        found: dict[str, str] = {}
+        for track in _list_or_empty(
+            resp.get("tracks") if isinstance(resp, dict) else None
+        ):
+            if not isinstance(track, dict):
+                continue
+            tid = _str_or_none(track.get("id"))
+            isrc = _track_isrc(track)
+            if tid is not None and isrc is not None:
+                found[tid] = isrc
+        return found
+
     async def _playlist_name(self, pid: str) -> Optional[str]:
         """The playlist's name, or None when the request fails or carries none:
         it decorates the confirmation, so it never fails the walk. Bounded like
@@ -914,7 +1001,7 @@ class Spotify:
         """
         trace.get_current_span().set_attribute("spotify.album_id", aid)
         # Versioned by the value's shape, as the playlist key is.
-        cache_key = f"spotify:album_tracks:v2:{aid}"
+        cache_key = f"spotify:album_tracks:v3:{aid}"
         cached = await _playlist_from_cache(await cache_get(self._redis, cache_key))
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
@@ -999,6 +1086,7 @@ class Spotify:
                     pages += 1
                     items = _list_or_empty(page.get("items"))
                     walked += len(items)
+                    isrcs = await self._page_isrcs(items, aid)
                     for track in items:
                         # An album item IS the track: no `track` wrapper.
                         if not isinstance(track, dict) or not _str_or_none(
@@ -1006,8 +1094,12 @@ class Spotify:
                         ):
                             unavailable += 1
                             continue
-                        titles.append(_track_search_title(track))
-                        tracks.append(_track_row(track))
+                        row = _track_row(track)
+                        tid = _str_or_none(track.get("id"))
+                        if row.isrc is None and tid is not None:
+                            row = replace(row, isrc=isrcs.get(tid))
+                        titles.append(row.search_title)
+                        tracks.append(row)
                         ms = track.get("duration_ms")
                         if isinstance(ms, int):
                             duration_ms += ms
@@ -1082,7 +1174,7 @@ class Spotify:
             )
             # The previous version's value is unreadable and unreferenced from here
             # on, and its 24h TTL would keep it resident beside this one.
-            await cache_del(self._redis, f"spotify:album_tracks:v1:{aid}")
+            await cache_del(self._redis, f"spotify:album_tracks:v2:{aid}")
         else:
             log.debug(f"spotify album {aid} kept no titles; not cached")
         return album

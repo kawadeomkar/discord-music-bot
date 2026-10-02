@@ -4638,6 +4638,27 @@ class TestEnqueueDepth:
         assert spy.await_args is not None
         assert {k: spy.await_args.kwargs[k] for k in ask_of(source)} == ask_of(source)
 
+    async def test_resolved_search_hands_the_recording_to_the_resolve_and_drops_it(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The ISRC and Spotify's length steer which recording yt_source picks;
+        the resolved item carries neither, like the term it resolved through."""
+        source = unresolved("a song", isrc="GBAHS1600463", duration=233)
+        resolved = QueueObject(
+            webpage_url="https://youtube.com/watch?v=1",
+            title="One",
+            requester=mock_author,
+            duration=234,
+        )
+        spy = AsyncMock(return_value=resolved)
+        with patch.object(YTDL, "yt_source", new=spy):
+            out = await music_player._resolve_source(source)
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["isrc"] == "GBAHS1600463"
+        assert spy.await_args.kwargs["expected_duration"] == 233
+        assert out.isrc is None
+        assert out.duration == 234
+
     async def test_resolved_search_passes_its_query_source_through(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
