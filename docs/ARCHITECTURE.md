@@ -1950,6 +1950,36 @@ Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
 
 ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
 
+#### An unknown Opus itag
+
+The passthrough allowlist names three itags, so a fourth one YouTube starts serving is
+re-encoded: a lossy generation spent on a source that could have been copied, and a step
+**down** from the 251 it replaced. Nothing about that is visible from the outside — the
+song plays, the span carries `ytdl.opus_passthrough=false`, and no error is raised — so
+`_warn_unknown_opus_itag` says so once per format id per process, for an id that leads with
+an itag, whose `acodec` is Opus and which the gate refused: `774`, `774-3`, and `251-drc`
+alike. A covered itag's own track forms (`251-23`) are copied and never reach it.
+SoundCloud's `http_opus` rungs are Opus and excluded too, but their ids are named rather
+than numeric, and their exclusion is correct on quality as well: that rung is 64 kbps,
+below SoundCloud's own 128 kbps mp3.
+
+itag 774 (Opus 256k) is the one to expect. It was absent on seven clients probed
+anonymously, including `web_music` and `ios_music`; only the `android` client carries it,
+and that client refuses cookies. When the warning names it:
+
+1. Fetch one such stream and remux it with `-c:a copy` to Ogg, then read the TOC byte of
+   every packet — the allowlist stands in for the frame duration the info-dict does not
+   report, and 60 ms framing would play at 3× speed and read a third of its true position.
+2. All 20 ms → add the itag to `_PASSTHROUGH_FORMAT_IDS` in the same commit as the line
+   recording the measurement. Anything else → leave it out and deprioritize it in the
+   fallback ladder instead.
+
+When it names a suffix instead (`251-drc`), the measurement is the same and the change is
+to the suffixes `_ITAG_FORMAT_ID` accepts, not to the itag set.
+
+No speculative selector change: the allowlist is a claim about measured framing, and
+widening it on anything less is how the position math silently breaks.
+
 #### Mid-song reconnects
 
 A song's connection can die after it has been playing for a while, and what happens next

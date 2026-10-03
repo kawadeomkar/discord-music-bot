@@ -755,6 +755,11 @@ _STREAM_CACHE_FIELDS = frozenset(
 # Once per format per process, so an outage does not warn on every song.
 # Optional[str] because an info-dict can omit format_id.
 _DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
+# Same rule, for a YouTube Opus itag the passthrough allowlist does not name.
+_UNKNOWN_OPUS_ITAG_WARNED: set[str] = set()
+# YouTube's audio-itag space is a few dozen wide, so this is a backstop against a
+# serve that is not an itag at all rather than an expected bound.
+_MAX_UNKNOWN_OPUS_ITAGS: Final[int] = 64
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -782,6 +787,40 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
             f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
             "audio-only primary is degraded and the player is on the fallback ladder"
         )
+    _warn_unknown_opus_itag(data)
+
+
+def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
+    """Say so when YouTube serves an Opus format the allowlist does not cover.
+
+    That serve is re-encoded, spending a lossy generation on a source that could
+    have been copied. Scoped to a format_id that leads with an itag, which is what
+    YouTube's are and what SoundCloud's named `http_opus` rungs are not. Once per
+    format id per process, and never for a serve the gate accepted.
+    Response: see docs/ARCHITECTURE.md#an-unknown-opus-itag.
+    """
+    format_id = str(data.get("format_id") or "")
+    if not _ITAG_LED_FORMAT_ID.fullmatch(format_id):
+        return
+    if format_id in _UNKNOWN_OPUS_ITAG_WARNED:
+        return
+    if _passthrough_itag(format_id) in _PASSTHROUGH_FORMAT_IDS:
+        # Covered, so not the thing this warns about. The gate also refuses a
+        # covered format whose cache entry predates `audio_channels`, which
+        # _STREAM_CACHE_FIELDS expects for the stream TTL after a deploy.
+        return
+    if not str(data.get("acodec") or "").startswith("opus"):
+        return
+    if _passthrough_codec(data, filtered=False) is not None:
+        return
+    if len(_UNKNOWN_OPUS_ITAG_WARNED) < _MAX_UNKNOWN_OPUS_ITAGS:
+        _UNKNOWN_OPUS_ITAG_WARNED.add(format_id)
+    log.warning(
+        f"YouTube served Opus format {format_id}, which is not in the passthrough "
+        f"allowlist ({sorted(_PASSTHROUGH_FORMAT_IDS)}), so the song was "
+        f"re-encoded instead of copied (audio_channels="
+        f"{data.get('audio_channels')}) — see ARCHITECTURE.md#an-unknown-opus-itag"
+    )
 
 
 def _source_cache_key(search: str) -> str:
