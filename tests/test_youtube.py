@@ -672,6 +672,12 @@ class TestYTDLFfmpegOpts:
         assert options[options.index("-fec") + 1] == "false"
         assert options[options.index("-packet_loss") + 1] == "0"
 
+    def test_before_options_retries_a_well_formed_5xx(self) -> None:
+        """A plain `-reconnect` retries a truncated stream but not an HTTP error, so
+        the ladder's own tier is the only thing that notices this flag going missing
+        — and `just check` does not run it."""
+        assert "-reconnect_on_http_error 5xx" in YTDL.FFMPEG_OPTS["before_options"]
+
 
 class TestYTSource:
     async def test_yt_source_returns_queue_object(self, mock_ctx: MagicMock) -> None:

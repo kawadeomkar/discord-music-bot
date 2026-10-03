@@ -1906,7 +1906,7 @@ flowchart LR
 ```
 
 **FFmpeg flags:**
-- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
+- `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -reconnect_on_http_error 5xx` — reconnects to the stream URL on drop, including when the drop is answered with a 5xx ([Mid-song reconnects](#mid-song-reconnects)); extended with `-ss {ts}` (**input side**) when the song carries a start offset
 - `options`: `-vn -fec false -packet_loss 0` (audio only; the encoder stays in CELT — see [Encoder mode](#encoder-mode)); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
@@ -1949,6 +1949,50 @@ Where the hybrid encode fails, by octave band (SDR against the lossless source, 
 Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
 
 ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
+
+#### Mid-song reconnects
+
+A song's connection can die after it has been playing for a while, and what happens next
+depends on how the **reconnect** is answered rather than on the death itself. `-reconnect`
+and `-reconnect_streamed` retry a stream that simply stopped, but not one whose retry comes
+back as a well-formed HTTP error — so a transient 503 ended the song wherever it died, with
+exit 0, no stored error and nothing in the logs tied to the audio stopping.
+`-reconnect_on_http_error 5xx` is what closes that, measured against a local server that
+dies halfway, refuses two retries and honours the third as a Range request:
+
+| `before_options` | Packets delivered | Exit | Stored error | Wall time |
+|---|---|---|---|---|
+| a healthy stream, for reference | 153 | 0 | none | 0.05 s |
+| without the flag | **77** | 0 | none | 0.04 s |
+| with it | **153**, byte-identical to the healthy stream | 0 | none | 1.05 s |
+
+Byte-identical matters more than the count: the reconnect resumes by `Range`, and a range
+that overlapped or skipped would still deliver 153 packets. The ffmpeg tier pins both rows.
+
+What the flag deliberately does not change is failure detection. A death nothing will
+answer — the retry returning 403 — measures identically with and without it (77 packets,
+exit 0, no error), so it still falls to `_drop_unplayable_stream_cache` rather than the
+retry ladder, and a 403 on the *first* request still exits 8 with an `FFmpegProcessError`
+either way. ffmpeg never retries a 403 when the list is `5xx`. The cost is bounded by
+`-reconnect_delay_max 5`: a 5xx that never clears is retried after 0, 1 and 3 seconds and
+then refused, so an unrecoverable song ends about 4 seconds later than it used to.
+
+A 5xx on the FIRST request is changed, and the stream probe reaches this path: `_probe_stream_url`
+maps 429 and 5xx to `UNCONFIRMED` and plays anyway. Measured against a server that answers
+503 forever, one spawn goes from `exit 8, 1 GET, 0.02 s` to `exit 8, 4 GETs, 4.03 s`. A
+transient 5xx on open therefore recovers instead of burning a rung of
+`_STREAM_PLAY_ATTEMPTS`; a persistent one costs about 4 seconds per attempt, so roughly 12
+before the failure embed where it used to fail at once.
+
+**Required ffmpeg.** `-reconnect_on_http_error` post-dates the three `-reconnect*` flags
+beside it; the `4xx,5xx` list form was added upstream around late 2020. An ffmpeg without it
+fails at argv parse — `Error splitting the argument list: Option not found`, exit 8, on every
+song and on every one of its attempts — so the floor is an ffmpeg no older than that. The
+runtime image installs Debian's, unpinned; `-ping` reports the version a deployment actually
+has.
+
+`-reconnect_on_network_error` was measured alongside and is **not** set: every network-level
+death in these cases was already retried by `-reconnect`, so it changed nothing.
 
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
@@ -2510,9 +2554,11 @@ deliberately **reset** by `interject()`'s resume tail (that song is producing au
 which ends the chain, and a format blacklisted at 0:00 may be healthy again by the time
 a deeply-stacked tail resolves).
 
-Mid-song death stays out of scope: it produced audio and earned its history entry, and
-retrying it means resuming at the death position — a different feature this machinery
-makes cheap to add later.
+Mid-song death stays out of scope for the LADDER: it produced audio and earned its history
+entry, and retrying it means resuming at the death position — a different feature this
+machinery makes cheap to add later. ffmpeg's own reconnect is the first line of defence and
+recovers the transient case before the loop hears about it
+([Mid-song reconnects](#mid-song-reconnects)).
 
 ### yt-dlp process boundary
 
