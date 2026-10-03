@@ -76,10 +76,10 @@ class QueueObject:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
-    # A -replay copy. Runtime-only, so absent from SongQueueEntry: a crash restores
+    # A -restart copy. Runtime-only, so absent from SongQueueEntry: a crash restores
     # an ordinary queued song. YTDL carries it so _neutralize_prefetch's rebuild
     # keeps it; an interjection's resume tail never sets it.
-    is_replay: bool = field(default=False, repr=False)
+    is_restart: bool = field(default=False, repr=False)
     # ── ask-time analytics ──
     # Stored and carried, never branched on or rendered; the wire entry and the
     # play_history row hold both under these names. yt_source/yt_playlist

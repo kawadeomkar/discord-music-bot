@@ -169,7 +169,7 @@ class TestHistoryCommand:
             "analytics",
             "debug",
             "resume",
-            "replay",
+            "restart",
             "shuffle",
             "clear",
             "remove",
@@ -187,7 +187,7 @@ class TestHistoryCommand:
         two racing on a disconnected bot both read `voice_client is None`, so
         validate_commands' "already being used in channel X" check cannot fire for
         either — both join, and the second MOVES the bot to its own author's channel.
-        `-replay` for a fifth: two racing callers would each front-insert a replay,
+        `-restart` for a fifth: two racing callers would each front-insert a restart,
         so the song plays three times.
 
         `-shuffle`/`-clear`/`-remove` for a sixth: all three park on the queue's

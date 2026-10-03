@@ -1180,9 +1180,9 @@ async def interject_flow(
             )
             return
 
-        if outcome.replay_pending:
+        if outcome.restart_pending:
             desc = (
-                f"**{outcome.interrupted_title}** was about to replay, so it plays "
+                f"**{outcome.interrupted_title}** was about to restart, so it plays "
                 "again from `0:00` after this."
             )
         elif outcome.resume_position is None:

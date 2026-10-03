@@ -251,7 +251,7 @@ graph TD
 |---|---|
 | `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when **`HISTORY_ARCHIVE_ENABLED` is true** (`PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`) — the flag is the consent gate, never URL presence: enabled without `POSTGRES_URL` **raises**, and disabled ignores a set one with an INFO, leaving bit-identical pre-Postgres behavior, and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
 | `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-play --now`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, `debug_settings`, `guild_settings` (the settings cache and only writer of `guild:{id}:config`), and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect), crash recovery via `on_ready` (`_recover_after_ready`: the settings hydrate pass, then one restore per guild), and `on_guild_join`/`on_guild_remove` (hydrate / `GuildSettings.forget`). |
-| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, `--now` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`), and the public hooks `-replay` drives from `commands/replay.py` (`still_live()`, `stop_if_live()`, `ensure_prefetch()`, `hand_over_to_replay()`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
+| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, `--now` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`), and the public hooks `-restart` drives from `commands/restart.py` (`still_live()`, `stop_if_live()`, `ensure_prefetch()`, `hand_over_to_restart()`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
 | `guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns **one deque plus a cursor into it** (`_items[:_cursor]` claimed, `_items[_cursor:]` pending) and the Redis mirror, along with the bulk-mutation mutex, the generation counter, and the `_wake` Event whose sole writer is `_sync_wake()`. Every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. This replaced an `asyncio.Queue` plus a parallel display `deque` whose agreement had to be maintained by hand — see [Queue invariant](#queue-invariant). |
 | `guild_history.py` | `GuildHistory` — played-song history domain class. Two legs, both bounded at `HISTORY_CACHE_LIMIT` (50): the PERSISTed `guild:{id}:history` Redis list and an in-memory deque of the same window. `recent()` merges those two and **never reads Postgres** — see [History read path](#history-read-path). Writes additionally XADD the outbox while the archive is enabled. |
 | `guild_state.py` | Schema module: **every byte persisted to Redis is defined here**. Field-name constants (`StateField`, `NowPlayingField`, `QueueEntryField`, `ConfigField`, with `ConfigFieldName` as its `Literal` type) + frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`, `GuildPlaybackSnapshot`, `HistoryEntry`, `GuildConfig`) with `from_redis`/`to_redis` converters. `GuildConfig` is the durable-settings object behind `guild:{id}:config`, and every one of its fields is `Optional` on purpose: absent means "follow the host default", which an explicit `False`/`0.0` does not (`tzinfo()` resolves the stored IANA name at read time, falling back to `DEFAULT_TIMEZONE` rather than raising on a render path). `CONFIG_DOMAIN` maps each numeric config field to a `ConfigDomain` (`lo`, `hi`, and whether `OFF_SECS` means off), and `GuildConfig.__post_init__` reads a value outside it as unset, with a WARNING, wherever a `GuildConfig` is built; the legacy `:state` volume parses through the same domain. `CONFIG_WRITER_FIELD` (`writer_app_id`) is a wire field beside the settings, not one of them: the application that last wrote the hash. `parse_number_fields` reads `bot:{application_id}:config`: the caller names the float and the count fields (`BotConfigStore` takes them from `config.KNOBS`, which this module cannot import), it only parses (a count is an exact `int()`), and the bounds stay with the `-settings` registry. `DEFAULT_IDLE_TIMEOUT_SECS`/`DEFAULT_ALONE_TIMEOUT_SECS` sit beside `DEFAULT_TIMEZONE`, because the `-settings` registry, the playback loop and the watchdog all read them and this is the one module that imports nothing from `src`. Pure data — no domain logic, no project runtime imports. Wire formats are pinned by golden-fixture tests. |
@@ -313,7 +313,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
 | `-resume` | `r` | — | Resume paused playback; the paused card leaves the block, and a response hosting it is re-hosted so the bar sits at the channel bottom. |
-| `-replay` | `rp`, `restart` | — | Replay the live song from its beginning: a copy carrying no `ts` is front-inserted (`commands/replay.py`'s `replay_current()` → `ReplayOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `MIN_REPLAY_POSITION_SECS`. See [-replay](#-replay). |
+| `-restart` | `rs` | — | Restart the live song from its beginning: a copy carrying no `ts` is front-inserted (`commands/restart.py`'s `restart_current()` → `RestartOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `MIN_RESTART_POSITION_SECS`. See [-restart](#-restart). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
 | `-clear` | `c` | — | Empty the queue and its mirror, reporting the removed songs (or "already empty"). |
@@ -558,51 +558,51 @@ Key properties:
 
 ---
 
-### -replay
+### -restart
 
-`-replay` (`rp`, `restart`) plays the live song again from `0:00`. The body is
-`src/commands/replay.py`, as every command body is; the cog keeps the declaration,
-the decorators and the `except` that renders the failure embed. The replay flow lives
-there too — `replay_current()`, its verdict and `ReplayResult` — and drives the player
+`-restart` (`rs`) plays the live song again from `0:00`. The body is
+`src/commands/restart.py`, as every command body is; the cog keeps the declaration,
+the decorators and the `except` that renders the failure embed. The restart flow lives
+there too — `restart_current()`, its verdict and `RestartResult` — and drives the player
 only through its public methods. The player keeps what its loop reads: the retire
-marker and the trace link, both set by `hand_over_to_replay()`. It reuses
+marker and the trace link, both set by `hand_over_to_restart()`. It reuses
 `--now`'s skeleton — neutralize the prefetch, front-insert, stop the live song,
 let the loop's ordinary dequeue do the rest — and differs in four decided ways.
 
 - **The interrupted play keeps its own history entry.** `--now` suppresses the
   parked fragment's entry via `_skip_history_for` because its resume tail spans the
-  whole play. A replay starts at `0:00` and spans none of what was already heard, so
+  whole play. A restart starts at `0:00` and spans none of what was already heard, so
   suppressing here would lose that listening with no row, no log line and no reject.
-  Two plays, two rows; `played_at` is stamped fresh on the replay, so the
+  Two plays, two rows; `played_at` is stamped fresh on the restart, so the
   `(guild_id, played_at, webpage_url)` dedup index does not collide.
-- **The replay is the caller's ask.** `requester` and the ask-time `queued_at`/`queue_position` all
-  name whoever ran `-replay`, not the original requester, or `-leaderboard` credits
+- **The restart is the caller's ask.** `requester` and the ask-time `queued_at`/`queue_position` all
+  name whoever ran `-restart`, not the original requester, or `-leaderboard` credits
   a play to someone who did not ask for it. `query_source` and `user_input` stay with
-  the song: they classify how the song was *found*, which a replay does not change.
+  the song: they classify how the song was *found*, which a restart does not change.
 - **A paused song comes back playing**, on `-play`'s precedent ("`-play` means
   play") and `-skip`'s: the ask is for the song to sound.
   Nothing sets `start_paused`, so the flag keeps its single `--now` producer.
-- **The interrupted song's NP card is retired, not finalized.** A replay is the same
+- **The interrupted song's NP card is retired, not finalized.** A restart is the same
   song, so a bar frozen at the interrupt position would stand directly above the
-  replay's own card naming it again. `_retire_np_for` carries the song's identity to
+  restart's own card naming it again. `_retire_np_for` carries the song's identity to
   the loop's iteration end, the way `_skip_history_for` does.
 
-**Liveness.** `MusicPlayer.still_live()` is the single test both `replay_current()`
+**Liveness.** `MusicPlayer.still_live()` is the single test both `restart_current()`
 and `interject()` use before acting on a song, and every term is a window a command
 can wake up in:
 
 | Term | Window it closes |
 |---|---|
 | `current_song is song` | the obvious one |
-| `not play_next.is_set()` | the audio thread sets `play_next` two task cancels before the loop clears `current_song`; acting there replays a finished song and stops the next one |
-| `not _stopped_deliberately` | `note_deliberate_stop()` precedes every stop we make (`-skip`, `--now`, `-replay`), and until the loop's next `vc.play()` `current_song` names a song already over — the stopped one, or the next one before it starts. Acting there front-inserts against it: a `--now` landing after a `-replay`'s stop would park a resume tail ahead of the replay, and a `-replay` after a `-skip` replays what was skipped. The loop clears the flag at that `vc.play()` |
+| `not play_next.is_set()` | the audio thread sets `play_next` two task cancels before the loop clears `current_song`; acting there restarts a finished song and stops the next one |
+| `not _stopped_deliberately` | `note_deliberate_stop()` precedes every stop we make (`-skip`, `--now`, `-restart`), and until the loop's next `vc.play()` `current_song` names a song already over — the stopped one, or the next one before it starts. Acting there front-inserts against it: a `--now` landing after a `-restart`'s stop would park a resume tail ahead of the restart, and a `-restart` after a `-skip` restarts what was skipped. The loop clears the flag at that `vc.play()` |
 | loop task not done | a torn-down player (`-stop`, the alone watchdog, a voice kick): the voice client is gone, so the stop would land on a disconnected one |
 
 It is checked twice per command — at dispatch and again after the prefetch is neutralized
 — because the neutralize destroys the next song's resolved source and a song already
 gone needs neither.
 
-**Bounding the resolve.** The replay is resolved through the loop's own
+**Bounding the resolve.** The restart is resolved through the loop's own
 `_prefetch_next_song()`, so the extraction, probe and FFmpeg spawn are paid while the
 interrupted song is still playing rather than in the silence after the stop. The wait
 is `asyncio.wait({task}, timeout=...)`: it does not cancel the task when the bound
@@ -612,26 +612,26 @@ body whose `except Exception` cannot catch it.
 
 **The stop is a gate, as it is for `--now`.** A copy that cannot play must not stop
 what is playing, so the song is stopped only when the copy is certain to be next:
-the task in the slot is still the replay's, it has finished, and the claimed head is
-the very `QueueObject` the replay inserted (`_replay_result`). Identity, not a URL
+the task in the slot is still the restart's, it has finished, and the claimed head is
+the very `QueueObject` the restart inserted (`_restart_result`). Identity, not a URL
 match, is what separates the cases that must not stop, because each of them leaves
 something at the head:
 
-| `ReplayResult` | What happened | The song |
+| `RestartResult` | What happened | The song |
 |---|---|---|
-| `REPLAYING` | the copy resolved and is held at the head | stopped; the copy plays now |
+| `RESTARTING` | the copy resolved and is held at the head | stopped; the copy plays now |
 | `ENDED_FIRST` | the song ended before the verdict | already over; the copy plays next |
-| `STILL_LOADING` | the resolve outlived `_REPLAY_RESOLVE_TIMEOUT`, still holding the copy | plays on; the copy follows it |
+| `STILL_LOADING` | the resolve outlived `_RESTART_RESOLVE_TIMEOUT`, still holding the copy | plays on; the copy follows it |
 | `STOPPED_ELSEWHERE` | a `-skip` or `--now` stopped the song first (`_stopped_deliberately`) | stopped by that command; the copy is still queued |
 | `TORN_DOWN` | the player was torn down (`-stop`, a kick, the alone watchdog) | gone; the copy waits in the saved queue for `-resume` |
 | `INTERRUPTED` | another command cancelled the resolve. The verdict runs as the cancel lands, before that command has changed the queue, so it cannot say where the copy ends up | plays on, or is stopped by that command |
-| `QUEUED_LATER` | a `-shuffle` or `--next` landed after the resolve finished and put something ahead of the copy, which is still queued — by identity, or as a rebuilt copy carrying `is_replay` | plays on; the copy plays when the queue reaches it |
+| `QUEUED_LATER` | a `-shuffle` or `--next` landed after the resolve finished and put something ahead of the copy, which is still queued — by identity, or as a rebuilt copy carrying `is_restart` | plays on; the copy plays when the queue reaches it |
 | `FAILED` | the resolve returned no song and retired the copy | plays on |
 | `DROPPED` | a `-clear` or `-remove` took the copy out of the queue | plays on |
 
-**A replay is two traces, and they say so.** One song is one trace, so the interrupted play and its replay are separate traces with the same attribute keys. The interrupted iteration records `song.ended_by=replay`; `player.replay` links to it (`link.kind=replayed_song`); the replayed iteration records `song.is_replay` and links back to it (`link.kind=replay_of`), carried on `MusicPlayer._replay_of` from the stop to the replay's start. `bot.replay` records `replay.outcome` on every exit, the refusals that never reach the player included.
+**A restart is two traces, and they say so.** One song is one trace, so the interrupted play and its restart are separate traces with the same attribute keys. The interrupted iteration records `song.ended_by=restart`; `player.restart` links to it (`link.kind=restarted_song`); the restarted iteration records `song.is_restart` and links back to it (`link.kind=restart_of`), carried on `MusicPlayer._restart_of` from the stop to the restart's start. `bot.restart` records `restart.outcome` on every exit, the refusals that never reach the player included.
 
-**A `--now` during the replay's resolve inserts no resume tail.** It neutralizes the resolve, which hands the copy back to the head, and `interject()` finds a `-replay` copy of the live song next (`guild_queue.is_replay_of`): the copy already plays the song again after the interjection, so a tail at the interrupt position ahead of it would play the song a third time. The interrupted fragment records its own history row, as with `-skip`, and `--now`'s reply says the song plays again from `0:00` after it. A marker held for the length of `replay_current` could not stand in for this check: the replay's verdict runs as soon as the neutralize cancels its resolve, before `--now` has inserted anything.
+**A `--now` during the restart's resolve inserts no resume tail.** It neutralizes the resolve, which hands the copy back to the head, and `interject()` finds a `-restart` copy of the live song next (`guild_queue.is_restart_of`): the copy already plays the song again after the interjection, so a tail at the interrupt position ahead of it would play the song a third time. The interrupted fragment records its own history row, as with `-skip`, and `--now`'s reply says the song plays again from `0:00` after it. A marker held for the length of `restart_current` could not stand in for this check: the restart's verdict runs as soon as the neutralize cancels its resolve, before `--now` has inserted anything.
 
 Expiring the bound stops nothing: a resolve past it can still fail, and a stop into
 it would cut the song off for a copy that never plays.
@@ -642,9 +642,9 @@ spawns its own prefetch. So liveness is checked once more after the insert, with
 await between that check and the slot write, and the write goes through
 `ensure_prefetch()` — as the loop's and `-shuffle`'s do — which never starts a task
 over one already in the slot. Two tasks in the slot is two claims the loop settles
-one of: the next song is skipped, or the replay lost, and `_cursor` drifts for good.
+one of: the next song is skipped, or the restart lost, and `_cursor` drifts for good.
 
-**Residual race.** A teardown completing *inside* that resolve leaves the replay on
+**Residual race.** A teardown completing *inside* that resolve leaves the restart on
 the queue, so a later `-resume` plays it. The stop is guarded, so nothing is sent to a
 disconnected client.
 
@@ -1330,7 +1330,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
-- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`. They identify the host and do not promise it still exists: a dedicated card the bot retires is deleted after its id is recorded — at a `-replay`, a teardown, a stream that never opened, and a parked tail flushed by `-clear`/`-remove`. A reader that fetches the message must expect a 404), `queued_at timestamptz` (read at **ask** time — when the user's command message was sent) and `queue_position` (read at the **insert** — how many songs were ahead of it when it took its slot, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. Rows written before the insert-time mint carry the dispatch-time depth, which differs only when two requests resolved together. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption.), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
+- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so an interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`. They identify the host and do not promise it still exists: a dedicated card the bot retires is deleted after its id is recorded — at a `-restart`, a teardown, a stream that never opened, and a parked tail flushed by `-clear`/`-remove`. A reader that fetches the message must expect a 404), `queued_at timestamptz` (read at **ask** time — when the user's command message was sent) and `queue_position` (read at the **insert** — how many songs were ahead of it when it took its slot, counting the one playing; 0 = played immediately, and also what a row predating the fields carries. Rows written before the insert-time mint carry the dispatch-time depth, which differs only when two requests resolved together. `queued_at` comes from the message snowflake, so it counts the 1–4s yt-dlp resolve and gateway delivery as the wait they are — but it is Discord's clock while `played_at` is the host's, so under host drift `played_at − queued_at` can come out slightly negative: that is skew, not corruption.), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
 - **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
@@ -2310,7 +2310,7 @@ Three placements inside that iteration are load-bearing:
   `_prefetch_task` into a local, so a neutralize there reads `None`, no-ops, and the
   already-resolved next song plays *instead of* the retry — exactly the failure that
   call exists to prevent. The requeue itself goes through `queue_put_next`, which hands
-  back any claim a command (`-shuffle`, `-remove`, `-replay`) opened in the slot
+  back any claim a command (`-shuffle`, `-remove`, `-restart`) opened in the slot
   between the decision and the put.
 - **The history write is suppressed while a retry is pending.** A retried fragment never
   records; the terminal attempt records exactly once. Without that, a stream-failed
@@ -2482,12 +2482,12 @@ playing song's ask is spelled the way a queued item's is.
 
 Three sites turn a playing song back into a queue entry, each a `replace(song.queued, …)`:
 `MusicPlayer._requeued_form` (a completed prefetch going back on the queue),
-`interject()`'s resume tail, and `commands/replay.py`'s copy. What they name is what they
+`interject()`'s resume tail, and `commands/restart.py`'s copy. What they name is what they
 deliberately do not carry: the fields the resolve learned (`webpage_url`, `title`,
 `duration`, `uploader`, `thumbnail`, and `ts` under its boundary name `start_offset`), and,
 for an entry that is new rather than the same play continuing, the state it must not
-inherit — a resume tail and a replay are both put on the list in their own right and host
-their own card, and a replay starts from the top. A field added to `QueueObject` crosses
+inherit — a resume tail and a restart are both put on the list in their own right and host
+their own card, and a restart starts from the top. A field added to `QueueObject` crosses
 into playback and back with no edit at any of the three.
 
 `played_at` is the one ask field a playing song writes: the loop stamps it at `vc.play()`
