@@ -1917,7 +1917,7 @@ flowchart LR
 |---|---|
 | no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Volume is the only source today. |
 | `audio_channels in (1, 2)` | a 5.1 serve copied verbatim reaches Discord as 6-channel multistream Opus and clients decode only the front pair, silently losing centre-channel vocals. yt-dlp ranks `channels` **above** `acodec` when sorting, so `bestaudio` does select itag 338 where it exists. Absent means re-encode. |
-| `format_id` in `{249, 250, 251}` | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly; SoundCloud's `http_opus` is exactly the case this excludes. |
+| `format_id` is itag `249`, `250` or `251`, bare or with a `-N` track number | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly — measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream. SoundCloud's `http_opus` is exactly the case this excludes, and its exclusion is right on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3. A video with several audio tracks (dubs) numbers them, and yt-dlp's id for the one served is the itag plus that number — `251-23`. `_passthrough_itag` reads the itag out of it, because the encode is the itag's own: measured on four such videos, every packet of `251-N`, `250-N` and `249-N` is 20 ms, one frame, stereo (249 mixes hybrid and CELT frames, which the frame count does not care about). `251-drc` is a different encode whose framing has not been measured, so any other suffix is refused. |
 
 Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
 
@@ -2478,7 +2478,9 @@ rewriting the ladder on **every** promotion (see below). Three filters are load-
 rather than cosmetic: storyboards also carry `vcodec: none` (the `acodec` test is what
 removes them, and yt-dlp writes the string `"none"` there, not `None`), and `-drc`
 variants and foreign-language dubs would make a fallback quietly change what the song
-*sounds* like. A muxed selection gets a one-rung ladder — itself — since that rung
+*sounds* like. yt-dlp scores the `-drc` rungs `quality − 0.5`
+(`extractor/youtube/_video.py`, the DRC branch of the format loop), so `bestaudio` never
+selects one and the filter here is the fallback path's half of the same rule. A muxed selection gets a one-rung ladder — itself — since that rung
 already means the audio-only path is degraded, and walking sideways across muxed
 formats is not a recovery worth having.
 

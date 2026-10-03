@@ -115,8 +115,10 @@ overridden on the encode path — docs/ARCHITECTURE.md#encoder-mode): `acodec` o
 refuses copy alongside a filtergraph — exit 234, zero bytes — so `yt_stream` asks
 `_audio_filters` what it produced rather than re-testing volume); `audio_channels` in
 (1, 2) (a 5.1 serve reaches Discord as multistream and clients decode only the front
-pair); and `format_id` in `{249, 250, 251}`, which stands in for the 20 ms frame
-duration the info-dict does not report. Absent fields mean re-encode.
+pair); and a `format_id` that is itag 249, 250 or 251 — bare, or with the `-N` track
+number a multi-audio-track video carries (`251-23`) — which stands in for the 20 ms frame
+duration the info-dict does not report. Any other suffix (`251-drc`) and absent fields
+mean re-encode.
 `read()` counts AUDIO frames (the first two packets are OpusHead and OpusTags, which
 discord.py yields like any other) → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, paused card, history,

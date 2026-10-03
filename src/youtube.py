@@ -861,6 +861,20 @@ def _playlist_cache_key(url: str) -> str:
 # Opus itags. The allowlist IS the frame-duration check, since the info-dict reports
 # no frame duration and "opus" alone cannot be trusted to mean 20ms.
 _PASSTHROUGH_FORMAT_IDS = frozenset({"249", "250", "251"})
+# A YouTube audio format id: the itag, and `-N` on a video with several audio
+# tracks, where N numbers the track and the encode is the itag's own.
+_ITAG_FORMAT_ID = re.compile(r"(\d+)(?:-\d+)?", re.ASCII)
+# Anything YouTube-shaped, which also takes in a suffix the allowlist cannot speak
+# for (`251-drc`).
+_ITAG_LED_FORMAT_ID = re.compile(r"\d+(?:-.+)?", re.ASCII)
+
+
+def _passthrough_itag(format_id: object) -> Optional[str]:
+    """The itag of a format id the allowlist can speak for, or None: `251`, and
+    `251-23` alike. See docs/ARCHITECTURE.md#audio-pipeline."""
+    match = _ITAG_FORMAT_ID.fullmatch(str(format_id or ""))
+    return match[1] if match else None
+
 
 # OpusHead + OpusTags, which RFC 7845 mandates at the head of every Ogg Opus stream.
 # discord.py yields them from read() like audio, so YTDL discounts exactly two.
@@ -902,7 +916,7 @@ def _passthrough_codec(data: YTDLVideoMetadata, *, filtered: bool) -> Optional[s
         return None
     if data.get("audio_channels") not in (1, 2):
         return None
-    if str(data.get("format_id") or "") not in _PASSTHROUGH_FORMAT_IDS:
+    if _passthrough_itag(data.get("format_id")) not in _PASSTHROUGH_FORMAT_IDS:
         return None
     return "copy"
 
