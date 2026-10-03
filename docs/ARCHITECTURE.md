@@ -102,7 +102,7 @@ graph TD
 | Discord client | `discord.py` 2.7.1 | Gateway, voice, commands framework |
 | Audio extraction | `yt-dlp` 2026.8.18.122307.dev0 (pinned to a **nightly**; `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so yt-dlp's fallback client stays available |
 | PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so the fallback client's formats are served at all |
-| Codec | FFmpeg (system, installed in the runtime image) | Remux Opus straight through (`-c:a copy`) when the serve already is 20 ms stereo Opus and volume is 1.0; decode + re-encode to Opus otherwise |
+| Codec | FFmpeg (system, installed in the runtime image) | Remux Opus straight through (`-c:a copy`) when the serve already is 20 ms mono or stereo Opus and volume is 1.0; decode + re-encode to Opus otherwise |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
 | Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
 | Serialization | `orjson` | Fast JSON serialization for Redis payloads |
@@ -1550,6 +1550,24 @@ flowchart TD
     PREF -->|via yt_stream| YTDLP
     PLAYER -->|via yt_stream| YTDLP
 ```
+
+**Send pacing.** discord.py's `AudioPlayer` is a plain Python thread sleeping to a
+20 ms deadline, so it competes for the GIL with everything the event loop runs. Measured
+once against a stub voice client, 8 s of sends per row. The harness is not in the tree, so
+these are a recorded reading rather than something a reader can reproduce from it — treat
+them as the shape of the effect, not as a threshold to test against:
+
+| Load on the interpreter | p99 send gap | Gaps over 30 ms |
+|---|---|---|
+| idle process | 24.7 ms | none |
+| one busy Python thread | 24.6 ms | none |
+| three busy Python threads | 42.9 ms | 39 |
+
+The bot's own CPU-heavy work — extraction, chart rendering — lives in process pools, which
+is why the realistic row is the middle one and why the pools are not a convenience. A
+stutter report starts here: three busy *threads* in this process would be the regression,
+and the harness is a `FFmpegOpusAudio` driven by `AudioPlayer` against a client whose
+`send_audio_packet` only timestamps.
 
 **Synchronization primitives:**
 

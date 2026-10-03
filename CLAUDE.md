@@ -27,7 +27,7 @@ The tier boundary is a rule, not a preference, and it governs reads in BOTH mode
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,730 passing tests (this figure is always the PASSING count, not the collected one) plus three opt-in integration tiers: a 99-test `pg` and a 60-test `redis` tier (testcontainers), and a 4-test `ffmpeg` tier that spawns the real binary; coverage gate `fail_under = 80` (actual ~97%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~5,960 passing tests (this figure is always the PASSING count, not the collected one) plus three opt-in integration tiers: a 99-test `pg` and a 60-test `redis` tier (testcontainers), and a 21-test `ffmpeg` tier that spawns the real binary; coverage gate `fail_under = 80` (actual ~97%) |
 | Lint/types | ruff 0.16.8 (format + lint) and pyright 1.1.414 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -141,9 +141,9 @@ just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment cons
 just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~38s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
 just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     ~15s
-just test-ffmpeg    # opt-in real-ffmpeg tier (needs ffmpeg on PATH, no Docker)  ~3s
+just test-ffmpeg    # opt-in real-ffmpeg tier (needs ffmpeg on PATH, no Docker)  ~11s
 just container-test # build test image, run suite inside it (spec cache OFF) ~1min
-just ci             # check + container-test + test-pg + test-redis — local mirror of CI
+just ci             # check + container-test + test-pg + test-redis + test-ffmpeg — mirrors CI
 
 # Test selection (args forward to pytest). ANY argument means a subset run: serial,
 # no coverage gate. The no-args form is the only parallel one and the only gated one —
@@ -321,7 +321,7 @@ One `tests/test_<module>.py` per src module, `tests/commands/` mirroring
 cog's wrapper. Redis is fakeredis, Discord objects are spec'd mocks, and
 **warnings are errors** (golden rule 11). Run `just check` before pushing — the
 pre-push hook does. Three opt-in tiers — `just test-pg`, `just test-redis` and `just test-ffmpeg` — cover
-what fakeredis and an in-process double get wrong; both are real merge gates.
+what fakeredis and an in-process double get wrong; all three are real merge gates.
 
 The layout rules, every seam the suite installs, fakeredis's five stream
 divergences and the tier gating: `.claude/rules/testing.md`.
