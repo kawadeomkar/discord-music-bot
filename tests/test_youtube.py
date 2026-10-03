@@ -665,6 +665,13 @@ class TestYTDLFfmpegOpts:
     def test_options_strips_video(self) -> None:
         assert "-vn" in YTDL.FFMPEG_OPTS["options"]
 
+    def test_options_override_discord_py_fec_pair(self) -> None:
+        """discord.py's own `-fec true -packet_loss 15` precede `options` in the
+        argv and ffmpeg keeps the last value, so both must trail, with these values."""
+        options = YTDL.FFMPEG_OPTS["options"].split()
+        assert options[options.index("-fec") + 1] == "false"
+        assert options[options.index("-packet_loss") + 1] == "0"
+
 
 class TestYTSource:
     async def test_yt_source_returns_queue_object(self, mock_ctx: MagicMock) -> None:

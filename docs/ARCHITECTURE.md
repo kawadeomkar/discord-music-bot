@@ -1907,11 +1907,11 @@ flowchart LR
 
 **FFmpeg flags:**
 - `before_options`: `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` — reconnects to the stream URL on drop; extended with `-ss {ts}` (**input side**) when the song carries a start offset
-- `options`: `-vn` (audio only); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
+- `options`: `-vn -fec false -packet_loss 0` (audio only; the encoder stays in CELT — see [Encoder mode](#encoder-mode)); extended with `-ss 0` whenever the input-side seek is present, and with `-filter:a volume={v}` for non-unity volume — but never both that filter and the copy codec (see below)
 
 **Volume** takes effect on the **next** song — the FFmpeg process for the current song is already running.
 
-**Opus passthrough.** Discord speaks Opus and most of what YouTube serves already is Opus, so `YTDL` passes `codec="copy"` to `FFmpegOpusAudio` and the stream is remuxed rather than decoded and re-encoded — saving a full lossy generation and ~3.9 s of CPU per 213 s song. `_passthrough_codec` (src/youtube.py) is the gate, and every clause of it is load-bearing, because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k` discord.py always emits:
+**Opus passthrough.** Discord speaks Opus and most of what YouTube serves already is Opus, so `YTDL` passes `codec="copy"` to `FFmpegOpusAudio` and the stream is remuxed rather than decoded and re-encoded — saving a full lossy generation and the encode's CPU (re-measure after the CELT change; the 3.9 s per 213 s figure was taken with the encoder in hybrid mode, which costs 2.5× a CELT encode). `_passthrough_codec` (src/youtube.py) is the gate, and every clause of it is load-bearing, because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k -fec -packet_loss` discord.py always emits:
 
 | Clause | Why |
 |---|---|
@@ -1921,7 +1921,35 @@ flowchart LR
 
 Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
 
-Three differences are accepted, and ffmpeg warns about none of them, since no encoder is instantiated to ignore them: a mono source stays mono rather than being upmixed; the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band forward error correction, so packet loss on the voice path produces dropouts libopus used to conceal. YouTube's files carry no FEC of their own, which makes that last one a real regression for lossy listeners and the reason to keep the gate narrow rather than widen it.
+Two differences from the encode path are accepted, and ffmpeg warns about neither, since no encoder is instantiated to read the options: a mono source stays mono rather than being upmixed, and the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251). The bitrate is not a quality lever in either direction: on the one 251 these figures were taken from, a 128k CELT re-encode measured about 3 dB below the copy and raising the target to 256k recovered 0.1 dB of it. Treat the 3 dB as that sample rather than as a constant — nothing in the tree re-derives it. Neither path carries in-band FEC — see [Encoder mode](#encoder-mode) for why the encode path turns it off — so the two differ by one lossy generation and nothing else.
+
+#### Encoder mode
+
+discord.py emits `-fec true -packet_loss 15` on every `FFmpegOpusAudio` spawn. In-band FEC exists only as LBRR inside SILK frames, so libopus answers a request for it at more than `(128 - voice_est) >> 4` percent expected loss — 8, for music — by leaving CELT for SILK/hybrid on every frame (`opus_encoder.c`, the `useInBandFEC` mode override). On music that is 8.7 dB against 39.6 dB at the same 128k target, the delivered stream is smaller (119 vs 153 kbps), and no bitrate recovers it: 510k hybrid measures 4.8 dB. The native `Encoder` discord.py uses for PCM sources carries the same defaults and lands in the same mode.
+
+`YTDL.FFMPEG_OPTS["options"]` therefore ends with `-fec false -packet_loss 0`. They trail discord.py's fixed arguments, and ffmpeg keeps the last value of a repeated option, so they win; on the copy path there is no encoder to read them, and the packets are byte-identical with or without them (603/603, both ffmpeg 9.0 and the image's 7.1.5). The ffmpeg tier pins both facts: the shipped options yield CELT, discord.py's bare defaults yield hybrid.
+
+Measured against the alternatives, concealment-only decode, three seeds: `-application lowdelay` ties at zero loss and loses 1.9–2.7 dB at 1–2 % loss while dropping the lookahead to 120 samples; `-packet_loss 5` with FEC off gains 1–3.4 dB under loss and costs 2.2 dB at zero loss on a 251 through the volume filter, the common re-encode. Real voice-path loss is under 1 %, so 0 stands; 5 is the knob if loss ever shows in telemetry. Turning FEC off is also what removes the last in-band-FEC argument for keeping the passthrough gate narrow: the no-FEC CELT stream is ahead at every loss rate tested, by 19 dB at 1 % and 6 dB at 20 %.
+
+The 20 ms framing the itag allowlist stands in for is measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream.
+
+Where the hybrid encode fails, by octave band (SDR against the lossless source, 40 s):
+
+| Band | Hybrid (discord.py defaults) | CELT (shipped options) |
+|---|---|---|
+| 0–500 Hz | 8.81 dB | 34.68 dB |
+| 500–1k | 8.79 | 42.93 |
+| 1k–2k | 8.71 | 41.85 |
+| 2k–4k | 7.18 | 35.45 |
+| 4k–8k | 2.35 | 26.49 |
+| 8k–12k | −0.06 | 17.84 |
+| 12k–16k | 0.53 | 12.43 |
+| 16k+ | −0.54 | 5.05 |
+
+Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
+
+ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
+
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
 
