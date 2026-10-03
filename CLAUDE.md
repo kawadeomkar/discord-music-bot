@@ -220,7 +220,7 @@ Discord gateway/voice                    YouTube / Spotify / SoundCloud CDNs
 └───────────────────┼─────────────────────────┘
                     ▼
    Redis 7 (AOF) ── guild:{id}:{state,queue,now_playing,history}
-                    ytdl:source:* / ytdl:stream:* / spotify:* caches
+                    ytdl:source:* / ytdl:stream:* / ytdl:loudness:* / spotify:* caches
                     lock:guild:{id}:recovery
                     history:outbox  (STREAM + "drainers" consumer group, no TTL)
                          │

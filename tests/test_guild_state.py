@@ -2767,7 +2767,11 @@ class TestConfigDomain:
         assert not ConfigDomain(lo=4.0, hi=60.0).admits(OFF_SECS)
 
     def test_every_numeric_config_field_has_a_domain(self) -> None:
-        numeric = members(ConfigField) - {ConfigField.DEBUG_MODE, ConfigField.TIMEZONE}
+        numeric = members(ConfigField) - {
+            ConfigField.DEBUG_MODE,
+            ConfigField.TIMEZONE,
+            ConfigField.LOUDNESS,
+        }
         assert set(CONFIG_DOMAIN) == numeric
 
     def test_np_refresh_floor_is_the_bot_knob_env_floor(self) -> None:

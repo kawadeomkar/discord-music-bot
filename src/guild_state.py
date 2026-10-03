@@ -18,6 +18,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import MappingProxyType
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Final,
@@ -260,6 +261,7 @@ type ConfigFieldName = Literal[
     "debug_mode",
     "volume",
     "timezone",
+    "loudness",
     "idle_timeout_secs",
     "alone_timeout_secs",
     "np_refresh_secs",
@@ -270,6 +272,7 @@ type ConfigFieldName = Literal[
 type ResettableConfigField = Literal[
     "debug_mode",
     "timezone",
+    "loudness",
     "idle_timeout_secs",
     "alone_timeout_secs",
     "np_refresh_secs",
@@ -286,6 +289,7 @@ class ConfigField:
     DEBUG_MODE: Final = "debug_mode"
     VOLUME: Final = "volume"
     TIMEZONE: Final = "timezone"
+    LOUDNESS: Final = "loudness"
     IDLE_TIMEOUT: Final = "idle_timeout_secs"
     ALONE_TIMEOUT: Final = "alone_timeout_secs"
     NP_REFRESH: Final = "np_refresh_secs"
@@ -305,6 +309,38 @@ def is_config_field(name: str) -> TypeIs[ConfigFieldName]:
 # Not a setting: the application id of the bot that last wrote a setting to the
 # hash, stamped by the store's writers when given one. GuildConfig never reads it.
 CONFIG_WRITER_FIELD: Final = "writer_app_id"
+
+
+class LoudnessMode(Enum):
+    """How much loudness processing a guild wants on playback.
+
+    OFF is the default and what an unset field resolves to, so a guild that never
+    chose emits no filter at all — which is also the only way a song stays
+    bit-exact, since any filtergraph refuses `-c:a copy`.
+    See docs/ARCHITECTURE.md#loudness-normalization.
+    """
+
+    OFF = "off"
+    # Cap peaks only, leaving anything below the ceiling byte-identical.
+    PEAK = "peak"
+    # EBU R128 in both directions: every song lands on the same integrated loudness.
+    NORMALIZE = "normalize"
+
+    @classmethod
+    def parse(cls, value: str) -> LoudnessMode | None:
+        """The mode `value` names, or None when it names none. Shared by the wire
+        parser and the settings grammar, so a stored value and a typed one are
+        accepted on exactly the same terms."""
+        try:
+            return cls(value.strip().lower())
+        except ValueError:
+            return None
+
+
+def _stored_loudness(value: str) -> str | None:
+    """`value` as a canonical LoudnessMode value, or None when it names none."""
+    mode = LoudnessMode.parse(value)
+    return mode.value if mode is not None else None
 
 
 # The zone every guild renders ETAs in until it picks one; the schema layer
@@ -403,6 +439,10 @@ class GuildConfig:
     # An IANA name, not a ZoneInfo: the wire stays human-readable. Resolved by
     # tzinfo(), which is also where an unusable name degrades.
     timezone: str | None = None
+    # A LoudnessMode value, not the enum: the wire stays human-readable and the
+    # stored string is what -settings echoes back. Resolved by loudness_mode(),
+    # which is where an unusable one degrades. Absent means the guild never chose.
+    loudness: str | None = None
     idle_timeout_secs: float | None = None
     alone_timeout_secs: float | None = None
     np_refresh_secs: float | None = None
@@ -429,12 +469,20 @@ class GuildConfig:
             mapping[ConfigField.DEBUG_MODE] = "1" if self.debug_mode else "0"
         if self.timezone is not None:
             mapping[ConfigField.TIMEZONE] = self.timezone
+        if self.loudness is not None:
+            mapping[ConfigField.LOUDNESS] = self.loudness
         # Every numeric field is in CONFIG_DOMAIN, under its attribute's name.
         for field in CONFIG_DOMAIN:
             value: float | None = getattr(self, field)
             if value is not None:
                 mapping[field] = str(value)
         return mapping
+
+    def loudness_mode(self) -> LoudnessMode:
+        """The mode to apply. Unset — and anything that does not name a mode —
+        resolves to OFF, so a guild that never chose gets no filter and keeps the
+        passthrough path."""
+        return LoudnessMode.parse(self.loudness or "") or LoudnessMode.OFF
 
     def tzinfo(self) -> ZoneInfo:
         """The guild's zone, or the default when it has not chosen a usable one.
@@ -462,6 +510,7 @@ class GuildConfig:
         return cls(
             debug_mode={"1": True, "0": False}.get(_b_str(raw, ConfigField.DEBUG_MODE)),
             timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
+            loudness=_stored_loudness(_b_str(raw, ConfigField.LOUDNESS)),
             **{field: _b_float(raw, field) for field in CONFIG_DOMAIN},
         )
 

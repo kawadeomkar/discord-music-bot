@@ -88,10 +88,14 @@ plus the traps that make a green run mean nothing if they are broken.
   where ffmpeg starts exiting 0 on a 403 turns the retry off in production and leaves the
   unit suite green. It also pins `_OGG_HEADER_PACKETS` against what a container actually
   emits; the Opus mode the encode path leaves libopus in (the shipped `options` hold
-  CELT, and discord.py's bare defaults — the control — do not); and the bitstream a
-  raised `-b:a` actually produces, which is the only place `_encode_bitrate_kbps`'
-  number is checked against libopus rather than against an argv. `just test-ffmpeg` runs
-  it against the ffmpeg on PATH; CI and `just container-test-ffmpeg` run it in the test
+  CELT, and discord.py's bare defaults — the control — do not); and the two halves of
+  the loudness ceiling, that `alimiter` is transparent below it with `latency=1` and
+  shifts every sample without, plus that `measure_loudness` can still read what
+  ebur128 prints. One more reads the bitstream a raised `-b:a` actually produces, which
+  is the only place `_encode_bitrate_kbps`' number is checked against libopus rather
+  than against an argv. Those last ones run ffmpeg directly rather than through
+  discord.py, because what is under test is the filter. `just test-ffmpeg` runs the tier
+  against the ffmpeg on PATH; CI and `just container-test-ffmpeg` run it in the test
   image, which installs the runtime stage's own ffmpeg package, because the reconnect
   timings it pins differ between ffmpeg majors (6.1 fails two of them). No network, and
   the sample is synthesised per session.
