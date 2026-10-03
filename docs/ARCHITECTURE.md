@@ -2090,7 +2090,7 @@ two rather than being rebuilt, and a song lands where a listener already hears i
 |---|---|---|
 | `off` (the default, and what an unset field resolves to) | none — the filtergraph stays empty | nothing |
 | `peak` | `alimiter=limit=0.891:level=disabled:latency=1` | nothing; a −1 dBFS ceiling, with everything below it untouched |
-| `normalize` | `volume={gain}dB`, then that same limiter | integrated loudness and sample peak, once per song, by `ebur128` |
+| `normalize` | `volume={gain}dB`, then that same limiter | the song's integrated loudness: YouTube's own figure when the extraction carried one, otherwise an `ebur128` scan, once per song |
 
 `_audio_filters` (src/youtube.py) is the only place a filter enters the argv, and it orders
 them volume → measured gain → ceiling: a limiter has to cap the signal the listener
@@ -2113,6 +2113,45 @@ measured `I`, clamped to (−20, +12) dB: past that a track is a field recording
 mastering error, and moving it 30 dB amplifies its noise floor into the room. A scan that
 fails, times out or prints no summary yields no gain at all — the song takes the ceiling and
 plays at its own level.
+
+**YouTube's own figure comes first.** The player response yt-dlp fetches for every YouTube
+video carries `playerConfig.audioConfig.trackAbsoluteLoudnessLkfs`, the loudness YouTube's
+own player normalizes that track against (beside `loudnessTargetLkfs: -14`). Measured
+against the `ebur128` scan on twenty-six videos from 3½ minutes to 3 hours, it agreed within
+0.05 dB on every one — the scan's own print resolution — so for those songs the scan
+computes a number the extraction already holds. Reading it costs no wait, no second fetch
+of the audio, and has no length limit.
+
+yt-dlp does not put it in the info-dict, so it is read at a private seam:
+
+1. `capture_player_loudness` wraps `YoutubeIE._extract_player_responses`, whose result is
+   `(player_responses, player_url)`. `_ytdlp_extract` calls it at the top of every
+   extraction, in the pool worker; it is idempotent, and the parent process never imports
+   the extractor.
+2. `_note_player_loudness` records the figure per video in `_PLAYER_LOUDNESS`, keyed by the
+   response's own `videoDetails.videoId` rather than by any argument position, first client
+   to answer winning. It is total over any shape — nothing yt-dlp or YouTube changes there
+   may cost an extraction. `_ytdlp_extract` empties the dict before each extraction; a
+   worker runs one at a time.
+3. `_lift_player_loudness`, in `_slim_info`'s loop, puts it on the info-dict as
+   `loudness_lkfs` when the served format is one the figure describes: a bare itag (the
+   video's only audio track, whatever the encode), or `itag-N` whose `format_note` carries
+   yt-dlp's `(default)` — measured on three multi-track videos, the figure is the default
+   track's level (−11.64 against a scanned −11.6, −7.40 against −7.4). A dub is a
+   different recording and `-drc` changes the very thing measured, so those get nothing.
+4. `loudness_lkfs` is in `_STREAM_CACHE_FIELDS`, so a cache hit carries it, and
+   `_player_loudness` re-validates it on the way out of the cache: a number, finite, not a
+   bool.
+
+Everything without a figure takes the scan below, unchanged: every non-YouTube source, the
+serves step 3 declines, a stream-cache entry written before the field existed, and — the
+case that matters — a yt-dlp whose seam has moved. That last one fails soft by design:
+`capture_player_loudness` answers `False`, songs still normalize, and each first play waits
+for its scan again. Three things make it visible rather than silent:
+`ytdl.loudness_source` on the song's span reads `youtube` or `scan`; a unit test pins that
+the pinned yt-dlp has the method and that its source still returns `prs, player_url`; and
+`just ytdl-formats <url>`, which the yt-dlp bump recipe already runs, prints the figure or
+says the seam is missing.
 
 Why a static gain rather than a normalizing filter, measured on the same loud/quiet pair:
 
@@ -2177,7 +2216,8 @@ where an unknown option fails every scan at argv parse.
 One observation from the measuring, a single address on a single evening: after one
 video's audio had been fetched in full about five times inside two hours, fresh URLs for it
 answered 403 to any range past the first megabyte. A scan is one extra fetch per song per
-30 days, which is the distance the cache keeps from that.
+30 days, which is the distance the cache keeps from that, and a YouTube song with a figure
+of its own is not fetched twice at all.
 `measure_loudness` caches the result under `ytdl:loudness:v1:{webpage_url}` for 30 days —
 what a song measures does not change, so the TTL is there because the entry is cheap to
 lose, not because it goes stale. A scan that measured nothing is cached too, under the same
@@ -2191,11 +2231,12 @@ every bulk queue mutation cancels and whose contract forbids uninterruptible wor
 Livestreams — no duration — are never scanned: the scan would read until its timeout and
 measure whatever it caught.
 
-One wait is the cost a user sees: the first play of a song in a normalizing server sits
-through its scan, bounded by the knob and by the re-fetch rather than the measuring, once
-per song per 30 days. It runs wherever the source is built — inside the prefetch for a
-queued song, and in the playback loop itself for the first song of a session or the first
-after an empty queue, which is the one case a listener waits on.
+One wait is the cost a user sees, and only for a song with no figure from YouTube: its
+first play in a normalizing server sits through the scan, bounded by the knob and by the
+re-fetch rather than the measuring, once per song per 30 days. It runs wherever the source
+is built — inside the prefetch for a queued song, and in the playback loop itself for the
+first song of a session or the first after an empty queue, which is the one case a listener
+waits on.
 
 A track whose peaks leave less headroom than its gain lands short of the target: the
 limiter holds back the difference rather than clipping, so a 20 dB-crest recording measured
@@ -2211,6 +2252,7 @@ next song when the queue was empty and nothing was prefetched.
 Considered and left out:
 
 - **Measuring during the first play** — needs a filter or an in-process decoder, and leaves that first play unnormalized.
+- **The per-format `loudnessDb`** in `streamingData.adaptiveFormats` — relative to the target rather than absolute, and using it means matching the served format back to its entry by itag, track and DRC flag. The track figure is the same number for the serves it is trusted for, and the scan covers the rest.
 - **Per-listener gain** — Discord has no such control.
 - **Album normalization** — AES TD1008 prefers one gain for a whole album when it plays in order, so its quiet tracks stay quiet against its loud ones. That gain is the loudest track's, which needs every track's loudness before the first one plays, and the queue resolves one song ahead: a Spotify album is queued as unresolved entries, and the YouTube video each becomes is not known until it is next. It would also have to give way the moment the album stops playing in order — a `-p --now` interjection, a shuffle, a removal — which the queue does not track as a property of its entries. Track normalization is what every major service does by default.
 
