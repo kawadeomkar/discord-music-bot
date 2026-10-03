@@ -17,7 +17,7 @@ from src.util import (
 )
 
 
-# -now and -replay answer the same idle state, so they answer it identically.
+# -now and -restart answer the same idle state, so they answer it identically.
 NOTHING_PLAYING = "No songs are currently playing."
 
 

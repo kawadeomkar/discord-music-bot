@@ -607,12 +607,12 @@ def live_song(mock_song: MagicMock) -> MagicMock:
 
 
 @pytest.fixture
-def replayer(mock_author: MagicMock) -> MagicMock:
-    """The caller of -replay, distinct from whoever queued the live song: the
-    replay is their ask and both the requester and the analytics must say so."""
+def restarter(mock_author: MagicMock) -> MagicMock:
+    """The caller of -restart, distinct from whoever queued the live song: the
+    restart is their ask and both the requester and the analytics must say so."""
     member = MagicMock(spec=discord.Member)
     member.id = 424242
-    member.display_name = "Replayer"
+    member.display_name = "Restarter"
     member.mention = "<@424242>"
     return member
 

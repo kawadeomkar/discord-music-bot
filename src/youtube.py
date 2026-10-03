@@ -1749,8 +1749,8 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.queued.start_paused
 
     @property
-    def is_replay(self) -> bool:
-        return self.queued.is_replay
+    def is_restart(self) -> bool:
+        return self.queued.is_restart
 
     @property
     def stream_attempts(self) -> int:
@@ -1881,6 +1881,29 @@ class YTDL(discord.FFmpegOpusAudio):
             return _enrich_queueobject(qo, data)
         return None
 
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.confirm_stream")
+    async def confirm_stream(
+        cls, qo: QueueObject, redis: Optional[aioredis.Redis] = None
+    ) -> bool:
+        """Whether `qo`'s cached stream URL plays, proven before a caller stops what
+        is playing for it. prefetch_stream answers a cache hit unprobed, and a hit
+        probed past _PROBE_REUSE_SECS would be probed by the play instead — after
+        the stop, in silence. Here the probe, any ladder walk and any re-extraction
+        run first, and a PLAYABLE verdict is restamped for the play to reuse. True
+        when there is nothing to prove: no Redis, no entry, or a verdict still fresh."""
+        if redis is None:
+            return True
+        cached = await _stream_cache_get(redis, _stream_cache_key(qo.webpage_url))
+        if cached is None or _probe_is_recent(cached):
+            return True
+        try:
+            await cls._resolve_playable_stream(qo, redis, stamp=True)
+        except Exception as e:
+            log.warning(f"confirm_stream failed for {qo.webpage_url}: {e}")
+            return False
+        return True
+
     @staticmethod
     def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
         """The audio URLs to try for this song, best first.
@@ -1957,6 +1980,7 @@ class YTDL(discord.FFmpegOpusAudio):
         redis: Optional[aioredis.Redis],
         *,
         allow_reextract: bool = True,
+        stamp: bool = False,
     ) -> YTDLVideoInfo:
         """Resolve a song to stream data whose URL YouTube will serve. Every URL
         is probed first (a revoked one fails as silence, nothing logged).
@@ -1972,6 +1996,8 @@ class YTDL(discord.FFmpegOpusAudio):
         against _MAX_STREAM_EXTRACTIONS. Two brakes: once the probe path looks
         broken process-wide the cached URL is served untouched, and
         `allow_reextract=False` (the background prefetch) declines to re-extract.
+        `stamp` re-caches a cached URL that probed PLAYABLE with a fresh `probed_at`,
+        so a play inside _PROBE_REUSE_SECS reuses this verdict.
         """
         span = trace.get_current_span()
         cache_key = _stream_cache_key(qo.webpage_url)
@@ -2031,7 +2057,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 # is dead re-probes it every play until the TTL lapses. (winner is
                 # never None on PLAYABLE; the comparison is for the type checker.)
                 promoted = winner is not None and winner > 0
-                if extracted_fresh or promoted:
+                if extracted_fresh or promoted or stamp:
                     await _cache_stream(
                         redis,
                         cache_key,

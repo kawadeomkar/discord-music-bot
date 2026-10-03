@@ -374,6 +374,23 @@ class PlaceStalled(Exception):
         self.before_the_put = before_the_put
 
 
+def place_stalled_notice(*, before_the_put: bool) -> discord.Embed:
+    """What a stalled placement may claim. Waiting for the lock nothing was written
+    and the song is honestly absent; inside the put the deque is appended before the
+    mirror write, so the song may be queued and a "try again" would duplicate it."""
+    if before_the_put:
+        return notice_embed(
+            "This server's queue is busy right now, so your song wasn't queued — "
+            "try again in a moment.",
+            discord.Color.red(),
+        )
+    return notice_embed(
+        "This server's queue is busy right now, so your song may not have been "
+        "queued — check `-queue` before trying again.",
+        discord.Color.red(),
+    )
+
+
 class ResolveWaitExpired(PoolSlotUnavailable):
     """The resolve wait elapsed queueing for one of the guild's resolve slots,
     before any yt-dlp work began. Raised in place of a wait with no end: the

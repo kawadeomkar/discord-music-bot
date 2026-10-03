@@ -907,13 +907,13 @@ class TestValidateCommands:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """discord.py's prepare() charges cooldowns before before-invoke hooks, so a
-        -rp from outside voice spent -replay's one guild token and locked the whole
+        -rs from outside voice spent -restart's one guild token and locked the whole
         guild out for five seconds. Against the real command's real bucket."""
         mock_ctx.voice_client = None
         mock_ctx.author.voice = None
         mock_ctx.send = AsyncMock()
-        mock_ctx.command = MusicBot.replay
-        charged = MusicBot.replay._buckets.get_bucket(mock_ctx)
+        mock_ctx.command = MusicBot.restart
+        charged = MusicBot.restart._buckets.get_bucket(mock_ctx)
         assert charged is not None
         charged.update_rate_limit()  # what prepare() did
         assert charged.get_tokens() == 0
@@ -951,7 +951,7 @@ class TestMaxConcurrencyNotice:
     ) -> None:
         """This arm is the only place a user learns why they were refused. Deleting
         it falls through to the generic handler, and zeroing retry_after reads as
-        "try again now". It names the command: -analytics and -replay both carry a
+        "try again now". It names the command: -analytics and -restart both carry a
         cooldown, and an unnamed refusal does not say which one it answers."""
         mock_ctx.command = MagicMock()
         mock_ctx.command.name = "analytics"
