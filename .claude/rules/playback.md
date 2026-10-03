@@ -10,10 +10,10 @@ paths:
   - "src/musicbot.py"
   - "src/main.py"
   - "src/util.py"
-  - "src/commands/{clear,join,jump,now,pause,play,queue,remove,replay,resume,shuffle,skip,stop,volume}.py"
+  - "src/commands/{clear,join,jump,now,pause,play,queue,remove,replay,restart,resume,shuffle,skip,stop,volume}.py"
   - "src/commands/_common.py"
   - "tests/test_{musicplayer,guild_queue,queue_item,play_placement,play_pipeline,queue_progress,queue_rows,musicbot,main,util}.py"
-  - "tests/commands/test_{clear,join,now,pause,play,queue,remove,replay,resume,shuffle,skip,stop,volume}.py"
+  - "tests/commands/test_{clear,join,now,pause,play,queue,remove,replay,restart,resume,shuffle,skip,stop,volume}.py"
 ---
 
 # Playback: `-play`, the queue, interjection and the Now Playing host
@@ -415,7 +415,7 @@ restart) is gated to dedicated cards — deleting a response would destroy a use
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
-| claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject vs `-replay`). Every write of a new task goes through `ensure_prefetch()`, which never starts one over a task already in the slot: loop() settles only the task it reads, so a second one's claim drifts `_cursor` for good |
+| claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject vs `-restart`). Every write of a new task goes through `ensure_prefetch()`, which never starts one over a task already in the slot: loop() settles only the task it reads, so a second one's claim drifts `_cursor` for good |
 
 The dequeue commit and the start transaction's server-side LPOP share ONE mutex hold,
 via `GuildQueue.commit_dequeue()` — the async context manager the playback loop wraps
@@ -468,7 +468,7 @@ parse) → `QueueObject` + `GuildQueue._rehydrate` → **a read-only property on
 returning `self.queued.<field>`, if a playing song reads it**. A playing song HOLDS the
 entry it was built from (`YTDL.queued`), so the field crosses into playback with no
 keyword and comes back through the `replace(song.queued, …)` rebuilds — the requeue of a
-completed prefetch, `interject()`'s resume tail, and `commands/replay.py` — without being
+completed prefetch, `interject()`'s resume tail, and `commands/restart.py` — without being
 named at any of them. What each rebuild still names is what it deliberately does NOT carry: the fields the resolve learned, and the
 play state a new entry must not inherit — the resume tail resets `stream_attempts` and
 `failed_format_ids` because it is producing audio, where `_requeued_form` inherits the

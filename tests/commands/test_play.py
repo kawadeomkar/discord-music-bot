@@ -1696,7 +1696,7 @@ class TestNowFlag:
         assert "nearly finished" in embed.description
         assert "will not resume" in embed.description
 
-    async def test_a_pending_replay_is_what_the_reply_promises(
+    async def test_a_pending_restart_is_what_the_reply_promises(
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
@@ -1704,7 +1704,7 @@ class TestNowFlag:
         live_vc: MagicMock,
     ) -> None:
         """No resume position here either, but "will not resume" would be false:
-        the song's replay plays after the interjection."""
+        the song's restart plays after the interjection."""
         from src.musicplayer import InterjectOutcome
 
         live_mp.interject = AsyncMock(
@@ -1712,7 +1712,7 @@ class TestNowFlag:
                 interrupted_title="Again",
                 resume_position=None,
                 was_paused=False,
-                replay_pending=True,
+                restart_pending=True,
             )
         )
         music_bot.get_mp = MagicMock(return_value=live_mp)

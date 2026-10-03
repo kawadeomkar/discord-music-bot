@@ -157,11 +157,11 @@ def is_persisted(item: Optional[QueueObject]) -> bool:
     return item.persisted if item is not None else True
 
 
-def is_replay_of(item: Optional[QueueObject], webpage_url: str) -> bool:
-    """Whether `item` is a -replay copy of the song at `webpage_url`."""
+def is_restart_of(item: Optional[QueueObject], webpage_url: str) -> bool:
+    """Whether `item` is a -restart copy of the song at `webpage_url`."""
     return (
         item is not None
-        and item.is_replay
+        and item.is_restart
         and bool(webpage_url)
         and item.webpage_url == webpage_url
     )

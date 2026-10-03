@@ -1749,8 +1749,8 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.queued.start_paused
 
     @property
-    def is_replay(self) -> bool:
-        return self.queued.is_replay
+    def is_restart(self) -> bool:
+        return self.queued.is_restart
 
     @property
     def stream_attempts(self) -> int:

@@ -1,353 +1,140 @@
-"""`-replay` — play the live song again from its beginning."""
+"""`-replay` — play the last song that finished again, from its beginning."""
 
-import asyncio
-import contextlib
-from dataclasses import dataclass, replace
-from enum import Enum
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import discord
 from discord.ext import commands
 from opentelemetry import trace
 
-from src.commands._common import NOTHING_PLAYING
-from src.guild_queue import is_replay_of
+from src import play_pipeline
+from src.commands import play as play_cmd
+from src.commands._common import await_restore
+from src.guild_history import GuildHistory
+from src.guild_state import HistoryEntry
+from src.play_placement import Placement, PlaceStalled, PlayMode
 from src.queue_item import QueueObject
-from src.musicplayer import MusicPlayer
-from src.telemetry import get_tracer
-from src.util import (
-    ECHO_MAX,
-    background_typing,
-    fmt_duration,
-    notice_embed,
-    refund_cooldown,
-    safe_label,
-)
-from src.youtube import YTDL
+from src.util import background_typing, notice_embed
 
-_tracer = get_tracer(__name__)
+if TYPE_CHECKING:
+    # A runtime import would close the cycle: musicbot imports this module.
+    from src.musicbot import MusicBot
 
 
-# Below this position -replay refuses: the song is at its beginning. Also bounds
-# history churn — every replay writes an entry to a list LTRIMmed to
-# HISTORY_CACHE_LIMIT.
-MIN_REPLAY_POSITION_SECS = 1
-
-# How long -replay waits for its copy to resolve. Past it the live song is left
-# playing: the resolve continues, and the copy it holds plays when the song ends.
-_REPLAY_RESOLVE_TIMEOUT = 8.0
+NOTHING_TO_REPLAY = "Nothing has finished playing yet, so there is nothing to replay."
 
 
-class ReplayResult(Enum):
-    """How a -replay that front-inserted its copy ended. Only REPLAYING stopped the
-    live song; see docs/ARCHITECTURE.md#-replay."""
-
-    REPLAYING = "replaying"
-    # The song ended on its own before the stop. The copy is next.
-    ENDED_FIRST = "ended_first"
-    # A -skip or --now stopped the song before the stop. The copy is still queued.
-    STOPPED_ELSEWHERE = "stopped_elsewhere"
-    # The player was torn down. The copy waits in the saved queue for -resume.
-    TORN_DOWN = "torn_down"
-    # The resolve outlived _REPLAY_RESOLVE_TIMEOUT. The copy plays after the song.
-    STILL_LOADING = "still_loading"
-    # Another command cancelled the resolve. The verdict runs before that command
-    # changes the queue, so where the copy ends up is not known here.
-    INTERRUPTED = "interrupted"
-    # A -shuffle or --next put something ahead of the resolved copy, still queued.
-    QUEUED_LATER = "queued_later"
-    # The resolve came back with no song, and retired the copy.
-    FAILED = "failed"
-    # A -clear or -remove took the copy out of the queue.
-    DROPPED = "dropped"
+def last_played(history: GuildHistory, *, skip_url: str = "") -> Optional[HistoryEntry]:
+    """The newest history entry with a link to play, passing over `skip_url`: the
+    live song, whose own fragment a -restart or -skip may already have recorded.
+    Cache-only, so no Redis round trip; the restore fills the cache."""
+    for entry in reversed(history):
+        if entry.webpage_url and entry.webpage_url != skip_url:
+            return entry
+    return None
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ReplayOutcome:
-    """What replay_current() did, for -replay's confirmation wording."""
-
-    title: str
-    position: int  # where the live song was when -replay ran
-    result: ReplayResult = ReplayResult.REPLAYING
-
-    @property
-    def stopped(self) -> bool:
-        return self.result is ReplayResult.REPLAYING
-
-    @property
-    def position_str(self) -> str:
-        return fmt_duration(self.position)
-
-
-@_tracer.start_as_current_span("player.replay")
-async def replay_current(
-    mp: MusicPlayer,
-    vc: discord.VoiceClient,
+def replay_item(
+    entry: HistoryEntry,
     *,
     requester: Union[discord.User, discord.Member],
     queued_at: float,
-    queue_position: int,
-) -> Optional[ReplayOutcome]:
-    """Play `mp`'s live song again from `0:00`: front-insert a copy with no `ts`,
-    persisted like any front insert, resolve it through the loop's prefetch, then stop
-    the song. `requester`, `queued_at` and `queue_position` are the caller's. None
-    when nothing is live, there is no URL to rebuild from, or the song stopped being
-    live while the copy resolved. See docs/ARCHITECTURE.md#-replay."""
-    current = mp.current_song
-    if current is None or not current.webpage_url:
-        return None
-    # Before the neutralize as well as after it: the neutralize destroys the
-    # next song's resolved source, and a song already gone needs neither.
-    if not mp.still_live(current):
-        return None
-    span = trace.get_current_span()
-    span.set_attribute("discord.guild_id", str(mp.guild_id))
-
-    # The same song asked for again: the origin comes along off current.queued —
-    # query_source, which webpage_url cannot rebuild (a Spotify link, a search and
-    # a pasted link all archive as youtube.com), and user_input, what -remove
-    # matches on — while everything the interrupted play accumulated is dropped.
-    replay = replace(
-        current.queued,
-        webpage_url=current.webpage_url,
-        title=current.title or "",
+) -> QueueObject:
+    """A queue item for `entry`, already resolved: the history row carries every
+    display field, so nothing is searched and the stream cache is keyed by its
+    `webpage_url`. A fresh ask by `requester`, from `0:00`; `query_source` stays
+    with the song — it classifies how the song was found, and webpage_url cannot
+    rebuild it."""
+    return QueueObject(
+        webpage_url=entry.webpage_url,
+        title=entry.title or entry.webpage_url,
         requester=requester,
-        duration=current.duration_secs or None,
-        uploader=current.uploader,
-        thumbnail=current.thumbnail,
+        # What a `-play <link>` of it stores, so `-remove <link>` takes it back out.
+        user_input=entry.webpage_url,
+        duration=entry.duration_secs or None,
+        uploader=entry.uploader or None,
+        thumbnail=entry.thumbnail or None,
         queued_at=queued_at,
-        queue_position=queue_position,
-        # Renders the queue card as a replay for the window before the loop
-        # dequeues it.
-        is_replay=True,
-        # A fresh play, from the top: no offset, no interjection flags, no start
-        # stamp, not the card the fragment it copies is holding, and the full
-        # retry budget — the attempts the live play spent are its own.
-        ts=None,
-        persisted=True,
-        interjected=False,
-        is_resume=False,
-        start_paused=False,
-        played_at=0.0,
-        stream_attempts=0,
-        failed_format_ids=frozenset(),
-        np_card=None,
-    )
-    # A completed prefetch bypasses the queue and would play instead of the
-    # front-inserted replay — take it off the board first.
-    await mp.settle_prefetch()
-    # Re-check after that await.
-    if not mp.still_live(current):
-        return None
-
-    position = int(current.position_secs)
-    await mp.queue.put_front([replay])
-    # Synchronous from this check to the slot write: a song that ended inside the
-    # LPUSH has had its slot read, and the loop dequeues the copy on its own.
-    if not mp.still_live(current):
-        result = _why_not_live(mp)
-    else:
-        # Resolved through the loop's own prefetch, so the extraction, probe and
-        # FFmpeg spawn are paid while the interrupted song still plays.
-        # asyncio.wait bounds the wait without cancelling the task or re-raising
-        # a teardown's cancellation of it — see docs/ARCHITECTURE.md#-replay.
-        resolving = mp.ensure_prefetch()
-        await asyncio.wait({resolving}, timeout=_REPLAY_RESOLVE_TIMEOUT)
-        result = _replay_result(mp, current, replay, resolving)
-        # Nothing awaits from the verdict to the stop, so the loop cannot move
-        # between them; the hand-over is recorded after the stop for the same reason.
-        if result is ReplayResult.REPLAYING and mp.stop_if_live(current, vc):
-            replayed = mp.hand_over_to_replay(current)
-            if replayed is not None:
-                span.add_link(replayed, {"link.kind": "replayed_song"})
-    span.set_attribute("replay.position", position)
-    span.set_attribute("replay.outcome", result.value)
-    span.set_attribute("replay.stopped", result is ReplayResult.REPLAYING)
-    return ReplayOutcome(
-        title=current.title or "Unknown", position=position, result=result
+        queue_position=0,
+        query_source=entry.query_source,
     )
 
 
-def _replay_result(
-    mp: MusicPlayer,
-    current: YTDL,
-    replay: QueueObject,
-    resolving: asyncio.Task[Optional[YTDL]],
-) -> ReplayResult:
-    """Whether the live song may be stopped for `replay`, and why not. Only a
-    copy still claimed at the head by the task in the slot is certain to play
-    next: a failed resolve retires it, a neutralize hands it back rebuilt, and a
-    -clear empties the deque around it."""
-    if not mp.still_live(current):
-        return _why_not_live(mp)
-    if resolving.cancelled():
-        return ReplayResult.INTERRUPTED
-    head = mp.queue.peek_next()
-    # By identity or as a rebuilt copy: a neutralize requeues a new QueueObject.
-    if head is replay or is_replay_of(head, replay.webpage_url):
-        held = (
-            head is replay
-            and mp.holds_prefetch(resolving)
-            and mp.queue.claim_outstanding()
-        )
-        if held and resolving.done():
-            return ReplayResult.REPLAYING
-        return ReplayResult.STILL_LOADING
-    if any(
-        item is replay or is_replay_of(item, replay.webpage_url)
-        for item in mp.queue.display_items()
-    ):
-        return ReplayResult.QUEUED_LATER
-    failed = (
-        resolving.done()
-        and not resolving.cancelled()
-        and resolving.exception() is None
-        and resolving.result() is None
-    )
-    return ReplayResult.FAILED if failed else ReplayResult.DROPPED
-
-
-def _why_not_live(mp: MusicPlayer) -> ReplayResult:
-    """What ended the live song before -replay could stop it, read in the order
-    the causes can stack: a teardown also stops, and a stop also ends it."""
-    if mp.torn_down:
-        return ReplayResult.TORN_DOWN
-    if mp.stopped_deliberately:
-        return ReplayResult.STOPPED_ELSEWHERE
-    return ReplayResult.ENDED_FIRST
-
-
-# What each outcome that queued a copy says. The copy plays and is recorded, so
-# these keep the cooldown.
-_REPLAYED = {
-    ReplayResult.REPLAYING: "🔁 Replaying **{title}** from `0:00` — was at `{position}`.",
-    ReplayResult.ENDED_FIRST: (
-        "🔁 **{title}** ended first — queued it again from `0:00`, playing next."
-    ),
-    ReplayResult.STOPPED_ELSEWHERE: (
-        "🔁 Another command stopped **{title}** first — its replay from `0:00` is "
-        "still queued."
-    ),
-    ReplayResult.TORN_DOWN: (
-        "🔁 The bot left before **{title}** could replay — the copy waits in the "
-        "saved queue for `-resume`."
-    ),
-    ReplayResult.STILL_LOADING: (
-        "🔁 **{title}** is taking a while to load, so it plays again from `0:00` "
-        "once this play ends."
-    ),
-    ReplayResult.INTERRUPTED: (
-        "🔁 Another command changed the queue while **{title}** was loading, so it "
-        "was not replayed now."
-    ),
-    ReplayResult.QUEUED_LATER: (
-        "🔁 Another request went ahead of **{title}**'s replay — it plays again "
-        "from `0:00` once the queue reaches it."
-    ),
-}
-_NOT_REPLAYED = {
-    ReplayResult.FAILED: "Couldn't load **{title}** again, so it keeps playing.",
-    ReplayResult.DROPPED: (
-        "**{title}**'s replay was taken out of the queue while it loaded, so it "
-        "keeps playing."
-    ),
-}
-
-
-async def run(ctx: commands.Context, *, mp: MusicPlayer) -> None:
-    """`-replay` — replay the live song from `0:00`, keeping the queue behind it.
-
-    Every reply that replayed nothing refunds the guild cooldown: it exists to bound
-    history churn, and a refusal writes no history. See docs/ARCHITECTURE.md#-replay.
-    """
-    # Every exit names itself here, refusals included: player.replay records only
-    # the replays that reached the player.
+async def run(ctx: commands.Context, *, cog: MusicBot) -> None:
+    """`-replay` — play the newest song in history again: now, parking a live song
+    to resume after it; next, when nothing is live; through `-play`'s cold path when
+    the bot is out of voice. See docs/ARCHITECTURE.md#-replay."""
     span = trace.get_current_span()
+    mp = cog.get_mp(ctx)
     async with background_typing(ctx):
+        # The history cache is the restore's to fill, and a player this command
+        # just built is still reading it.
+        if not await await_restore(ctx, mp):
+            span.set_attribute("replay.outcome", "restore_pending")
+            return
         vc = ctx.voice_client
-        song = mp.current_song
-        if (
-            song is None
-            or not isinstance(vc, discord.VoiceClient)
-            or not (vc.is_playing() or vc.is_paused())
-        ):
-            # A connected bot with a queue is between songs, not idle. A claimed
-            # head counts: the prefetch holds the last song as a claim, not pending.
-            loading = (
-                isinstance(vc, discord.VoiceClient)
-                and vc.is_connected()
-                and (mp.queue.claim_outstanding() or not mp.queue.empty())
-            )
-            span.set_attribute("replay.outcome", "loading" if loading else "idle")
-            refund_cooldown(ctx)
+        current = mp.current_song
+        live_vc = (
+            vc
+            if isinstance(vc, discord.VoiceClient)
+            and current is not None
+            and (vc.is_playing() or vc.is_paused())
+            else None
+        )
+        skip_url = current.webpage_url if live_vc is not None and current else ""
+        entry = last_played(mp.history, skip_url=skip_url)
+        if entry is None:
+            span.set_attribute("replay.outcome", "no_history")
             await ctx.send(
-                embed=notice_embed(
-                    "The next song is still loading, so there is nothing to replay yet."
-                    if loading
-                    else NOTHING_PLAYING,
-                    discord.Color.orange(),
-                )
+                embed=notice_embed(NOTHING_TO_REPLAY, discord.Color.orange())
             )
             return
-        if int(song.position_secs) < MIN_REPLAY_POSITION_SECS:
-            # Nothing to rewind, and a repeat here mints history entries nobody
-            # heard.
-            span.set_attribute("replay.outcome", "at_beginning")
-            refund_cooldown(ctx)
-            await ctx.send(
-                embed=notice_embed(
-                    f"**{safe_label(song.title or 'That song', ECHO_MAX)}** is "
-                    "already at the beginning.",
-                    discord.Color.orange(),
-                )
-            )
+        span.set_attribute("replay.url", entry.webpage_url)
+
+        # Out of voice, or a join still in flight: -play's cold path owns the join,
+        # the gate hold and the teardown on failure. It resolves the link, which the
+        # voice handshake runs alongside.
+        if not ctx.voice_client or cog._plays.join_in_flight(mp.guild_id):
+            span.set_attribute("replay.outcome", "cold_start")
+            await play_cmd.run(ctx, entry.webpage_url, cog=cog)
             return
-        outcome = await replay_current(
-            mp,
-            vc,
-            # The replay is this caller's ask: the requester column and the ask-time
-            # analytics both name them.
+
+        qobj = replay_item(
+            entry,
             requester=ctx.author,
             queued_at=ctx.message.created_at.timestamp(),
-            queue_position=0,
         )
-        if outcome is None:
-            # The song stopped being live while the replay resolved — distinct from
-            # the guard above, where nothing was playing.
-            span.set_attribute("replay.outcome", "not_live")
-            refund_cooldown(ctx)
-            await ctx.send(
-                embed=notice_embed(
-                    "That song is no longer playing — nothing was replayed.",
-                    discord.Color.orange(),
+        # Registered like a -play, so it takes the place lock its siblings take,
+        # and -clear, -stop or -remove can still drop it until it lands.
+        req = cog._plays.register(
+            ctx,
+            query=entry.webpage_url,
+            mp=mp,
+            mode=PlayMode.NOW if live_vc is not None else PlayMode.NEXT,
+        )
+        try:
+            if live_vc is not None:
+                span.set_attribute("replay.outcome", "now")
+                # resume_paused=False: a paused song comes back playing, on -play's
+                # precedent — the command asked for music.
+                await play_pipeline.interject_resolved(
+                    ctx,
+                    qobj,
+                    mp,
+                    live_vc,
+                    req,
+                    origin=entry.webpage_url,
+                    resume_paused=False,
+                    lead="🔁 Replaying",
+                    cog=cog,
                 )
-            )
-            return
-        span.set_attribute("replay.outcome", outcome.result.value)
-        title = safe_label(outcome.title, ECHO_MAX)
-        if outcome.result in (ReplayResult.FAILED, ReplayResult.DROPPED):
-            # Nothing was replayed and nothing is queued, so nothing will be
-            # recorded: the cooldown is handed back.
-            refund_cooldown(ctx)
-            await ctx.send(
-                embed=notice_embed(
-                    _NOT_REPLAYED[outcome.result].format(title=title),
-                    discord.Color.orange(),
+            else:
+                span.set_attribute("replay.outcome", "next")
+                await play_pipeline.enqueue_single(
+                    ctx, qobj, mp, req, placement=Placement.NEXT, cog=cog
                 )
+        except PlaceStalled as stall:
+            await ctx.send(
+                embed=play_cmd.place_stalled_notice(before_the_put=stall.before_the_put)
             )
-            return
-        text = _REPLAYED[outcome.result].format(
-            title=title, position=outcome.position_str
-        )
-
-        async def _react() -> None:
-            # Swallowed here: the replay is committed, so a guild without Add
-            # Reactions must not also be told it failed.
-            with contextlib.suppress(discord.HTTPException):
-                await ctx.message.add_reaction("🔁")
-
-        # Together, so the reaction does not wait out the send. A failed send
-        # still raises into the command's except.
-        await asyncio.gather(
-            ctx.send(embed=notice_embed(text, discord.Color.blue())), _react()
-        )
+        finally:
+            cog._plays.retire(req)

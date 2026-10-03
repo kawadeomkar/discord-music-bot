@@ -21,7 +21,7 @@ src/
 ├── musicbot.py       # MusicBot cog — command REGISTRATION and one try/except each;
 │                     # per-guild player registry (mps), the discord.py hooks, crash-recovery entry
 ├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch (ensure_prefetch), gate,
-│                     # NP host, ETA, interject, the hooks -replay drives (hand_over_to_replay),
+│                     # NP host, ETA, interject, the hooks -restart drives (hand_over_to_restart),
 │                     # and still_live, the one liveness test both interrupts use
 ├── play_placement.py # -play's flag grammar, its voice gate, the two bounds on the resolve
 │                     # (ResolveSlot's deadline on the WAIT for a slot, and slow_resolve_notice
@@ -45,6 +45,7 @@ src/
 │                     # leaderboard, debug, ping, analytics) keeps only its entry point
 │                     # here and imports the machinery
 ├── play_pipeline.py  # the machinery behind -play/-playnow: resolve, place, interject
+│                     # (interject_resolved is the half -replay shares, with nothing to resolve)
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
 │                     # the command body is commands/leaderboard.py)
 ├── analytics_card.py # -analytics, everything but the command and the figure. Pure half:

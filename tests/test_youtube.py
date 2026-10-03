@@ -402,7 +402,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             start_paused=True,
             persisted=False,
             played_at=12.5,
-            is_replay=True,
+            is_restart=True,
             queued_at=99.5,
             queue_position=7,
             np_card=NpCard(

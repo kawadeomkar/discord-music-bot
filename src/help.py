@@ -25,6 +25,7 @@ CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
         "resume",
         "skip",
         "replay",
+        "restart",
         "stop",
         "volume",
     ),

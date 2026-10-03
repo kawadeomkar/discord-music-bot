@@ -45,7 +45,7 @@ what the command can accept.
 
 | The command takes | Use | Today |
 |---|---|---|
-| nothing, or one positional — consume-rest included | discord.py's own parameters | 14 commands; `-volume <0-100>`, `-remove <needle>` |
+| nothing, or one positional — consume-rest included | discord.py's own parameters | 15 commands; `-volume <0-100>`, `-remove <needle>` |
 | options only, no free text | `commands.FlagConverter` | `-history`, `-analytics`, `-leaderboard` |
 | free text AND options | `play_placement._PLAY_OPTIONS` + `split_play_args` | `-play`, `-playnow`, `-playnext` |
 | a grammar of its own (scopes, bounds, suggestions) | a module registry | `-settings`, `-debug` |

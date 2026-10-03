@@ -389,7 +389,7 @@ def give_queue_object(song: Any, queued: QueueObject) -> QueueObject:
 
 class Ask(TypedDict):
     """The two ask-time analytics keywords a queue item, the resolve functions
-    and -replay take together, spelled once per test module and splatted."""
+    and -restart take together, spelled once per test module and splatted."""
 
     queued_at: float
     queue_position: int
@@ -401,9 +401,9 @@ def ask_of(item: Any) -> Ask:
     return {"queued_at": item.queued_at, "queue_position": item.queue_position}
 
 
-# What -replay mints at dispatch: the command message's snowflake time, and
-# depth 0 — the replay plays immediately.
-REPLAY_ASK: Ask = {"queued_at": 1752530500.5, "queue_position": 0}
+# What -restart mints at dispatch: the command message's snowflake time, and
+# depth 0 — the restart plays immediately.
+RESTART_ASK: Ask = {"queued_at": 1752530500.5, "queue_position": 0}
 
 
 def loop_song(url: str, title: str, *, position: float) -> MagicMock:
@@ -431,8 +431,8 @@ def loop_song(url: str, title: str, *, position: float) -> MagicMock:
     return song
 
 
-def replayed_song(source: QueueObject) -> MagicMock:
-    """The source a -replay's copy resolves to, HOLDING the entry that was
+def restarted_song(source: QueueObject) -> MagicMock:
+    """The source a -restart's copy resolves to, HOLDING the entry that was
     queued rather than a copy of a few of its fields — so a test can put state
     on `source` and see what the play reads back off it, including the fields
     _neutralize_prefetch's rebuild carries."""
