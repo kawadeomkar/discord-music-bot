@@ -5617,6 +5617,31 @@ class TestStreamSource:
             result = await music_player._stream_source(queue_obj)
         assert result is mock_ytdl
 
+    @staticmethod
+    async def _kwargs_of_a_stream(
+        player: MusicPlayer, source: QueueObject
+    ) -> dict[str, Any]:
+        stream = AsyncMock(return_value=MagicMock())
+        with patch("src.musicplayer.YTDL.yt_stream", new=stream):
+            await player._stream_source(source)
+        assert stream.await_args is not None
+        return dict(stream.await_args.kwargs)
+
+    async def test_the_channels_own_bitrate_reaches_the_stream(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        mocked(music_player._guild).voice_client.channel.bitrate = 256000
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["channel_bitrate"] == 256000
+
+    async def test_a_disconnected_guild_spends_no_bitrate(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """A resolve can outlive the connection it was started for."""
+        mocked(music_player._guild).voice_client = None
+        kwargs = await self._kwargs_of_a_stream(music_player, queue_obj)
+        assert kwargs["channel_bitrate"] is None
+
 
 # ── FromContext ───────────────────────────────────────────────────────────────
 

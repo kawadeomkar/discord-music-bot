@@ -87,9 +87,11 @@ plus the traps that make a green run mean nothing if they are broken.
   to `_drop_unplayable_stream_cache` instead — deliberate, see playback.md). A build
   where ffmpeg starts exiting 0 on a 403 turns the retry off in production and leaves the
   unit suite green. It also pins `_OGG_HEADER_PACKETS` against what a container actually
-  emits; and the Opus mode the encode path leaves libopus in (the shipped `options` hold
-  CELT, and discord.py's bare defaults — the control — do not). Needs ffmpeg on PATH, not
-  Docker: only the runtime stage installs it, so this cannot run in the container
+  emits; the Opus mode the encode path leaves libopus in (the shipped `options` hold
+  CELT, and discord.py's bare defaults — the control — do not); and the bitstream a
+  raised `-b:a` actually produces, which is the only place `_encode_bitrate_kbps`'
+  number is checked against libopus rather than against an argv. Needs ffmpeg on PATH,
+  not Docker: only the runtime stage installs it, so this cannot run in the container
   tier. No network, and the sample is synthesised per session.
 - **The `redis` tier** (`tests/test_redis_integration.py`, marker `redis`) is the same
   shape against a real `redis:7-alpine` (`just test-redis`, or `REDIS_TEST_URL` in CI),

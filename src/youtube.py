@@ -251,6 +251,10 @@ class YTDLVideoMetadata(TypedDict, total=False):
     abr: float
     asr: int
     acodec: str
+    # Container extension. Read beside acodec by _encode_bitrate_kbps, because a
+    # direct WAV or AIFF arrives with acodec=None: yt-dlp infers acodec from the
+    # extension only for aac/opus/mp3/flac/vorbis.
+    ext: str
     # Channel count of the served format. _passthrough_codec refuses more than
     # two: `-c:a copy` also copies OpusHead, and clients decode only the front pair.
     audio_channels: int
@@ -740,6 +744,9 @@ _STREAM_CACHE_FIELDS = frozenset(
         # Absent reads as re-encode in _passthrough_codec, so a cache hit must
         # carry it or passthrough silently stops applying.
         "audio_channels",
+        # WAV and AIFF report no acodec, so _encode_bitrate_kbps reads this too:
+        # a cache hit without it silently drops those back to 128k.
+        "ext",
         # Format shape, so cache hits stay attributable (_record_serving_format).
         "format_id",
         "protocol",
@@ -821,6 +828,43 @@ def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
         f"re-encoded instead of copied (audio_channels="
         f"{data.get('audio_channels')}) — see ARCHITECTURE.md#an-unknown-opus-itag"
     )
+
+
+# Lossless by codec, and by container for the two that report no codec at all:
+# yt-dlp infers `acodec` from the extension only for aac/opus/mp3/flac/vorbis, so a
+# direct WAV arrives with acodec=None. Which containers count, and why m4a is not
+# one of them: docs/ARCHITECTURE.md#encoder-mode.
+_LOSSLESS_ACODECS = frozenset({"flac", "alac"})
+_LOSSLESS_EXTS = frozenset({"flac", "wav", "aiff", "aif"})
+# Discord's own ceiling. libopus caps a packet at 1276 B, so the largest 20 ms
+# datagram is 1320-1324 B of UDP payload once DAVE's frame trailer and discord.py's
+# RTP header, nonce and Poly1305 tag are on it. See docs/ARCHITECTURE.md#encoder-mode.
+_ENCODE_BITRATE_CAP_KBPS = 384
+# discord.py's default, which it emits as `-b:a 128k` with or without us.
+_DEFAULT_ENCODE_KBPS = 128
+
+
+def _encode_bitrate_kbps(
+    data: YTDLVideoMetadata, *, channel_bitrate: Optional[int]
+) -> Optional[int]:
+    """The encoder bitrate to ask for, or None to leave discord.py's 128k.
+
+    Only for a source that is actually lossless, where it buys 2 dB at 256k
+    (39.6 -> 41.5 measured). An Opus serve gains 0.0-0.3 dB, because the encode
+    saturates on what the source already threw away; an AAC one gains 0.6-2.0 dB,
+    which does not pay for doubling its voice traffic.
+    See docs/ARCHITECTURE.md#encoder-mode.
+    """
+    if not channel_bitrate:
+        return None
+    lossless = (
+        data.get("acodec") in _LOSSLESS_ACODECS or data.get("ext") in _LOSSLESS_EXTS
+    )
+    if not lossless:
+        return None
+    kbps = min(channel_bitrate // 1000, _ENCODE_BITRATE_CAP_KBPS)
+    # Below the default is not an improvement, and equal to it is not a change.
+    return kbps if kbps > _DEFAULT_ENCODE_KBPS else None
 
 
 def _source_cache_key(search: str) -> str:
@@ -1844,14 +1888,18 @@ class YTDL(discord.FFmpegOpusAudio):
         before_options: Optional[str] = None,
         options: Optional[str] = None,
         codec: Optional[str] = None,
+        bitrate: Optional[int] = None,
     ) -> None:
         # codec=None keeps discord.py's `-c:a libopus` default; "copy" remuxes.
+        # bitrate=None keeps its 128k default; a kbps int raises the encode target
+        # for the one source worth it. The copy path reads neither.
         super().__init__(
             url,
             executable="ffmpeg",
             before_options=before_options,
             options=options,
             codec=codec,
+            bitrate=bitrate,
         )
 
         # The ask this source plays, held rather than copied field by field. Every
@@ -2271,6 +2319,7 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         *,
         volume: float = 1.0,
+        channel_bitrate: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
         allow_reextract: bool = True,
     ) -> YTDL:
@@ -2302,6 +2351,11 @@ class YTDL(discord.FFmpegOpusAudio):
         codec = _passthrough_codec(data, filtered=bool(filters))
         if filters:
             ffmpeg_opts["options"] += f" -filter:a {','.join(filters)}"
+        # Beside the codec decision, and for the same reason: both describe what
+        # the encoder is asked to do, and the copy path reads neither.
+        bitrate = _encode_bitrate_kbps(data, channel_bitrate=channel_bitrate)
+        if bitrate is not None:
+            trace.get_current_span().set_attribute("ytdl.encode_bitrate_kbps", bitrate)
 
         return cls(
             channel,
@@ -2311,6 +2365,7 @@ class YTDL(discord.FFmpegOpusAudio):
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
             codec=codec,
+            bitrate=bitrate,
         )
 
     @classmethod

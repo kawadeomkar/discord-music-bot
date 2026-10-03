@@ -35,6 +35,7 @@ from src import youtube
 from src.play_placement import ResolveWaitExpired
 from src.youtube import (
     YTDL,
+    _encode_bitrate_kbps,
     YTDL_OPTS,
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
@@ -2488,6 +2489,7 @@ class TestYTStream:
             before_options: str,
             options: str,
             codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -2528,6 +2530,7 @@ class TestYTStream:
             before_options: str,
             options: str,
             codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -4049,6 +4052,7 @@ class TestOpusPassthrough:
             *,
             codec: Optional[str] = None,
             options: Optional[str] = None,
+            bitrate: Optional[int] = None,
             **kwargs: Any,
         ) -> None:
             noop_ffmpeg_init(self)
@@ -4303,6 +4307,7 @@ class TestYTStreamInterjectionFlags:
             before_options: Optional[str],
             options: Optional[str],
             codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["before_options"] = before_options
@@ -7342,6 +7347,164 @@ class TestYtPlaylistProgress:
 
         assert seen == [(0, 1671), (25, None)]
         assert youtube._PROGRESS_SUBSCRIBERS == {}
+
+
+class TestEncodeBitrate:
+    """What the encoder is asked for, which is only ever raised for a source that
+    has something left to give: a ~130 kbps lossy serve saturates, so raising its
+    target buys 0.0-0.3 dB, where a lossless one gains 2 dB at 256k."""
+
+    @pytest.mark.parametrize(
+        ("data", "expected"),
+        [
+            ({"acodec": "flac"}, 256),
+            ({"acodec": "alac"}, 256),
+            # WAV and AIFF report NO acodec: yt-dlp infers it from the extension
+            # only for aac/opus/mp3/flac/vorbis. Measured against a real archive.org
+            # WAV, which arrives acodec=None, ext='wav'.
+            ({"ext": "wav"}, 256),
+            ({"ext": "aiff"}, 256),
+            ({"ext": "aif"}, 256),
+            ({"acodec": "opus", "ext": "webm"}, None),
+            ({"acodec": "mp3", "ext": "mp3"}, None),
+            # m4a carries AAC as often as ALAC, and guessing lossless there would
+            # triple the egress of every AAC file.
+            ({"ext": "m4a"}, None),
+            ({}, None),
+        ],
+        ids=[
+            "flac-by-acodec",
+            "alac-by-acodec",
+            "wav-by-ext",
+            "aiff-by-ext",
+            "aif-by-ext",
+            "opus",
+            "mp3",
+            "m4a-is-not-lossless",
+            "nothing-known",
+        ],
+    )
+    def test_only_a_lossless_source_raises_the_target(
+        self, data: Any, expected: Optional[int]
+    ) -> None:
+        assert _encode_bitrate_kbps(data, channel_bitrate=256000) == expected
+
+    @pytest.mark.parametrize(
+        ("channel_bitrate", "expected"),
+        [
+            (64000, None),
+            (128000, None),
+            (129000, 129),
+            (160000, 160),
+            (256000, 256),
+            (512000, 384),
+            (None, None),
+            (0, None),
+        ],
+        ids=[
+            "below-the-default",
+            "equal-to-the-default",
+            "a-hair-above-is-taken-as-it-is",
+            "above",
+            "typical-boosted-tier",
+            "capped-at-discords-ceiling",
+            "not-connected",
+            "zero",
+        ],
+    )
+    def test_the_channel_bounds_it_and_384_caps_it(
+        self, channel_bitrate: Optional[int], expected: Optional[int]
+    ) -> None:
+        """Below or equal to discord.py's own 128k is not a change worth making, and
+        384k is Discord's ceiling — a 20 ms packet there is ~1 KB, clear of UDP
+        fragmentation."""
+        assert (
+            _encode_bitrate_kbps({"acodec": "flac"}, channel_bitrate=channel_bitrate)
+            == expected
+        )
+
+    def test_a_cache_hit_that_lost_ext_is_not_read_as_lossless(self) -> None:
+        """The `audio_channels` trap, one field over: the gate reads `ext`, so a
+        cached entry written without it would silently drop every WAV back to 128k.
+        _STREAM_CACHE_FIELDS is what stops that, and this is the assertion that
+        keeps them in step."""
+        assert "ext" in _STREAM_CACHE_FIELDS
+        # A cache entry from the build before `ext` was cached: acodec is the only
+        # thing it carries about a WAV, and it carries None.
+        entry: Any = {"acodec": None}
+        assert _encode_bitrate_kbps(entry, channel_bitrate=256000) is None
+
+    async def test_yt_stream_forwards_it_to_the_encoder(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["bitrate"] = bitrate
+
+        data = _fake_ytdl_data(acodec="flac", ext="flac", audio_channels=2)
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject(
+                    webpage_url="https://archive.org/a.flac",
+                    title="Lossless",
+                    requester=mock_ctx.author,
+                ),
+                AsyncMock(spec=discord.TextChannel),
+                channel_bitrate=256000,
+            )
+
+        # A FLAC is never remuxed anyway — it is not Opus — so the encoder reads it.
+        assert (captured["codec"], captured["bitrate"]) == (None, 256)
+
+    async def test_an_opus_serve_stays_on_the_default(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """And keeps the copy path, which discards the bitrate unread."""
+        captured: dict[str, Any] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            bitrate: Optional[int] = None,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+            captured["bitrate"] = bitrate
+
+        data = _fake_ytdl_data(
+            acodec="opus", ext="webm", audio_channels=2, format_id="251"
+        )
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject(
+                    webpage_url="https://yt.com/v=x",
+                    title="Song",
+                    requester=mock_ctx.author,
+                ),
+                AsyncMock(spec=discord.TextChannel),
+                channel_bitrate=256000,
+            )
+
+        assert (captured["codec"], captured["bitrate"]) == ("copy", None)
 
 
 class TestUnknownOpusItagTripwire:

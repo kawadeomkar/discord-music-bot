@@ -59,6 +59,7 @@ import pytest
 
 from src.youtube import (
     YTDL,
+    _ENCODE_BITRATE_CAP_KBPS,
     _OGG_HEADER_PACKETS,
 )
 from tests.helpers import tier_enabled
@@ -335,6 +336,43 @@ class TestWhatFFmpegReportsForAFailedStream:
 _CELT_CONFIG_FLOOR = 16
 # Enough to see a mode hold rather than a first-frame choice; ~1s of the 3s sample.
 _MODE_SAMPLE_PACKETS = 50
+
+
+def _audio_bytes(url: str, *, bitrate: Optional[int] = None) -> int:
+    """How many bytes of Opus the player reads for a fixed number of packets, at
+    `bitrate` kbps. Packets, not file size, because the Ogg framing is not the wire."""
+    source = discord.FFmpegOpusAudio(
+        url, options=YTDL.FFMPEG_OPTS["options"], bitrate=bitrate
+    )
+    process = source._process
+    try:
+        for _ in range(_OGG_HEADER_PACKETS):
+            source.read()
+        return sum(len(source.read()) for _ in range(_MODE_SAMPLE_PACKETS))
+    finally:
+        source.cleanup()
+        for pipe in (process.stdout, process.stderr, process.stdin):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+class TestTheChannelBitrateIsSpent:
+    """`_encode_bitrate_kbps` decides the number; this is the only place that reads
+    what libopus does with it. The argv is asserted in the default tier against a
+    patched `FFmpegOpusAudio`, which cannot see the bitstream.
+    See docs/ARCHITECTURE.md#encoder-mode."""
+
+    def test_a_raised_bitrate_reaches_the_bitstream(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """Monotonic rather than a fixed figure: libopus runs unconstrained VBR, so
+        what a target delivers depends on the content, but more target is more bits
+        for the same input."""
+        url = server.url  # pyright: ignore[reportAttributeAccessIssue]
+        default = _audio_bytes(url)
+        raised = _audio_bytes(url, bitrate=_ENCODE_BITRATE_CAP_KBPS)
+        assert raised > default, (default, raised)
 
 
 # Production's `before_options` minus the flag under test, derived rather than

@@ -1950,6 +1950,35 @@ Encode CPU for the same 40 s, user+sys: hybrid 0.70 s, CELT 0.28 s.
 
 ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-bit stage on the encode path, and a source peaking at +4.5 dBFS in float round-trips at +4.5: the chain adds and removes no clipping on either path.
 
+**Encode bitrate.** discord.py asks for 128k and the copy path discards it unread. The one
+case where asking for more is worth anything is a source that has something left to give:
+raising the target for a ~130 kbps Opus serve buys 0.0–0.3 dB, because the encode
+saturates on what the source already threw away, while a lossless source gains 2 dB at
+256k (39.6 → 41.5 measured). AAC sits between: measured against the original through
+original → AAC 128k → Opus, raising 128k to 256k bought 1.1, 0.6 and 2.0 dB on three
+tracks, against 0.1, 0.1 and 0.0 for the same chain through Opus 130k — AAC's own
+artefacts leave the re-encode more to approximate. That is not raised either: AAC reaches
+the bot as YouTube's itag 140 only when the Opus serves are gone, and from SoundCloud,
+whose `hls_aac_160k` would double its voice traffic for a gain below the hybrid-mode loss
+this file opens with. So `_encode_bitrate_kbps` raises it only for a lossless source, bounded by
+the voice channel's own ceiling and capped at 384k — Discord's limit, where a 20 ms packet
+reaches libopus's own 1276-byte per-packet ceiling. DAVE, Discord's end-to-end encryption,
+wraps every Opus frame before transport encryption (`dave_session.encrypt_opus` in
+discord.py 2.7.1, with `davey` installed): an 8-byte truncated AES-GCM tag, a 1–5 byte
+ULEB128 nonce, a size byte and the 2-byte `0xFAFA` marker, 12–16 bytes in all. With
+discord.py's 12-byte RTP header, 16-byte Poly1305 tag and 4-byte nonce on top, that is a
+1320–1324-byte UDP payload — inside a 1500-byte path, and past the 1280-byte IPv6 minimum,
+where `voice_state`'s `sendall` failure surfaces only as a discord.py DEBUG line.
+
+"Lossless" is read from `acodec` **and** `ext`, because yt-dlp infers `acodec` from the
+extension only for aac/opus/mp3/flac/vorbis: a direct WAV arrives with `acodec` None and
+`ext` `wav`. `m4a` is deliberately not on the list — AAC and ALAC share it, and guessing
+lossless there would triple the egress of every AAC file. `ext` is in
+`_STREAM_CACHE_FIELDS` for the same reason `audio_channels` is: a cache hit that lost it
+would silently drop those sources back to 128k. Like volume, the value is baked into the
+argv, so it applies from the next song the player builds — the one after next while a
+prefetch holds a built one, and the very next after an empty queue.
+
 #### An unknown Opus itag
 
 The passthrough allowlist names three itags, so a fourth one YouTube starts serving is
