@@ -828,9 +828,11 @@ Four properties are load-bearing:
   (`u2 akiaura` would take a U2 song). A declined candidate leaves the ask with the answer
   it already had, and sets `ytdl.music_no_match` on the span.
 
-The fallback is best-effort: its own failure is logged and the ask keeps the answer it
-earned, because an age-restricted candidate raises yt-dlp's `--cookies-from-browser`
-boilerplate, which `user_message` shows verbatim for an `expected` error.
+**Both legs are best-effort**, under one guard: a failure of either is logged and the ask
+keeps the answer it earned. Each has its own way of taking it — an age-restricted candidate
+raises yt-dlp's `--cookies-from-browser` boilerplate, which `user_message` shows verbatim
+for an `expected` error, and the music ask's own `unsupported` branch names the internal
+`music.youtube.com/search?q=…` URL in text a user reads.
 
 Cookies would fix the wall at its source and are what yt-dlp's own wiki recommends for
 age-restricted content, but the same wiki warns that using an account "run[s] the risk of

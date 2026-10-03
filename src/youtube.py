@@ -2283,24 +2283,25 @@ class YTDL(discord.FFmpegOpusAudio):
         # to. A LINK is excluded: it named one video, and a second opinion on a
         # different corpus would play something the user did not ask for.
         if not is_link(search.strip()):
-            watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
-            if watch_url is not None:
-                trace.get_current_span().set_attribute(
-                    "ytdl.search_kind", _SEARCH_KIND_MUSIC
-                )
-                log.info(
-                    f"search {search!r} found nothing; music search found {watch_url}"
-                )
-                try:
+            try:
+                watch_url = await _ytmusic_candidate_url(search, pool_slot=pool_slot)
+                if watch_url is not None:
+                    trace.get_current_span().set_attribute(
+                        "ytdl.search_kind", _SEARCH_KIND_MUSIC
+                    )
+                    log.info(
+                        f"search {search!r} found nothing; music search found {watch_url}"
+                    )
                     # Never flat: the candidate is a link now, and the link path is
                     # what fills both caches from one round.
                     return await resolve(watch_url, flat=False)
-                except Exception as e:
-                    # The fallback is best-effort. Its own failure must not replace
-                    # the answer the ask already earned — an age-restricted
-                    # candidate raises yt-dlp's cookies boilerplate, which
-                    # user_message would show verbatim for an `expected` error.
-                    log.warning(f"music fallback for {search!r} failed: {e!r}")
+            except Exception as e:
+                # BOTH legs are best-effort: the ask keeps the answer it earned. Each
+                # leg has its own way of replacing it — a candidate raises yt-dlp's
+                # cookies boilerplate, which user_message shows verbatim for an
+                # `expected` error, and the music ask's unsupported branch names the
+                # internal search URL in text a user reads.
+                log.warning(f"music fallback for {search!r} failed: {e!r}")
 
         # Raised as the failure the caller has always seen, `from None` because the
         # wrapper is this method's private business.

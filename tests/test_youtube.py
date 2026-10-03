@@ -1732,6 +1732,59 @@ class TestMusicSearchFallback:
 
         assert "cookies" not in str(raised.value)
 
+    @pytest.mark.parametrize(
+        ("raised", "must_not_leak"),
+        [
+            (
+                ExtractionError(
+                    "ERROR: [youtube:music:search_url] Sign in to confirm you're not "
+                    "a bot. Use --cookies-from-browser",
+                    expected=True,
+                ),
+                "cookies",
+            ),
+            (
+                Exception(
+                    "This link isn't from a site I can play: "
+                    "https://music.youtube.com/search?q=xvi+akiaura"
+                ),
+                "music.youtube.com",
+            ),
+        ],
+        ids=["expected-extraction-error", "unsupported-url"],
+    )
+    async def test_a_failing_music_ask_keeps_the_original_answer(
+        self, mock_ctx: MagicMock, raised: Exception, must_not_leak: str
+    ) -> None:
+        """The music ask is a second extraction on an already-failing path, so it owns
+        a way to replace the answer the ask earned: an `expected` ExtractionError
+        reaches the user through user_message verbatim, and _extract_for_source's
+        unsupported branch names the internal search URL. Neither may be what a user
+        who typed a song name reads."""
+        asked: list[str] = []
+
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            if search == self._MUSIC_URL:
+                raise raised
+            return None
+
+        with (
+            patch("src.youtube._extract_for_source", new=extract),
+            pytest.raises(Exception, match="Could not find song") as caught,
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:xvi akiaura",
+                query_source="search",
+                **_ANALYTICS,
+                user_input=None,
+            )
+
+        assert must_not_leak not in str(caught.value)
+        # The candidate was never reached, so the ask ends on its own miss.
+        assert asked == ["ytsearch:xvi akiaura", self._MUSIC_URL]
+
     async def test_the_span_names_the_music_kind(self, mock_ctx: MagicMock) -> None:
         asked: list[str] = []
         answers = {
