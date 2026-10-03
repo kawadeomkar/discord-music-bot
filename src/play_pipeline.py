@@ -1084,147 +1084,185 @@ async def interject_flow(
         if refusal is not None:
             await ctx.send(embed=notice_embed(refusal, discord.Color.red()))
             return
-        # The head only: `interjected` is attribution, which song cut the line.
-        qobj = replace(qobj, interjected=True)
+        await interject_resolved(
+            ctx,
+            qobj,
+            mp,
+            vc,
+            req,
+            follow_on=follow_on,
+            origin=url,
+            noun=collection_noun(source),
+            # None when the flag set the offset — see the -play call site.
+            warning=None if start_offset is not None else timestamp_warning(source),
+            resume_paused=resume_paused,
+            require_paused=require_paused,
+            cog=cog,
+        )
 
-        # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
-        # the interrupt and the new song, and the current song plays through the wait.
-        # A gate, not a hint — this flow stops what is playing, so a head that could
-        # not be extracted must not get that far. Hands the head back with its embed
-        # fields back-filled.
-        warmed = await YTDL.prefetch_stream(qobj, redis=cog.redis)
-        if warmed is None:
-            raise RuntimeError(
-                "Could not get a playable stream for that song, so the current "
-                "song was left alone."
-            )
-        qobj = warmed
 
-        # Before the lock: the neutralize can wait on a prefetch pinned in the
-        # yt-dlp executor, which under _place would hold the guild's lock.
-        await mp.settle_prefetch()
+async def interject_resolved(
+    ctx: commands.Context,
+    qobj: QueueObject,
+    mp: MusicPlayer,
+    vc: discord.VoiceClient,
+    req: PlayRequest,
+    *,
+    follow_on: Sequence[QueueObject] = (),
+    origin: str,
+    noun: CollectionNoun = "playlist",
+    warning: Optional[str] = None,
+    resume_paused: bool = True,
+    require_paused: bool = False,
+    lead: str = "▶️ Playing now",
+    cog: MusicBot,
+) -> None:
+    """Interrupt what is playing with `qobj`, a song already resolved, and report.
+    `follow_on` is a collection's tail behind it, named in the reply by `origin`
+    and `noun`; `warning` rides the append a `require_paused` request turns into
+    when the song was resumed meanwhile. `lead` heads the confirmation. Shared by
+    interject_flow and `-replay`, which builds its song from history and so has
+    nothing to resolve."""
+    # The head only: `interjected` is attribution, which song cut the line.
+    qobj = replace(qobj, interjected=True)
 
-        outcome: Optional[InterjectOutcome] = None
-        resumed = False
-        async with cog._plays.place(req) as verdict:
-            if not verdict.placed:
-                pass
-            elif require_paused and not vc.is_paused():
-                # Resumed during the resolve, so the reason to interject is gone:
-                # append instead. The append takes the lock again on its own, and
-                # until it places, -remove or -clear may still drop the request.
-                resumed = True
-                req.placed = False
-            else:
-                outcome = await mp.interject(
-                    qobj, vc, resume_paused=resume_paused, follow_on=follow_on
-                )
-                if outcome is None:
-                    # The song ended during the resolve, so this interrupted nothing:
-                    # the marker comes off and the song front-inserts instead.
-                    # interject() also returns None when the loop moved on to a
-                    # DIFFERENT song, which this insert waits behind: depth 1.
-                    qobj = replace(
-                        qobj, interjected=False, queue_position=front_insert_depth(mp)
-                    )
-                    # queue_put_next, for the claim the loop's prefetch holds.
-                    # prefetch=False — the stream URL was warmed above.
-                    await mp.queue_put_next([qobj, *follow_on], prefetch=False)
+    # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
+    # the interrupt and the new song, and the current song plays through the wait.
+    # A gate, not a hint — this flow stops what is playing, so a head that could
+    # not be extracted must not get that far. Hands the head back with its embed
+    # fields back-filled.
+    warmed = await YTDL.prefetch_stream(qobj, redis=cog.redis)
+    if warmed is None:
+        raise RuntimeError(
+            "Could not get a playable stream for that song, so the current "
+            "song was left alone."
+        )
+    qobj = warmed
+
+    # Before the lock: the neutralize can wait on a prefetch pinned in the
+    # yt-dlp executor, which under _place would hold the guild's lock.
+    await mp.settle_prefetch()
+
+    outcome: Optional[InterjectOutcome] = None
+    resumed = False
+    async with cog._plays.place(req) as verdict:
         if not verdict.placed:
-            await cog._report_dropped(req, verdict)
-            return
-
-        if resumed:
-            # Clear the marker: a queued song must not trigger replace semantics
-            # later. The interjection's 0 is replaced at the insert.
-            qobj = replace(qobj, interjected=False)
-            note = (
-                collection_note(
-                    url,
-                    len(follow_on) + 1,
-                    head_playing=False,
-                    noun=collection_noun(source),
-                )
-                if follow_on
-                else ""
-            )
-            await enqueue_single(
-                ctx,
-                qobj,
-                mp,
-                req,
-                note=note,
-                # None when the flag set the offset — see the -play call site.
-                warning=(
-                    None if start_offset is not None else timestamp_warning(source)
-                ),
-                follow_on=follow_on,
-                cog=cog,
-            )
-            return
-
-        if outcome is None:
-            note = "The song being interrupted already ended — queued to play next instead."
-            if follow_on:
-                # Nothing was interrupted, so the head is QUEUED rather than
-                # playing: it counts, and -remove reaches it.
-                note += collection_note(
-                    url,
-                    len(follow_on) + 1,
-                    head_playing=False,
-                    noun=collection_noun(source),
-                )
-            await asyncio.gather(
-                ctx.send(embed=playing_next_embed(ctx, qobj, note=note)),
-                ctx.message.add_reaction("⏯️"),
-            )
-            return
-
-        if outcome.restart_pending:
-            desc = (
-                f"**{outcome.interrupted_title}** was about to restart, so it plays "
-                "again from `0:00` after this."
-            )
-        elif outcome.resume_position is None:
-            desc = f"**{outcome.interrupted_title}** was nearly finished and will not resume."
-        elif outcome.returns_paused:
-            # returns_paused, not was_paused: with resume_paused=False a paused
-            # song comes back playing.
-            desc = (
-                f"**{outcome.interrupted_title}** will return paused at "
-                f"`{outcome.resume_position_str}`."
-            )
-        elif outcome.was_paused:
-            desc = (
-                f"**{outcome.interrupted_title}** was paused at "
-                f"`{outcome.resume_position_str}` and will resume from there."
-            )
+            pass
+        elif require_paused and not vc.is_paused():
+            # Resumed during the resolve, so the reason to interject is gone:
+            # append instead. The append takes the lock again on its own, and
+            # until it places, -remove or -clear may still drop the request.
+            resumed = True
+            req.placed = False
         else:
-            desc = (
-                f"**{outcome.interrupted_title}** will resume at "
-                f"`{outcome.resume_position_str}`."
+            outcome = await mp.interject(
+                qobj, vc, resume_paused=resume_paused, follow_on=follow_on
             )
+            if outcome is None:
+                # The song ended during the resolve, so this interrupted nothing:
+                # the marker comes off and the song front-inserts instead.
+                # interject() also returns None when the loop moved on to a
+                # DIFFERENT song, which this insert waits behind: depth 1.
+                qobj = replace(
+                    qobj, interjected=False, queue_position=front_insert_depth(mp)
+                )
+                # queue_put_next, for the claim the loop's prefetch holds.
+                # prefetch=False — the stream URL was warmed above.
+                await mp.queue_put_next([qobj, *follow_on], prefetch=False)
+    if not verdict.placed:
+        await cog._report_dropped(req, verdict)
+        return
+
+    if resumed:
+        # Clear the marker: a queued song must not trigger replace semantics
+        # later. The interjection's 0 is replaced at the insert.
+        qobj = replace(qobj, interjected=False)
+        note = (
+            collection_note(
+                origin,
+                len(follow_on) + 1,
+                head_playing=False,
+                noun=noun,
+            )
+            if follow_on
+            else ""
+        )
+        await enqueue_single(
+            ctx,
+            qobj,
+            mp,
+            req,
+            note=note,
+            warning=warning,
+            follow_on=follow_on,
+            cog=cog,
+        )
+        return
+
+    if outcome is None:
+        note = "The song being interrupted already ended — queued to play next instead."
         if follow_on:
-            # The interrupted song waits behind the whole collection, so the reply says
-            # so and names the undo (`-remove <the link>` matches user_input).
-            desc += collection_note(
-                url,
-                len(follow_on),
-                returns=(
-                    f" **{outcome.interrupted_title}** returns after the last of them."
-                    if outcome.resume_position is not None
-                    else ""
-                ),
-                head_playing=True,
-                noun=collection_noun(source),
+            # Nothing was interrupted, so the head is QUEUED rather than
+            # playing: it counts, and -remove reaches it.
+            note += collection_note(
+                origin,
+                len(follow_on) + 1,
+                head_playing=False,
+                noun=noun,
             )
         await asyncio.gather(
-            send_embed(
-                ctx,
-                truncate_embed_title(f"▶️ Playing now: {qobj.title}"),
-                f"Requested by: [{ctx.author.mention}]\n{desc}",
-                discord.Color.blue(),
-                thumbnail=qobj.thumbnail,
-            ),
+            ctx.send(embed=playing_next_embed(ctx, qobj, note=note)),
             ctx.message.add_reaction("⏯️"),
         )
+        return
+
+    if outcome.restart_pending:
+        desc = (
+            f"**{outcome.interrupted_title}** was about to restart, so it plays "
+            "again from `0:00` after this."
+        )
+    elif outcome.resume_position is None:
+        desc = (
+            f"**{outcome.interrupted_title}** was nearly finished and will not resume."
+        )
+    elif outcome.returns_paused:
+        # returns_paused, not was_paused: with resume_paused=False a paused
+        # song comes back playing.
+        desc = (
+            f"**{outcome.interrupted_title}** will return paused at "
+            f"`{outcome.resume_position_str}`."
+        )
+    elif outcome.was_paused:
+        desc = (
+            f"**{outcome.interrupted_title}** was paused at "
+            f"`{outcome.resume_position_str}` and will resume from there."
+        )
+    else:
+        desc = (
+            f"**{outcome.interrupted_title}** will resume at "
+            f"`{outcome.resume_position_str}`."
+        )
+    if follow_on:
+        # The interrupted song waits behind the whole collection, so the reply says
+        # so and names the undo (`-remove <the link>` matches user_input).
+        desc += collection_note(
+            origin,
+            len(follow_on),
+            returns=(
+                f" **{outcome.interrupted_title}** returns after the last of them."
+                if outcome.resume_position is not None
+                else ""
+            ),
+            head_playing=True,
+            noun=noun,
+        )
+    await asyncio.gather(
+        send_embed(
+            ctx,
+            truncate_embed_title(f"{lead}: {qobj.title}"),
+            f"Requested by: [{ctx.author.mention}]\n{desc}",
+            discord.Color.blue(),
+            thumbnail=qobj.thumbnail,
+        ),
+        ctx.message.add_reaction("⏯️"),
+    )

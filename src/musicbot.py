@@ -33,6 +33,7 @@ from src.commands import ping as ping_cmd
 from src.commands import play as play_cmd
 from src.commands import queue as queue_cmd
 from src.commands import remove as remove_cmd
+from src.commands import replay as replay_cmd
 from src.commands import restart as restart_cmd
 from src.commands import resume as resume_cmd
 from src.commands import settings as settings_cmd
@@ -816,6 +817,42 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
+        name="replay",
+        aliases=["rp", "previous"],
+        brief="play the last song that finished again",
+        help=(
+            "Plays the newest song in `-history` again, from the beginning — the "
+            "song before the one playing now, so a song skipped by mistake is one "
+            "command away.\n\n"
+            "A song that is playing is interrupted and comes back from where it left "
+            "off once the replay ends, the way `-play --now` parks it; a **paused** "
+            "one comes back playing. With nothing playing the replay starts now, and "
+            "if the bot has left voice it joins your channel first."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": ["-replay", "-rp", "-previous"],
+            "note": (
+                "`-restart` starts the song that is playing over instead. The replay "
+                "is recorded in `-history` as a new play, requested by you."
+            ),
+        },
+    )
+    @commands.before_invoke(validate_commands)
+    # One -replay per guild at a time: two read the same newest entry, and the
+    # second, landing on the first's interjection, would queue the song twice.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @_tracer.start_as_current_span("bot.replay")
+    async def replay(self, ctx: commands.Context) -> None:
+        try:
+            await replay_cmd.run(ctx, cog=self)
+        except commands.MaxConcurrencyReached:
+            # PlayRegistry.register's refusal past PLAY_INFLIGHT_MAX, as for -play.
+            raise
+        except Exception as e:
+            await self._command_error(ctx, e, title="Failed to replay song")
+
+    @commands.command(
         name="restart",
         aliases=["rs"],
         brief="play the current song again from the beginning",
@@ -834,7 +871,8 @@ class MusicBot(commands.Cog):
                 "reached, the way a skipped song is; the restart is recorded "
                 "again when it ends. A song still at its beginning is left alone, "
                 "and a song queued with a `?t=` timestamp restarts from `0:00` "
-                "rather than from its timestamp."
+                "rather than from its timestamp. `-replay` plays the song before "
+                "this one instead."
             ),
         },
     )

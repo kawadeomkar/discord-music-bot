@@ -17,6 +17,20 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.0 — 2026-10-03
+
+**`-replay` now plays the song before the one playing, and the old `-replay` is
+`-restart`.** Until this release `-replay` (and `-rp`) started the current song over;
+that is now `-restart`, alias `-rs`, and behaves exactly as before. `-replay`, `-rp` and
+the new `-previous` play the last song that finished again, from the beginning — handy
+after a `-skip` by mistake. A song that is playing is interrupted and picks up where it
+left off once the replay ends; with nothing playing the replay starts straight away, and
+if the bot has left voice it joins first. Tell your users: anyone used to `-rp` or
+`-replay` restarting the current song now needs `-restart`.
+
+Nothing to migrate, and rolling back is safe — the change is in chat commands only and
+nothing written to Redis or Postgres changes shape.
+
 ## 2.55.0 — 2026-10-02
 
 **Spotify links now play the album recording, not the music video.** A Spotify track

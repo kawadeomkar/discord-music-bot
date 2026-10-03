@@ -99,7 +99,7 @@ async def run(
     except PlaceStalled as stall:
         # The interject route only: _resolve_and_place reports its own, and
         # there is no gate hold to unwind here and nothing to abandon.
-        await ctx.send(embed=_place_stalled_notice(before_the_put=stall.before_the_put))
+        await ctx.send(embed=place_stalled_notice(before_the_put=stall.before_the_put))
     except ResolveWaitExpired:
         # Reported here rather than at the resolve: the cold path's handler around
         # queue_source unwinds a join, and reporting a full pool as a failed join
@@ -440,7 +440,7 @@ async def _resolve_and_place(
         except PlaceStalled as stall:
             if cold_start and not _cold_start_left_something_playable(ctx, mp):
                 await abandon_cold_start(cog, ctx, mp)
-            return _place_stalled_notice(before_the_put=stall.before_the_put)
+            return place_stalled_notice(before_the_put=stall.before_the_put)
         if cold_start and not req.placed:
             # Refused at the lock, with the join already in the channel: tear
             # down like the other exits, unless a sibling or a restore left
@@ -495,7 +495,7 @@ def _resolve_wait_notice() -> discord.Embed:
     )
 
 
-def _place_stalled_notice(*, before_the_put: bool) -> discord.Embed:
+def place_stalled_notice(*, before_the_put: bool) -> discord.Embed:
     """What a stalled placement may claim. Waiting for the lock nothing was written
     and the song is honestly absent; inside the put the deque is appended before the
     mirror write, so the song may be queued and a "try again" would duplicate it."""

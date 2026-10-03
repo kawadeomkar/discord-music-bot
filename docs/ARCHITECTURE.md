@@ -17,6 +17,8 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [Voice Channel Join](#voice-channel-join)
    - [-play Command Pipeline](#-play-command-pipeline)
    - [-play --now Interjection](#-play---now-interjection)
+   - [-replay](#-replay)
+   - [-restart](#-restart)
    - [Source Resolution](#source-resolution)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
    - [Playback Loop](#playback-loop)
@@ -313,6 +315,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
 | `-resume` | `r` | — | Resume paused playback; the paused card leaves the block, and a response hosting it is re-hosted so the bar sits at the channel bottom. |
+| `-replay` | `rp`, `previous` | — | Play the newest song in history again from `0:00`, passing over the live song: built straight from the `HistoryEntry` (`commands/replay.py`'s `replay_item()`), so nothing is resolved. Interrupts a live song, which resumes after it; plays next with nothing live; joins first through `-play`'s cold path when out of voice. See [-replay](#-replay). |
 | `-restart` | `rs` | — | Restart the live song from its beginning: a copy carrying no `ts` is front-inserted (`commands/restart.py`'s `restart_current()` → `RestartOutcome`), resolved, and the song is stopped. Nothing is dropped from the queue. Refused below `MIN_RESTART_POSITION_SECS`. See [-restart](#-restart). |
 | `-join` | `summon` | — | Join the user's voice channel (`connect(timeout=10.0)`). Saves channel IDs to Redis. |
 | `-shuffle` | — | — | Shuffle all songs currently in the queue (requires 4+ songs). |
@@ -557,6 +560,54 @@ Key properties:
 - **Crash-safe**: resume entries are ordinary persisted `SongQueueEntry`s (LPUSHed to the front of the Redis list), so a crash mid-interjection recovers the parked song from the queue like any other.
 
 ---
+
+### -replay
+
+`-replay` (`rp`, `previous`) plays the newest song in history again, from `0:00`:
+where `-restart` repeats the live song, `-replay` repeats the one before it. The body
+is `src/commands/replay.py`; the cog keeps the declaration, the decorators and the
+`except`.
+
+**Which song.** `last_played()` walks the history cache newest-first and takes the
+first entry with a `webpage_url` that is not the live song's. The live song is passed
+over because a `-restart` or `-skip` of it records its own fragment, so the newest row
+can be the song still playing. The cache mirrors the capped Redis list, so the read
+costs no round trip; it waits on `await_restore` first, because a player the command
+itself built is still filling that cache, and reading it early answers "nothing to
+replay" for a guild with history.
+
+**Nothing is resolved.** `replay_item()` builds a resolved `QueueObject` from the
+`HistoryEntry`: the row carries `webpage_url`, title, duration, uploader and thumbnail,
+and `ytdl:stream` is keyed by that same `webpage_url`. A song replayed inside the
+stream cache's window (at most 30 minutes from its last extraction) therefore costs one
+Redis GET and no yt-dlp call; past it, one stream extraction, which the live song plays
+through. Re-entering `-play` with the link instead would look `ytdl:source` up under the
+canonical watch URL, a key that a search, a Spotify link or a `youtu.be` link never
+wrote, and pay a full link extraction — a link's floor, see
+[Resolve mode](#resolve-mode) — to relearn fields the row already holds. The row's
+`query_source` is carried, since it classifies how the song was found and `webpage_url`
+cannot rebuild it; `requester` and the ask-time fields name the caller, as for
+`-restart`.
+
+**Where it goes** is decided by what the channel hears at dispatch:
+
+| State | Route |
+|---|---|
+| a song live, playing or paused | `play_pipeline.interject_resolved()`, the post-resolve half `interject_flow` shares: the stream warm as a gate, `settle_prefetch()`, then `interject()` under the place lock. The live song is parked and resumes after; a paused one comes back playing (`resume_paused=False`, on `-play`'s precedent) |
+| connected, nothing live | `enqueue_single(placement=NEXT)`: front-inserted, which with an empty queue is now |
+| out of voice, or a join in flight | `play_cmd.run(ctx, url)`, `-play`'s cold path, which owns the join, the gate hold and the teardown on failure. It resolves the link alongside the voice handshake, and records the link's host as `query_source` |
+
+**It is a registered `-play`.** Both connected routes register a `PlayRequest` — mode
+`NOW` or `NEXT`, so the same-channel gate applies at dispatch and again at the insert —
+and place through `PlayRegistry.place()`. A `-clear`, `-stop` or `-remove <link>` that
+lands while the stream warms drops it, and it serializes with a sibling `--now` instead
+of parking two resume tails for one song. `max_concurrency(1, guild)` closes the race
+the lock cannot: two `-replay`s read the same newest entry before either places, and the
+second, finding the song the first stopped no longer live, would front-insert it again.
+
+**History.** A replay is a new play: its own row when it ends, `played_at` stamped
+fresh, the caller as requester. A song it parks is recorded once, at its resume tail,
+as under any interjection.
 
 ### -restart
 

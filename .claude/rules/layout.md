@@ -45,6 +45,7 @@ src/
 │                     # leaderboard, debug, ping, analytics) keeps only its entry point
 │                     # here and imports the machinery
 ├── play_pipeline.py  # the machinery behind -play/-playnow: resolve, place, interject
+│                     # (interject_resolved is the half -replay shares, with nothing to resolve)
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
 │                     # the command body is commands/leaderboard.py)
 ├── analytics_card.py # -analytics, everything but the command and the figure. Pure half:

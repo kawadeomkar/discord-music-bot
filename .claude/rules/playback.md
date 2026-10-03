@@ -10,10 +10,10 @@ paths:
   - "src/musicbot.py"
   - "src/main.py"
   - "src/util.py"
-  - "src/commands/{clear,join,jump,now,pause,play,queue,remove,restart,resume,shuffle,skip,stop,volume}.py"
+  - "src/commands/{clear,join,jump,now,pause,play,queue,remove,replay,restart,resume,shuffle,skip,stop,volume}.py"
   - "src/commands/_common.py"
   - "tests/test_{musicplayer,guild_queue,queue_item,play_placement,play_pipeline,queue_progress,queue_rows,musicbot,main,util}.py"
-  - "tests/commands/test_{clear,join,now,pause,play,queue,remove,restart,resume,shuffle,skip,stop,volume}.py"
+  - "tests/commands/test_{clear,join,now,pause,play,queue,remove,replay,restart,resume,shuffle,skip,stop,volume}.py"
 ---
 
 # Playback: `-play`, the queue, interjection and the Now Playing host
