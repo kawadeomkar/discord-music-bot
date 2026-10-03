@@ -30,6 +30,7 @@ from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
     ProgressFn,
+    cancel_task,
     current_traceparent,
     fmt_duration,
     get_logger,
@@ -904,8 +905,86 @@ _SCAN_RECONNECT_ARGS: Final[tuple[str, ...]] = (
 )
 
 
+# googlevideo serves one request for more than this at about twice realtime, from
+# its first byte; yt-dlp chunks its own downloads at the same size.
+# See docs/ARCHITECTURE.md#loudness-normalization.
+_SCAN_RANGE_BYTES: Final[int] = 10 << 20
+# How many dead connections or 5xx answers one ranged scan rides out.
+_SCAN_FETCH_RETRIES: Final[int] = 2
+
+
 def _loudness_cache_key(webpage_url: str) -> str:
     return f"ytdl:loudness:v1:{webpage_url}"
+
+
+def _ranged_scan_size(stream_url: str) -> Optional[int]:
+    """The byte size of a googlevideo file, which is what a scan needs to ask for
+    it in ranges, or None for any other URL."""
+    parsed = urlparse(stream_url)
+    if not (parsed.hostname or "").endswith(".googlevideo.com"):
+        return None
+    try:
+        return int(parse_qs(parsed.query)["clen"][0])
+    except KeyError, ValueError:
+        return None
+
+
+async def _feed_ranges(stream_url: str, size: int, stdin: asyncio.StreamWriter) -> None:
+    """Write a googlevideo file to the scan's stdin, fetched in ranges small
+    enough to be served at full speed.
+
+    A dead connection or a 5xx resumes at the byte it reached, up to
+    _SCAN_FETCH_RETRIES times; any other answer than the range asked for raises.
+    stdin is closed either way, which is what lets ffmpeg finish.
+    """
+    session = _get_probe_session()
+    # The scan's own timeout bounds this; the session's backstop would undercut it.
+    timeout = aiohttp.ClientTimeout(total=None)
+    sent = deaths = 0
+    try:
+        while sent < size:
+            last = min(sent + _SCAN_RANGE_BYTES, size) - 1
+            try:
+                async with session.get(
+                    _probe_target(stream_url),
+                    headers={"Range": f"bytes={sent}-{last}"},
+                    timeout=timeout,
+                ) as response:
+                    if response.status != 206:
+                        # A 200 is the whole file again, from byte 0.
+                        raise aiohttp.ClientResponseError(
+                            response.request_info,
+                            response.history,
+                            status=response.status,
+                            message="the range was not served",
+                        )
+                    async for chunk in response.content.iter_any():
+                        stdin.write(chunk)
+                        await stdin.drain()
+                        sent += len(chunk)
+            except aiohttp.ClientError as e:
+                refused = isinstance(e, aiohttp.ClientResponseError) and e.status < 500
+                deaths += 1
+                if refused or deaths > _SCAN_FETCH_RETRIES:
+                    raise
+    finally:
+        stdin.close()
+
+
+async def _scan_in_ranges(
+    process: asyncio.subprocess.Process, stream_url: str, size: int
+) -> bytes:
+    """Feed a scan its input and return what it printed. stderr is read while the
+    feed runs: a pipe nobody drains stops ffmpeg, which stops it reading stdin."""
+    assert process.stdin is not None and process.stderr is not None
+    printed = asyncio.create_task(process.stderr.read())
+    try:
+        await _feed_ranges(stream_url, size, process.stdin)
+        stderr = await printed
+        await process.wait()
+    finally:
+        await cancel_task(printed)
+    return stderr
 
 
 def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
@@ -962,6 +1041,13 @@ async def measure_loudness(
     process: Optional[asyncio.subprocess.Process] = None
     stderr = b""
     failure: Optional[str] = None
+    # A googlevideo file over the range is fetched here and piped in: ffmpeg's one
+    # request for it is throttled past any timeout this scan has. Anything else
+    # ffmpeg reads itself, with the play path's reconnects, because a drop is
+    # remembered for an hour.
+    size = _ranged_scan_size(stream_url) or 0
+    ranged = size > _SCAN_RANGE_BYTES
+    source = ("-i", "pipe:0") if ranged else (*_SCAN_RECONNECT_ARGS, "-i", stream_url)
     try:
         async with asyncio.timeout(config.loudness_scan_timeout_secs()):
             process = await asyncio.create_subprocess_exec(
@@ -969,11 +1055,7 @@ async def measure_loudness(
                 "-nostats",
                 "-loglevel",
                 "info",
-                # The play path's reconnects, because a drop here is remembered for
-                # an hour: see FFMPEG_OPTS["before_options"].
-                *_SCAN_RECONNECT_ARGS,
-                "-i",
-                stream_url,
+                *source,
                 "-vn",
                 "-af",
                 # Sample peak, which is the one `alimiter` holds the ceiling on, and
@@ -983,11 +1065,18 @@ async def measure_loudness(
                 "-f",
                 "null",
                 "-",
+                stdin=asyncio.subprocess.PIPE if ranged else None,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await process.communicate()
-    except (TimeoutError, OSError) as e:
+            if ranged:
+                stderr = await _scan_in_ranges(process, stream_url, size)
+            else:
+                _, stderr = await process.communicate()
+    except aiohttp.ClientResponseError as e:
+        # Not its repr, which carries the signed URL.
+        failure = f"HTTP {e.status} for a range"
+    except (TimeoutError, OSError, aiohttp.ClientError, ProbeSessionClosed) as e:
         failure = repr(e)
     finally:
         # Both the timeout and an outer cancellation land here, and either leaves a

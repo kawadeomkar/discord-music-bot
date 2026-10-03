@@ -94,11 +94,16 @@ plus the traps that make a green run mean nothing if they are broken.
   ebur128 prints. One more reads the bitstream a raised `-b:a` actually produces, which
   is the only place `_encode_bitrate_kbps`' number is checked against libopus rather
   than against an argv. Those last ones run ffmpeg directly rather than through
-  discord.py, because what is under test is the filter. `just test-ffmpeg` runs the tier
-  against the ffmpeg on PATH; CI and `just container-test-ffmpeg` run it in the test
-  image, which installs the runtime stage's own ffmpeg package, because the reconnect
-  timings it pins differ between ffmpeg majors (6.1 fails two of them). No network, and
-  the sample is synthesised per session.
+  discord.py, because what is under test is the filter. And it pins the ranged
+  loudness scan's seam, which the unit tests fake on both sides: real aiohttp ranges
+  into a real ffmpeg's stdin, a range that dies resumed with every byte delivered
+  once (read off the server — ffmpeg resyncs past a duplicated stretch of this
+  sample and measures it the same), and ranges that keep dying yielding no level
+  although ffmpeg exits 0 with a summary. `just test-ffmpeg` runs the tier against the
+  ffmpeg on PATH; CI and `just container-test-ffmpeg` run it in the test image, which
+  installs the runtime stage's own ffmpeg package, because the reconnect timings it pins
+  differ between ffmpeg majors (6.1 fails two of them). No network, and the sample is
+  synthesised per session.
 - **The `redis` tier** (`tests/test_redis_integration.py`, marker `redis`) is the same
   shape against a real `redis:7-alpine` (`just test-redis`, or `REDIS_TEST_URL` in CI),
   and the conftest hook gates it identically. It exists because of the divergence list
