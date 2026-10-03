@@ -234,6 +234,43 @@ class TestQueueSource:
             )
         assert isinstance(result, QueueObject)
 
+    async def test_the_tracks_recording_reaches_yt_source(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """What Spotify knows about the recording has to arrive at the search, or
+        the ladder has nothing to prefer over YouTube's own ranking."""
+        assert music_bot.spotify is not None
+        music_bot.spotify.track = AsyncMock(
+            return_value=SpotifyTrack(
+                name="Shape of You",
+                artists=["Ed Sheeran"],
+                duration_secs=233,
+                url=None,
+                isrc="GBAHS1600463",
+            )
+        )
+        spy = AsyncMock(
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="R",
+                requester=mock_ctx.author,
+                **_ANALYTICS,
+            )
+        )
+        with patch("src.play_pipeline.YTDL.yt_source", new=spy):
+            await play_pipeline.queue_source(
+                mock_ctx,
+                SpotifySource(type=SpotifyType.TRACK, id="tid123"),
+                **_ANALYTICS,
+                origin=_ORIGIN,
+                mode=ResolveMode.FLAT_OK,
+                cog=music_bot,
+            )
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["isrc"] == "GBAHS1600463"
+        assert spy.await_args.kwargs["expected_duration"] == 233
+
     async def test_youtube_url_calls_yt_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -2168,6 +2205,55 @@ class TestQuerySourceClassification:
         assert [cast(QueueObject, t).title for t in follow_on] == ["T3", "T4"]
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
+
+    async def test_a_collections_head_resolves_by_its_own_recording(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Two hand-offs in one path: the walk's rows have to reach the items
+        `_searches_for` builds, and the head's item has to reach its resolve.
+        A Spotify album's tracks take no other route."""
+        rows = [
+            SpotifyTrack(
+                name="Shape of You",
+                artists=["Ed Sheeran"],
+                duration_secs=233,
+                url=None,
+                isrc="GBAHS1600463",
+            )
+        ]
+        walked = SpotifyPlaylist(
+            name="Divide",
+            titles=["Shape of You Ed Sheeran"],
+            duration_secs=233,
+            duration_partial=False,
+            unavailable=0,
+            tracks=rows,
+        )
+        spy = AsyncMock(
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=1",
+                title="R",
+                requester=mock_ctx.author,
+                **_ANALYTICS,
+            )
+        )
+        with (
+            patch(
+                "src.play_pipeline._spotify_collection",
+                new=AsyncMock(return_value=walked),
+            ),
+            patch("src.play_pipeline.YTDL.yt_source", new=spy),
+        ):
+            await play_pipeline._resolve_interjection_source(
+                mock_ctx,
+                SpotifySource(type=SpotifyType.ALBUM, id="aid123"),
+                origin=_ORIGIN,
+                cog=music_bot,
+            )
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["isrc"] == "GBAHS1600463"
+        assert spy.await_args.kwargs["expected_duration"] == 233
 
     async def test_interjection_index_past_the_end_reports_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock

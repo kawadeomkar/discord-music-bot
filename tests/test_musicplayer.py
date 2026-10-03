@@ -5570,6 +5570,25 @@ class TestResolveSource:
         assert isinstance(result, QueueObject)
         assert result.title == "Resolved"
 
+    async def test_the_items_recording_reaches_the_resolve(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The dequeue resolve is the only path a Spotify COLLECTION track takes, so
+        this hand-off carries the majority of the ISRC's traffic. Without it every
+        album track resolves by title again and plays the music video."""
+        spy = AsyncMock(
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=1", title="R", requester=mock_author
+            )
+        )
+        item = unresolved("shape of you", isrc="GBAHS1600463", duration=233)
+        with patch("src.musicplayer.YTDL.yt_source", new=spy):
+            await music_player._resolve_source(item)
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["isrc"] == "GBAHS1600463"
+        assert spy.await_args.kwargs["expected_duration"] == 233
+
 
 class TestResolveUsesTheItemsRequester:
     """A playlist's tracks resolve minutes to an hour after the command that
