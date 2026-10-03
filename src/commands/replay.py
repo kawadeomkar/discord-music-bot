@@ -1,5 +1,6 @@
 """`-replay` — play the last song that finished again, from its beginning."""
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Optional, Union
 
 import discord
@@ -7,30 +8,60 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import play_pipeline
-from src.commands import play as play_cmd
 from src.commands._common import await_restore
-from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
-from src.play_placement import Placement, PlaceStalled, PlayMode
+from src.musicplayer import MusicPlayer
+from src.play_placement import Placement, PlaceStalled, PlayMode, place_stalled_notice
 from src.queue_item import QueueObject
-from src.util import background_typing, notice_embed
+from src.util import background_typing, notice_embed, refund_cooldown
 
 if TYPE_CHECKING:
     # A runtime import would close the cycle: musicbot imports this module.
     from src.musicbot import MusicBot
 
 
-NOTHING_TO_REPLAY = "Nothing has finished playing yet, so there is nothing to replay."
+NOTHING_TO_REPLAY = "There's no earlier song to replay."
 
 
-def last_played(history: GuildHistory, *, skip_url: str = "") -> Optional[HistoryEntry]:
-    """The newest history entry with a link to play, passing over `skip_url`: the
-    live song, whose own fragment a -restart or -skip may already have recorded.
-    Cache-only, so no Redis round trip; the restore fills the cache."""
-    for entry in reversed(history):
-        if entry.webpage_url and entry.webpage_url != skip_url:
+def last_played(
+    history: Iterable[HistoryEntry],
+    *,
+    pending: Optional[HistoryEntry] = None,
+    skip_urls: frozenset[str] = frozenset(),
+) -> Optional[HistoryEntry]:
+    """The newest played song with a link, passing over `skip_urls`: the live song,
+    whose own fragment a -restart records, and songs parked to resume, which play
+    again anyway. `pending` is a play that ended but is not in `history` yet, so it
+    is the newest. `history` is oldest-first, as GuildHistory iterates."""
+    for entry in (pending, *reversed(list(history))):
+        if (
+            entry is not None
+            and entry.webpage_url
+            and entry.webpage_url not in skip_urls
+        ):
             return entry
     return None
+
+
+def songs_to_pass_over(mp: MusicPlayer, *, live: bool) -> frozenset[str]:
+    """The live song, and every song parked to resume. Without the parked ones a
+    repeated -replay flips between two songs, parking each in turn."""
+    urls = {item.webpage_url for item in mp.queue.display_items() if item.is_resume}
+    current = mp.current_song
+    if live and current is not None:
+        urls.add(current.webpage_url)
+    return frozenset(urls)
+
+
+def pending_entry(mp: MusicPlayer) -> Optional[HistoryEntry]:
+    """The ended play the loop has yet to record, as the row it will write. Without
+    it a -replay right after a -skip finds the song before the skipped one."""
+    song = mp.ended_unrecorded
+    if song is None:
+        return None
+    return HistoryEntry.from_song(
+        song, guild_id=mp.guild_id, message_id=0, channel_id=0
+    )
 
 
 def replay_item(
@@ -60,42 +91,47 @@ def replay_item(
 
 
 async def run(ctx: commands.Context, *, cog: MusicBot) -> None:
-    """`-replay` — play the newest song in history again: now, parking a live song
-    to resume after it; next, when nothing is live; through `-play`'s cold path when
-    the bot is out of voice. See docs/ARCHITECTURE.md#-replay."""
+    """`-replay` — play the last song that finished again: now, parking a live song
+    to resume after it; next, when nothing is live; through `-playnext` when the bot
+    is out of voice. Refusals hand back the cooldown. See docs/ARCHITECTURE.md#-replay.
+    """
     span = trace.get_current_span()
     mp = cog.get_mp(ctx)
     async with background_typing(ctx):
         # The history cache is the restore's to fill, and a player this command
         # just built is still reading it.
         if not await await_restore(ctx, mp):
-            span.set_attribute("replay.outcome", "restore_pending")
+            span.set_attribute("replay.refused", "restore_pending")
+            refund_cooldown(ctx)
             return
         vc = ctx.voice_client
-        current = mp.current_song
         live_vc = (
             vc
             if isinstance(vc, discord.VoiceClient)
-            and current is not None
+            and mp.current_song is not None
             and (vc.is_playing() or vc.is_paused())
             else None
         )
-        skip_url = current.webpage_url if live_vc is not None and current else ""
-        entry = last_played(mp.history, skip_url=skip_url)
+        entry = last_played(
+            mp.history,
+            pending=pending_entry(mp),
+            skip_urls=songs_to_pass_over(mp, live=live_vc is not None),
+        )
         if entry is None:
-            span.set_attribute("replay.outcome", "no_history")
+            span.set_attribute("replay.refused", "no_history")
+            refund_cooldown(ctx)
             await ctx.send(
                 embed=notice_embed(NOTHING_TO_REPLAY, discord.Color.orange())
             )
             return
         span.set_attribute("replay.url", entry.webpage_url)
 
-        # Out of voice, or a join still in flight: -play's cold path owns the join,
-        # the gate hold and the teardown on failure. It resolves the link, which the
-        # voice handshake runs alongside.
+        # Out of voice, or a join still in flight: -playnext's cold path owns the
+        # join, the gate hold and the teardown on failure, and its placement is the
+        # front whichever way the join race lands.
         if not ctx.voice_client or cog._plays.join_in_flight(mp.guild_id):
-            span.set_attribute("replay.outcome", "cold_start")
-            await play_cmd.run(ctx, entry.webpage_url, cog=cog)
+            span.set_attribute("replay.route", "cold_start")
+            await ctx.invoke(cog.playnext, url=entry.webpage_url)
             return
 
         qobj = replay_item(
@@ -113,7 +149,7 @@ async def run(ctx: commands.Context, *, cog: MusicBot) -> None:
         )
         try:
             if live_vc is not None:
-                span.set_attribute("replay.outcome", "now")
+                span.set_attribute("replay.route", "now")
                 # resume_paused=False: a paused song comes back playing, on -play's
                 # precedent — the command asked for music.
                 await play_pipeline.interject_resolved(
@@ -128,13 +164,13 @@ async def run(ctx: commands.Context, *, cog: MusicBot) -> None:
                     cog=cog,
                 )
             else:
-                span.set_attribute("replay.outcome", "next")
+                span.set_attribute("replay.route", "next")
                 await play_pipeline.enqueue_single(
                     ctx, qobj, mp, req, placement=Placement.NEXT, cog=cog
                 )
         except PlaceStalled as stall:
             await ctx.send(
-                embed=play_cmd.place_stalled_notice(before_the_put=stall.before_the_put)
+                embed=place_stalled_notice(before_the_put=stall.before_the_put)
             )
         finally:
             cog._plays.retire(req)

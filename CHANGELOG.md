@@ -21,15 +21,28 @@ differently, what you have to do, and whether you can roll it back.
 
 **`-replay` now plays the song before the one playing, and the old `-replay` is
 `-restart`.** Until this release `-replay` (and `-rp`) started the current song over;
-that is now `-restart`, alias `-rs`, and behaves exactly as before. `-replay`, `-rp` and
-the new `-previous` play the last song that finished again, from the beginning — handy
-after a `-skip` by mistake. A song that is playing is interrupted and picks up where it
-left off once the replay ends; with nothing playing the replay starts straight away, and
-if the bot has left voice it joins first. Tell your users: anyone used to `-rp` or
-`-replay` restarting the current song now needs `-restart`.
+that is now `-restart`, alias `-rs`, and works the same way, with its replies reading
+"Restarting" rather than "Replaying". `-replay`, `-rp` and the new `-previous` play the
+last song that finished again, from the beginning — handy after a `-skip` by mistake. A
+song that is playing is interrupted and picks up where it left off once the replay ends
+(unless it had only seconds left), and a paused one comes back playing. With nothing
+playing the replay plays next, and if the bot has left voice it joins first. Run it
+again and it goes one song further back. It has a 5-second per-server cooldown, as the
+old command did. Tell your users: anyone used to `-rp` or `-replay` restarting the
+current song now needs `-restart`.
 
-Nothing to migrate, and rolling back is safe — the change is in chat commands only and
-nothing written to Redis or Postgres changes shape.
+**If you watch the bot's traces, queries on the old names change meaning.** The
+restart command's spans and attributes moved: `bot.replay` → `bot.restart`,
+`player.replay` → `player.restart`, `replay.outcome`/`replay.position`/`replay.stopped`
+→ `restart.*`, `song.is_replay` → `song.is_restart`, `song.ended_by=replay` →
+`restart`, and the link kinds `replay_of`/`replayed_song` → `restart_of`/
+`restarted_song`. `bot.replay` and `command.replay` now time the NEW command, which
+records `replay.route` or `replay.refused`; `replay.outcome` is no longer written by
+anything. A per-command panel keyed on span name shows one `command.replay` series that
+changes meaning at the deploy.
+
+Nothing to migrate, and rolling back is safe — nothing written to Redis or Postgres
+changes shape.
 
 ## 2.55.0 — 2026-10-02
 

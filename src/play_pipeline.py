@@ -1129,10 +1129,10 @@ async def interject_resolved(
     # The head only, awaited: a cache miss at dequeue is yt-dlp dead air between
     # the interrupt and the new song, and the current song plays through the wait.
     # A gate, not a hint — this flow stops what is playing, so a head that could
-    # not be extracted must not get that far. Hands the head back with its embed
-    # fields back-filled.
+    # not be extracted, or whose cached URL no longer plays, must not get that far.
+    # Hands the head back with its embed fields back-filled.
     warmed = await YTDL.prefetch_stream(qobj, redis=cog.redis)
-    if warmed is None:
+    if warmed is None or not await YTDL.confirm_stream(warmed, redis=cog.redis):
         raise RuntimeError(
             "Could not get a playable stream for that song, so the current "
             "song was left alone."

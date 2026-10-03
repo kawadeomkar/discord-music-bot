@@ -1619,7 +1619,8 @@ class TestNowFlag:
         }
         # Confirmation embed names both songs and the resume position.
         embed = mock_ctx.send.call_args.kwargs["embed"]
-        assert "Urgent" in embed.title
+        # interject_resolved's `lead` default: -replay overrides it, --now does not.
+        assert embed.title == "▶️ Playing now: Urgent"
         assert "Original Song" in embed.description
         assert "2:31" in embed.description
         mock_ctx.message.add_reaction.assert_awaited_once_with("⏯️")
@@ -2357,6 +2358,55 @@ class TestPlacementInsertsAndConfirmations:
             )
         )
         return mp
+
+    @pytest.mark.parametrize(
+        ("argument", "warned"),
+        [
+            ("https://youtu.be/dQw4w9WgXcQ?t=banana", True),
+            ("-ts 1:32 https://youtu.be/dQw4w9WgXcQ?t=banana", False),
+        ],
+    )
+    async def test_a_resume_mid_resolve_carries_the_timestamp_warning_to_the_append(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, argument: str, warned: bool
+    ) -> None:
+        """interject_flow computes the warning and interject_resolved hands it to
+        the append a -resume turns the request into: the dead `t=` changed where the
+        song starts, unless `--timestamp` set the offset instead."""
+        vc = paused_vc(mock_ctx)
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        play_pipeline.queue_source = AsyncMock(
+            return_value=QueueObject(
+                webpage_url="https://yt.com/v=dQw4w9WgXcQ",
+                title="Song",
+                requester=mock_ctx.author,
+                duration=212,
+            )
+        )
+        play_pipeline.enqueue_single = AsyncMock()
+
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> Any:
+            vc.is_paused.return_value = False
+            return a[0]
+
+        with (
+            no_typing("src.commands.play.background_typing"),
+            no_slow_notice("src.commands.play.slow_resolve_notice"),
+            patch.object(
+                YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
+            ),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=argument)
+
+        mp.interject.assert_not_awaited()
+        call = play_pipeline.enqueue_single.await_args
+        assert call is not None
+        warning = call.kwargs["warning"]
+        if warned:
+            assert warning is not None and "banana" in warning
+        else:
+            assert warning is None
 
     async def test_a_resume_mid_resolve_still_queues_the_rest_of_the_playlist(
         self, music_bot: MusicBot, mock_ctx: MagicMock

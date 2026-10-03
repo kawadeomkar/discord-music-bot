@@ -16,6 +16,7 @@ from src.musicplayer import MusicPlayer
 from src.play_placement import (
     PlaceStalled,
     ResolveWaitExpired,
+    place_stalled_notice,
     resolve_mode_for,
     slow_resolve_notice,
     Placement,
@@ -491,23 +492,6 @@ def _resolve_wait_notice() -> discord.Embed:
     return notice_embed(
         "This server has too many songs being looked up right now, so yours "
         "wasn't queued — try again in a moment.",
-        discord.Color.red(),
-    )
-
-
-def place_stalled_notice(*, before_the_put: bool) -> discord.Embed:
-    """What a stalled placement may claim. Waiting for the lock nothing was written
-    and the song is honestly absent; inside the put the deque is appended before the
-    mirror write, so the song may be queued and a "try again" would duplicate it."""
-    if before_the_put:
-        return notice_embed(
-            "This server's queue is busy right now, so your song wasn't queued — "
-            "try again in a moment.",
-            discord.Color.red(),
-        )
-    return notice_embed(
-        "This server's queue is busy right now, so your song may not have been "
-        "queued — check `-queue` before trying again.",
         discord.Color.red(),
     )
 

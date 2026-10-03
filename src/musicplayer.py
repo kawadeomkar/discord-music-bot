@@ -777,6 +777,20 @@ class MusicPlayer:
                 inline=True,
             )
 
+    @property
+    def ended_unrecorded(self) -> Optional[YTDL]:
+        """The play that has ended but whose history row the loop has not written
+        yet — it awaits the prefetch between the two — when the loop will write one:
+        not a parked song (its tail records it) and not one that produced no audio.
+        The write appends to the cache before it awaits Redis, so the same play can
+        briefly be both here and the cache's newest entry."""
+        song = self._ended_song
+        if song is None or self._skip_history_for is song:
+            return None
+        if not song.produced_audio:
+            return None
+        return song
+
     def claim_current_song_for_history(self) -> Optional[HistoryEntry]:
         """Take the playing song's history entry so a teardown can record it: its
         queue entry was LPOPed at start, clear_connection() drops the parked state

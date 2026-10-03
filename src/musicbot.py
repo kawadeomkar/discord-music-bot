@@ -821,27 +821,31 @@ class MusicBot(commands.Cog):
         aliases=["rp", "previous"],
         brief="play the last song that finished again",
         help=(
-            "Plays the newest song in `-history` again, from the beginning — the "
-            "song before the one playing now, so a song skipped by mistake is one "
-            "command away.\n\n"
+            "Plays the last song that finished again, from the beginning — the song "
+            "before the one playing now, so a song skipped by mistake is one command "
+            "away.\n\n"
             "A song that is playing is interrupted and comes back from where it left "
             "off once the replay ends, the way `-play --now` parks it; a **paused** "
-            "one comes back playing. With nothing playing the replay starts now, and "
+            "one comes back playing. With nothing playing the replay plays next, and "
             "if the bot has left voice it joins your channel first."
         ),
         extras={
             "category": "Playback",
             "examples": ["-replay", "-rp", "-previous"],
             "note": (
-                "`-restart` starts the song that is playing over instead. The replay "
-                "is recorded in `-history` as a new play, requested by you."
+                "`-restart` starts the song that is playing over instead. Run it "
+                "again and it goes one song further back, passing over songs already "
+                "waiting to resume. The replay is recorded in `-history` as a new "
+                "play, requested by you."
             ),
         },
     )
     @commands.before_invoke(validate_commands)
     # One -replay per guild at a time: two read the same newest entry, and the
-    # second, landing on the first's interjection, would queue the song twice.
+    # second, landing on the first's interjection, would queue the song twice. The
+    # cooldown bounds how fast repeats stack parked songs; refusals hand it back.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @commands.cooldown(1, 5.0, commands.BucketType.guild)
     @_tracer.start_as_current_span("bot.replay")
     async def replay(self, ctx: commands.Context) -> None:
         try:
