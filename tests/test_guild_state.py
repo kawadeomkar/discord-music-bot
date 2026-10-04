@@ -48,27 +48,18 @@ from src.guild_state import (
 from tests.helpers import members
 
 
-_PARKED_URL = b"https://youtu.be/abc"
-
-
-def _parked(raw: dict[bytes, bytes]) -> SongQueueEntry:
-    """The parked song a raw hash describes. Every case here parks one, so the
-    url that proves it is added when the case does not name its own."""
-    data = GuildStateData.from_redis({b"current_song_url": _PARKED_URL} | raw)
-    assert data.current_song is not None
-    return data.current_song
-
-
 def _full_state_hash() -> dict[bytes, bytes]:
     return {
         b"volume": b"0.5",
         b"voice_channel_id": b"111",
         b"text_channel_id": b"222",
-        b"current_song_url": b"https://youtu.be/abc",
-        b"current_song_title": b"Test Song",
-        b"current_song_duration": b"240",
-        b"current_song_uploader": b"Test Channel",
-        b"current_song_requester_id": b"333",
+        b"current_song": SongQueueEntry(
+            webpage_url="https://youtu.be/abc",
+            title="Test Song",
+            duration=240,
+            uploader="Test Channel",
+            requester_id=333,
+        ).to_redis(),
         b"play_start_epoch": b"1000.5",
         b"total_pause_seconds": b"12.5",
         b"pause_start_epoch": b"1100.0",
@@ -99,7 +90,7 @@ class TestGuildStateDataFromRedis:
         data = GuildStateData.from_redis({b"volume": b"0.8"})
         assert data.volume == 0.8
         assert data.voice_channel_id is None
-        # No url: nothing was playing, so there is no parked song to read.
+        # No blob: nothing was playing, so there is no parked song to read.
         assert data.current_song is None
         assert data.total_pause_seconds == 0.0
 
@@ -115,9 +106,9 @@ class TestGuildStateDataFromRedis:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            song = _parked({b"current_song_requester_id": b"abc"})
-        assert song.requester_id is None
-        assert "current_song_requester_id" in caplog.text
+            data = GuildStateData.from_redis({b"voice_channel_id": b"abc"})
+        assert data.voice_channel_id is None
+        assert "voice_channel_id" in caplog.text
 
     def test_float_formatted_int_parses(self) -> None:
         data = GuildStateData.from_redis({b"voice_channel_id": b"111.0"})
@@ -126,8 +117,8 @@ class TestGuildStateDataFromRedis:
     def test_snowflake_id_precision_preserved(self) -> None:
         # Discord snowflakes exceed float's 53-bit integer precision; parsing
         # via float() would corrupt 222222222222222222 to ...208.
-        song = _parked({b"current_song_requester_id": b"222222222222222222"})
-        assert song.requester_id == 222222222222222222
+        data = GuildStateData.from_redis({b"voice_channel_id": b"222222222222222222"})
+        assert data.voice_channel_id == 222222222222222222
 
     def test_zero_volume_is_preserved(self) -> None:
         # Falsy-zero trap: coalescing with `or` would elevate a stored 0.0.
@@ -163,72 +154,25 @@ class TestGuildStateDataFromRedis:
     ) -> None:
         # int(float(b"inf")) raises OverflowError, not ValueError.
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            song = _parked({b"current_song_duration": b"inf"})
-        assert song.duration is None
+            data = GuildStateData.from_redis({b"text_channel_id": b"inf"})
+        assert data.text_channel_id is None
 
     def test_non_utf8_bytes_degrade_instead_of_raising(self) -> None:
-        # A corrupt byte in one field must not make from_redis raise — that
+        # A corrupt byte in the parked song must not make from_redis raise — that
         # would turn get_guild_state() into None ("Redis unavailable") and
-        # block recovery entirely.
-        song = _parked({b"current_song_title": b"Song \xff\xfe"})
-        assert song.title.startswith("Song ")
-
-    def test_empty_uploader_coerces_to_none(self) -> None:
-        song = _parked({b"current_song_uploader": b""})
-        assert song.uploader is None
-
-    def test_empty_bytes_ids_coerce_to_none(self) -> None:
-        song = _parked(
-            {b"current_song_duration": b"", b"current_song_requester_id": b""}
+        # block recovery entirely. It costs the song and nothing beside it.
+        data = GuildStateData.from_redis(
+            {b"voice_channel_id": b"111", b"current_song": b'{"title": "Song \xff"}'}
         )
-        assert song.duration is None
-        assert song.requester_id is None
+        assert data.current_song is None
+        assert data.voice_channel_id == 111
 
-    def test_interjected_parses_one_as_true(self) -> None:
-        song = _parked({b"current_song_interjected": b"1"})
-        assert song.interjected is True
-
-    @pytest.mark.parametrize("raw", [b"", b"0", b"true"])
-    def test_interjected_anything_but_one_is_false(self, raw: Any) -> None:
-        # The write path stores exactly "1" or "" — anything else (including
-        # a missing field on pre-interjection state hashes) reads as False.
-        song = _parked({b"current_song_interjected": raw})
-        assert song.interjected is False
-
-    def test_interjected_missing_is_false(self) -> None:
-        assert GuildStateData.from_redis({}).current_song is None
-
-    def test_enqueue_stamps_parse(self) -> None:
-        song = _parked(
-            {
-                b"current_song_queued_at": b"1752530000.5",
-                b"current_song_queue_position": b"3",
-            }
+    def test_empty_ids_coerce_to_none(self) -> None:
+        data = GuildStateData.from_redis(
+            {b"voice_channel_id": b"", b"text_channel_id": b""}
         )
-        assert song.queued_at == 1752530000.5
-        assert song.queue_position == 3
-
-    def test_enqueue_stamps_missing_are_zero(self) -> None:
-        # Pre-feature state hashes carry neither field.
-        song = _parked({})
-        assert song.queued_at == 0.0
-        assert song.queue_position == 0
-
-    def test_query_source_parses(self) -> None:
-        song = _parked({b"current_song_query_source": b"soundcloud.com"})
-        assert song.query_source == "soundcloud.com"
-
-    def test_played_at_parses(self) -> None:
-        song = _parked({b"current_song_played_at": b"1752530000.5"})
-        assert song.played_at == 1752530000.5
-
-    def test_played_at_missing_is_zero(self) -> None:
-        # Pre-feature state hashes carry no such field; 0.0 is the wire's
-        # "unknown", never a stand-in clock.
-        assert _parked({}).played_at == 0.0
-
-    def test_query_source_missing_is_unknown(self) -> None:
-        assert _parked({}).query_source == ""
+        assert data.voice_channel_id is None
+        assert data.text_channel_id is None
 
 
 class TestGuildStateDataProperties:
@@ -1696,12 +1640,9 @@ class TestCrashedSongRoundTrip:
 
 
 class TestTheParkedSongSurvivesACrash:
-    """The playing song is parked as one blob beside the prefixed fields a build
-    before it reads. Those fields win on everything they carry; the blob adds the
-    thumbnail and the np_* ids, and only when its url and start epoch match them —
-    an older build HDELs only the fields it knows, so a blob can outlive the song
-    it describes, the rollback-then-roll-forward window `_heartbeat_predates_song`
-    guards on the position."""
+    """The playing song is parked as one blob — the entry its start transaction
+    LPOPed — and the blob is the whole record: a hash without one parks nothing,
+    whatever else it holds."""
 
     @staticmethod
     def _entry(url: str, **fields: Any) -> SongQueueEntry:
@@ -1709,40 +1650,23 @@ class TestTheParkedSongSurvivesACrash:
             webpage_url=url, title="Crashed", requester_id=7, **fields
         )
 
-    @classmethod
-    def _hash(
-        cls,
-        url: str,
-        blob: SongQueueEntry | bytes | None,
-        *,
-        played_at: float = 0.0,
-    ) -> dict[bytes, bytes]:
-        """A state hash parking `url`, started at `played_at`, with whatever `blob`
-        the field holds: the prefixed fields are what an older build wrote and
-        still reads."""
-        raw = {
-            StateField.CURRENT_SONG_URL.encode(): url.encode(),
-            StateField.CURRENT_SONG_TITLE.encode(): b"Crashed",
-            StateField.CURRENT_SONG_REQUESTER_ID.encode(): b"7",
-            StateField.CURRENT_SONG_PLAYED_AT.encode(): str(played_at).encode(),
-        }
-        if blob is not None:
-            raw[StateField.CURRENT_SONG.encode()] = (
+    @staticmethod
+    def _hash(blob: SongQueueEntry | bytes) -> dict[bytes, bytes]:
+        """A state hash parking whatever `blob` the field holds."""
+        return {
+            StateField.CURRENT_SONG.encode(): (
                 blob.to_redis() if isinstance(blob, SongQueueEntry) else blob
             )
-        return raw
+        }
 
-    def test_the_prefixed_fields_alone_recover_every_field_they_carry(self) -> None:
-        """The leg the dual write exists for: a build before this one wrote no
-        blob, and an older build during a rollback writes none either. Every
-        prefixed field the mapping still writes has to come back from it —
-        `is_resume` and `start_paused` decide whether the song announces itself as
-        resuming and whether it comes back paused, and `user_input` is what
-        `-remove <collection link>` matches on, so losing them here is BEHAVIOUR,
+    def test_everything_the_start_transaction_parks_comes_back(self) -> None:
+        """`is_resume` and `start_paused` decide whether the song announces itself
+        as resuming and whether it comes back paused, and `user_input` is what
+        `-remove <collection link>` matches on, so losing one here is BEHAVIOUR,
         not attribution.
 
-        Built from the writer's own mapping, minus the blob, so a field added to
-        the mapping without a parse reaching it fails here."""
+        Read back off the writer's own mapping, so the two cannot disagree about
+        which field holds the song."""
         entry = SongQueueEntry(
             webpage_url="https://yt.com/v=1",
             title="Crashed",
@@ -1757,198 +1681,90 @@ class TestTheParkedSongSurvivesACrash:
             query_source="spotify.com",
             user_input="https://open.spotify.com/playlist/abc",
             played_at=1000.5,
+            thumbnail="https://img/1.jpg",
+            np_message_id=11,
+            np_channel_id=22,
+            np_dedicated=True,
         )
         written = GuildRedisStore._now_playing_state_mapping(
             cast(GuildRedisStore, None), entry, 1000.5
         )
-        raw = {
-            key.encode(): value.encode()
-            for key, value in written.items()
-            if key != StateField.CURRENT_SONG
-        }
-
-        parked = GuildStateData.from_redis(raw).current_song
-
-        assert parked == entry
-
-    def test_the_blob_of_the_song_it_describes_is_read(self) -> None:
-        """Everything the prefixed fields never carried — the thumbnail here —
-        comes back only from the blob."""
-        parked = self._entry("https://yt.com/v=1", thumbnail="https://img/1.jpg")
-        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", parked))
-        assert state.current_song == parked
-
-    def test_a_blob_naming_another_song_is_ignored(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """What a rollback leaves behind: the blob describes a song that ended
-        releases ago, and its list entry is long LPOPed. The prefixed fields name
-        the song actually parked."""
-        stale = self._entry("https://yt.com/v=1", thumbnail="https://img/1.jpg")
-        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            state = GuildStateData.from_redis(self._hash("https://yt.com/v=2", stale))
-        assert state.current_song is not None
-        assert state.current_song.webpage_url == "https://yt.com/v=2"
-        assert state.current_song.thumbnail is None
-        assert "does not describe" in caplog.text
-
-    def test_a_blob_from_an_earlier_play_of_the_same_song_is_ignored(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The url alone does not identify a play. A rolled-back build replays one
-        song constantly — a fragment and its own resume tail share a url — and the
-        blob it left behind carries that earlier play's flags: the song would come
-        back paused, announced as resuming, and archived under the wrong start."""
-        stale = self._entry(
-            "https://yt.com/v=1",
-            played_at=1000.0,
-            is_resume=True,
-            start_paused=True,
-        )
-        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
-            state = GuildStateData.from_redis(
-                self._hash("https://yt.com/v=1", stale, played_at=2000.0)
-            )
-        assert state.current_song is not None
-        assert state.current_song.played_at == 2000.0
-        assert state.current_song.is_resume is False
-        assert state.current_song.start_paused is False
-        assert "does not describe" in caplog.text
-
-    def test_an_earlier_plays_card_does_not_reach_the_recovered_song(self) -> None:
-        """The other half of the gate's consequence, at the surface recovery
-        reads: the prefixed fields win on what they carry either way, so what an
-        earlier play's blob actually lends is the thumbnail and the NP card it
-        already posted — and the recovered song would edit and delete a message
-        belonging to a play that ended."""
-        stale = self._entry(
-            "https://yt.com/v=1",
-            played_at=1000.0,
-            thumbnail="https://img/old.jpg",
-            np_message_id=11,
-            np_channel_id=22,
-            np_dedicated=True,
-        )
-        state = GuildStateData.from_redis(
-            self._hash("https://yt.com/v=1", stale, played_at=2000.0)
-        )
-
-        recovered = SongQueueEntry.from_crashed_state(state, position=42)
-
-        assert recovered is not None
-        assert recovered.thumbnail is None
-        assert (recovered.np_message_id, recovered.np_channel_id) == (0, 0)
-        assert recovered.np_dedicated is False
-
-    def test_a_blob_from_the_other_fragment_of_one_play_loses_to_the_fields(
-        self,
-    ) -> None:
-        """A resume tail INHERITS its fragment's start epoch, so url and
-        `played_at` cannot tell the two apart and a rolled-back build's blob for
-        one passes the gate on the other. The prefixed fields describe the play
-        THIS build parked, so they win on everything they carry; the blob is read
-        for the thumbnail and the np_* ids alone.
-
-        Built off the writer's own mapping against a blob that disagrees on every
-        field of it, so a field the overlay forgets fails here."""
-        tail = SongQueueEntry(
-            webpage_url="https://yt.com/v=1",
-            title="Tail",
-            duration=321,
-            uploader="A Channel",
-            requester_id=7,
-            interjected=True,
-            is_resume=True,
-            start_paused=True,
-            queued_at=900.5,
-            queue_position=4,
-            query_source="spotify.com",
-            user_input="https://open.spotify.com/playlist/abc",
-            played_at=1000.5,
-        )
-        fragment = SongQueueEntry(
-            webpage_url="https://yt.com/v=1",
-            title="Fragment",
-            duration=999,
-            uploader="Another Channel",
-            requester_id=8,
-            interjected=False,
-            is_resume=False,
-            start_paused=False,
-            queued_at=1.5,
-            queue_position=0,
-            query_source="youtube.com",
-            user_input="https://yt.com/v=1",
-            played_at=1000.5,  # inherited by the tail — the one field they share
-            thumbnail="https://img/1.jpg",
-            np_message_id=11,
-            np_channel_id=22,
-            np_dedicated=True,
-        )
-        written = GuildRedisStore._now_playing_state_mapping(
-            cast(GuildRedisStore, None), tail, 1000.5
-        )
         raw = {key.encode(): value.encode() for key, value in written.items()}
-        raw[StateField.CURRENT_SONG.encode()] = fragment.to_redis()
 
-        parked = GuildStateData.from_redis(raw).current_song
+        assert GuildStateData.from_redis(raw).current_song == entry
 
-        assert parked == dataclasses.replace(
-            tail,
-            thumbnail="https://img/1.jpg",
-            np_message_id=11,
-            np_channel_id=22,
-            np_dedicated=True,
-        )
-
-    def test_a_blob_with_no_parked_url_is_no_parked_song(self) -> None:
-        """An older build HDELs the fields it knows and leaves the blob. Nothing
-        was playing when this build stopped, so nothing is recovered."""
-        raw = self._hash("https://yt.com/v=1", self._entry("https://yt.com/v=1"))
-        del raw[StateField.CURRENT_SONG_URL.encode()]
+    def test_a_hash_with_no_blob_parks_nothing(self) -> None:
+        """What a build before 2.53.3 leaves behind: the song spelled as prefixed
+        fields and no blob. Nothing reads those fields, so nothing is recovered."""
+        raw = {
+            b"current_song_url": b"https://yt.com/v=1",
+            b"current_song_title": b"Crashed",
+            b"current_song_requester_id": b"7",
+            b"current_song_played_at": b"1000.5",
+        }
 
         assert GuildStateData.from_redis(raw).current_song is None
 
+    def test_the_prefixed_fields_beside_a_blob_are_not_read(self) -> None:
+        """A hash a build through 2.55.0 parked holds both spellings. The blob
+        answers alone, so a prefixed field that disagrees changes nothing."""
+        parked = self._entry("https://yt.com/v=A", thumbnail="https://img/a.jpg")
+        raw = self._hash(parked) | {
+            b"current_song_url": b"https://yt.com/v=B",
+            b"current_song_title": b"Another build's song",
+            b"current_song_is_resume": b"1",
+            b"current_song_start_paused": b"1",
+        }
+
+        assert GuildStateData.from_redis(raw).current_song == parked
+
     @pytest.mark.parametrize("stored", [b"not json", b'"a string"', b"[]", b"{}"])
-    def test_a_malformed_blob_falls_back_to_the_fields(self, stored: bytes) -> None:
-        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", stored))
-        assert state.current_song is not None
-        assert state.current_song.title == "Crashed"
+    def test_a_blob_that_does_not_read_parks_nothing(
+        self, stored: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The refusal is about one guild's hash, and the warning is the only
+        signal it happened, so it names the owner the store read it under."""
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            state = GuildStateData.from_redis(self._hash(stored), owner="[guild:42]")
 
-    def test_a_hash_with_no_blob_still_recovers(self) -> None:
-        """Every entry parked before this build, and every one an older build
-        parks during a rollback."""
-        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", None))
-        assert state.current_song == self._entry("https://yt.com/v=1")
+        assert state.current_song is None
+        assert not state.has_crashed_song
+        assert "[guild:42] parked song does not read" in caplog.text
 
-    def test_a_rollback_then_roll_forward_recovers_the_right_song(self) -> None:
-        """The sequence that makes the guard load-bearing: this build parks A,
-        an older build rolls back and parks B in the fields it knows (leaving A's
-        blob untouched), then this build reads the hash."""
-        raw = self._hash(
-            "https://yt.com/v=A",
-            self._entry("https://yt.com/v=A", thumbnail="https://img/a.jpg"),
-        )
-        raw[StateField.CURRENT_SONG_URL.encode()] = b"https://yt.com/v=B"
-        raw[StateField.CURRENT_SONG_TITLE.encode()] = b"Older build's song"
+    def test_an_empty_blob_is_no_parked_song_and_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            state = GuildStateData.from_redis(self._hash(b""))
 
-        state = GuildStateData.from_redis(raw)
-
-        assert state.current_song is not None
-        assert state.current_song.webpage_url == "https://yt.com/v=B"
-        assert state.current_song.title == "Older build's song"
+        assert state.current_song is None
+        assert caplog.text == ""
 
     def test_the_recovered_entry_carries_the_thumbnail(self) -> None:
-        """A crash-recovered head is re-queued, so its queue row has a cover
-        again — the prefixed fields never carried one."""
+        """A crash-recovered head is re-queued, so its queue row shows the cover
+        it was playing with."""
         parked = self._entry("https://yt.com/v=1", thumbnail="https://img/1.jpg")
-        state = GuildStateData.from_redis(self._hash("https://yt.com/v=1", parked))
+        state = GuildStateData.from_redis(self._hash(parked))
 
         entry = SongQueueEntry.from_crashed_state(state, position=95)
 
         assert entry is not None
         assert entry.thumbnail == "https://img/1.jpg"
         assert (entry.ts, entry.persisted) == (95, False)
+
+    def test_the_recovered_entry_carries_the_card_it_posted(self) -> None:
+        """The ids are what `_dispose_previous_np_card` deletes a card by and what
+        `play_history` archives a removed head under."""
+        parked = self._entry(
+            "https://yt.com/v=1", np_message_id=11, np_channel_id=22, np_dedicated=True
+        )
+        state = GuildStateData.from_redis(self._hash(parked))
+
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+
+        assert entry is not None
+        assert (entry.np_message_id, entry.np_channel_id) == (11, 22)
+        assert entry.np_dedicated is True
 
 
 class TestFromCrashedState:

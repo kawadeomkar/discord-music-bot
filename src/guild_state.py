@@ -46,35 +46,9 @@ class StateField:
     VOLUME: Final[str] = "volume"
     VOICE_CHANNEL_ID: Final[str] = "voice_channel_id"
     TEXT_CHANNEL_ID: Final[str] = "text_channel_id"
-    CURRENT_SONG_URL: Final[str] = "current_song_url"
-    CURRENT_SONG_TITLE: Final[str] = "current_song_title"
-    CURRENT_SONG_DURATION: Final[str] = "current_song_duration"
-    CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
-    CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
-    # "1" when the playing song was queued by an interjection (attribution only).
-    CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
-    # "1" when the playing song is an interjection's resume tail / was parked
-    # paused. is_resume drives the announcement and the NP-card cleanup;
-    # queue_rows.remaining_secs reads `ts` alone, whatever set it.
-    CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
-    CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
-    # Set once at ask time and carried, never rewritten, so a crash-recovered
-    # song still archives what it was originally queued with.
-    CURRENT_SONG_QUEUED_AT: Final[str] = "current_song_queued_at"
-    CURRENT_SONG_QUEUE_POSITION: Final[str] = "current_song_queue_position"
-    CURRENT_SONG_QUERY_SOURCE: Final[str] = "current_song_query_source"
-    # What the user typed, so -remove <collection link> can take out a
-    # crash-recovered head.
-    CURRENT_SONG_USER_INPUT: Final[str] = "current_song_user_input"
-    # The parked song as one SongQueueEntry blob, the shape its queue entry had.
-    # The prefixed fields below are dual-written beside it for one release and win
-    # on everything they carry; the blob supplies the rest, and only when its
-    # webpage_url and played_at match theirs (docs/ARCHITECTURE.md#the-parked-song).
+    # The parked song as one SongQueueEntry blob, the shape its queue entry had;
+    # absent when nothing is playing (docs/ARCHITECTURE.md#the-parked-song).
     CURRENT_SONG: Final[str] = "current_song"
-    # When the audio started. Not PLAY_START_EPOCH (backdated by -ss) and not
-    # derivable from this run's clock: a resume tail inherits an earlier
-    # fragment's value.
-    CURRENT_SONG_PLAYED_AT: Final[str] = "current_song_played_at"
     # LEGACY, all three: read only by _legacy_wall_clock_position_at, still
     # written so a rollback recovers. Drop with that method and on_pause/
     # on_resume one release after the heartbeat ships.
@@ -182,75 +156,18 @@ def parse_number_fields(
     return numbers
 
 
-# The entry fields the thirteen prefixed keys carry. A matching blob is overlaid
-# with these, so it contributes only what they never did: `thumbnail` and the
-# np_* ids.
-_PARKED_FIELDS: Final[tuple[str, ...]] = (
-    "webpage_url",
-    "title",
-    "duration",
-    "uploader",
-    "requester_id",
-    "interjected",
-    "is_resume",
-    "start_paused",
-    "queued_at",
-    "queue_position",
-    "query_source",
-    "user_input",
-    "played_at",
-)
-
-
-def _parked_fields(raw: dict[bytes, bytes], url: str) -> SongQueueEntry:
-    """The parked song as the prefixed keys spell it — every build's write, and
-    the whole entry for one that stored no blob."""
-    return SongQueueEntry(
-        webpage_url=url,
-        title=_b_str(raw, StateField.CURRENT_SONG_TITLE),
-        duration=_b_opt_int(raw, StateField.CURRENT_SONG_DURATION),
-        uploader=_b_str(raw, StateField.CURRENT_SONG_UPLOADER) or None,
-        requester_id=_b_opt_int(raw, StateField.CURRENT_SONG_REQUESTER_ID),
-        interjected=_b_str(raw, StateField.CURRENT_SONG_INTERJECTED) == "1",
-        is_resume=_b_str(raw, StateField.CURRENT_SONG_IS_RESUME) == "1",
-        start_paused=_b_str(raw, StateField.CURRENT_SONG_START_PAUSED) == "1",
-        # `or` coalescing is safe on these: the zero value IS the default.
-        queued_at=_b_float(raw, StateField.CURRENT_SONG_QUEUED_AT) or 0.0,
-        queue_position=_b_opt_int(raw, StateField.CURRENT_SONG_QUEUE_POSITION) or 0,
-        query_source=_b_str(raw, StateField.CURRENT_SONG_QUERY_SOURCE),
-        user_input=_b_str(raw, StateField.CURRENT_SONG_USER_INPUT) or None,
-        played_at=_b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0,
-    )
-
-
 def _parked_song(raw: dict[bytes, bytes], owner: str) -> SongQueueEntry | None:
-    """The song that was playing, as its queue entry; None when none is parked.
-    The prefixed fields win on everything they carry, and a blob describing the
-    same play adds `thumbnail` and the np_* ids; the url and start-epoch gate
-    keeps out a blob an older build left behind
-    (docs/ARCHITECTURE.md#the-parked-song). `owner` labels the refusal below,
-    which is about one guild's hash and is the only signal it happened."""
-    url = _b_str(raw, StateField.CURRENT_SONG_URL)
-    if not url:
-        return None
-    fields = _parked_fields(raw, url)
-    blob = _b_str(raw, StateField.CURRENT_SONG)
+    """The song that was playing, as its queue entry; None when none is parked
+    (docs/ARCHITECTURE.md#the-parked-song). A blob that does not read is no
+    parked song either, and `owner` labels that refusal: it is about one guild's
+    hash and is the only signal it happened."""
+    blob = raw.get(StateField.CURRENT_SONG.encode())
     if not blob:
-        return fields
-    entry = parse_queue_entry(blob)
-    if (
-        isinstance(entry, SongQueueEntry)
-        and entry.webpage_url == url
-        and entry.played_at == fields.played_at
-    ):
-        # The gate alone cannot settle it: a fragment and its own resume tail are
-        # one play, so they agree on both. Overlaying is what keeps the other
-        # fragment's flags off this one.
-        return replace(
-            entry, **{name: getattr(fields, name) for name in _PARKED_FIELDS}
-        )
-    log.warning(f"{owner} parked blob does not describe the parked play")
-    return fields
+        return None
+    entry, reason = read_queue_entry(blob)
+    if entry is None:
+        log.warning(f"{owner} parked song does not read, not recovered: {reason}")
+    return entry
 
 
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
@@ -476,8 +393,7 @@ class GuildStateData:
     volume: float | None = None
     voice_channel_id: int | None = None
     text_channel_id: int | None = None
-    # The song that was playing, as the queue entry it was LPOPed from — the blob
-    # when the hash carries one, else the prefixed fields (_parked_song).
+    # The song that was playing, as the queue entry it was LPOPed from.
     current_song: SongQueueEntry | None = None
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0

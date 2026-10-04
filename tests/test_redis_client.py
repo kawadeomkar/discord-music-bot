@@ -52,6 +52,7 @@ from src.redis_client import (
     GuildRedisStore,
     _PLAYBACK_POSITION_FIELDS,
     _prev_stream_id,
+    _RETIRED_SONG_FIELDS,
     _TRANSIENT_SONG_FIELDS,
     ack_outbox,
     cache_get,
@@ -2405,16 +2406,11 @@ class TestGetGuildState:
     async def test_returns_typed_snapshot(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
+        parked = _current("https://x")
         await fake_redis.hset(store.state_key(), b"volume", b"0.5")
-        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.hset(store.state_key(), b"current_song", parked.to_redis())
         state = await store.get_guild_state()
-        assert state == GuildStateData(
-            volume=0.5,
-            # The url alone parks a song: the rest of the fields default.
-            current_song=SongQueueEntry(
-                webpage_url="https://x", title="", requester_id=None
-            ),
-        )
+        assert state == GuildStateData(volume=0.5, current_song=parked)
 
     async def test_returns_zero_value_snapshot_when_missing(
         self, store: GuildRedisStore
@@ -2428,24 +2424,18 @@ class TestGetGuildState:
         fake_redis: aioredis.Redis,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A stale blob is a rollback artifact in ONE guild's hash, and the warning
-        is the only signal it is there — the store is the layer that knows which
-        guild the parse ran for."""
-        stale = SongQueueEntry(webpage_url="https://x", title="Old", requester_id=7)
+        """A blob that does not read costs ONE guild its playing song, and the
+        warning is the only signal it happened — the store is the layer that knows
+        which guild the parse ran for."""
         await fake_redis.hset(
-            store.state_key(),
-            mapping={
-                b"current_song_url": b"https://y",
-                StateField.CURRENT_SONG.encode(): stale.to_redis(),
-            },
+            store.state_key(), StateField.CURRENT_SONG.encode(), b"not json"
         )
 
         with caplog.at_level("WARNING", logger="src.guild_state"):
             state = await store.get_guild_state()
 
-        assert state is not None and state.current_song is not None
-        assert state.current_song.webpage_url == "https://y"
-        assert "[guild:123456789] parked blob does not describe" in caplog.text
+        assert state is not None and state.current_song is None
+        assert "[guild:123456789] parked song does not read" in caplog.text
 
     async def test_returns_none_on_error_not_defaults(
         self, broken_store: GuildRedisStore
@@ -2487,7 +2477,9 @@ class TestGetPlaybackSnapshot:
     async def test_returns_state_and_queue_together(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.hset(
+            store.state_key(), b"current_song", _current("https://x").to_redis()
+        )
         await fake_redis.rpush(
             store.queue_key(), _entry(1).to_redis(), _entry(2).to_redis()
         )
@@ -2653,7 +2645,9 @@ class TestGetRecoveryGate:
     async def test_returns_state_and_queue_length(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.hset(
+            store.state_key(), b"current_song", _current("https://x").to_redis()
+        )
         await fake_redis.rpush(
             store.queue_key(), _entry(1).to_redis(), _entry(2).to_redis()
         )
@@ -2715,7 +2709,9 @@ class TestGetRecoveryGate:
     async def test_crashed_song_makes_empty_queue_restorable(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.hset(
+            store.state_key(), b"current_song", _current("https://x").to_redis()
+        )
         gate = await store.get_recovery_gate()
         assert gate is not None
         assert gate.pending_count == 0
@@ -2836,6 +2832,7 @@ class TestClearConnection:
         transient_fields = {
             b"voice_channel_id": b"111",
             b"text_channel_id": b"222",
+            b"current_song": _current("https://yt.com/v=1").to_redis(),
             b"current_song_url": b"https://yt.com/v=1",
             b"current_song_title": b"Test Song",
             b"current_song_duration": b"210",
@@ -3096,8 +3093,7 @@ class TestSpotifyTokenCache:
 
 def _current(url: str = "url", title: str = "title", **kwargs: Any) -> SongQueueEntry:
     """The start-transaction carrier: the queue-entry view of the song that is
-    about to play, parked in the state hash as one blob and as the prefixed
-    fields beside it."""
+    about to play, parked in the state hash as one blob."""
     return SongQueueEntry(
         webpage_url=url,
         title=title,
@@ -3106,12 +3102,19 @@ def _current(url: str = "url", title: str = "title", **kwargs: Any) -> SongQueue
     )
 
 
-class TestTheParkedBlob:
-    """The start transaction parks the whole entry, not just the thirteen fields
-    that predate it: everything else — the thumbnail — survives a crash only in
-    the blob."""
+async def _parked(store: GuildRedisStore, fake_redis: aioredis.Redis) -> SongQueueEntry:
+    """The song the state hash parks, read the way recovery reads it."""
+    raw = cast(dict[bytes, bytes], await fake_redis.hgetall(store.state_key()))
+    parked = GuildStateData.from_redis(raw).current_song
+    assert parked is not None
+    return parked
 
-    async def test_the_blob_carries_what_the_fields_never_did(
+
+class TestTheParkedBlob:
+    """The start transaction parks the whole entry, so everything the song was
+    queued and played with survives a crash."""
+
+    async def test_the_blob_carries_the_cover_the_song_played_with(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         current = _current(
@@ -3184,8 +3187,8 @@ class TestPopQueueAndStartSong:
             _current("https://yt.com/v=1", "Test Song"), 1000.5
         )
         state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_url"] == b"https://yt.com/v=1"
-        assert state[b"current_song_title"] == b"Test Song"
+        parked = await _parked(store, fake_redis)
+        assert (parked.webpage_url, parked.title) == ("https://yt.com/v=1", "Test Song")
         assert state[b"play_start_epoch"] == b"1000.5"
         assert state[b"total_pause_seconds"] == b"0"
 
@@ -3197,20 +3200,20 @@ class TestPopQueueAndStartSong:
             _current(duration=210, uploader="Some Channel", requester_id=42),
             1000.0,
         )
-        state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_duration"] == b"210"
-        assert state[b"current_song_uploader"] == b"Some Channel"
-        assert state[b"current_song_requester_id"] == b"42"
+        parked = await _parked(store, fake_redis)
+        assert parked.duration == 210
+        assert parked.uploader == "Some Channel"
+        assert parked.requester_id == 42
 
-    async def test_omitted_duration_uploader_requester_id_write_empty(
+    async def test_omitted_duration_uploader_requester_id_read_back_unset(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(_current(), 1000.0)
-        state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_duration"] == b""
-        assert state[b"current_song_uploader"] == b""
-        assert state[b"current_song_requester_id"] == b""
+        parked = await _parked(store, fake_redis)
+        assert parked.duration is None
+        assert parked.uploader is None
+        assert parked.requester_id is None
 
     async def test_clears_pause_epoch_on_start(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -3226,16 +3229,14 @@ class TestPopQueueAndStartSong:
     ) -> None:
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(_current(interjected=True), 1000.0)
-        state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_interjected"] == b"1"
+        assert (await _parked(store, fake_redis)).interjected is True
 
-    async def test_interjected_false_writes_empty(
+    async def test_interjected_false_reads_back_false(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(_current(), 1000.0)
-        state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_interjected"] == b""
+        assert (await _parked(store, fake_redis)).interjected is False
 
     async def test_parks_the_enqueue_stamps(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -3246,11 +3247,7 @@ class TestPopQueueAndStartSong:
         await store.pop_queue_and_start_song(
             _current(queued_at=1752530000.5, queue_position=3), 1000.0
         )
-        state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_queued_at"] == b"1752530000.5"
-        assert state[b"current_song_queue_position"] == b"3"
-        parked = GuildStateData.from_redis(cast(dict[bytes, bytes], state)).current_song
-        assert parked is not None
+        parked = await _parked(store, fake_redis)
         assert parked.queued_at == 1752530000.5
         assert parked.queue_position == 3
 
@@ -3259,31 +3256,44 @@ class TestPopQueueAndStartSong:
     ) -> None:
         """The start transaction and the two clear paths must name the same
         fields. A field added to the mapping but to neither tuple survives its
-        own song: nothing reads it while `current_song_url` is absent, so it is
-        invisible until some later change starts trusting it. Asserted as a
-        relationship rather than a list, because enumerating the fields is what
-        already failed — `query_source` was added to both and neither had a test.
+        own song, where the next restart reads it as that song still playing.
+        Asserted as a relationship rather than a list, because enumerating the
+        fields is what already failed — `query_source` was added to both and
+        neither had a test.
         """
         parked = set(store._now_playing_state_mapping(_current(), 1000.0))
         assert parked <= {*_TRANSIENT_SONG_FIELDS, *_PLAYBACK_POSITION_FIELDS}
 
-    def test_every_prefixed_field_is_written_beside_the_blob(
+    def test_the_song_is_written_as_the_blob_and_nothing_else(
         self, store: GuildRedisStore
     ) -> None:
-        """The other direction, and the one the dual write rests on: a build
-        before this one recovers from the prefixed fields and knows nothing of
-        `current_song`, so dropping one here would take a whole release of
-        rollbacks with it. The subset test above cannot see a field REMOVED from
-        the mapping, and `is_resume`, `start_paused` and `user_input` are read back
-        by nothing else in the suite — they carry behaviour, not attribution."""
+        """One spelling of the parked song: the blob, and none of the prefixed
+        fields a build before 2.56.0 wrote beside it."""
         written = set(store._now_playing_state_mapping(_current(), 1000.0))
-        prefixed = {
-            field
-            for field in _TRANSIENT_SONG_FIELDS
-            if field.startswith("current_song_")
-        }
-        assert prefixed == written & prefixed
         assert StateField.CURRENT_SONG in written
+        assert written.isdisjoint(_RETIRED_SONG_FIELDS)
+        assert [field for field in written if field.startswith("current_song")] == [
+            StateField.CURRENT_SONG
+        ]
+
+    async def test_a_start_scrubs_the_spelling_an_older_build_parked(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A hash a build before 2.56.0 parked song A in still names A in the
+        prefixed fields. Left beside this start's blob they outlive A, and a
+        rollback to that build recovers A in place of the song that is playing."""
+        await fake_redis.hset(
+            store.state_key(),
+            mapping={field: "song A" for field in _RETIRED_SONG_FIELDS},
+        )
+
+        await store.pop_queue_and_start_song(_current(url="https://yt.com/v=B"), 1000.0)
+
+        state = cast(dict[bytes, bytes], await fake_redis.hgetall(store.state_key()))
+        assert [key for key in state if key.startswith(b"current_song")] == [
+            b"current_song"
+        ]
+        assert (await _parked(store, fake_redis)).webpage_url == "https://yt.com/v=B"
 
     async def test_a_song_end_leaves_no_current_song_field_in_the_hash(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -3311,11 +3321,7 @@ class TestPopQueueAndStartSong:
         await store.pop_queue_and_start_song(
             _current(query_source="spotify.com"), 1000.0
         )
-        state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_query_source"] == b"spotify.com"
-        parked = GuildStateData.from_redis(cast(dict[bytes, bytes], state)).current_song
-        assert parked is not None
-        assert parked.query_source == "spotify.com"
+        assert (await _parked(store, fake_redis)).query_source == "spotify.com"
 
     async def test_parks_the_user_input(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -3327,9 +3333,7 @@ class TestPopQueueAndStartSong:
         await store.pop_queue_and_start_song(
             _current(user_input="https://open.spotify.com/playlist/abc"), 1000.0
         )
-        state = await fake_redis.hgetall(store.state_key())
-        parked = GuildStateData.from_redis(cast(dict[bytes, bytes], state)).current_song
-        assert parked is not None
+        parked = await _parked(store, fake_redis)
         assert parked.user_input == "https://open.spotify.com/playlist/abc"
 
     async def test_parks_the_played_at(
@@ -3343,11 +3347,8 @@ class TestPopQueueAndStartSong:
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(_current(played_at=1752530000.5), 990.0)
         state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_played_at"] == b"1752530000.5"
         assert state[b"play_start_epoch"] == b"990.0"
-        parked = GuildStateData.from_redis(cast(dict[bytes, bytes], state)).current_song
-        assert parked is not None
-        assert parked.played_at == 1752530000.5
+        assert (await _parked(store, fake_redis)).played_at == 1752530000.5
 
     async def test_sets_ttl_on_state(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -3365,8 +3366,11 @@ class TestPopQueueAndStartSong:
             _current("https://yt.com/v=1", "No Queue Song"), 500.0
         )
         state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_url"] == b"https://yt.com/v=1"
-        assert state[b"current_song_title"] == b"No Queue Song"
+        parked = await _parked(store, fake_redis)
+        assert (parked.webpage_url, parked.title) == (
+            "https://yt.com/v=1",
+            "No Queue Song",
+        )
         assert state[b"play_start_epoch"] == b"500.0"
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == []
@@ -3406,24 +3410,18 @@ class TestSetCurrentSongState:
     async def test_writes_now_playing_fields(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await store.set_current_song_state(
-            _current(
-                "https://yt.com/v=1",
-                "Test Song",
-                duration=210,
-                uploader="Some Channel",
-                requester_id=42,
-            ),
-            1000.5,
+        current = _current(
+            "https://yt.com/v=1",
+            "Test Song",
+            duration=210,
+            uploader="Some Channel",
+            requester_id=42,
         )
+        await store.set_current_song_state(current, 1000.5)
         state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_url"] == b"https://yt.com/v=1"
-        assert state[b"current_song_title"] == b"Test Song"
+        assert await _parked(store, fake_redis) == current
         assert state[b"play_start_epoch"] == b"1000.5"
         assert state[b"total_pause_seconds"] == b"0"
-        assert state[b"current_song_duration"] == b"210"
-        assert state[b"current_song_uploader"] == b"Some Channel"
-        assert state[b"current_song_requester_id"] == b"42"
 
     async def test_does_not_touch_queue(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -3500,7 +3498,7 @@ class TestRebuildQueueAndStartSong:
         assert items == [_entry(2).to_redis(), _entry(3).to_redis()]
         assert await fake_redis.ttl(store.queue_key()) > 0
         state = await fake_redis.hgetall(store.state_key())
-        assert state[b"current_song_url"] == b"https://yt.com/v=1"
+        assert (await _parked(store, fake_redis)).webpage_url == "https://yt.com/v=1"
         assert state[b"play_start_epoch"] == b"1000.5"
 
     async def test_nothing_queued_deletes_the_list(
@@ -3511,7 +3509,7 @@ class TestRebuildQueueAndStartSong:
         await fake_redis.rpush(store.queue_key(), b"stale-head")
         assert await store.rebuild_queue_and_start_song(_current(), [], 1000.0)
         assert await fake_redis.exists(store.queue_key()) == 0
-        assert await fake_redis.hget(store.state_key(), "current_song_url") == b"url"
+        assert (await _parked(store, fake_redis)).webpage_url == "url"
 
     async def test_a_swallowed_failure_reports_that_nothing_landed(
         self, broken_store: GuildRedisStore
@@ -3636,32 +3634,43 @@ class TestPlaybackPosition:
 
 
 class TestClearSongEndState:
-    async def test_clears_current_song_fields(
+    async def test_clears_the_parked_song_in_both_spellings(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
+        """A song a build before 2.56.0 parked is in the hash twice. The prefixed
+        copy has to go with the blob: left behind, it is a finished song a
+        rollback to that build recovers."""
         await fake_redis.hset(
             store.state_key(),
             mapping={
-                b"current_song_url": b"https://yt.com/v=1",
-                b"current_song_title": b"Song",
-                b"current_song_duration": b"210",
-                b"current_song_uploader": b"Some Channel",
-                b"current_song_requester_id": b"42",
-                b"current_song_interjected": b"1",
-                b"current_song_queued_at": b"1752530000.5",
-                b"current_song_queue_position": b"3",
+                "volume": "0.5",
+                "current_song": _current("https://yt.com/v=1").to_redis(),
+                **{field: "1" for field in _RETIRED_SONG_FIELDS},
             },
         )
         await store.clear_song_end_state()
         state = await fake_redis.hgetall(store.state_key())
-        assert b"current_song_url" not in state
-        assert b"current_song_title" not in state
-        assert b"current_song_duration" not in state
-        assert b"current_song_uploader" not in state
-        assert b"current_song_requester_id" not in state
-        assert b"current_song_interjected" not in state
-        assert b"current_song_queued_at" not in state
-        assert b"current_song_queue_position" not in state
+        assert state == {b"volume": b"0.5"}
+
+    def test_the_scrub_list_names_every_field_an_older_build_parked(self) -> None:
+        """Spelled out rather than derived: these are another build's wire names,
+        and one dropped from the list is a field that build's hash keeps for as
+        long as the guild stays active."""
+        assert set(_RETIRED_SONG_FIELDS) == {
+            "current_song_url",
+            "current_song_title",
+            "current_song_duration",
+            "current_song_uploader",
+            "current_song_requester_id",
+            "current_song_interjected",
+            "current_song_is_resume",
+            "current_song_start_paused",
+            "current_song_queued_at",
+            "current_song_queue_position",
+            "current_song_query_source",
+            "current_song_user_input",
+            "current_song_played_at",
+        }
 
     async def test_deletes_now_playing_hash(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

@@ -965,9 +965,9 @@ class MusicPlayer:
 
     async def repark_crashed_head(self) -> bool:
         """Write a crash-recovered queue head back into the state hash it came from;
-        True when something was re-parked. _restore_state clears current_song_* as
-        soon as it re-queues that song, so this player's memory is its only copy.
-        Call AFTER cleanup(): its clear_connection() HDELs these same fields."""
+        True when something was re-parked. _restore_state clears the parked song as
+        soon as it re-queues it, so this player's memory is its only copy.
+        Call AFTER cleanup(): its clear_connection() HDELs that same field."""
         head = self.queue.peek_next()
         if self.store is None or head is None or head.unresolved:
             # An unresolved head has no page to park under: its webpage_url is
