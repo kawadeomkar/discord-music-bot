@@ -1173,8 +1173,7 @@ class TestTheParkedSongBlob:
 
     @staticmethod
     def _current(n: int = 1) -> SongQueueEntry:
-        """A fully populated parked entry: everything the thirteen prefixed
-        fields carry, plus the thumbnail that lives only in the blob."""
+        """A fully populated parked entry, cover included."""
         return SongQueueEntry(
             webpage_url=f"https://yt.com/v={n}",
             title=f"Song {n}",

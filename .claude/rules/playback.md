@@ -133,7 +133,7 @@ code in the repo. Its bookkeeping invariants:
   otherwise).
 - The Redis start write is `pop_queue_and_start_song` (MULTI/EXEC: LPOP + state HSET +
   now_playing HSET) so a crash can never observe the song absent from both the queue and
-  `current_song_url`. Crash-recovered songs use `set_current_song_state` (no LPOP —
+  `current_song`. Crash-recovered songs use `set_current_song_state` (no LPOP —
   they were never on the Redis list; `persisted=False` on the QueueObject encodes this,
   read only via `guild_queue.is_persisted()`).
 - `play_start_epoch` is **backdated by the FFmpeg `-ss` start offset** so recovery math
@@ -484,10 +484,10 @@ takes the same form. The rebuilds are
 invisible to the tests while their song fixtures are bare `MagicMock()` — drive one off
 a real `YTDL` (the `ytdl_instance` fixture takes carried fields as kwargs) or off a
 double wired with `give_queue_object`, so a dropped field fails the suite rather than a
-guild. If it is a DURABLE property of the play rather than of the queue slot, it also
-needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
-`_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song` / `from_crashed_state`**, or a
-crash silently resets it (see `is_resume`/`start_paused`, and `user_input`, which came
+guild. If it is a DURABLE property of the play rather than of the queue slot,
+**`SongQueueEntry.from_song` must carry it too**: the state hash parks that entry whole
+(`docs/ARCHITECTURE.md#the-parked-song`), so a field `from_song` leaves out is one a
+crash silently resets (see `is_resume`/`start_paused`, and `user_input`, which came
 back `None` on the one song that was playing).
 
 **An UNRESOLVED item takes the same checklist**, and nothing more: a collection's tracks

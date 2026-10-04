@@ -2238,6 +2238,27 @@ def started(mock_author: MagicMock) -> QueueObject:
     )
 
 
+async def _park(
+    fake_redis: aioredis.Redis,
+    music_player: MusicPlayer,
+    url: str,
+    title: str,
+    **fields: Any,
+) -> None:
+    """Park a song in the guild's state hash as the start transaction does — what
+    a crash mid-song leaves for _restore_state to find."""
+    assert music_player.store is not None
+    entry = SongQueueEntry(
+        webpage_url=url,
+        title=title,
+        requester_id=fields.pop("requester_id", None),
+        **fields,
+    )
+    await fake_redis.hset(
+        music_player.store.state_key(), b"current_song", entry.to_redis()
+    )
+
+
 def _crashed(
     mock_author: MagicMock,
     *,
@@ -4683,8 +4704,8 @@ class TestEnqueueDepth:
 
         Everything downstream treats user_input as what the user typed:
         `-remove <album link>` matches the tracks the album queued, and
-        SongQueueEntry.from_song parks it in current_song_user_input, so a
-        recovered head stays removable by the collection link."""
+        SongQueueEntry.from_song parks it with the song, so a recovered head
+        stays removable by the collection link."""
         album = "https://open.spotify.com/album/xyz"
         source = unresolved("Artist - Title", user_input=album)
         resolved = QueueObject(
@@ -4858,14 +4879,7 @@ class TestRestoreCrashedSong:
         mock_author: MagicMock,
     ) -> None:
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed Song")
         normal_item = orjson.dumps(
             {
                 "type": "qobj",
@@ -4896,14 +4910,13 @@ class TestRestoreCrashedSong:
         crashed song goes in front of the tails it interrupted, and each tail keeps
         its own absolute position and start."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            mapping={
-                b"current_song_url": b"https://yt.com/v=cut3",
-                b"current_song_title": b"Cut 3",
-                b"current_song_interjected": b"1",
-                b"current_song_played_at": b"1752530300.0",
-            },
+        await _park(
+            fake_redis,
+            music_player,
+            "https://yt.com/v=cut3",
+            "Cut 3",
+            interjected=True,
+            played_at=1752530300.0,
         )
         for n, ts in ((2, 90), (1, 60), (0, 30)):
             await fake_redis.rpush(
@@ -4942,21 +4955,13 @@ class TestRestoreCrashedSong:
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed Song")
         music_player._guild.get_member = MagicMock(return_value=None)
 
         await music_player._restore_state()
 
         state = await fake_redis.hgetall(music_player.store.state_key())
-        assert b"current_song_url" not in state
-        assert b"current_song_title" not in state
+        assert b"current_song" not in state
 
     async def test_crashed_song_restores_duration_and_uploader(
         self,
@@ -4965,19 +4970,13 @@ class TestRestoreCrashedSong:
         mock_author: MagicMock,
     ) -> None:
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_duration", b"240"
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_uploader", b"Test Channel"
+        await _park(
+            fake_redis,
+            music_player,
+            "https://yt.com/v=crash",
+            "Crashed Song",
+            duration=240,
+            uploader="Test Channel",
         )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
@@ -4987,21 +4986,14 @@ class TestRestoreCrashedSong:
         assert queue_object(first).duration == 240
         assert queue_object(first).uploader == "Test Channel"
 
-    async def test_crashed_song_url_cleared_even_when_requester_unresolvable(
+    async def test_parked_song_cleared_even_when_requester_unresolvable(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         """When guild.me and guild.owner are both None, the crashed song cannot be
-        re-queued — but current_song_url must still be cleared to avoid an infinite
+        re-queued — but the parked song must still be cleared to avoid an infinite
         retry loop on every subsequent restart."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Ghost Song"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Ghost Song")
         music_player._guild.get_member = MagicMock(return_value=None)
         mocked(music_player._guild).me = None
         mocked(music_player._guild).owner = None
@@ -5009,8 +5001,7 @@ class TestRestoreCrashedSong:
         await music_player._restore_state()
 
         state = await fake_redis.hgetall(music_player.store.state_key())
-        assert b"current_song_url" not in state
-        assert b"current_song_title" not in state
+        assert b"current_song" not in state
         # Song was not re-queued since requester was unresolvable.
         assert music_player.queue.empty()
 
@@ -5045,21 +5036,15 @@ class TestRestoreCrashedSong:
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """current_song_requester_id (persisted atomically with the song at
+        """The parked requester_id (persisted atomically with the song at
         start-transaction time) resolves to the guild member who requested it."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_requester_id",
-            str(mock_author.id).encode(),
+        await _park(
+            fake_redis,
+            music_player,
+            "https://yt.com/v=crash",
+            "Crashed",
+            requester_id=mock_author.id,
         )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player.bot.wait_until_ready = AsyncMock()
@@ -5076,17 +5061,10 @@ class TestRestoreCrashedSong:
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """State without current_song_requester_id (or a departed member) falls
+        """A parked song with no requester_id (or a departed member) falls
         back to guild.me so the song is still re-queued."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed")
         music_player._guild.get_member = MagicMock(return_value=None)
         bot_member = MagicMock(spec=discord.Member)
         mocked(music_player._guild).me = bot_member
@@ -5108,14 +5086,7 @@ class TestRestoreCrashedSong:
         import time
 
         start = time.time() - 90  # started 90 seconds ago, 10s of pauses
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed")
         await fake_redis.hset(
             music_player.store.state_key(), b"play_start_epoch", str(start).encode()
         )
@@ -5140,14 +5111,7 @@ class TestRestoreCrashedSong:
     ) -> None:
         """When play_start_epoch is absent, ts on the restored QueueObject is None."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed")
         music_player._guild.get_member = MagicMock(return_value=None)
         music_player.bot.wait_until_ready = AsyncMock()
 
@@ -5169,14 +5133,7 @@ class TestRestoreCrashedSong:
 
         play_start = time.time() - 90  # song started 90 s ago
         pause_start = time.time() - 20  # paused 20 s ago (still paused at crash)
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Paused Crash"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Paused Crash")
         await fake_redis.hset(
             music_player.store.state_key(),
             b"play_start_epoch",
@@ -5211,12 +5168,12 @@ class TestRestoreCrashedSong:
         sourcing it there capped or did not depending on how long the restart took.
         """
         assert music_player.store is not None
+        await _park(
+            fake_redis, music_player, "https://yt.com/v=crash", "Crashed", duration=60
+        )
         await fake_redis.hset(
             music_player.store.state_key(),
             mapping={
-                b"current_song_url": b"https://yt.com/v=crash",
-                b"current_song_title": b"Crashed",
-                b"current_song_duration": b"60",
                 b"last_position_secs": b"90",
                 b"last_heartbeat_epoch": b"2000",
                 b"play_start_epoch": b"1000",
@@ -5241,12 +5198,12 @@ class TestRestoreCrashedSong:
         """max(0, 0 - 10) is 0, so treating an unknown duration as a real one would
         restart every livestream from the beginning."""
         assert music_player.store is not None
+        await _park(
+            fake_redis, music_player, "https://yt.com/v=live", "Live", duration=0
+        )
         await fake_redis.hset(
             music_player.store.state_key(),
             mapping={
-                b"current_song_url": b"https://yt.com/v=live",
-                b"current_song_title": b"Live",
-                b"current_song_duration": b"0",
                 b"last_position_secs": b"140",
                 b"last_heartbeat_epoch": b"2000",
                 b"play_start_epoch": b"1000",
@@ -5273,14 +5230,7 @@ class TestRestoreCrashedSong:
         import time
 
         start = time.time() - 90
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed")
         await fake_redis.hset(
             music_player.store.state_key(), b"play_start_epoch", str(start).encode()
         )
@@ -5297,7 +5247,7 @@ class TestRestoreCrashedSong:
         assert first.ts is not None
         assert 80 <= first.ts <= 100  # uncapped ≈90s position survives
         state = await fake_redis.hgetall(music_player.store.state_key())
-        assert b"current_song_url" not in state  # restore completed and cleared
+        assert b"current_song" not in state  # restore completed and cleared
 
 
 # ── RestoreCompleteEvent (loop guard) ─────────────────────────────────────────
@@ -5375,14 +5325,7 @@ class TestRestoreCompleteLoopGuard:
         pop_queue(), yet both real queued songs must survive — pop_queue() must not
         fire for the crashed song's own dequeue."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed Song")
         for i in range(2):
             item = orjson.dumps(
                 {
@@ -5428,14 +5371,7 @@ class TestRestoreCompleteLoopGuard:
         has dequeued it), Redis's queue list must still end up with exactly
         the real queued songs — no phantom entry for the crashed song."""
         assert music_player.store is not None
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed Song")
         for i in range(4):
             item = orjson.dumps(
                 {
@@ -10150,13 +10086,13 @@ class TestLoop:
 
         mocked(music_player._channel.send).assert_awaited()
 
-    async def test_error_path_clears_current_song_url(
+    async def test_error_path_clears_the_parked_song(
         self,
         music_player: MusicPlayer,
         queue_obj: QueueObject,
         fake_redis: aioredis.Redis,
     ) -> None:
-        """When loop() hits an unhandled exception, current_song_url must be cleared so
+        """When loop() hits an unhandled exception, the parked song must be cleared so
         a later process restart does not ghost-replay the failed song."""
         assert music_player.store is not None
         music_player.bot.wait_until_ready = AsyncMock()
@@ -10170,11 +10106,7 @@ class TestLoop:
         mocked(music_player._guild).voice_client = vc
 
         # Seed Redis so a restart would see a crashed song.
-        await fake_redis.hset(
-            music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
-        )
+        await _park(fake_redis, music_player, "https://yt.com/v=crash", "Crashed")
 
         with (
             patch.object(
@@ -10187,8 +10119,7 @@ class TestLoop:
             await music_player.loop()
 
         state = await fake_redis.hgetall(music_player.store.state_key())
-        assert state.get(b"current_song_url", b"") == b""
-        assert state.get(b"current_song_title", b"") == b""
+        assert b"current_song" not in state
 
 
 # ── _restore_complete event ───────────────────────────────────────────────────
@@ -11435,19 +11366,16 @@ class TestLoopAdditional:
             except StopIteration:
                 return await real_pop(*args, **kwargs)
 
-        parked: list[bytes] = []
+        parked: list[str] = []
 
         async def _rebuild(*args: Any, **kwargs: Any) -> bool:
             held.append(music_player.queue._mutex.locked())
             ok = await real_rebuild(*args, **kwargs)
             # Read here: the song "ends" at once under the driver, and song end
-            # clears the current_song_* fields.
-            parked.append(
-                cast(
-                    bytes,
-                    await fake_redis.hget(store.state_key(), "current_song_url"),
-                )
-            )
+            # clears the parked song.
+            state = await store.get_guild_state()
+            assert state is not None and state.current_song is not None
+            parked.append(state.current_song.webpage_url)
             return ok
 
         await _drive_one_start(
@@ -11466,7 +11394,7 @@ class TestLoopAdditional:
         mirror = cast(list[bytes], await fake_redis.lrange(key, 0, -1))
         assert len(mirror) == 1
         assert b"v=third" in mirror[0]
-        assert parked == [live_song.webpage_url.encode()]
+        assert parked == [live_song.webpage_url]
 
     async def test_a_stale_mirror_with_nothing_queued_is_deleted_at_the_next_start(
         self,

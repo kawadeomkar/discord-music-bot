@@ -17,6 +17,23 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.0 — 2026-10-04
+
+**The playing song is parked in Redis once.** Nothing changes in chat. Since 2.53.3 the
+state hash `guild:{id}:state` has held the playing song twice: whole, under
+`current_song`, and again as thirteen `current_song_*` fields kept for the builds before
+it. This release stops writing the thirteen and reads `current_song` alone.
+
+- **Deploy from 2.53.3 or later, and a song playing across the deploy resumes where it
+  was.** Those builds already write the entry this one reads. Coming straight from an
+  older build, the song playing at that moment is not resumed; the queue behind it is.
+- **Rolling back costs the song that is playing.** Every earlier build looks for the
+  thirteen fields first and finds none, so a rollback made mid-song picks up at the next
+  song in the queue instead of resuming. Nothing else is lost, and a rollback made while
+  nothing is playing loses nothing.
+- **The old fields clear themselves.** A state hash an earlier build wrote loses its
+  thirteen fields the next time a song starts or ends in that server. Nothing to do.
+
 ## 2.55.0 — 2026-10-02
 
 **Spotify links now play the album recording, not the music video.** A Spotify track

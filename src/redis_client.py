@@ -97,28 +97,33 @@ HISTORY_CACHE_LIMIT = 50
 # first few spell out the shape without the line growing with the queue.
 _CORRUPT_REASON_SAMPLE = 3
 
+# LEGACY: the parked song as a build before 2.56.0 spells it. Nothing here reads
+# or writes these (hence the bare literals); they are HDELed wherever the blob is
+# written or cleared, so a hash such a build parked a song in cannot hand that
+# song to a rollback after it ended. Drop one release on, given the 24h TTL.
+_RETIRED_SONG_FIELDS = (
+    "current_song_url",
+    "current_song_title",
+    "current_song_duration",
+    "current_song_uploader",
+    "current_song_requester_id",
+    "current_song_interjected",
+    "current_song_is_resume",
+    "current_song_start_paused",
+    "current_song_queued_at",
+    "current_song_queue_position",
+    "current_song_query_source",
+    "current_song_user_input",
+    "current_song_played_at",
+)
+
 # Transient per-song fields and the playback-position fields, cleared together
 # on song end / disconnect (clear_song_end_state, clear_connection). An older
 # image's copy of this tuple cannot name fields added since, so after `just up
 # <older-sha>` from_crashed_state can read a value from a song that finished
 # under the old build; rewritten on every song start, so the exposure is one
 # restore read.
-_TRANSIENT_SONG_FIELDS = (
-    StateField.CURRENT_SONG_URL,
-    StateField.CURRENT_SONG_TITLE,
-    StateField.CURRENT_SONG_DURATION,
-    StateField.CURRENT_SONG_UPLOADER,
-    StateField.CURRENT_SONG_REQUESTER_ID,
-    StateField.CURRENT_SONG_INTERJECTED,
-    StateField.CURRENT_SONG_IS_RESUME,
-    StateField.CURRENT_SONG_START_PAUSED,
-    StateField.CURRENT_SONG_QUEUED_AT,
-    StateField.CURRENT_SONG_QUEUE_POSITION,
-    StateField.CURRENT_SONG_QUERY_SOURCE,
-    StateField.CURRENT_SONG_USER_INPUT,
-    StateField.CURRENT_SONG,
-    StateField.CURRENT_SONG_PLAYED_AT,
-)
+_TRANSIENT_SONG_FIELDS = (StateField.CURRENT_SONG, *_RETIRED_SONG_FIELDS)
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
     StateField.TOTAL_PAUSE_SECONDS,
@@ -903,32 +908,11 @@ class GuildRedisStore:
         play_start_epoch: float,
         start_offset: float = 0.0,
     ) -> dict[str, str]:
-        """The parked queue entry, written as one blob and as the prefixed fields
-        a build before it reads. One signature, so the identity
-        SongQueueEntry.from_song()/from_crashed_state() rely on cannot drift."""
+        """The parked queue entry, whole, and the position seeded beside it. One
+        signature, so the identity SongQueueEntry.from_song()/from_crashed_state()
+        rely on cannot drift."""
         return {
-            StateField.CURRENT_SONG_URL: current.webpage_url,
-            StateField.CURRENT_SONG_TITLE: current.title,
-            StateField.CURRENT_SONG_DURATION: (
-                str(current.duration) if current.duration else ""
-            ),
-            StateField.CURRENT_SONG_UPLOADER: current.uploader or "",
-            StateField.CURRENT_SONG_REQUESTER_ID: (
-                str(current.requester_id) if current.requester_id else ""
-            ),
-            StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
-            StateField.CURRENT_SONG_IS_RESUME: ("1" if current.is_resume else ""),
-            StateField.CURRENT_SONG_START_PAUSED: ("1" if current.start_paused else ""),
-            StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
-            StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
-            StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
-            StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
-            # The whole entry, beside the prefixed copies above: one release of
-            # dual writes, so a rollback still recovers from the fields it knows.
-            # A reader takes only thumbnail and the np_* ids from the blob, and
-            # only when CURRENT_SONG_URL and CURRENT_SONG_PLAYED_AT match its own.
             StateField.CURRENT_SONG: current.to_redis().decode(),
-            StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
             # Seeded so a position exists before the first tick: a crash inside
@@ -953,7 +937,7 @@ class GuildRedisStore:
         )
         pipe = self.redis.pipeline(transaction=True)
         pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
-        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
+        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH, *_RETIRED_SONG_FIELDS)
         pipe.expire(self.state_key(), GUILD_TTL)
         if now_playing is not None:
             pipe.hset(
@@ -1226,7 +1210,7 @@ class GuildRedisStore:
 
     @_guild_op(default=None)
     async def clear_song_end_state(self) -> None:
-        """HDEL every current_song_*/position field and DELETE the now_playing
+        """HDEL the parked song and every position field and DELETE the now_playing
         hash in one round-trip, so *absent* is the one representation of "no
         song" (as in clear_connection)."""
         pipe = self.redis.pipeline()

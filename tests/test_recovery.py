@@ -63,7 +63,7 @@ class TestEagerRestore:
 
         store = GuildRedisStore(fake_redis_bot, mock_guild.id)
         await store.set_connection(888000000000000001, 888000000000000002)
-        # No queue items, no current_song_url in state
+        # No queue items, no parked song in state
 
         await restore_guild(music_bot_with_redis, mock_guild)
         assert mock_guild.id not in music_bot_with_redis.mps

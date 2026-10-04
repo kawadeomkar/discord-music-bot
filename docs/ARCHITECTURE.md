@@ -1179,7 +1179,7 @@ sequenceDiagram
     MP->>Redis: get_playback_snapshot() — one round-trip for state +<br/>queue + now_playing + history
     MP->>MP: GuildSettings.seed(snapshot.config) → restore volume/timezone<br/>(only accepted fields; a legacy volume migrates via a SEED write)
     MP->>MP: crashed song → SongQueueEntry.from_crashed_state()<br/>→ queue.restore_crashed() (persisted=False)
-    MP->>Redis: clear current_song_url immediately (at-most-once)
+    MP->>Redis: clear current_song immediately (at-most-once)
     MP->>MP: queue.restore_entries(pending) + history.restore()
     MP->>Redis: refresh_ttl()
     MP->>MP: _restore_complete.set() → loop() may dequeue
@@ -1190,56 +1190,52 @@ sequenceDiagram
 Key properties:
 
 - **Lightweight gate**: `get_recovery_gate()` reads only the state hash and the queue **length** (LLEN). A `-stop`ped guild keeps its (possibly long) queue list, so gating on LLEN keeps that payload off the wire on every `on_ready`. The full payload is read once by `_restore_state` after a successful connect.
-- **At-most-once crashed song**: `current_song_url` is written when a song starts and cleared on normal end. On recovery the crashed song is rebuilt, injected in-memory only (`persisted=False` — it was never on the Redis queue list), and `current_song_url` is cleared immediately, even when the requester is unresolvable.
+- **At-most-once crashed song**: `current_song` is written when a song starts and cleared on normal end. On recovery the crashed song is rebuilt, injected in-memory only (`persisted=False` — it was never on the Redis queue list), and `current_song` is cleared immediately, even when the requester is unresolvable.
 - **Failure isolation**: a failed snapshot read aborts the whole restore rather than fabricating partial state; the lock's 60 s TTL auto-expires if the holder crashes, and release compare-and-deletes so an expired holder cannot delete its successor's lock.
 - **Intentional stop vs crash**: `cleanup()` calls `clear_connection()`, which empties the channel-ID fields — `on_ready` then skips that guild.
 
 #### The parked song
 
 `guild:{id}:state` holds the song that is playing as **one `SongQueueEntry` blob** under
-`current_song` — the shape its queue entry had before the start transaction LPOPed it. The
-thirteen `current_song_*` fields that used to carry it are **dual-written beside it for one
-release**, the pattern `volume` and the wall-clock position fields already used, and then
-they go.
+`current_song` — the shape its queue entry had before the start transaction LPOPed it —
+and that blob is the whole record. `GuildStateData.current_song` is the one attribute
+readers use, built by `_parked_song`:
 
-`GuildStateData.current_song` is the one attribute readers use, built by `_parked_song`:
-
-- **The prefixed fields win on everything they carry; a matching blob adds the rest.**
-  Every build writes the thirteen for the fragment playing now, so a blob whose
-  `webpage_url` AND `played_at` both match them is overlaid with all thirteen and
-  contributes only what they never carried: the `thumbnail` and the `np_*` card ids. A blob
-  failing either test describes another song or an earlier play — it is ignored with a
-  warning and the fields answer alone. An older build HDELs only the fields it knows, so a
-  blob written before a rollback survives every song that build then plays, and read
-  unguarded it re-queues a song whose list entry was LPOPed releases ago and loses the real
-  one. The gate cannot settle a fragment against its own resume tail — one play, so they
-  agree on both — which is why the overlay, not the match, is what keeps the other
-  fragment's flags off this one.
-- **With no blob the prefixed fields are the whole entry**, so a hash written before this
-  build, or by an older one during a rollback, recovers exactly as it did.
-- **No url, no parked song**: `current_song is None`, and `has_crashed_song` reads that.
-- **The dual write takes the state hash from ~700 B to ~2.1 KB while a song plays, and
-  the `hashtable` it forces never comes back.** `OBJECT ENCODING` and
-  `MEMORY USAGE … SAMPLES 0` on `redis:7-alpine` at the default
-  `hash-max-listpack-value=64`, over `TestTheParkedSongBlob`'s fully populated entry (a
-  430 B blob): 104 B `listpack` idle → 2,152 B `hashtable` at play → 512 B once
-  `clear_song_end_state` HDELs it — still a `hashtable`, so ~400 B over idle outlives
-  every song, and the shrink Redis does lazily takes it no lower than 256 B. The blob is
-  what promotes the encoding — the thirteen prefixed fields alone leave that entry a
-  696 B `listpack` — so on a hash they had already promoted (any title or `user_input`
-  past 64 B, which every Spotify `?si=` link is) the blob adds ~680 B instead. Never
-  predict this arithmetically, and always ask for `SAMPLES 0`: by default `MEMORY USAGE`
-  estimates a `hashtable` from five sampled fields, which moved the at-play figure
-  between 1,680 B and 3,472 B over five runs of the same test. See the stream-entry note
-  below, and `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the
-  missing demotion and prints these sizes under `just test-redis -s`.
+- **The blob is the parked song.** Present and readable, it is the entry; absent,
+  `current_song is None` and `has_crashed_song` reads that. One that does not read is no
+  parked song either: that song is not recovered, the rest of the hash still is, and the
+  warning names the guild.
+- **Thirteen `current_song_*` fields are scrubbed, and neither read nor written.** Builds
+  from 2.53.3 through 2.55.0 spelled the song a second time under them, and builds before
+  2.53.3 spelled it only there (`_RETIRED_SONG_FIELDS`). Every start transaction and both
+  clear paths HDEL them beside the blob. Left behind in a hash one of those builds parked
+  a song in, they outlive that song, and a rollback to such a build recovers it in place
+  of whatever is playing.
+- **A rollback past 2.56.0 does not resume the playing song.** Every earlier build reads
+  `current_song_url` first and takes its absence for nothing parked, so the song playing
+  when the rollback restarts the bot is dropped and the queue behind it plays on. The
+  hash keeps the blob until that build starts its next song over it.
+- **The floor for an upgrade is 2.53.3.** A build before it neither writes the blob nor
+  clears one: coming straight from it, the song playing across the deploy is not resumed,
+  and a blob it inherited from an earlier run of a newer build is read as the parked song.
+- **The blob promotes the state hash to `hashtable`, and the encoding never comes back.**
+  A parked entry is longer than `hash-max-listpack-value` (64 by default; the fully
+  populated entry `TestTheParkedSongBlob` parks is a 430 B blob), so the first song start
+  converts a hash that idles as a 104 B `listpack` on `redis:7-alpine`, and
+  `clear_song_end_state` HDELing the blob does not convert it back: a guild that has ever
+  played keeps a `hashtable` until the key expires. Never predict the sizes
+  arithmetically, and always ask for `MEMORY USAGE … SAMPLES 0`: by default it estimates
+  a `hashtable` from five sampled fields, which moved one at-play figure between 1,680 B
+  and 3,472 B over five runs of the same test. See the stream-entry note below, and
+  `TestTheParkedSongBlob` in the redis tier, which pins the promotion and the missing
+  demotion and prints the idle, at-play and ended sizes under `just test-redis -s`.
 
 `from_crashed_state` is then `replace(state.current_song, ts=position, persisted=False)` —
 the entry, at the resume offset, with the LPOP already committed. `ts` is set there
 unconditionally, so a blob's own offset never reaches playback; the recovered position
-does. What the blob adds over the fields is what they never carried: the `thumbnail`, so a
-recovered head's queue row has a cover again, and the card's ids. The ids reach two
-places a crash-recovered head never reached before — `_dispose_previous_np_card`, which deletes a card by them, and
+does. The entry carries the `thumbnail`, so a recovered head's queue row keeps its cover,
+and the card's ids, which reach two places: `_dispose_previous_np_card`, which deletes a
+card by them, and
 `play_history.message_id`/`channel_id` when `_flush_played` archives a head a removal
 destroys. The delete is gated on the card's `dedicated` and a same-guild channel, and the card it
 names was already gone when the tail started, so it is a wasted DELETE at worst.
@@ -1307,7 +1303,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|
-| `guild:{id}:state` | Hash | 22 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song` (the parked `SongQueueEntry` whole — [The parked song](#the-parked-song)) beside the thirteen prefixed copies an older build reads, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_user_input/_played_at`, then `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
+| `guild:{id}:state` | Hash | 9 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song` (the parked `SongQueueEntry` whole — [The parked song](#the-parked-song)), `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`, and `ytsearch` only while the item has not resolved). An entry whose `"type"` is not `"qobj"`, or missing `webpage_url`, `title` or `requester_id`, is dropped as corrupt. RPUSH on enqueue (LPUSH to the front for interjection resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
@@ -3165,7 +3161,7 @@ Every persisted byte is defined in `guild_state.py` as frozen value objects with
 
 ### At-most-once delivery for crash recovery
 
-`current_song_url` is written when a song begins and deleted when it ends normally; a non-empty value at startup means a mid-song crash. Recovery re-enqueues the song in-memory only (`persisted=False` — it never touches the Redis list, and `redis_pop_for()` skips it) and clears the key immediately, so repeated crash-restart cycles cannot accumulate duplicates. The start transaction (`pop_queue_and_start_song`) makes the LPOP and the state write atomic, closing the historical at-most-once window for normal dequeues too.
+`current_song` is written when a song begins and deleted when it ends normally; one present at startup means a mid-song crash. Recovery re-enqueues the song in-memory only (`persisted=False` — it never touches the Redis list, and `redis_pop_for()` skips it) and clears the field immediately, so repeated crash-restart cycles cannot accumulate duplicates. The start transaction (`pop_queue_and_start_song`) makes the LPOP and the state write atomic, closing the historical at-most-once window for normal dequeues too.
 
 ### `-play --now` interjection via front-inserted resume entries
 
