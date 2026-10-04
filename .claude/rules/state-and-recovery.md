@@ -34,7 +34,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 
 | Key | Type | TTL | Contents |
 |---|---|---|---|
-| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song` (the parked queue entry as one blob, with the thirteen `current_song_*` fields dual-written beside it for one release — the prefixed fields win on everything they carry and the blob adds `thumbnail` and the np_* ids, only when its url and start epoch match `current_song_url`/`current_song_played_at`, see `docs/ARCHITECTURE.md#the-parked-song`), `last_position_secs` + `last_heartbeat_epoch` (the recorded playback position — what recovery reads), and the legacy `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` it replaced, **dual-written for one release** so a rollback still recovers. Still *parses* a legacy `volume` field — see `:config` |
+| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song` (the parked queue entry as one blob, the whole record of the playing song; the thirteen `current_song_*` fields builds through 2.55.0 wrote are HDELed with it and never read — see `docs/ARCHITECTURE.md#the-parked-song`), `last_position_secs` + `last_heartbeat_epoch` (the recorded playback position — what recovery reads), and the legacy `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` it replaced, **dual-written for one release** so a rollback still recovers. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h, re-armed by every queue write and every song start | JSON `"qobj"` entries (SongQueueEntry, carrying `ytsearch` only while the item has not resolved); one whose `"type"` is not `"qobj"`, or missing `webpage_url`, `title` or `requester_id`, is dropped as corrupt. Each carries `user_input`, what the user typed, the requester (`requester_id`), and the display fields a listing shows until the track resolves (`title`, `uploader`, `duration`, `webpage_url`). For a collection track `user_input` is the ONLY surviving record of the collection link, since its `ytsearch` is a generated title. Mirror writes all go through `GuildQueue._write_mirror` — rebuild, DELETE, or LREM |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
@@ -123,7 +123,7 @@ on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is
                 settings write that committed after the read began keeps its value
               • crashed song: crashed_position_at() returns the RECORDED
                 last_position_secs (no clock read), capped at the snapshot's own
-                current_song_duration − 10s (EOF guard, no IO), rebuilt via
+                parked duration − 10s (EOF guard, no IO), rebuilt via
                 SongQueueEntry.from_crashed_state (persisted=False, interjected flag
                 preserved) → queue.restore_crashed at the FRONT; state cleared
                 unconditionally so a failed re-queue can't loop every restart
@@ -139,13 +139,11 @@ on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is
 
 The closed loop that makes this work: `SongQueueEntry.from_song → HSET state (start
 transaction) → crash → from_crashed_state → re-queue`. The state hash holds that entry as
-one blob (`current_song`), with the prefixed fields dual-written for a release;
-`_now_playing_state_mapping` is the single signature enforcing the identity, and
-`_parked_song` is the single reader — those fields, overlaid onto a blob that matches
-them on url and start epoch for the `thumbnail` and np_* ids they never carried.
+one blob (`current_song`) and nowhere else; `_now_playing_state_mapping` is the single
+signature enforcing the identity, and `_parked_song` is the single reader.
 
 **Clearing that state hands the only copy to memory**, which is why
-`MusicPlayer.repark_crashed_head()` exists. `_restore_state` HDELs `current_song_*` the
+`MusicPlayer.repark_crashed_head()` exists. `_restore_state` HDELs `current_song` the
 moment it re-queues the song (unconditionally — a re-queue that failed must not re-enter
 that block every restart), so from then until the song plays, the player's queue is the
 only place it exists. Any teardown before that loses it silently: no error, no log line,
