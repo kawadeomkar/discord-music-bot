@@ -94,7 +94,12 @@ plus the traps that make a green run mean nothing if they are broken.
   ebur128 prints. One more reads the bitstream a raised `-b:a` actually produces, which
   is the only place `_encode_bitrate_kbps`' number is checked against libopus rather
   than against an argv. Those last ones run ffmpeg directly rather than through
-  discord.py, because what is under test is the filter. Needs ffmpeg on PATH, not
+  discord.py, because what is under test is the filter. And it pins the ranged
+  loudness scan's seam, which the unit tests fake on both sides: real aiohttp ranges
+  into a real ffmpeg's stdin, a range that dies resumed with every byte delivered
+  once (read off the server — ffmpeg resyncs past a duplicated stretch of this
+  sample and measures it the same), and ranges that keep dying yielding no level
+  although ffmpeg exits 0 with a summary. Needs ffmpeg on PATH, not
   Docker: only the runtime stage installs it, so this cannot run in the container
   tier. No network, and the sample is synthesised per session.
 - **The `redis` tier** (`tests/test_redis_integration.py`, marker `redis`) is the same

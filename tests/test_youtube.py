@@ -7063,6 +7063,353 @@ class TestMeasureLoudness:
             assert await measure_loudness("https://cdn/a", self._URL, None) is None
 
 
+def _googlevideo(clen: object, host: str = "rr1---sn-abc.googlevideo.com") -> str:
+    return f"https://{host}/videoplayback?expire=1&itag=251&clen={clen}&sig=SECRET"
+
+
+class _RangeServer:
+    """What `_feed_ranges` sees of a session: `get()` answering each request from a
+    script, and the Range header every request carried. A script entry is a status,
+    or `("dies", n)` for a 206 whose connection dies n bytes in."""
+
+    def __init__(self, payload: bytes, script: Optional[list[Any]] = None) -> None:
+        self.payload = payload
+        self.script = list(script or [])
+        self.asked: list[tuple[int, int]] = []
+
+    def get(self, _url: object, *, headers: dict[str, str], **_kwargs: Any) -> Any:
+        first, last = (
+            int(n) for n in headers["Range"].removeprefix("bytes=").split("-")
+        )
+        self.asked.append((first, last))
+        step = self.script.pop(0) if self.script else 206
+        body = self.payload[first : last + 1]
+
+        async def chunks() -> Any:
+            if step == 206:
+                # Two chunks, so a cursor that counts requests rather than bytes
+                # shows up as a wrong Range.
+                yield body[: len(body) // 2]
+                yield body[len(body) // 2 :]
+                return
+            yield body[: step[1]]
+            raise aiohttp.ClientPayloadError("connection died")
+
+        response = MagicMock()
+        response.status = step if isinstance(step, int) else 206
+        response.content.iter_any = chunks
+        entered = MagicMock()
+        entered.__aenter__ = AsyncMock(return_value=response)
+        entered.__aexit__ = AsyncMock(return_value=False)
+        return entered
+
+
+class _Stdin:
+    """The scan's stdin: what was written to it, and whether it was closed."""
+
+    def __init__(self) -> None:
+        self.written = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        assert not self.closed
+        self.written += data
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestRangedScanSize:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Another host's `clen` says nothing about how it serves a range.
+            "https://cdn.example.com/a.webm?clen=99999999",
+            "https://googlevideo.com.example.net/videoplayback?clen=99999999",
+            "https://notgooglevideo.com/videoplayback?clen=99999999",
+            # The muxed rung's HLS manifest: a path, and no size.
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/x.m3u8",
+            "https://rr1---sn-abc.googlevideo.com/videoplayback?itag=251",
+            "https://rr1---sn-abc.googlevideo.com/videoplayback?clen=lots",
+            "not a url",
+        ],
+    )
+    def test_only_a_sized_googlevideo_file_has_one(self, url: str) -> None:
+        assert youtube._ranged_scan_size(url) is None
+
+    def test_it_is_the_clen(self) -> None:
+        assert youtube._ranged_scan_size(_googlevideo(16_216_875)) == 16_216_875
+
+
+class TestFeedRanges:
+    """googlevideo serves one request for more than 10 MB at about twice realtime,
+    which no scan timeout covers; asked for in ranges of that size it is served at
+    full speed. See docs/ARCHITECTURE.md#loudness-normalization."""
+
+    _RANGE = 1000
+    _URL = _googlevideo(0)
+
+    @pytest.fixture(autouse=True)
+    def _small_ranges(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(youtube, "_SCAN_RANGE_BYTES", self._RANGE)
+
+    async def _feed(self, server: _RangeServer) -> _Stdin:
+        stdin = _Stdin()
+        with patch("src.youtube._get_probe_session", return_value=server):
+            try:
+                await youtube._feed_ranges(
+                    self._URL, len(server.payload), cast(Any, stdin)
+                )
+            finally:
+                self.stdin = stdin
+        return stdin
+
+    @pytest.mark.parametrize("size", [1, 999, 1000, 1001, 2000, 2005, 6437])
+    async def test_the_ranges_cover_every_byte_once(self, size: int) -> None:
+        payload = bytes(n % 251 for n in range(size))
+        server = _RangeServer(payload)
+
+        stdin = await self._feed(server)
+
+        assert bytes(stdin.written) == payload
+        assert stdin.closed
+        assert server.asked[0][0] == 0
+        assert server.asked[-1][1] == size - 1
+        for (_, last), (first, _) in zip(server.asked, server.asked[1:]):
+            assert first == last + 1
+        assert all(last - first < self._RANGE for first, last in server.asked)
+
+    async def test_a_dead_connection_resumes_at_the_byte_it_reached(self) -> None:
+        payload = bytes(n % 251 for n in range(2500))
+        # The second range delivers 300 of its 1000 bytes and dies.
+        server = _RangeServer(payload, [206, ("dies", 300)])
+
+        stdin = await self._feed(server)
+
+        assert bytes(stdin.written) == payload
+        assert server.asked == [(0, 999), (1000, 1999), (1300, 2299), (2300, 2499)]
+
+    async def test_a_5xx_is_retried(self) -> None:
+        payload = bytes(1500)
+        server = _RangeServer(payload, [503, 206, 503])
+
+        stdin = await self._feed(server)
+
+        assert bytes(stdin.written) == payload
+        assert server.asked == [(0, 999), (0, 999), (1000, 1499), (1000, 1499)]
+
+    async def test_it_gives_up_after_the_retries(self) -> None:
+        server = _RangeServer(bytes(5000), [("dies", 0)] * 50)
+
+        with pytest.raises(aiohttp.ClientPayloadError):
+            await self._feed(server)
+
+        assert len(server.asked) == youtube._SCAN_FETCH_RETRIES + 1
+        assert self.stdin.closed
+
+    @pytest.mark.parametrize("status", [403, 404, 429, 200])
+    async def test_any_other_answer_ends_the_scan_at_once(self, status: int) -> None:
+        """A 403 is a revoked URL and asking again does not un-revoke it. A 200 is
+        a server that ignored the Range and sent the whole file from byte 0."""
+        server = _RangeServer(bytes(5000), [206, status])
+
+        with pytest.raises(aiohttp.ClientResponseError) as raised:
+            await self._feed(server)
+
+        assert raised.value.status == status
+        assert len(server.asked) == 2
+        assert self.stdin.closed
+        assert len(self.stdin.written) == self._RANGE
+
+
+class TestMeasureLoudnessInRanges:
+    """The half of a ranged scan that is measure_loudness's: which songs take it,
+    what ffmpeg is asked to read, and what a failed feed costs."""
+
+    _PAGE = "https://yt.com/watch?v=long"
+    _LONG = _googlevideo(youtube._SCAN_RANGE_BYTES + 1)
+
+    @staticmethod
+    def _child(
+        argv: list[Any], kwargs: dict[str, Any], *, hangs: bool = False
+    ) -> tuple[MagicMock, Callable[..., Awaitable[Any]]]:
+        """The ffmpeg child of a ranged scan: its stderr reaches EOF once stdin is
+        closed, the way the real one finishes when its input does."""
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = _Stdin()
+
+        async def read() -> bytes:
+            while hangs or not process.stdin.closed:
+                await asyncio.sleep(0)
+            return TestEbur128Summary._CAPTURED.encode()
+
+        async def wait() -> int:
+            process.returncode = 0
+            return 0
+
+        process.stderr.read = read
+        process.wait = wait
+        process.kill = MagicMock(side_effect=lambda: setattr(process, "returncode", -9))
+
+        async def spawn(*args: Any, **kw: Any) -> MagicMock:
+            argv.extend(args)
+            kwargs.update(kw)
+            return process
+
+        return process, spawn
+
+    @staticmethod
+    def _feeds(payload: bytes = b"audio") -> Any:
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            stdin.write(payload)
+            stdin.close()
+
+        return feed
+
+    async def test_a_song_over_the_range_is_piped_in(self, fake_redis: Any) -> None:
+        argv: list[Any] = []
+        kwargs: dict[str, Any] = {}
+        process, spawn = self._child(argv, kwargs)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=self._feeds(b"the song")),
+        ):
+            measured = await measure_loudness(self._LONG, self._PAGE, fake_redis)
+
+        assert measured == Loudness(i=-19.7, peak=-3.8)
+        assert argv[argv.index("-i") + 1] == "pipe:0"
+        assert self._LONG not in argv
+        assert kwargs["stdin"] == asyncio.subprocess.PIPE
+        assert bytes(process.stdin.written) == b"the song"
+        process.kill.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            _googlevideo(youtube._SCAN_RANGE_BYTES),
+            _googlevideo(1),
+            "https://cdn.example.com/a.webm?clen=99999999",
+        ],
+    )
+    async def test_any_other_song_is_ffmpegs_own_request(self, url: str) -> None:
+        argv: list[str] = []
+        kwargs: dict[str, Any] = {}
+
+        async def spawn(*args: Any, **kw: Any) -> MagicMock:
+            argv.extend(args)
+            kwargs.update(kw)
+            return await TestMeasureLoudness._child(
+                stderr=TestEbur128Summary._CAPTURED.encode()
+            )[1]()
+
+        async def refuse(*_args: Any) -> None:
+            raise AssertionError("fetched a song ffmpeg reads at full speed itself")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=refuse),
+        ):
+            assert await measure_loudness(url, self._PAGE, None) is not None
+
+        assert argv[argv.index("-i") + 1] == url
+        assert "-reconnect_on_http_error" in argv
+        assert kwargs["stdin"] is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientResponseError(
+                aiohttp.RequestInfo(
+                    URL(_googlevideo(1)), "GET", cast(Any, {}), URL(_googlevideo(1))
+                ),
+                (),
+                status=403,
+            ),
+            aiohttp.ClientPayloadError("connection died"),
+            youtube.ProbeSessionClosed("closed"),
+            BrokenPipeError(32, "Broken pipe"),
+        ],
+        ids=["refused", "dead", "shutdown", "ffmpeg-gone"],
+    )
+    async def test_a_feed_that_failed_is_not_a_level(
+        self, fake_redis: Any, error: Exception, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """ffmpeg still prints a summary, of the audio that reached it."""
+        process, spawn = self._child([], {})
+
+        async def feed(_url: str, _size: int, stdin: _Stdin) -> None:
+            stdin.write(b"half a song")
+            stdin.close()
+            raise error
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+            caplog.at_level(logging.WARNING),
+        ):
+            assert await measure_loudness(self._LONG, self._PAGE, fake_redis) is None
+
+        key = _loudness_cache_key(self._PAGE)
+        assert orjson.loads(await fake_redis.get(key)) == {"unmeasured": True}
+        process.kill.assert_called_once()
+        assert "SECRET" not in caplog.text
+
+    async def test_a_failed_feed_does_not_leave_the_reader_running(self) -> None:
+        """The child is killed after the scan gives up, and a reader still waiting
+        on its stderr then would be a task nothing holds."""
+        process, spawn = self._child([], {}, hangs=True)
+
+        async def feed(*_args: Any) -> None:
+            raise aiohttp.ClientPayloadError("connection died")
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=feed),
+        ):
+            assert await measure_loudness(self._LONG, self._PAGE, None) is None
+
+        process.kill.assert_called_once()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    async def test_a_timeout_kills_the_child_and_stops_reading_it(self) -> None:
+        process, spawn = self._child([], {}, hangs=True)
+        config.loudness_scan_timeout_secs.set_override(
+            config.loudness_scan_timeout_secs.floor
+        )
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=self._feeds()),
+        ):
+            measured = await asyncio.wait_for(
+                measure_loudness(self._LONG, self._PAGE, None), 5
+            )
+
+        assert measured is None
+        process.kill.assert_called_once()
+        await settle()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    async def test_a_cancellation_propagates_and_the_child_is_dead(self) -> None:
+        process, spawn = self._child([], {}, hangs=True)
+        with (
+            patch("asyncio.create_subprocess_exec", new=spawn),
+            patch("src.youtube._feed_ranges", new=self._feeds()),
+        ):
+            task = asyncio.ensure_future(measure_loudness(self._LONG, self._PAGE, None))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        process.kill.assert_called_once()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+
 class TestYtStreamLoudness:
     """What the mode does to one song's argv, end to end."""
 

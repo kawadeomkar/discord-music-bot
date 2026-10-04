@@ -54,6 +54,7 @@ import array
 import contextlib
 import http.server
 import math
+import re
 import socketserver
 import subprocess
 import threading
@@ -65,8 +66,10 @@ from typing import Any, Optional
 import discord
 import pytest
 
+from src import youtube
 from src.youtube import (
     YTDL,
+    Loudness,
     _ENCODE_BITRATE_CAP_KBPS,
     _OGG_HEADER_PACKETS,
     _PEAK_LIMITER,
@@ -124,6 +127,8 @@ class _FailingHandler(http.server.BaseHTTPRequestHandler):
     mode: str = "ok"
     seen_range: Optional[str] = None
     gets: int = 0
+    # (first byte, bytes delivered) of every bounded range served, in order.
+    served: list[tuple[int, int]] = []
 
     def log_message(self, *_args: Any) -> None:  # noqa: D102 - quiet under pytest
         pass
@@ -153,6 +158,23 @@ class _FailingHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload[start:])
 
+    def _serve_bounded(self, first: int, last: int) -> None:
+        """One request of a ranged scan: that slice as a 206, or half of it and a
+        dead connection."""
+        mode = type(self).mode
+        payload = type(self).payload
+        body = payload[first : last + 1]
+        self.send_response(206)
+        self.send_header("Content-Range", f"bytes {first}-{last}/{len(payload)}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if mode == "ranges_die" or (mode == "range_dies_once" and type(self).gets == 2):
+            body = body[: len(body) // 2]
+            self.close_connection = True
+        type(self).served.append((first, len(body)))
+        self.wfile.write(body)
+        self.wfile.flush()
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
         type(self).seen_range = self.headers.get("Range")
         type(self).gets += 1
@@ -161,6 +183,12 @@ class _FailingHandler(http.server.BaseHTTPRequestHandler):
             # A revoked URL: what YouTube returns once the signature expires.
             self.send_response(403)
             self.end_headers()
+            return
+        # ffmpeg only ever asks open-ended (`bytes=N-`); a bounded range is the
+        # scan's own fetch.
+        bounded = re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers.get("Range") or "")
+        if bounded:
+            self._serve_bounded(int(bounded[1]), int(bounded[2]))
             return
         if mode == "dead_then_503_then_ok":
             # A transient CDN failure, and the shape the reconnect flag exists for:
@@ -211,6 +239,7 @@ def server(opus_sample: bytes) -> Iterator[type[_FailingHandler]]:
     _FailingHandler.mode = "ok"
     _FailingHandler.seen_range = None
     _FailingHandler.gets = 0
+    _FailingHandler.served = []
     with socketserver.TCPServer(("127.0.0.1", 0), _FailingHandler) as srv:
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
@@ -573,6 +602,88 @@ class TestMeasureLoudnessReadsTheRealBinary:
         precondition for one."""
         server.mode = "refused"
         assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # pyright: ignore[reportAttributeAccessIssue]
+
+
+class TestALongSongIsScannedInRanges:
+    """A googlevideo file over 10 MB is fetched by the bot in ranges and piped to
+    ffmpeg, because ffmpeg's single request for it is throttled past any scan
+    timeout. What is under test is the seam the unit tests fake on both sides: real
+    aiohttp reading real ranges into a real ffmpeg's stdin.
+    See docs/ARCHITECTURE.md#loudness-normalization."""
+
+    _RANGES = 4
+
+    @pytest.fixture(autouse=True)
+    def _as_a_long_googlevideo_song(
+        self, monkeypatch: pytest.MonkeyPatch, server: type[_FailingHandler]
+    ) -> None:
+        """The host gate is the one part a local server cannot meet."""
+        size = len(server.payload)
+        monkeypatch.setattr(youtube, "_ranged_scan_size", lambda _url: size)
+        monkeypatch.setattr(youtube, "_SCAN_RANGE_BYTES", -(-size // self._RANGES))
+
+    @staticmethod
+    async def _scan(server: type[_FailingHandler], page: str) -> Optional[Loudness]:
+        return await measure_loudness(server.url, page, None)  # pyright: ignore[reportAttributeAccessIssue]
+
+    async def _whole(self, server: type[_FailingHandler]) -> Optional[Loudness]:
+        """The level ffmpeg reads off this sample in one request of its own."""
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(youtube, "_ranged_scan_size", lambda _url: None)
+            whole = await self._scan(server, "https://yt.com/v=whole")
+        server.gets = 0
+        return whole
+
+    @staticmethod
+    def _assert_every_byte_arrived_once(server: type[_FailingHandler]) -> None:
+        """Read off the server rather than the level: ffmpeg resyncs past a
+        duplicated or missing stretch of this sample and measures it the same."""
+        position = 0
+        for first, delivered in server.served:
+            assert first == position
+            position += delivered
+        assert position == len(server.payload)
+
+    async def test_it_measures_what_one_request_does(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        whole = await self._whole(server)
+
+        ranged = await self._scan(server, "https://yt.com/v=ranged")
+
+        assert server.gets == self._RANGES
+        self._assert_every_byte_arrived_once(server)
+        assert ranged is not None and ranged == whole
+
+    async def test_a_range_that_dies_is_resumed_where_it_stopped(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        whole = await self._whole(server)
+        server.mode = "range_dies_once"
+
+        ranged = await self._scan(server, "https://yt.com/v=resumed")
+
+        assert server.gets == self._RANGES + 1
+        self._assert_every_byte_arrived_once(server)
+        assert ranged is not None and ranged == whole
+
+    async def test_ranges_that_keep_dying_are_not_a_level(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        """ffmpeg exits 0 with a summary of the audio that did arrive, so the feed's
+        failure is the only thing that says the song was not all read."""
+        server.mode = "ranges_die"
+
+        assert await self._scan(server, "https://yt.com/v=dying") is None
+        assert server.gets == youtube._SCAN_FETCH_RETRIES + 1
+
+    async def test_a_refused_range_is_not_asked_for_again(
+        self, server: type[_FailingHandler]
+    ) -> None:
+        server.mode = "refused"
+
+        assert await self._scan(server, "https://yt.com/v=gone") is None
+        assert server.gets == 1
 
 
 # The reconnect backoff is 0 + 1 + 3 s before -reconnect_delay_max refuses a 7,

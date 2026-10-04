@@ -17,6 +17,21 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.7 — 2026-10-04
+
+**`normalize` now measures songs longer than about ten minutes.** It never did. YouTube
+slows a single request for a file over roughly 10 MB to twice playback speed, so the scan
+of anything longer ran into its time limit, the song played at its own level, and the same
+wait was paid again an hour later. The bot now fetches a long song's audio in pieces
+YouTube serves at full speed: an hour-long upload measures in about six seconds. Nothing to
+do, and no setting changes — a long song that failed in the last hour is measured on its
+first play after that hour is up.
+
+**Correction to 2.56.4.** It said an hour-long upload "measures in under three seconds".
+That was the measuring alone, timed on a local file; over the network that scan did not
+finish at all before this release. `.env.example` and the README said the default 8 seconds
+covers two and a half hours of audio. It covers roughly one.
+
 ## 2.56.6 — 2026-10-02
 
 **The "unknown Opus itag" warning stops crying wolf.** For the half-hour after a deploy it
