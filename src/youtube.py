@@ -801,23 +801,22 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
 
 
 def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
-    """Say so when YouTube serves an Opus itag the allowlist does not name.
+    """Say so when YouTube serves an Opus format the allowlist does not cover.
 
     That serve is re-encoded, spending a lossy generation on a source that could
-    have been copied. Scoped to a bare numeric format_id, which is what a YouTube
-    itag is and what SoundCloud's named `http_opus` rungs are not. Once per itag per
-    process, and never for a serve the gate accepted.
+    have been copied. Scoped to a format_id that leads with an itag, which is what
+    YouTube's are and what SoundCloud's named `http_opus` rungs are not. Once per
+    format id per process, and never for a serve the gate accepted.
     Response: see docs/ARCHITECTURE.md#an-unknown-opus-itag.
     """
     format_id = str(data.get("format_id") or "")
-    # isascii first: str.isdigit() admits non-ASCII digits, which no itag is.
-    if not (format_id.isascii() and format_id.isdigit()):
+    if not _ITAG_LED_FORMAT_ID.fullmatch(format_id):
         return
     if format_id in _UNKNOWN_OPUS_ITAG_WARNED:
         return
-    if format_id in _PASSTHROUGH_FORMAT_IDS:
-        # Named, so not the thing this warns about. The gate also refuses an
-        # allowlisted itag whose cache entry predates `audio_channels`, which
+    if _passthrough_itag(format_id) in _PASSTHROUGH_FORMAT_IDS:
+        # Covered, so not the thing this warns about. The gate also refuses a
+        # covered format whose cache entry predates `audio_channels`, which
         # _STREAM_CACHE_FIELDS expects for the stream TTL after a deploy.
         return
     if not str(data.get("acodec") or "").startswith("opus"):
@@ -827,7 +826,7 @@ def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
     if len(_UNKNOWN_OPUS_ITAG_WARNED) < _MAX_UNKNOWN_OPUS_ITAGS:
         _UNKNOWN_OPUS_ITAG_WARNED.add(format_id)
     log.warning(
-        f"YouTube served Opus itag {format_id}, which is not in the passthrough "
+        f"YouTube served Opus format {format_id}, which is not in the passthrough "
         f"allowlist ({sorted(_PASSTHROUGH_FORMAT_IDS)}), so the song was "
         f"re-encoded instead of copied (audio_channels="
         f"{data.get('audio_channels')}) — see ARCHITECTURE.md#an-unknown-opus-itag"
@@ -1188,6 +1187,20 @@ def _playlist_cache_key(url: str) -> str:
 # Opus itags. The allowlist IS the frame-duration check, since the info-dict reports
 # no frame duration and "opus" alone cannot be trusted to mean 20ms.
 _PASSTHROUGH_FORMAT_IDS = frozenset({"249", "250", "251"})
+# A YouTube audio format id: the itag, and `-N` on a video with several audio
+# tracks, where N numbers the track and the encode is the itag's own.
+_ITAG_FORMAT_ID = re.compile(r"(\d+)(?:-\d+)?", re.ASCII)
+# Anything YouTube-shaped, which also takes in a suffix the allowlist cannot speak
+# for (`251-drc`).
+_ITAG_LED_FORMAT_ID = re.compile(r"\d+(?:-.+)?", re.ASCII)
+
+
+def _passthrough_itag(format_id: object) -> Optional[str]:
+    """The itag of a format id the allowlist can speak for, or None: `251`, and
+    `251-23` alike. See docs/ARCHITECTURE.md#audio-pipeline."""
+    match = _ITAG_FORMAT_ID.fullmatch(str(format_id or ""))
+    return match[1] if match else None
+
 
 # OpusHead + OpusTags, which RFC 7845 mandates at the head of every Ogg Opus stream.
 # discord.py yields them from read() like audio, so YTDL discounts exactly two.
@@ -1263,7 +1276,7 @@ def _passthrough_codec(data: YTDLVideoMetadata, *, filtered: bool) -> Optional[s
         return None
     if data.get("audio_channels") not in (1, 2):
         return None
-    if str(data.get("format_id") or "") not in _PASSTHROUGH_FORMAT_IDS:
+    if _passthrough_itag(data.get("format_id")) not in _PASSTHROUGH_FORMAT_IDS:
         return None
     return "copy"
 

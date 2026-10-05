@@ -3564,6 +3564,38 @@ class TestOpusPassthrough:
         """
         assert await self._codec(format_id="http_opus_0_0") is None
 
+    @pytest.mark.parametrize("format_id", ["251-23", "250-0", "249-7", "251-104"])
+    async def test_one_track_of_a_multi_track_video_is_remuxed(
+        self, format_id: str
+    ) -> None:
+        """A video with dubbed audio numbers its tracks, and the format id of the
+        one served is the itag plus that number. The encode is the itag's own:
+        measured 20 ms on every packet of 249-N, 250-N and 251-N across four videos.
+        See docs/ARCHITECTURE.md#audio-pipeline."""
+        assert await self._codec(format_id=format_id) == "copy"
+
+    @pytest.mark.parametrize(
+        "format_id",
+        [
+            # A different encode of the itag, whose framing nobody has measured.
+            "251-drc",
+            "251-drc-3",
+            "251-3-drc",
+            # Not an itag and a track number.
+            "251-",
+            "-251",
+            "251-x",
+            "251 ",
+            "2510",
+            "774-3",
+            # Decimal digits str.isdigit() admits and no itag is.
+            "251-\u0663",
+            "\u0662\u0665\u0661",
+        ],
+    )
+    async def test_any_other_suffix_is_encoded(self, format_id: str) -> None:
+        assert await self._codec(format_id=format_id) is None
+
     async def test_the_volume_filter_and_the_copy_codec_are_mutually_exclusive(
         self,
     ) -> None:
@@ -7724,14 +7756,38 @@ class TestUnknownOpusItagTripwire:
             _record_serving_format(serve)
         assert "allowlist" not in caplog.text
 
+    @pytest.mark.parametrize("format_id", ["\u0663\u0664", "\u0663\u0664-3"])
     def test_a_format_id_that_is_not_ascii_digits_is_silent(
-        self, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture, format_id: str
     ) -> None:
         """`str.isdigit()` alone admits Unicode decimal digits, which no itag is."""
         with caplog.at_level(logging.WARNING):
-            _record_serving_format(self._serve(format_id="\u0663\u0664"))
+            _record_serving_format(self._serve(format_id=format_id))
         assert "allowlist" not in caplog.text
         assert not youtube._UNKNOWN_OPUS_ITAG_WARNED
+
+    @pytest.mark.parametrize("channels", [2, None])
+    def test_a_covered_track_of_a_multi_track_video_is_silent(
+        self, caplog: pytest.LogCaptureFixture, channels: Optional[int]
+    ) -> None:
+        """`251-23` is itag 251, which the gate copies — and with no channel count
+        it is the same stale cache entry the bare itag is silent for."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(
+                self._serve(format_id="251-23", audio_channels=channels)
+            )
+        assert "allowlist" not in caplog.text
+
+    @pytest.mark.parametrize("format_id", ["774-3", "251-drc"])
+    def test_a_suffixed_format_the_gate_refused_warns_with_its_whole_id(
+        self, caplog: pytest.LogCaptureFixture, format_id: str
+    ) -> None:
+        """The suffix is what an operator needs: `774-3` is an unknown itag, and
+        `251-drc` a known one in an encode the allowlist does not cover."""
+        with caplog.at_level(logging.WARNING):
+            _record_serving_format(self._serve(format_id=format_id))
+        assert f"Opus format {format_id}," in caplog.text
+        assert "not in the passthrough allowlist" in caplog.text
 
     def test_soundclouds_named_opus_rung_is_silent(
         self, caplog: pytest.LogCaptureFixture

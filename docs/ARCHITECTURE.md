@@ -1788,7 +1788,7 @@ flowchart LR
 |---|---|
 | no filtergraph | ffmpeg **refuses** `-c:a copy` alongside any filtergraph (exit 234, zero bytes — which the player reports as a refused stream and spends the whole retry budget on). The gate reads what `_audio_filters` actually produced rather than re-deriving why, so a filter added there disables the remux path by construction. Two sources today: a non-unity volume, and any loudness mode but `off`. |
 | `audio_channels in (1, 2)` | a 5.1 serve copied verbatim reaches Discord as 6-channel multistream Opus and clients decode only the front pair, silently losing centre-channel vocals. yt-dlp ranks `channels` **above** `acodec` when sorting, so `bestaudio` does select itag 338 where it exists. Absent means re-encode. |
-| `format_id` in `{249, 250, 251}` | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly — measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream. SoundCloud's `http_opus` is exactly the case this excludes, and its exclusion is right on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3. |
+| `format_id` is itag `249`, `250` or `251`, bare or with a `-N` track number | packet duration. `read()` counts packets and every position surface is frames × 20 ms, but Opus may legally be 60 ms-framed — which plays at 3× speed and reads a third of its true position. The info-dict reports no frame duration, so the known-20 ms itags are named explicitly — measured for 251: 601/601 packets CELT / fullband / 20 ms / stereo off a live googlevideo stream. SoundCloud's `http_opus` is exactly the case this excludes, and its exclusion is right on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3. A video with several audio tracks (dubs) numbers them, and yt-dlp's id for the one served is the itag plus that number — `251-23`. `_passthrough_itag` reads the itag out of it, because the encode is the itag's own: measured on four such videos, every packet of `251-N`, `250-N` and `249-N` is 20 ms, one frame, stereo (249 mixes hybrid and CELT frames, which the frame count does not care about). `251-drc` is a different encode whose framing has not been measured, so any other suffix is refused. |
 
 Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
 
@@ -1847,10 +1847,12 @@ The passthrough allowlist names three itags, so a fourth one YouTube starts serv
 re-encoded: a lossy generation spent on a source that could have been copied, and a step
 **down** from the 251 it replaced. Nothing about that is visible from the outside — the
 song plays, the span carries `ytdl.opus_passthrough=false`, and no error is raised — so
-`_warn_unknown_opus_itag` says so once per itag per process, for a bare numeric format id
-whose `acodec` is Opus and which the gate refused. SoundCloud's `http_opus` rungs are Opus
-and excluded too, but their ids are named rather than numeric, and their exclusion is
-correct on quality as well: that rung is 64 kbps, below SoundCloud's own 128 kbps mp3.
+`_warn_unknown_opus_itag` says so once per format id per process, for an id that leads with
+an itag, whose `acodec` is Opus and which the gate refused: `774`, `774-3`, and `251-drc`
+alike. A covered itag's own track forms (`251-23`) are copied and never reach it.
+SoundCloud's `http_opus` rungs are Opus and excluded too, but their ids are named rather
+than numeric, and their exclusion is correct on quality as well: that rung is 64 kbps,
+below SoundCloud's own 128 kbps mp3.
 
 itag 774 (Opus 256k) is the one to expect. It was absent on seven clients probed
 anonymously, including `web_music` and `ios_music`; only the `android` client carries it,
@@ -1862,6 +1864,9 @@ and that client refuses cookies. When the warning names it:
 2. All 20 ms → add the itag to `_PASSTHROUGH_FORMAT_IDS` in the same commit as the line
    recording the measurement. Anything else → leave it out and deprioritize it in the
    fallback ladder instead.
+
+When it names a suffix instead (`251-drc`), the measurement is the same and the change is
+to the suffixes `_ITAG_FORMAT_ID` accepts, not to the itag set.
 
 No speculative selector change: the allowlist is a claim about measured framing, and
 widening it on anything less is how the position math silently breaks.

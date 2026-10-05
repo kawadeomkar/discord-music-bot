@@ -17,6 +17,16 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.8 — 2026-10-04
+
+**Videos with dubbed audio tracks are no longer re-encoded.** YouTube numbers the audio
+tracks of a video that carries several, and the bot's check for "this is YouTube's own
+Opus, pass it through untouched" did not recognise a numbered one — so those videos were
+decoded and re-encoded like a non-Opus source, losing a little quality every time, with
+nothing in the logs. They are now copied like any other. The warning for an Opus format
+the bot does not copy also covers suffixed format ids, which it could not see before.
+Nothing to do.
+
 ## 2.56.7 — 2026-10-04
 
 **`normalize` now measures songs longer than about ten minutes.** It never did. YouTube
