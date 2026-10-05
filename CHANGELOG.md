@@ -17,6 +17,18 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.10 — 2026-10-04
+
+**Corrections.** 2.56.7 said the eight-second loudness limit covers roughly an hour of
+audio. That is YouTube; SoundCloud delivers a song in small pieces fetched one after
+another, and there it covers about 40 minutes — a longer mix plays at its own level.
+
+2.56.0 said raising the encoder's bitrate buys 0.0–0.3 dB for anything from YouTube,
+SoundCloud or Spotify. That holds for YouTube's usual Opus, but an AAC source — SoundCloud,
+or YouTube's fallback format — gains 0.6–2.0 dB. The bot still does not raise it for those,
+because it would double their voice traffic; only the entry was wrong. Nothing in the bot
+changed for either correction.
+
 ## 2.56.9 — 2026-10-04
 
 **`normalize` no longer makes a YouTube song wait to be measured.** YouTube already tells

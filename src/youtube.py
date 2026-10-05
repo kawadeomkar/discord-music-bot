@@ -856,7 +856,6 @@ _UNKNOWN_OPUS_ITAG_WARNED: set[str] = set()
 # YouTube's audio-itag space is a few dozen wide, so this is a backstop against a
 # serve that is not an itag at all rather than an expected bound.
 _MAX_UNKNOWN_OPUS_ITAGS: Final[int] = 64
-_DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -927,8 +926,8 @@ def _warn_unknown_opus_itag(data: YTDLVideoMetadata) -> None:
 _LOSSLESS_ACODECS = frozenset({"flac", "alac"})
 _LOSSLESS_EXTS = frozenset({"flac", "wav", "aiff", "aif"})
 # Discord's own ceiling. libopus caps a packet at 1276 B, so the largest 20 ms
-# datagram is 1308 B of UDP payload once discord.py's RTP header and Poly1305 tag
-# are on it. See docs/ARCHITECTURE.md#encoder-mode.
+# datagram is 1320-1324 B of UDP payload once DAVE's frame trailer and discord.py's
+# RTP header, nonce and Poly1305 tag are on it. See docs/ARCHITECTURE.md#encoder-mode.
 _ENCODE_BITRATE_CAP_KBPS = 384
 # discord.py's default, which it emits as `-b:a 128k` with or without us.
 _DEFAULT_ENCODE_KBPS = 128
@@ -940,8 +939,9 @@ def _encode_bitrate_kbps(
     """The encoder bitrate to ask for, or None to leave discord.py's 128k.
 
     Only for a source that is actually lossless, where it buys 2 dB at 256k
-    (39.6 -> 41.5 measured). A ~130 kbps lossy serve gains 0.0-0.3 dB, because the
-    encode saturates on what the source already threw away.
+    (39.6 -> 41.5 measured). An Opus serve gains 0.0-0.3 dB, because the encode
+    saturates on what the source already threw away; an AAC one gains 0.6-2.0 dB,
+    which does not pay for doubling its voice traffic.
     See docs/ARCHITECTURE.md#encoder-mode.
     """
     if not channel_bitrate:
@@ -2728,9 +2728,9 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
             except _NothingFound as miss:
                 if index == len(terms) - 1:
-                    # The ask is out of terms, so this miss is the answer. Raised
-                    # as the failure the caller has always seen, `from None`
-                    # because the wrapper is this method's private business.
+                    # The ask is out of terms, so this miss is the answer, raised
+                    # as the failure the caller has always seen. Chained to the
+                    # wrapper so the traceback keeps the frame that found nothing.
                     raise miss.public from miss
                 log.info(
                     f"{kind} search {term!r} found nothing; "

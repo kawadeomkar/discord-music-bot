@@ -110,8 +110,9 @@ song after next — the prefetch has already built the next one at the old level
 rebuilding it would re-request a signed URL that may since have been revoked).
 **Encode bitrate**: `_encode_bitrate_kbps` raises the encoder's 128k target to the voice
 channel's own ceiling (capped at 384k) for a LOSSLESS source only — read from `acodec` and
-`ext`, since a direct WAV arrives with no acodec. A lossy serve saturates, so raising its
-target buys 0.0–0.3 dB; a lossless one gains 2 dB at 256k. `ext` is a cached field for the
+`ext`, since a direct WAV arrives with no acodec. An Opus serve saturates, so raising its
+target buys 0.0–0.3 dB; an AAC one 0.6–2.0 dB, not worth doubling its traffic; a lossless
+one gains 2 dB at 256k. `ext` is a cached field for the
 same reason `audio_channels` is.
 **Opus passthrough**: `codec="copy"` remuxes instead of re-encoding. `_passthrough_codec`
 is the gate and all four clauses are required, because `-c:a copy` also discards the

@@ -1823,14 +1823,23 @@ ffmpeg negotiates the decoder's `fltp` into libopus's `flt`, so there is no 16-b
 
 **Encode bitrate.** discord.py asks for 128k and the copy path discards it unread. The one
 case where asking for more is worth anything is a source that has something left to give:
-raising the target for a ~130 kbps lossy serve buys 0.0–0.3 dB, because the encode
+raising the target for a ~130 kbps Opus serve buys 0.0–0.3 dB, because the encode
 saturates on what the source already threw away, while a lossless source gains 2 dB at
-256k (39.6 → 41.5 measured). So `_encode_bitrate_kbps` raises it only for one, bounded by
+256k (39.6 → 41.5 measured). AAC sits between: measured against the original through
+original → AAC 128k → Opus, raising 128k to 256k bought 1.1, 0.6 and 2.0 dB on three
+tracks, against 0.1, 0.1 and 0.0 for the same chain through Opus 130k — AAC's own
+artefacts leave the re-encode more to approximate. That is not raised either: AAC reaches
+the bot as YouTube's itag 140 only when the Opus serves are gone, and from SoundCloud,
+whose `hls_aac_160k` would double its voice traffic for a gain below the hybrid-mode loss
+this file opens with. So `_encode_bitrate_kbps` raises it only for a lossless source, bounded by
 the voice channel's own ceiling and capped at 384k — Discord's limit, where a 20 ms packet
-reaches libopus's own 1276-byte per-packet ceiling. With discord.py's 12-byte RTP header,
-16-byte Poly1305 tag and 4-byte nonce that is a 1308-byte UDP payload — inside a 1500-byte
-path, and past the 1280-byte IPv6 minimum, where `voice_state`'s `sendall` failure surfaces
-only as a discord.py DEBUG line.
+reaches libopus's own 1276-byte per-packet ceiling. DAVE, Discord's end-to-end encryption,
+wraps every Opus frame before transport encryption (`dave_session.encrypt_opus` in
+discord.py 2.7.1, with `davey` installed): an 8-byte truncated AES-GCM tag, a 1–5 byte
+ULEB128 nonce, a size byte and the 2-byte `0xFAFA` marker, 12–16 bytes in all. With
+discord.py's 12-byte RTP header, 16-byte Poly1305 tag and 4-byte nonce on top, that is a
+1320–1324-byte UDP payload — inside a 1500-byte path, and past the 1280-byte IPv6 minimum,
+where `voice_state`'s `sendall` failure surfaces only as a discord.py DEBUG line.
 
 "Lossless" is read from `acodec` **and** `ext`, because yt-dlp infers `acodec` from the
 extension only for aac/opus/mp3/flac/vorbis: a direct WAV arrives with `acodec` None and
@@ -2019,6 +2028,19 @@ through `measure_loudness` on live streams: 37 min in 3.5 s, 42 min in 4.0 s, 61
 carries for the track. The 8 s default therefore covers a song of roughly an hour. The play
 path is untouched by the throttle: it reads at 1× and is served at 2×.
 
+**SoundCloud is HLS, and paced by its segments.** Its serves are `hls_aac_160k` and
+`hls_aac_96k` playlists of ~10 s fMP4 segments, which ffmpeg's HLS demuxer fetches one at a
+time, and none is large enough to be throttled the way a googlevideo file is. Measured live:
+a 3–9 minute song scans in 1.1–2.1 s (median 1.2 s over 24 runs), and a one-hour mix in
+10.8–11.3 s, so the 8 s default covers SoundCloud songs of about 40 minutes and a longer mix
+plays at its own level. Individual scans occasionally stall on a slow segment — 5.6 s and
+7.1 s for songs that otherwise take 1.2 — which the timeout absorbs. `-http_multiple 1`,
+which fetches the next segment alongside the current one, was measured against that and
+left out: across 24 interleaved runs both forms had the same median, p90 and maximum, and
+the option is fatal on every other demuxer (`Option http_multiple not found`, exit 8), so
+it would need its own HLS gate for no measured gain. The ffmpeg tier pins that an HLS
+playlist scans through the same argv as everything else.
+
 The feed owns what the reconnect flags own on the other path. A connection that dies, or a
 5xx, resumes at the byte it reached, at most `_SCAN_FETCH_RETRIES` (2) times a scan; any
 other status ends it at once — a 403 is a revoked URL, and a 200 is a server that ignored
@@ -2076,6 +2098,7 @@ Considered and left out:
 - **Measuring during the first play** — needs a filter or an in-process decoder, and leaves that first play unnormalized.
 - **The per-format `loudnessDb`** in `streamingData.adaptiveFormats` — relative to the target rather than absolute, and using it means matching the served format back to its entry by itag, track and DRC flag. The track figure is the same number for the serves it is trusted for, and the scan covers the rest.
 - **Per-listener gain** — Discord has no such control.
+- **Album normalization** — AES TD1008 prefers one gain for a whole album when it plays in order, so its quiet tracks stay quiet against its loud ones. That gain is the loudest track's, which needs every track's loudness before the first one plays, and the queue resolves one song ahead: a Spotify album is queued as unresolved entries, and the YouTube video each becomes is not known until it is next. It would also have to give way the moment the album stops playing in order — a `-p --now` interjection, a shuffle, a removal — which the queue does not track as a property of its entries. Track normalization is what every major service does by default.
 
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and the paused card.
 

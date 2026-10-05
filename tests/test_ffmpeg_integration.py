@@ -604,6 +604,61 @@ class TestMeasureLoudnessReadsTheRealBinary:
         assert await measure_loudness(server.url, "https://yt.com/v=gone", None) is None  # pyright: ignore[reportAttributeAccessIssue]
 
 
+class TestAnHlsPlaylistIsScanned:
+    """SoundCloud's serves are HLS playlists of fMP4 segments, a different demuxer
+    from the webm every other test here reads — and the scan hands it the play
+    path's reconnect flags, which it must accept."""
+
+    @pytest.fixture
+    def playlist(self, tmp_path: Path) -> Iterator[str]:
+        """A VOD playlist of the tier's tone in 1 s fMP4 segments, served locally."""
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency=440:duration={_SAMPLE_SECS}",
+                "-c:a",
+                "aac",
+                "-f",
+                "hls",
+                "-hls_time",
+                "1",
+                "-hls_playlist_type",
+                "vod",
+                "-hls_segment_type",
+                "fmp4",
+                str(tmp_path / "playlist.m3u8"),
+            ],
+            check=True,
+        )
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, directory=str(tmp_path), **kwargs)
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), Quiet) as srv:
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                yield f"http://127.0.0.1:{srv.server_address[1]}/playlist.m3u8"
+            finally:
+                srv.shutdown()
+                thread.join(timeout=5)
+
+    async def test_it_measures(self, playlist: str) -> None:
+        measured = await measure_loudness(playlist, "https://sc.com/a/hls", None)
+        assert measured is not None
+        assert -60.0 < measured.i < 0.0
+
+
 class TestALongSongIsScannedInRanges:
     """A googlevideo file over 10 MB is fetched by the bot in ranges and piped to
     ffmpeg, because ffmpeg's single request for it is throttled past any scan
