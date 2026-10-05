@@ -1,10 +1,12 @@
 import asyncio
 import contextlib
 import copy
+import functools
+import math
 import os
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
@@ -265,6 +267,9 @@ class YTDLVideoMetadata(TypedDict, total=False):
     format_id: str
     protocol: str
     vcodec: str
+    # Not yt-dlp's: the loudness YouTube's own player normalizes this song against,
+    # lifted from the player response in the worker (_lift_player_loudness).
+    loudness_lkfs: float
     # The song's audio ladder, best first, candidate[0] being the format above.
     # Mined in the worker (_mine_audio_candidates) and walked at probe time, so a
     # revoked URL costs one sideways probe instead of the song.
@@ -475,6 +480,83 @@ def _lift_thumbnail(info: dict[str, Any]) -> None:
             info["thumbnail"] = last["url"]
 
 
+# video id -> the loudness YouTube's player normalizes it against, from the player
+# responses of the extraction this process is running. A pool worker runs one at a
+# time, and _ytdlp_extract empties this before each.
+# See docs/ARCHITECTURE.md#loudness-normalization.
+_PLAYER_LOUDNESS: dict[str, float] = {}
+# The wrapper capture_player_loudness installed, so a second call can tell.
+_noting_player_loudness: Optional[Callable[..., Any]] = None
+
+
+def _note_player_loudness(player_responses: object) -> None:
+    """Record `trackAbsoluteLoudnessLkfs` for every video these responses describe.
+    Keyed by the response's own video id, and total over any shape: yt-dlp's
+    internals are not a contract, and a figure is never worth an extraction."""
+    if not isinstance(player_responses, list):
+        return
+    for response in player_responses:
+        try:
+            video_id = response["videoDetails"]["videoId"]
+            lkfs = response["playerConfig"]["audioConfig"]["trackAbsoluteLoudnessLkfs"]
+        except KeyError, TypeError:
+            continue
+        # bool is an int, and a NaN would become the gain.
+        if (
+            isinstance(video_id, str)
+            and isinstance(lkfs, int | float)
+            and not isinstance(lkfs, bool)
+            and math.isfinite(lkfs)
+        ):
+            # Two places is all YouTube sends; the rest is its float32.
+            _PLAYER_LOUDNESS.setdefault(video_id, round(float(lkfs), 2))
+
+
+def capture_player_loudness() -> bool:
+    """Have yt-dlp's YouTube extractor leave each video's loudness in
+    _PLAYER_LOUDNESS, and answer whether it could. Idempotent.
+
+    The seam is a private method of the pinned yt-dlp, so its absence is an answer
+    rather than an error: the song is then measured by the scan.
+    """
+    global _noting_player_loudness
+    from yt_dlp.extractor.youtube import YoutubeIE
+
+    original = getattr(YoutubeIE, "_extract_player_responses", None)
+    if original is None:
+        return False
+    if original is _noting_player_loudness:
+        return True
+
+    @functools.wraps(original)
+    def noting(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        # (player_responses, player_url) today.
+        if isinstance(result, tuple) and result:
+            _note_player_loudness(result[0])
+        return result
+
+    _noting_player_loudness = noting
+    setattr(YoutubeIE, "_extract_player_responses", noting)
+    return True
+
+
+def _lift_player_loudness(node: dict[str, Any]) -> None:
+    """Put YouTube's figure for this video on its info-dict, when the format served
+    is one the figure describes: the only audio track, or the default one of
+    several. A `-drc` serve is a different signal, and falls to the scan."""
+    lkfs = _PLAYER_LOUDNESS.get(str(node.get("id") or ""))
+    if lkfs is None:
+        return
+    track = _ITAG_FORMAT_ID.fullmatch(str(node.get("format_id") or ""))
+    if track is None:
+        return
+    numbered = track[0] != track[1]
+    if numbered and "(default)" not in str(node.get("format_note") or ""):
+        return
+    node["loudness_lkfs"] = lkfs
+
+
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker:
     sanitize_info() reduces the live objects of a process=True info-dict to JSON
@@ -492,6 +574,7 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
         nodes.extend(entry for entry in entries if isinstance(entry, dict))
     for node in nodes:
         _lift_thumbnail(node)
+        _lift_player_loudness(node)
         candidates = _mine_audio_candidates(node)
         if candidates:
             node["audio_candidates"] = candidates
@@ -518,6 +601,8 @@ def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     """Extraction worker run in the process pool. Top-level so it is picklable."""
     url, opts = req.url, req.opts
     download, process = req.download, req.process
+    capture_player_loudness()
+    _PLAYER_LOUDNESS.clear()
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it;
     # the copy keeps the opts profile immutable across a worker's extractions.
     try:
@@ -749,6 +834,8 @@ _STREAM_CACHE_FIELDS = frozenset(
         # WAV and AIFF report no acodec, so _encode_bitrate_kbps reads this too:
         # a cache hit without it silently drops those back to 128k.
         "ext",
+        # A cache hit without it falls back to the scan, and its wait.
+        "loudness_lkfs",
         # Format shape, so cache hits stay attributable (_record_serving_format).
         "format_id",
         "protocol",
@@ -999,10 +1086,11 @@ def parse_ebur128_summary(stderr: str) -> Optional[Loudness]:
         return None
 
 
-def normalize_gain_db(loudness: Loudness) -> float:
-    """The gain that puts this song on the target, clamped."""
+def normalize_gain_db(lufs: float) -> float:
+    """The gain that puts a song of this integrated loudness on the target,
+    clamped."""
     lo, hi = _LOUDNESS_GAIN_CLAMP_DB
-    return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - loudness.i))
+    return max(lo, min(hi, _LOUDNESS_TARGET_LUFS - lufs))
 
 
 async def measure_loudness(
@@ -1108,6 +1196,22 @@ async def measure_loudness(
         redis, cache_key, {"i": measured.i, "peak": measured.peak}, _LOUDNESS_TTL
     )
     return measured
+
+
+def _player_loudness(data: YTDLVideoInfo) -> Optional[float]:
+    """YouTube's own figure for this song in LUFS, when the extraction carried one.
+    Re-validated because it has been through the stream cache."""
+    lkfs = data.get("loudness_lkfs")
+    if (
+        not isinstance(lkfs, int | float)
+        or isinstance(lkfs, bool)
+        or not math.isfinite(lkfs)
+    ):
+        return None
+    span = trace.get_current_span()
+    span.set_attribute("ytdl.loudness_source", "youtube")
+    span.set_attribute("ytdl.loudness_lufs", float(lkfs))
+    return float(lkfs)
 
 
 def _source_cache_key(search: str) -> str:
@@ -2524,21 +2628,26 @@ class YTDL(discord.FFmpegOpusAudio):
             ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
             ffmpeg_opts["options"] += " -ss 0"
         gain_db: Optional[float] = None
-        if loudness is LoudnessMode.NORMALIZE and data.get("duration"):
-            # Livestreams (no duration) are skipped: the scan would read the stream
+        if loudness is LoudnessMode.NORMALIZE:
+            span = trace.get_current_span()
+            # YouTube's own figure costs nothing; the scan is for a song without
+            # one. Livestreams (no duration) are never scanned: the scan would read
             # until its timeout and measure whatever it happened to catch.
-            measured = await measure_loudness(data["url"], qo.webpage_url, redis)
-            if measured is not None:
-                gain_db = normalize_gain_db(measured)
-                span = trace.get_current_span()
+            lufs = _player_loudness(data)
+            if lufs is None and data.get("duration"):
+                measured = await measure_loudness(data["url"], qo.webpage_url, redis)
+                if measured is not None:
+                    lufs = measured.i
+                    # The gain asked for, against what fits under the ceiling. A
+                    # song with less headroom than gain lands short of the target,
+                    # because the limiter holds back the difference.
+                    span.set_attribute(
+                        "ytdl.normalize_headroom_db",
+                        _PEAK_CEILING_DBFS - measured.peak,
+                    )
+            if lufs is not None:
+                gain_db = normalize_gain_db(lufs)
                 span.set_attribute("ytdl.normalize_gain_db", gain_db)
-                # The gain asked for, against what fits under the ceiling. A song
-                # with less headroom than gain lands short of the target, because
-                # the limiter holds back the difference — which is the whole
-                # reading of a quiet song that stays quieter than the rest.
-                span.set_attribute(
-                    "ytdl.normalize_headroom_db", _PEAK_CEILING_DBFS - measured.peak
-                )
         # Chain first, codec second: ffmpeg refuses `-c:a copy` alongside any
         # filtergraph, and asking _audio_filters what it produced keeps the two
         # from disagreeing when a filter is added.

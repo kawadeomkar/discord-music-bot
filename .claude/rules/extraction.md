@@ -195,6 +195,11 @@ test-image-rebuild` before `DOCKER=1` recipes. Then run **`just ytdl-formats <ur
 against a real video and reconcile what it prints with the format claims in
 `src/youtube.py` (the client ladder, `_STREAM_CANDIDATES`, the passthrough itag
 allowlist) — those claims are empirical and both YouTube and yt-dlp move under them.
+Read its `LOUDNESS` line too: `normalize` takes YouTube's own figure from a PRIVATE
+yt-dlp method (`YoutubeIE._extract_player_responses`, wrapped by
+`capture_player_loudness`), and a bump that moves it fails soft — every song is scanned
+again and nothing errors. The line says "seam missing" when that has happened, and
+`TestCapturePlayerLoudness` fails in the suite.
 Watch `_record_serving_format` warnings
 and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
 YouTube-side changes.

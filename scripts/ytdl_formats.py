@@ -1,10 +1,12 @@
 """What would the bot actually play? — `just ytdl-formats <url>`.
 
 A diagnostic, not part of the running bot. It runs the real `_YTDL_STREAM_OPTS`
-against one URL and prints three things: the format yt-dlp selected, the full
-audio ladder it chose from, and the fallback ladder `_mine_audio_candidates`
-would keep. That last one is the production decision — everything the stream
-retry can fall back to comes from it.
+against one URL and prints four things: the format yt-dlp selected, the full
+audio ladder it chose from, the fallback ladder `_mine_audio_candidates` would
+keep, and the loudness figure `normalize` would read off YouTube's player
+response. The ladder is the production decision — everything the stream retry
+can fall back to comes from it — and the figure is the one place a yt-dlp bump
+that moved its private seam shows up.
 
 Run it at every yt-dlp bump. The claims this repo makes about format selection
 (bestaudio already picks the ladder top; opus beats AAC at equal quality tier;
@@ -20,8 +22,10 @@ import yt_dlp
 
 from src.youtube import (
     YTDL,
+    _lift_player_loudness,
     _mine_audio_candidates,
     _YTDL_STREAM_OPTS,
+    capture_player_loudness,
     select_search_entry,
 )
 
@@ -85,6 +89,24 @@ def render(info: dict[str, Any]) -> list[str]:
     return lines
 
 
+def loudness_line(info: dict[str, Any], *, captured: bool) -> str:
+    """What `normalize` would read for this serve, through the same lift the worker
+    runs. Three answers, because two of them look alike in production: a yt-dlp
+    whose seam moved, and a serve the figure does not describe, both end in a scan.
+    """
+    if not captured:
+        return (
+            "LOUDNESS  capture seam missing from this yt-dlp, so every song is "
+            "scanned — see src.youtube.capture_player_loudness"
+        )
+    node = dict(info)
+    _lift_player_loudness(node)
+    lkfs = node.get("loudness_lkfs")
+    if lkfs is None:
+        return "LOUDNESS  no figure for this serve, so the scan measures it"
+    return f"LOUDNESS  {lkfs} LUFS, YouTube's own figure (no scan)"
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print(
@@ -99,6 +121,7 @@ def main() -> int:
     # they go to stderr rather than through the bot's structlog routing.
     opts = copy.copy(_YTDL_STREAM_OPTS)
     opts.pop("logger", None)
+    captured = capture_player_loudness()
     # cast(), as everywhere yt-dlp's untyped dicts meet ours: the opts profile is the
     # one src.youtube already hands the extractor, and the result is an info-dict.
     raw = yt_dlp.YoutubeDL(cast(Any, opts)).extract_info(
@@ -119,7 +142,7 @@ def main() -> int:
             print("search returned no playable entry", file=sys.stderr)
             return 1
         info = cast(dict[str, Any], chosen)
-    print("\n".join(render(info)))
+    print("\n".join([*render(info), "", loudness_line(info, captured=captured)]))
     return 0
 
 

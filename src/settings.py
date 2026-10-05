@@ -534,7 +534,8 @@ SETTINGS: Final[tuple[SettingSpec, ...]] = (
         summary="Time limit for measuring how loud a song is.",
         more=(
             "Only a server with `loudness normalize` pays it, once per song per "
-            "month. Past it the song plays at its own level."
+            "month, and not for a song YouTube already sent a loudness for. Past "
+            "it the song plays at its own level."
         ),
         applies="from the next song measured",
         knob=config.loudness_scan_timeout_secs,

@@ -6836,13 +6836,13 @@ class TestNormalizeGain:
     recording from being amplified into the room."""
 
     def test_a_song_on_the_target_is_not_moved(self) -> None:
-        assert normalize_gain_db(Loudness(i=_LOUDNESS_TARGET_LUFS, peak=-1.0)) == 0.0
+        assert normalize_gain_db(_LOUDNESS_TARGET_LUFS) == 0.0
 
     def test_a_quiet_song_is_raised(self) -> None:
-        assert normalize_gain_db(Loudness(i=-19.7, peak=-3.8)) == pytest.approx(5.7)
+        assert normalize_gain_db(-19.7) == pytest.approx(5.7)
 
     def test_a_loud_song_is_lowered(self) -> None:
-        assert normalize_gain_db(Loudness(i=-8.0, peak=-0.1)) == pytest.approx(-6.0)
+        assert normalize_gain_db(-8.0) == pytest.approx(-6.0)
 
     def test_the_clamp_is_twenty_down_and_twelve_up(self) -> None:
         """Asserting against the constant itself passes for any value, and these two
@@ -6850,15 +6850,10 @@ class TestNormalizeGain:
         assert _LOUDNESS_GAIN_CLAMP_DB == (-20.0, 12.0)
 
     def test_a_silent_recording_is_clamped(self) -> None:
-        assert (
-            normalize_gain_db(Loudness(i=-60.0, peak=-40.0))
-            == (_LOUDNESS_GAIN_CLAMP_DB[1])
-        )
+        assert normalize_gain_db(-60.0) == (_LOUDNESS_GAIN_CLAMP_DB[1])
 
     def test_a_mastering_error_is_clamped_the_other_way(self) -> None:
-        assert (
-            normalize_gain_db(Loudness(i=6.0, peak=3.0)) == (_LOUDNESS_GAIN_CLAMP_DB[0])
-        )
+        assert normalize_gain_db(6.0) == (_LOUDNESS_GAIN_CLAMP_DB[0])
 
 
 class TestLoudnessFilters:
@@ -7452,6 +7447,7 @@ class TestYtStreamLoudness:
         stderr: bytes = b"",
         duration: Optional[int] = 213,
         spawn: Optional[Callable[..., Awaitable[Any]]] = None,
+        **served: Any,
     ) -> tuple[Optional[str], str]:
         captured: dict[str, Any] = {}
 
@@ -7470,7 +7466,11 @@ class TestYtStreamLoudness:
 
         _, default_spawn = TestMeasureLoudness._child(stderr=stderr)
         data = _fake_ytdl_data(
-            acodec="opus", audio_channels=2, format_id="251", duration=duration
+            acodec="opus",
+            audio_channels=2,
+            format_id="251",
+            duration=duration,
+            **served,
         )
         with (
             patch("src.youtube._ytdlp_extract", return_value=data),
@@ -7537,6 +7537,387 @@ class TestYtStreamLoudness:
         )
 
         assert _PEAK_LIMITER in options
+
+    @staticmethod
+    async def _no_scan(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("scanned a song YouTube had already measured")
+
+    async def test_youtubes_own_figure_is_the_gain_and_nothing_is_scanned(
+        self,
+    ) -> None:
+        """The player response yt-dlp already fetched carries the loudness YouTube
+        normalizes against — within 0.05 dB of ebur128 on every song measured — so
+        a normalizing server's first play of a song waits for nothing."""
+        codec, options = await self._options(
+            LoudnessMode.NORMALIZE, spawn=self._no_scan, loudness_lkfs=-8.29
+        )
+
+        assert codec is None
+        # -8.29 LUFS against a -14 target.
+        assert "volume=-5.7dB" in options
+        assert options.index("volume=-5.7dB") < options.index("alimiter")
+
+    async def test_a_livestream_with_a_figure_is_normalized(self) -> None:
+        """No duration only rules out the scan."""
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE,
+            duration=None,
+            spawn=self._no_scan,
+            loudness_lkfs=-20.0,
+        )
+        assert "volume=6.0dB" in options
+
+    @pytest.mark.parametrize(
+        "figure", [None, "-8.29", True, float("nan"), float("inf"), [-8.29]]
+    )
+    async def test_a_figure_that_is_not_a_number_falls_to_the_scan(
+        self, figure: Any
+    ) -> None:
+        """It has been through the stream cache, and a NaN would be the gain."""
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE,
+            stderr=TestEbur128Summary._CAPTURED.encode(),
+            loudness_lkfs=figure,
+        )
+        assert "volume=5.7dB" in options
+
+    @pytest.mark.parametrize("mode", [LoudnessMode.OFF, LoudnessMode.PEAK])
+    async def test_only_normalize_reads_the_figure(self, mode: LoudnessMode) -> None:
+        _, options = await self._options(mode, loudness_lkfs=-8.29)
+        assert "volume=" not in options
+
+    async def test_the_figure_is_clamped_like_a_measured_one(self) -> None:
+        _, options = await self._options(
+            LoudnessMode.NORMALIZE, spawn=self._no_scan, loudness_lkfs=-60.0
+        )
+        assert "volume=12.0dB" in options
+
+    def test_the_span_says_where_the_level_came_from(self) -> None:
+        """`youtube` against `scan` is how an operator sees the capture stop working
+        after a yt-dlp bump: the songs still normalize, and every one waits."""
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        with provider.get_tracer("t").start_as_current_span("song"):
+            lufs = youtube._player_loudness(
+                cast(Any, _fake_ytdl_data(loudness_lkfs=-8.29))
+            )
+
+        assert lufs == -8.29
+        attributes = exporter.get_finished_spans()[-1].attributes or {}
+        assert attributes["ytdl.loudness_source"] == "youtube"
+        assert attributes["ytdl.loudness_lufs"] == -8.29
+
+    def test_a_cache_hit_carries_the_figure(self) -> None:
+        """Otherwise every cached play of a YouTube song falls back to the scan."""
+        assert "loudness_lkfs" in _STREAM_CACHE_FIELDS
+
+
+def _player_response(video_id: object, lkfs: object) -> dict[str, Any]:
+    return {
+        "videoDetails": {"videoId": video_id},
+        "playerConfig": {"audioConfig": {"trackAbsoluteLoudnessLkfs": lkfs}},
+    }
+
+
+@pytest.fixture
+def player_loudness() -> Iterator[dict[str, float]]:
+    """The worker's per-extraction figures, empty before and after."""
+    youtube._PLAYER_LOUDNESS.clear()
+    yield youtube._PLAYER_LOUDNESS
+    youtube._PLAYER_LOUDNESS.clear()
+
+
+class TestNotePlayerLoudness:
+    """What is read out of yt-dlp's player responses. Their shape is YouTube's and
+    yt-dlp's to change, so nothing here may raise."""
+
+    def test_each_video_gets_its_own_figure(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        youtube._note_player_loudness(
+            [
+                _player_response("aaa", -13.01),
+                _player_response("bbb", -8),
+                # What -7.08 looks like after YouTube's float32.
+                _player_response("ccc", -7.0799999),
+            ]
+        )
+        assert player_loudness == {"aaa": -13.01, "bbb": -8.0, "ccc": -7.08}
+        assert all(type(lkfs) is float for lkfs in player_loudness.values())
+
+    def test_the_first_client_to_answer_wins(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        youtube._note_player_loudness(
+            [_player_response("aaa", -13.01), _player_response("aaa", -12.0)]
+        )
+        assert player_loudness == {"aaa": -13.01}
+
+    @pytest.mark.parametrize(
+        "responses",
+        [
+            None,
+            "responses",
+            ({"videoDetails": {"videoId": "aaa"}},),
+            [None, 3, "pr", []],
+            [{}],
+            [{"videoDetails": {"videoId": "aaa"}}],
+            [{"videoDetails": {"videoId": "aaa"}, "playerConfig": None}],
+            [{"videoDetails": None, "playerConfig": {"audioConfig": {}}}],
+            [_player_response("aaa", None)],
+            [_player_response("aaa", "-13.01")],
+            [_player_response("aaa", True)],
+            [_player_response("aaa", float("nan"))],
+            [_player_response("aaa", float("-inf"))],
+            [_player_response(None, -13.01)],
+            [_player_response(123, -13.01)],
+        ],
+    )
+    def test_anything_else_is_ignored_without_raising(
+        self, player_loudness: dict[str, float], responses: Any
+    ) -> None:
+        youtube._note_player_loudness(responses)
+        assert player_loudness == {}
+
+    def test_one_bad_response_does_not_cost_the_next(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        youtube._note_player_loudness([{}, None, _player_response("bbb", -9.5)])
+        assert player_loudness == {"bbb": -9.5}
+
+
+class TestCapturePlayerLoudness:
+    """The seam is a private method of the pinned yt-dlp. A bump that moves it must
+    fail here, not turn every YouTube song's first play back into a scan in
+    production with nothing to show for it."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_the_extractor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from yt_dlp.extractor.youtube import YoutubeIE
+
+        self.extractor = cast(Any, YoutubeIE)
+        monkeypatch.setattr(
+            YoutubeIE, "_extract_player_responses", YoutubeIE._extract_player_responses
+        )
+        monkeypatch.setattr(
+            youtube, "_noting_player_loudness", youtube._noting_player_loudness
+        )
+
+    def test_the_pinned_yt_dlp_has_the_seam_and_its_shape(self) -> None:
+        import inspect
+
+        assert youtube.capture_player_loudness() is True
+        installed = self.extractor._extract_player_responses
+        assert installed is youtube._noting_player_loudness
+        # What the wrapper reads: a tuple whose first item is the responses.
+        source = inspect.getsource(inspect.unwrap(installed))
+        assert "return prs, player_url" in source
+        assert "prs.append(" in source
+
+    def test_every_extraction_installs_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In the worker, where the extraction runs — the parent never imports the
+        extractor at all."""
+        import inspect
+
+        bare = inspect.unwrap(self.extractor._extract_player_responses)
+        monkeypatch.setattr(self.extractor, "_extract_player_responses", bare)
+        monkeypatch.setattr(youtube, "_noting_player_loudness", None)
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as ydl:
+            ydl.return_value.extract_info.return_value = {"id": "aaa", "url": "u"}
+            _ytdlp_extract(ExtractRequest(url="u", opts={}))
+
+        installed = self.extractor._extract_player_responses
+        assert installed is not bare
+        assert installed is youtube._noting_player_loudness
+
+    def test_a_second_call_does_not_wrap_the_wrapper(self) -> None:
+        youtube.capture_player_loudness()
+        once = self.extractor._extract_player_responses
+        assert youtube.capture_player_loudness() is True
+        assert self.extractor._extract_player_responses is once
+
+    def test_the_result_passes_through_and_its_figures_are_noted(
+        self, monkeypatch: pytest.MonkeyPatch, player_loudness: dict[str, float]
+    ) -> None:
+        result = ([_player_response("aaa", -13.01)], "https://player.js")
+        seen: list[tuple[Any, ...]] = []
+
+        def original(*args: Any, **kwargs: Any) -> Any:
+            seen.append((args, kwargs))
+            return result
+
+        monkeypatch.setattr(self.extractor, "_extract_player_responses", original)
+        assert youtube.capture_player_loudness() is True
+
+        answered = self.extractor._extract_player_responses("ie", "clients", x=1)
+
+        assert answered is result
+        assert seen == [(("ie", "clients"), {"x": 1})]
+        assert player_loudness == {"aaa": -13.01}
+
+    @pytest.mark.parametrize("result", [None, (), [], "prs", ([],), (None, None)])
+    def test_a_result_of_another_shape_passes_through_untouched(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        player_loudness: dict[str, float],
+        result: Any,
+    ) -> None:
+        monkeypatch.setattr(
+            self.extractor, "_extract_player_responses", lambda *_a, **_k: result
+        )
+        youtube.capture_player_loudness()
+
+        assert self.extractor._extract_player_responses() is result
+        assert player_loudness == {}
+
+    def test_an_extractor_error_is_still_the_extractors(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def original(*_args: Any, **_kwargs: Any) -> Any:
+            raise DownloadError("Video unavailable")
+
+        monkeypatch.setattr(self.extractor, "_extract_player_responses", original)
+        youtube.capture_player_loudness()
+
+        with pytest.raises(DownloadError):
+            self.extractor._extract_player_responses()
+
+    def test_a_yt_dlp_without_the_seam_is_an_answer_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delattr(self.extractor, "_extract_player_responses")
+
+        assert youtube.capture_player_loudness() is False
+        with patch("src.youtube.youtube_dl.YoutubeDL") as ydl:
+            ydl.return_value.extract_info.return_value = {"id": "aaa", "url": "u"}
+            extracted = _ytdlp_extract(ExtractRequest(url="u", opts={}))
+        assert extracted is not None and "loudness_lkfs" not in extracted
+
+
+class TestLiftPlayerLoudness:
+    """Which served formats YouTube's figure describes."""
+
+    @staticmethod
+    def _lifted(player_loudness: dict[str, float], **node: Any) -> Optional[float]:
+        player_loudness["aaa"] = -13.01
+        info = {"id": "aaa", "format_id": "251", "format_note": "medium", **node}
+        youtube._lift_player_loudness(info)
+        return info.get("loudness_lkfs")
+
+    @pytest.mark.parametrize("format_id", ["251", "140", "18", "93"])
+    def test_the_only_audio_track_takes_it(
+        self, player_loudness: dict[str, float], format_id: str
+    ) -> None:
+        """Whatever the encode: the muxed rungs carry the same track."""
+        assert self._lifted(player_loudness, format_id=format_id) == -13.01
+
+    def test_the_default_track_of_several_takes_it(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        """Measured on three such videos: the figure is the default track's level."""
+        assert (
+            self._lifted(
+                player_loudness,
+                format_id="251-23",
+                format_note="English (US) original (default), medium",
+            )
+            == -13.01
+        )
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            # A dub is a different recording of the vocal.
+            {"format_id": "251-4", "format_note": "Deutsch - dubbed, medium"},
+            {"format_id": "251-4", "format_note": None},
+            {"format_id": "251-4"},
+            # Dynamic range compression changes the very thing measured.
+            {"format_id": "251-drc", "format_note": "medium, DRC"},
+            {"format_id": "251-drc-3", "format_note": "English (default), medium"},
+            {"format_id": None},
+            {"format_id": "http_opus_0_0"},
+            {"id": "bbb"},
+            {"id": None},
+        ],
+    )
+    def test_any_other_serve_is_left_to_the_scan(
+        self, player_loudness: dict[str, float], node: dict[str, Any]
+    ) -> None:
+        assert self._lifted(player_loudness, **node) is None
+
+
+class TestExtractionCarriesPlayerLoudness:
+    """The worker's half: the figure reaches the info-dict that crosses the pool
+    boundary, for a link and for each result of a search."""
+
+    @staticmethod
+    def _extract(info: dict[str, Any], noted: list[Any]) -> Any:
+        """Run _ytdlp_extract over a YoutubeDL that notes `noted` the way the
+        extractor's wrapped step does mid-extraction."""
+
+        def extract_info(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            youtube._note_player_loudness(noted)
+            return info
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as ydl:
+            ydl.return_value.extract_info.side_effect = extract_info
+            return _ytdlp_extract(ExtractRequest(url="u", opts={}))
+
+    def test_a_link_carries_its_videos_figure(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        extracted = self._extract(
+            {"id": "aaa", "url": "https://cdn/a", "format_id": "251"},
+            [_player_response("aaa", -13.01)],
+        )
+        assert extracted["loudness_lkfs"] == -13.01
+
+    def test_each_search_result_carries_its_own(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        extracted = self._extract(
+            {
+                "_type": "playlist",
+                "entries": [
+                    {"id": "aaa", "url": "https://cdn/a", "format_id": "251"},
+                    None,
+                    {"id": "bbb", "url": "https://cdn/b", "format_id": "140"},
+                    {"id": "ccc", "url": "https://cdn/c", "format_id": "251"},
+                ],
+            },
+            [_player_response("bbb", -8.29), _player_response("aaa", -13.01)],
+        )
+        figures = [e and e.get("loudness_lkfs") for e in extracted["entries"]]
+        assert figures == [-13.01, None, -8.29, None]
+        assert "loudness_lkfs" not in extracted
+
+    def test_a_figure_does_not_outlive_its_extraction(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        """A worker serves thousands of extractions, and a later one that came back
+        without a player response must not inherit an earlier one's level."""
+        player_loudness["aaa"] = -3.0
+        player_loudness["zzz"] = -30.0
+
+        extracted = self._extract(
+            {"id": "aaa", "url": "https://cdn/a", "format_id": "251"}, []
+        )
+
+        assert "loudness_lkfs" not in extracted
+        assert player_loudness == {}
+
+    def test_the_figure_survives_slimming_and_the_cache_filter(
+        self, player_loudness: dict[str, float]
+    ) -> None:
+        extracted = self._extract(
+            _realistic_raw_info(id="aaa"), [_player_response("aaa", -13.01)]
+        )
+        assert extracted["loudness_lkfs"] == -13.01
+        assert "formats" not in extracted
 
 
 class TestEncodeBitrate:

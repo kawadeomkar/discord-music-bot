@@ -17,6 +17,20 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.9 — 2026-10-04
+
+**`normalize` no longer makes a YouTube song wait to be measured.** YouTube already tells
+the bot how loud each video is — the same figure its own player turns the volume down by —
+and it matched the bot's own measurement to within 0.05 dB on every song checked. The bot
+now uses that figure, so the first play of a YouTube song in a normalizing server starts as
+fast as any other, with no second download of the audio and no length limit. Other sources
+(SoundCloud, direct links) are still measured the old way, as is any YouTube song the
+figure does not arrive for.
+
+If a future yt-dlp update stops exposing the figure, nothing breaks: songs go back to being
+measured before their first play. `just ytdl-formats <url>` prints a `LOUDNESS` line that
+says which of the two is happening. Nothing to do.
+
 ## 2.56.8 — 2026-10-04
 
 **Videos with dubbed audio tracks are no longer re-encoded.** YouTube numbers the audio

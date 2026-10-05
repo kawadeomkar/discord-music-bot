@@ -235,9 +235,9 @@ stream_probe_timeout_secs = _secs(
 STREAM_PROBE_TIMEOUT_MAX_SECS: Final[float] = 5.0
 
 # The ebur128 scan is the only thing between a NORMALIZE guild's first play of a
-# song and its audio, and it is paid once per song per cache TTL. Measured live, a
-# 4-minute song takes about half a second and an hour-long one about six; past
-# this the song plays at its own level.
+# song YouTube sent no loudness for and its audio, once per song per cache TTL.
+# Measured live, a 4-minute song takes about half a second and an hour-long one
+# about six; past this the song plays at its own level.
 _MIN_LOUDNESS_SCAN_SECS: Final[float] = 1.0
 loudness_scan_timeout_secs = _secs(
     "LOUDNESS_SCAN_TIMEOUT_SECS", 8.0, minimum=_MIN_LOUDNESS_SCAN_SECS
