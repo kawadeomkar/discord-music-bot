@@ -795,6 +795,27 @@ a processed search extracts every entry it answers with — 3.69 s for three aga
 for one, and three times the player requests, which is not a cost worth paying at the
 dequeue resolve for a re-upload instead of a music video.
 
+**A songs-filtered music search as a rung after the ISRC was measured and not built.**
+Music search's songs section prints each row's artist and length in one POST (0.50 s
+median, the same as the widened title search's 0.52 s), so it could pick by artist and
+Spotify's length before any resolve. What it could add depends on how often the ISRC rung
+misses, so that was measured first, on 2026-10-06, over 118 tracks — the first eight of 12
+albums across genres and languages and of 3 user playlists (indie, Bollywood, J-pop):
+
+| | tracks |
+|---|---|
+| carried an ISRC | 118 / 118 |
+| ISRC search answered | 111 (94 %) |
+| … within `_MUSIC_DURATION_TOLERANCE_SECS` of Spotify's length | 110 |
+| today's ladder (ISRC, else the length-matched title search) within tolerance | 116 (98 %) |
+| ISRC missed, songs search would have picked within tolerance | 7 / 7 |
+| outcome a songs rung would change | 1 (a 174 s upload against Spotify's 187 s) |
+
+One rung for one track in 118, paid by every miss: not built. The other miss of the two
+is an ISRC hit at the wrong length (a 176 s upload for a 268 s recording), which the
+ISRC length check above now declines in favour of the title term. Script and per-track data: `docs/ytm_research/isrc_measure.py`,
+`isrc.json`.
+
 ### The music search fallback
 
 A signed-out `ytsearch` can come back EMPTY for a query that has results. When the top

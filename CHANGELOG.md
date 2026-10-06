@@ -17,6 +17,42 @@ page lists every merged PR if you want the full record.
 Entries are written for whoever runs the bot, not whoever wrote it: what you will see
 differently, what you have to do, and whether you can roll it back.
 
+## 2.56.1 — 2026-10-06
+
+**Songs whose top YouTube result is age-restricted now play.** Some searches found a
+video, but one YouTube will not play without a signed-in, adult account — `yoru ni kakeru
+yoasobi` is one. Played straight away, the request failed with yt-dlp's "Sign in to
+confirm your age. Use --cookies-from-browser…"; queued behind another song, it showed up
+in the queue and was then skipped with the same message. Both now ask YouTube Music for
+the song instead and play what it finds, skipping the restricted video. That covers
+Spotify tracks too, single or from a playlist.
+
+- **A queued one may change name in the queue** a few seconds after it is added: the
+  bot finds out the video is restricted when it starts fetching it, and swaps in YouTube
+  Music's answer then. The card you got when you queued it still names the first video.
+- **YouTube Music's answers are chosen more carefully.** The bot now reads the artist
+  YouTube Music lists next to each result and its top pick, so "Kendrick Lamar - Not Like
+  Us" plays the song rather than a clip that mentions him, and searches typed in Japanese,
+  Korean, Russian, Hindi and other non-Latin scripts can be matched at all. It also turns
+  down answers that merely share your words: a search that names no artist (`how to tie
+  a tie`, a meme, a video essay) now plays YouTube Music's answer only when YouTube
+  Music itself backs it, instead of whichever song happens to carry those words. A few
+  searches that used to play something loosely related, mostly non-music ones, now say
+  nothing was found. This only matters for searches YouTube refused to answer.
+- **A Spotify track no longer plays a mislabelled upload.** When the upload YouTube
+  finds by the track's recording code runs well off Spotify's length (one track in about
+  a hundred, measured), the bot now falls back to searching the title instead.
+- **When even YouTube Music has nothing**, the message is now "That search's top result
+  is age-restricted, and I couldn't find another upload of it." instead of yt-dlp's
+  cookie advice.
+- **A link to an age-restricted video still fails**, as before: it names that video.
+- **Cost:** a request that hits this pays about 1.5–2 seconds more than it took to fail
+  before, once; the answer is then remembered for a day against the words you typed.
+- **Nothing to do, and safe to roll back.** No setting, key or service. Remembered
+  answers are ordinary cache entries with one extra field, and queued Spotify songs
+  carry three extra fields on the saved queue; an older version ignores both (it
+  rewrites the saved queue once, the first time it removes such a song).
+
 ## 2.56.0 — 2026-10-02
 
 **Searches that YouTube refused to answer now play.** Some searches came back as
