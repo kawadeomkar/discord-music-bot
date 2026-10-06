@@ -45,6 +45,9 @@ answers as if the bot had joined. Nothing checked.
   bot sat alone until the alone timer disconnected it. It now moves, and the song
   playing carries on in your channel. A channel with someone still in it keeps the bot,
   as before.
+- **Muting the bot no longer keeps it in an empty channel for good.** Server-muting or
+  deafening the bot while it counted down to leaving an empty channel stopped the
+  countdown, so it never left. The countdown now runs on.
 - **Nothing to do**, and no state to clean up: both windows were in memory only. If you
   have a server where the bot shows as connected but answers "I'm not in a voice
   channel", `-join` once after deploying this.

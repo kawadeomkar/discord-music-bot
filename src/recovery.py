@@ -292,8 +292,8 @@ class VoiceWatchdog:
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Two cases: the bot itself disconnected/moved (full cleanup or
-        stale-timer cancellation), and a human's channel change relative to the
+        """Two cases: the bot itself disconnected/moved (full cleanup, or ending
+        the countdown it moved away from), and a human's channel change relative to the
         bot's (starts/ends the alone-disconnect countdown)."""
         cog = self._cog
         guild = member.guild
@@ -310,10 +310,14 @@ class VoiceWatchdog:
                             f"Bot disconnected from voice in guild {guild.id}, cleaning up"
                         )
                         await cog.cleanup(guild)
-            elif before.channel is not None and after.channel is not None:
-                # Moved. Beside a listener (a -join from them) the countdown ends on
-                # its rejoined frame; otherwise any timer for the old channel is
-                # cancelled.
+            elif (
+                before.channel is not None
+                and after.channel is not None
+                and before.channel != after.channel
+            ):
+                # Moved (a mute or deafen keeps the channel, and is not a move).
+                # Beside a listener (a -join from them) the countdown ends on its
+                # rejoined frame; otherwise any timer for the old channel is cancelled.
                 if any(not m.bot for m in after.channel.members):
                     self._signal_rejoin(guild.id)
                 else:

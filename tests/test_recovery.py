@@ -567,6 +567,39 @@ class TestVoiceStateConsistency:
         timer.cancel.assert_called_once()
         assert mock_guild.id not in music_bot_with_redis.voice_watchdog._countdowns
 
+    async def test_bot_muted_in_place_leaves_the_countdown_running(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A mute or deafen of the alone bot keeps its channel: not a move, so the
+        countdown neither cancels (the bot would stay alone for good) nor ends."""
+        self._wire_bot_user(music_bot_with_redis)
+
+        timer = make_mock_task()
+        rejoined = asyncio.Event()
+        music_bot_with_redis.voice_watchdog._countdowns[mock_guild.id] = _Countdown(
+            task=timer, rejoined=rejoined
+        )
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 999999999999999999
+        member.guild = mock_guild
+        channel = MagicMock()
+        channel.members = [MagicMock(spec=discord.Member, bot=True)]
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = channel
+
+        with patch.object(
+            music_bot_with_redis, "cleanup", new=AsyncMock()
+        ) as mock_cleanup:
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        timer.cancel.assert_not_called()
+        assert not rejoined.is_set()
+        assert mock_guild.id in music_bot_with_redis.voice_watchdog._countdowns
+        mock_cleanup.assert_not_awaited()
+
     async def test_bot_moved_beside_a_listener_ends_the_countdown_on_its_card(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
     ) -> None:
