@@ -162,7 +162,11 @@ with an id that is not base62, raises `UnsupportedSpotifyLinkError` — not a
 **Music search answers a search every term missed.** It is not a rung of
 `_search_terms`: once the ladder is exhausted, `yt_source` asks it once, for a search
 only, because a signed-out `ytsearch` whose top results hold age-restricted content
-comes back EMPTY with nothing in what yt-dlp returns to say so. `_ytmusic_candidate_url`
+comes back EMPTY with nothing in what yt-dlp returns to say so — or answers with an
+age-restricted top hit that fails the processed search, which the worker classifies
+(`ExtractionError.age_restricted`) and the ladder counts as that term's miss, the
+restricted id excluded from the music pick. The flat path cannot see the gate, so
+`rescue_age_restricted` re-answers a typed search where its stream fails. `_ytmusic_candidate_url`
 sends one music search POST through `ExtractRequest(music_search=True)`: the worker issues
 yt-dlp's own request (`_music_search`, two private yt-dlp methods) and parses the answer
 itself (`_music_search_entries`), because yt-dlp's parser keeps only a row's title and
@@ -173,7 +177,8 @@ character pairs) and, for a Spotify ask, its length. The winner's watch URL reso
 processed. The parser is pinned by recorded responses in `tests/data/ytmusic_search.json`
 — re-record them (and re-read `_music_search_entries`) when a yt-dlp bump or a YouTube
 change moves the renderer shapes. Why each of those, and what it costs:
-ARCHITECTURE.md#the-music-search-fallback, #reading-music-search, #the-relevance-gate.
+ARCHITECTURE.md#the-music-search-fallback, #an-age-restricted-top-hit,
+#reading-music-search, #the-relevance-gate.
 
 ## Concurrency primitives
 

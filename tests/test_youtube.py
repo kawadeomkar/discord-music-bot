@@ -8,6 +8,7 @@ import logging
 import redis.asyncio as aioredis
 import pickle
 from dataclasses import FrozenInstanceError, replace
+from dataclasses import fields as dataclass_fields
 import threading
 import time
 from http.cookies import SimpleCookie
@@ -2592,6 +2593,423 @@ class TestRelevanceGate:
         # title carries every word but the artist's, which is not all of them.
         assert youtube._music_pick("yoru ni kakeru yoasobi", entries[:1]) is None
         assert youtube._music_pick("yoru ni kakeru", entries[:1]) is not None
+
+
+class TestAgeRestrictedSearch:
+    """A search whose top hit asks a signed-out client to confirm its age fails the
+    processed search outright. Music search answers the ask instead, skipping that
+    video. See docs/ARCHITECTURE.md#an-age-restricted-top-hit."""
+
+    _ASK = "ytsearch:夜に駆ける"
+    _MUSIC_URL = "https://music.youtube.com/search?q=%E5%A4%9C%E3%81%AB%E9%A7%86%E3%81%91%E3%82%8B"
+    _ATV = "https://www.youtube.com/watch?v=by4SYYWlhEs"
+    _FOUND = {
+        "webpage_url": _ATV,
+        "title": "夜に駆ける",
+        "url": "https://cdn/atv",
+        "duration": 261,
+        "uploader": "YOASOBI",
+    }
+
+    @staticmethod
+    def _age_error(video_id: str = "x8VYWazR5mE") -> ExtractionError:
+        return ExtractionError(
+            f"ERROR: [youtube] {video_id}: Sign in to confirm your age. Use "
+            "--cookies-from-browser or --cookies for the authentication.",
+            original_type="DownloadError",
+            expected=True,
+            video_id=video_id,
+            age_restricted=True,
+        )
+
+    def _extract(self, answers: dict[str, Any], asked: list[str]) -> Callable[..., Any]:
+        async def extract(_key: Any, request: Any, search: str, **_kw: Any) -> Any:
+            asked.append(search)
+            answer = answers.get(search)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        return extract
+
+    def _answers(self, **over: Any) -> dict[str, Any]:
+        return {
+            self._ASK: self._age_error(),
+            self._MUSIC_URL: {"entries": _music_entries("夜に駆ける")},
+            self._ATV: self._FOUND,
+        } | over
+
+    def test_yt_dlps_age_wall_is_classified_in_the_worker(self) -> None:
+        import sys
+
+        from yt_dlp.utils import ExtractorError
+
+        try:
+            raise ExtractorError(
+                "Sign in to confirm your age. This video may be inappropriate for "
+                "some users.",
+                video_id="x8VYWazR5mE",
+                expected=True,
+            )
+        except ExtractorError:
+            wrapped = DownloadError(
+                "ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age. Use "
+                "--cookies-from-browser or --cookies for the authentication.",
+                sys.exc_info(),  # pyright: ignore[reportArgumentType]
+            )
+        err = youtube._classify_ytdlp_error(wrapped)
+        assert err.age_restricted is True
+        assert err.video_id == "x8VYWazR5mE"
+        back = pickle.loads(pickle.dumps(err))
+        assert back.age_restricted is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "ERROR: [youtube] v1: Video unavailable",
+            "ERROR: [youtube] v1: Sign in to confirm you're not a bot",
+            "ERROR: [youtube] v1: Private video. Sign in if you've been granted access",
+        ],
+    )
+    def test_other_failures_are_not_age_walls(self, message: str) -> None:
+        assert (
+            youtube._classify_ytdlp_error(DownloadError(message)).age_restricted
+            is False
+        )
+
+    async def test_music_search_answers_and_skips_the_restricted_video(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The recorded answer's top card IS the restricted music video, so the pick
+        has to step past it to the art track."""
+        asked: list[str] = []
+        span = MagicMock()
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract(self._answers(), asked),
+            ),
+            patch("src.youtube.trace.get_current_span", return_value=span),
+        ):
+            got = await YTDL.yt_source(
+                mock_ctx.author, self._ASK, query_source="search", **_ANALYTICS,
+                user_input="夜に駆ける",
+            )  # fmt: skip
+
+        assert got.webpage_url == self._ATV
+        assert got.user_input == "夜に駆ける"
+        assert asked == [self._ASK, self._MUSIC_URL, self._ATV]
+        attributes = {c.args[0]: c.args[1] for c in span.set_attribute.call_args_list}
+        assert attributes["ytdl.music_fallback_trigger"] == "age_restricted"
+        assert attributes["ytdl.search_kind"] == "music"
+
+    async def test_the_answer_is_cached_under_the_ask_and_marked(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(self._answers(), [])
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author, self._ASK, query_source="search", **_ANALYTICS,
+                user_input=None, redis=fake_redis,
+            )  # fmt: skip
+            await _settle_stream_warms()
+        raw = await fake_redis.get(_source_cache_key(self._ASK))
+        assert raw is not None
+        stored = orjson.loads(raw)
+        assert stored["webpage_url"] == self._ATV
+        assert stored["via"] == "music"
+
+    async def test_a_declined_answer_says_age_restricted_without_cookie_advice(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        answers = self._answers(**{self._MUSIC_URL: {"entries": []}})
+        with (
+            patch("src.youtube._extract_for_source", new=self._extract(answers, [])),
+            pytest.raises(ExtractionError) as raised,
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author, self._ASK, query_source="search", **_ANALYTICS,
+                user_input=None,
+            )  # fmt: skip
+        err = raised.value
+        assert err.age_restricted is True
+        assert err.video_id == "x8VYWazR5mE"
+        assert "age-restricted" in err.user_message
+        assert "cookies" not in err.user_message
+
+    async def test_a_link_to_a_restricted_video_fails_as_it_always_has(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        link = "https://www.youtube.com/watch?v=x8VYWazR5mE"
+        asked: list[str] = []
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract({link: self._age_error()}, asked),
+            ),
+            pytest.raises(ExtractionError, match="cookies"),
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author, link, query_source="youtube.com", **_ANALYTICS,
+                user_input=None,
+            )  # fmt: skip
+        assert asked == [link]
+
+    async def test_any_other_extraction_failure_is_not_a_miss(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+        broken = ExtractionError(
+            "ERROR: [youtube] v1: Video unavailable", expected=True
+        )
+        with (
+            patch(
+                "src.youtube._extract_for_source",
+                new=self._extract(self._answers(**{self._ASK: broken}), asked),
+            ),
+            pytest.raises(ExtractionError) as raised,
+        ):
+            await YTDL.yt_source(
+                mock_ctx.author, self._ASK, query_source="search", **_ANALYTICS,
+                user_input=None,
+            )  # fmt: skip
+        assert raised.value is broken
+        assert asked == [self._ASK]
+
+    async def test_a_restricted_isrc_hit_falls_through_to_the_title(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        asked: list[str] = []
+        answers = {
+            'ytsearch:"JPU902000123"': self._age_error(),
+            self._ASK: {"entries": [self._FOUND]},
+        }
+        with patch(
+            "src.youtube._extract_for_source", new=self._extract(answers, asked)
+        ):
+            got = await YTDL.yt_source(
+                mock_ctx.author, self._ASK, query_source="spotify", **_ANALYTICS,
+                user_input=None, isrc="JPU902000123",
+            )  # fmt: skip
+        assert got.webpage_url == self._ATV
+        assert asked == ['ytsearch:"JPU902000123"', self._ASK]
+
+
+class TestAgeRescueAtStreamTime:
+    """A flat resolve makes no player call, so a restricted top hit queues and fails
+    at its stream extraction. The ask is re-answered by music search there."""
+
+    _ATV = "https://www.youtube.com/watch?v=by4SYYWlhEs"
+    _OMV = "https://www.youtube.com/watch?v=x8VYWazR5mE"
+
+    def _queued(self, mock_ctx: MagicMock, **over: Any) -> QueueObject:
+        return replace(
+            QueueObject(
+                webpage_url=self._OMV,
+                title="YOASOBI「夜に駆ける」 Official Music Video",
+                requester=mock_ctx.author,
+                user_input="夜に駆ける",
+                query_source="search",
+                duration=276,
+                ts=30,
+                queued_at=1752529000.5,
+                queue_position=3,
+            ),
+            **over,
+        )
+
+    def _answers(self) -> dict[str, Any]:
+        return {
+            TestAgeRestrictedSearch._MUSIC_URL: {
+                "entries": _music_entries("夜に駆ける")
+            },
+            self._ATV: TestAgeRestrictedSearch._FOUND,
+        }
+
+    async def test_a_typed_search_is_re_pointed_at_music_searchs_answer(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        key = _source_cache_key("ytsearch:夜に駆ける")
+        await fake_redis.set(
+            key, orjson.dumps({"webpage_url": self._OMV, "title": "OMV"})
+        )
+        asked: list[str] = []
+        queued = self._queued(mock_ctx)
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(self._answers(), asked),
+        ):
+            got = await YTDL.rescue_age_restricted(
+                queued, TestAgeRestrictedSearch._age_error(), fake_redis
+            )
+            await _settle_stream_warms()
+
+        assert got is not None
+        assert (got.webpage_url, got.title, got.duration) == (
+            self._ATV,
+            "夜に駆ける",
+            261,
+        )
+        # Everything about the ask stays: -remove's needle, the offset, analytics.
+        display = {"webpage_url", "title", "duration", "uploader", "thumbnail"}
+        for field in dataclass_fields(QueueObject):
+            if field.name not in display:
+                assert getattr(got, field.name) == getattr(queued, field.name), (
+                    field.name
+                )
+        assert asked == [TestAgeRestrictedSearch._MUSIC_URL, self._ATV]
+        raw = await fake_redis.get(key)
+        assert raw is not None
+        assert orjson.loads(raw)["webpage_url"] == self._ATV
+        assert orjson.loads(raw)["via"] == "music"
+
+    @pytest.mark.parametrize(
+        "user_input",
+        [
+            "https://www.youtube.com/watch?v=x8VYWazR5mE",
+            "https://open.spotify.com/track/3QFInJAm9eyaho5vBzxInN",
+            None,
+        ],
+        ids=["link", "spotify-link", "no-ask"],
+    )
+    async def test_only_a_typed_search_is_re_asked(
+        self, mock_ctx: MagicMock, user_input: Optional[str]
+    ) -> None:
+        asked: list[str] = []
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(self._answers(), asked),
+        ):
+            got = await YTDL.rescue_age_restricted(
+                self._queued(mock_ctx, user_input=user_input),
+                TestAgeRestrictedSearch._age_error(),
+                None,
+            )
+        assert got is None
+        assert asked == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ExtractionError("ERROR: [youtube] v: Video unavailable", expected=True),
+            RuntimeError("YouTube refused the audio stream"),
+        ],
+        ids=["unavailable", "not-an-extraction-error"],
+    )
+    async def test_only_an_age_wall_is_rescued(
+        self, mock_ctx: MagicMock, error: BaseException
+    ) -> None:
+        asked: list[str] = []
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(self._answers(), asked),
+        ):
+            assert (
+                await YTDL.rescue_age_restricted(self._queued(mock_ctx), error, None)
+                is None
+            )
+        assert asked == []
+
+    async def test_a_declined_answer_rescues_nothing(self, mock_ctx: MagicMock) -> None:
+        answers = {TestAgeRestrictedSearch._MUSIC_URL: {"entries": []}}
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(answers, []),
+        ):
+            got = await YTDL.rescue_age_restricted(
+                self._queued(mock_ctx), TestAgeRestrictedSearch._age_error(), None
+            )
+        assert got is None
+
+    async def test_the_restricted_video_is_never_the_answer(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Music search ranks that very video first; without the exclusion the
+        rescue re-points the song at what just failed."""
+        asked: list[str] = []
+        with patch(
+            "src.youtube._extract_for_source",
+            new=TestAgeRestrictedSearch()._extract(self._answers(), asked),
+        ):
+            got = await YTDL.rescue_age_restricted(
+                self._queued(mock_ctx),
+                # No id on the error: the queued item's own URL names the video.
+                ExtractionError("Sign in to confirm your age", age_restricted=True),
+                None,
+            )
+        assert got is not None
+        assert got.webpage_url == self._ATV
+
+    async def test_the_enqueue_warm_hands_back_the_rescued_item(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        queued = self._queued(mock_ctx)
+        rescued = replace(queued, webpage_url=self._ATV, title="夜に駆ける")
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                side_effect=TestAgeRestrictedSearch._age_error(),
+            ),
+            patch.object(
+                YTDL, "rescue_age_restricted", AsyncMock(return_value=rescued)
+            ) as rescue,
+        ):
+            assert await YTDL.prefetch_stream(queued, redis=fake_redis) is rescued
+        assert rescue.await_args is not None
+        assert rescue.await_args.args[0] is queued
+
+    async def test_an_unrescued_warm_still_reports_not_warmed(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                side_effect=TestAgeRestrictedSearch._age_error(),
+            ),
+            patch.object(YTDL, "rescue_age_restricted", AsyncMock(return_value=None)),
+        ):
+            assert (
+                await YTDL.prefetch_stream(self._queued(mock_ctx), redis=fake_redis)
+                is None
+            )
+
+    async def test_the_song_plays_as_the_rescued_item(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        queued = self._queued(mock_ctx)
+        rescued = replace(queued, webpage_url=self._ATV, title="夜に駆ける")
+
+        def extract(req: ExtractRequest) -> Any:
+            if req.url == self._OMV:
+                raise TestAgeRestrictedSearch._age_error()
+            return _fake_ytdl_data(webpage_url=self._ATV, title="夜に駆ける")
+
+        channel = AsyncMock(spec=discord.TextChannel)
+        with (
+            patch("src.youtube._ytdlp_extract", side_effect=extract),
+            patch.object(
+                YTDL, "rescue_age_restricted", AsyncMock(return_value=rescued)
+            ),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            song = await YTDL.yt_stream(queued, channel)
+        assert song.queued is rescued
+        assert song.queued.ts == 30
+
+    async def test_an_unrescued_stream_fails_as_it_always_has(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        channel = AsyncMock(spec=discord.TextChannel)
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                side_effect=TestAgeRestrictedSearch._age_error(),
+            ),
+            patch.object(YTDL, "rescue_age_restricted", AsyncMock(return_value=None)),
+            pytest.raises(ExtractionError, match="confirm your age"),
+        ):
+            await YTDL.yt_stream(self._queued(mock_ctx), channel)
 
 
 class TestYTSourceUnifiedExtraction:
@@ -5864,6 +6282,26 @@ class TestSourceCacheRevalidation:
         )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
             await self._hit(mock_ctx, fake_redis, "fresh search")
+        assert not youtube._SOURCE_REVALIDATIONS
+        mock_extract.assert_not_called()
+
+    async def test_a_stale_music_answer_refreshes_nothing(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """Music search answered because the search failed. A refresh re-runs that
+        search, and for an age-restricted top hit it finds the very video that
+        failed and would write it back over the answer."""
+        await fake_redis.set(
+            "ytdl:source:age gated",
+            orjson.dumps(
+                self._entry(
+                    cached_at=time.time() - _YT_SOURCE_FRESH_SECS - 1, via="music"
+                )
+            ),
+        )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            qobj = await self._hit(mock_ctx, fake_redis, "age gated")
+        assert qobj.title == "Stale Song"
         assert not youtube._SOURCE_REVALIDATIONS
         mock_extract.assert_not_called()
 

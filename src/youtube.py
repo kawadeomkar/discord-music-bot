@@ -5,7 +5,7 @@ import os
 import re
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, replace
 from functools import partial
 from enum import Enum
@@ -25,7 +25,7 @@ from opentelemetry.trace import StatusCode
 from src import config
 from src.queue_item import NpCard, QueueObject
 from src.redis_client import cache_del, cache_get, cache_set
-from src.sources import is_link, is_mix
+from src.sources import YTSource, is_link, is_mix, parse_input
 from src.telemetry import get_tracer
 from src.util import (
     PoolSlotUnavailable,
@@ -161,6 +161,7 @@ class ExtractionError(Exception):
         video_id: str = "",
         cause_type: str = "",
         unsupported: bool = False,
+        age_restricted: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -171,6 +172,9 @@ class ExtractionError(Exception):
         # UnsupportedError, classified in the worker where the original type still
         # exists; yt_source reads it to say "not a site I can play".
         self.unsupported = unsupported
+        # The video (video_id) asks a signed-out client to confirm its age. A search
+        # that landed on one can still be answered by music search.
+        self.age_restricted = age_restricted
 
     @property
     def user_message(self) -> str:
@@ -195,19 +199,26 @@ def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
     exc_info = getattr(e, "exc_info", None)
     if isinstance(exc_info, tuple) and len(exc_info) == 3 and exc_info[1] is not None:
         inner = exc_info[1]
-
     cause = getattr(inner, "cause", None) or getattr(e, "cause", None)
     # extract_info wraps an UnsupportedError in a DownloadError carrying the
     # original in exc_info, so check both.
     unsupported = isinstance(e, UnsupportedError) or isinstance(inner, UnsupportedError)
+    message = str(e)
     return ExtractionError(
-        message=str(e),
+        message=message,
         original_type=type(e).__name__,
         expected=bool(getattr(inner, "expected", False)),
         video_id=str(getattr(inner, "video_id", "") or ""),
         cause_type=type(cause).__name__ if cause is not None else "",
         unsupported=unsupported,
+        age_restricted=bool(_AGE_GATE_RE.search(message)),
     )
+
+
+# The reasons yt-dlp's own `_is_agegated` matches in a playability status, as they
+# reach the raised message. The player request asks for English (hl=en), so the
+# wording does not follow the host's locale.
+_AGE_GATE_RE = re.compile(r"confirm your age|age-restricted", re.IGNORECASE)
 
 
 class _YTDLVideoInfoRequired(TypedDict):
@@ -1030,9 +1041,16 @@ def _identity_from_wire(entry: dict[str, Any]) -> SourceIdentity:
     )
 
 
-def _source_cache_value(identity: SourceIdentity) -> dict[str, Any]:
-    """A source-cache entry: the identity plus the stamp _source_entry_is_stale reads."""
-    return {**_identity_to_wire(identity), "cached_at": time.time()}
+def _source_cache_value(
+    identity: SourceIdentity, *, via_music: bool = False
+) -> dict[str, Any]:
+    """A source-cache entry: the identity plus the stamp _source_entry_is_stale reads.
+    `via_music` marks an answer music search gave in place of the ask's own search,
+    which a revalidation would replace with what that search finds."""
+    value = {**_identity_to_wire(identity), "cached_at": time.time()}
+    if via_music:
+        value["via"] = "music"
+    return value
 
 
 def _playlist_cache_key(url: str) -> str:
@@ -1665,6 +1683,21 @@ def _nothing_playable(search: str) -> _NothingFound:
     )
 
 
+def _age_restricted_miss(error: ExtractionError) -> _NothingFound:
+    """The miss for a search term whose result is a video only a signed-in, adult
+    account may play. Worded here because yt-dlp's text is cookie advice."""
+    log.warning(f"age-restricted result for a search: {error.video_id}")
+    return _NothingFound(
+        ExtractionError(
+            "That search's top result is age-restricted, and I couldn't find "
+            "another upload of it.",
+            expected=True,
+            video_id=error.video_id,
+            age_restricted=True,
+        )
+    )
+
+
 _SEARCH_KIND_ISRC: Final[str] = "isrc"
 _SEARCH_KIND_TITLE: Final[str] = "title"
 _SEARCH_KIND_TITLE_MATCHED: Final[str] = "title_matched"
@@ -1928,6 +1961,7 @@ async def _ytmusic_candidate_url(
     search: str,
     *,
     pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]] = None,
+    exclude: frozenset[str] = frozenset(),
     expected_duration: Optional[int] = None,
 ) -> Optional[str]:
     """The watch URL of what music.youtube.com answers `search` with, chosen by
@@ -1947,6 +1981,7 @@ async def _ytmusic_candidate_url(
     picked = _music_pick(
         query,
         (data or {}).get("entries") or [],
+        exclude=exclude,
         expected_duration=expected_duration,
     )
     span = trace.get_current_span()
@@ -1956,6 +1991,36 @@ async def _ytmusic_candidate_url(
     span.set_attribute("ytdl.music_pick_top", bool(picked.get("music_top")))
     span.set_attribute("ytdl.music_pick_type", picked.get("music_video_type") or "")
     return f"https://www.youtube.com/watch?v={picked.get('id')}"
+
+
+async def _cache_music_answer(
+    redis: Optional[aioredis.Redis], term: str, found: QueueObject
+) -> None:
+    """Cache what music search found under the term the next ask reads first, or
+    every repeat re-asks the failing search and music search before reaching the
+    watch URL's own entry. Marked, so a revalidation does not swap it back."""
+    if redis is None:
+        return
+    await cache_set(
+        redis,
+        _source_cache_key(term),
+        _source_cache_value(
+            SourceIdentity(
+                webpage_url=found.webpage_url,
+                title=found.title,
+                duration=found.duration,
+                uploader=found.uploader,
+                thumbnail=found.thumbnail,
+            ),
+            via_music=True,
+        ),
+        _YT_SOURCE_TTL,
+    )
+
+
+def _video_id_of(webpage_url: str) -> str:
+    """The `v=` of a watch URL, or "" for any other shape."""
+    return (parse_qs(urlparse(webpage_url).query).get("v") or [""])[0]
 
 
 def _first_video_entry(
@@ -2310,10 +2375,14 @@ class YTDL(discord.FFmpegOpusAudio):
             )
         except Exception as e:
             trace.get_current_span().record_exception(e)
+            log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
+            # The rescue's resolve warms the new song's stream itself.
+            rescued = await cls.rescue_age_restricted(qo, e, redis)
+            if rescued is not None:
+                return rescued
             trace.get_current_span().set_status(
                 StatusCode.ERROR, f"prefetch_stream failed: {e}"
             )
-            log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return None
         if data is not None:
             # Shielded like every other join: a cancelled prefetch (every bulk queue
@@ -2552,9 +2621,20 @@ class YTDL(discord.FFmpegOpusAudio):
         uninterruptible executor job in that path."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
 
-        data = await cls._resolve_playable_stream(
-            qo, redis, allow_reextract=allow_reextract
-        )
+        try:
+            data = await cls._resolve_playable_stream(
+                qo, redis, allow_reextract=allow_reextract
+            )
+        except ExtractionError as e:
+            # The song plays as what music search found for its ask, and the
+            # YTDL carries the re-pointed item, so the card and history name it.
+            rescued = await cls.rescue_age_restricted(qo, e, redis)
+            if rescued is None:
+                raise
+            qo = rescued
+            data = await cls._resolve_playable_stream(
+                qo, redis, allow_reextract=allow_reextract
+            )
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts:
@@ -2636,89 +2716,172 @@ class YTDL(discord.FFmpegOpusAudio):
             pool_slot=pool_slot,
         )
         last_miss: Optional[_NothingFound] = None
+        # Videos a term landed on that refused a signed-out client its age check.
+        age_gated: set[str] = set()
         for index, (kind, term) in enumerate(terms):
             trace.get_current_span().set_attribute("ytdl.search_kind", kind)
             try:
                 return await resolve(term, flat=flat)
             except _NothingFound as miss:
                 last_miss = miss
-                if index < len(terms) - 1:
-                    log.info(
-                        f"{kind} search {term!r} found nothing; "
-                        f"falling back to {terms[index + 1][1]!r}"
-                    )
+            except ExtractionError as e:
+                # A link names the one video it plays; a search can be answered
+                # by another upload of the same song.
+                if not e.age_restricted or is_link(search.strip()):
+                    raise
+                age_gated.add(e.video_id)
+                last_miss = _age_restricted_miss(e)
+            if index < len(terms) - 1:
+                log.info(
+                    f"{kind} search {term!r} found nothing playable; "
+                    f"falling back to {terms[index + 1][1]!r}"
+                )
         if last_miss is None:
             raise AssertionError("_search_terms never returns an empty ladder")
 
         # Every ytsearch term missed. For a SEARCH that can mean YouTube withheld
-        # the results rather than holding none, which music search is not subject
-        # to. A LINK is excluded: it named one video, and a second opinion on a
-        # different corpus would play something the user did not ask for.
+        # the results, or ranked an age-restricted video first; music search is
+        # subject to neither. A LINK is excluded: it named one video, and a second
+        # opinion on a different corpus would play something the user did not ask for.
         if not is_link(search.strip()):
-            trace.get_current_span().set_attribute("ytdl.music_fallback", True)
-            try:
-                watch_url = await _ytmusic_candidate_url(
-                    search,
-                    pool_slot=pool_slot,
-                    expected_duration=expected_duration,
-                )
-                if watch_url is not None:
-                    log.info(
-                        f"search {search!r} found nothing; music search found {watch_url}"
-                    )
-                    # Never flat: the candidate is a link now, and the link path is
-                    # what fills both caches from one round. The needle is the ask's,
-                    # not the watch URL's, so -remove still matches what was typed.
-                    found = await resolve(
-                        watch_url,
-                        flat=False,
-                        user_input=user_input if user_input is not None else search,
-                    )
-                    if _music_duration_fits(found.duration, expected_duration):
-                        # Stamped only here: an attempt that declined or failed is
-                        # `ytdl.music_fallback` alone, still the ladder's kind.
-                        trace.get_current_span().set_attribute(
-                            "ytdl.search_kind", _SEARCH_KIND_MUSIC
-                        )
-                        # Under the term the next ask reads first, or every repeat
-                        # re-asks the walled search and music search before reaching
-                        # the watch URL's own entry.
-                        if redis is not None:
-                            await cache_set(
-                                redis,
-                                _source_cache_key(terms[0][1]),
-                                _source_cache_value(
-                                    SourceIdentity(
-                                        webpage_url=found.webpage_url,
-                                        title=found.title,
-                                        duration=found.duration,
-                                        uploader=found.uploader,
-                                        thumbnail=found.thumbnail,
-                                    )
-                                ),
-                                _YT_SOURCE_TTL,
-                            )
-                        return found
-                    # A Spotify ask knows its length, and music search's pick ran
-                    # too far from it to be that recording: declined like any miss.
-                    trace.get_current_span().set_attribute(
-                        "ytdl.music_duration_mismatch", True
-                    )
-                    log.info(
-                        f"music search's candidate {watch_url} for {search!r} runs "
-                        f"{found.duration}s against {expected_duration}s; declined"
-                    )
-            except Exception as e:
-                # BOTH legs are best-effort: the ask keeps the answer it earned. Each
-                # leg has its own way of replacing it — a candidate raises yt-dlp's
-                # cookies boilerplate, which user_message shows verbatim for an
-                # `expected` error, and the music ask's unsupported branch names the
-                # internal search URL in text a user reads.
-                log.warning(f"music fallback for {search!r} failed: {e!r}")
+            span = trace.get_current_span()
+            span.set_attribute("ytdl.music_fallback", True)
+            span.set_attribute(
+                "ytdl.music_fallback_trigger",
+                "age_restricted" if age_gated else "nothing_found",
+            )
+            found = await cls._music_answer(
+                search,
+                resolve,
+                cache_term=terms[0][1],
+                user_input=user_input,
+                redis=redis,
+                pool_slot=pool_slot,
+                expected_duration=expected_duration,
+                exclude=frozenset(age_gated),
+            )
+            if found is not None:
+                return found
 
         # Raised as the failure the caller has always seen, `from None` because the
         # wrapper is this method's private business.
         raise last_miss.public from None
+
+    @staticmethod
+    async def _music_answer(
+        search: str,
+        resolve: Callable[..., Awaitable[QueueObject]],
+        *,
+        cache_term: str,
+        user_input: Optional[str],
+        redis: Optional[aioredis.Redis],
+        pool_slot: Optional[contextlib.AbstractAsyncContextManager[Any]],
+        expected_duration: Optional[int],
+        exclude: frozenset[str],
+    ) -> Optional[QueueObject]:
+        """What music search answers `search` with, resolved through `resolve` as a
+        link and cached under `cache_term`, or None. Never raises: both legs are
+        best-effort, and the ask keeps the answer it earned."""
+        try:
+            watch_url = await _ytmusic_candidate_url(
+                search,
+                pool_slot=pool_slot,
+                exclude=exclude,
+                expected_duration=expected_duration,
+            )
+            if watch_url is None:
+                return None
+            log.info(f"search {search!r} missed; music search found {watch_url}")
+            # Never flat: the candidate is a link now, and the link path is what
+            # fills both caches from one round. The needle is the ask's, not the
+            # watch URL's, so -remove still matches what was typed.
+            found = await resolve(
+                watch_url,
+                flat=False,
+                user_input=user_input if user_input is not None else search,
+            )
+            if not _music_duration_fits(found.duration, expected_duration):
+                # A Spotify ask knows its length, and the pick ran too far from it
+                # to be that recording: declined like any miss.
+                trace.get_current_span().set_attribute(
+                    "ytdl.music_duration_mismatch", True
+                )
+                log.info(
+                    f"music search's candidate {watch_url} for {search!r} runs "
+                    f"{found.duration}s against {expected_duration}s; declined"
+                )
+                return None
+            # Stamped only here: an attempt that declined or failed is
+            # `ytdl.music_fallback` alone, still the ladder's kind.
+            trace.get_current_span().set_attribute(
+                "ytdl.search_kind", _SEARCH_KIND_MUSIC
+            )
+            await _cache_music_answer(redis, cache_term, found)
+            return found
+        except Exception as e:
+            # A candidate raises yt-dlp's cookies boilerplate, which user_message
+            # shows verbatim for an `expected` error, and the music ask's
+            # unsupported branch names the internal search URL.
+            log.warning(f"music fallback for {search!r} failed: {e!r}")
+            return None
+
+    @classmethod
+    @_tracer.start_as_current_span("ytdl.rescue_age_restricted")
+    async def rescue_age_restricted(
+        cls,
+        qo: QueueObject,
+        error: BaseException,
+        redis: Optional[aioredis.Redis],
+    ) -> Optional[QueueObject]:
+        """`qo` re-pointed at what music search answers its ask with, when its
+        stream failed for an age check and the ask was a typed search; else None.
+
+        A flat resolve cannot see an age gate (it makes no player call), so a
+        restricted top hit queues and fails here. The answer replaces the ask's
+        source-cache entry, which still names the restricted video.
+        See docs/ARCHITECTURE.md#an-age-restricted-top-hit."""
+        if not isinstance(error, ExtractionError) or not error.age_restricted:
+            return None
+        try:
+            source = parse_input(qo.user_input) if qo.user_input else None
+        except Exception:
+            # A link parse_input refuses (an unsupported Spotify page) was never
+            # a typed search, and this runs inside its caller's error handling.
+            return None
+        if not isinstance(source, YTSource) or source.ytsearch is None:
+            return None
+        term = source.ytsearch
+        span = trace.get_current_span()
+        span.set_attribute("ytdl.music_fallback", True)
+        span.set_attribute("ytdl.music_fallback_trigger", "age_restricted_stream")
+        failed = {error.video_id, _video_id_of(qo.webpage_url)} - {""}
+        found = await cls._music_answer(
+            term,
+            partial(
+                cls._resolve_term,
+                qo.requester,
+                query_source=qo.query_source,
+                queued_at=qo.queued_at,
+                queue_position=qo.queue_position,
+                redis=redis,
+            ),
+            cache_term=term,
+            user_input=qo.user_input,
+            redis=redis,
+            pool_slot=None,
+            expected_duration=None,
+            exclude=frozenset(failed),
+        )
+        if found is None:
+            return None
+        return replace(
+            qo,
+            webpage_url=found.webpage_url,
+            title=found.title,
+            duration=found.duration,
+            uploader=found.uploader,
+            thumbnail=found.thumbnail,
+        )
 
     @classmethod
     async def _resolve_term(
@@ -2758,7 +2921,10 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
                 stale = _source_entry_is_stale(cached)
                 trace.get_current_span().set_attribute("ytdl.source_stale", stale)
-                if stale and not is_link(search.strip()):
+                # A music answer stands until its TTL: the search a refresh would
+                # re-run is the one that failed, and its answer would replace it.
+                via_music = cached.get("via") == "music"
+                if stale and not via_music and not is_link(search.strip()):
                     # Served now, refreshed behind the reply: what ages is the
                     # ranking a search resolved through, and a link's mapping is
                     # the link. Not awaited — this play uses the entry it has.

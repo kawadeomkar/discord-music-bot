@@ -19,6 +19,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
    - [-play --now Interjection](#-play---now-interjection)
    - [Source Resolution](#source-resolution)
    - [The music search fallback](#the-music-search-fallback)
+     - [An age-restricted top hit](#an-age-restricted-top-hit)
      - [Reading music search](#reading-music-search)
      - [The relevance gate](#the-relevance-gate)
    - [yt-dlp Pipeline](#yt-dlp-pipeline)
@@ -805,6 +806,10 @@ would mean patching a private yt-dlp method inside the pool worker, against a lo
 string. So the bot cannot tell the two apart, and `-play` answered both with "Couldn't
 find anything playable for that." for a song that exists and plays.
 
+The wall is one of two ways a signed-out search fails on age; the other answers, and
+fails later ([An age-restricted top hit](#an-age-restricted-top-hit)). Music search
+answers both.
+
 `music.youtube.com` is not subject to it. So once every term `_search_terms` returned has
 missed, `yt_source` makes one more ask, outside the ladder and only for a search:
 `_ytmusic_candidate_url` asks music search for the same query — one InnerTube POST, read
@@ -869,11 +874,62 @@ The song music search found is cached twice: under the candidate's watch URL, by
 link path that resolves it, and under the ask's first term, by `yt_source`. The second is
 what a repeat reads first, so a repeat of a walled query is one Redis GET (~2 ms) rather
 than the walled search, the music ask and the candidate's hit (~0.85 s and two pool slots,
-measured, before this was cached). It is an ordinary `ytdl:source` entry: 24 h TTL, and
-past the freshness window it is revalidated behind the reply like any search — a
-revalidation that finds the search still walled writes nothing, so the entry stands until
-its TTL. A search that genuinely has no matches pays the flat music ask and then
-declines, on a path that was already failing; nothing is cached for it.
+measured, before this was cached). It is an ordinary `ytdl:source` entry with a 24 h TTL,
+marked `"via": "music"` (`_cache_music_answer`), and a marked entry is never revalidated:
+the refresh re-runs the ask's own search, which for an age-restricted top hit finds the
+very video that failed and would write it back over the answer. So the entry stands until
+its TTL. A search that genuinely has no matches pays the music ask and then declines, on a
+path that was already failing; nothing is cached for it.
+
+#### An age-restricted top hit
+
+The second failure is a search that answers, with an age-restricted video first. Measured
+on 2026-10-06: `yoru ni kakeru yoasobi` and `夜に駆ける` rank YOASOBI's music video
+`x8VYWazR5mE` first, and `coffin dance meme` ranked `Er57QHHiE_Q` first; the processed
+search failed with "Sign in to confirm your age" in 8 of the research's 9 attempts, while
+the flat search returned the same entry with a title and a length. yt-dlp raises the
+player's age reason (the request asks for `hl=en`), so the worker classifies it there:
+`_classify_ytdlp_error` sets `ExtractionError.age_restricted` when the message carries one
+of the reasons yt-dlp's own `_is_agegated` matches. It also unwraps a bare
+`ExtractorError`, which `_music_search` raises without `extract_info`'s `DownloadError`
+around it.
+
+**A full resolve (cold start, an interjection head, an item at dequeue).** `yt_source`
+treats an age-restricted failure of a SEARCH term as a miss of that term: the next term
+runs (an ISRC hit that is restricted falls through to the title), and an exhausted ladder
+asks music search with the restricted ids in `exclude` — music search ranks the same video
+first for `夜に駆ける`, and taking it would fail again. `ytdl.music_fallback_trigger` is
+`age_restricted` (else `nothing_found`). When music search declines, the ask fails with
+"That search's top result is age-restricted, and I couldn't find another upload of it."
+rather than yt-dlp's cookie advice. A LINK to a restricted video fails exactly as before:
+it named that video.
+
+**A flat resolve (`TAIL`/`NEXT`).** The flat search makes no player call, so nothing at
+enqueue can see the gate: the restricted entry queues, the card names it, and its stream
+extraction is the first thing to fail. The search response does differ — the restricted
+renderers lacked `inlinePlaybackEndpoint` where the others had one — but that is an
+undocumented UI field yt-dlp's flat entry does not carry, and reading it would mean
+replacing yt-dlp's `ytsearch` parser; declined. Instead `YTDL.rescue_age_restricted`
+runs where the stream fails, in two places:
+
+- `prefetch_stream`, the enqueue-time warm `queue_put` spawns. It returns the re-pointed
+  item, and `_warm_stream` swaps it into the queue's slot (`GuildQueue.replace_item`) —
+  seconds after the card, while the song is still waiting its turn.
+- `yt_stream`, for the loop's one-ahead prefetch and its play-time resolve. The YTDL is
+  built on the re-pointed item, so the Now Playing card, `-replay` and play history name
+  what plays.
+
+The rescue re-asks only an item whose `user_input` `parse_input` reads as a typed search —
+the term it rebuilds is the one the ask was cached under — so a Spotify single-track
+`TAIL`, whose `user_input` is the link, is not rescued (its ISRC and length-matched title
+terms rarely land on a music video). It excludes the restricted id and the item's own,
+resolves the candidate through the link path (warming its stream), and overwrites the
+ask's source-cache entry, which still named the restricted video, with the marked music
+answer. The item keeps everything about the ask — `user_input` (`-remove`'s needle),
+`ts`, the requester and the analytics — and changes only its five display fields. When
+music search declines, the original failure stands and the song is skipped as before. The
+Redis queue list keeps the bytes it holds for the slot until its next rebuild, so a crash
+in between restores the restricted URL, and the rescue runs again at its turn.
 
 #### Reading music search
 
@@ -992,6 +1048,15 @@ ask 0.41–0.49 s (one outlier at 0.83 s), the candidate's resolve 1.06–1.13 s
   would be, and the flat path refuses an entry without a duration; the resolve is also
   what proves the candidate plays before it is cached under the ask. A walled song is one
   that previously did not queue at all, and its repeats are a source-cache hit.
+- **An age-restricted top hit, full path** answers in ~3.1–3.4 s (measured, 2026-10-06):
+  the failing processed search (~1.6 s, its player call included), the music ask and the
+  candidate's resolve — where it used to fail in ~1.6 s.
+- **An age-restricted top hit, flat path** still acknowledges at flat speed (~0.4–0.5 s):
+  the card names the restricted video. The enqueue warm then pays its failed stream
+  extraction (~1.2 s), the music ask and the candidate's resolve (~1.7 s) behind the card,
+  so the slot is corrected a few seconds later. Reached at play time instead (the warm
+  bound was full, or the item was restored), the same ~3 s is added before the song
+  starts — once per ask per day, since the music answer is then cached under the ask.
 - **At dequeue**, an unresolved collection item whose ISRC and title terms both miss
   pays up to four extractions — both terms, the music ask, and a candidate declined on
   length — ~2.0–2.6 s at worst, inside `_IN_BAND_RESOLVE_TIMEOUT_SECS` (300 s) with two
